@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
-use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::error::{StageOutcome, TrafficTestResult};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -22,7 +22,122 @@ impl OrchestrationStage for TrafficTestMatrixStage {
     fn fanout(&self) -> StageFanout {
         StageFanout::PerNode
     }
-    fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
-        StageOutcome::Skipped
+
+    fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+
+        // Collect mesh IPs from adapters if not already populated
+        if ctx.mesh_ips.is_empty() {
+            let collected: Vec<(String, Option<String>)> = aliases
+                .iter()
+                .map(|alias| {
+                    let ip = ctx
+                        .adapters
+                        .get(alias.as_str())
+                        .and_then(|a| a.collect_mesh_ip().ok());
+                    (alias.clone(), ip)
+                })
+                .collect();
+            for (alias, ip) in collected {
+                if let Some(ip) = ip {
+                    ctx.mesh_ips.insert(alias, ip);
+                }
+            }
+        }
+
+        if ctx.mesh_ips.is_empty() {
+            return StageOutcome::Failed(
+                "no mesh IPs available; cannot run traffic tests".to_string(),
+            );
+        }
+
+        let mesh_ips = ctx.mesh_ips.clone();
+        let mut errors = Vec::new();
+
+        for src_alias in &aliases {
+            // Positive tests: ping each peer
+            for peer_alias in &aliases {
+                if peer_alias == src_alias {
+                    continue;
+                }
+                let peer_ip = match mesh_ips.get(peer_alias) {
+                    Some(ip) => ip.clone(),
+                    None => {
+                        errors.push(format!("{src_alias}: no mesh IP for '{peer_alias}'"));
+                        continue;
+                    }
+                };
+                match ctx
+                    .adapters
+                    .get(src_alias.as_str())
+                    .map(|a| a.ping_mesh_peer(&peer_ip))
+                {
+                    Some(Ok(TrafficTestResult::Reachable)) => {}
+                    Some(Ok(TrafficTestResult::Blocked)) => {
+                        errors.push(format!(
+                            "{src_alias} → {peer_alias} ({peer_ip}): blocked (expected reachable)"
+                        ));
+                    }
+                    Some(Ok(TrafficTestResult::Error(e))) => {
+                        errors.push(format!("{src_alias} → {peer_alias} ({peer_ip}): {e}"));
+                    }
+                    Some(Err(e)) => errors.push(format!("{src_alias} → {peer_alias}: {e}")),
+                    None => errors.push(format!("no adapter for '{src_alias}'")),
+                }
+            }
+
+            // Negative test: confirm default-deny
+            // TEST-NET-2 (RFC 5737) — never routable in real meshes
+            let denied_ip = "198.51.100.1";
+            match ctx
+                .adapters
+                .get(src_alias.as_str())
+                .map(|a| a.probe_denied_peer(denied_ip))
+            {
+                Some(Ok(TrafficTestResult::Blocked)) | Some(Ok(TrafficTestResult::Error(_))) => {}
+                Some(Ok(TrafficTestResult::Reachable)) => {
+                    errors.push(format!(
+                        "{src_alias}: default-deny VIOLATED — {denied_ip} was reachable"
+                    ));
+                }
+                Some(Err(e)) => errors.push(format!("{src_alias}: probe_denied_peer error: {e}")),
+                None => {} // no adapter: skip denied probe
+            }
+        }
+
+        if errors.is_empty() {
+            StageOutcome::Passed
+        } else {
+            StageOutcome::Failed(errors.join("; "))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn empty_assignments_no_mesh_ips_fails() {
+        let mut ctx = OrchestrationContext {
+            assignments: vec![],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            network_id: "net".to_string(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+        };
+        // No assignments, no adapters, no mesh IPs → fail
+        assert!(matches!(
+            TrafficTestMatrixStage.execute(&mut ctx),
+            StageOutcome::Failed(_)
+        ));
     }
 }

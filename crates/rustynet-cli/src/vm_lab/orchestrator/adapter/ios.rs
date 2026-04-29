@@ -110,4 +110,21 @@ impl NodeAdapter for IosNodeAdapter {
     fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
         Err(ios_unsupported())
     }
+    fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn endpoint(&self) -> String {
+        "0.0.0.0:0".to_string()
+    }
+    fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+        Err(ios_unsupported())
+    }
+    fn issue_bundles_to_dir(
+        &self,
+        _kind: BundleKind,
+        _env_content: &str,
+        _local_out_dir: &std::path::Path,
+    ) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
 }

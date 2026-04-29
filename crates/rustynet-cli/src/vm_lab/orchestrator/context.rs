@@ -32,6 +32,12 @@ pub struct OrchestrationContext {
     /// CIDRs that SSH is allowed from (passed to bootstrap env as
     /// `SSH_ALLOW_CIDRS`). Empty string means no restriction at bootstrap.
     pub ssh_allow_cidrs: String,
+    /// Membership snapshot bytes collected from exit node during MembershipInit.
+    pub membership_snapshot: Option<Vec<u8>>,
+    /// WireGuard mesh IPs per alias, collected during CollectPubkeys.
+    pub mesh_ips: HashMap<String, String>,
+    /// WireGuard endpoint (host:port) per alias, collected during CollectPubkeys.
+    pub endpoints: HashMap<String, String>,
 }
 
 impl OrchestrationContext {
@@ -50,6 +56,9 @@ impl OrchestrationContext {
             network_id,
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
         }
     }
 

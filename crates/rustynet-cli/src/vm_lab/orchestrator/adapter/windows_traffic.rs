@@ -186,6 +186,138 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     Ok(())
 }
 
+/// Verify SSH/PS connectivity by running a no-op command.
+pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
+    run_remote_ps(conn, "Write-Host 'reachable'", Duration::from_secs(10))?;
+    Ok(())
+}
+
+/// Collect the WireGuard mesh IP from the running daemon or network interface.
+pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
+    let script = "$iface = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*rustynet*' -or $_.Name -like '*rustynet*' } | Select-Object -First 1; \
+         if ($iface) { (Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress } else { '' }";
+    let ip = run_remote_ps(conn, script, SHORT_TIMEOUT)?;
+    let ip = ip.trim().to_string();
+    if !ip.is_empty() {
+        return Ok(ip);
+    }
+    let daemon_pipe = r"\\.\pipe\rustynet-rustynetd";
+    let status_script = format!(
+        "$env:RUSTYNET_DAEMON_SOCKET = {pipe_q}; \
+         $out = & 'C:\\Program Files\\RustyNet\\rustynet.exe' status 2>&1; \
+         Write-Output $out",
+        pipe_q = crate::vm_lab::orchestrator::adapter::windows_install::ps_quote(daemon_pipe)?
+    );
+    let status = run_remote_ps(conn, &status_script, SHORT_TIMEOUT)?;
+    ssh::parse_status_field(&status, "mesh_ip")
+        .or_else(|| ssh::parse_status_field(&status, "wg_ip"))
+        .ok_or_else(|| AdapterError::Protocol {
+            message: "mesh IP not found via network interface or rustynet status".to_string(),
+        })
+}
+
+/// Issue signed bundles on this (Windows) exit node and SCP results to `local_out_dir`.
+pub fn issue_bundles_to_dir(
+    conn: &NodeConnection,
+    rustynet_path: &str,
+    kind: &crate::vm_lab::orchestrator::error::BundleKind,
+    env_content: &str,
+    local_out_dir: &std::path::Path,
+) -> Result<(), AdapterError> {
+    use crate::vm_lab::orchestrator::adapter::windows_install::{WINDOWS_STAGING_DIR, ps_quote};
+    use std::io::Write as IoWrite;
+    let pid = std::process::id();
+    let remote_env = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_env_{pid}.env");
+    let remote_issue_dir = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_{pid}");
+
+    let issue_subcmd = match kind {
+        crate::vm_lab::orchestrator::error::BundleKind::Assignment => {
+            "e2e-issue-assignment-bundles-from-env"
+        }
+        crate::vm_lab::orchestrator::error::BundleKind::Traversal => {
+            "e2e-issue-traversal-bundles-from-env"
+        }
+        crate::vm_lab::orchestrator::error::BundleKind::DnsZone => {
+            "e2e-issue-dns-zone-bundles-from-env"
+        }
+        crate::vm_lab::orchestrator::error::BundleKind::Membership => {
+            return Err(AdapterError::Protocol {
+                message: "Membership bundles are issued via init_membership_snapshot".to_string(),
+            });
+        }
+    };
+
+    let mut env_tmp = std::env::temp_dir();
+    env_tmp.push(format!("rn_issue_env_{pid}.env"));
+    {
+        let mut f = std::fs::File::create(&env_tmp).map_err(|e| AdapterError::Io {
+            message: format!("create env tmp: {e}"),
+        })?;
+        f.write_all(env_content.as_bytes())
+            .map_err(|e| AdapterError::Io {
+                message: format!("write env tmp: {e}"),
+            })?;
+    }
+    ssh::scp_to(
+        conn,
+        &env_tmp,
+        &remote_env.replace('\\', "/"),
+        MEDIUM_TIMEOUT,
+    )?;
+    let _ = std::fs::remove_file(&env_tmp);
+
+    let ensure_script = format!(
+        "New-Item -ItemType Directory -Force -Path {} | Out-Null; \
+         New-Item -ItemType Directory -Force -Path {} | Out-Null",
+        ps_quote(WINDOWS_STAGING_DIR)?,
+        ps_quote(&remote_issue_dir)?,
+    );
+    run_remote_ps(conn, &ensure_script, SHORT_TIMEOUT)?;
+
+    let run_script = format!(
+        "$env:RUSTYNET_NODE_ROLE = 'admin'; \
+         & {rustynet_q} ops {issue_subcmd} \
+             --env-file {env_q} --issue-dir {issue_dir_q}; \
+         if ($LASTEXITCODE -ne 0) {{ throw '{issue_subcmd} failed with exit code ' + $LASTEXITCODE }}",
+        rustynet_q = ps_quote(rustynet_path)?,
+        issue_subcmd = issue_subcmd,
+        env_q = ps_quote(&remote_env)?,
+        issue_dir_q = ps_quote(&remote_issue_dir)?,
+    );
+    run_remote_ps(conn, &run_script, MEDIUM_TIMEOUT)?;
+
+    let list_script = format!(
+        "Get-ChildItem -Path {} | Select-Object -ExpandProperty Name",
+        ps_quote(&remote_issue_dir)?
+    );
+    let listing = run_remote_ps(conn, &list_script, SHORT_TIMEOUT)?;
+
+    std::fs::create_dir_all(local_out_dir).map_err(|e| AdapterError::Io {
+        message: format!("create local out dir: {e}"),
+    })?;
+
+    for filename in listing.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let remote_path = format!("{remote_issue_dir}\\{filename}");
+        let local_path = local_out_dir.join(filename);
+        ssh::scp_from(
+            conn,
+            &remote_path.replace('\\', "/"),
+            &local_path,
+            MEDIUM_TIMEOUT,
+        )?;
+    }
+
+    let cleanup_script = format!(
+        "Remove-Item -LiteralPath {env_q} -Force -ErrorAction SilentlyContinue; \
+         Remove-Item -LiteralPath {dir_q} -Recurse -Force -ErrorAction SilentlyContinue",
+        env_q = ps_quote(&remote_env)?,
+        dir_q = ps_quote(&remote_issue_dir)?,
+    );
+    let _ = run_remote_ps(conn, &cleanup_script, SHORT_TIMEOUT);
+
+    Ok(())
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Validate that an IP address argument contains no shell-dangerous characters.

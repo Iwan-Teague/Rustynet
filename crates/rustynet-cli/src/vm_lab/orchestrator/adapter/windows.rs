@@ -168,6 +168,38 @@ impl NodeAdapter for WindowsNodeAdapter {
     fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
         windows_traffic::cleanup_runtime_state(&self.conn)
     }
+
+    fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+        windows_traffic::check_ssh_reachable(&self.conn)
+    }
+
+    fn endpoint(&self) -> String {
+        match &self.conn {
+            crate::vm_lab::orchestrator::connection::NodeConnection::Ssh { host, .. } => {
+                format!("{host}:51820")
+            }
+            _ => "0.0.0.0:51820".to_string(),
+        }
+    }
+
+    fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+        windows_traffic::collect_mesh_ip(&self.conn)
+    }
+
+    fn issue_bundles_to_dir(
+        &self,
+        kind: BundleKind,
+        env_content: &str,
+        local_out_dir: &std::path::Path,
+    ) -> Result<(), AdapterError> {
+        windows_traffic::issue_bundles_to_dir(
+            &self.conn,
+            windows_install::WINDOWS_RUSTYNET_PATH,
+            &kind,
+            env_content,
+            local_out_dir,
+        )
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

@@ -287,6 +287,9 @@ mod tests {
             collected_pubkeys: HashMap::new(),
             network_id: "test-net".to_string(),
             ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
         }
     }
 

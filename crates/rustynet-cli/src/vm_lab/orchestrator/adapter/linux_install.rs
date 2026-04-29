@@ -201,6 +201,9 @@ mod tests {
             network_id: "test-net".to_string(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: "10.0.0.0/8".to_string(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx);
         assert!(env.contains("ROLE=exit"), "must contain ROLE=exit: {env}");
@@ -227,6 +230,9 @@ mod tests {
             network_id: "net".to_string(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
         };
         let env = build_bootstrap_env("id1", &NodeRole::Custom("special".to_string()), &ctx);
         assert!(env.contains("ROLE=special"), "custom role: {env}");

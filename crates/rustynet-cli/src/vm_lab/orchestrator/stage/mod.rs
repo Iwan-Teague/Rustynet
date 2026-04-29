@@ -11,6 +11,7 @@ pub mod distribute_membership;
 pub mod distribute_traversal;
 pub mod enforce_runtime;
 pub mod exit_handoff;
+pub mod final_cleanup;
 pub mod install;
 pub mod membership_init;
 pub mod preflight;

@@ -6,6 +6,7 @@ use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
+const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Collect WireGuard public key from `/var/lib/rustynet/keys/wireguard.pub`.
 /// Returns the base64-encoded key as a hex string (32-byte decode → hex).
@@ -153,6 +154,122 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
          /var/lib/rustynet/rustynetd.trust 2>/dev/null; true",
         Duration::from_secs(30),
     )?;
+    Ok(())
+}
+
+/// Verify SSH connectivity by running a no-op command.
+pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
+    ssh::run_remote(conn, "echo reachable", Duration::from_secs(10))?;
+    Ok(())
+}
+
+/// Collect the WireGuard mesh IP from the running daemon interface or status.
+pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
+    let ip = ssh::run_remote(
+        conn,
+        "ip addr show rustynet0 2>/dev/null \
+         | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1 || echo ''",
+        SHORT_TIMEOUT,
+    )?;
+    let ip = ip.trim().to_string();
+    if !ip.is_empty() {
+        return Ok(ip);
+    }
+    let status = ssh::run_remote(
+        conn,
+        "rustynet status 2>/dev/null || echo ''",
+        SHORT_TIMEOUT,
+    )?;
+    ssh::parse_status_field(&status, "mesh_ip")
+        .or_else(|| ssh::parse_status_field(&status, "wg_ip"))
+        .ok_or_else(|| AdapterError::Protocol {
+            message: "mesh IP not found via rustynet0 interface or rustynet status".to_string(),
+        })
+}
+
+/// Issue signed bundles on this exit node and SCP the results to `local_out_dir`.
+pub fn issue_bundles_to_dir(
+    conn: &NodeConnection,
+    rustynet_path: &str,
+    kind: &crate::vm_lab::orchestrator::error::BundleKind,
+    env_content: &str,
+    local_out_dir: &std::path::Path,
+) -> Result<(), AdapterError> {
+    use std::io::Write as IoWrite;
+    let pid = std::process::id();
+    let remote_env = format!("/tmp/rn_issue_env_{pid}.env");
+    let remote_issue_dir = format!("/tmp/rn_issue_{pid}");
+
+    let issue_subcmd = match kind {
+        crate::vm_lab::orchestrator::error::BundleKind::Assignment => {
+            "e2e-issue-assignment-bundles-from-env"
+        }
+        crate::vm_lab::orchestrator::error::BundleKind::Traversal => {
+            "e2e-issue-traversal-bundles-from-env"
+        }
+        crate::vm_lab::orchestrator::error::BundleKind::DnsZone => {
+            "e2e-issue-dns-zone-bundles-from-env"
+        }
+        crate::vm_lab::orchestrator::error::BundleKind::Membership => {
+            return Err(AdapterError::Protocol {
+                message: "Membership bundles are issued via init_membership_snapshot".to_string(),
+            });
+        }
+    };
+
+    let mut env_tmp = std::env::temp_dir();
+    env_tmp.push(format!("rn_issue_env_{pid}.env"));
+    {
+        let mut f = std::fs::File::create(&env_tmp).map_err(|e| AdapterError::Io {
+            message: format!("create env tmp: {e}"),
+        })?;
+        f.write_all(env_content.as_bytes())
+            .map_err(|e| AdapterError::Io {
+                message: format!("write env tmp: {e}"),
+            })?;
+    }
+    ssh::scp_to(conn, &env_tmp, &remote_env, MEDIUM_TIMEOUT)?;
+    let _ = std::fs::remove_file(&env_tmp);
+
+    ssh::run_remote(
+        conn,
+        &format!("mkdir -p '{remote_issue_dir}'"),
+        SHORT_TIMEOUT,
+    )?;
+
+    let safe_rustynet = rustynet_path.replace('\'', "'\"'\"'");
+    ssh::run_remote(
+        conn,
+        &format!(
+            "env RUSTYNET_NODE_ROLE=admin sudo -n \
+             '{safe_rustynet}' ops {issue_subcmd} \
+             --env-file '{remote_env}' --issue-dir '{remote_issue_dir}'"
+        ),
+        MEDIUM_TIMEOUT,
+    )?;
+
+    let listing = ssh::run_remote(
+        conn,
+        &format!("ls -1 '{remote_issue_dir}' 2>/dev/null"),
+        SHORT_TIMEOUT,
+    )?;
+
+    std::fs::create_dir_all(local_out_dir).map_err(|e| AdapterError::Io {
+        message: format!("create local out dir: {e}"),
+    })?;
+
+    for filename in listing.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let remote_path = format!("{remote_issue_dir}/{filename}");
+        let local_path = local_out_dir.join(filename);
+        ssh::scp_from(conn, &remote_path, &local_path, MEDIUM_TIMEOUT)?;
+    }
+
+    let _ = ssh::run_remote(
+        conn,
+        &format!("rm -f '{remote_env}' && rm -rf '{remote_issue_dir}'"),
+        SHORT_TIMEOUT,
+    );
+
     Ok(())
 }
 
@@ -353,6 +470,12 @@ mod tests {
             AdapterError::KeyExclusionViolation { .. } => {}
             other => panic!("wrong error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_ssh_reachable_fn_exists() {
+        // Compilation test — function signature is valid.
+        let _: fn(&NodeConnection) -> Result<(), AdapterError> = check_ssh_reachable;
     }
 
     #[test]

@@ -4,17 +4,17 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-pub struct BootstrapHostsStage;
+pub struct FinalCleanupStage;
 
-impl OrchestrationStage for BootstrapHostsStage {
+impl OrchestrationStage for FinalCleanupStage {
     fn id(&self) -> StageId {
-        StageId::BootstrapHosts
+        StageId::Cleanup
     }
     fn name(&self) -> &str {
-        "bootstrap_hosts"
+        "cleanup"
     }
     fn dependencies(&self) -> &[StageId] {
-        &[StageId::CleanupHosts]
+        &[StageId::ExitHandoff]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
         &[]
@@ -24,20 +24,13 @@ impl OrchestrationStage for BootstrapHostsStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        let source = match ctx.source_archive.clone() {
-            Some(s) => s,
-            None => return StageOutcome::Failed("no source archive in context".to_string()),
-        };
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results: Vec<(String, Result<(), String>)> = aliases
             .iter()
             .map(|alias| {
                 let r = match ctx.adapters.get(alias.as_str()) {
-                    Some(adapter) => adapter
-                        .install_daemon(&source, ctx)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
-                    None => Err(format!("no adapter for '{alias}'")),
+                    Some(adapter) => adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
+                    None => Ok(()), // no adapter = nothing to clean
                 };
                 (alias.clone(), r)
             })
@@ -60,7 +53,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn no_source_archive_fails() {
+    fn empty_assignments_passes() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -75,9 +68,6 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
         };
-        assert!(matches!(
-            BootstrapHostsStage.execute(&mut ctx),
-            StageOutcome::Failed(_)
-        ));
+        assert_eq!(FinalCleanupStage.execute(&mut ctx), StageOutcome::Passed);
     }
 }

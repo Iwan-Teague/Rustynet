@@ -302,6 +302,14 @@ pub fn parse_status_node_id(status_text: &str) -> Option<String> {
     })
 }
 
+/// Parse any `key=<value>` field from a `rustynet status` space-separated output.
+pub fn parse_status_field(status_text: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    status_text
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(prefix.as_str()).map(|v| v.to_string()))
+}
+
 // ── Build remote path for a host+user combination ────────────────────────────
 
 pub fn remote_home(user: Option<&str>) -> &'static str {

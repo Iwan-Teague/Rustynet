@@ -80,4 +80,26 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     fn collect_artifacts(&self, dst: &Path) -> Result<(), AdapterError>;
 
     fn cleanup_runtime_state(&self) -> Result<(), AdapterError>;
+
+    // ── SSH reachability probe ────────────────────────────────────
+
+    fn check_ssh_reachable(&self) -> Result<(), AdapterError>;
+
+    // ── Endpoint identity ─────────────────────────────────────────
+
+    /// Return the WireGuard-reachable endpoint for this node: "host:51820".
+    fn endpoint(&self) -> String;
+
+    // ── Mesh IP collection ────────────────────────────────────────
+
+    fn collect_mesh_ip(&self) -> Result<String, AdapterError>;
+
+    // ── Bundle issuance (exit node only) ──────────────────────────
+
+    fn issue_bundles_to_dir(
+        &self,
+        kind: BundleKind,
+        env_content: &str,
+        local_out_dir: &Path,
+    ) -> Result<(), AdapterError>;
 }
