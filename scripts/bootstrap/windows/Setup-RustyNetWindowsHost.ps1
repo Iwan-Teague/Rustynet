@@ -83,25 +83,37 @@ else {
     Write-Step '-SkipDefenderExclusions set; not modifying Windows Defender preferences.'
 }
 
-# ── Step 2: WireGuard, Rustup, Git via winget configure ───────────────────
-$resolvedWingetConfig = if ($WingetConfigPath -and $WingetConfigPath.Trim().Length -gt 0) {
-    $WingetConfigPath
-}
-else {
-    Join-Path $PSScriptRoot 'RustyNetBootstrap.winget.yml'
-}
-if (-not (Test-Path -LiteralPath $resolvedWingetConfig)) {
-    throw ('winget config file not found: ' + $resolvedWingetConfig)
-}
-
+# ── Step 2: WireGuard, Rustup, Git, PowerShell 7 via direct winget install
+#
+# Direct `winget install` is preferred over `winget configure --file <yml>`
+# here because the latter depends on the Microsoft.Windows.Developer DSC
+# resource module. Lab images that don't have that PowerShell module
+# installed silently skip every package install ("assert failed or was
+# false") while reporting an unhelpful winget exit code. Iterating per
+# package is more robust and surfaces a precise error per failed package.
 if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
     throw 'winget.exe is not on PATH. Install Microsoft App Installer from the Store, or use a pre-baked Windows lab template.'
 }
 
-Write-Step ('winget configure --file ' + $resolvedWingetConfig)
-& winget configure --file $resolvedWingetConfig --accept-configuration-agreements --disable-interactivity
-if ($LASTEXITCODE -ne 0) {
-    throw ('winget configure failed (exit ' + [string]$LASTEXITCODE + '). See the winget log for details.')
+$packages = @(
+    @{ Id = 'Git.Git'; CheckPath = @('C:\Program Files\Git\cmd\git.exe', 'C:\Program Files (x86)\Git\cmd\git.exe') },
+    @{ Id = 'Rustlang.Rustup'; CheckPath = @((Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe')) },
+    @{ Id = 'WireGuard.WireGuard'; CheckPath = @('C:\Program Files\WireGuard\wireguard.exe', 'C:\Program Files (x86)\WireGuard\wireguard.exe') },
+    @{ Id = 'Microsoft.PowerShell'; CheckPath = @('C:\Program Files\PowerShell\7\pwsh.exe') }
+)
+foreach ($pkg in $packages) {
+    $present = $pkg.CheckPath | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if ($present) {
+        Write-Step ('skip ' + $pkg.Id + ' (already present at ' + $present + ')')
+        continue
+    }
+    Write-Step ('winget install ' + $pkg.Id)
+    & winget install --accept-package-agreements --accept-source-agreements `
+        --disable-interactivity -e --id $pkg.Id
+    # winget exit code 0 = success; -1978335189 = already installed; both OK.
+    if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+        throw ('winget install ' + $pkg.Id + ' failed (exit ' + [string]$LASTEXITCODE + '). See the winget log for details.')
+    }
 }
 
 # ── Step 3: VS Build Tools ─────────────────────────────────────────────────
