@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.rustynet.daemon.plist — reviewed launchd unit for the RustyNet daemon.
+
+  This is the reference plist. The actual deployed plist is written by
+  scripts/bootstrap/macos/Install-RustyNetMacosService.sh with node-specific
+  flags (--node-id, --node-role, etc.) filled in.
+
+  Reviewed hardening keys checked by macos_service_hardening.rs:
+    UserName        = rustynetd
+    GroupName       = rustynetd
+    RunAtLoad       = true
+    KeepAlive       = true
+    ProcessType     = Background
+    AbandonProcessGroup = false
+
+  Install to: /Library/LaunchDaemons/com.rustynet.daemon.plist
+  Owner/mode: root:wheel 0644
+  Load via:   launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist
+  Unload via: launchctl bootout system/com.rustynet.daemon
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+        <string>--state</string>
+        <string>/usr/local/var/rustynet/rustynetd.state</string>
+        <string>--wg-encrypted-private-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.key.enc</string>
+        <string>--wg-public-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
+        <string>--backend</string>
+        <string>macos-wireguard</string>
+    </array>
+
+    <!-- Reviewed hardening directives — do not weaken without updating
+         macos_service_hardening.rs and the security minimum bar. -->
+    <key>UserName</key>
+    <string>rustynetd</string>
+
+    <key>GroupName</key>
+    <string>rustynetd</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>AbandonProcessGroup</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/rustynet/rustynetd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/rustynet/rustynetd-error.log</string>
+</dict>
+</plist>

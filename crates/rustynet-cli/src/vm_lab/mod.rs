@@ -5730,6 +5730,33 @@ impl DaemonProbe for WindowsDaemonProbe {
     }
 }
 
+pub struct MacosDaemonProbe;
+
+impl DaemonProbe for MacosDaemonProbe {
+    fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String> {
+        let daemon = daemon_path.to_string_lossy().into_owned();
+        if daemon.is_empty() {
+            return Err("daemon_path must not be empty".to_string());
+        }
+        let subcommand = match op {
+            DaemonProbeOp::RuntimeAcls => "macos-runtime-acls-check",
+            DaemonProbeOp::ServiceHardening => "macos-service-hardening-check",
+            DaemonProbeOp::KeyCustody => "macos-key-custody-check",
+            DaemonProbeOp::Authenticode => "macos-authenticode-check",
+            DaemonProbeOp::MeshStatus => "macos-mesh-status-check",
+            DaemonProbeOp::DnsFailclosed => "macos-dns-failclosed-check",
+        };
+        Ok(vec![
+            daemon,
+            subcommand.to_string(),
+            "--no-fail-on-drift".to_string(),
+        ])
+    }
+    fn platform_label(&self) -> &'static str {
+        "macos"
+    }
+}
+
 pub struct UnsupportedDaemonProbe {
     platform_label: &'static str,
 }
@@ -5773,7 +5800,7 @@ fn daemon_probe_for(platform: VmGuestPlatform) -> Box<dyn DaemonProbe> {
     match platform {
         VmGuestPlatform::Linux => Box::new(LinuxDaemonProbe),
         VmGuestPlatform::Windows => Box::new(WindowsDaemonProbe),
-        VmGuestPlatform::Macos => Box::new(UnsupportedDaemonProbe::macos()),
+        VmGuestPlatform::Macos => Box::new(MacosDaemonProbe),
         VmGuestPlatform::Ios => Box::new(UnsupportedDaemonProbe::ios()),
         VmGuestPlatform::Android => Box::new(UnsupportedDaemonProbe::android()),
     }

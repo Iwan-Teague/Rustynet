@@ -31,6 +31,14 @@ use rustynetd::linux_key_custody::collect_linux_key_custody_report;
 use rustynetd::linux_mesh_status::{LinuxMeshStatusOptions, collect_linux_mesh_status_report};
 use rustynetd::linux_runtime_acls::collect_linux_runtime_acl_report;
 use rustynetd::linux_service_hardening::collect_linux_service_hardening_report;
+use rustynetd::macos_authenticode::collect_macos_authenticode_report;
+use rustynetd::macos_dns_failclosed::{
+    build_macos_dns_failclosed_report, collect_macos_dns_failclosed_snapshot,
+};
+use rustynetd::macos_key_custody::collect_macos_key_custody_report;
+use rustynetd::macos_mesh_status::{MacosMeshStatusOptions, collect_macos_mesh_status_report};
+use rustynetd::macos_runtime_acls::collect_macos_runtime_acl_report;
+use rustynetd::macos_service_hardening::collect_macos_service_hardening_report;
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
@@ -137,6 +145,24 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "linux-dns-failclosed-check" => {
                 run_linux_dns_failclosed_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "macos-runtime-acls-check" => {
+                run_macos_runtime_acls_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "macos-service-hardening-check" => {
+                run_macos_service_hardening_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "macos-key-custody-check" => {
+                run_macos_key_custody_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "macos-authenticode-check" => {
+                run_macos_authenticode_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "macos-mesh-status-check" => {
+                run_macos_mesh_status_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "macos-dns-failclosed-check" => {
+                run_macos_dns_failclosed_check_command(rest)
             }
             _ => Err(help_text()),
         },
@@ -680,6 +706,224 @@ fn run_linux_runtime_acls_check_command(args: &[String]) -> Result<(), String> {
     if fail_on_drift && !report.overall_ok {
         return Err(
             "linux-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_macos_runtime_acls_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!("unknown macos-runtime-acls-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let report = collect_macos_runtime_acl_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize macos runtime-acls report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "macos-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_macos_service_hardening_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown macos-service-hardening-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_macos_service_hardening_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize macos service-hardening report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "macos-service-hardening-check reported drift in the live RustyNet service hardening posture"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_macos_key_custody_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!("unknown macos-key-custody-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let report = collect_macos_key_custody_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize macos key-custody report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "macos-key-custody-check reported drift in the live RustyNet key custody state"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_macos_authenticode_check_command(args: &[String]) -> Result<(), String> {
+    // Gatekeeper operates at launch time; runtime binary attestation is not
+    // applicable on macOS. `--no-fail-on-drift` is accepted for argv parity;
+    // the verifier always emits `applicable=false, overall_ok=true`.
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => index += 1,
+            Some(flag) => {
+                return Err(format!("unknown macos-authenticode-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let report = collect_macos_authenticode_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize macos authenticode report failed: {err}"))?
+    );
+    Ok(())
+}
+
+fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut state_path: Option<std::path::PathBuf> = None;
+    let mut expected_peer_ids: Vec<String> = Vec::new();
+    let mut max_age_seconds: Option<i64> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--state-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--state-path requires a value".to_string())?;
+                state_path = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            Some("--expected-peer-id") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--expected-peer-id requires a value".to_string())?;
+                expected_peer_ids.push(value.clone());
+                index += 2;
+            }
+            Some("--max-age-seconds") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--max-age-seconds requires a value".to_string())?;
+                let parsed: i64 = value
+                    .parse()
+                    .map_err(|err| format!("invalid --max-age-seconds value: {err}"))?;
+                if parsed < 0 {
+                    return Err("--max-age-seconds must be non-negative".to_string());
+                }
+                max_age_seconds = Some(parsed);
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!("unknown macos-mesh-status-check argument: {flag}"));
+            }
+            None => break,
+        }
+    }
+    let options = MacosMeshStatusOptions {
+        state_path,
+        expected_peer_ids,
+        max_age_seconds,
+    };
+    let report = collect_macos_mesh_status_report(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize macos mesh-status report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(format!(
+            "macos-mesh-status-check failed for {}: {}",
+            report.state_path,
+            if report.drift_reasons.is_empty() {
+                "no drift_reasons recorded".to_string()
+            } else {
+                report.drift_reasons.join("; ")
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn run_macos_dns_failclosed_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown macos-dns-failclosed-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let snapshot = collect_macos_dns_failclosed_snapshot();
+    let report = build_macos_dns_failclosed_report(snapshot);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize macos dns-failclosed report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "macos-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed posture"
                 .to_string(),
         );
     }

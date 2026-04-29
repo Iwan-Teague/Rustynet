@@ -55,7 +55,7 @@ pub fn node_adapter_for(
             conn,
             remote_workdir,
         ))),
-        VmGuestPlatform::Macos => Ok(Box::new(MacosNodeAdapter::new(alias, conn))),
+        VmGuestPlatform::Macos => Ok(Box::new(MacosNodeAdapter::new(alias, conn, remote_workdir))),
         VmGuestPlatform::Ios => Err(AdapterError::UnsupportedPlatform {
             platform,
             message: IOS_UNSUPPORTED_MSG.to_string(),
