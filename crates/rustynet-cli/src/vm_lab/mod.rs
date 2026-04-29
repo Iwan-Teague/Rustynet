@@ -6157,13 +6157,18 @@ fn execute_rust_native_orchestration(
             )
         })?;
 
-        let adapter =
-            node_adapter_for(assignment.alias.clone(), platform, conn).map_err(|err| {
-                format!(
-                    "create adapter for alias '{}' (platform {platform:?}): {err}",
-                    assignment.alias
-                )
-            })?;
+        let adapter = node_adapter_for(
+            assignment.alias.clone(),
+            platform,
+            conn,
+            entry.rustynet_src_dir.clone(),
+        )
+        .map_err(|err| {
+            format!(
+                "create adapter for alias '{}' (platform {platform:?}): {err}",
+                assignment.alias
+            )
+        })?;
 
         ctx.adapters.insert(assignment.alias.clone(), adapter);
     }

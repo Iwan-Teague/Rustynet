@@ -5,14 +5,14 @@ Owner: AI implementation agent (per `CLAUDE.md`)
 Supersedes the bash orchestrator's monopoly on the live-lab install path.
 Sister doc: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W1-W4 deliverables this plan builds on top of).
 
-> **Status: W5.1 COMPLETE — LinuxNodeAdapter + --node opt-in merged (2026-04-29).**
+> **Status: W5.2 COMPLETE — WindowsNodeAdapter merged (2026-04-29).**
 > Each W5.x slice listed below is a future commit. Mark `[x]` as each
 > ships with a commit SHA, evidence pointers, and residual-risk notes
 > following the existing W3.2-followup-N entry pattern.
 >
 > - [x] W5.0 — Foundation (traits, stubs, 26 unit tests). All gates green.
 > - [x] W5.1 — LinuxNodeAdapter + --node flag opt-in. Commit `8c255c8`. Gates: fmt ✓ clippy ✓ 92 test suites ✓ audit ✓ deny ✓. Security invariants: shell_safe_arg, validate_ip_arg, key-exclusion (collect_artifacts). rn_bootstrap.sh extracted + embedded via include_str!(). execute_rust_native_orchestration routes --node traffic to NodeAdapter pipeline.
-> - [ ] W5.2 — WindowsNodeAdapter
+> - [x] W5.2 — WindowsNodeAdapter. Gates: fmt ✓ clippy ✓ tests ✓ audit ✓ deny ✓. Files: windows_install.rs (PS encoding, install lifecycle, 3 embedded scripts), windows_traffic.rs (WG key, node_id, ping/probe, tunnels, artifacts, key-exclusion zip verify), windows_membership.rs (distribute_signed_bundle staging+atomic-move; issue_membership_owner_key / init_membership_snapshot blocked until W5.4 with UnsupportedPlatform), windows.rs (full delegation, workdir field, run_validator via WindowsDaemonProbe). factory.rs gains remote_workdir param; execute_rust_native_orchestration passes rustynet_src_dir. Security invariants: ps_quote NUL/CR/LF rejection, validate_ip_arg, key-exclusion (verify_no_key_material_zip), membership-owner blocked via UnsupportedPlatform. Commit TBD.
 > - [ ] W5.3 — MacosNodeAdapter
 > - [ ] W5.4 — Windows/macOS as exit (membership-owner cross-OS)
 > - [ ] W5.5 — 17 stage implementations + parity run

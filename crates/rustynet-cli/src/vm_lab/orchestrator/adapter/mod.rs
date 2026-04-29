@@ -10,3 +10,6 @@ pub mod macos;
 pub mod node_adapter;
 pub mod ssh;
 pub mod windows;
+pub mod windows_install;
+pub mod windows_membership;
+pub mod windows_traffic;

@@ -24,6 +24,8 @@ an app-layer management channel reviewed against security minimum bar.";
 
 /// Build a `NodeAdapter` for the given platform using `conn` as its transport.
 /// `alias` must match the `NodeRoleAssignment::alias` for this node.
+/// `remote_workdir` is the path to the RustyNet source tree on the remote host;
+/// required for Windows `install_daemon`, populated from inventory `rustynet_src_dir`.
 ///
 /// Error precedence:
 /// 1. `ConnectionPlatformMismatch` if connection type is wrong for platform
@@ -34,6 +36,7 @@ pub fn node_adapter_for(
     alias: impl Into<String>,
     platform: VmGuestPlatform,
     conn: NodeConnection,
+    remote_workdir: Option<String>,
 ) -> Result<Box<dyn NodeAdapter>, AdapterError> {
     let alias = alias.into();
     // Connection-type check comes first so Ssh+iOS → ConnectionPlatformMismatch,
@@ -47,7 +50,11 @@ pub fn node_adapter_for(
 
     match platform {
         VmGuestPlatform::Linux => Ok(Box::new(LinuxNodeAdapter::new(alias, conn))),
-        VmGuestPlatform::Windows => Ok(Box::new(WindowsNodeAdapter::new(alias, conn))),
+        VmGuestPlatform::Windows => Ok(Box::new(WindowsNodeAdapter::new(
+            alias,
+            conn,
+            remote_workdir,
+        ))),
         VmGuestPlatform::Macos => Ok(Box::new(MacosNodeAdapter::new(alias, conn))),
         VmGuestPlatform::Ios => Err(AdapterError::UnsupportedPlatform {
             platform,
@@ -82,8 +89,13 @@ mod tests {
     fn factory_linux_returns_linux_adapter() {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "# kh").unwrap();
-        let adapter =
-            node_adapter_for("exit", VmGuestPlatform::Linux, make_ssh_conn_with_file(&f)).unwrap();
+        let adapter = node_adapter_for(
+            "exit",
+            VmGuestPlatform::Linux,
+            make_ssh_conn_with_file(&f),
+            None,
+        )
+        .unwrap();
         assert_eq!(adapter.platform(), VmGuestPlatform::Linux);
         assert_eq!(adapter.alias(), "exit");
     }
@@ -96,6 +108,7 @@ mod tests {
             "win-node",
             VmGuestPlatform::Windows,
             make_ssh_conn_with_file(&f),
+            None,
         )
         .unwrap();
         assert_eq!(adapter.platform(), VmGuestPlatform::Windows);
@@ -110,6 +123,7 @@ mod tests {
             "mac-node",
             VmGuestPlatform::Macos,
             make_ssh_conn_with_file(&f),
+            None,
         )
         .unwrap();
         assert_eq!(adapter.platform(), VmGuestPlatform::Macos);
@@ -120,7 +134,7 @@ mod tests {
         let conn = NodeConnection::Mdm {
             enrollment_id: "enroll-123".to_string(),
         };
-        let err = node_adapter_for("ios-node", VmGuestPlatform::Ios, conn).unwrap_err();
+        let err = node_adapter_for("ios-node", VmGuestPlatform::Ios, conn, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("security minimum bar"),
@@ -138,7 +152,8 @@ mod tests {
         let conn = NodeConnection::Adb {
             device_serial: "abc123".to_string(),
         };
-        let err = node_adapter_for("android-node", VmGuestPlatform::Android, conn).unwrap_err();
+        let err =
+            node_adapter_for("android-node", VmGuestPlatform::Android, conn, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("security minimum bar"),
@@ -156,7 +171,7 @@ mod tests {
         let conn = NodeConnection::Adb {
             device_serial: "abc123".to_string(),
         };
-        let err = node_adapter_for("node", VmGuestPlatform::Linux, conn).unwrap_err();
+        let err = node_adapter_for("node", VmGuestPlatform::Linux, conn, None).unwrap_err();
         assert!(
             matches!(err, AdapterError::ConnectionPlatformMismatch { .. }),
             "expected ConnectionPlatformMismatch, got: {:?}",
@@ -169,7 +184,7 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "# kh").unwrap();
         let conn = make_ssh_conn_with_file(&f);
-        let err = node_adapter_for("node", VmGuestPlatform::Ios, conn).unwrap_err();
+        let err = node_adapter_for("node", VmGuestPlatform::Ios, conn, None).unwrap_err();
         assert!(
             matches!(err, AdapterError::ConnectionPlatformMismatch { .. }),
             "expected ConnectionPlatformMismatch, got: {:?}",
