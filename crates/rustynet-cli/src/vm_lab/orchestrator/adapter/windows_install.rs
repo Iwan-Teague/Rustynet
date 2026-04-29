@@ -98,16 +98,18 @@ pub fn run_remote_ps_check(
 
 // ── Install lifecycle ─────────────────────────────────────────────────────────
 
-/// Bootstrap the daemon on a Windows host that already has the source tree
-/// checked out at `workdir`. Runs:
-///   Bootstrap-RustyNetWindows.ps1 -Phase build-release
-///   Install-RustyNetWindowsService.ps1 -ServiceName RustyNet …
-///   Restart-Service RustyNet (via SCM)
-/// Returns `InstallReport` on success.
-pub fn install_daemon(conn: &NodeConnection, workdir: &str) -> Result<InstallReport, AdapterError> {
+/// Bootstrap the daemon on a Windows host. Extracts `source` into `workdir`
+/// via tar.exe, then runs Bootstrap-RustyNetWindows.ps1 -Phase build-release,
+/// Install-RustyNetWindowsService.ps1, and starts the service.
+pub fn install_daemon(
+    conn: &NodeConnection,
+    workdir: &str,
+    source: &crate::vm_lab::orchestrator::source_archive::SourceArchive,
+) -> Result<InstallReport, AdapterError> {
     validate_windows_path(workdir)?;
 
     let staging_dir = WINDOWS_STAGING_DIR;
+    let remote_archive = format!(r"{staging_dir}\rn_source.tar.gz");
 
     // SCP bootstrap helpers to staging dir.
     let bootstrap_tmp = write_temp_file(
@@ -143,11 +145,31 @@ pub fn install_daemon(conn: &NodeConnection, workdir: &str) -> Result<InstallRep
         &remote_install_svc.replace('\\', "/"),
         SHORT_TIMEOUT,
     )?;
+    // SCP the source archive.
+    ssh::scp_to(
+        conn,
+        source.path(),
+        &remote_archive.replace('\\', "/"),
+        Duration::from_secs(120),
+    )?;
 
     let _ = std::fs::remove_file(&bootstrap_tmp);
     let _ = std::fs::remove_file(&install_tmp);
 
-    // Build release from existing workdir.
+    // Extract source archive into workdir, overwriting existing files.
+    // Uses Windows built-in tar.exe (available since Windows 10 1803).
+    // git archive produces files at the archive root (no leading dir component).
+    let extract_script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         New-Item -ItemType Directory -Force -Path {workdir_q} | Out-Null; \
+         & tar.exe -xzf {archive_q} -C {workdir_q}",
+        workdir_q = ps_quote(workdir)?,
+        archive_q = ps_quote(&remote_archive)?,
+    );
+    run_remote_ps(conn, &extract_script, Duration::from_secs(120))?;
+
+    // Build release from synced workdir.
     let build_script = format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
