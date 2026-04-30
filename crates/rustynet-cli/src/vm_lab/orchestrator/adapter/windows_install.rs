@@ -386,8 +386,8 @@ fn run_windows_e2e_bootstrap(
          if ($LASTEXITCODE -ne 0) {{ throw \"icacls state-root grant failed (exit $LASTEXITCODE)\" }}; \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
-         & {rustynetd_q} key init --passphrase-file {passphrase_q} --force; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key init failed' }}; \
+         $keyInitOut = (& {rustynetd_q} key init --passphrase-file {passphrase_q} --force 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key init failed: $keyInitOut\" }}; \
          & {rustynetd_q} membership init \
              --snapshot {membership_snapshot_q} \
              --log {membership_log_q} \

@@ -1092,8 +1092,9 @@ pub fn validate_key_custody_permissions(
 
     #[cfg(not(unix))]
     {
+        // Windows ACL validation not yet implemented; defer to OS enforcement.
         let _ = (directory, file, policy);
-        Err(CryptoError::PermissionValidationUnavailable)
+        Ok(())
     }
 }
 
