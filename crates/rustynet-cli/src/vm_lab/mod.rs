@@ -7251,7 +7251,9 @@ fn run_windows_orchestration_stages_with_options(
                         None => "pub".to_string(),
                     },
                 );
-                let automation_public_key = std::fs::read_to_string(&pub_key_path).ok();
+                let automation_public_key = std::fs::read_to_string(&pub_key_path)
+                    .ok()
+                    .map(|s| s.trim().to_string());
                 bootstrap_windows_access_for_target(
                     &target,
                     None,
