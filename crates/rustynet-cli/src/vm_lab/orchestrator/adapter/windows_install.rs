@@ -403,7 +403,12 @@ fn run_windows_e2e_bootstrap(
          $kspOut = (& {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q} 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key store-passphrase failed: $kspOut\" }}; \
          Start-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
-         Start-Sleep -Seconds 5",
+         Start-Sleep -Seconds 8; \
+         $svcStatus = (Get-Service -Name {svc_q} -ErrorAction SilentlyContinue).Status; \
+         if ($svcStatus -ne 'Running') {{ \
+             $evtSrc = try {{ (Get-EventLog -LogName Application -Source 'RustyNet' -Newest 3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Message) -join ' | ' }} catch {{ 'no event log' }}; \
+             throw \"Service failed to reach Running state (status=$svcStatus): $evtSrc\" \
+         }}",
     );
     run_remote_ps(conn, &bootstrap_script, Duration::from_secs(120))?;
     Ok(())
