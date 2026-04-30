@@ -45,7 +45,10 @@ const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
 const IP_BINARY_PATH_ENV: &str = "RUSTYNET_IP_BINARY_PATH";
 #[cfg(target_os = "macos")]
 const IFCONFIG_BINARY_PATH_ENV: &str = "RUSTYNET_IFCONFIG_BINARY_PATH";
+#[cfg(not(windows))]
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
+#[cfg(windows)]
+const DEFAULT_WG_BINARY_PATH: &str = r"C:\Program Files\WireGuard\wg.exe";
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 #[cfg(target_os = "macos")]
@@ -200,7 +203,12 @@ fn store_windows_dpapi_passphrase_blob(path: &Path, plaintext: &[u8]) -> Result<
 
     let mut protected = dpapi_protect(
         plaintext,
-        WindowsDpapiScope::CurrentUser,
+        // LocalMachine scope allows the service account (NT SERVICE\RustyNet) to
+        // decrypt a passphrase blob provisioned by the Administrator bootstrap
+        // session via SSH. NTFS ACLs on C:\ProgramData\RustyNet\secrets\ restrict
+        // which local identities can read the file at all; DPAPI provides an
+        // additional layer that ties the blob to this machine.
+        WindowsDpapiScope::LocalMachine,
         WINDOWS_DPAPI_PASSPHRASE_DESCRIPTION,
     )
     .map_err(|err| format!("protect Windows DPAPI passphrase blob failed: {err}"))?;

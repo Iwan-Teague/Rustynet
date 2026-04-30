@@ -5,7 +5,9 @@ use base64::prelude::*;
 
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
+use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
+use crate::vm_lab::orchestrator::role::NodeRole;
 
 pub const WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
@@ -21,6 +23,24 @@ pub const WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.owner.key.pub";
 pub const WINDOWS_MEMBERSHIP_SNAPSHOT_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.snapshot";
+
+// Paths written by the e2e bootstrap sequence.
+const WINDOWS_WG_PASSPHRASE_PATH: &str =
+    r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi";
+const WINDOWS_MEMBERSHIP_LOG_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.log";
+const WINDOWS_MEMBERSHIP_WATERMARK_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.watermark";
+const WINDOWS_MEMBERSHIP_OWNER_KEY_PATH: &str =
+    r"C:\ProgramData\RustyNet\membership\membership.owner.key";
+const WINDOWS_TRUST_SIGNING_KEY_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\trust-evidence.key";
+const WINDOWS_TRUST_VERIFIER_KEY_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\trust-evidence.pub";
+const WINDOWS_TRUST_EVIDENCE_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\rustynetd.trust";
+const WINDOWS_WG_BINARY_PATH: &str =
+    r"C:\Program Files\WireGuard\wg.exe";
 
 static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1");
@@ -100,11 +120,14 @@ pub fn run_remote_ps_check(
 
 /// Bootstrap the daemon on a Windows host. Extracts `source` into `workdir`
 /// via tar.exe, then runs Bootstrap-RustyNetWindows.ps1 -Phase build-release,
-/// Install-RustyNetWindowsService.ps1, and starts the service.
+/// Install-RustyNetWindowsService.ps1, and runs the e2e bootstrap sequence to
+/// generate WireGuard keys, membership state, and trust evidence.
 pub fn install_daemon(
     conn: &NodeConnection,
+    alias: &str,
     workdir: &str,
     source: &crate::vm_lab::orchestrator::source_archive::SourceArchive,
+    ctx: &OrchestrationContext,
 ) -> Result<InstallReport, AdapterError> {
     validate_windows_path(workdir)?;
 
@@ -197,15 +220,18 @@ pub fn install_daemon(
     );
     run_remote_ps(conn, &install_script, Duration::from_secs(120))?;
 
-    // Start the service.
-    start_daemon(conn)?;
-
-    // Verify the binary is present.
+    // Verify the binary is present before running e2e bootstrap.
     let verify_script = format!(
-        "if (-not (Test-Path -LiteralPath {})) {{ throw 'rustynetd.exe not found' }}",
-        ps_quote(WINDOWS_RUSTYNETD_PATH)?
+        "if (-not (Test-Path -LiteralPath {})) {{ throw 'rustynetd.exe not found' }}; \
+         if (-not (Test-Path -LiteralPath {})) {{ throw 'rustynet.exe not found' }}",
+        ps_quote(WINDOWS_RUSTYNETD_PATH)?,
+        ps_quote(WINDOWS_RUSTYNET_PATH)?,
     );
     run_remote_ps(conn, &verify_script, SHORT_TIMEOUT)?;
+
+    // Run the e2e bootstrap sequence to generate WireGuard keys, membership
+    // state, and trust evidence. The service starts AFTER bootstrap completes.
+    run_windows_e2e_bootstrap(conn, alias, ctx)?;
 
     Ok(InstallReport {
         daemon_path: WINDOWS_RUSTYNETD_PATH.into(),
@@ -269,6 +295,89 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
         state_root_q = ps_quote(WINDOWS_STATE_ROOT)?,
     );
     run_remote_ps(conn, &script, Duration::from_secs(60))?;
+    Ok(())
+}
+
+// ── Windows e2e bootstrap ─────────────────────────────────────────────────────
+
+/// Generate WireGuard keys, membership state, and trust evidence on the Windows
+/// host. Mirrors the Linux `rustynet ops e2e-bootstrap-host` flow.
+/// Called from `install_daemon` after the service binaries are installed.
+fn run_windows_e2e_bootstrap(
+    conn: &NodeConnection,
+    alias: &str,
+    ctx: &OrchestrationContext,
+) -> Result<(), AdapterError> {
+    let node_id = ctx
+        .node_ids
+        .get(alias)
+        .cloned()
+        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+    let network_id = &ctx.network_id;
+    let role_str = match ctx
+        .assignments
+        .iter()
+        .find(|a| a.alias == alias)
+        .map(|a| &a.role)
+    {
+        Some(NodeRole::Exit) => "admin",
+        _ => "client",
+    };
+
+    let passphrase_q = ps_quote(WINDOWS_WG_PASSPHRASE_PATH)?;
+    let rustynetd_q = ps_quote(WINDOWS_RUSTYNETD_PATH)?;
+    let rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?;
+    let wg_binary_q = ps_quote(WINDOWS_WG_BINARY_PATH)?;
+    let trust_signing_key_q = ps_quote(WINDOWS_TRUST_SIGNING_KEY_PATH)?;
+    let trust_verifier_key_q = ps_quote(WINDOWS_TRUST_VERIFIER_KEY_PATH)?;
+    let trust_evidence_q = ps_quote(WINDOWS_TRUST_EVIDENCE_PATH)?;
+    let node_id_q = ps_quote(&node_id)?;
+    let network_id_q = ps_quote(network_id)?;
+    let membership_owner_key_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_KEY_PATH)?;
+    let membership_log_q = ps_quote(WINDOWS_MEMBERSHIP_LOG_PATH)?;
+    let membership_watermark_q = ps_quote(WINDOWS_MEMBERSHIP_WATERMARK_PATH)?;
+    let membership_snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?;
+    let svc_q = ps_quote(WINDOWS_SERVICE_NAME)?;
+    let _ = role_str; // used implicitly via node_id/network_id in membership init
+
+    let bootstrap_script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $env:RUSTYNET_WG_BINARY_PATH = {wg_binary_q}; \
+         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create(); \
+         $bytes = New-Object byte[] 48; \
+         $rng.GetBytes($bytes); \
+         $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
+         [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
+         & {rustynetd_q} key init --passphrase-file {passphrase_q} --force; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key init failed' }}; \
+         & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q}; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key store-passphrase failed' }}; \
+         & {rustynetd_q} membership init \
+             --snapshot {membership_snapshot_q} \
+             --log {membership_log_q} \
+             --watermark {membership_watermark_q} \
+             --owner-signing-key {membership_owner_key_q} \
+             --owner-signing-key-passphrase-file {passphrase_q} \
+             --node-id {node_id_q} \
+             --network-id {network_id_q} \
+             --force; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd membership init failed' }}; \
+         & {rustynet_q} trust keygen \
+             --signing-key-output {trust_signing_key_q} \
+             --signing-key-passphrase-file {passphrase_q} \
+             --verifier-key-output {trust_verifier_key_q} \
+             --force; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'rustynet trust keygen failed' }}; \
+         & {rustynet_q} trust issue \
+             --signing-key {trust_signing_key_q} \
+             --signing-key-passphrase-file {passphrase_q} \
+             --output {trust_evidence_q}; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'rustynet trust issue failed' }}; \
+         Start-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
+         Start-Sleep -Seconds 5",
+    );
+    run_remote_ps(conn, &bootstrap_script, Duration::from_secs(120))?;
     Ok(())
 }
 

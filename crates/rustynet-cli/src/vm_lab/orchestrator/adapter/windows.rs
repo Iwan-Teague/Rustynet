@@ -55,7 +55,7 @@ impl NodeAdapter for WindowsNodeAdapter {
     fn install_daemon(
         &self,
         source: &SourceArchive,
-        _ctx: &OrchestrationContext,
+        ctx: &OrchestrationContext,
     ) -> Result<InstallReport, AdapterError> {
         let workdir = self
             .workdir
@@ -67,7 +67,7 @@ impl NodeAdapter for WindowsNodeAdapter {
                     self.alias
                 ),
             })?;
-        windows_install::install_daemon(&self.conn, workdir, source)
+        windows_install::install_daemon(&self.conn, &self.alias, workdir, source, ctx)
     }
 
     fn start_daemon(&self) -> Result<(), AdapterError> {
