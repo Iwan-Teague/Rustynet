@@ -438,7 +438,21 @@ function Build-ReviewedDaemonArgsJson {
     # cannot complete on a fresh node.  The mesh-join phases later
     # distribute and validate the assignment; this flag does NOT
     # bypass that — it only defers the startup gate to runtime.
-    return (@('--backend', $BackendLabel, '--auto-tunnel-enforce', 'false') | ConvertTo-Json -Compress)
+    #
+    # --trust-max-age-secs 86400: the trust evidence file is generated
+    # by the access bootstrap phase and may be hours old by the time
+    # install-release runs in a phase-by-phase walkthrough.  The
+    # daemon's default DEFAULT_TRUST_MAX_AGE_SECS is 300 (5 min) which
+    # is correct for production but rejects lab evidence with
+    # "trust evidence is stale".  Mesh-join phases regenerate trust
+    # evidence with a fresh signature; this lab-image flag widens the
+    # window so the per-node service-host bring-up does not fail
+    # closed in between.
+    return (@(
+        '--backend', $BackendLabel,
+        '--auto-tunnel-enforce', 'false',
+        '--trust-max-age-secs', '86400'
+    ) | ConvertTo-Json -Compress)
 }
 
 function Write-ReviewedEnvFile {
