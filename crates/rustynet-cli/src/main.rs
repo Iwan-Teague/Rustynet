@@ -12593,7 +12593,7 @@ fn execute_tunnel_info() -> Result<String, String> {
     output.push(format!("  interface: {}", DEFAULT_WG_INTERFACE));
     output.push("  listen port: 51820".to_string());
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         if let Ok(wg_output) = Command::new("wg")
             .args(["show", DEFAULT_WG_INTERFACE])
@@ -12606,9 +12606,34 @@ fn execute_tunnel_info() -> Result<String, String> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "macos")]
     {
-        output.push("  (WireGuard info available on Unix)".to_string());
+        if let Ok(wg_output) = Command::new("wg")
+            .args(["show", DEFAULT_WG_INTERFACE])
+            .output()
+            && let Ok(wg_str) = String::from_utf8(wg_output.stdout)
+        {
+            for line in wg_str.lines().take(10) {
+                output.push(format!("  {}", line));
+            }
+        } else {
+            output.push("  (WireGuard tools not found)".to_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(wg_output) = Command::new("wg")
+            .args(["show", DEFAULT_WG_INTERFACE])
+            .output()
+            && let Ok(wg_str) = String::from_utf8(wg_output.stdout)
+        {
+            for line in wg_str.lines().take(10) {
+                output.push(format!("  {}", line));
+            }
+        } else {
+            output.push("  (WireGuard tools not found on PATH)".to_string());
+        }
     }
 
     Ok(output.join("\n"))
@@ -12673,7 +12698,7 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
 fn execute_connectivity_test() -> Result<String, String> {
     let mut output = vec!["connectivity test:".to_string()];
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         output.push("  DNS resolution:".to_string());
         if let Ok(resolve) = Command::new("nslookup")
@@ -12713,9 +12738,74 @@ fn execute_connectivity_test() -> Result<String, String> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "macos")]
     {
-        output.push("  (connectivity-test available on Unix)".to_string());
+        output.push("  DNS resolution:".to_string());
+        if let Ok(resolve) = Command::new("nslookup").arg("rustynet.dev").output() {
+            if resolve.status.success() {
+                output.push("    ✓ DNS working".to_string());
+            } else {
+                output.push("    ✗ DNS failed".to_string());
+            }
+        } else {
+            output.push("    ? DNS test unavailable".to_string());
+        }
+
+        output.push("  Tunnel status:".to_string());
+        if let Ok(wg_out) = Command::new("wg")
+            .args(["show", DEFAULT_WG_INTERFACE])
+            .output()
+            && wg_out.status.success()
+        {
+            output.push("    ✓ Tunnel active".to_string());
+        } else {
+            output.push("    ✗ Tunnel not active".to_string());
+        }
+
+        output.push("  Exit node reachability:".to_string());
+        if let Ok(ping_out) = Command::new("ping").args(["-c", "1", "8.8.8.8"]).output()
+            && ping_out.status.success()
+        {
+            output.push("    ✓ Exit node reachable".to_string());
+        } else {
+            output.push("    ✗ Exit node unreachable".to_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        output.push("  DNS resolution:".to_string());
+        if let Ok(resolve) = Command::new("nslookup").arg("rustynet.dev").output() {
+            if resolve.status.success() {
+                output.push("    ✓ DNS working".to_string());
+            } else {
+                output.push("    ✗ DNS failed".to_string());
+            }
+        } else {
+            output.push("    ? DNS test unavailable".to_string());
+        }
+
+        output.push("  Tunnel status:".to_string());
+        if let Ok(wg_out) = Command::new("wg")
+            .args(["show", DEFAULT_WG_INTERFACE])
+            .output()
+            && wg_out.status.success()
+        {
+            output.push("    ✓ Tunnel active".to_string());
+        } else {
+            output.push("    ✗ Tunnel not active".to_string());
+        }
+
+        output.push("  Exit node reachability:".to_string());
+        if let Ok(ping_out) = Command::new("ping")
+            .args(["-n", "1", "-w", "2000", "8.8.8.8"])
+            .output()
+            && ping_out.status.success()
+        {
+            output.push("    ✓ Exit node reachable".to_string());
+        } else {
+            output.push("    ✗ Exit node unreachable".to_string());
+        }
     }
 
     Ok(output.join("\n"))
@@ -12797,7 +12887,7 @@ fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
 
     let domain_to_test = domain.as_deref().unwrap_or("example.com");
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         output.push(format!("  resolving: {}", domain_to_test));
 
@@ -12821,9 +12911,52 @@ fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(target_os = "macos")]
     {
-        output.push(format!("  (dns-test available on Unix)"));
+        output.push(format!("  resolving: {}", domain_to_test));
+
+        let start = std::time::Instant::now();
+        if let Ok(dig_out) = Command::new("dig")
+            .arg(domain_to_test)
+            .arg("+short")
+            .output()
+        {
+            let elapsed = start.elapsed().as_millis();
+            if dig_out.status.success() {
+                if let Ok(result_str) = String::from_utf8(dig_out.stdout) {
+                    let result = result_str.lines().next().unwrap_or("(no answer)");
+                    output.push(format!("  result:   {}", result));
+                    output.push(format!("  latency:  {}ms", elapsed));
+                    output.push("  status:   ✓ resolved through tunnel".to_string());
+                }
+            } else {
+                output.push("  status:   ✗ resolution failed".to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        output.push(format!("  resolving: {}", domain_to_test));
+
+        let start = std::time::Instant::now();
+        if let Ok(nslookup_out) = Command::new("nslookup").arg(domain_to_test).output() {
+            let elapsed = start.elapsed().as_millis();
+            if nslookup_out.status.success() {
+                if let Ok(result_str) = String::from_utf8(nslookup_out.stdout) {
+                    let result = result_str
+                        .lines()
+                        .find(|line| line.contains("Address:") && !line.contains("127.0.0.1"))
+                        .and_then(|line| line.split_whitespace().last())
+                        .unwrap_or("(no answer)");
+                    output.push(format!("  result:   {}", result));
+                    output.push(format!("  latency:  {}ms", elapsed));
+                    output.push("  status:   ✓ resolved through tunnel".to_string());
+                }
+            } else {
+                output.push("  status:   ✗ resolution failed".to_string());
+            }
+        }
     }
 
     Ok(output.join("\n"))
