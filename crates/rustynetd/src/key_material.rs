@@ -167,7 +167,11 @@ fn parse_passphrase_bytes(
 fn read_windows_runtime_passphrase_source(path: &Path) -> Result<Zeroizing<String>, String> {
     validate_windows_secret_blob_path(path, "passphrase file")?;
     validate_secret_file_security(path, "passphrase file", false)?;
-    validate_windows_runtime_acl(path, "passphrase file")?;
+    // Use local-secret ACL here: the blob may be created by an SSH bootstrap session
+    // (admin user, not SYSTEM), so the file owner is the SSH user's SID rather than
+    // BA/SY. Security is provided by DPAPI LocalMachine encryption + NTFS DACL
+    // (SY/BA/service only); file-owner identity is not a meaningful invariant.
+    validate_windows_local_secret_acl(path, "passphrase file")?;
     let raw = fs::read(path).map_err(|err| format!("read passphrase file failed: {err}"))?;
     decode_windows_dpapi_passphrase_blob(raw, "passphrase file")
 }

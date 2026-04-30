@@ -83,7 +83,8 @@ use crate::windows_paths::{
     DEFAULT_WINDOWS_TRUST_WATERMARK_PATH, DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
     DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH, DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH,
     DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH, default_windows_tunnel_service_config_path,
-    validate_windows_runtime_acl, validate_windows_runtime_file_path,
+    validate_windows_local_secret_acl, validate_windows_runtime_acl,
+    validate_windows_runtime_file_path,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(target_os = "linux")]
@@ -11132,7 +11133,12 @@ fn validate_file_security(
             "{label} is not readable by the current service identity: {err}"
         ))
     })?;
-    validate_windows_runtime_acl(path, label).map_err(DaemonError::InvalidConfig)
+    // Use local-secret ACL (not runtime ACL) so files created during SSH bootstrap
+    // (owned by the admin SSH user, not SYSTEM/BA) are accepted. NTFS DACL on the
+    // containing directory enforces access control; the file-owner SID is not a
+    // meaningful security invariant — the directory-level owner check in
+    // validate_windows_runtime_startup_acls() is the authoritative gate.
+    validate_windows_local_secret_acl(path, label).map_err(DaemonError::InvalidConfig)
 }
 
 #[cfg(not(windows))]
