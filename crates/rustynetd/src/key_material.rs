@@ -976,11 +976,16 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
             path.display()
         ));
     }
-    let parent_dir = fs::File::open(parent)
-        .map_err(|err| format!("open parent directory {} failed: {err}", parent.display()))?;
-    parent_dir
-        .sync_all()
-        .map_err(|err| format!("sync parent directory {} failed: {err}", parent.display()))?;
+    // Directory fsync is a no-op on Windows: FlushFileBuffers on a directory
+    // handle requires special access that read-open does not provide.
+    #[cfg(unix)]
+    {
+        let parent_dir = fs::File::open(parent)
+            .map_err(|err| format!("open parent directory {} failed: {err}", parent.display()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| format!("sync parent directory {} failed: {err}", parent.display()))?;
+    }
     Ok(())
 }
 
