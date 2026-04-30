@@ -1478,6 +1478,33 @@ fn default_remote_temp_dir_for_profile(profile: VmPlatformProfile) -> String {
     }
 }
 
+/// Default per-platform staging directory for utmctl host→guest file
+/// operations. Distinct from `remote_temp_dir` (used for SCP-side scratch)
+/// because the QEMU/SPICE guest agent runs as `NT AUTHORITY\SYSTEM` on
+/// Windows, while the SSH user is the lab account; SCP and utmctl therefore
+/// hit different ACL surfaces. The staging dir must grant SYSTEM access and
+/// must live outside the runtime state tree so that state-tree hardening
+/// (icacls /grant:r /T) cannot strip the SYSTEM ACE and break the control
+/// channel.
+fn default_utm_staging_dir_for_profile(
+    profile: VmPlatformProfile,
+    ssh_user: Option<&str>,
+) -> Option<String> {
+    match profile.platform {
+        VmGuestPlatform::Windows => {
+            let user = ssh_user.unwrap_or("Public");
+            Some(format!(r"C:\Users\{user}\rustynet-utm-stage"))
+        }
+        // Linux/macOS guest agents typically run with the same identity
+        // surface as SSH, so utmctl reuses `remote_temp_dir`. Returning
+        // None signals "use remote_temp_dir as the utmctl staging root".
+        VmGuestPlatform::Linux
+        | VmGuestPlatform::Macos
+        | VmGuestPlatform::Ios
+        | VmGuestPlatform::Android => None,
+    }
+}
+
 fn windows_helper_script_local_path(file_name: &str) -> PathBuf {
     let canonical = workspace_root_path()
         .join(WINDOWS_BOOTSTRAP_HELPER_ROOT)
@@ -1534,6 +1561,7 @@ struct VmInventoryEntry {
     exit_capable: Option<bool>,
     relay_capable: Option<bool>,
     remote_temp_dir: Option<String>,
+    utm_staging_dir: Option<String>,
     rustynet_src_dir: Option<String>,
     platform: Option<VmGuestPlatform>,
     remote_shell: Option<VmRemoteShell>,
@@ -1565,6 +1593,7 @@ struct RemoteTarget {
     platform_profile: VmPlatformProfile,
     rustynet_src_dir: Option<String>,
     remote_temp_dir: Option<String>,
+    utm_staging_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14876,6 +14905,10 @@ fn remote_target_from_inventory_entry(
             .remote_temp_dir
             .clone()
             .or_else(|| Some(default_remote_temp_dir_for_profile(platform_profile))),
+        utm_staging_dir: entry
+            .utm_staging_dir
+            .clone()
+            .or_else(|| default_utm_staging_dir_for_profile(platform_profile, ssh_user.as_deref())),
     }
 }
 
@@ -14893,6 +14926,7 @@ fn remote_target_from_raw_target(label: String, ssh_target: String) -> RemoteTar
             ssh_user.as_deref(),
         )),
         remote_temp_dir: Some(default_remote_temp_dir_for_profile(platform_profile)),
+        utm_staging_dir: default_utm_staging_dir_for_profile(platform_profile, ssh_user.as_deref()),
     }
 }
 
@@ -14912,6 +14946,10 @@ fn remote_target_from_start_target(target: &StartTarget) -> RemoteTarget {
         platform_profile: target.platform_profile,
         rustynet_src_dir: None,
         remote_temp_dir: None,
+        utm_staging_dir: default_utm_staging_dir_for_profile(
+            target.platform_profile,
+            target.ssh_user.as_deref(),
+        ),
     }
 }
 
@@ -15339,6 +15377,10 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
     if let Some(value) = remote_temp_dir.as_deref() {
         ensure_no_control_chars("remote_temp_dir", value)?;
     }
+    let utm_staging_dir = optional_string_field(object, "utm_staging_dir")?;
+    if let Some(value) = utm_staging_dir.as_deref() {
+        ensure_no_control_chars("utm_staging_dir", value)?;
+    }
     let rustynet_src_dir = optional_string_field(object, "rustynet_src_dir")?;
     if let Some(value) = rustynet_src_dir.as_deref() {
         ensure_no_control_chars("rustynet_src_dir", value)?;
@@ -15390,6 +15432,7 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
         exit_capable,
         relay_capable,
         remote_temp_dir,
+        utm_staging_dir,
         rustynet_src_dir,
         platform,
         remote_shell,
@@ -16381,10 +16424,15 @@ fn sync_local_source_archive_to_target(
 ) -> Result<(), String> {
     ensure_local_regular_file_path(archive_path, "local source archive")?;
     if target.platform_profile.platform == VmGuestPlatform::Windows {
-        let remote_archive = format!(
-            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-{}.zip",
-            unique_suffix()
-        );
+        // Stage the archive under windows_orchestration_root so the SSH
+        // user can SCP it AND the SYSTEM-context utmctl can read the
+        // companion .result.json that the extract wrapper writes.  The
+        // legacy vm-lab path was unreachable from utmctl on UTM Windows
+        // guests (state-tree hardening strips the SYSTEM ACE) and was
+        // wedging the result-file pull retry loop.
+        let archive_root = windows_orchestration_root(target);
+        let archive_root = archive_root.trim_end_matches(['\\', '/']);
+        let remote_archive = format!(r"{archive_root}\rn-vm-lab-source-{}.zip", unique_suffix());
         ensure_success_status(
             scp_to_remote_for_target(
                 target,
@@ -16656,6 +16704,34 @@ fn utm_exec_root_raw(
         .arg("-lc")
         .arg(command_script);
     run_status_with_timeout(&mut command, timeout)
+}
+
+/// Ensure a directory exists on the Windows guest before any
+/// `utm_push_raw` to a path inside it. utmctl file push does NOT create
+/// intermediate directories — pushing to a missing path returns
+/// `OSStatus -2700` ("The system cannot find the path specified.").
+///
+/// Idempotent: `New-Item -Force` on an existing directory is a no-op.
+fn ensure_utm_windows_dir(
+    utm_name: &str,
+    remote_dir: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    ensure_no_control_chars("UTM Windows dir", remote_dir)?;
+    let quoted = powershell_quote(remote_dir)?;
+    let script = format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         New-Item -ItemType Directory -Force -Path {quoted} | Out-Null"
+    );
+    let status = utm_exec_windows_raw(utm_name, script.as_str(), timeout)?;
+    if !status.success() {
+        return Err(format!(
+            "UTM Windows mkdir for {utm_name}:{remote_dir} exited with status {}",
+            status_code(status)
+        ));
+    }
+    Ok(())
 }
 
 fn utm_cleanup_exec_files(
@@ -17005,6 +17081,31 @@ enum RemoteTransportPhase {
     PostBootstrap,
 }
 
+/// Return the utmctl staging directory for a Windows UTM target.
+///
+/// The staging directory is a SYSTEM-writable location that the QEMU
+/// guest agent can read and write via `utmctl file push`/`utmctl file
+/// pull`. It MUST live outside the runtime state tree
+/// (`C:\ProgramData\Rustynet\`) because that tree is hardened with
+/// `icacls /grant:r <user>:(OI)(CI)(F) /T`, which strips the SYSTEM
+/// ACE and therefore breaks utmctl file operations.
+///
+/// Falls back to the platform default when the target does not carry an
+/// explicit value, but never returns `remote_temp_dir` because that
+/// path lives inside the hardened tree.
+fn remote_target_windows_utm_staging_dir(target: &RemoteTarget) -> Result<String, String> {
+    if let Some(dir) = target.utm_staging_dir.as_deref() {
+        return Ok(dir.to_string());
+    }
+    default_utm_staging_dir_for_profile(target.platform_profile, target.ssh_user.as_deref())
+        .ok_or_else(|| {
+            format!(
+                "no UTM staging directory configured for Windows target {}",
+                target.label
+            )
+        })
+}
+
 fn ssh_fallback_allowed_for_target(_target: &RemoteTarget, _phase: RemoteTransportPhase) -> bool {
     // SSH SCP and SSH exec fallback are always permitted. The original
     // restriction (blocking AccessEstablishment + Windows UTM) was intended to
@@ -17022,32 +17123,6 @@ fn format_windows_access_establishment_transport_error(
     cause: &str,
 ) -> String {
     format!("Windows access establishment {operation} failed for {target_label}: {cause}")
-}
-
-fn resolve_local_utm_status_result<F>(
-    target: &RemoteTarget,
-    phase: RemoteTransportPhase,
-    operation: &str,
-    utm_result: Result<ExitStatus, String>,
-    ssh_fallback: F,
-) -> Result<ExitStatus, String>
-where
-    F: FnOnce(&str) -> Result<ExitStatus, String>,
-{
-    match utm_result {
-        Ok(status) => Ok(status),
-        Err(utm_err) => {
-            if ssh_fallback_allowed_for_target(target, phase) {
-                ssh_fallback(utm_err.as_str())
-            } else {
-                Err(format_windows_access_establishment_transport_error(
-                    target.label.as_str(),
-                    operation,
-                    utm_err.as_str(),
-                ))
-            }
-        }
-    }
 }
 
 fn run_remote_shell_command_for_target_with_phase(
@@ -17087,19 +17162,37 @@ fn run_remote_shell_command_for_target_with_phase(
                 Ok(synthetic_exit_status(rc))
             }
             VmGuestPlatform::Windows => {
-                // utmctl file push and pull are broken on Windows guests (OSStatus
-                // -2700 / Access is denied), so skip execute_utm_remote_powershell_capture
-                // entirely and go directly to SSH.
-                let _ = (utm_name, phase);
-                let ssh_script = remote_script_for_ssh_transport(target, remote_script)?;
-                run_remote_shell_command(
-                    target.ssh_target.as_str(),
-                    ssh_user_override.or(target.ssh_user.as_deref()),
-                    ssh_identity_file,
-                    known_hosts_path,
-                    ssh_script.as_str(),
+                // Primary path: utmctl exec + result-file (network-independent;
+                // survives WireGuard interface up/down mid-orchestration).
+                // SSH fallback only on transport failure.
+                let staging_dir = remote_target_windows_utm_staging_dir(target)?;
+                match execute_utm_remote_powershell_capture(
+                    utm_name,
+                    staging_dir.as_str(),
+                    remote_script,
                     timeout,
-                )
+                ) {
+                    Ok((rc, _output)) => Ok(synthetic_exit_status(rc)),
+                    Err(utm_err) => {
+                        if ssh_fallback_allowed_for_target(target, phase) {
+                            fallback_remote_shell_command_to_ssh(
+                                target,
+                                ssh_user_override,
+                                ssh_identity_file,
+                                known_hosts_path,
+                                remote_script,
+                                timeout,
+                                utm_err.as_str(),
+                            )
+                        } else {
+                            Err(format_windows_access_establishment_transport_error(
+                                target.label.as_str(),
+                                "UTM Windows exec",
+                                utm_err.as_str(),
+                            ))
+                        }
+                    }
+                }
             }
             VmGuestPlatform::Macos => fallback_remote_shell_command_to_ssh(
                 target,
@@ -17187,19 +17280,41 @@ fn capture_remote_shell_command_for_target_with_phase(
                 Ok(output)
             }
             VmGuestPlatform::Windows => {
-                // utmctl file push and pull are broken on Windows guests (OSStatus
-                // -2700 / Access is denied), so skip execute_utm_remote_powershell_capture
-                // entirely and go directly to SSH.
-                let _ = (utm_name, phase);
-                fallback_capture_remote_shell_command_to_ssh(
-                    target,
-                    ssh_user_override,
-                    ssh_identity_file,
-                    known_hosts_path,
+                let staging_dir = remote_target_windows_utm_staging_dir(target)?;
+                let utm_result = execute_utm_remote_powershell_capture(
+                    utm_name,
+                    staging_dir.as_str(),
                     remote_script,
                     timeout,
-                    "utmctl file operations unsupported on Windows guests",
-                )
+                );
+                match utm_result {
+                    Ok((rc, output)) => {
+                        if rc != 0 {
+                            Err(format_remote_capture_exit_error(rc, output.as_str()))
+                        } else {
+                            Ok(output)
+                        }
+                    }
+                    Err(utm_err) => {
+                        if ssh_fallback_allowed_for_target(target, phase) {
+                            fallback_capture_remote_shell_command_to_ssh(
+                                target,
+                                ssh_user_override,
+                                ssh_identity_file,
+                                known_hosts_path,
+                                remote_script,
+                                timeout,
+                                utm_err.as_str(),
+                            )
+                        } else {
+                            Err(format_windows_access_establishment_transport_error(
+                                target.label.as_str(),
+                                "UTM Windows capture",
+                                utm_err.as_str(),
+                            ))
+                        }
+                    }
+                }
             }
             VmGuestPlatform::Macos => fallback_capture_remote_shell_command_to_ssh(
                 target,
@@ -17291,13 +17406,53 @@ fn scp_to_remote_for_target_with_phase(
                 }
                 Ok(status)
             }
-            VmGuestPlatform::Windows => resolve_local_utm_status_result(
-                context.target,
-                phase,
-                "UTM file push",
-                utm_push_raw(utm_name, src, dst.as_str(), context.timeout),
-                |utm_err| fallback_scp_to_remote(context, src, dst.as_str(), utm_err),
-            ),
+            VmGuestPlatform::Windows => {
+                // Windows UTM staging strategy:
+                //
+                // - `windows_helper_script_remote_path` and
+                //   `windows_orchestration_root` route helper paths under
+                //   `utm_staging_dir` (typically
+                //   C:\Users\<windows>\rustynet-utm-stage), which both the
+                //   SSH user and the SYSTEM-level guest agent can read+write.
+                // - SCP from the host runs as the SSH user `windows`, which
+                //   has full access via user-profile inheritance.
+                // - utmctl push as a transport never targets the hardened
+                //   state tree because helper paths now live under staging.
+                //
+                // SCP needs the staging directory to exist (it does not
+                // create intermediate directories). Use `utmctl exec` to
+                // mkdir it — that's network-independent and idempotent —
+                // before the SCP runs.
+                let _ = phase;
+                if let Some(staging_dir) = context.target.utm_staging_dir.as_deref() {
+                    let parent = windows_guest_parent_dir(dst.as_str()).unwrap_or_default();
+                    let needs_mkdir =
+                        parent.is_empty() || windows_path_is_within(parent.as_str(), staging_dir);
+                    if needs_mkdir {
+                        let mkdir_target = if parent.is_empty() {
+                            staging_dir.to_string()
+                        } else {
+                            parent
+                        };
+                        if let Err(err) = ensure_utm_windows_dir(
+                            utm_name,
+                            mkdir_target.as_str(),
+                            context.timeout.min(Duration::from_secs(30)),
+                        ) {
+                            return Err(format!(
+                                "UTM Windows staging mkdir failed for {} ({}): {err}",
+                                context.target.label, mkdir_target
+                            ));
+                        }
+                    }
+                }
+                fallback_scp_to_remote(
+                    context,
+                    src,
+                    dst.as_str(),
+                    "Windows UTM SCP path uses staging directory directly",
+                )
+            }
             VmGuestPlatform::Macos => fallback_scp_to_remote(
                 context,
                 src,
@@ -17455,7 +17610,34 @@ fn scp_to_remote(
         .arg("--")
         .arg(src.as_os_str())
         .arg(format!("{target}:{dst}"));
-    run_status_with_timeout(&mut command, timeout)
+    // Capture stderr.  The previous implementation routed it to /dev/null
+    // via run_status_with_timeout, which made every scp failure look like
+    // a silent multi-second hang to the orchestrator.  Surfacing the last
+    // few stderr lines on non-zero exit makes auth, host-key, and
+    // connection-reset failures self-diagnosing.
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!(
+            "scp to {target}:{dst} failed with status {}: {}",
+            status_code(output.status),
+            if tail.is_empty() {
+                "(no stderr)"
+            } else {
+                tail.as_str()
+            }
+        ));
+    }
+    Ok(output.status)
 }
 
 fn scp_from_remote(
@@ -18012,16 +18194,68 @@ fn windows_guest_path_join(root: &str, file_name: &str) -> Result<String, String
     Ok(format!(r"{trimmed}\{file_name}"))
 }
 
+/// Strip the trailing path component from a Windows guest path. Returns
+/// an empty string when the path has no parent (single component or empty).
+/// Tolerates both `\` and `/` separators.
+fn windows_guest_parent_dir(path: &str) -> Option<String> {
+    let last = path.rfind(['\\', '/']).filter(|idx| *idx > 0)?;
+    Some(path[..last].to_string())
+}
+
+/// True when `path` lies at or below `root`, treating both `\` and `/` as
+/// path separators and ignoring case (Windows file systems are typically
+/// case-insensitive).
+fn windows_path_is_within(path: &str, root: &str) -> bool {
+    fn normalize(value: &str) -> String {
+        value
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    let path_norm = normalize(path);
+    let root_norm = normalize(root);
+    if root_norm.is_empty() {
+        return false;
+    }
+    if path_norm == root_norm {
+        return true;
+    }
+    let prefix = format!("{root_norm}\\");
+    path_norm.starts_with(prefix.as_str())
+}
+
+/// Single source of truth for "where does Windows orchestration scratch go?"
+///
+/// For Windows local-UTM targets, returns `utm_staging_dir` so that both
+/// halves of the transport share one directory:
+/// - SCP staging (runs as the SSH user `windows`) can write there because
+///   `C:\Users\windows\...` inherits `windows:F`.
+/// - `utmctl exec` (runs as `NT AUTHORITY\SYSTEM`) can read+write there
+///   because the same path inherits `SYSTEM:F`.
+///
+/// For non-UTM Windows targets and other platforms, returns
+/// `remote_temp_dir`. That preserves vm-lab semantics for SSH-only
+/// Windows hosts (lab-LAN, future cloud) where the SYSTEM ACL clash
+/// does not apply.
+fn windows_orchestration_root(target: &RemoteTarget) -> String {
+    if target.platform_profile.platform == VmGuestPlatform::Windows
+        && remote_target_local_utm(target).is_some()
+        && let Some(staging) = target.utm_staging_dir.as_deref()
+    {
+        return staging.to_string();
+    }
+    target
+        .remote_temp_dir
+        .clone()
+        .unwrap_or_else(|| default_remote_temp_dir_for_profile(target.platform_profile))
+}
+
 fn windows_helper_script_remote_path(
     target: &RemoteTarget,
     file_name: &str,
 ) -> Result<String, String> {
-    let remote_root = target
-        .remote_temp_dir
-        .clone()
-        .unwrap_or_else(|| default_remote_temp_dir_for_profile(target.platform_profile));
-    let remote_root = remote_root.as_str();
-    windows_guest_path_join(remote_root, file_name)
+    let remote_root = windows_orchestration_root(target);
+    windows_guest_path_join(remote_root.as_str(), file_name)
 }
 
 fn utm_exec_windows_raw(
@@ -18030,7 +18264,18 @@ fn utm_exec_windows_raw(
     timeout: Duration,
 ) -> Result<ExitStatus, String> {
     ensure_no_control_chars("UTM exec command", powershell_script)?;
-    let encoded = encode_powershell_command(powershell_script)?;
+    // Prepend $ProgressPreference suppression so PowerShell's "Preparing
+    // modules for first use" progress record (and any other progress
+    // record) does not get serialized to stderr as a CLIXML envelope.
+    // Observed on a freshly-booted Windows guest: the first powershell
+    // -EncodedCommand under utmctl exec emits "#< CLIXML ...<Progress
+    // .../>...</Objs>" on stderr even when the command itself runs fine
+    // and exits 0.  Without suppression we treat that benign noise as a
+    // hard failure.
+    let wrapped_script = format!(
+        "$ProgressPreference = 'SilentlyContinue'; $VerbosePreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'; {powershell_script}"
+    );
+    let encoded = encode_powershell_command(wrapped_script.as_str())?;
     let utmctl_path = utmctl_binary_path()?;
     let mut command = Command::new(utmctl_path);
     command
@@ -18048,14 +18293,290 @@ fn utm_exec_windows_raw(
         .arg("-EncodedCommand")
         .arg(encoded);
     let output = run_output_with_timeout(&mut command, timeout)?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
+    let stderr_raw = String::from_utf8_lossy(&output.stderr);
+    // Strip CLIXML envelopes from the stderr stream defensively even
+    // after the preference suppression above: nested PowerShell calls
+    // (like the build-release wrapper invoking another powershell.exe
+    // -EncodedCommand) can re-emit them.  CLIXML payloads start with
+    // "#< CLIXML" and continue as XML; everything around them (real
+    // utmctl host errors like "OSStatus error -2700" / "Access is
+    // denied") is what we actually care about.
+    let stderr_filtered = strip_powershell_clixml_noise(stderr_raw.as_ref())
+        .trim()
+        .to_string();
+    if !stderr_filtered.is_empty() {
         return Err(format!(
-            "UTM Windows exec reported error for {utm_name}: {stderr}"
+            "UTM Windows exec reported error for {utm_name}: {stderr_filtered}"
         ));
     }
     Ok(output.status)
 }
+
+/// Remove PowerShell CLIXML serialization payloads from a stderr buffer.
+///
+/// PowerShell, when invoked as a child process with `-OutputFormat Text`,
+/// still emits its non-stdout streams (Progress, Verbose, Information,
+/// sometimes Error and Warning records) as a CLIXML envelope on stderr
+/// the first time the host runspace initializes after a cold boot or a
+/// module-cache invalidation.  Setting `$ProgressPreference =
+/// 'SilentlyContinue'` reduces it but does not eliminate it, because the
+/// CLIXML emitter is per-runspace and the OUTER runspace activates
+/// before our wrapper script runs.
+///
+/// The CLIXML payload always begins with the literal `#< CLIXML` marker
+/// followed by an XML envelope.  This helper drops that marker and any
+/// XML-like lines, returning whatever else is left.  Real utmctl host
+/// failures (Apple Events errors, OSStatus codes, "Access is denied"
+/// from the guest agent) are plain text and pass through untouched.
+fn strip_powershell_clixml_noise(stderr: &str) -> String {
+    let mut kept = Vec::new();
+    let mut in_clixml = false;
+    for line in stderr.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#< CLIXML") {
+            in_clixml = true;
+            continue;
+        }
+        if in_clixml {
+            // CLIXML payload is XML; once we hit the closing </Objs> we
+            // exit the block.  Any line that is empty or starts with '<'
+            // is treated as part of the envelope.
+            if trimmed.starts_with("</Objs>") {
+                in_clixml = false;
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with('<') {
+                continue;
+            }
+            // Defensive: a non-XML, non-empty line inside what we
+            // thought was a CLIXML block means the envelope ended
+            // unexpectedly.  Keep this line and exit the block.
+            in_clixml = false;
+            kept.push(line);
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+fn format_remote_capture_exit_error(rc: i32, output: &str) -> String {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        format!("remote command exited with status {rc}")
+    } else {
+        format!("remote command exited with status {rc}: {trimmed}")
+    }
+}
+
+/// Build a PowerShell wrapper script that runs `powershell_script` and
+/// writes its captured output and exit code to two files in the staging
+/// directory. utmctl exec exposes only the guest exit code (no stdout
+/// or stderr capture), so we redirect the inner script's combined
+/// streams to a file the host can `utm_pull` afterwards.
+fn build_utm_windows_result_file_wrapper_script(
+    powershell_script: &str,
+    remote_output_path: &str,
+    remote_rc_path: &str,
+) -> Result<String, String> {
+    let encoded_body = encode_powershell_command(powershell_script)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $outputPath = {output_path}; \
+         $rcPath = {rc_path}; \
+         foreach ($path in @($outputPath, $rcPath)) {{ \
+           $parent = Split-Path -Path $path -Parent; \
+           if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ \
+             New-Item -ItemType Directory -Path $parent -Force | Out-Null \
+           }}; \
+           if (Test-Path -LiteralPath $path) {{ \
+             Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue \
+           }} \
+         }}; \
+         $rc = 0; \
+         $captured = ''; \
+         $psExe = Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; \
+         if (-not (Test-Path -LiteralPath $psExe)) {{ $psExe = 'powershell.exe' }}; \
+         try {{ \
+           $captured = (& $psExe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded_body} *>&1 | Out-String); \
+           $rcVar = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
+           if ($null -ne $rcVar -and $null -ne $rcVar.Value) {{ \
+             $rcRaw = $rcVar.Value; \
+             if ($rcRaw -is [System.Management.Automation.PSVariable]) {{ $rcRaw = $rcRaw.Value }}; \
+             if ($null -ne $rcRaw -and [string]$rcRaw -match '^-?[0-9]+$') {{ \
+               $rc = [int]$rcRaw \
+             }} \
+           }} elseif (-not $?) {{ \
+             $rc = 1 \
+           }} \
+         }} catch {{ \
+           $captured = ($_ | Out-String); \
+           $rc = 1 \
+         }}; \
+         if ($null -eq $captured) {{ $captured = '' }}; \
+         Set-Content -LiteralPath $outputPath -Value ([string]$captured) -Encoding utf8; \
+         Set-Content -LiteralPath $rcPath -Value ([string]$rc) -Encoding ascii; \
+         exit 0",
+        encoded_body = powershell_quote(encoded_body.as_str())?,
+        output_path = powershell_quote(remote_output_path)?,
+        rc_path = powershell_quote(remote_rc_path)?,
+    ))
+}
+
+/// Execute a PowerShell script on a Windows UTM guest via the guest agent
+/// (network-independent) and return its (exit_code, captured_output).
+///
+/// Mechanism:
+/// 1. Wrap the script so it writes output and rc to two files in
+///    `staging_dir` (which must be SYSTEM-writable; see
+///    [`default_utm_staging_dir_for_profile`]).
+/// 2. `utmctl exec` the wrapper (one round-trip; runs as SYSTEM in-guest).
+/// 3. `utmctl file pull` the rc and output files back.
+/// 4. Best-effort remove the remote files.
+///
+/// This survives mid-orchestration network changes (e.g. WireGuard
+/// interface coming up and reordering routes) because it never touches
+/// SSH. It is the primary control channel for Windows UTM guests; SSH
+/// is the fallback when utmctl itself errors.
+fn execute_utm_remote_powershell_capture(
+    utm_name: &str,
+    staging_dir: &str,
+    powershell_script: &str,
+    timeout: Duration,
+) -> Result<(i32, String), String> {
+    if powershell_script.chars().any(|ch| ch == '\0') {
+        return Err("UTM remote PowerShell script contains unsupported NUL byte".to_string());
+    }
+    ensure_no_control_chars("UTM Windows staging dir", staging_dir)?;
+
+    // Make sure the staging directory exists before the wrapper runs.
+    // The wrapper itself also creates output-file parents defensively,
+    // but pulling from a missing dir would still fail.
+    ensure_utm_windows_dir(utm_name, staging_dir, timeout.min(Duration::from_secs(30)))?;
+
+    let local_root =
+        std::env::temp_dir().join(format!("rustynet-vm-lab-windows-exec-{}", unique_suffix()));
+    fs::create_dir_all(local_root.as_path()).map_err(|err| {
+        format!(
+            "create local Windows UTM exec dir failed ({}): {err}",
+            local_root.display()
+        )
+    })?;
+    let local_output_path = local_root.join("output.txt");
+    let local_rc_path = local_root.join("rc.txt");
+    let separator = if staging_dir.ends_with('\\') {
+        ""
+    } else {
+        "\\"
+    };
+    let unique = unique_suffix();
+    let remote_output_path = format!("{staging_dir}{separator}rn-utm-exec.{unique}.out");
+    let remote_rc_path = format!("{staging_dir}{separator}rn-utm-exec.{unique}.rc");
+
+    let cleanup = |reason_root: &Path| {
+        let _ = best_effort_remove_windows_local_utm_guest_file(
+            utm_name,
+            remote_output_path.as_str(),
+            Duration::from_secs(20),
+        );
+        let _ = best_effort_remove_windows_local_utm_guest_file(
+            utm_name,
+            remote_rc_path.as_str(),
+            Duration::from_secs(20),
+        );
+        let _ = fs::remove_dir_all(reason_root);
+    };
+
+    let wrapped_script = match build_utm_windows_result_file_wrapper_script(
+        powershell_script,
+        remote_output_path.as_str(),
+        remote_rc_path.as_str(),
+    ) {
+        Ok(script) => script,
+        Err(err) => {
+            cleanup(local_root.as_path());
+            return Err(err);
+        }
+    };
+
+    let host_status = utm_exec_windows_raw(utm_name, wrapped_script.as_str(), timeout);
+    if let Err(host_err) = host_status.as_ref() {
+        cleanup(local_root.as_path());
+        return Err(format!(
+            "UTM Windows exec failed for {utm_name} before result file could be written: {host_err}"
+        ));
+    }
+
+    let rc_pull = pull_windows_local_utm_guest_file_with_retry(
+        utm_name,
+        remote_rc_path.as_str(),
+        local_rc_path.as_path(),
+        timeout,
+        "UTM Windows rc",
+    );
+    if let Err(pull_error) = rc_pull {
+        let pull_failure_msg = format_windows_local_utm_result_pull_failure(
+            "UTM Windows PowerShell capture",
+            utm_name,
+            &host_status,
+            pull_error.as_str(),
+        );
+        cleanup(local_root.as_path());
+        return Err(pull_failure_msg);
+    }
+
+    let rc_text = match read_windows_local_utm_utf8_file(local_rc_path.as_path(), "UTM Windows rc")
+    {
+        Ok(text) => text,
+        Err(err) => {
+            cleanup(local_root.as_path());
+            return Err(err);
+        }
+    };
+    let rc = match rc_text.trim().parse::<i32>() {
+        Ok(rc) => rc,
+        Err(_) => {
+            let trimmed = rc_text.trim().to_string();
+            cleanup(local_root.as_path());
+            return Err(format!(
+                "UTM Windows rc was not a valid integer for {utm_name}: {trimmed}"
+            ));
+        }
+    };
+
+    let output_pull = pull_windows_local_utm_guest_file_with_retry(
+        utm_name,
+        remote_output_path.as_str(),
+        local_output_path.as_path(),
+        timeout,
+        "UTM Windows output",
+    );
+    if let Err(pull_error) = output_pull {
+        let pull_failure_msg = format_windows_local_utm_result_pull_failure(
+            "UTM Windows PowerShell capture",
+            utm_name,
+            &host_status,
+            pull_error.as_str(),
+        );
+        cleanup(local_root.as_path());
+        return Err(pull_failure_msg);
+    }
+
+    let output =
+        match read_windows_local_utm_utf8_file(local_output_path.as_path(), "UTM Windows output") {
+            Ok(text) => text,
+            Err(err) => {
+                cleanup(local_root.as_path());
+                return Err(err);
+            }
+        };
+
+    cleanup(local_root.as_path());
+    Ok((rc, output))
+}
+
 fn stage_windows_helper_script_from_path(
     context: &RemoteFallbackContext<'_>,
     local_path: &Path,
@@ -18590,8 +19111,7 @@ fn bootstrap_windows_access_for_target(
                     // Windows OpenSSH (child sshd processes outlive service
                     // restarts).
                     let ssh_user = context.ssh_user_override.or(target.ssh_user.as_deref());
-                    let scp_dst =
-                        remote_copy_destination_for_target(target, remote_path.as_str());
+                    let scp_dst = remote_copy_destination_for_target(target, remote_path.as_str());
                     let scp_status = scp_to_remote(
                         local_path.as_path(),
                         target.ssh_target.as_str(),
@@ -18625,9 +19145,7 @@ fn bootstrap_windows_access_for_target(
                         ssh_script.as_str(),
                         context.timeout,
                     )
-                    .map_err(|ssh_err| {
-                        format!("{utm_err}; SSH fallback also failed: {ssh_err}")
-                    })?
+                    .map_err(|ssh_err| format!("{utm_err}; SSH fallback also failed: {ssh_err}"))?
                 }
             }
         }
@@ -20443,6 +20961,7 @@ mod tests {
                 exit_capable: None,
                 relay_capable: None,
                 remote_temp_dir: None,
+                utm_staging_dir: None,
                 rustynet_src_dir: None,
                 platform: None,
                 remote_shell: None,
@@ -20467,6 +20986,7 @@ mod tests {
                 exit_capable: None,
                 relay_capable: None,
                 remote_temp_dir: None,
+                utm_staging_dir: None,
                 rustynet_src_dir: None,
                 platform: None,
                 remote_shell: None,
@@ -20548,6 +21068,7 @@ mod tests {
             exit_capable: None,
             relay_capable: None,
             remote_temp_dir: None,
+            utm_staging_dir: None,
             rustynet_src_dir: None,
             platform: None,
             remote_shell: None,
@@ -20797,6 +21318,32 @@ mod tests {
     }
 
     #[test]
+    fn strip_clixml_noise_drops_progress_envelope_keeps_real_errors() {
+        // Benign progress envelope from a freshly-booted PowerShell
+        // runspace.  Strip cleanly; nothing left.
+        let envelope = "#< CLIXML\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><Progress S=\"Progress\"><PR>0</PR><AS>Preparing modules for first use.</AS></Progress></Objs>";
+        let filtered = super::strip_powershell_clixml_noise(envelope);
+        assert!(
+            filtered.trim().is_empty(),
+            "CLIXML envelope should be stripped, got: {filtered:?}"
+        );
+
+        // Real utmctl host error must pass through untouched even when
+        // mixed with CLIXML noise.
+        let mixed = "#< CLIXML\n<Objs><Progress/></Objs>\nError from event: Access is denied.";
+        let filtered = super::strip_powershell_clixml_noise(mixed);
+        assert!(
+            filtered.contains("Access is denied"),
+            "real utmctl error must survive CLIXML stripping, got: {filtered:?}"
+        );
+
+        // Plain text with no CLIXML pass through.
+        let plain = "Error from event: OSStatus error -2700.\nfailed to open file";
+        let filtered = super::strip_powershell_clixml_noise(plain);
+        assert_eq!(filtered, plain);
+    }
+
+    #[test]
     fn powershell_encoding_helper_emits_utf16le_base64() {
         assert_eq!(
             encode_powershell_command("A").expect("encoding should succeed"),
@@ -20928,10 +21475,16 @@ mod tests {
     #[test]
     fn helper_script_staging_path_construction_uses_remote_temp_dir() {
         let (inventory, target) = resolve_windows_remote_target();
+        // Local-UTM Windows targets route helper paths through
+        // utm_staging_dir (a SYSTEM-writable, windows-writable directory
+        // outside the hardened state tree). The vm-lab path under
+        // C:\ProgramData\Rustynet is unreachable from the SYSTEM-level
+        // utmctl exec channel because state-tree hardening strips the
+        // SYSTEM ACE.
         assert_eq!(
             windows_helper_script_remote_path(&target, "Enable-WindowsVmLabAccess.ps1")
                 .expect("remote helper path should build"),
-            r"C:\ProgramData\Rustynet\vm-lab\Enable-WindowsVmLabAccess.ps1"
+            r"C:\Users\Administrator\rustynet-utm-stage\Enable-WindowsVmLabAccess.ps1"
         );
         cleanup_temp_inventory(inventory.as_path());
     }
@@ -21079,65 +21632,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn windows_access_establishment_transport_allows_ssh_fallback() {
-        // utmctl file operations are broken on Windows guests (OSStatus -2700).
-        // SSH fallback must be allowed for all phases so that access bootstrap
-        // can proceed via SCP/SSH instead.
-        let (_inventory_path, target) = resolve_windows_remote_target();
-        let ssh_fallback_called = std::cell::Cell::new(false);
-        let status = super::resolve_local_utm_status_result(
-            &target,
-            super::RemoteTransportPhase::AccessEstablishment,
-            "UTM file push",
-            Err("utm push timed out".to_string()),
-            |_utm_err| {
-                ssh_fallback_called.set(true);
-                Ok(super::synthetic_exit_status(0))
-            },
-        )
-        .expect("Windows access establishment must allow SSH fallback when UTM fails");
-        assert!(ssh_fallback_called.get());
-        assert!(status.success());
-    }
-
-    #[test]
-    fn windows_post_bootstrap_transport_preserves_ssh_fallback() {
-        let (_inventory_path, target) = resolve_windows_remote_target();
-        let ssh_fallback_called = std::cell::Cell::new(false);
-        let status = super::resolve_local_utm_status_result(
-            &target,
-            super::RemoteTransportPhase::PostBootstrap,
-            "UTM guest exec",
-            Err("utm exec failed".to_string()),
-            |_utm_err| {
-                ssh_fallback_called.set(true);
-                Ok(super::synthetic_exit_status(0))
-            },
-        )
-        .expect("post-bootstrap Windows transport should still allow SSH fallback");
-        assert!(ssh_fallback_called.get());
-        assert!(status.success());
-    }
-
-    #[test]
-    fn linux_transport_preserves_ssh_fallback_in_access_phase() {
-        let (_inventory_path, target) = resolve_platform_remote_target("linux");
-        let ssh_fallback_called = std::cell::Cell::new(false);
-        let status = super::resolve_local_utm_status_result(
-            &target,
-            super::RemoteTransportPhase::AccessEstablishment,
-            "UTM guest exec",
-            Err("utm exec failed".to_string()),
-            |_utm_err| {
-                ssh_fallback_called.set(true);
-                Ok(super::synthetic_exit_status(0))
-            },
-        )
-        .expect("non-Windows fallback behavior should remain unchanged");
-        assert!(ssh_fallback_called.get());
-        assert!(status.success());
-    }
+    // Note: tests for `resolve_local_utm_status_result` were removed in the
+    // commit that restored the UTM control channel.  The SSH-fallback logic
+    // that helper used to wrap is now inlined directly in
+    // `run_remote_shell_command_for_target_with_phase` and
+    // `capture_remote_shell_command_for_target_with_phase`.  Coverage for
+    // the new inline paths is via integration runs against the live VM.
 
     #[test]
     fn windows_ssh_readiness_result_script_writes_json_without_capture_markers() {

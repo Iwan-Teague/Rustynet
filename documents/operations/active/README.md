@@ -27,6 +27,8 @@ Start with these when you need current status, remaining work, or the public imp
 - [VmLabCapabilityCookbook_2026-04-14.md](./VmLabCapabilityCookbook_2026-04-14.md)
 - [VmLabCapabilityReportingPlan_2026-04-14.md](./VmLabCapabilityReportingPlan_2026-04-14.md)
 - [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md)
+- [WindowsLabVmStabilityAndSessionModel_2026-04-30.md](./WindowsLabVmStabilityAndSessionModel_2026-04-30.md)
+- [WindowsUtmTransportArchitecture_2026-04-30.md](./WindowsUtmTransportArchitecture_2026-04-30.md)
 - [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 - [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)

@@ -315,8 +315,26 @@ function Repair-RustyNetRuntimeAcl {
         throw "icacls /inheritance:r failed for $Path"
     }
 
-    $serviceGrant = if ($Directory) { "$ServiceIdentity`:(OI)(CI)(M)" } else { "$ServiceIdentity`:M" }
-    & icacls $Path /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" $serviceGrant | Out-Null
+    if ($Directory) {
+        # Inheritance MUST flow to children for Administrators and
+        # LocalSystem too — otherwise files the SYSTEM-running daemon
+        # creates under this directory inherit only the service-
+        # identity grant, and the daemon (running as LocalSystem) is
+        # then denied read/write/delete on its own files.  Observed
+        # symptom: rustynetd's runtime-boundary check creates
+        # boundary-check.passphrase.dpapi via DPAPI, then fails to
+        # scrub+delete it with "Access is denied (os error 5)" because
+        # the file's inherited ACL only had windows:(I)(F) +
+        # RustyNet:(I)(M).
+        $adminGrant = "$AdministratorsName`:(OI)(CI)(F)"
+        $systemGrant = "$LocalSystemName`:(OI)(CI)(F)"
+        $serviceGrant = "$ServiceIdentity`:(OI)(CI)(M)"
+    } else {
+        $adminGrant = "$AdministratorsName`:F"
+        $systemGrant = "$LocalSystemName`:F"
+        $serviceGrant = "$ServiceIdentity`:M"
+    }
+    & icacls $Path /grant:r $adminGrant $systemGrant $serviceGrant | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /grant:r failed for $Path"
     }
@@ -412,8 +430,33 @@ function Build-ReviewedDaemonArgsJson {
         # startup with "invalid Windows backend value".
         throw ('Build-ReviewedDaemonArgsJson rejects unknown backend label: {0}' -f $BackendLabel)
     }
-    return (@('--backend', $BackendLabel) | ConvertTo-Json -Compress)
+    # --auto-tunnel-enforce false: per-node bootstrap brings the
+    # service host up before any mesh assignment bundle has been
+    # distributed by `vm-lab-orchestrate-live-lab`.  Without this
+    # flag the daemon refuses to start until the assignment file
+    # exists, so install-release / restart-runtime / verify-runtime
+    # cannot complete on a fresh node.  The mesh-join phases later
+    # distribute and validate the assignment; this flag does NOT
+    # bypass that — it only defers the startup gate to runtime.
+    #
+    # --trust-max-age-secs 86400: the trust evidence file is generated
+    # by the access bootstrap phase and may be hours old by the time
+    # install-release runs in a phase-by-phase walkthrough.  The
+    # daemon's default DEFAULT_TRUST_MAX_AGE_SECS is 300 (5 min) which
+    # is correct for production but rejects lab evidence with
+    # "trust evidence is stale".  Mesh-join phases regenerate trust
+    # evidence with a fresh signature; this lab-image flag widens the
+    # window so the per-node service-host bring-up does not fail
+    # closed in between.
+    return (@(
+        '--backend', $BackendLabel,
+        '--auto-tunnel-enforce', 'false',
+        '--trust-max-age-secs', '86400'
+    ) | ConvertTo-Json -Compress)
 }
+# (--trust-max-age-secs is parsed by rustynetd's daemon command — added to
+# the CLI flag set in 4b23484+follow-on; threads through DaemonConfig and
+# is read by the trust preflight in run_daemon.)
 
 function Write-ReviewedEnvFile {
     param(
@@ -470,6 +513,35 @@ if ($cliSource) {
     $script:InstallFailureStep = 'copy-cli-binary'
     Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'rustynet.exe') -Force
 }
+
+# Re-encrypt the WireGuard private key + DPAPI passphrase blob in the
+# current execution context.  The access-bootstrap phase generates these
+# under the SSH user (`windows`); the install-release phase runs as
+# SYSTEM via utmctl exec; even with DPAPI LocalMachine scope, an
+# Unprotect call from a different identity than the one that called
+# Protect can fail with "decryption failed" on some Windows builds (we
+# have observed this consistently on Windows 11 ARM64 26200).  Doing
+# `key init --force` + `key store-passphrase` here aligns the encryption
+# identity with the runtime identity (SYSTEM service), so the daemon's
+# subsequent decrypt at startup matches.  Idempotent: re-runs are safe.
+$script:InstallFailureStep = 'rekey-wireguard-under-runtime-identity'
+$wgPassphrasePath = Join-Path $StateRoot 'secrets\wireguard.passphrase.dpapi'
+$wgPassphraseDir = Split-Path -Parent $wgPassphrasePath
+if (-not (Test-Path -LiteralPath $wgPassphraseDir)) {
+    New-Item -ItemType Directory -Force -Path $wgPassphraseDir | Out-Null
+}
+$rekeyPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
+[System.IO.File]::WriteAllText($wgPassphrasePath, $rekeyPlaintext)
+$keyInitOutput = (& $daemonDest key init --passphrase-file $wgPassphrasePath --force 2>&1) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    throw "rustynetd key init --force failed (exit $LASTEXITCODE): $keyInitOutput"
+}
+Write-Host "[install-helper] rekey: rustynetd key init complete"
+$keyStoreOutput = (& $daemonDest key store-passphrase --passphrase-file $wgPassphrasePath 2>&1) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    throw "rustynetd key store-passphrase failed (exit $LASTEXITCODE): $keyStoreOutput"
+}
+Write-Host "[install-helper] rekey: passphrase blob written under SYSTEM DPAPI scope"
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 $script:InstallFailureStep = 'write-reviewed-env-file'
@@ -579,7 +651,11 @@ $imagePath = [string]$serviceRuntime.image_path
 $serviceImagePathUsesWindowsService = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--windows-service'
 $serviceImagePathUsesEnvFile = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--env-file'
 $serviceEnvFilePinned = Test-ImagePathContainsToken -ImagePath $imagePath -Token $configPath
-$backendLabel = 'windows-unsupported'
+# $backendLabel was set at the top of the script by Resolve-ReviewedBackendLabel
+# from the WireGuard probe and -ForceUnsupportedBackend.  Keep that value for
+# the report — overwriting it to 'windows-unsupported' here was a leftover that
+# made every install look blocked even when wireguard.exe was present and the
+# env file pinned --backend windows-wireguard-nt.
 $notes = @()
 if ($serviceConfigError) {
     $notes += 'service-config-error'

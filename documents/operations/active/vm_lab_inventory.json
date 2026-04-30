@@ -174,7 +174,8 @@
       "service_manager": "windows_service",
       "ssh_password": "tempo",
       "ssh_target": "192.168.64.14",
-      "ssh_user": "windows"
+      "ssh_user": "windows",
+      "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage"
     }
   ],
   "version": 1

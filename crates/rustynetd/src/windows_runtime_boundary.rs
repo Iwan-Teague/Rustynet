@@ -69,59 +69,103 @@ pub fn run_windows_runtime_boundary_check(
         }
         secret_round_trip_ok = true;
 
-        let pipe_path_for_server = pipe_path.clone();
-        let secret_blob_for_server = secret_blob_path.clone();
-        let server = thread::spawn(move || {
-            serve_windows_privileged_request_once(
-                pipe_path_for_server.as_path(),
-                WindowsLocalIpcRole::PrivilegedHelper,
-                None,
-                |request| match request {
-                    WindowsPrivilegedRequest::Probe { protocol_version } => {
-                        Ok(WindowsPrivilegedResponse::ProbeAck { protocol_version })
-                    }
-                    WindowsPrivilegedRequest::InspectRuntimePathAcl { path } => {
-                        let request_path = PathBuf::from(&path);
-                        validate_windows_secret_blob_path(
-                            request_path.as_path(),
-                            "inspect-runtime-path-acl path",
-                        )?;
-                        if request_path != secret_blob_for_server {
-                            return Err(format!(
-                                "inspect-runtime-path-acl request must stay pinned to the reviewed self-check secret blob {}; got {}",
-                                secret_blob_for_server.display(),
-                                request_path.display()
-                            ));
-                        }
-                        let sddl = inspect_file_sddl(request_path.as_path()).map_err(|err| {
-                            format!(
-                                "inspect-runtime-path-acl failed for {}: {err}",
-                                request_path.display()
-                            )
-                        })?;
-                        Ok(WindowsPrivilegedResponse::RuntimePathAcl { path, sddl })
-                    }
-                },
-            )
-        });
-
-        thread::sleep(Duration::from_millis(100));
         let timeout = Duration::from_millis(DEFAULT_SELF_CHECK_TIMEOUT_MS);
-        windows_ipc_probe(
-            pipe_path.as_path(),
-            WindowsLocalIpcRole::PrivilegedHelper,
-            timeout,
-        )?;
-        ipc_probe_ok = true;
 
-        let response = call_windows_privileged_request(
-            pipe_path.as_path(),
-            WindowsLocalIpcRole::PrivilegedHelper,
-            &WindowsPrivilegedRequest::InspectRuntimePathAcl {
-                path: secret_blob_path.display().to_string(),
-            },
-            timeout,
-        )?;
+        // The named-pipe server in `serve_windows_privileged_request_once`
+        // handles exactly one message and then disconnects.  The boundary
+        // check makes two calls (probe + inspect-runtime-path-acl), so
+        // each call needs its own freshly-spawned server.  Otherwise the
+        // second call hits CallNamedPipeW with ERROR_FILE_NOT_FOUND
+        // because the first call already consumed the only message.
+        //
+        // For each request: spawn the server, call the request with a
+        // retry that absorbs the spawn -> CreateNamedPipeW latency
+        // (Windows error 2 means "pipe doesn't exist yet"), then join.
+
+        // Step 1: probe
+        {
+            let pipe_path_for_server = pipe_path.clone();
+            let server = thread::spawn(move || {
+                serve_windows_privileged_request_once(
+                    pipe_path_for_server.as_path(),
+                    WindowsLocalIpcRole::PrivilegedHelper,
+                    None,
+                    |request| match request {
+                        WindowsPrivilegedRequest::Probe { protocol_version } => {
+                            Ok(WindowsPrivilegedResponse::ProbeAck { protocol_version })
+                        }
+                        other => Err(format!(
+                            "unexpected request during boundary-check probe: {other:?}"
+                        )),
+                    },
+                )
+            });
+            wait_for_pipe_then(timeout, pipe_path.as_path(), || {
+                windows_ipc_probe(
+                    pipe_path.as_path(),
+                    WindowsLocalIpcRole::PrivilegedHelper,
+                    timeout,
+                )
+            })?;
+            server.join().map_err(|_| {
+                "Windows privileged self-check probe server thread panicked".to_string()
+            })??;
+            ipc_probe_ok = true;
+        }
+
+        // Step 2: inspect-runtime-path-acl
+        let response = {
+            let pipe_path_for_server = pipe_path.clone();
+            let secret_blob_for_server = secret_blob_path.clone();
+            let server = thread::spawn(move || {
+                serve_windows_privileged_request_once(
+                    pipe_path_for_server.as_path(),
+                    WindowsLocalIpcRole::PrivilegedHelper,
+                    None,
+                    |request| match request {
+                        WindowsPrivilegedRequest::InspectRuntimePathAcl { path } => {
+                            let request_path = PathBuf::from(&path);
+                            validate_windows_secret_blob_path(
+                                request_path.as_path(),
+                                "inspect-runtime-path-acl path",
+                            )?;
+                            if request_path != secret_blob_for_server {
+                                return Err(format!(
+                                    "inspect-runtime-path-acl request must stay pinned to the reviewed self-check secret blob {}; got {}",
+                                    secret_blob_for_server.display(),
+                                    request_path.display()
+                                ));
+                            }
+                            let sddl =
+                                inspect_file_sddl(request_path.as_path()).map_err(|err| {
+                                    format!(
+                                        "inspect-runtime-path-acl failed for {}: {err}",
+                                        request_path.display()
+                                    )
+                                })?;
+                            Ok(WindowsPrivilegedResponse::RuntimePathAcl { path, sddl })
+                        }
+                        other => Err(format!(
+                            "unexpected request during boundary-check inspect: {other:?}"
+                        )),
+                    },
+                )
+            });
+            let response = wait_for_pipe_then(timeout, pipe_path.as_path(), || {
+                call_windows_privileged_request(
+                    pipe_path.as_path(),
+                    WindowsLocalIpcRole::PrivilegedHelper,
+                    &WindowsPrivilegedRequest::InspectRuntimePathAcl {
+                        path: secret_blob_path.display().to_string(),
+                    },
+                    timeout,
+                )
+            })?;
+            server.join().map_err(|_| {
+                "Windows privileged self-check inspect server thread panicked".to_string()
+            })??;
+            response
+        };
         match response {
             WindowsPrivilegedResponse::RuntimePathAcl { path, sddl } => {
                 if path != secret_blob_path.display().to_string() {
@@ -139,9 +183,6 @@ pub fn run_windows_runtime_boundary_check(
             }
         }
 
-        server
-            .join()
-            .map_err(|_| "Windows privileged self-check server thread panicked".to_string())??;
         Ok(())
     })();
 
@@ -165,6 +206,34 @@ pub fn run_windows_runtime_boundary_check(
         inspected_acl_path: secret_blob_path.display().to_string(),
         inspected_acl_sddl,
     })
+}
+
+/// Run `op` against a freshly-spawned named-pipe server, retrying when the
+/// underlying call returns Windows error 2 (ERROR_FILE_NOT_FOUND).  Used by
+/// the boundary check to absorb the spawn -> first CreateNamedPipeW latency
+/// without depending on platform-specific filesystem probing.
+fn wait_for_pipe_then<T>(
+    timeout: Duration,
+    pipe_path: &Path,
+    mut op: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + timeout.max(Duration::from_secs(1));
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.contains("Windows error 2") => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "Windows runtime-boundary check pipe was not ready within {:?}: {} ({err})",
+                        timeout,
+                        pipe_path.display()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn write_plaintext_seed_passphrase(path: &Path) -> Result<(), String> {

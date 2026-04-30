@@ -1241,6 +1241,17 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 config.trust_verifier_key_path = value.into();
                 index += 2;
             }
+            Some("--trust-max-age-secs") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--trust-max-age-secs requires a value".to_string())?;
+                let parsed = value
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid trust max age: {err}"))?;
+                config.trust_max_age_secs = NonZeroU64::new(parsed)
+                    .ok_or_else(|| "trust max age must be greater than 0".to_string())?;
+                index += 2;
+            }
             Some("--trust-watermark") => {
                 let value = args
                     .get(index + 1)

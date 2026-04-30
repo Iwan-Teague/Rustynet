@@ -331,6 +331,12 @@ function Get-ReviewedBackendState {
     elseif ($backendLabel -eq 'windows-unsupported') {
         $backendReason = 'windows-runtime-backend-explicitly-unsupported'
     }
+    elseif ($backendLabel -eq 'windows-wireguard-nt') {
+        # The opt-in reviewed Windows backend.  Bring-up uses
+        # WireGuard for Windows (wireguard.exe / wg.exe).  Treat as
+        # OK — empty backendReason signals "no blocker" upstream.
+        $backendReason = ''
+    }
     elseif ($backendLabel -in @(
             'linux-wireguard',
             'linux-wireguard-userspace-shared',
