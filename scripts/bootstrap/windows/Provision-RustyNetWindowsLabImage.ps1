@@ -201,14 +201,30 @@ if ($SkipRustup) {
     if (-not $needRustup) {
         Write-Host "[provision] rustup already present at $rustupExe; skipping install"
     } else {
+        # rustup-init.exe is platform-specific and the host triple it
+        # installs becomes the default for `rustup default stable`.  We
+        # MUST pick the installer that matches the running guest arch
+        # (ARM64 vs x86_64), otherwise cargo runs in the workspace see
+        # a host mismatch and fail with "cargo.exe is not installed for
+        # the toolchain 1.88.0-aarch64-pc-windows-msvc".  Detect from
+        # PROCESSOR_ARCHITECTURE / Win32_OperatingSystem.OSArchitecture.
+        $osArch = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
+        if ($osArch -match 'ARM' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+            $rustupHostTriple = 'aarch64-pc-windows-msvc'
+            $rustupInitUrl = 'https://win.rustup.rs/aarch64'
+        } else {
+            $rustupHostTriple = 'x86_64-pc-windows-msvc'
+            $rustupInitUrl = 'https://win.rustup.rs/x86_64'
+        }
+        Write-Host "[provision] guest OS arch '$osArch' -> rustup host triple $rustupHostTriple"
         $rustupInit = Join-Path $workRoot 'rustup-init.exe'
-        Invoke-WebDownload -Uri 'https://win.rustup.rs/x86_64' -OutFile $rustupInit
+        Invoke-WebDownload -Uri $rustupInitUrl -OutFile $rustupInit
         $rustupArgs = @(
             '-y',
             '--no-modify-path',
             '--default-toolchain', $RustToolchain,
             '--profile', 'minimal',
-            '--default-host', 'x86_64-pc-windows-msvc'
+            '--default-host', $rustupHostTriple
         )
         Write-Host "[provision] running rustup-init.exe $($rustupArgs -join ' ')"
         $proc = Start-Process -FilePath $rustupInit -ArgumentList $rustupArgs `
