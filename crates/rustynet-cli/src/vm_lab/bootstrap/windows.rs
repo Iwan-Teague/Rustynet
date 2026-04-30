@@ -38,17 +38,12 @@ fn render_windows_access_gate_error(
     )
 }
 
-fn local_utm_result_file_supported_for_phase(phase: BootstrapPhase, target: &RemoteTarget) -> bool {
-    matches!(
-        windows_local_utm_execution_authority(target, false),
-        Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
-    ) && matches!(
-        phase,
-        BootstrapPhase::BuildRelease
-            | BootstrapPhase::InstallRelease
-            | BootstrapPhase::RestartRuntime
-            | BootstrapPhase::VerifyRuntime
-    )
+fn local_utm_result_file_supported_for_phase(_phase: BootstrapPhase, _target: &RemoteTarget) -> bool {
+    // utmctl file push and pull are broken on Windows guests (OSStatus -2700 /
+    // Access is denied). The result-file mechanism relies on both, so it always
+    // stalls for the full timeout. Return false unconditionally to route all
+    // phases through capture_helper_output → SSH instead.
+    false
 }
 
 fn build_windows_build_release_report_paths(
@@ -1463,7 +1458,9 @@ mod tests {
     }
 
     #[test]
-    fn local_utm_result_file_support_covers_build_and_runtime_phases_on_windows_local_utm() {
+    fn local_utm_result_file_not_supported_because_utmctl_file_ops_broken_on_windows() {
+        // utmctl file push/pull fail with OSStatus -2700 on Windows guests.
+        // All phases must route through SSH regardless of target type.
         let target = RemoteTarget {
             label: "windows-utm-1".to_string(),
             ssh_target: "192.168.64.14".to_string(),
@@ -1477,19 +1474,19 @@ mod tests {
             remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_string()),
         };
 
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::BuildRelease,
             &target
         ));
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::InstallRelease,
             &target
         ));
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::RestartRuntime,
             &target
         ));
-        assert!(local_utm_result_file_supported_for_phase(
+        assert!(!local_utm_result_file_supported_for_phase(
             BootstrapPhase::VerifyRuntime,
             &target
         ));

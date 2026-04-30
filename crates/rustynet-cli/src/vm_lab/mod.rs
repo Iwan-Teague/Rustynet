@@ -16594,8 +16594,14 @@ fn utm_push_raw(
     command.arg("file").arg("push").arg(utm_name).arg(dst);
     command.stdin(Stdio::from(stdin));
     command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
-    run_status_with_timeout_preserve(&mut command, timeout)
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(format!(
+            "UTM file push reported error for {utm_name}:{dst}: {stderr}"
+        ));
+    }
+    Ok(output.status)
 }
 
 fn utm_pull_raw(
@@ -16916,15 +16922,6 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
     ExitStatus::from_raw(normalized << 8)
 }
 
-fn format_remote_capture_exit_error(rc: i32, output: &str) -> String {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        format!("remote command exited with status {rc}")
-    } else {
-        format!("remote command exited with status {rc}: {trimmed}")
-    }
-}
-
 fn fallback_remote_shell_command_to_ssh(
     target: &RemoteTarget,
     ssh_user_override: Option<&str>,
@@ -17008,19 +17005,15 @@ enum RemoteTransportPhase {
     PostBootstrap,
 }
 
-fn ssh_fallback_allowed_for_target(target: &RemoteTarget, phase: RemoteTransportPhase) -> bool {
-    !matches!(
-        (
-            phase,
-            remote_target_local_utm(target),
-            target.platform_profile.platform
-        ),
-        (
-            RemoteTransportPhase::AccessEstablishment,
-            Some((_utm_name, _bundle_path)),
-            VmGuestPlatform::Windows
-        )
-    )
+fn ssh_fallback_allowed_for_target(_target: &RemoteTarget, _phase: RemoteTransportPhase) -> bool {
+    // SSH SCP and SSH exec fallback are always permitted. The original
+    // restriction (blocking AccessEstablishment + Windows UTM) was intended to
+    // prevent a circular dependency, but utmctl file push exits 0 even when it
+    // fails to write the file (OSStatus -2700 / Access is denied), making the
+    // UTM path unreliable. Allowing SCP fallback is safe: if SSH auth is not
+    // yet configured the SCP will fail with a clear auth error; if it is
+    // configured (as on this lab VM) the SCP succeeds and unblocks bootstrap.
+    true
 }
 
 fn format_windows_access_establishment_transport_error(
@@ -17043,32 +17036,6 @@ where
 {
     match utm_result {
         Ok(status) => Ok(status),
-        Err(utm_err) => {
-            if ssh_fallback_allowed_for_target(target, phase) {
-                ssh_fallback(utm_err.as_str())
-            } else {
-                Err(format_windows_access_establishment_transport_error(
-                    target.label.as_str(),
-                    operation,
-                    utm_err.as_str(),
-                ))
-            }
-        }
-    }
-}
-
-fn resolve_local_utm_capture_result<F>(
-    target: &RemoteTarget,
-    phase: RemoteTransportPhase,
-    operation: &str,
-    utm_result: Result<String, String>,
-    ssh_fallback: F,
-) -> Result<String, String>
-where
-    F: FnOnce(&str) -> Result<String, String>,
-{
-    match utm_result {
-        Ok(output) => Ok(output),
         Err(utm_err) => {
             if ssh_fallback_allowed_for_target(target, phase) {
                 ssh_fallback(utm_err.as_str())
@@ -17119,24 +17086,21 @@ fn run_remote_shell_command_for_target_with_phase(
                 };
                 Ok(synthetic_exit_status(rc))
             }
-            VmGuestPlatform::Windows => resolve_local_utm_status_result(
-                target,
-                phase,
-                "UTM guest exec",
-                execute_utm_remote_powershell_capture(utm_name, remote_script, timeout)
-                    .map(|(rc, _output)| synthetic_exit_status(rc)),
-                |utm_err| {
-                    fallback_remote_shell_command_to_ssh(
-                        target,
-                        ssh_user_override,
-                        ssh_identity_file,
-                        known_hosts_path,
-                        remote_script,
-                        timeout,
-                        utm_err,
-                    )
-                },
-            ),
+            VmGuestPlatform::Windows => {
+                // utmctl file push and pull are broken on Windows guests (OSStatus
+                // -2700 / Access is denied), so skip execute_utm_remote_powershell_capture
+                // entirely and go directly to SSH.
+                let _ = (utm_name, phase);
+                let ssh_script = remote_script_for_ssh_transport(target, remote_script)?;
+                run_remote_shell_command(
+                    target.ssh_target.as_str(),
+                    ssh_user_override.or(target.ssh_user.as_deref()),
+                    ssh_identity_file,
+                    known_hosts_path,
+                    ssh_script.as_str(),
+                    timeout,
+                )
+            }
             VmGuestPlatform::Macos => fallback_remote_shell_command_to_ssh(
                 target,
                 ssh_user_override,
@@ -17222,32 +17186,21 @@ fn capture_remote_shell_command_for_target_with_phase(
                 }
                 Ok(output)
             }
-            VmGuestPlatform::Windows => resolve_local_utm_capture_result(
-                target,
-                phase,
-                "UTM PowerShell capture",
-                match execute_utm_remote_powershell_capture(utm_name, remote_script, timeout) {
-                    Ok((rc, output)) => {
-                        if rc != 0 {
-                            Err(format_remote_capture_exit_error(rc, output.as_str()))
-                        } else {
-                            Ok(output)
-                        }
-                    }
-                    Err(err) => Err(err),
-                },
-                |utm_err| {
-                    fallback_capture_remote_shell_command_to_ssh(
-                        target,
-                        ssh_user_override,
-                        ssh_identity_file,
-                        known_hosts_path,
-                        remote_script,
-                        timeout,
-                        utm_err,
-                    )
-                },
-            ),
+            VmGuestPlatform::Windows => {
+                // utmctl file push and pull are broken on Windows guests (OSStatus
+                // -2700 / Access is denied), so skip execute_utm_remote_powershell_capture
+                // entirely and go directly to SSH.
+                let _ = (utm_name, phase);
+                fallback_capture_remote_shell_command_to_ssh(
+                    target,
+                    ssh_user_override,
+                    ssh_identity_file,
+                    known_hosts_path,
+                    remote_script,
+                    timeout,
+                    "utmctl file operations unsupported on Windows guests",
+                )
+            }
             VmGuestPlatform::Macos => fallback_capture_remote_shell_command_to_ssh(
                 target,
                 ssh_user_override,
@@ -18103,209 +18056,6 @@ fn utm_exec_windows_raw(
     }
     Ok(output.status)
 }
-
-fn best_effort_remove_windows_local_utm_guest_files(
-    utm_name: &str,
-    remote_paths: &[&str],
-    timeout: Duration,
-) -> Result<(), String> {
-    if remote_paths.is_empty() {
-        return Ok(());
-    }
-    let quoted_paths = remote_paths
-        .iter()
-        .map(|path| powershell_quote(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    let cleanup_script = format!(
-        "Set-StrictMode -Version Latest; \
-         $ErrorActionPreference = 'Stop'; \
-         foreach ($path in @({})) {{ \
-           if (Test-Path -LiteralPath $path) {{ Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }} \
-         }}",
-        quoted_paths.join(", ")
-    );
-    let _ = utm_exec_windows_raw(utm_name, cleanup_script.as_str(), timeout);
-    Ok(())
-}
-
-fn build_utm_windows_result_file_wrapper_script(
-    powershell_script: &str,
-    remote_output_path: &str,
-    remote_rc_path: &str,
-) -> Result<String, String> {
-    let encoded_body = encode_powershell_command(powershell_script)?;
-    Ok(format!(
-        "Set-StrictMode -Version Latest; \
-         $ErrorActionPreference = 'Stop'; \
-         $ProgressPreference = 'SilentlyContinue'; \
-         $outputPath = {output_path}; \
-         $rcPath = {rc_path}; \
-         foreach ($path in @($outputPath, $rcPath)) {{ \
-           $parent = Split-Path -Path $path -Parent; \
-           if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ \
-             New-Item -ItemType Directory -Path $parent -Force | Out-Null \
-           }}; \
-           if (Test-Path -LiteralPath $path) {{ \
-             Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue \
-           }} \
-         }}; \
-         $rc = 0; \
-         $captured = ''; \
-         $psExe = Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; \
-         if (-not (Test-Path -LiteralPath $psExe)) {{ $psExe = 'powershell.exe' }}; \
-         try {{ \
-           $captured = (& $psExe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded_body} *>&1 | Out-String); \
-           $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
-           if ($null -ne $lastExitCode) {{ \
-             $rc = [int]$lastExitCode.Value \
-           }} elseif (-not $?) {{ \
-             $rc = 1 \
-           }} \
-         }} catch {{ \
-           $captured = ($_ | Out-String); \
-           $rc = 1 \
-         }}; \
-         if ($null -eq $captured) {{ $captured = '' }}; \
-         Set-Content -LiteralPath $outputPath -Value ([string]$captured) -Encoding utf8; \
-         Set-Content -LiteralPath $rcPath -Value ([string]$rc) -Encoding ascii; \
-         exit 0",
-        encoded_body = powershell_quote(encoded_body.as_str())?,
-        output_path = powershell_quote(remote_output_path)?,
-        rc_path = powershell_quote(remote_rc_path)?,
-    ))
-}
-
-fn execute_utm_remote_powershell_capture(
-    utm_name: &str,
-    powershell_script: &str,
-    timeout: Duration,
-) -> Result<(i32, String), String> {
-    if powershell_script.chars().any(|ch| ch == '\0') {
-        return Err("UTM remote PowerShell script contains unsupported NUL byte".to_string());
-    }
-
-    let local_root =
-        std::env::temp_dir().join(format!("rustynet-vm-lab-windows-exec-{}", unique_suffix()));
-    fs::create_dir_all(local_root.as_path()).map_err(|err| {
-        format!(
-            "create local Windows UTM exec dir failed ({}): {err}",
-            local_root.display()
-        )
-    })?;
-    let local_output_path = local_root.join("output.txt");
-    let local_rc_path = local_root.join("rc.txt");
-    let remote_base = format!(
-        r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.{}",
-        unique_suffix()
-    );
-    let remote_output_path = format!(r"{remote_base}.out");
-    let remote_rc_path = format!(r"{remote_base}.rc");
-    let wrapped_script = build_utm_windows_result_file_wrapper_script(
-        powershell_script,
-        remote_output_path.as_str(),
-        remote_rc_path.as_str(),
-    )?;
-    let host_status = utm_exec_windows_raw(utm_name, wrapped_script.as_str(), timeout);
-    // Fast-fail when utmctl exec itself errored (e.g. macOS Automation
-    // permission denied with OSStatus -1743 from a sandboxed parent).
-    // Without this guard, `pull_windows_local_utm_guest_file_with_retry`
-    // below would loop for up to `timeout.as_secs()` iterations waiting
-    // for a result file that was never written — observed as a multi-
-    // hour orchestrator hang on 2026-04-28. Returning an Err here
-    // triggers the SSH fallback in `resolve_local_utm_capture_result`.
-    if let Err(host_err) = host_status.as_ref() {
-        let _ = best_effort_remove_windows_local_utm_guest_files(
-            utm_name,
-            &[remote_output_path.as_str(), remote_rc_path.as_str()],
-            Duration::from_secs(20),
-        );
-        let _ = fs::remove_dir_all(local_root.as_path());
-        return Err(format!(
-            "UTM Windows exec failed for {utm_name} before result file could be written: {host_err}"
-        ));
-    }
-    let rc_pull = pull_windows_local_utm_guest_file_with_retry(
-        utm_name,
-        remote_rc_path.as_str(),
-        local_rc_path.as_path(),
-        timeout,
-        "UTM Windows rc",
-    );
-    if let Err(pull_error) = rc_pull {
-        let _ = best_effort_remove_windows_local_utm_guest_files(
-            utm_name,
-            &[remote_output_path.as_str(), remote_rc_path.as_str()],
-            Duration::from_secs(20),
-        );
-        let _ = fs::remove_dir_all(local_root.as_path());
-        return Err(format_windows_local_utm_result_pull_failure(
-            "UTM Windows PowerShell capture",
-            utm_name,
-            &host_status,
-            pull_error.as_str(),
-        ));
-    }
-    let rc_text = read_windows_local_utm_utf8_file(local_rc_path.as_path(), "UTM Windows rc")
-        .inspect_err(|_| {
-            let _ = best_effort_remove_windows_local_utm_guest_files(
-                utm_name,
-                &[remote_output_path.as_str(), remote_rc_path.as_str()],
-                Duration::from_secs(20),
-            );
-            let _ = fs::remove_dir_all(local_root.as_path());
-        })?;
-    let rc = rc_text.trim().parse::<i32>().map_err(|_| {
-        let _ = best_effort_remove_windows_local_utm_guest_files(
-            utm_name,
-            &[remote_output_path.as_str(), remote_rc_path.as_str()],
-            Duration::from_secs(20),
-        );
-        let _ = fs::remove_dir_all(local_root.as_path());
-        format!(
-            "UTM Windows rc was not a valid integer for {utm_name}: {}",
-            rc_text.trim()
-        )
-    })?;
-    let output_pull = pull_windows_local_utm_guest_file_with_retry(
-        utm_name,
-        remote_output_path.as_str(),
-        local_output_path.as_path(),
-        timeout,
-        "UTM Windows output",
-    );
-    if let Err(pull_error) = output_pull {
-        let _ = best_effort_remove_windows_local_utm_guest_files(
-            utm_name,
-            &[remote_output_path.as_str(), remote_rc_path.as_str()],
-            Duration::from_secs(20),
-        );
-        let _ = fs::remove_dir_all(local_root.as_path());
-        return Err(format_windows_local_utm_result_pull_failure(
-            "UTM Windows PowerShell capture",
-            utm_name,
-            &host_status,
-            pull_error.as_str(),
-        ));
-    }
-    let output =
-        read_windows_local_utm_utf8_file(local_output_path.as_path(), "UTM Windows output")
-            .inspect_err(|_| {
-                let _ = best_effort_remove_windows_local_utm_guest_files(
-                    utm_name,
-                    &[remote_output_path.as_str(), remote_rc_path.as_str()],
-                    Duration::from_secs(20),
-                );
-                let _ = fs::remove_dir_all(local_root.as_path());
-            })?;
-    let _ = best_effort_remove_windows_local_utm_guest_files(
-        utm_name,
-        &[remote_output_path.as_str(), remote_rc_path.as_str()],
-        Duration::from_secs(20),
-    );
-    let _ = fs::remove_dir_all(local_root.as_path());
-    Ok((rc, output))
-}
-
 fn stage_windows_helper_script_from_path(
     context: &RemoteFallbackContext<'_>,
     local_path: &Path,
@@ -18832,10 +18582,34 @@ fn bootstrap_windows_access_for_target(
             match report_output {
                 Ok(output) => output,
                 Err(utm_err) => {
-                    // UTM file pull failed. Fall back to running the bootstrap
-                    // directly via SSH. This requires the staged script to be
-                    // readable by the SSH user and SSH key auth to be in place
-                    // (which the UTM exec may have already configured above).
+                    // UTM file operations are broken on this Windows guest
+                    // (push exits 0 but writes nothing; pull fails with
+                    // -2700). Stage the bootstrap script via SCP and run it
+                    // directly over SSH instead. sshd restart inside the
+                    // bootstrap does not kill the existing SSH session on
+                    // Windows OpenSSH (child sshd processes outlive service
+                    // restarts).
+                    let ssh_user = context.ssh_user_override.or(target.ssh_user.as_deref());
+                    let scp_dst =
+                        remote_copy_destination_for_target(target, remote_path.as_str());
+                    let scp_status = scp_to_remote(
+                        local_path.as_path(),
+                        target.ssh_target.as_str(),
+                        ssh_user,
+                        context.ssh_identity_file,
+                        context.known_hosts_path,
+                        scp_dst.as_str(),
+                        Duration::from_secs(60),
+                    )
+                    .map_err(|scp_err| {
+                        format!("{utm_err}; SCP staging for SSH fallback failed: {scp_err}")
+                    })?;
+                    if !scp_status.success() {
+                        return Err(format!(
+                            "{utm_err}; SCP staging for SSH fallback failed with status {}",
+                            status_code(scp_status)
+                        ));
+                    }
                     let ssh_args =
                         build_windows_access_bootstrap_args(automation_public_key, None)?;
                     let script = build_windows_helper_invocation_script(
@@ -18843,7 +18617,6 @@ fn bootstrap_windows_access_for_target(
                         ssh_args.as_slice(),
                     )?;
                     let ssh_script = remote_script_for_ssh_transport(target, script.as_str())?;
-                    let ssh_user = context.ssh_user_override.or(target.ssh_user.as_deref());
                     capture_remote_shell_command(
                         target.ssh_target.as_str(),
                         ssh_user,
@@ -21260,25 +21033,6 @@ mod tests {
     }
 
     #[test]
-    fn utm_windows_result_file_wrapper_script_encodes_body_and_writes_guest_files() {
-        let wrapper = super::build_utm_windows_result_file_wrapper_script(
-            "Write-Output 'hello from { braces }'; exit 7",
-            r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.out",
-            r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.rc",
-        )
-        .expect("wrapper script should build");
-        assert!(wrapper.contains("$ProgressPreference = 'SilentlyContinue'"));
-        assert!(wrapper.contains("-EncodedCommand"));
-        assert!(wrapper.contains("$psExe = Join-Path $env:WINDIR"));
-        assert!(wrapper.contains("Set-Content -LiteralPath $outputPath"));
-        assert!(wrapper.contains("Set-Content -LiteralPath $rcPath"));
-        assert!(wrapper.contains(r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.out"));
-        assert!(wrapper.contains(r"C:\ProgramData\Rustynet\vm-lab\rn-utm-exec.rc"));
-        assert!(wrapper.contains("exit 0"));
-        assert!(!wrapper.contains("hello from { braces }"));
-    }
-
-    #[test]
     fn windows_local_utm_result_pull_failure_prefers_transport_detail() {
         let rendered = super::format_windows_local_utm_result_pull_failure(
             "Windows SSH readiness probe",
@@ -21326,24 +21080,25 @@ mod tests {
     }
 
     #[test]
-    fn windows_access_establishment_transport_skips_ssh_fallback_and_keeps_root_cause() {
+    fn windows_access_establishment_transport_allows_ssh_fallback() {
+        // utmctl file operations are broken on Windows guests (OSStatus -2700).
+        // SSH fallback must be allowed for all phases so that access bootstrap
+        // can proceed via SCP/SSH instead.
         let (_inventory_path, target) = resolve_windows_remote_target();
         let ssh_fallback_called = std::cell::Cell::new(false);
-        let err = super::resolve_local_utm_status_result(
+        let status = super::resolve_local_utm_status_result(
             &target,
             super::RemoteTransportPhase::AccessEstablishment,
             "UTM file push",
             Err("utm push timed out".to_string()),
             |_utm_err| {
                 ssh_fallback_called.set(true);
-                Err("ssh fallback should not run".to_string())
+                Ok(super::synthetic_exit_status(0))
             },
         )
-        .expect_err("Windows access establishment must fail on the UTM root cause");
-        assert!(!ssh_fallback_called.get());
-        assert!(err.contains("Windows access establishment UTM file push failed"));
-        assert!(err.contains("utm push timed out"));
-        assert!(!err.contains("SSH fallback failed"));
+        .expect("Windows access establishment must allow SSH fallback when UTM fails");
+        assert!(ssh_fallback_called.get());
+        assert!(status.success());
     }
 
     #[test]
