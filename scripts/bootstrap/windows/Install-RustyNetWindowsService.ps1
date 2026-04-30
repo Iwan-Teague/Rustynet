@@ -315,8 +315,26 @@ function Repair-RustyNetRuntimeAcl {
         throw "icacls /inheritance:r failed for $Path"
     }
 
-    $serviceGrant = if ($Directory) { "$ServiceIdentity`:(OI)(CI)(M)" } else { "$ServiceIdentity`:M" }
-    & icacls $Path /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" $serviceGrant | Out-Null
+    if ($Directory) {
+        # Inheritance MUST flow to children for Administrators and
+        # LocalSystem too — otherwise files the SYSTEM-running daemon
+        # creates under this directory inherit only the service-
+        # identity grant, and the daemon (running as LocalSystem) is
+        # then denied read/write/delete on its own files.  Observed
+        # symptom: rustynetd's runtime-boundary check creates
+        # boundary-check.passphrase.dpapi via DPAPI, then fails to
+        # scrub+delete it with "Access is denied (os error 5)" because
+        # the file's inherited ACL only had windows:(I)(F) +
+        # RustyNet:(I)(M).
+        $adminGrant = "$AdministratorsName`:(OI)(CI)(F)"
+        $systemGrant = "$LocalSystemName`:(OI)(CI)(F)"
+        $serviceGrant = "$ServiceIdentity`:(OI)(CI)(M)"
+    } else {
+        $adminGrant = "$AdministratorsName`:F"
+        $systemGrant = "$LocalSystemName`:F"
+        $serviceGrant = "$ServiceIdentity`:M"
+    }
+    & icacls $Path /grant:r $adminGrant $systemGrant $serviceGrant | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /grant:r failed for $Path"
     }
