@@ -408,8 +408,9 @@ fn run_windows_e2e_bootstrap(
          Start-Sleep -Seconds 8; \
          $svcStatus = (Get-Service -Name {svc_q} -ErrorAction SilentlyContinue).Status; \
          if ($svcStatus -ne 'Running') {{ \
-             $evtSrc = try {{ (Get-EventLog -LogName Application -Source 'RustyNet' -Newest 3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Message) -join ' | ' }} catch {{ 'no event log' }}; \
-             throw \"Service failed to reach Running state (status=$svcStatus): $evtSrc\" \
+             $scmEvt = try {{ (Get-EventLog -LogName System -Source 'Service Control Manager' -Newest 5 -ErrorAction SilentlyContinue | Where-Object {{ $_.Message -like '*RustyNet*' }} | Select-Object -ExpandProperty Message) -join ' | ' }} catch {{ '' }}; \
+             $directOut = (& {rustynetd_q} start 2>&1 | Select-Object -First 20) -join ' '; \
+             throw \"Service failed (status=$svcStatus) scm=[$scmEvt] direct=[$directOut]\" \
          }}",
     );
     run_remote_ps(conn, &bootstrap_script, Duration::from_secs(120))?;
