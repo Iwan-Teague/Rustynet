@@ -454,6 +454,9 @@ function Build-ReviewedDaemonArgsJson {
         '--trust-max-age-secs', '86400'
     ) | ConvertTo-Json -Compress)
 }
+# (--trust-max-age-secs is parsed by rustynetd's daemon command — added to
+# the CLI flag set in 4b23484+follow-on; threads through DaemonConfig and
+# is read by the trust preflight in run_daemon.)
 
 function Write-ReviewedEnvFile {
     param(
