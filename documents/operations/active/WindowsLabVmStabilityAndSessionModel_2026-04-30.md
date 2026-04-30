@@ -216,7 +216,7 @@ For the rebuilt guest:
 | RAM | 8 GB minimum | `cargo build --release` peaks at ~5–7 GB for this workspace |
 | CPU cores | 4 | balance between build throughput and host pressure |
 | Disk | 80 GB qcow2 | accommodates full Rust toolchain + VS BT + workspace + target/ |
-| Display | console enabled but no GPU acceleration | the warning we saw is the failure surface; we do not need GPU accel for headless build |
+| Display | console enabled, **GPU acceleration off** (final decision) | guest is a headless build/runtime node; nothing on the bootstrap or service-runtime path renders to the guest desktop. UTM GPU accel exists to accelerate interactive guest graphics — no caller. The "Suspend not supported when GPU acceleration enabled" warning is direct evidence of an unwanted failure surface. |
 | Suspend | enabled | matches "no GPU accel" line |
 | Network | shared (192.168.64.0/24) | matches inventory `last_known_network` |
 | Auto-login | on, for the lab user, even though we no longer need an Active session | safety net in case future changes regress to needing one |

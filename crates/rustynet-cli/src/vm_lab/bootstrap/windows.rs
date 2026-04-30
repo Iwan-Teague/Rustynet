@@ -393,6 +393,13 @@ fn parse_windows_build_release_report_output(
         format!("report_root={report_root}"),
     ];
     details.push(format!("exit_code={exit_code}"));
+    if let Some(scope) = parsed
+        .get("toolchain_scope")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    {
+        details.push(format!("toolchain_scope={scope}"));
+    }
     if let Some(stderr_tail) = stderr_tail {
         details.push(format!("stderr_tail={stderr_tail}"));
     }
