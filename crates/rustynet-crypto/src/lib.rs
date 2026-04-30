@@ -980,8 +980,14 @@ fn write_atomic_encrypted_key_file(
         return Err(CryptoError::Io);
     }
 
-    let parent_dir = std::fs::File::open(parent).map_err(|_| CryptoError::Io)?;
-    parent_dir.sync_all().map_err(|_| CryptoError::Io)?;
+    // Directory fsync is a no-op on Windows: FlushFileBuffers on a directory
+    // handle requires special access flags not provided by File::open, and the
+    // durability guarantee is enforced by the rename above.
+    #[cfg(unix)]
+    {
+        let parent_dir = std::fs::File::open(parent).map_err(|_| CryptoError::Io)?;
+        parent_dir.sync_all().map_err(|_| CryptoError::Io)?;
+    }
     Ok(())
 }
 
