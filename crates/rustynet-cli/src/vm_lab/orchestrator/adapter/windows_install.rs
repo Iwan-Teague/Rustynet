@@ -409,8 +409,9 @@ fn run_windows_e2e_bootstrap(
          $svcStatus = (Get-Service -Name {svc_q} -ErrorAction SilentlyContinue).Status; \
          if ($svcStatus -ne 'Running') {{ \
              $scmEvt = try {{ (Get-EventLog -LogName System -Source 'Service Control Manager' -Newest 5 -ErrorAction SilentlyContinue | Where-Object {{ $_.Message -like '*RustyNet*' }} | Select-Object -ExpandProperty Message) -join ' | ' }} catch {{ '' }}; \
-             $directOut = (& {rustynetd_q} start 2>&1 | Select-Object -First 20) -join ' '; \
-             throw \"Service failed (status=$svcStatus) scm=[$scmEvt] direct=[$directOut]\" \
+             $appEvt = try {{ (Get-EventLog -LogName Application -Newest 15 -ErrorAction SilentlyContinue | Where-Object {{ $_.Message -like '*rustynet*' -or $_.Source -like '*rustynet*' }} | Select-Object -ExpandProperty Message) -join ' | ' }} catch {{ '' }}; \
+             $svcExitCode = try {{ (Get-WmiObject win32_service -Filter \"Name={svc_q}\" -ErrorAction SilentlyContinue).ExitCode }} catch {{ 'unknown' }}; \
+             throw \"Service failed (status=$svcStatus exitCode=$svcExitCode) scm=[$scmEvt] app=[$appEvt]\" \
          }}",
     );
     run_remote_ps(conn, &bootstrap_script, Duration::from_secs(120))?;

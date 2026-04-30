@@ -8049,7 +8049,39 @@ fn detect_default_egress_interface() -> Result<String, String> {
     detect_route_interface("route", &["-n", "get", "default"])
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn detect_default_egress_interface() -> Result<String, String> {
+    // Use PowerShell Get-NetRoute to find the best default-route interface alias.
+    // The InterfaceAlias (e.g. "Ethernet 0") is the string the daemon uses for
+    // egress operations on Windows.
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object -Property RouteMetric | Select-Object -First 1).InterfaceAlias",
+        ])
+        .output()
+        .map_err(|err| format!("spawn powershell for egress detection failed: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "powershell egress detection failed: status={} stderr={stderr}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| "powershell egress detection returned non-utf8 output".to_string())?;
+    let interface = stdout.trim().to_string();
+    if interface.is_empty() {
+        return Err(
+            "powershell egress detection returned empty interface (no default route?)".to_string(),
+        );
+    }
+    Ok(interface)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn detect_default_egress_interface() -> Result<String, String> {
     Err("egress interface auto-detect is unsupported on this platform".to_string())
 }

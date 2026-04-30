@@ -1978,7 +1978,7 @@ fn fill_random_bytes(buf: &mut [u8]) -> Result<(), std::io::Error> {
     use rand::TryRngCore;
     rand::rngs::OsRng
         .try_fill_bytes(buf)
-        .map_err(|e| std::io::Error::other(e))
+        .map_err(std::io::Error::other)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
