@@ -220,12 +220,10 @@ pub fn install_daemon(
     );
     run_remote_ps(conn, &install_script, Duration::from_secs(120))?;
 
-    // Verify the binary is present before running e2e bootstrap.
+    // Verify the daemon binary is present before running e2e bootstrap.
     let verify_script = format!(
-        "if (-not (Test-Path -LiteralPath {})) {{ throw 'rustynetd.exe not found' }}; \
-         if (-not (Test-Path -LiteralPath {})) {{ throw 'rustynet.exe not found' }}",
+        "if (-not (Test-Path -LiteralPath {})) {{ throw 'rustynetd.exe not found' }}",
         ps_quote(WINDOWS_RUSTYNETD_PATH)?,
-        ps_quote(WINDOWS_RUSTYNET_PATH)?,
     );
     run_remote_ps(conn, &verify_script, SHORT_TIMEOUT)?;
 
@@ -300,8 +298,9 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
 
 // ── Windows e2e bootstrap ─────────────────────────────────────────────────────
 
-/// Generate WireGuard keys, membership state, and trust evidence on the Windows
-/// host. Mirrors the Linux `rustynet ops e2e-bootstrap-host` flow.
+/// Generate WireGuard keys, membership state, and trust evidence for a Windows host.
+/// Trust keys are generated locally on the orchestrator (rustynet-cli cannot compile
+/// on Windows due to std::os::unix::* imports) and SCP'd to the remote host.
 /// Called from `install_daemon` after the service binaries are installed.
 fn run_windows_e2e_bootstrap(
     conn: &NodeConnection,
@@ -323,14 +322,47 @@ fn run_windows_e2e_bootstrap(
         Some(NodeRole::Exit) => "admin",
         _ => "client",
     };
+    let _ = role_str;
 
+    // ── 1. Generate trust material locally ──────────────────────────────────
+    let (verifier_key_content, trust_evidence_content) =
+        generate_local_trust_material().map_err(|msg| AdapterError::Protocol { message: msg })?;
+
+    // Ensure trust directory exists on remote before SCP.
+    let trust_dir_q = ps_quote(r"C:\ProgramData\RustyNet\trust")?;
+    run_remote_ps(
+        conn,
+        &format!("New-Item -ItemType Directory -Force -Path {trust_dir_q} | Out-Null"),
+        SHORT_TIMEOUT,
+    )?;
+
+    let verifier_tmp =
+        write_temp_file("trust_verifier_", ".pub", verifier_key_content.as_bytes())?;
+    let evidence_tmp =
+        write_temp_file("trust_evidence_", ".dat", trust_evidence_content.as_bytes())?;
+
+    let scp_result = (|| {
+        ssh::scp_to(
+            conn,
+            &verifier_tmp,
+            &WINDOWS_TRUST_VERIFIER_KEY_PATH.replace('\\', "/"),
+            SHORT_TIMEOUT,
+        )?;
+        ssh::scp_to(
+            conn,
+            &evidence_tmp,
+            &WINDOWS_TRUST_EVIDENCE_PATH.replace('\\', "/"),
+            SHORT_TIMEOUT,
+        )
+    })();
+    let _ = std::fs::remove_file(&verifier_tmp);
+    let _ = std::fs::remove_file(&evidence_tmp);
+    scp_result?;
+
+    // ── 2. WireGuard key init + membership init + service start ─────────────
     let passphrase_q = ps_quote(WINDOWS_WG_PASSPHRASE_PATH)?;
     let rustynetd_q = ps_quote(WINDOWS_RUSTYNETD_PATH)?;
-    let rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?;
     let wg_binary_q = ps_quote(WINDOWS_WG_BINARY_PATH)?;
-    let trust_signing_key_q = ps_quote(WINDOWS_TRUST_SIGNING_KEY_PATH)?;
-    let trust_verifier_key_q = ps_quote(WINDOWS_TRUST_VERIFIER_KEY_PATH)?;
-    let trust_evidence_q = ps_quote(WINDOWS_TRUST_EVIDENCE_PATH)?;
     let node_id_q = ps_quote(&node_id)?;
     let network_id_q = ps_quote(network_id)?;
     let membership_owner_key_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_KEY_PATH)?;
@@ -338,7 +370,6 @@ fn run_windows_e2e_bootstrap(
     let membership_watermark_q = ps_quote(WINDOWS_MEMBERSHIP_WATERMARK_PATH)?;
     let membership_snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?;
     let svc_q = ps_quote(WINDOWS_SERVICE_NAME)?;
-    let _ = role_str; // used implicitly via node_id/network_id in membership init
 
     let bootstrap_script = format!(
         "$ErrorActionPreference = 'Stop'; \
@@ -363,22 +394,56 @@ fn run_windows_e2e_bootstrap(
              --network-id {network_id_q} \
              --force; \
          if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd membership init failed' }}; \
-         & {rustynet_q} trust keygen \
-             --signing-key-output {trust_signing_key_q} \
-             --signing-key-passphrase-file {passphrase_q} \
-             --verifier-key-output {trust_verifier_key_q} \
-             --force; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'rustynet trust keygen failed' }}; \
-         & {rustynet_q} trust issue \
-             --signing-key {trust_signing_key_q} \
-             --signing-key-passphrase-file {passphrase_q} \
-             --output {trust_evidence_q}; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'rustynet trust issue failed' }}; \
          Start-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
          Start-Sleep -Seconds 5",
     );
     run_remote_ps(conn, &bootstrap_script, Duration::from_secs(120))?;
     Ok(())
+}
+
+/// Generate an ed25519 trust signing key and matching trust evidence locally.
+/// Returns `(verifier_key_file_content, trust_evidence_file_content)`.
+fn generate_local_trust_material() -> Result<(String, String), String> {
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::{TryRngCore, rngs::OsRng};
+    use zeroize::Zeroize;
+
+    let mut seed = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut seed)
+        .map_err(|e| format!("OsRng seed failed: {e}"))?;
+    let mut nonce_bytes = [0u8; 8];
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|e| format!("OsRng nonce failed: {e}"))?;
+    let nonce = u64::from_le_bytes(nonce_bytes);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system time error: {e}"))?
+        .as_secs();
+
+    let signing_key = SigningKey::from_bytes(&seed);
+    let verifier_hex = encode_hex(signing_key.verifying_key().as_bytes());
+    let payload = format!(
+        "version=2\ntls13_valid=true\nsigned_control_valid=true\
+         \nsigned_data_age_secs=0\nclock_skew_secs=0\
+         \nupdated_at_unix={now}\nnonce={nonce}\n"
+    );
+    let signature = signing_key.sign(payload.as_bytes());
+    let evidence = format!("{payload}signature={}\n", encode_hex(&signature.to_bytes()));
+
+    let mut seed_zeroed = seed;
+    seed_zeroed.zeroize();
+
+    Ok((format!("{verifier_hex}\n"), evidence))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

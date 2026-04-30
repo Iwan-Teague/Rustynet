@@ -1406,7 +1406,7 @@ function Build-RustyNet {
     Push-Location $RustyNetRoot
     try {
         if ($null -eq $buildReportLayout) {
-            & $cargoCommand build --locked --release -p rustynetd -p rustynet-cli
+            & $cargoCommand build --locked --release -p rustynetd
             if ($LASTEXITCODE -ne 0) {
                 throw 'cargo build failed for Windows build-release'
             }
@@ -1414,7 +1414,7 @@ function Build-RustyNet {
         }
 
         $buildProcess = Start-Process -FilePath $cargoCommand `
-            -ArgumentList @('build', '--locked', '--release', '-p', 'rustynetd', '-p', 'rustynet-cli') `
+            -ArgumentList @('build', '--locked', '--release', '-p', 'rustynetd') `
             -WorkingDirectory $RustyNetRoot `
             -NoNewWindow `
             -Wait `
