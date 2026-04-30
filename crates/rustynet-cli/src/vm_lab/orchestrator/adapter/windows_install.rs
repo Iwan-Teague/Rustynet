@@ -384,6 +384,8 @@ fn run_windows_e2e_bootstrap(
          if ($LASTEXITCODE -ne 0) {{ throw \"takeown state-root failed (exit $LASTEXITCODE)\" }}; \
          icacls.exe 'C:\\ProgramData\\RustyNet' /grant:r \"${{buser}}:(OI)(CI)(F)\" /T; \
          if ($LASTEXITCODE -ne 0) {{ throw \"icacls state-root grant failed (exit $LASTEXITCODE)\" }}; \
+         icacls.exe 'C:\\ProgramData\\RustyNet' /setowner 'BUILTIN\\Administrators' /T; \
+         if ($LASTEXITCODE -ne 0) {{ Write-Warning \"icacls setowner failed (exit $LASTEXITCODE) - continuing\" }}; \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
          $keyInitOut = (& {rustynetd_q} key init --passphrase-file {passphrase_q} --force 2>&1) -join ' '; \

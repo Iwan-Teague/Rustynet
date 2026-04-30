@@ -260,7 +260,13 @@ fn store_windows_dpapi_passphrase_blob(path: &Path, plaintext: &[u8]) -> Result<
             )
         })?;
         validate_secret_file_security(path, "passphrase file", false)?;
-        validate_windows_runtime_acl(path, "passphrase file")
+        // Use local-secret ACL (not runtime ACL) for the post-write check: the blob
+        // may be created during SSH bootstrap where the creating process runs under
+        // the admin user's SSH token (not SYSTEM), so the file owner is the SSH user
+        // rather than BA/SY. DPAPI LocalMachine encryption + NTFS DACL are the
+        // enforced security guarantees; owner identity is checked at startup
+        // by validate_windows_runtime_startup_acls on the containing directories.
+        validate_windows_local_secret_acl(path, "passphrase file")
     })();
     if write_result.is_err() {
         let _ = remove_file_if_present(candidate.as_path());
