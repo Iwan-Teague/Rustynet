@@ -1975,8 +1975,10 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
 }
 
 fn fill_random_bytes(buf: &mut [u8]) -> Result<(), std::io::Error> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")?.read_exact(buf)
+    use rand::TryRngCore;
+    rand::rngs::OsRng
+        .try_fill_bytes(buf)
+        .map_err(|e| std::io::Error::other(e))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
