@@ -212,8 +212,24 @@ fn run() -> Result<(), String> {
 }
 
 fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
-    let config = parse_daemon_config(args)?;
-    run_daemon(config).map_err(|err| err.to_string())
+    rn_svc_trace(&format!("run_service_daemon_args enter: args={args:?}"));
+    let config = match parse_daemon_config(args) {
+        Ok(c) => {
+            rn_svc_trace("parse_daemon_config ok");
+            c
+        }
+        Err(err) => {
+            rn_svc_trace(&format!("parse_daemon_config err: {err}"));
+            return Err(err);
+        }
+    };
+    rn_svc_trace("run_daemon enter");
+    let result = run_daemon(config).map_err(|err| err.to_string());
+    match &result {
+        Ok(()) => rn_svc_trace("run_daemon exit ok"),
+        Err(err) => rn_svc_trace(&format!("run_daemon exit err: {err}")),
+    }
+    result
 }
 
 fn run_key_command(args: &[String]) -> Result<(), String> {
