@@ -380,6 +380,7 @@ fn run_windows_e2e_bootstrap(
          $rng.GetBytes($bytes); \
          $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
+         if (Test-Path {passphrase_q}) {{ takeown.exe /f {passphrase_q} | Out-Null; icacls.exe {passphrase_q} /grant:r 'BUILTIN\\Administrators:F' | Out-Null; }}; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
          icacls.exe {passphrase_q} /grant:r 'BUILTIN\\Administrators:F' /grant:r 'NT AUTHORITY\\SYSTEM:F'; \
          & {rustynetd_q} key init --passphrase-file {passphrase_q} --force; \
