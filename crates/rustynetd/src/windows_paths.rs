@@ -371,7 +371,14 @@ fn looks_like_windows_absolute_path(text: &str) -> bool {
 
 fn is_reviewed_runtime_path(normalized: &str) -> bool {
     let lowered = normalized.to_ascii_lowercase();
+    // Match the canonical state file (rustynetd.state under the state
+    // root) and the state root directory itself.  The bare state root
+    // is needed because run_windows_runtime_boundary_check validates
+    // it directly via this helper before walking into its subdirs;
+    // earlier the bare root was rejected even though every accepted
+    // subdir (config/log/trust/membership/keys/secret) lives under it.
     lowered == DEFAULT_WINDOWS_STATE_PATH.to_ascii_lowercase()
+        || lowered == DEFAULT_WINDOWS_STATE_ROOT.to_ascii_lowercase()
         || under_reviewed_root(lowered.as_str(), DEFAULT_WINDOWS_CONFIG_ROOT)
         || under_reviewed_root(lowered.as_str(), DEFAULT_WINDOWS_LOG_ROOT)
         || under_reviewed_root(lowered.as_str(), DEFAULT_WINDOWS_TRUST_ROOT)
@@ -413,6 +420,20 @@ mod tests {
         assert!(
             result.is_ok(),
             "reviewed program data path should validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_windows_runtime_file_path_accepts_state_root_itself() {
+        // run_windows_runtime_boundary_check validates state_root via the
+        // same helper before it descends into the subdirs; the bare root
+        // must be accepted or every Windows install fails closed at the
+        // boundary check.
+        let result =
+            validate_windows_runtime_file_path(Path::new(DEFAULT_WINDOWS_STATE_ROOT), "state root");
+        assert!(
+            result.is_ok(),
+            "default state root must validate: {result:?}"
         );
     }
 
