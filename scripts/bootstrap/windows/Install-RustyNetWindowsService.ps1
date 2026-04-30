@@ -579,7 +579,11 @@ $imagePath = [string]$serviceRuntime.image_path
 $serviceImagePathUsesWindowsService = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--windows-service'
 $serviceImagePathUsesEnvFile = Test-ImagePathContainsToken -ImagePath $imagePath -Token '--env-file'
 $serviceEnvFilePinned = Test-ImagePathContainsToken -ImagePath $imagePath -Token $configPath
-$backendLabel = 'windows-unsupported'
+# $backendLabel was set at the top of the script by Resolve-ReviewedBackendLabel
+# from the WireGuard probe and -ForceUnsupportedBackend.  Keep that value for
+# the report — overwriting it to 'windows-unsupported' here was a leftover that
+# made every install look blocked even when wireguard.exe was present and the
+# env file pinned --backend windows-wireguard-nt.
 $notes = @()
 if ($serviceConfigError) {
     $notes += 'service-config-error'
