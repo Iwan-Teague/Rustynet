@@ -14905,9 +14905,10 @@ fn remote_target_from_inventory_entry(
             .remote_temp_dir
             .clone()
             .or_else(|| Some(default_remote_temp_dir_for_profile(platform_profile))),
-        utm_staging_dir: entry.utm_staging_dir.clone().or_else(|| {
-            default_utm_staging_dir_for_profile(platform_profile, ssh_user.as_deref())
-        }),
+        utm_staging_dir: entry
+            .utm_staging_dir
+            .clone()
+            .or_else(|| default_utm_staging_dir_for_profile(platform_profile, ssh_user.as_deref())),
     }
 }
 
@@ -14925,10 +14926,7 @@ fn remote_target_from_raw_target(label: String, ssh_target: String) -> RemoteTar
             ssh_user.as_deref(),
         )),
         remote_temp_dir: Some(default_remote_temp_dir_for_profile(platform_profile)),
-        utm_staging_dir: default_utm_staging_dir_for_profile(
-            platform_profile,
-            ssh_user.as_deref(),
-        ),
+        utm_staging_dir: default_utm_staging_dir_for_profile(platform_profile, ssh_user.as_deref()),
     }
 }
 
@@ -16731,38 +16729,6 @@ fn ensure_utm_windows_dir(
     Ok(())
 }
 
-/// Push a local file into the Windows guest's UTM staging directory,
-/// ensuring the staging dir exists first. The destination path is the
-/// staging dir joined with `leaf_name` using a backslash separator.
-fn utm_push_to_windows_staging(
-    utm_name: &str,
-    staging_dir: &str,
-    src: &Path,
-    leaf_name: &str,
-    timeout: Duration,
-) -> Result<String, String> {
-    ensure_no_control_chars("UTM Windows staging dir", staging_dir)?;
-    ensure_no_control_chars("UTM Windows staging leaf", leaf_name)?;
-    if leaf_name.is_empty() {
-        return Err("UTM Windows staging leaf must not be empty".to_string());
-    }
-    let mkdir_timeout = timeout.min(Duration::from_secs(30));
-    ensure_utm_windows_dir(utm_name, staging_dir, mkdir_timeout)?;
-    let dst = if staging_dir.ends_with('\\') {
-        format!("{staging_dir}{leaf_name}")
-    } else {
-        format!("{staging_dir}\\{leaf_name}")
-    };
-    let status = utm_push_raw(utm_name, src, dst.as_str(), timeout)?;
-    if !status.success() {
-        return Err(format!(
-            "UTM Windows push to {utm_name}:{dst} exited with status {}",
-            status_code(status)
-        ));
-    }
-    Ok(dst)
-}
-
 fn utm_cleanup_exec_files(
     utm_name: &str,
     remote_script: &str,
@@ -17152,32 +17118,6 @@ fn format_windows_access_establishment_transport_error(
     cause: &str,
 ) -> String {
     format!("Windows access establishment {operation} failed for {target_label}: {cause}")
-}
-
-fn resolve_local_utm_status_result<F>(
-    target: &RemoteTarget,
-    phase: RemoteTransportPhase,
-    operation: &str,
-    utm_result: Result<ExitStatus, String>,
-    ssh_fallback: F,
-) -> Result<ExitStatus, String>
-where
-    F: FnOnce(&str) -> Result<ExitStatus, String>,
-{
-    match utm_result {
-        Ok(status) => Ok(status),
-        Err(utm_err) => {
-            if ssh_fallback_allowed_for_target(target, phase) {
-                ssh_fallback(utm_err.as_str())
-            } else {
-                Err(format_windows_access_establishment_transport_error(
-                    target.label.as_str(),
-                    operation,
-                    utm_err.as_str(),
-                ))
-            }
-        }
-    }
 }
 
 fn run_remote_shell_command_for_target_with_phase(
@@ -17665,7 +17605,34 @@ fn scp_to_remote(
         .arg("--")
         .arg(src.as_os_str())
         .arg(format!("{target}:{dst}"));
-    run_status_with_timeout(&mut command, timeout)
+    // Capture stderr.  The previous implementation routed it to /dev/null
+    // via run_status_with_timeout, which made every scp failure look like
+    // a silent multi-second hang to the orchestrator.  Surfacing the last
+    // few stderr lines on non-zero exit makes auth, host-key, and
+    // connection-reset failures self-diagnosing.
+    let output = run_output_with_timeout(&mut command, timeout)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!(
+            "scp to {target}:{dst} failed with status {}: {}",
+            status_code(output.status),
+            if tail.is_empty() {
+                "(no stderr)"
+            } else {
+                tail.as_str()
+            }
+        ));
+    }
+    Ok(output.status)
 }
 
 fn scp_from_remote(
@@ -18226,9 +18193,7 @@ fn windows_guest_path_join(root: &str, file_name: &str) -> Result<String, String
 /// an empty string when the path has no parent (single component or empty).
 /// Tolerates both `\` and `/` separators.
 fn windows_guest_parent_dir(path: &str) -> Option<String> {
-    let last = path
-        .rfind(|ch: char| ch == '\\' || ch == '/')
-        .filter(|idx| *idx > 0)?;
+    let last = path.rfind(['\\', '/']).filter(|idx| *idx > 0)?;
     Some(path[..last].to_string())
 }
 
@@ -18423,7 +18388,11 @@ fn execute_utm_remote_powershell_capture(
     })?;
     let local_output_path = local_root.join("output.txt");
     let local_rc_path = local_root.join("rc.txt");
-    let separator = if staging_dir.ends_with('\\') { "" } else { "\\" };
+    let separator = if staging_dir.ends_with('\\') {
+        ""
+    } else {
+        "\\"
+    };
     let unique = unique_suffix();
     let remote_output_path = format!("{staging_dir}{separator}rn-utm-exec.{unique}.out");
     let remote_rc_path = format!("{staging_dir}{separator}rn-utm-exec.{unique}.rc");
@@ -18480,14 +18449,14 @@ fn execute_utm_remote_powershell_capture(
         return Err(pull_failure_msg);
     }
 
-    let rc_text =
-        match read_windows_local_utm_utf8_file(local_rc_path.as_path(), "UTM Windows rc") {
-            Ok(text) => text,
-            Err(err) => {
-                cleanup(local_root.as_path());
-                return Err(err);
-            }
-        };
+    let rc_text = match read_windows_local_utm_utf8_file(local_rc_path.as_path(), "UTM Windows rc")
+    {
+        Ok(text) => text,
+        Err(err) => {
+            cleanup(local_root.as_path());
+            return Err(err);
+        }
+    };
     let rc = match rc_text.trim().parse::<i32>() {
         Ok(rc) => rc,
         Err(_) => {
@@ -19064,8 +19033,7 @@ fn bootstrap_windows_access_for_target(
                     // Windows OpenSSH (child sshd processes outlive service
                     // restarts).
                     let ssh_user = context.ssh_user_override.or(target.ssh_user.as_deref());
-                    let scp_dst =
-                        remote_copy_destination_for_target(target, remote_path.as_str());
+                    let scp_dst = remote_copy_destination_for_target(target, remote_path.as_str());
                     let scp_status = scp_to_remote(
                         local_path.as_path(),
                         target.ssh_target.as_str(),
@@ -19099,9 +19067,7 @@ fn bootstrap_windows_access_for_target(
                         ssh_script.as_str(),
                         context.timeout,
                     )
-                    .map_err(|ssh_err| {
-                        format!("{utm_err}; SSH fallback also failed: {ssh_err}")
-                    })?
+                    .map_err(|ssh_err| format!("{utm_err}; SSH fallback also failed: {ssh_err}"))?
                 }
             }
         }
@@ -21562,65 +21528,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn windows_access_establishment_transport_allows_ssh_fallback() {
-        // utmctl file operations are broken on Windows guests (OSStatus -2700).
-        // SSH fallback must be allowed for all phases so that access bootstrap
-        // can proceed via SCP/SSH instead.
-        let (_inventory_path, target) = resolve_windows_remote_target();
-        let ssh_fallback_called = std::cell::Cell::new(false);
-        let status = super::resolve_local_utm_status_result(
-            &target,
-            super::RemoteTransportPhase::AccessEstablishment,
-            "UTM file push",
-            Err("utm push timed out".to_string()),
-            |_utm_err| {
-                ssh_fallback_called.set(true);
-                Ok(super::synthetic_exit_status(0))
-            },
-        )
-        .expect("Windows access establishment must allow SSH fallback when UTM fails");
-        assert!(ssh_fallback_called.get());
-        assert!(status.success());
-    }
-
-    #[test]
-    fn windows_post_bootstrap_transport_preserves_ssh_fallback() {
-        let (_inventory_path, target) = resolve_windows_remote_target();
-        let ssh_fallback_called = std::cell::Cell::new(false);
-        let status = super::resolve_local_utm_status_result(
-            &target,
-            super::RemoteTransportPhase::PostBootstrap,
-            "UTM guest exec",
-            Err("utm exec failed".to_string()),
-            |_utm_err| {
-                ssh_fallback_called.set(true);
-                Ok(super::synthetic_exit_status(0))
-            },
-        )
-        .expect("post-bootstrap Windows transport should still allow SSH fallback");
-        assert!(ssh_fallback_called.get());
-        assert!(status.success());
-    }
-
-    #[test]
-    fn linux_transport_preserves_ssh_fallback_in_access_phase() {
-        let (_inventory_path, target) = resolve_platform_remote_target("linux");
-        let ssh_fallback_called = std::cell::Cell::new(false);
-        let status = super::resolve_local_utm_status_result(
-            &target,
-            super::RemoteTransportPhase::AccessEstablishment,
-            "UTM guest exec",
-            Err("utm exec failed".to_string()),
-            |_utm_err| {
-                ssh_fallback_called.set(true);
-                Ok(super::synthetic_exit_status(0))
-            },
-        )
-        .expect("non-Windows fallback behavior should remain unchanged");
-        assert!(ssh_fallback_called.get());
-        assert!(status.success());
-    }
+    // Note: tests for `resolve_local_utm_status_result` were removed in the
+    // commit that restored the UTM control channel.  The SSH-fallback logic
+    // that helper used to wrap is now inlined directly in
+    // `run_remote_shell_command_for_target_with_phase` and
+    // `capture_remote_shell_command_for_target_with_phase`.  Coverage for
+    // the new inline paths is via integration runs against the live VM.
 
     #[test]
     fn windows_ssh_readiness_result_script_writes_json_without_capture_markers() {

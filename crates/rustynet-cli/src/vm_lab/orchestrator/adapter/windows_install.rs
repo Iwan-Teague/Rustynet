@@ -27,20 +27,15 @@ pub const WINDOWS_MEMBERSHIP_SNAPSHOT_PATH: &str =
 // Paths written by the e2e bootstrap sequence.
 const WINDOWS_WG_PASSPHRASE_PATH: &str =
     r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi";
-const WINDOWS_MEMBERSHIP_LOG_PATH: &str =
-    r"C:\ProgramData\RustyNet\membership\membership.log";
+const WINDOWS_MEMBERSHIP_LOG_PATH: &str = r"C:\ProgramData\RustyNet\membership\membership.log";
 const WINDOWS_MEMBERSHIP_WATERMARK_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.watermark";
 const WINDOWS_MEMBERSHIP_OWNER_KEY_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.owner.key";
-const WINDOWS_TRUST_SIGNING_KEY_PATH: &str =
-    r"C:\ProgramData\RustyNet\trust\trust-evidence.key";
-const WINDOWS_TRUST_VERIFIER_KEY_PATH: &str =
-    r"C:\ProgramData\RustyNet\trust\trust-evidence.pub";
-const WINDOWS_TRUST_EVIDENCE_PATH: &str =
-    r"C:\ProgramData\RustyNet\trust\rustynetd.trust";
-const WINDOWS_WG_BINARY_PATH: &str =
-    r"C:\Program Files\WireGuard\wg.exe";
+const WINDOWS_TRUST_SIGNING_KEY_PATH: &str = r"C:\ProgramData\RustyNet\trust\trust-evidence.key";
+const WINDOWS_TRUST_VERIFIER_KEY_PATH: &str = r"C:\ProgramData\RustyNet\trust\trust-evidence.pub";
+const WINDOWS_TRUST_EVIDENCE_PATH: &str = r"C:\ProgramData\RustyNet\trust\rustynetd.trust";
+const WINDOWS_WG_BINARY_PATH: &str = r"C:\Program Files\WireGuard\wg.exe";
 
 static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1");
@@ -336,8 +331,7 @@ fn run_windows_e2e_bootstrap(
         SHORT_TIMEOUT,
     )?;
 
-    let verifier_tmp =
-        write_temp_file("trust_verifier_", ".pub", verifier_key_content.as_bytes())?;
+    let verifier_tmp = write_temp_file("trust_verifier_", ".pub", verifier_key_content.as_bytes())?;
     let evidence_tmp =
         write_temp_file("trust_evidence_", ".dat", trust_evidence_content.as_bytes())?;
 
