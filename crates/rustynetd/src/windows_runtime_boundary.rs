@@ -105,7 +105,25 @@ pub fn run_windows_runtime_boundary_check(
             )
         });
 
-        thread::sleep(Duration::from_millis(100));
+        // Wait for the server thread to actually create the pipe.
+        // CallNamedPipeW returns ERROR_FILE_NOT_FOUND (Windows error 2)
+        // immediately when the pipe doesn't exist — its timeout argument
+        // only covers the "exists but busy" case.  A fixed sleep races
+        // on slow guests; instead, poll for pipe existence with a small
+        // budget.
+        let pipe_ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::metadata(pipe_path.as_path()).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= pipe_ready_deadline {
+                return Err(format!(
+                    "Windows runtime-boundary check pipe was not created by the server thread within 5s: {}",
+                    pipe_path.display()
+                ));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         let timeout = Duration::from_millis(DEFAULT_SELF_CHECK_TIMEOUT_MS);
         windows_ipc_probe(
             pipe_path.as_path(),
