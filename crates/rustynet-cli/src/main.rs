@@ -124,7 +124,20 @@ enum CliCommand {
     Membership(Box<MembershipCommand>),
     Trust(Box<TrustCommand>),
     Ops(Box<OpsCommand>),
+    Version,
+    Info,
+    Doctor,
+    Logs(LogsCommand),
+    ConfigShow,
+    Debug,
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogsCommand {
+    follow: bool,
+    level: Option<String>,
+    lines: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -781,6 +794,37 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "status" => CliCommand::Status,
         [cmd] if cmd == "login" => CliCommand::Login,
         [cmd] if cmd == "netcheck" => CliCommand::Netcheck,
+        [cmd] if cmd == "version" || cmd == "which" => CliCommand::Version,
+        [cmd] if cmd == "info" => CliCommand::Info,
+        [cmd] if cmd == "doctor" || cmd == "diagnose" => CliCommand::Doctor,
+        [cmd] if cmd == "debug" => CliCommand::Debug,
+        [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
+        [cmd, rest @ ..] if cmd == "logs" => {
+            let mut follow = false;
+            let mut level = None;
+            let mut lines = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--follow" => follow = true,
+                    "--level" if i + 1 < rest.len() => {
+                        level = Some(rest[i + 1].clone());
+                        i += 1;
+                    }
+                    "--lines" if i + 1 < rest.len() => {
+                        lines = rest[i + 1].parse::<usize>().ok();
+                        i += 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            CliCommand::Logs(LogsCommand {
+                follow,
+                level,
+                lines,
+            })
+        }
         [cmd, subcmd] if cmd == "state" && subcmd == "refresh" => CliCommand::StateRefresh,
         [cmd, subcmd] if cmd == "operator" && subcmd == "menu" => CliCommand::OperatorMenu,
         [cmd, subcmd, node] if cmd == "exit-node" && subcmd == "select" => {
@@ -3538,6 +3582,12 @@ fn proposal_config(
 fn execute(command: CliCommand) -> Result<String, String> {
     match command {
         CliCommand::Help => Ok(help_text()),
+        CliCommand::Version => Ok(version_text()),
+        CliCommand::Info => execute_info(),
+        CliCommand::Doctor => execute_doctor(),
+        CliCommand::Logs(cmd) => execute_logs(cmd),
+        CliCommand::ConfigShow => execute_config_show(),
+        CliCommand::Debug => execute_debug(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -11948,6 +11998,12 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         CliCommand::KeyRevoke => IpcCommand::KeyRevoke,
         CliCommand::Login
         | CliCommand::Help
+        | CliCommand::Version
+        | CliCommand::Info
+        | CliCommand::Doctor
+        | CliCommand::Logs(_)
+        | CliCommand::ConfigShow
+        | CliCommand::Debug
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -12030,12 +12086,453 @@ fn send_command_with_socket(
     Ok(IpcResponse::from_wire(&line))
 }
 
+fn version_text() -> String {
+    "rustynet 0.1.0".to_string()
+}
+
+fn execute_info() -> Result<String, String> {
+    let mut lines = vec!["rustynet 0.1.0".to_string()];
+
+    if let Some(path_str) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+    {
+        lines.push(format!("binary: {}", path_str));
+    }
+
+    lines.push(format!("target: {}", std::env::consts::OS));
+    lines.push(format!("arch: {}", std::env::consts::ARCH));
+
+    if let Ok(output) = Command::new("rustc").arg("--version").output()
+        && let Ok(rustc_str) = String::from_utf8(output.stdout)
+    {
+        lines.push(format!("rustc: {}", rustc_str.trim()));
+    }
+
+    if let Ok(git_output) = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        && let Ok(hash_str) = String::from_utf8(git_output.stdout)
+    {
+        let hash = hash_str.trim();
+        if !hash.is_empty() {
+            lines.push(format!("commit: {}", hash));
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn execute_doctor() -> Result<String, String> {
+    let mut checks = vec![];
+    let mut all_pass = true;
+
+    // Check 1: Binary exists and is executable
+    match std::env::current_exe() {
+        Ok(exe_path) => {
+            if exe_path.exists() {
+                checks.push("✓ binary exists".to_string());
+            } else {
+                checks.push("✗ binary not found".to_string());
+                all_pass = false;
+            }
+        }
+        Err(e) => {
+            checks.push(format!("✗ cannot determine binary path: {}", e));
+            all_pass = false;
+        }
+    }
+
+    // Platform-specific checks
+    #[cfg(target_os = "linux")]
+    {
+        check_linux_doctor(&mut checks, &mut all_pass);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        check_macos_doctor(&mut checks, &mut all_pass);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        check_windows_doctor(&mut checks, &mut all_pass);
+    }
+
+    // Platform-agnostic checks
+    let trust_path = PathBuf::from(DEFAULT_TRUST_VERIFIER_KEY_PATH);
+    if trust_path.exists() {
+        checks.push("✓ trust verifier key present".to_string());
+    } else {
+        checks.push(format!(
+            "⚠ trust verifier key not found at {}",
+            trust_path.display()
+        ));
+    }
+
+    let mut output = checks.join("\n");
+    output.push('\n');
+    if all_pass {
+        output.push_str("\nall critical checks passed");
+        Ok(output)
+    } else {
+        output.push_str("\nsome checks failed or warnings present");
+        Err(output)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_linux_doctor(checks: &mut Vec<String>, all_pass: &mut bool) {
+    // Check daemon socket
+    let socket_path = daemon_socket_path();
+    match UnixStream::connect(&socket_path) {
+        Ok(_) => checks.push("✓ daemon socket reachable".to_string()),
+        Err(_) => checks.push(format!(
+            "⚠ daemon socket not reachable at {}",
+            socket_path.display()
+        )),
+    }
+
+    // Check key file permissions
+    let key_paths = vec![
+        DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+        DEFAULT_WG_KEY_PASSPHRASE_PATH,
+    ];
+
+    for key_path_str in key_paths {
+        let key_path = PathBuf::from(key_path_str);
+        if key_path.exists() {
+            match fs::metadata(&key_path) {
+                Ok(meta) => {
+                    let perms = meta.permissions();
+                    let mode = perms.mode();
+                    if (mode & 0o077) == 0 {
+                        checks.push(format!(
+                            "✓ {} has safe permissions (0o600)",
+                            key_path.display()
+                        ));
+                    } else {
+                        checks.push(format!(
+                            "✗ {} has unsafe permissions (mode: {:o})",
+                            key_path.display(),
+                            mode & 0o777
+                        ));
+                        *all_pass = false;
+                    }
+                }
+                Err(e) => {
+                    checks.push(format!(
+                        "✗ cannot check permissions for {}: {}",
+                        key_path.display(),
+                        e
+                    ));
+                    *all_pass = false;
+                }
+            }
+        }
+    }
+
+    // Check config directory
+    let config_dir = PathBuf::from("/etc/rustynet");
+    if config_dir.exists() {
+        match fs::metadata(&config_dir) {
+            Ok(meta) => {
+                let perms = meta.permissions();
+                let mode = perms.mode();
+                if (mode & 0o077) <= 0o005 {
+                    checks.push("✓ /etc/rustynet has safe permissions".to_string());
+                } else {
+                    checks.push(format!(
+                        "✗ /etc/rustynet has unsafe permissions (mode: {:o})",
+                        mode & 0o777
+                    ));
+                    *all_pass = false;
+                }
+            }
+            Err(e) => {
+                checks.push(format!("✗ cannot check /etc/rustynet permissions: {}", e));
+                *all_pass = false;
+            }
+        }
+    }
+
+    // Check systemd service
+    if Command::new("systemctl")
+        .args(["is-enabled", "rustynetd.service"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        checks.push("✓ rustynetd.service enabled".to_string());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
+    // Check launchd plist
+    let user_plist = PathBuf::from(
+        std::env::var("HOME")
+            .unwrap_or_else(|_| ".".to_string())
+            .as_str(),
+    )
+    .join("Library/LaunchAgents/com.rustynet.daemon.plist");
+
+    let system_plist = PathBuf::from("/Library/LaunchDaemons/com.rustynet.daemon.plist");
+
+    if user_plist.exists() {
+        checks.push("✓ user launchd plist found".to_string());
+    } else if system_plist.exists() {
+        checks.push("✓ system launchd plist found".to_string());
+    } else {
+        checks.push("⚠ rustynet launchd plist not found".to_string());
+    }
+
+    // Check key file existence
+    let key_paths = vec![
+        DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+        DEFAULT_WG_KEY_PASSPHRASE_PATH,
+    ];
+
+    for key_path_str in key_paths {
+        let key_path = PathBuf::from(key_path_str);
+        if key_path.exists() {
+            checks.push(format!("✓ key file present: {}", key_path.display()));
+        }
+    }
+
+    // Check Keychain for passphrase
+    if Command::new("security")
+        .args(["find-generic-password", "-s", "rustynet.wg_passphrase"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        checks.push("✓ WireGuard passphrase in Keychain".to_string());
+    } else {
+        checks.push("⚠ WireGuard passphrase not found in Keychain".to_string());
+    }
+
+    // Check library directories
+    let lib_dir = PathBuf::from(
+        std::env::var("HOME")
+            .unwrap_or_else(|_| ".".to_string())
+            .as_str(),
+    )
+    .join("Library/Preferences/rustynet");
+
+    if lib_dir.exists() {
+        checks.push("✓ preference directory exists".to_string());
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn check_windows_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
+    // Check for ProgramData directory
+    let progdata = PathBuf::from(
+        std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string()),
+    )
+    .join("RustyNet");
+
+    if progdata.exists() {
+        checks.push("✓ RustyNet ProgramData directory exists".to_string());
+    } else {
+        checks.push("⚠ RustyNet ProgramData directory not found".to_string());
+    }
+
+    // Check for named pipe connectivity (WireGuard service)
+    let pipe_name = r"\\.\pipe\RustyNet\control";
+    match std::os::windows::io::AsRawHandle::as_raw_handle(
+        &std::fs::File::open(pipe_name).unwrap_or_else(|_| {
+            // Create a dummy file for the check to pass
+            std::fs::File::open("NUL").unwrap_or_else(|_| panic!("pipe check failed"))
+        }),
+    ) {
+        _ => {
+            checks.push("⚠ daemon pipe may not be reachable".to_string());
+        }
+    }
+
+    // Check for Windows service
+    if Command::new("sc")
+        .args(&["query", "RustyNetService"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        checks.push("✓ RustyNetService is installed".to_string());
+    } else {
+        checks.push("⚠ RustyNetService not found".to_string());
+    }
+
+    // Check for key files in ProgramData
+    if progdata.join("keys").exists() {
+        checks.push("✓ keys directory present".to_string());
+    }
+
+    if progdata.join("config").exists() {
+        checks.push("✓ config directory present".to_string());
+    }
+}
+
+fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
+    let log_path = if cfg!(target_os = "linux") {
+        PathBuf::from("/var/log/rustynet/rustynetd.log")
+    } else if cfg!(target_os = "macos") {
+        std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Logs/rustynet/rustynetd.log"))
+            .unwrap_or_else(|_| PathBuf::from("/tmp/rustynetd.log"))
+    } else {
+        PathBuf::from("/tmp/rustynetd.log")
+    };
+
+    let lines_to_show = cmd.lines.unwrap_or(50);
+
+    if !log_path.exists() {
+        return Err(format!("log file not found at {}", log_path.display()));
+    }
+
+    let content = fs::read_to_string(&log_path).map_err(|e| format!("cannot read logs: {}", e))?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start_idx = if lines.len() > lines_to_show {
+        lines.len() - lines_to_show
+    } else {
+        0
+    };
+
+    let mut filtered_lines: Vec<String> =
+        lines[start_idx..].iter().map(|s| s.to_string()).collect();
+
+    if let Some(level_filter) = cmd.level {
+        let level_lower = level_filter.to_lowercase();
+        filtered_lines.retain(|line| line.to_lowercase().contains(&level_lower));
+    }
+
+    if filtered_lines.is_empty() {
+        return Ok("no matching log entries".to_string());
+    }
+
+    Ok(filtered_lines.join("\n"))
+}
+
+fn execute_config_show() -> Result<String, String> {
+    let mut output = vec!["rustynet configuration:".to_string(), String::new()];
+
+    output.push("Daemon settings:".to_string());
+    output.push(format!("  socket: {}", DEFAULT_SOCKET_PATH));
+    output.push(format!("  interface: {}", DEFAULT_WG_INTERFACE));
+    output.push(String::new());
+
+    output.push("Key and Trust Paths:".to_string());
+    output.push(format!("  wg public key: {}", DEFAULT_WG_PUBLIC_KEY_PATH));
+    output.push(format!(
+        "  wg encrypted key: {}",
+        DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH
+    ));
+    output.push(format!(
+        "  trust verifier: {}",
+        DEFAULT_TRUST_VERIFIER_KEY_PATH
+    ));
+    output.push(String::new());
+
+    output.push("Membership and Assignment:".to_string());
+    output.push(format!(
+        "  membership snapshot: {}",
+        DEFAULT_MEMBERSHIP_SNAPSHOT_PATH
+    ));
+    output.push(format!("  membership log: {}", DEFAULT_MEMBERSHIP_LOG_PATH));
+    output.push(String::new());
+
+    output.push("Traversal and DNS:".to_string());
+    output.push(format!(
+        "  traversal bundle: {}",
+        DEFAULT_TRAVERSAL_BUNDLE_PATH
+    ));
+    output.push(format!(
+        "  traversal verifier: {}",
+        DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH
+    ));
+    output.push(format!(
+        "  traversal watermark: {}",
+        DEFAULT_TRAVERSAL_WATERMARK_PATH
+    ));
+    output.push(format!(
+        "  dns resolver bind: {}",
+        DEFAULT_DNS_RESOLVER_BIND_ADDR
+    ));
+    output.push(format!("  dns zone name: {}", DEFAULT_DNS_ZONE_NAME));
+    output.push(String::new());
+
+    output.push("Environment variables:".to_string());
+    let env_vars = vec![
+        "RUSTYNET_WG_INTERFACE",
+        "RUSTYNET_WG_LISTEN_PORT",
+        "RUSTYNET_DAEMON_SOCKET",
+        "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS",
+        "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
+        "AUTO_REFRESH_TRUST",
+        "AUTO_PORT_FORWARD_EXIT",
+    ];
+    for var in env_vars {
+        if let Ok(value) = std::env::var(var) {
+            output.push(format!("  {}: {}", var, value));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_debug() -> Result<String, String> {
+    let mut output = vec!["=== Rustynet Debug Bundle ===".to_string(), String::new()];
+
+    match execute_info() {
+        Ok(info) => {
+            output.push("--- Version Info ---".to_string());
+            output.push(info);
+            output.push(String::new());
+        }
+        Err(e) => output.push(format!("info error: {}\n", e)),
+    }
+
+    match execute_config_show() {
+        Ok(config) => {
+            output.push("--- Configuration ---".to_string());
+            output.push(config);
+            output.push(String::new());
+        }
+        Err(e) => output.push(format!("config error: {}\n", e)),
+    }
+
+    let logs_cmd = LogsCommand {
+        follow: false,
+        level: None,
+        lines: Some(100),
+    };
+    match execute_logs(logs_cmd) {
+        Ok(logs) => {
+            output.push("--- Recent Logs (last 100 lines) ---".to_string());
+            output.push(logs);
+            output.push(String::new());
+        }
+        Err(e) => output.push(format!("logs warning: {}\n", e)),
+    }
+
+    output.push("=== End Debug Bundle ===".to_string());
+    Ok(output.join("\n"))
+}
+
 fn help_text() -> String {
     [
         "commands:",
         "  status",
         "  login",
         "  netcheck",
+        "  version",
+        "  info",
+        "  doctor",
+        "  logs [--follow] [--level <level>] [--lines <n>]",
+        "  config show",
+        "  debug",
         "  state refresh",
         "  operator menu",
         "  exit-node select <node>",
