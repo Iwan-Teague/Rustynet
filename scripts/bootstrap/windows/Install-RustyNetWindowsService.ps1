@@ -514,6 +514,35 @@ if ($cliSource) {
     Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'rustynet.exe') -Force
 }
 
+# Re-encrypt the WireGuard private key + DPAPI passphrase blob in the
+# current execution context.  The access-bootstrap phase generates these
+# under the SSH user (`windows`); the install-release phase runs as
+# SYSTEM via utmctl exec; even with DPAPI LocalMachine scope, an
+# Unprotect call from a different identity than the one that called
+# Protect can fail with "decryption failed" on some Windows builds (we
+# have observed this consistently on Windows 11 ARM64 26200).  Doing
+# `key init --force` + `key store-passphrase` here aligns the encryption
+# identity with the runtime identity (SYSTEM service), so the daemon's
+# subsequent decrypt at startup matches.  Idempotent: re-runs are safe.
+$script:InstallFailureStep = 'rekey-wireguard-under-runtime-identity'
+$wgPassphrasePath = Join-Path $StateRoot 'secrets\wireguard.passphrase.dpapi'
+$wgPassphraseDir = Split-Path -Parent $wgPassphrasePath
+if (-not (Test-Path -LiteralPath $wgPassphraseDir)) {
+    New-Item -ItemType Directory -Force -Path $wgPassphraseDir | Out-Null
+}
+$rekeyPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
+[System.IO.File]::WriteAllText($wgPassphrasePath, $rekeyPlaintext)
+$keyInitOutput = (& $daemonDest key init --passphrase-file $wgPassphrasePath --force 2>&1) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    throw "rustynetd key init --force failed (exit $LASTEXITCODE): $keyInitOutput"
+}
+Write-Host "[install-helper] rekey: rustynetd key init complete"
+$keyStoreOutput = (& $daemonDest key store-passphrase --passphrase-file $wgPassphrasePath 2>&1) -join "`n"
+if ($LASTEXITCODE -ne 0) {
+    throw "rustynetd key store-passphrase failed (exit $LASTEXITCODE): $keyStoreOutput"
+}
+Write-Host "[install-helper] rekey: passphrase blob written under SYSTEM DPAPI scope"
+
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 $script:InstallFailureStep = 'write-reviewed-env-file'
 $backendLabel = Resolve-ReviewedBackendLabel `
