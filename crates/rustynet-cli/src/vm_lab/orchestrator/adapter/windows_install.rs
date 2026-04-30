@@ -379,11 +379,11 @@ fn run_windows_e2e_bootstrap(
          $bytes = New-Object byte[] 48; \
          $rng.GetBytes($bytes); \
          $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
+         New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
+         icacls.exe {passphrase_q} /grant:r 'BUILTIN\\Administrators:F' /grant:r 'NT AUTHORITY\\SYSTEM:F'; \
          & {rustynetd_q} key init --passphrase-file {passphrase_q} --force; \
          if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key init failed' }}; \
-         & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q}; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key store-passphrase failed' }}; \
          & {rustynetd_q} membership init \
              --snapshot {membership_snapshot_q} \
              --log {membership_log_q} \
@@ -394,6 +394,8 @@ fn run_windows_e2e_bootstrap(
              --network-id {network_id_q} \
              --force; \
          if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd membership init failed' }}; \
+         & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q}; \
+         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key store-passphrase failed' }}; \
          Start-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
          Start-Sleep -Seconds 5",
     );
