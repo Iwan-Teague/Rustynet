@@ -38,21 +38,29 @@ fn render_windows_access_gate_error(
     )
 }
 
-fn local_utm_result_file_supported_for_phase(_phase: BootstrapPhase, _target: &RemoteTarget) -> bool {
-    // utmctl file push and pull are broken on Windows guests (OSStatus -2700 /
-    // Access is denied). The result-file mechanism relies on both, so it always
-    // stalls for the full timeout. Return false unconditionally to route all
-    // phases through capture_helper_output → SSH instead.
-    false
+fn local_utm_result_file_supported_for_phase(phase: BootstrapPhase, target: &RemoteTarget) -> bool {
+    // The result-file path uses utmctl exec + utm_staging_dir to run a
+    // wrapper that writes captured output and rc to files inside the
+    // staging directory. Both halves work because the staging dir is
+    // SYSTEM-writable (lives under C:\Users\<user>\, outside the
+    // hardened state tree) — see remote_target_windows_utm_staging_dir
+    // in vm_lab/mod.rs.
+    matches!(
+        windows_local_utm_execution_authority(target, false),
+        Some(WindowsLocalUtmExecutionAuthority::StatusProbeResultFile)
+    ) && matches!(
+        phase,
+        BootstrapPhase::BuildRelease
+            | BootstrapPhase::InstallRelease
+            | BootstrapPhase::RestartRuntime
+            | BootstrapPhase::VerifyRuntime
+    )
 }
 
 fn build_windows_build_release_report_paths(
     target: &RemoteTarget,
 ) -> Result<(String, String, String), String> {
-    let remote_root = target
-        .remote_temp_dir
-        .clone()
-        .unwrap_or_else(|| default_remote_temp_dir_for_profile(target.platform_profile));
+    let remote_root = windows_orchestration_root(target);
     ensure_no_control_chars("Windows build-release report root", remote_root.as_str())?;
     let report_root = format!(
         r"{}\build-release\bootstrap-{}-build-release-{}",
@@ -303,10 +311,7 @@ fn build_windows_diagnostics_invocation(
     target: &RemoteTarget,
     phase: BootstrapPhase,
 ) -> Result<WindowsHelperScriptSpec, String> {
-    let remote_root = target
-        .remote_temp_dir
-        .clone()
-        .unwrap_or_else(|| default_remote_temp_dir_for_profile(target.platform_profile));
+    let remote_root = windows_orchestration_root(target);
     ensure_no_control_chars("Windows diagnostics root", remote_root.as_str())?;
     let output_root = format!(
         r"{}\diagnostics\bootstrap-{}-{}-{}",
@@ -1430,6 +1435,7 @@ mod tests {
             platform_profile: default_platform_profile(VmGuestPlatform::Windows),
             rustynet_src_dir: Some(r"C:\Rustynet".to_string()),
             remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_string()),
+            utm_staging_dir: Some(r"C:\Users\windows\rustynet-utm-stage".to_string()),
         };
         let invocation =
             build_windows_diagnostics_invocation(&target, BootstrapPhase::InstallRelease)
@@ -1458,9 +1464,10 @@ mod tests {
     }
 
     #[test]
-    fn local_utm_result_file_not_supported_because_utmctl_file_ops_broken_on_windows() {
-        // utmctl file push/pull fail with OSStatus -2700 on Windows guests.
-        // All phases must route through SSH regardless of target type.
+    fn local_utm_result_file_supported_for_runtime_phases_on_windows_local_utm() {
+        // Result-file path is enabled for BuildRelease, InstallRelease,
+        // RestartRuntime, VerifyRuntime when the target is a Windows
+        // local-UTM guest with a SYSTEM-writable staging directory.
         let target = RemoteTarget {
             label: "windows-utm-1".to_string(),
             ssh_target: "192.168.64.14".to_string(),
@@ -1472,21 +1479,22 @@ mod tests {
             platform_profile: default_platform_profile(VmGuestPlatform::Windows),
             rustynet_src_dir: Some(r"C:\Rustynet".to_string()),
             remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_string()),
+            utm_staging_dir: Some(r"C:\Users\windows\rustynet-utm-stage".to_string()),
         };
 
-        assert!(!local_utm_result_file_supported_for_phase(
+        assert!(local_utm_result_file_supported_for_phase(
             BootstrapPhase::BuildRelease,
             &target
         ));
-        assert!(!local_utm_result_file_supported_for_phase(
+        assert!(local_utm_result_file_supported_for_phase(
             BootstrapPhase::InstallRelease,
             &target
         ));
-        assert!(!local_utm_result_file_supported_for_phase(
+        assert!(local_utm_result_file_supported_for_phase(
             BootstrapPhase::RestartRuntime,
             &target
         ));
-        assert!(!local_utm_result_file_supported_for_phase(
+        assert!(local_utm_result_file_supported_for_phase(
             BootstrapPhase::VerifyRuntime,
             &target
         ));
