@@ -382,7 +382,7 @@ fn run_windows_e2e_bootstrap(
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
          if (Test-Path {passphrase_q}) {{ takeown.exe /f {passphrase_q} | Out-Null; icacls.exe {passphrase_q} /grant:r 'BUILTIN\\Administrators:F' | Out-Null; }}; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
-         icacls.exe {passphrase_q} /grant:r 'BUILTIN\\Administrators:F' /grant:r 'NT AUTHORITY\\SYSTEM:F'; \
+         icacls.exe {passphrase_q} /grant:r \"$env:USERNAME:(F)\" /grant:r 'BUILTIN\\Administrators:F' /grant:r 'NT AUTHORITY\\SYSTEM:F'; \
          & {rustynetd_q} key init --passphrase-file {passphrase_q} --force; \
          if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key init failed' }}; \
          & {rustynetd_q} membership init \
