@@ -430,7 +430,15 @@ function Build-ReviewedDaemonArgsJson {
         # startup with "invalid Windows backend value".
         throw ('Build-ReviewedDaemonArgsJson rejects unknown backend label: {0}' -f $BackendLabel)
     }
-    return (@('--backend', $BackendLabel) | ConvertTo-Json -Compress)
+    # --auto-tunnel-enforce false: per-node bootstrap brings the
+    # service host up before any mesh assignment bundle has been
+    # distributed by `vm-lab-orchestrate-live-lab`.  Without this
+    # flag the daemon refuses to start until the assignment file
+    # exists, so install-release / restart-runtime / verify-runtime
+    # cannot complete on a fresh node.  The mesh-join phases later
+    # distribute and validate the assignment; this flag does NOT
+    # bypass that — it only defers the startup gate to runtime.
+    return (@('--backend', $BackendLabel, '--auto-tunnel-enforce', 'false') | ConvertTo-Json -Compress)
 }
 
 function Write-ReviewedEnvFile {
