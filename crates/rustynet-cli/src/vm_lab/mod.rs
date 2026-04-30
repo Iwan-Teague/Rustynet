@@ -16424,10 +16424,15 @@ fn sync_local_source_archive_to_target(
 ) -> Result<(), String> {
     ensure_local_regular_file_path(archive_path, "local source archive")?;
     if target.platform_profile.platform == VmGuestPlatform::Windows {
-        let remote_archive = format!(
-            r"C:\ProgramData\Rustynet\vm-lab\rn-vm-lab-source-{}.zip",
-            unique_suffix()
-        );
+        // Stage the archive under windows_orchestration_root so the SSH
+        // user can SCP it AND the SYSTEM-context utmctl can read the
+        // companion .result.json that the extract wrapper writes.  The
+        // legacy vm-lab path was unreachable from utmctl on UTM Windows
+        // guests (state-tree hardening strips the SYSTEM ACE) and was
+        // wedging the result-file pull retry loop.
+        let archive_root = windows_orchestration_root(target);
+        let archive_root = archive_root.trim_end_matches(['\\', '/']);
+        let remote_archive = format!(r"{archive_root}\rn-vm-lab-source-{}.zip", unique_suffix());
         ensure_success_status(
             scp_to_remote_for_target(
                 target,
