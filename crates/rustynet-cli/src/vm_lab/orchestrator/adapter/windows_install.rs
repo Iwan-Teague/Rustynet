@@ -381,9 +381,9 @@ fn run_windows_e2e_bootstrap(
          $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
          $buser = (whoami.exe).Trim(); \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
-         if (Test-Path {passphrase_q}) {{ takeown.exe /f {passphrase_q} | Out-Null; icacls.exe {passphrase_q} /grant:r \"$buser:(F)\" | Out-Null; }}; \
+         if (Test-Path {passphrase_q}) {{ takeown.exe /f {passphrase_q} | Out-Null; icacls.exe {passphrase_q} /grant:r \"${{buser}}:(F)\" | Out-Null; }}; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
-         icacls.exe 'C:\\ProgramData\\RustyNet' /grant:r \"$buser:(OI)(CI)(F)\" /T | Out-Null; \
+         icacls.exe 'C:\\ProgramData\\RustyNet' /grant:r \"${{buser}}:(OI)(CI)(F)\" /T | Out-Null; \
          & {rustynetd_q} key init --passphrase-file {passphrase_q} --force; \
          if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key init failed' }}; \
          & {rustynetd_q} membership init \
