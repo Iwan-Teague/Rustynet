@@ -18259,7 +18259,18 @@ fn utm_exec_windows_raw(
     timeout: Duration,
 ) -> Result<ExitStatus, String> {
     ensure_no_control_chars("UTM exec command", powershell_script)?;
-    let encoded = encode_powershell_command(powershell_script)?;
+    // Prepend $ProgressPreference suppression so PowerShell's "Preparing
+    // modules for first use" progress record (and any other progress
+    // record) does not get serialized to stderr as a CLIXML envelope.
+    // Observed on a freshly-booted Windows guest: the first powershell
+    // -EncodedCommand under utmctl exec emits "#< CLIXML ...<Progress
+    // .../>...</Objs>" on stderr even when the command itself runs fine
+    // and exits 0.  Without suppression we treat that benign noise as a
+    // hard failure.
+    let wrapped_script = format!(
+        "$ProgressPreference = 'SilentlyContinue'; $VerbosePreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'; {powershell_script}"
+    );
+    let encoded = encode_powershell_command(wrapped_script.as_str())?;
     let utmctl_path = utmctl_binary_path()?;
     let mut command = Command::new(utmctl_path);
     command
@@ -18277,13 +18288,71 @@ fn utm_exec_windows_raw(
         .arg("-EncodedCommand")
         .arg(encoded);
     let output = run_output_with_timeout(&mut command, timeout)?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
+    let stderr_raw = String::from_utf8_lossy(&output.stderr);
+    // Strip CLIXML envelopes from the stderr stream defensively even
+    // after the preference suppression above: nested PowerShell calls
+    // (like the build-release wrapper invoking another powershell.exe
+    // -EncodedCommand) can re-emit them.  CLIXML payloads start with
+    // "#< CLIXML" and continue as XML; everything around them (real
+    // utmctl host errors like "OSStatus error -2700" / "Access is
+    // denied") is what we actually care about.
+    let stderr_filtered = strip_powershell_clixml_noise(stderr_raw.as_ref())
+        .trim()
+        .to_string();
+    if !stderr_filtered.is_empty() {
         return Err(format!(
-            "UTM Windows exec reported error for {utm_name}: {stderr}"
+            "UTM Windows exec reported error for {utm_name}: {stderr_filtered}"
         ));
     }
     Ok(output.status)
+}
+
+/// Remove PowerShell CLIXML serialization payloads from a stderr buffer.
+///
+/// PowerShell, when invoked as a child process with `-OutputFormat Text`,
+/// still emits its non-stdout streams (Progress, Verbose, Information,
+/// sometimes Error and Warning records) as a CLIXML envelope on stderr
+/// the first time the host runspace initializes after a cold boot or a
+/// module-cache invalidation.  Setting `$ProgressPreference =
+/// 'SilentlyContinue'` reduces it but does not eliminate it, because the
+/// CLIXML emitter is per-runspace and the OUTER runspace activates
+/// before our wrapper script runs.
+///
+/// The CLIXML payload always begins with the literal `#< CLIXML` marker
+/// followed by an XML envelope.  This helper drops that marker and any
+/// XML-like lines, returning whatever else is left.  Real utmctl host
+/// failures (Apple Events errors, OSStatus codes, "Access is denied"
+/// from the guest agent) are plain text and pass through untouched.
+fn strip_powershell_clixml_noise(stderr: &str) -> String {
+    let mut kept = Vec::new();
+    let mut in_clixml = false;
+    for line in stderr.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#< CLIXML") {
+            in_clixml = true;
+            continue;
+        }
+        if in_clixml {
+            // CLIXML payload is XML; once we hit the closing </Objs> we
+            // exit the block.  Any line that is empty or starts with '<'
+            // is treated as part of the envelope.
+            if trimmed.starts_with("</Objs>") {
+                in_clixml = false;
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with('<') {
+                continue;
+            }
+            // Defensive: a non-XML, non-empty line inside what we
+            // thought was a CLIXML block means the envelope ended
+            // unexpectedly.  Keep this line and exit the block.
+            in_clixml = false;
+            kept.push(line);
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
 }
 
 fn format_remote_capture_exit_error(rc: i32, output: &str) -> String {
@@ -21237,6 +21306,32 @@ mod tests {
         assert_eq!(android.remote_shell, VmRemoteShell::Unsupported);
         assert_eq!(android.guest_exec_mode, VmGuestExecMode::Unsupported);
         assert_eq!(android.service_manager, VmServiceManager::Unsupported);
+    }
+
+    #[test]
+    fn strip_clixml_noise_drops_progress_envelope_keeps_real_errors() {
+        // Benign progress envelope from a freshly-booted PowerShell
+        // runspace.  Strip cleanly; nothing left.
+        let envelope = "#< CLIXML\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><Progress S=\"Progress\"><PR>0</PR><AS>Preparing modules for first use.</AS></Progress></Objs>";
+        let filtered = super::strip_powershell_clixml_noise(envelope);
+        assert!(
+            filtered.trim().is_empty(),
+            "CLIXML envelope should be stripped, got: {filtered:?}"
+        );
+
+        // Real utmctl host error must pass through untouched even when
+        // mixed with CLIXML noise.
+        let mixed = "#< CLIXML\n<Objs><Progress/></Objs>\nError from event: Access is denied.";
+        let filtered = super::strip_powershell_clixml_noise(mixed);
+        assert!(
+            filtered.contains("Access is denied"),
+            "real utmctl error must survive CLIXML stripping, got: {filtered:?}"
+        );
+
+        // Plain text with no CLIXML pass through.
+        let plain = "Error from event: OSStatus error -2700.\nfailed to open file";
+        let filtered = super::strip_powershell_clixml_noise(plain);
+        assert_eq!(filtered, plain);
     }
 
     #[test]
