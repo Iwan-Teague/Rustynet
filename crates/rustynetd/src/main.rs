@@ -73,52 +73,10 @@ use std::path::PathBuf;
 const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
     "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_PATH";
 
-#[cfg(windows)]
-fn rn_svc_trace(line: &str) {
-    use std::io::Write;
-    let path = r"C:\ProgramData\RustyNet\logs\service-trace.log";
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let _ = writeln!(f, "{ts} pid={} {line}", std::process::id());
-    }
-}
-#[cfg(not(windows))]
-fn rn_svc_trace(_line: &str) {}
-
 fn main() {
-    rn_svc_trace(&format!(
-        "main entered: argv={:?}",
-        std::env::args().collect::<Vec<_>>()
-    ));
-    let result = std::panic::catch_unwind(run);
-    match result {
-        Ok(Ok(())) => {
-            rn_svc_trace("main exit ok");
-        }
-        Ok(Err(err)) => {
-            rn_svc_trace(&format!("main exit err: {err}"));
-            eprintln!("rustynetd startup failed: {err}");
-            std::process::exit(1);
-        }
-        Err(panic) => {
-            let msg = match panic.downcast_ref::<&str>() {
-                Some(s) => (*s).to_string(),
-                None => match panic.downcast_ref::<String>() {
-                    Some(s) => s.clone(),
-                    None => "unknown panic".to_string(),
-                },
-            };
-            rn_svc_trace(&format!("main panic: {msg}"));
-            eprintln!("rustynetd panicked: {msg}");
-            std::process::exit(1);
-        }
+    if let Err(err) = run() {
+        eprintln!("rustynetd startup failed: {err}");
+        std::process::exit(1);
     }
 }
 
@@ -212,24 +170,8 @@ fn run() -> Result<(), String> {
 }
 
 fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
-    rn_svc_trace(&format!("run_service_daemon_args enter: args={args:?}"));
-    let config = match parse_daemon_config(args) {
-        Ok(c) => {
-            rn_svc_trace("parse_daemon_config ok");
-            c
-        }
-        Err(err) => {
-            rn_svc_trace(&format!("parse_daemon_config err: {err}"));
-            return Err(err);
-        }
-    };
-    rn_svc_trace("run_daemon enter");
-    let result = run_daemon(config).map_err(|err| err.to_string());
-    match &result {
-        Ok(()) => rn_svc_trace("run_daemon exit ok"),
-        Err(err) => rn_svc_trace(&format!("run_daemon exit err: {err}")),
-    }
-    result
+    let config = parse_daemon_config(args)?;
+    run_daemon(config).map_err(|err| err.to_string())
 }
 
 fn run_key_command(args: &[String]) -> Result<(), String> {
