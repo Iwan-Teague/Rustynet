@@ -380,8 +380,10 @@ fn run_windows_e2e_bootstrap(
          $rng.GetBytes($bytes); \
          $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
          $buser = (whoami.exe).Trim(); \
-         takeown.exe /f 'C:\\ProgramData\\RustyNet' /r /d y | Out-Null; \
-         icacls.exe 'C:\\ProgramData\\RustyNet' /grant:r \"${{buser}}:(OI)(CI)(F)\" /T | Out-Null; \
+         takeown.exe /f 'C:\\ProgramData\\RustyNet' /r /d y; \
+         if ($LASTEXITCODE -ne 0) {{ throw \"takeown state-root failed (exit $LASTEXITCODE)\" }}; \
+         icacls.exe 'C:\\ProgramData\\RustyNet' /grant:r \"${{buser}}:(OI)(CI)(F)\" /T; \
+         if ($LASTEXITCODE -ne 0) {{ throw \"icacls state-root grant failed (exit $LASTEXITCODE)\" }}; \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
          & {rustynetd_q} key init --passphrase-file {passphrase_q} --force; \
