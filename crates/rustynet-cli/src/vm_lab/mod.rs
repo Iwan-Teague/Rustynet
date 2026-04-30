@@ -18401,9 +18401,13 @@ fn build_utm_windows_result_file_wrapper_script(
          if (-not (Test-Path -LiteralPath $psExe)) {{ $psExe = 'powershell.exe' }}; \
          try {{ \
            $captured = (& $psExe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded_body} *>&1 | Out-String); \
-           $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
-           if ($null -ne $lastExitCode) {{ \
-             $rc = [int]$lastExitCode.Value \
+           $rcVar = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
+           if ($null -ne $rcVar -and $null -ne $rcVar.Value) {{ \
+             $rcRaw = $rcVar.Value; \
+             if ($rcRaw -is [System.Management.Automation.PSVariable]) {{ $rcRaw = $rcRaw.Value }}; \
+             if ($null -ne $rcRaw -and [string]$rcRaw -match '^-?[0-9]+$') {{ \
+               $rc = [int]$rcRaw \
+             }} \
            }} elseif (-not $?) {{ \
              $rc = 1 \
            }} \
