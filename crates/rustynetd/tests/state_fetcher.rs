@@ -13,6 +13,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         trust_evidence_path: dir.join("trust.evidence"),
         trust_verifier_key_path: dir.join("trust.pub"),
         trust_watermark_path: dir.join("trust.watermark"),
+        trust_max_age_secs: std::num::NonZeroU64::new(300).unwrap(),
         membership_snapshot_path: dir.join("membership.snap"),
         membership_log_path: dir.join("membership.log"),
         membership_watermark_path: dir.join("membership.watermark"),

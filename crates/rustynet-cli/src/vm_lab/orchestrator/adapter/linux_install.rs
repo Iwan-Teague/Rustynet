@@ -209,7 +209,10 @@ mod tests {
             endpoints: HashMap::new(),
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx);
-        assert!(env.contains("ROLE=admin"), "exit node must map to admin role: {env}");
+        assert!(
+            env.contains("ROLE=admin"),
+            "exit node must map to admin role: {env}"
+        );
         assert!(
             env.contains("NODE_ID=exit-node1-abc123"),
             "must contain NODE_ID: {env}"
@@ -237,9 +240,17 @@ mod tests {
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
         };
-        for role in [NodeRole::Client, NodeRole::Entry, NodeRole::Aux, NodeRole::Extra] {
+        for role in [
+            NodeRole::Client,
+            NodeRole::Entry,
+            NodeRole::Aux,
+            NodeRole::Extra,
+        ] {
             let env = build_bootstrap_env("id1", &role, &ctx);
-            assert!(env.contains("ROLE=client"), "non-exit role {role:?} must map to client: {env}");
+            assert!(
+                env.contains("ROLE=client"),
+                "non-exit role {role:?} must map to client: {env}"
+            );
         }
     }
 

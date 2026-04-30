@@ -988,6 +988,7 @@ pub struct DaemonConfig {
     pub trust_evidence_path: PathBuf,
     pub trust_verifier_key_path: PathBuf,
     pub trust_watermark_path: PathBuf,
+    pub trust_max_age_secs: NonZeroU64,
     pub membership_snapshot_path: PathBuf,
     pub membership_log_path: PathBuf,
     pub membership_watermark_path: PathBuf,
@@ -1056,6 +1057,8 @@ impl Default for DaemonConfig {
             trust_evidence_path: PathBuf::from(DEFAULT_TRUST_EVIDENCE_PATH),
             trust_verifier_key_path: PathBuf::from(DEFAULT_TRUST_VERIFIER_KEY_PATH),
             trust_watermark_path: PathBuf::from(DEFAULT_TRUST_WATERMARK_PATH),
+            trust_max_age_secs: NonZeroU64::new(DEFAULT_TRUST_MAX_AGE_SECS)
+                .expect("default trust max age must be non-zero"),
             membership_snapshot_path: PathBuf::from(DEFAULT_MEMBERSHIP_SNAPSHOT_PATH),
             membership_log_path: PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH),
             membership_watermark_path: PathBuf::from(DEFAULT_MEMBERSHIP_WATERMARK_PATH),
@@ -8246,7 +8249,10 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
     let _ = load_trust_evidence(
         &config.trust_evidence_path,
         &config.trust_verifier_key_path,
-        TrustPolicy::default(),
+        TrustPolicy {
+            max_signed_data_age_secs: config.trust_max_age_secs.get(),
+            max_clock_skew_secs: TrustPolicy::default().max_clock_skew_secs,
+        },
         watermark,
     )
     .map_err(|err| DaemonError::InvalidConfig(format!("trust preflight failed: {err}")))?;

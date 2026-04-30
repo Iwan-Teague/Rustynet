@@ -17,7 +17,17 @@ param(
     [switch]$InstallPowerShell7,
     [switch]$SetDefaultShellToPowerShell,
     [switch]$SetDefaultShellToPowerShell7,
-    [switch]$InteractiveBuildBootstrapChild
+    [switch]$InteractiveBuildBootstrapChild,
+    # Opt-in fallback to Register-ScheduledTask -LogonType Interactive when
+    # the SYSTEM-context build-release path cannot resolve a usable
+    # toolchain.  Off by default: lab images install Rust + VS Build Tools
+    # machine-scoped (see WindowsLabVmStabilityAndSessionModel_2026-04-30.md)
+    # so the SYSTEM short-circuit succeeds without an Active interactive
+    # Windows session.  When this switch is off and the SYSTEM path cannot
+    # resolve the toolchain, build-release fails fast with a precise error
+    # naming which canonical paths were missing.  Only set this for ad-hoc
+    # runs against a Windows host where Rust lives only in a user profile.
+    [switch]$AllowInteractiveTaskFallback
 )
 
 Set-StrictMode -Version Latest
@@ -182,6 +192,31 @@ function Get-BuildReleaseReportLayout {
     }
 }
 
+# Classify a resolved cargo/rustc/rustup exe path as "machine"-scope
+# (lab-image install under C:\CargoHome\bin or $env:CARGO_HOME\bin) or
+# "user"-scope (USERPROFILE\.cargo\bin or scoop/chocolatey).  Returns
+# "unknown" for any other location and "" for empty input.  Used in
+# the build-release manifest so the orchestrator can confirm at the
+# host end that the bootstrap took the SYSTEM short-circuit and did
+# not silently fall back to the Interactive Scheduled Task.
+function Get-ToolchainScope {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$ResolvedExePath)
+    if ([string]::IsNullOrWhiteSpace($ResolvedExePath)) { return '' }
+    $normalized = $ResolvedExePath.Replace('/', '\').ToLowerInvariant()
+    $machinePrefixes = @('c:\cargohome\bin\')
+    if ($env:CARGO_HOME -and $env:CARGO_HOME.Trim().Length -gt 0) {
+        $machinePrefixes += ((Join-Path $env:CARGO_HOME 'bin') + '\').ToLowerInvariant()
+    }
+    foreach ($prefix in $machinePrefixes) {
+        if ($normalized.StartsWith($prefix)) { return 'machine' }
+    }
+    $userMarkers = @('\.cargo\bin\', '\scoop\apps\rustup\', '\chocolatey\lib\rust\')
+    foreach ($marker in $userMarkers) {
+        if ($normalized.Contains($marker)) { return 'user' }
+    }
+    return 'unknown'
+}
+
 function New-BuildReleaseReport {
     param(
         [Parameter(Mandatory = $true)]$Layout,
@@ -191,8 +226,12 @@ function New-BuildReleaseReport {
         [AllowEmptyString()][string]$StderrTail = ''
     )
 
+    $cargoPathForScope = ''
+    try { $cargoPathForScope = [string](Resolve-CargoExePath) } catch { $cargoPathForScope = '' }
+    $toolchainScope = Get-ToolchainScope -ResolvedExePath $cargoPathForScope
+
     return [ordered]@{
-        schema_version = 1
+        schema_version = 2
         phase = 'build-release'
         captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
         status = $Status
@@ -203,6 +242,7 @@ function New-BuildReleaseReport {
         stderr_path = $Layout.stderr_path
         exit_code_path = $Layout.exit_code_path
         toolchain_path = $Layout.toolchain_path
+        toolchain_scope = $toolchainScope
         manifest_path = $Layout.manifest_path
         complete_marker_path = $Layout.complete_marker_path
         exit_code = $ExitCode
@@ -295,17 +335,18 @@ function Get-CurrentInteractiveUserName {
     }
 }
 
-# Verify that an interactive Windows session is *currently active* (i.e. the
-# user is signed into the desktop), not merely the "last logged on" user
-# stamped in Win32_ComputerSystem.UserName. Returns the resolved active user
-# name, or empty string if no Active session exists.
+# Verify that an interactive Windows session is available (Active or Disconnected).
+# Returns the resolved user name, or empty string if no session exists.
 #
 # Background: Win32_ComputerSystem.UserName is non-empty even when the
-# interactive session has been disconnected or the lock screen is up; in
-# that state, Register-ScheduledTask -LogonType Interactive accepts the
-# task and Start-ScheduledTask reports success, but the task never actually
-# runs — it sits in 'Ready' state until a real session appears, which can
-# leave Bootstrap-RustyNetWindows.ps1 polling for up to 4 hours.
+# interactive session has been disconnected or the lock screen is up.
+# For RDP/remote, Scheduled Task with LogonType=Interactive may not run on
+# disconnected sessions. But for console (e.g., UTM), Disconnected sessions
+# are still active console sessions and can run interactive tasks.
+#
+# This function accepts both 'Active' and 'Disconnected' states to support
+# console-based VM environments (UTM, KVM) where the session is legitimately
+# accessible via console even if not in 'Active' state.
 function Get-ActiveInteractiveUserSessionName {
     try {
         $quserOutput = (& quser.exe 2>$null | Out-String).Trim()
@@ -314,16 +355,15 @@ function Get-ActiveInteractiveUserSessionName {
         }
         $lines = $quserOutput -split "`r?`n"
         # Skip header line; columns vary by locale, so match on STATE token
-        # 'Active' (positionally column 4 in en-US, but quser doesn't quote
-        # the username column when it's prefixed with '>'). Conservative:
-        # any line whose tokens include 'Active'.
+        # Accept 'Active' or 'Disconnected' (for console sessions).
         foreach ($line in $lines | Select-Object -Skip 1) {
             $trimmed = $line.Trim()
             if ([string]::IsNullOrWhiteSpace($trimmed)) {
                 continue
             }
             $tokens = $trimmed -split '\s+'
-            if ($tokens -contains 'Active') {
+            # Accept Active or Disconnected session states
+            if ($tokens -contains 'Active' -or $tokens -contains 'Disconnected') {
                 $userToken = $tokens[0]
                 if ($userToken.StartsWith('>')) {
                     $userToken = $userToken.Substring(1)
@@ -1088,9 +1128,33 @@ function Assert-RustyNetWingetDependenciesInstalled {
     }
 }
 
+# Resolve the toolchain bin directory on disk in priority order:
+#   1. machine-scope CARGO_HOME\bin if CARGO_HOME is set in the env
+#   2. canonical lab-image path C:\CargoHome\bin
+#   3. user-profile fallback %USERPROFILE%\.cargo\bin
+# Returns the first existing dir, or empty string if none exist.
+# Used by both Ensure-CargoOnPath and the Resolve-* helpers so the
+# decision is made in one place.
+function Resolve-MachineScopedCargoBinDir {
+    $candidates = @()
+    if ($env:CARGO_HOME -and $env:CARGO_HOME.Trim().Length -gt 0) {
+        $candidates += (Join-Path $env:CARGO_HOME 'bin')
+    }
+    $candidates += 'C:\CargoHome\bin'
+    if ($env:USERPROFILE -and $env:USERPROFILE.Trim().Length -gt 0) {
+        $candidates += (Join-Path $env:USERPROFILE '.cargo\bin')
+    }
+    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
 function Ensure-CargoOnPath {
-    $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
-    if (Test-Path -LiteralPath $cargoBin) {
+    # Machine-scoped tools (lab image standard) win over user-profile
+    # installs because the machine path is visible to SYSTEM-context
+    # bootstrap runs.  When CARGO_HOME is set in machine env, honor it;
+    # otherwise probe the canonical lab-image path C:\CargoHome\bin
+    # before falling back to %USERPROFILE%\.cargo\bin.
+    $cargoBin = Resolve-MachineScopedCargoBinDir
+    if ($cargoBin -and (-not ($env:PATH -split ';' | Where-Object { $_ -ieq $cargoBin }))) {
         $env:PATH = "$cargoBin;$env:PATH"
     }
 }
@@ -1108,7 +1172,12 @@ function Test-CommandPresent {
 }
 
 function Resolve-VsDevCmdPath {
+    # Lab-image canonical install at C:\BuildTools wins.  Falls through
+    # to the standard Visual Studio 2022 install paths so this resolver
+    # also works on developer machines and pre-existing Windows hosts
+    # that have a normal Visual Studio installation.
     $candidates = @(
+        'C:\BuildTools\Common7\Tools\VsDevCmd.bat',
         'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat',
         'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat',
         'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat',
@@ -1117,6 +1186,28 @@ function Resolve-VsDevCmdPath {
         'C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat'
     )
     return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+# Build the candidate list for a Rust toolchain binary in the same
+# priority order Resolve-MachineScopedCargoBinDir uses, with fallbacks
+# for non-image hosts (scoop, chocolatey, alternate users).
+function Get-RustToolchainBinaryCandidates {
+    param([Parameter(Mandatory = $true)][string]$ExeName)
+    $candidates = @()
+    if ($env:CARGO_HOME -and $env:CARGO_HOME.Trim().Length -gt 0) {
+        $candidates += (Join-Path (Join-Path $env:CARGO_HOME 'bin') $ExeName)
+    }
+    $candidates += (Join-Path 'C:\CargoHome\bin' $ExeName)
+    if ($env:USERPROFILE -and $env:USERPROFILE.Trim().Length -gt 0) {
+        $candidates += (Join-Path (Join-Path $env:USERPROFILE '.cargo\bin') $ExeName)
+    }
+    $candidates += (Join-Path 'C:\Users\Administrator\.cargo\bin' $ExeName)
+    $candidates += (Join-Path 'C:\.cargo\bin' $ExeName)
+    if ($env:LOCALAPPDATA -and $env:LOCALAPPDATA.Trim().Length -gt 0) {
+        $candidates += (Join-Path (Join-Path $env:LOCALAPPDATA 'scoop\apps\rustup\current\.cargo\bin') $ExeName)
+    }
+    $candidates += (Join-Path 'C:\ProgramData\chocolatey\lib\rust\tools\bin' $ExeName)
+    return $candidates
 }
 
 # Multi-path lookup for cargo.exe. Checks PATH first (fastest), then the
@@ -1130,39 +1221,22 @@ function Resolve-VsDevCmdPath {
 function Resolve-CargoExePath {
     $cmd = Get-Command cargo.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    $candidates = @(
-        (Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'),
-        'C:\Users\Administrator\.cargo\bin\cargo.exe',
-        'C:\.cargo\bin\cargo.exe',
-        (Join-Path $env:LOCALAPPDATA 'scoop\apps\rustup\current\.cargo\bin\cargo.exe'),
-        'C:\ProgramData\chocolatey\lib\rust\tools\bin\cargo.exe'
-    )
-    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+    return (Get-RustToolchainBinaryCandidates -ExeName 'cargo.exe' |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
 }
 
 function Resolve-RustcExePath {
     $cmd = Get-Command rustc.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    $candidates = @(
-        (Join-Path $env:USERPROFILE '.cargo\bin\rustc.exe'),
-        'C:\Users\Administrator\.cargo\bin\rustc.exe',
-        'C:\.cargo\bin\rustc.exe',
-        (Join-Path $env:LOCALAPPDATA 'scoop\apps\rustup\current\.cargo\bin\rustc.exe'),
-        'C:\ProgramData\chocolatey\lib\rust\tools\bin\rustc.exe'
-    )
-    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+    return (Get-RustToolchainBinaryCandidates -ExeName 'rustc.exe' |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
 }
 
 function Resolve-RustupExePath {
     $cmd = Get-Command rustup.exe -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    $candidates = @(
-        (Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'),
-        'C:\Users\Administrator\.cargo\bin\rustup.exe',
-        'C:\.cargo\bin\rustup.exe',
-        (Join-Path $env:LOCALAPPDATA 'scoop\apps\rustup\current\.cargo\bin\rustup.exe')
-    )
-    return ($candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+    return (Get-RustToolchainBinaryCandidates -ExeName 'rustup.exe' |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
 }
 
 function Resolve-WireGuardExePath {
@@ -1373,6 +1447,23 @@ function Build-RustyNet {
     $buildToolsPresent = [bool](Resolve-VsDevCmdPath)
     $systemScopedContext = (Test-SystemExecutionContext) -or (Test-SystemProfileExecutionContext)
     if (-not $InteractiveBuildBootstrapChild -and $null -ne $buildReportLayout -and $systemScopedContext -and (-not ($cargoPresent -and $rustcPresent -and $buildToolsPresent))) {
+        if (-not $AllowInteractiveTaskFallback) {
+            $missing = @()
+            if (-not $cargoPresent)      { $missing += 'cargo.exe'      }
+            if (-not $rustcPresent)      { $missing += 'rustc.exe'      }
+            if (-not $buildToolsPresent) { $missing += 'VsDevCmd.bat'   }
+            $missingDisplay = ($missing -join ', ')
+            $cargoHint = if ($env:CARGO_HOME) { "CARGO_HOME=$($env:CARGO_HOME)" } else { 'CARGO_HOME unset' }
+            throw ([string]::Concat(
+                'Windows bootstrap build-release: SYSTEM-context build cannot resolve toolchain (',
+                $missingDisplay, '). Install Rust + VS Build Tools machine-scoped on the lab image ',
+                '(see Provision-RustyNetWindowsLabImage.ps1; canonical paths: C:\CargoHome\bin, ',
+                'C:\BuildTools\Common7\Tools\VsDevCmd.bat). Current resolver context: ',
+                $cargoHint, ', cargo=', [string]$cargoPath, ', rustc=', [string]$rustcPath, '. ',
+                'Pass -AllowInteractiveTaskFallback to opt back into the legacy Scheduled Task ',
+                'fallback for ad-hoc developer hosts where Rust lives in a user profile.'
+            ))
+        }
         Invoke-BuildReleaseViaInteractiveUserTask -Layout $buildReportLayout
         return
     }
