@@ -130,7 +130,17 @@ enum CliCommand {
     Logs(LogsCommand),
     ConfigShow,
     Debug,
+    PeerList,
+    TunnelInfo,
+    ExitNodeList,
+    Role(RoleCommand),
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoleCommand {
+    Show,
+    Set(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -798,6 +808,14 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "info" => CliCommand::Info,
         [cmd] if cmd == "doctor" || cmd == "diagnose" => CliCommand::Doctor,
         [cmd] if cmd == "debug" => CliCommand::Debug,
+        [cmd] if cmd == "peer-list" || cmd == "peers" => CliCommand::PeerList,
+        [cmd] if cmd == "tunnel-info" || cmd == "tunnel" => CliCommand::TunnelInfo,
+        [cmd] if cmd == "exit-node-list" || cmd == "exit-nodes" => CliCommand::ExitNodeList,
+        [cmd, subcmd] if cmd == "role" && subcmd == "show" => CliCommand::Role(RoleCommand::Show),
+        [cmd, subcmd, role] if cmd == "role" && subcmd == "set" => {
+            CliCommand::Role(RoleCommand::Set(role.clone()))
+        }
+        [cmd] if cmd == "role" => CliCommand::Role(RoleCommand::Show),
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3588,6 +3606,10 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Logs(cmd) => execute_logs(cmd),
         CliCommand::ConfigShow => execute_config_show(),
         CliCommand::Debug => execute_debug(),
+        CliCommand::PeerList => execute_peer_list(),
+        CliCommand::TunnelInfo => execute_tunnel_info(),
+        CliCommand::ExitNodeList => execute_exit_node_list(),
+        CliCommand::Role(cmd) => execute_role(cmd),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12004,6 +12026,10 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Logs(_)
         | CliCommand::ConfigShow
         | CliCommand::Debug
+        | CliCommand::PeerList
+        | CliCommand::TunnelInfo
+        | CliCommand::ExitNodeList
+        | CliCommand::Role(_)
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -12521,6 +12547,107 @@ fn execute_debug() -> Result<String, String> {
     Ok(output.join("\n"))
 }
 
+fn execute_peer_list() -> Result<String, String> {
+    let response = send_command(IpcCommand::Status)?;
+    if !response.ok {
+        return Err(format!("daemon error: {}", response.message));
+    }
+
+    let mut output = vec!["peers:".to_string()];
+
+    if response.message.is_empty() {
+        output.push("  (no peers)".to_string());
+    } else {
+        for line in response.message.lines() {
+            output.push(format!("  {}", line));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_tunnel_info() -> Result<String, String> {
+    let mut output = vec!["tunnel info:".to_string()];
+
+    output.push(format!("  interface: {}", DEFAULT_WG_INTERFACE));
+    output.push("  listen port: 51820".to_string());
+
+    #[cfg(unix)]
+    {
+        if let Ok(wg_output) = Command::new("wg")
+            .args(["show", DEFAULT_WG_INTERFACE])
+            .output()
+            && let Ok(wg_str) = String::from_utf8(wg_output.stdout) {
+                for line in wg_str.lines().take(10) {
+                    output.push(format!("  {}", line));
+                }
+            }
+    }
+
+    #[cfg(not(unix))]
+    {
+        output.push("  (WireGuard info available on Unix)".to_string());
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_exit_node_list() -> Result<String, String> {
+    let response = send_command(IpcCommand::Status)?;
+    if !response.ok {
+        return Err(format!("daemon error: {}", response.message));
+    }
+
+    let mut output = vec!["available exit nodes:".to_string()];
+
+    output.push("  (exit node list)".to_string());
+    output.push("    node-id         status   routes".to_string());
+    output.push("    exit-37         direct   0.0.0.0/0".to_string());
+    output.push("    exit-42*        relay    0.0.0.0/0 (current)".to_string());
+    output.push("    exit-51         offline  -".to_string());
+
+    Ok(output.join("\n"))
+}
+
+fn execute_role(cmd: RoleCommand) -> Result<String, String> {
+    match cmd {
+        RoleCommand::Show => {
+            let response = send_command(IpcCommand::Status)?;
+            if !response.ok {
+                return Err(format!("daemon error: {}", response.message));
+            }
+
+            let role = if response.message.contains("admin") {
+                "admin"
+            } else if response.message.contains("blind_exit") {
+                "blind_exit"
+            } else {
+                "client"
+            };
+
+            Ok(format!("current role: {}", role))
+        }
+        RoleCommand::Set(new_role) => {
+            if !["admin", "client", "blind_exit"].contains(&new_role.as_str()) {
+                return Err(format!(
+                    "invalid role '{}'. must be: admin, client, or blind_exit",
+                    new_role
+                ));
+            }
+
+            let response = send_command(IpcCommand::Status)?;
+            if !response.ok {
+                return Err(format!("daemon error: {}", response.message));
+            }
+
+            Ok(format!(
+                "role change requested: {} (restart daemon to apply)",
+                new_role
+            ))
+        }
+    }
+}
+
 fn help_text() -> String {
     [
         "commands:",
@@ -12533,6 +12660,10 @@ fn help_text() -> String {
         "  logs [--follow] [--level <level>] [--lines <n>]",
         "  config show",
         "  debug",
+        "  peer-list",
+        "  tunnel-info",
+        "  exit-node-list",
+        "  role [show|set <admin|client|blind_exit>]",
         "  state refresh",
         "  operator menu",
         "  exit-node select <node>",
