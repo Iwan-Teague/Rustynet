@@ -6291,18 +6291,56 @@ fn execute_rust_native_orchestration(
         }
     }
 
-    for assignment in &config.node_assignments {
-        let entry = inventory
-            .iter()
-            .find(|e| e.alias == assignment.alias)
-            .ok_or_else(|| {
-                format!(
-                    "alias '{}' not found in inventory ({})",
-                    assignment.alias,
-                    inventory_path.display()
-                )
-            })?;
+    // Collect node hosts first so we can auto-derive ssh_allow_cidrs when not
+    // provided. This mirrors the bash orchestrator's auto-detection behaviour.
+    let node_entries: Vec<(
+        &crate::vm_lab::VmInventoryEntry,
+        &crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment,
+    )> = config
+        .node_assignments
+        .iter()
+        .map(|assignment| {
+            inventory
+                .iter()
+                .find(|e| e.alias == assignment.alias)
+                .map(|entry| (entry, assignment))
+                .ok_or_else(|| {
+                    format!(
+                        "alias '{}' not found in inventory ({})",
+                        assignment.alias,
+                        inventory_path.display()
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
+    // Auto-derive /24 ssh_allow_cidrs from node underlay IPs when not set.
+    if ctx.ssh_allow_cidrs.is_empty() {
+        use std::net::Ipv4Addr;
+        use std::str::FromStr;
+        let mut derived: Vec<String> = node_entries
+            .iter()
+            .filter_map(|(entry, _)| {
+                let host = entry
+                    .last_known_ip
+                    .as_deref()
+                    .unwrap_or(entry.ssh_target.as_str());
+                // Strip optional user@ prefix from ssh_target.
+                let ip_str = host.split('@').next_back().unwrap_or(host);
+                Ipv4Addr::from_str(ip_str).ok().map(|ip| {
+                    let o = ip.octets();
+                    format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+                })
+            })
+            .collect();
+        derived.sort();
+        derived.dedup();
+        if !derived.is_empty() {
+            ctx.ssh_allow_cidrs = derived.join(",");
+        }
+    }
+
+    for (entry, assignment) in &node_entries {
         let host = entry
             .last_known_ip
             .as_deref()
