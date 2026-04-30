@@ -18804,10 +18804,17 @@ fn bootstrap_windows_access_for_target(
                 automation_public_key,
                 Some(&remote_result_path),
             )?;
+            // Cap the UTM probe timeout so we can fall back to SSH in a
+            // reasonable time when the UTM file pull is broken on this guest.
+            // The exec step blocks until the script completes; give it up to
+            // 6 minutes (covering slower first-time OpenSSH installs), then
+            // allow equal time for pull retries before giving up on the UTM
+            // path entirely.
+            let utm_probe_timeout = context.timeout.min(Duration::from_secs(360));
             let report_output = execute_windows_local_utm_result_file_probe(
                 utm_name,
                 "Windows access bootstrap probe",
-                context.timeout,
+                utm_probe_timeout,
                 remote_result_path.as_str(),
                 |remote_result_path| {
                     build_windows_access_bootstrap_result_script(
@@ -18822,7 +18829,34 @@ fn bootstrap_windows_access_for_target(
                 remote_result_path.as_str(),
                 Duration::from_secs(20),
             );
-            report_output?
+            match report_output {
+                Ok(output) => output,
+                Err(utm_err) => {
+                    // UTM file pull failed. Fall back to running the bootstrap
+                    // directly via SSH. This requires the staged script to be
+                    // readable by the SSH user and SSH key auth to be in place
+                    // (which the UTM exec may have already configured above).
+                    let ssh_args =
+                        build_windows_access_bootstrap_args(automation_public_key, None)?;
+                    let script = build_windows_helper_invocation_script(
+                        remote_path.as_str(),
+                        ssh_args.as_slice(),
+                    )?;
+                    let ssh_script = remote_script_for_ssh_transport(target, script.as_str())?;
+                    let ssh_user = context.ssh_user_override.or(target.ssh_user.as_deref());
+                    capture_remote_shell_command(
+                        target.ssh_target.as_str(),
+                        ssh_user,
+                        context.ssh_identity_file,
+                        context.known_hosts_path,
+                        ssh_script.as_str(),
+                        context.timeout,
+                    )
+                    .map_err(|ssh_err| {
+                        format!("{utm_err}; SSH fallback also failed: {ssh_err}")
+                    })?
+                }
+            }
         }
         _ => {
             let args = build_windows_access_bootstrap_args(automation_public_key, None)?;
