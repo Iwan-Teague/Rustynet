@@ -388,7 +388,7 @@ fn run_windows_e2e_bootstrap(
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
          $keyInitOut = (& {rustynetd_q} key init --passphrase-file {passphrase_q} --force 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key init failed: $keyInitOut\" }}; \
-         & {rustynetd_q} membership init \
+         $mbInitOut = (& {rustynetd_q} membership init \
              --snapshot {membership_snapshot_q} \
              --log {membership_log_q} \
              --watermark {membership_watermark_q} \
@@ -396,10 +396,10 @@ fn run_windows_e2e_bootstrap(
              --owner-signing-key-passphrase-file {passphrase_q} \
              --node-id {node_id_q} \
              --network-id {network_id_q} \
-             --force; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd membership init failed' }}; \
-         & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q}; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'rustynetd key store-passphrase failed' }}; \
+             --force 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd membership init failed: $mbInitOut\" }}; \
+         $kspOut = (& {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q} 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key store-passphrase failed: $kspOut\" }}; \
          Start-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
          Start-Sleep -Seconds 5",
     );
