@@ -12577,11 +12577,12 @@ fn execute_tunnel_info() -> Result<String, String> {
         if let Ok(wg_output) = Command::new("wg")
             .args(["show", DEFAULT_WG_INTERFACE])
             .output()
-            && let Ok(wg_str) = String::from_utf8(wg_output.stdout) {
-                for line in wg_str.lines().take(10) {
-                    output.push(format!("  {}", line));
-                }
+            && let Ok(wg_str) = String::from_utf8(wg_output.stdout)
+        {
+            for line in wg_str.lines().take(10) {
+                output.push(format!("  {}", line));
             }
+        }
     }
 
     #[cfg(not(unix))]
