@@ -614,6 +614,124 @@ fn run() -> Result<(), String> {
         &config.second_client_host,
     )?;
 
+    // The traversal coordination records inside each signed bundle have a
+    // hard-capped 30-second TTL (MAX_COORDINATION_TTL_SECS in
+    // crates/rustynetd/src/traversal.rs). Between the initial issuance
+    // above and now (post enforce_host x4 + wait_for_socket x4 +
+    // refresh_trust_evidence x4) significantly more than 30s have
+    // elapsed, so each daemon's reconcile loop sees the stored
+    // coordination as expired, fails 5+ times, and escalates to
+    // restriction_mode=Permanent. Once Permanent, the next mutating
+    // IPC (route advertise below) is refused with "daemon is in
+    // restricted-safe mode" — the failure mode that broke this stage
+    // in livelab4 even with the trust refresh in place.
+    //
+    // Re-issue + re-distribute traversal bundles so each peer has a
+    // freshly-signed coordination record (new 30s TTL window starting
+    // now), then run `state refresh` IPC on every node. State refresh
+    // is non-mutating (exempt from the restricted-safe gate) and on
+    // success explicitly resets restriction_mode to None and clears
+    // reconcile_failures (daemon.rs:3506-3508). The route advertise
+    // that follows then sees a daemon out of restricted-safe.
+    logger.line("[two-hop] re-issuing signed traversal bundles before route advertise")?;
+    issue_traversal_bundles_from_env(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &traversal_env,
+        "/tmp/rn_issue_twohop_traversal.env",
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
+            config.final_exit_node_id
+        ),
+        &final_exit_traversal_local,
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
+            config.client_node_id
+        ),
+        &client_traversal_local,
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
+            config.entry_node_id
+        ),
+        &entry_traversal_local,
+    )?;
+    capture_root_file_to_local(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &format!(
+            "/run/rustynet/traversal-issue/rn-traversal-{}.traversal",
+            config.second_client_node_id
+        ),
+        &second_client_traversal_local,
+    )?;
+    install_traversal_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+        &traversal_pub_local,
+        &final_exit_traversal_local,
+    )?;
+    install_traversal_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.client_host,
+        &traversal_pub_local,
+        &client_traversal_local,
+    )?;
+    install_traversal_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.entry_host,
+        &traversal_pub_local,
+        &entry_traversal_local,
+    )?;
+    install_traversal_bundle(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.second_client_host,
+        &traversal_pub_local,
+        &second_client_traversal_local,
+    )?;
+
+    logger.line("[two-hop] forcing signed-state refresh to clear restricted-safe")?;
+    refresh_signed_state(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+    )?;
+    refresh_signed_state(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.client_host,
+    )?;
+    refresh_signed_state(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.entry_host,
+    )?;
+    refresh_signed_state(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.second_client_host,
+    )?;
+
     logger.line("[two-hop] advertising default route on final exit and entry relay")?;
     run_root(
         &config.ssh_identity_file,
