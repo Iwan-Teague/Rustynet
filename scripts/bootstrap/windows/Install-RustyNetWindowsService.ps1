@@ -507,8 +507,49 @@ foreach ($candidate in $cliCandidates) {
 }
 
 $daemonDest = Join-Path $InstallRoot 'rustynetd.exe'
+
+# On idempotent re-runs the service from a previous install may already be
+# running and holding rustynetd.exe open, which would block Copy-Item below
+# with "the process cannot access the file". Stop it first; configure-service-
+# registration further down still deletes and recreates the service entry, so
+# this only changes the lifecycle ordering, not the end state.
+$script:InstallFailureStep = 'stop-existing-service-for-binary-replace'
+$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($existingService -and $existingService.Status -ne 'Stopped') {
+    Write-Host ("[install-helper] stopping existing {0} service (status={1}) before replacing daemon binary" -f $ServiceName, $existingService.Status)
+    Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+    $stopDeadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $stopDeadline) {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq 'Stopped') { break }
+        Start-Sleep -Milliseconds 250
+    }
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Stopped') {
+        throw "RustyNet service did not transition to Stopped within 15s (current=$($svc.Status))"
+    }
+}
+
 $script:InstallFailureStep = 'copy-daemon-binary'
-Copy-Item -LiteralPath $daemonSource -Destination $daemonDest -Force
+# Even after Stop-Service returns, SCM may briefly retain the file handle while
+# the process tears down. Retry the copy for up to ~10 seconds before giving
+# up so a normal idempotent re-run is not racy.
+$copyDeadline = (Get-Date).AddSeconds(10)
+$copyOk = $false
+$lastCopyError = $null
+while (-not $copyOk -and (Get-Date) -lt $copyDeadline) {
+    try {
+        Copy-Item -LiteralPath $daemonSource -Destination $daemonDest -Force -ErrorAction Stop
+        $copyOk = $true
+    } catch {
+        $lastCopyError = $_
+        Start-Sleep -Milliseconds 250
+    }
+}
+if (-not $copyOk) {
+    throw "rustynetd.exe copy failed after 10s of retries: $lastCopyError"
+}
+
 if ($cliSource) {
     $script:InstallFailureStep = 'copy-cli-binary'
     Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'rustynet.exe') -Force
