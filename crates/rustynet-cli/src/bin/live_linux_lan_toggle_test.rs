@@ -528,6 +528,25 @@ fn run() -> Result<(), i32> {
     ensure_daemon_services_ready(&ctx, &client_host)?;
     ensure_daemon_services_ready(&ctx, &blind_exit_host)?;
 
+    // After enforce_host the daemons come up cold and stay in
+    // restricted-safe mode until they ingest fresh signed trust
+    // evidence. The route advertise call below is a mutating IPC
+    // command and is refused while restricted-safe is set, so refresh
+    // trust on every node first. Mirrors the equivalent step in
+    // live_linux_two_hop_test (commit cca0418); without it
+    // `route advertise 0.0.0.0/0` fails with "daemon is in
+    // restricted-safe mode" on the exit and the LAN-toggle stage hard-
+    // fails before the toggle is exercised at all.
+    logger
+        .line("Refreshing signed trust evidence on all nodes")
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    refresh_trust_evidence(&ctx, &exit_host)?;
+    refresh_trust_evidence(&ctx, &client_host)?;
+    refresh_trust_evidence(&ctx, &blind_exit_host)?;
+
     logger
         .line("Advertising default route on exit")
         .map_err(|err| {
