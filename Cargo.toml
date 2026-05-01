@@ -12,6 +12,7 @@ members = [
   "crates/rustynet-backend-api",
   "crates/rustynet-backend-wireguard",
   "crates/rustynet-backend-stub",
+  "crates/rustynet-sysinfo",
 ]
 resolver = "2"
 
