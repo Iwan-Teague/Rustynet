@@ -1494,10 +1494,20 @@ function Build-RustyNet {
     }
 
     $cargoCommand = $cargoPath
+    # Build rustynetd (the Windows service host) AND rustynet-cli (which
+    # is what `rustynet trust keygen` / `trust issue` dispatch through;
+    # Install-RustyNetWindowsService.ps1 needs the CLI on disk so it can
+    # rotate per-host trust evidence under SYSTEM at install-release time
+    # — see scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1
+    # 'reissue-trust-evidence-under-runtime-identity'). cargo's
+    # multi-`-p` syntax compiles them in one invocation; the CLI shares
+    # most of its dep graph with the daemon so the marginal cost over
+    # `-p rustynetd` alone is small.
+    $cargoBuildArgs = @('build', '--locked', '--release', '-p', 'rustynetd', '-p', 'rustynet-cli')
     Push-Location $RustyNetRoot
     try {
         if ($null -eq $buildReportLayout) {
-            & $cargoCommand build --locked --release -p rustynetd
+            & $cargoCommand $cargoBuildArgs
             if ($LASTEXITCODE -ne 0) {
                 throw 'cargo build failed for Windows build-release'
             }
@@ -1505,7 +1515,7 @@ function Build-RustyNet {
         }
 
         $buildProcess = Start-Process -FilePath $cargoCommand `
-            -ArgumentList @('build', '--locked', '--release', '-p', 'rustynetd') `
+            -ArgumentList $cargoBuildArgs `
             -WorkingDirectory $RustyNetRoot `
             -NoNewWindow `
             -Wait `

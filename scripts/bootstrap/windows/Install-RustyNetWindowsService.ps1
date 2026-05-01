@@ -507,6 +507,19 @@ foreach ($candidate in $cliCandidates) {
         break
     }
 }
+# The CLI binary is required: install-release runs `rustynet trust
+# keygen` + `trust issue` further down to rotate this host's trust
+# evidence under SYSTEM. Before commit ab4eb08 the CLI copy was
+# best-effort and a missing binary surfaced as an opaque
+# "rustynet.exe not found" later in the script. Promote that to a
+# fail-closed locate-build-artifacts error so the operator sees
+# the real cause: build-release did not produce a CLI artifact.
+if (-not $cliSource) {
+    throw ("rustynet CLI binary not found under release output. Looked at: " +
+        ($cliCandidates -join ', ') +
+        ". Bootstrap-RustyNetWindows.ps1's build-release must invoke cargo with both " +
+        "'-p rustynetd' and '-p rustynet-cli'.")
+}
 
 $daemonDest = Join-Path $InstallRoot 'rustynetd.exe'
 
