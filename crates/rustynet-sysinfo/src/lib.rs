@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 /// System information queries without external tool dependencies.
-
+///
 pub fn git_version() -> Option<String> {
     git_version_internal()
 }
@@ -55,7 +55,9 @@ fn rustc_version_internal() -> Option<String> {
         .arg("--version")
         .output()
         .ok()?;
-    String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -64,7 +66,9 @@ fn rustc_version_internal() -> Option<String> {
         .arg("--version")
         .output()
         .ok()?;
-    String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -73,7 +77,9 @@ fn rustc_version_internal() -> Option<String> {
         .arg("--version")
         .output()
         .ok()?;
-    String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -150,12 +156,12 @@ fn find_log_files_internal(app_name: &str) -> Vec<PathBuf> {
     if let Ok(entries) = fs::read_dir("/var/log") {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(filename) = path.file_name() {
-                if let Some(name) = filename.to_str() {
-                    if name.contains(app_name) {
-                        logs.push(path);
-                    }
-                }
+            if path
+                .file_name()
+                .and_then(|filename| filename.to_str())
+                .is_some_and(|n| n.contains(app_name))
+            {
+                logs.push(path);
             }
         }
     }
@@ -167,21 +173,18 @@ fn find_log_files_internal(app_name: &str) -> Vec<PathBuf> {
 fn find_log_files_internal(app_name: &str) -> Vec<PathBuf> {
     let mut logs = vec![];
 
-    let log_dirs = [
-        dirs_home().join("Library/Logs"),
-        PathBuf::from("/var/log"),
-    ];
+    let log_dirs = [dirs_home().join("Library/Logs"), PathBuf::from("/var/log")];
 
     for log_dir in log_dirs {
         if let Ok(entries) = fs::read_dir(&log_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(filename) = path.file_name() {
-                    if let Some(name) = filename.to_str() {
-                        if name.contains(app_name) {
-                            logs.push(path);
-                        }
-                    }
+                if path
+                    .file_name()
+                    .and_then(|filename| filename.to_str())
+                    .is_some_and(|n| n.contains(app_name))
+                {
+                    logs.push(path);
                 }
             }
         }
@@ -199,12 +202,12 @@ fn find_log_files_internal(app_name: &str) -> Vec<PathBuf> {
         if let Ok(entries) = fs::read_dir(&log_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(filename) = path.file_name() {
-                    if let Some(name) = filename.to_str() {
-                        if name.to_lowercase().contains(&app_name.to_lowercase()) {
-                            logs.push(path);
-                        }
-                    }
+                if path
+                    .file_name()
+                    .and_then(|filename| filename.to_str())
+                    .is_some_and(|n| n.to_lowercase().contains(&app_name.to_lowercase()))
+                {
+                    logs.push(path);
                 }
             }
         }

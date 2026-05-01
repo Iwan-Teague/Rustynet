@@ -12138,6 +12138,8 @@ fn version_text() -> String {
 }
 
 fn execute_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
     let mut lines = vec!["rustynet 0.1.0".to_string()];
 
     if let Some(path_str) = std::env::current_exe()
@@ -12150,21 +12152,12 @@ fn execute_info() -> Result<String, String> {
     lines.push(format!("target: {}", std::env::consts::OS));
     lines.push(format!("arch: {}", std::env::consts::ARCH));
 
-    if let Ok(output) = Command::new("rustc").arg("--version").output()
-        && let Ok(rustc_str) = String::from_utf8(output.stdout)
-    {
-        lines.push(format!("rustc: {}", rustc_str.trim()));
+    if let Some(rustc_str) = rustynet_sysinfo::rustc_version() {
+        lines.push(format!("rustc: {}", rustc_str));
     }
 
-    if let Ok(git_output) = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        && let Ok(hash_str) = String::from_utf8(git_output.stdout)
-    {
-        let hash = hash_str.trim();
-        if !hash.is_empty() {
-            lines.push(format!("commit: {}", hash));
-        }
+    if rustynet_sysinfo::git_version().is_some() {
+        lines.push("git: available".to_string());
     }
 
     Ok(lines.join("\n"))
@@ -12588,52 +12581,21 @@ fn execute_peer_list() -> Result<String, String> {
 }
 
 fn execute_tunnel_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
     let mut output = vec!["tunnel info:".to_string()];
 
     output.push(format!("  interface: {}", DEFAULT_WG_INTERFACE));
     output.push("  listen port: 51820".to_string());
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(wg_output) = Command::new("wg")
-            .args(["show", DEFAULT_WG_INTERFACE])
-            .output()
-            && let Ok(wg_str) = String::from_utf8(wg_output.stdout)
-        {
-            for line in wg_str.lines().take(10) {
-                output.push(format!("  {}", line));
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(wg_output) = Command::new("wg")
-            .args(["show", DEFAULT_WG_INTERFACE])
-            .output()
-            && let Ok(wg_str) = String::from_utf8(wg_output.stdout)
-        {
-            for line in wg_str.lines().take(10) {
-                output.push(format!("  {}", line));
-            }
-        } else {
-            output.push("  (WireGuard tools not found)".to_string());
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(wg_output) = Command::new("wg")
-            .args(["show", DEFAULT_WG_INTERFACE])
-            .output()
-            && let Ok(wg_str) = String::from_utf8(wg_output.stdout)
-        {
-            for line in wg_str.lines().take(10) {
-                output.push(format!("  {}", line));
-            }
-        } else {
-            output.push("  (WireGuard tools not found on PATH)".to_string());
-        }
+    let iface_info = rustynet_sysinfo::wireguard_interface_info(DEFAULT_WG_INTERFACE);
+    if iface_info.exists {
+        output.push(format!(
+            "  status: {}",
+            if iface_info.is_up { "up" } else { "down" }
+        ));
+    } else {
+        output.push("  status: interface not found".to_string());
     }
 
     Ok(output.join("\n"))
@@ -12696,6 +12658,8 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
 }
 
 fn execute_connectivity_test() -> Result<String, String> {
+    use rustynet_sysinfo;
+
     let mut output = vec!["connectivity test:".to_string()];
 
     output.push("  DNS resolution:".to_string());
@@ -12709,7 +12673,8 @@ fn execute_connectivity_test() -> Result<String, String> {
     }
 
     output.push("  Tunnel status:".to_string());
-    if tunnel_interface_exists(DEFAULT_WG_INTERFACE) {
+    let iface_info = rustynet_sysinfo::wireguard_interface_info(DEFAULT_WG_INTERFACE);
+    if iface_info.exists && iface_info.is_up {
         output.push("    ✓ Tunnel active".to_string());
     } else {
         output.push("    ✗ Tunnel not active".to_string());
@@ -12723,38 +12688,6 @@ fn execute_connectivity_test() -> Result<String, String> {
     }
 
     Ok(output.join("\n"))
-}
-
-fn tunnel_interface_exists(interface_name: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let path = format!("/sys/class/net/{}", interface_name);
-        std::path::Path::new(&path).exists()
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = Command::new("ifconfig").arg(interface_name).output() {
-            output.status.success()
-        } else {
-            false
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = Command::new("ipconfig").output() {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                stdout
-                    .to_lowercase()
-                    .contains(&interface_name.to_lowercase())
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
 }
 
 fn test_connectivity(host: &str, port: u16) -> bool {
