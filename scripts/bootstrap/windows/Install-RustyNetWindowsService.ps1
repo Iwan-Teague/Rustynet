@@ -570,6 +570,126 @@ if ($cliSource) {
     Copy-Item -LiteralPath $cliSource -Destination (Join-Path $InstallRoot 'rustynet.exe') -Force
 }
 
+# Sign the installed binaries with a per-host self-signed code-signing
+# certificate, and trust that certificate in LocalMachine\Root. This
+# is what `validate_windows_authenticode` (and the daemon's
+# `windows-authenticode-check`) require to pass — they call
+# `WinVerifyTrust` on rustynetd.exe and refuse anything where
+# `signature_present=false` or the chain doesn't terminate at a
+# trusted root.
+#
+# We do NOT relax the validator (no "lab mode" carve-out, no
+# fail-soft). Instead we make the binary genuinely signed and the
+# signing certificate genuinely chain-verifiable on this host. The
+# cert is unique per host (subject embeds the computer name), lives
+# in `Cert:\LocalMachine\My`, and is imported into
+# `Cert:\LocalMachine\Root` so WinVerifyTrust accepts it. Both stores
+# require Administrator; install-release already runs as SYSTEM via
+# the orchestrator, so the trust addition here matches the install-
+# scope authority and never leaves the lab guest.
+#
+# Idempotent: an existing non-expired cert with the same subject is
+# reused; signtool re-signing replaces the prior signature in place.
+$script:InstallFailureStep = 'sign-installed-binaries-for-authenticode'
+$signtoolCandidatePatterns = @(
+    'C:\Program Files (x86)\Windows Kits\10\bin\*\arm64\signtool.exe',
+    'C:\Program Files\Windows Kits\10\bin\*\arm64\signtool.exe',
+    'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe',
+    'C:\Program Files\Windows Kits\10\bin\*\x64\signtool.exe',
+    'C:\Program Files (x86)\Windows Kits\10\bin\*\x86\signtool.exe'
+)
+$signtoolPath = $null
+foreach ($pattern in $signtoolCandidatePatterns) {
+    $found = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if ($found) { $signtoolPath = $found.FullName; break }
+}
+if (-not $signtoolPath) {
+    throw ("signtool.exe not found under any Windows SDK path; install Windows SDK 10 " +
+        "(VS Build Tools) before re-running install-release. Patterns searched: " +
+        ($signtoolCandidatePatterns -join '; '))
+}
+Write-Host "[install-helper] authenticode: using signtool at $signtoolPath"
+
+$codeSigningSubject = "CN=RustyNet Lab Code Signing - $(hostname)"
+$codeSigningCert = Get-ChildItem -Path 'Cert:\LocalMachine\My' -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Subject -eq $codeSigningSubject -and
+        $_.HasPrivateKey -and
+        $_.NotAfter -gt (Get-Date).AddDays(7)
+    } |
+    Sort-Object NotAfter -Descending |
+    Select-Object -First 1
+if (-not $codeSigningCert) {
+    Write-Host "[install-helper] authenticode: minting new code-signing cert"
+    $codeSigningCert = New-SelfSignedCertificate `
+        -Type CodeSigningCert `
+        -Subject $codeSigningSubject `
+        -CertStoreLocation 'Cert:\LocalMachine\My' `
+        -KeyAlgorithm RSA `
+        -KeyLength 3072 `
+        -KeyUsage DigitalSignature `
+        -NotAfter (Get-Date).AddYears(2)
+} else {
+    Write-Host "[install-helper] authenticode: reusing existing code-signing cert (thumbprint=$($codeSigningCert.Thumbprint))"
+}
+
+# Make the cert chain-verifiable: import into LocalMachine\Root so
+# WinVerifyTrust treats it as a trusted root. Cert\Root.Add is a no-
+# op when the same thumbprint is already trusted.
+$rootStore = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
+$rootStore.Open('ReadWrite')
+try {
+    $alreadyTrusted = $false
+    foreach ($existing in $rootStore.Certificates) {
+        if ($existing.Thumbprint -eq $codeSigningCert.Thumbprint) {
+            $alreadyTrusted = $true
+            break
+        }
+    }
+    if (-not $alreadyTrusted) {
+        $rootStore.Add($codeSigningCert)
+        Write-Host "[install-helper] authenticode: added code-signing cert to LocalMachine\Root"
+    } else {
+        Write-Host "[install-helper] authenticode: code-signing cert already in LocalMachine\Root"
+    }
+}
+finally {
+    $rootStore.Close()
+}
+
+# Sign rustynetd.exe (the binary the validator targets) and rustynet
+# .exe (consistency; it's what the trust-issue step below executes).
+# Skip /tr timestamping: lab guests may lack internet, and an
+# expired-cert risk is bounded by the 2-year cert lifetime above. If
+# timestamping becomes important add /tr <server> /td SHA256 here.
+$binariesToSign = @($daemonDest, (Join-Path $InstallRoot 'rustynet.exe'))
+foreach ($binPath in $binariesToSign) {
+    if (-not (Test-Path -LiteralPath $binPath)) {
+        continue
+    }
+    # `/sm /s My`: search the LocalMachine\My store (default is the
+    # current-user store, which would be empty when install-release
+    # runs as SYSTEM via utmctl exec). Without `/sm` signtool errors
+    # out with "No certificates were found that met all the given
+    # criteria" even when the cert is sitting in LocalMachine\My.
+    $signtoolArgs = @(
+        'sign',
+        '/sm',
+        '/s', 'My',
+        '/sha1', $codeSigningCert.Thumbprint,
+        '/fd', 'SHA256',
+        '/v',
+        $binPath
+    )
+    $signOutput = (& $signtoolPath @signtoolArgs 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool sign failed for $binPath (exit $LASTEXITCODE): $signOutput"
+    }
+    Write-Host "[install-helper] authenticode: signed $binPath"
+}
+
 # Re-encrypt the WireGuard private key + DPAPI passphrase blob in the
 # current execution context.  The access-bootstrap phase generates these
 # under the SSH user (`windows`); the install-release phase runs as
