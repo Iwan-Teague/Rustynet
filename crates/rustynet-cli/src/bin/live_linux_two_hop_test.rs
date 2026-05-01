@@ -585,6 +585,35 @@ fn run() -> Result<(), String> {
         2,
     )?;
 
+    // After enforce_host the daemon comes up cold and stays in
+    // restricted-safe mode until it ingests fresh signed trust evidence.
+    // The route advertise call below is a mutating IPC command and is
+    // refused while restricted-safe is set, so refresh trust on every
+    // node first. Mirrors the exit_handoff test's pre-route-advertise
+    // refresh; without it `route advertise 0.0.0.0/0` fails with
+    // "daemon is in restricted-safe mode" on the final exit.
+    logger.line("[two-hop] refreshing signed trust evidence on all nodes")?;
+    refresh_trust_evidence(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.final_exit_host,
+    )?;
+    refresh_trust_evidence(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.entry_host,
+    )?;
+    refresh_trust_evidence(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.client_host,
+    )?;
+    refresh_trust_evidence(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.second_client_host,
+    )?;
+
     logger.line("[two-hop] advertising default route on final exit and entry relay")?;
     run_root(
         &config.ssh_identity_file,
@@ -1181,6 +1210,15 @@ fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Re
         known_hosts,
         target,
         "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh",
+    )
+}
+
+fn refresh_trust_evidence(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
+    run_root(
+        identity,
+        known_hosts,
+        target,
+        "rustynet ops refresh-signed-trust",
     )
 }
 
