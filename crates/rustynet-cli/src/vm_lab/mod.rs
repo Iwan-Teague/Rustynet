@@ -290,6 +290,12 @@ pub fn run_validate_windows_security(
                 .clone(),
             distribute_windows_traversal_bundle: config.distribute_windows_traversal_bundle.clone(),
             distribute_windows_dns_zone_bundle: config.distribute_windows_dns_zone_bundle.clone(),
+            // Verifier-key distribution opts in via the orchestrate-live-lab
+            // path (which auto-populates them from the local report state
+            // dir). vm-lab-validate-windows-security has not yet grown CLI
+            // flags for these; default to None so the verifier-key stages
+            // emit Skipped with "no local bundle path provided".
+            ..Default::default()
         },
     );
     let summary_path = config.report_dir.join("windows_security_validation.json");
@@ -7239,18 +7245,27 @@ fn run_windows_orchestration_with_pulled_bundles(
                 options.distribute_windows_assignment_bundle = Some(paths.assignment.clone());
                 options.distribute_windows_traversal_bundle = Some(paths.traversal.clone());
                 options.distribute_windows_dns_zone_bundle = Some(paths.dns_zone.clone());
+                options.distribute_windows_assignment_verifier_key =
+                    Some(paths.assignment_verifier_key.clone());
+                options.distribute_windows_traversal_verifier_key =
+                    Some(paths.traversal_verifier_key.clone());
+                options.distribute_windows_dns_zone_verifier_key =
+                    Some(paths.dns_zone_verifier_key.clone());
                 prelude_outcomes.push(stage_outcome(
                     "stage_windows_bundles_for_distribution",
                     VmLabStageStatus::Pass,
                     format!(
-                        "located signed bundles from local report dir for exit {exit_alias} \
-                         (node_id={exit_node_id})"
+                        "located signed bundles + verifier keys from local report dir for exit \
+                         {exit_alias} (node_id={exit_node_id})"
                     ),
                     vec![
                         paths.membership,
                         paths.assignment,
                         paths.traversal,
                         paths.dns_zone,
+                        paths.assignment_verifier_key,
+                        paths.traversal_verifier_key,
+                        paths.dns_zone_verifier_key,
                     ],
                 ));
             }
@@ -7286,6 +7301,9 @@ struct WindowsBundleLocalPaths {
     assignment: PathBuf,
     traversal: PathBuf,
     dns_zone: PathBuf,
+    assignment_verifier_key: PathBuf,
+    traversal_verifier_key: PathBuf,
+    dns_zone_verifier_key: PathBuf,
 }
 
 fn locate_windows_bundle_paths_from_report_dir(
@@ -7319,11 +7337,22 @@ fn locate_windows_bundle_paths_from_report_dir(
     let assignment = state_dir.join(format!("assignment-{exit_node_id}.bundle"));
     let traversal = state_dir.join(format!("traversal-{exit_node_id}.bundle"));
     let dns_zone = state_dir.join(format!("dns-zone-{exit_node_id}.bundle"));
+    // Mesh-wide verifier public keys, distributed alongside their bundles.
+    // Each Linux peer holds the same triple at /etc/rustynet/<kind>.pub;
+    // the bash orchestrator's issue stages write a copy of each public
+    // key into <report_dir>/state/<kind>.pub for the orchestrator host
+    // to redistribute to the Windows peer.
+    let assignment_verifier_key = state_dir.join("assignment.pub");
+    let traversal_verifier_key = state_dir.join("traversal.pub");
+    let dns_zone_verifier_key = state_dir.join("dns-zone.pub");
     for (label, path) in [
         ("membership snapshot", &membership),
         ("assignment bundle", &assignment),
         ("traversal bundle", &traversal),
         ("dns-zone bundle", &dns_zone),
+        ("assignment verifier key", &assignment_verifier_key),
+        ("traversal verifier key", &traversal_verifier_key),
+        ("dns-zone verifier key", &dns_zone_verifier_key),
     ] {
         if !path.is_file() {
             return Err(format!(
@@ -7338,6 +7367,9 @@ fn locate_windows_bundle_paths_from_report_dir(
             assignment,
             traversal,
             dns_zone,
+            assignment_verifier_key,
+            traversal_verifier_key,
+            dns_zone_verifier_key,
         },
         exit_alias,
         exit_node_id,
@@ -7403,6 +7435,22 @@ pub struct WindowsOrchestrationOptions {
     pub distribute_windows_traversal_bundle: Option<PathBuf>,
     /// Local path to a signed-DNS-zone bundle.
     pub distribute_windows_dns_zone_bundle: Option<PathBuf>,
+    /// Local path to the mesh's assignment-bundle verifier public key
+    /// (peer-set's `assignment.pub`). The Windows daemon loads this at
+    /// `C:\ProgramData\RustyNet\trust\assignment.pub` to verify every
+    /// signed assignment bundle on ingest. Without it the daemon
+    /// rejects every distributed assignment as
+    /// "read verifier key failed" and stays in restricted-safe.
+    /// `None` skips the distribute_windows_assignment_verifier_key
+    /// stage.
+    pub distribute_windows_assignment_verifier_key: Option<PathBuf>,
+    /// Local path to the mesh's traversal-bundle verifier public key.
+    /// Loaded by the daemon at
+    /// `C:\ProgramData\RustyNet\trust\traversal.pub`.
+    pub distribute_windows_traversal_verifier_key: Option<PathBuf>,
+    /// Local path to the mesh's DNS-zone verifier public key. Loaded
+    /// by the daemon at `C:\ProgramData\RustyNet\trust\dns-zone.pub`.
+    pub distribute_windows_dns_zone_verifier_key: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8034,6 +8082,12 @@ fn run_windows_orchestration_stages_with_options(
     let distribute_assignment_log_path = logs_dir.join("distribute_windows_assignment.log");
     let distribute_traversal_log_path = logs_dir.join("distribute_windows_traversal.log");
     let distribute_dns_zone_log_path = logs_dir.join("distribute_windows_dns_zone.log");
+    let distribute_assignment_verifier_log_path =
+        logs_dir.join("distribute_windows_assignment_verifier_key.log");
+    let distribute_traversal_verifier_log_path =
+        logs_dir.join("distribute_windows_traversal_verifier_key.log");
+    let distribute_dns_zone_verifier_log_path =
+        logs_dir.join("distribute_windows_dns_zone_verifier_key.log");
 
     type DistributeFn =
         fn(&str, &Path, &Path, Option<&Path>, &Path) -> Result<(String, String), (String, String)>;
@@ -8126,6 +8180,34 @@ fn run_windows_orchestration_stages_with_options(
         distribute_membership_log_path.as_path(),
         options.distribute_windows_membership_bundle.as_deref(),
         run_distribute_windows_membership_stage,
+    );
+    // Verifier keys MUST land before the corresponding bundles. The
+    // daemon's WatermarkStore re-ingests a bundle whenever its
+    // canonical-path mtime changes (or watermark is cleared); at that
+    // re-ingest moment the verifier key file must already be on disk
+    // or the ingest fails with "read verifier key failed" / "verifier
+    // key not found", and the daemon stays in restricted-safe with
+    // empty peer state. Pushing the verifier key first avoids that
+    // race.
+    let distribute_assignment_verifier_outcome = run_distribute(
+        "distribute_windows_assignment_verifier_key",
+        distribute_assignment_verifier_log_path.as_path(),
+        options
+            .distribute_windows_assignment_verifier_key
+            .as_deref(),
+        run_distribute_windows_assignment_verifier_key_stage,
+    );
+    let distribute_traversal_verifier_outcome = run_distribute(
+        "distribute_windows_traversal_verifier_key",
+        distribute_traversal_verifier_log_path.as_path(),
+        options.distribute_windows_traversal_verifier_key.as_deref(),
+        run_distribute_windows_traversal_verifier_key_stage,
+    );
+    let distribute_dns_zone_verifier_outcome = run_distribute(
+        "distribute_windows_dns_zone_verifier_key",
+        distribute_dns_zone_verifier_log_path.as_path(),
+        options.distribute_windows_dns_zone_verifier_key.as_deref(),
+        run_distribute_windows_dns_zone_verifier_key_stage,
     );
     let distribute_assignment_outcome = run_distribute(
         "distribute_windows_assignment",
@@ -8262,6 +8344,9 @@ fn run_windows_orchestration_stages_with_options(
         authenticode_outcome,
         dns_failclosed_outcome,
         distribute_membership_outcome,
+        distribute_assignment_verifier_outcome,
+        distribute_traversal_verifier_outcome,
+        distribute_dns_zone_verifier_outcome,
         distribute_assignment_outcome,
         distribute_traversal_outcome,
         distribute_dns_zone_outcome,
@@ -8996,6 +9081,48 @@ const WINDOWS_BUNDLE_DNS_ZONE: WindowsBundleDistributionContract =
         staging_prefix: "rustynetd.dns-zone",
     };
 
+// Verifier-key distribution contracts. The Windows daemon's
+// auto-tunnel / traversal / DNS-zone bundle ingest paths each load a
+// peer-set verifier key from a fixed canonical path
+// (`crates/rustynetd/src/windows_paths.rs:31-44`). Without those keys
+// the daemon's bundle preflight rejects every signed bundle as
+// "verifier key not found" / "read verifier key failed", and the
+// `validate_windows_mesh_join` stage fails with empty peer state.
+//
+// Each verifier-key contract reuses the bundle distribution
+// machinery: SCP to staging, atomic Move-Item to canonical. The
+// `watermark_path` field is set to a sentinel filename that never
+// exists on disk; the install-script's watermark-clear step is
+// already gated on `Test-Path`, so no Remove-Item ever fires for
+// these contracts. Verifier keys are static config, not signed
+// bundles with freshness watermarks.
+const WINDOWS_BUNDLE_ASSIGNMENT_VERIFIER_KEY: WindowsBundleDistributionContract =
+    WindowsBundleDistributionContract {
+        label: "assignment-verifier-key",
+        canonical_path: r"C:\ProgramData\RustyNet\trust\assignment.pub",
+        watermark_path: r"C:\ProgramData\RustyNet\trust\assignment.pub.no-watermark-sentinel",
+        staging_dir: r"C:\ProgramData\RustyNet\trust\.staging",
+        staging_prefix: "assignment.pub",
+    };
+
+const WINDOWS_BUNDLE_TRAVERSAL_VERIFIER_KEY: WindowsBundleDistributionContract =
+    WindowsBundleDistributionContract {
+        label: "traversal-verifier-key",
+        canonical_path: r"C:\ProgramData\RustyNet\trust\traversal.pub",
+        watermark_path: r"C:\ProgramData\RustyNet\trust\traversal.pub.no-watermark-sentinel",
+        staging_dir: r"C:\ProgramData\RustyNet\trust\.staging",
+        staging_prefix: "traversal.pub",
+    };
+
+const WINDOWS_BUNDLE_DNS_ZONE_VERIFIER_KEY: WindowsBundleDistributionContract =
+    WindowsBundleDistributionContract {
+        label: "dns-zone-verifier-key",
+        canonical_path: r"C:\ProgramData\RustyNet\trust\dns-zone.pub",
+        watermark_path: r"C:\ProgramData\RustyNet\trust\dns-zone.pub.no-watermark-sentinel",
+        staging_dir: r"C:\ProgramData\RustyNet\trust\.staging",
+        staging_prefix: "dns-zone.pub",
+    };
+
 /// Build the PowerShell script body that ensures the staging
 /// directory exists. `New-Item -Force` is idempotent. The path is
 /// a hard-coded reviewed constant so no untrusted value crosses the
@@ -9285,6 +9412,74 @@ pub fn run_distribute_windows_dns_zone_stage(
         ssh_identity_file,
         known_hosts_path,
         local_bundle_path,
+    )
+}
+
+/// Distribute the assignment-bundle verifier public key to the
+/// Windows guest. The Windows daemon loads this key at the canonical
+/// path `C:\ProgramData\RustyNet\trust\assignment.pub` to verify
+/// every signed assignment bundle on ingest. Without it,
+/// `verify_assignment_bundle` rejects all bundles as
+/// "read verifier key failed" and the daemon stays in restricted-safe.
+#[allow(dead_code)]
+pub fn run_distribute_windows_assignment_verifier_key_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_verifier_key_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    run_distribute_windows_bundle_stage(
+        &WINDOWS_BUNDLE_ASSIGNMENT_VERIFIER_KEY,
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        local_verifier_key_path,
+    )
+}
+
+/// Distribute the traversal-bundle verifier public key to the Windows
+/// guest. Loaded by the daemon at
+/// `C:\ProgramData\RustyNet\trust\traversal.pub` to verify signed
+/// traversal bundles on ingest.
+#[allow(dead_code)]
+pub fn run_distribute_windows_traversal_verifier_key_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_verifier_key_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    run_distribute_windows_bundle_stage(
+        &WINDOWS_BUNDLE_TRAVERSAL_VERIFIER_KEY,
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        local_verifier_key_path,
+    )
+}
+
+/// Distribute the DNS-zone-bundle verifier public key to the Windows
+/// guest. Loaded by the daemon at
+/// `C:\ProgramData\RustyNet\trust\dns-zone.pub` to verify signed
+/// DNS-zone bundles on ingest.
+#[allow(dead_code)]
+pub fn run_distribute_windows_dns_zone_verifier_key_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_verifier_key_path: &Path,
+) -> Result<(String, String), (String, String)> {
+    run_distribute_windows_bundle_stage(
+        &WINDOWS_BUNDLE_DNS_ZONE_VERIFIER_KEY,
+        windows_alias,
+        inventory_path,
+        ssh_identity_file,
+        known_hosts_path,
+        local_verifier_key_path,
     )
 }
 
