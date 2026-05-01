@@ -1780,11 +1780,43 @@ fn memory_info_internal() -> MemoryInfo {
 
 #[cfg(target_os = "macos")]
 fn memory_info_internal() -> MemoryInfo {
+    let mut total = 0u64;
+    let mut used = 0u64;
+
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .arg("hw.memsize")
+        .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+        && let Some(val) = s.split(':').nth(1)
+    {
+        total = val.trim().parse::<u64>().unwrap_or(0) / 1024 / 1024;
+    }
+
+    if let Ok(output) = std::process::Command::new("vm_stat").output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        for line in s.lines() {
+            if (line.contains("Pages wired down") || line.contains("Pages active"))
+                && let Some(val) = line.split_whitespace().last()
+            {
+                let pages = val.trim_end_matches('.').parse::<u64>().unwrap_or(0);
+                used += pages * 4 / 1024;
+            }
+        }
+    }
+
+    let available = total.saturating_sub(used);
+    let percent = if total > 0 {
+        (used as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
     MemoryInfo {
-        total_mb: 0,
-        used_mb: 0,
-        available_mb: 0,
-        percent: 0.0,
+        total_mb: total,
+        used_mb: used,
+        available_mb: available,
+        percent,
     }
 }
 
@@ -1811,13 +1843,49 @@ fn disk_info_internal() -> Vec<DiskInfo> {
 
 #[cfg(target_os = "macos")]
 fn disk_info_internal() -> Vec<DiskInfo> {
-    vec![DiskInfo {
-        mount: "/".to_string(),
-        total_mb: 0,
-        used_mb: 0,
-        available_mb: 0,
-        percent: 0.0,
-    }]
+    let mut disks = Vec::new();
+
+    if let Ok(output) = std::process::Command::new("df").args(["-k", "/"]).output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        for line in s.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let total_kb = parts[1].parse::<u64>().unwrap_or(0);
+                let used_kb = parts[2].parse::<u64>().unwrap_or(0);
+                let available_kb = parts[3].parse::<u64>().unwrap_or(0);
+
+                let total_mb = total_kb / 1024;
+                let used_mb = used_kb / 1024;
+                let available_mb = available_kb / 1024;
+                let percent = if total_mb > 0 {
+                    (used_mb as f64 / total_mb as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                disks.push(DiskInfo {
+                    mount: "/".to_string(),
+                    total_mb,
+                    used_mb,
+                    available_mb,
+                    percent,
+                });
+            }
+        }
+    }
+
+    if disks.is_empty() {
+        disks.push(DiskInfo {
+            mount: "/".to_string(),
+            total_mb: 0,
+            used_mb: 0,
+            available_mb: 0,
+            percent: 0.0,
+        });
+    }
+
+    disks
 }
 
 #[cfg(target_os = "windows")]
@@ -1861,9 +1929,28 @@ fn cpu_info_internal() -> CpuInfo {
 
 #[cfg(target_os = "macos")]
 fn cpu_info_internal() -> CpuInfo {
+    let mut cores = 1usize;
+    let mut model = "Apple Silicon/Intel".to_string();
+
+    if let Ok(output) = std::process::Command::new("sysctl").arg("hw.ncpu").output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+        && let Some(val) = s.split(':').nth(1)
+    {
+        cores = val.trim().parse::<usize>().unwrap_or(1);
+    }
+
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .arg("machdep.cpu.brand_string")
+        .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+        && let Some(val) = s.split(':').nth(1)
+    {
+        model = val.trim().to_string();
+    }
+
     CpuInfo {
-        cores: 1,
-        model: "Apple Silicon/Intel".to_string(),
+        cores,
+        model,
         freq_ghz: None,
     }
 }
@@ -1908,11 +1995,33 @@ fn socket_stats_internal() -> SocketStats {
 
 #[cfg(target_os = "macos")]
 fn socket_stats_internal() -> SocketStats {
+    let mut established = 0usize;
+    let mut listening = 0usize;
+    let mut time_wait = 0usize;
+
+    if let Ok(output) = std::process::Command::new("netstat")
+        .args(["-an", "-p", "tcp"])
+        .output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        for line in s.lines().skip(1) {
+            if line.contains("ESTABLISHED") {
+                established += 1;
+            } else if line.contains("LISTEN") {
+                listening += 1;
+            } else if line.contains("TIME_WAIT") {
+                time_wait += 1;
+            }
+        }
+    }
+
+    let total = established + listening + time_wait;
+
     SocketStats {
-        established: 0,
-        listening: 0,
-        time_wait: 0,
-        total: 0,
+        established,
+        listening,
+        time_wait,
+        total,
     }
 }
 
@@ -2062,7 +2171,51 @@ fn iface_list_internal() -> Vec<InterfaceDetail> {
 
 #[cfg(target_os = "macos")]
 fn iface_list_internal() -> Vec<InterfaceDetail> {
-    Vec::new()
+    let mut ifaces = Vec::new();
+
+    if let Ok(output) = std::process::Command::new("ifconfig").output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        let mut current_iface: Option<InterfaceDetail> = None;
+
+        for line in s.lines() {
+            if !line.starts_with('\t') && !line.starts_with(' ') && !line.is_empty() {
+                if let Some(iface) = current_iface.take() {
+                    ifaces.push(iface);
+                }
+
+                let name = line.split(':').next().unwrap_or("").to_string();
+                current_iface = Some(InterfaceDetail {
+                    name,
+                    up: line.contains("UP"),
+                    mac_address: None,
+                    ip_addresses: Vec::new(),
+                    mtu: 1500,
+                });
+            } else if let Some(ref mut iface) = current_iface {
+                if line.contains("HWaddr ") {
+                    if let Some(mac) = line.split("HWaddr ").nth(1) {
+                        iface.mac_address = Some(mac.trim().to_string());
+                    }
+                } else if line.contains("inet ")
+                    && let Some(ip) = line.split_whitespace().nth(1)
+                {
+                    iface.ip_addresses.push(ip.to_string());
+                } else if line.contains("mtu ")
+                    && let Some(mtu_str) = line.split("mtu ").nth(1)
+                    && let Some(mtu) = mtu_str.split_whitespace().next()
+                {
+                    iface.mtu = mtu.parse::<u32>().unwrap_or(1500);
+                }
+            }
+        }
+
+        if let Some(iface) = current_iface {
+            ifaces.push(iface);
+        }
+    }
+
+    ifaces
 }
 
 #[cfg(target_os = "windows")]
@@ -2188,7 +2341,28 @@ fn permission_check_internal() -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 fn permission_check_internal() -> Vec<String> {
-    Vec::new()
+    let mut issues = Vec::new();
+    let paths = vec![
+        "/etc/rustynet/config.yaml",
+        "/var/run/rustynet.sock",
+        "/var/lib/rustynet/state",
+    ];
+
+    for path in paths {
+        match fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions();
+                if mode.readonly() {
+                    issues.push(format!("{}: read-only", path));
+                }
+            }
+            Err(_) => {
+                issues.push(format!("{}: not found", path));
+            }
+        }
+    }
+
+    issues
 }
 
 #[cfg(target_os = "windows")]
