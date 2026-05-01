@@ -1822,11 +1822,41 @@ fn memory_info_internal() -> MemoryInfo {
 
 #[cfg(target_os = "windows")]
 fn memory_info_internal() -> MemoryInfo {
+    let mut total = 0u64;
+    let mut available = 0u64;
+
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            let lines: Vec<&str> = s.lines().collect();
+            for line in lines.iter().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    total = parts[0].parse::<u64>().unwrap_or(0);
+                    available = parts[1].parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    let used = total.saturating_sub(available);
+    let percent = if total > 0 {
+        (used as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
     MemoryInfo {
-        total_mb: 0,
-        used_mb: 0,
-        available_mb: 0,
-        percent: 0.0,
+        total_mb: total / 1024,
+        used_mb: used / 1024,
+        available_mb: available / 1024,
+        percent,
     }
 }
 
@@ -1890,13 +1920,49 @@ fn disk_info_internal() -> Vec<DiskInfo> {
 
 #[cfg(target_os = "windows")]
 fn disk_info_internal() -> Vec<DiskInfo> {
-    vec![DiskInfo {
-        mount: "C:".to_string(),
-        total_mb: 0,
-        used_mb: 0,
-        available_mb: 0,
-        percent: 0.0,
-    }]
+    let mut disks = Vec::new();
+
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Volume | Where-Object { $_.DriveLetter } | Select-Object DriveLetter,Size,SizeRemaining",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let drive = parts[0].to_string();
+                    let total = parts[1].parse::<u64>().unwrap_or(0);
+                    let available = parts[2].parse::<u64>().unwrap_or(0);
+                    let used = total.saturating_sub(available);
+                    let percent = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+
+                    disks.push(DiskInfo {
+                        mount: format!("{}:", drive),
+                        total_mb: total / 1024 / 1024,
+                        used_mb: used / 1024 / 1024,
+                        available_mb: available / 1024 / 1024,
+                        percent,
+                    });
+                }
+            }
+        }
+    }
+
+    if disks.is_empty() {
+        disks.push(DiskInfo {
+            mount: "C:".to_string(),
+            total_mb: 0,
+            used_mb: 0,
+            available_mb: 0,
+            percent: 0.0,
+        });
+    }
+
+    disks
 }
 
 #[cfg(target_os = "linux")]
@@ -1957,9 +2023,32 @@ fn cpu_info_internal() -> CpuInfo {
 
 #[cfg(target_os = "windows")]
 fn cpu_info_internal() -> CpuInfo {
+    let mut cores = 1usize;
+    let mut model = "Unknown".to_string();
+
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Processor | Select-Object NumberOfCores,Name",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            let lines: Vec<&str> = s.lines().collect();
+            for line in lines.iter().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    cores = parts[0].parse::<usize>().unwrap_or(1);
+                    model = parts[1..].join(" ");
+                }
+            }
+        }
+    }
+
     CpuInfo {
-        cores: 1,
-        model: "Unknown".to_string(),
+        cores,
+        model,
         freq_ghz: None,
     }
 }
@@ -2027,11 +2116,44 @@ fn socket_stats_internal() -> SocketStats {
 
 #[cfg(target_os = "windows")]
 fn socket_stats_internal() -> SocketStats {
+    let mut established = 0usize;
+    let mut listening = 0usize;
+    let mut time_wait = 0usize;
+
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetTCPConnection | Select-Object State | Group-Object State | Select-Object Name,Count",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let state = parts[0].to_lowercase();
+                    let count = parts[1].parse::<usize>().unwrap_or(0);
+
+                    if state.contains("established") {
+                        established = count;
+                    } else if state.contains("listen") {
+                        listening = count;
+                    } else if state.contains("time_wait") || state.contains("timewait") {
+                        time_wait = count;
+                    }
+                }
+            }
+        }
+    }
+
+    let total = established + listening + time_wait;
+
     SocketStats {
-        established: 0,
-        listening: 0,
-        time_wait: 0,
-        total: 0,
+        established,
+        listening,
+        time_wait,
+        total,
     }
 }
 
@@ -2131,7 +2253,36 @@ fn process_list_internal() -> Vec<ProcessListEntry> {
 
 #[cfg(target_os = "windows")]
 fn process_list_internal() -> Vec<ProcessListEntry> {
-    Vec::new()
+    let mut procs = Vec::new();
+
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'rustynet' -or $_.Name -match 'daemon' } | Select-Object Name,Id,WorkingSet",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let name = parts[0].to_string();
+                    let pid = parts[1].parse::<u32>().unwrap_or(0);
+                    let memory_mb = parts[2].parse::<u64>().unwrap_or(0) / 1024 / 1024;
+
+                    procs.push(ProcessListEntry {
+                        name,
+                        pid,
+                        memory_mb,
+                        uptime_seconds: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    procs
 }
 
 #[cfg(target_os = "linux")]
@@ -2220,7 +2371,38 @@ fn iface_list_internal() -> Vec<InterfaceDetail> {
 
 #[cfg(target_os = "windows")]
 fn iface_list_internal() -> Vec<InterfaceDetail> {
-    Vec::new()
+    let mut ifaces = Vec::new();
+
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter | Select-Object Name,Status,MacAddress,InterfaceDescription,MTUSize",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 5 {
+                    let name = parts[0].to_string();
+                    let up = parts[1].to_lowercase().contains("up");
+                    let mac = Some(parts[2].to_string());
+                    let mtu = parts[4].parse::<u32>().unwrap_or(1500);
+
+                    ifaces.push(InterfaceDetail {
+                        name,
+                        up,
+                        mac_address: mac,
+                        ip_addresses: Vec::new(),
+                        mtu,
+                    });
+                }
+            }
+        }
+    }
+
+    ifaces
 }
 
 #[cfg(target_os = "linux")]
