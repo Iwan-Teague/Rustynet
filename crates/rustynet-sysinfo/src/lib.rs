@@ -61,6 +61,26 @@ pub fn key_expiry() -> KeyExpiry {
     key_expiry_internal()
 }
 
+pub fn tunnel_status() -> TunnelStatus {
+    tunnel_status_internal()
+}
+
+pub fn wg_peers() -> Vec<WireGuardPeer> {
+    wg_peers_internal()
+}
+
+pub fn system_uptime() -> UptimeInfo {
+    uptime_internal()
+}
+
+pub fn process_info() -> ProcessInfo {
+    process_info_internal()
+}
+
+pub fn connection_test() -> ConnectionTest {
+    connection_test_internal()
+}
+
 pub struct InterfaceInfo {
     pub exists: bool,
     pub is_up: bool,
@@ -117,6 +137,38 @@ pub struct Route {
 pub struct KeyExpiry {
     pub expiring_soon: bool,
     pub key_details: Vec<String>,
+}
+
+pub struct TunnelStatus {
+    pub up: bool,
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub last_handshake_secs: Option<u64>,
+}
+
+pub struct WireGuardPeer {
+    pub name: String,
+    pub ip: String,
+    pub allowed_ips: String,
+    pub last_handshake_ago: Option<u64>,
+}
+
+pub struct UptimeInfo {
+    pub system_uptime_secs: u64,
+    pub daemon_uptime_secs: Option<u64>,
+}
+
+pub struct ProcessInfo {
+    pub pid: Option<u32>,
+    pub rss_mb: Option<u64>,
+    pub cpu_percent: Option<f64>,
+}
+
+pub struct ConnectionTest {
+    pub tunnel_reachable: bool,
+    pub exit_node_reachable: bool,
+    pub dns_working: bool,
+    pub message: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -924,4 +976,298 @@ fn key_expiry_internal() -> KeyExpiry {
         expiring_soon,
         key_details,
     }
+}
+
+fn tunnel_status_internal() -> TunnelStatus {
+    let iface_info = wireguard_interface_info_internal("wg0");
+    let (bytes_sent, bytes_recv) = get_interface_bytes("wg0");
+    let last_handshake = get_last_handshake();
+
+    TunnelStatus {
+        up: iface_info.is_up,
+        bytes_sent,
+        bytes_recv,
+        last_handshake_secs: last_handshake,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_interface_bytes(interface: &str) -> (u64, u64) {
+    if let Ok(content) = fs::read_to_string("/proc/net/dev") {
+        for line in content.lines() {
+            if line.contains(interface) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 10 {
+                    let bytes_recv = parts[1].parse::<u64>().unwrap_or(0);
+                    let bytes_sent = parts[9].parse::<u64>().unwrap_or(0);
+                    return (bytes_sent, bytes_recv);
+                }
+            }
+        }
+    }
+    (0, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn get_interface_bytes(_interface: &str) -> (u64, u64) {
+    (0, 0)
+}
+
+#[cfg(target_os = "windows")]
+fn get_interface_bytes(_interface: &str) -> (u64, u64) {
+    (0, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn get_last_handshake() -> Option<u64> {
+    if let Ok(output) = std::process::Command::new("wg")
+        .args(["show", "wg0", "latest-handshakes"])
+        .output()
+    {
+        if let Ok(stdout) = String::from_utf8(output.stdout) {
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(handshake) = parts[1].parse::<u64>() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        return Some(now.saturating_sub(handshake));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn get_last_handshake() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn get_last_handshake() -> Option<u64> {
+    None
+}
+
+fn wg_peers_internal() -> Vec<WireGuardPeer> {
+    let mut peers = vec![];
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("wg")
+            .args(["show", "wg0"])
+            .output()
+        {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                for line in stdout.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
+                        peers.push(WireGuardPeer {
+                            name: format!("peer-{}", &parts[0][..8.min(parts[0].len())]),
+                            ip: parts.get(3).unwrap_or(&"-").to_string(),
+                            allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
+                            last_handshake_ago: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        peers.push(WireGuardPeer {
+            name: "peer-info".to_string(),
+            ip: "(unavailable on this platform)".to_string(),
+            allowed_ips: "-".to_string(),
+            last_handshake_ago: None,
+        });
+    }
+
+    peers
+}
+
+fn uptime_internal() -> UptimeInfo {
+    let system_uptime = get_system_uptime();
+    let daemon_uptime = daemon_health_internal().uptime_secs;
+
+    UptimeInfo {
+        system_uptime_secs: system_uptime,
+        daemon_uptime_secs: daemon_uptime,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_system_uptime() -> u64 {
+    fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|content| {
+            content
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .map(|uptime| uptime as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn get_system_uptime() -> u64 {
+    std::process::Command::new("uptime")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|stdout| {
+            for part in stdout.split(',') {
+                if part.contains("up") {
+                    let trimmed = part.trim();
+                    if let Some(days) = trimmed
+                        .find("day")
+                        .and_then(|days_pos| {
+                            trimmed[..days_pos]
+                                .split_whitespace()
+                                .last()
+                                .and_then(|s| s.parse::<u64>().ok())
+                        })
+                    {
+                        return Some(days * 86400);
+                    }
+                }
+            }
+            None
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "windows")]
+fn get_system_uptime() -> u64 {
+    0
+}
+
+fn process_info_internal() -> ProcessInfo {
+    let pid = find_daemon_pid();
+    let (rss, cpu) = if let Some(p) = pid {
+        get_process_stats(p)
+    } else {
+        (None, None)
+    };
+
+    ProcessInfo {
+        pid,
+        rss_mb: rss,
+        cpu_percent: cpu,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_daemon_pid() -> Option<u32> {
+    if let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-o", "-f", "rustynetd"])
+        .output()
+    {
+        if let Ok(stdout) = String::from_utf8(output.stdout) {
+            return stdout.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn find_daemon_pid() -> Option<u32> {
+    std::process::Command::new("pgrep")
+        .args(["-o", "-f", "rustynetd"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|stdout| stdout.trim().parse::<u32>().ok())
+}
+
+#[cfg(target_os = "windows")]
+fn find_daemon_pid() -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn get_process_stats(pid: u32) -> (Option<u64>, Option<f64>) {
+    let stat_path = format!("/proc/{}/stat", pid);
+    let status_path = format!("/proc/{}/status", pid);
+
+    let rss = fs::read_to_string(&status_path).ok().and_then(|content| {
+        for line in content.lines() {
+            if line.starts_with("VmRSS:") {
+                return line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|kb| kb / 1024);
+            }
+        }
+        None
+    });
+
+    (rss, None)
+}
+
+#[cfg(target_os = "macos")]
+fn get_process_stats(_pid: u32) -> (Option<u64>, Option<f64>) {
+    (None, None)
+}
+
+#[cfg(target_os = "windows")]
+fn get_process_stats(_pid: u32) -> (Option<u64>, Option<f64>) {
+    (None, None)
+}
+
+fn connection_test_internal() -> ConnectionTest {
+    let tunnel_up = wireguard_interface_info_internal("wg0").is_up;
+    let exit_reachable = test_tcp_connection("8.8.8.8", 53).is_ok();
+    let dns_ok = test_dns_resolution("google.com").is_some();
+
+    let message = if tunnel_up && exit_reachable && dns_ok {
+        "all tests passed".to_string()
+    } else {
+        let mut issues = vec![];
+        if !tunnel_up {
+            issues.push("tunnel down");
+        }
+        if !exit_reachable {
+            issues.push("exit node unreachable");
+        }
+        if !dns_ok {
+            issues.push("dns resolution failed");
+        }
+        issues.join(", ")
+    };
+
+    ConnectionTest {
+        tunnel_reachable: tunnel_up,
+        exit_node_reachable: exit_reachable,
+        dns_working: dns_ok,
+        message,
+    }
+}
+
+fn test_tcp_connection(host: &str, port: u16) -> Result<(), String> {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    match TcpStream::connect_timeout(
+        &format!("{}:{}", host, port)
+            .parse()
+            .map_err(|e| format!("{}", e))?,
+        Duration::from_secs(3),
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("{}", e)),
+    }
+}
+
+fn test_dns_resolution(domain: &str) -> Option<String> {
+    std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:53", domain))
+        .ok()?
+        .next()
+        .map(|addr| addr.to_string())
 }

@@ -149,6 +149,11 @@ enum CliCommand {
     WgAddresses,
     Routes,
     KeyExpiry,
+    TunnelStatus,
+    WgPeers,
+    Uptime,
+    ProcessInfo,
+    ConnectionTest,
     Help,
 }
 
@@ -847,6 +852,11 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "wg-addresses" || cmd == "tunnel-ips" => CliCommand::WgAddresses,
         [cmd] if cmd == "routes" || cmd == "route-list" => CliCommand::Routes,
         [cmd] if cmd == "key-expiry" || cmd == "cert-expiry" => CliCommand::KeyExpiry,
+        [cmd] if cmd == "tunnel-status" || cmd == "tunnel" => CliCommand::TunnelStatus,
+        [cmd] if cmd == "wg-peers" || cmd == "peers" => CliCommand::WgPeers,
+        [cmd] if cmd == "uptime" => CliCommand::Uptime,
+        [cmd] if cmd == "process-info" || cmd == "daemon-proc" => CliCommand::ProcessInfo,
+        [cmd] if cmd == "connection-test" || cmd == "test-connection" => CliCommand::ConnectionTest,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3656,6 +3666,11 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::WgAddresses => execute_wg_addresses(),
         CliCommand::Routes => execute_routes(),
         CliCommand::KeyExpiry => execute_key_expiry(),
+        CliCommand::TunnelStatus => execute_tunnel_status(),
+        CliCommand::WgPeers => execute_wg_peers(),
+        CliCommand::Uptime => execute_uptime(),
+        CliCommand::ProcessInfo => execute_process_info(),
+        CliCommand::ConnectionTest => execute_connection_test(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12091,6 +12106,11 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::WgAddresses
         | CliCommand::Routes
         | CliCommand::KeyExpiry
+        | CliCommand::TunnelStatus
+        | CliCommand::WgPeers
+        | CliCommand::Uptime
+        | CliCommand::ProcessInfo
+        | CliCommand::ConnectionTest
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -12851,6 +12871,121 @@ fn execute_key_expiry() -> Result<String, String> {
     } else {
         output.push("  (no expiring keys detected)".to_string());
     }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_tunnel_status() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let status = rustynet_sysinfo::tunnel_status();
+    let mut output = vec!["tunnel status:".to_string()];
+    output.push(format!("  up: {}", if status.up { "yes" } else { "no" }));
+    output.push(format!("  bytes sent: {}", status.bytes_sent));
+    output.push(format!("  bytes received: {}", status.bytes_recv));
+    if let Some(ago) = status.last_handshake_secs {
+        output.push(format!("  last handshake: {}s ago", ago));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_wg_peers() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let peers = rustynet_sysinfo::wg_peers();
+    let mut output = vec!["wireguard peers:".to_string()];
+
+    if peers.is_empty() {
+        output.push("  (none)".to_string());
+    } else {
+        for peer in peers {
+            output.push(format!("  {}:", peer.name));
+            output.push(format!("    ip: {}", peer.ip));
+            output.push(format!("    allowed: {}", peer.allowed_ips));
+            if let Some(ago) = peer.last_handshake_ago {
+                output.push(format!("    handshake: {}s ago", ago));
+            }
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_uptime() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let info = rustynet_sysinfo::system_uptime();
+    let sys_hours = info.system_uptime_secs / 3600;
+    let sys_mins = (info.system_uptime_secs % 3600) / 60;
+
+    let mut output = vec!["uptime:".to_string()];
+    output.push(format!("  system: {}h {}m", sys_hours, sys_mins));
+
+    if let Some(daemon_secs) = info.daemon_uptime_secs {
+        let daemon_hours = daemon_secs / 3600;
+        let daemon_mins = (daemon_secs % 3600) / 60;
+        output.push(format!("  daemon: {}h {}m", daemon_hours, daemon_mins));
+    } else {
+        output.push("  daemon: not running".to_string());
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_process_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let info = rustynet_sysinfo::process_info();
+    let mut output = vec!["daemon process:".to_string()];
+
+    if let Some(pid) = info.pid {
+        output.push(format!("  pid: {}", pid));
+    } else {
+        output.push("  pid: not found".to_string());
+    }
+
+    if let Some(rss) = info.rss_mb {
+        output.push(format!("  memory: {} MB", rss));
+    }
+
+    if let Some(cpu) = info.cpu_percent {
+        output.push(format!("  cpu: {:.1}%", cpu));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_connection_test() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let test = rustynet_sysinfo::connection_test();
+    let mut output = vec!["connection test:".to_string()];
+    output.push(format!(
+        "  tunnel: {}",
+        if test.tunnel_reachable {
+            "reachable"
+        } else {
+            "unreachable"
+        }
+    ));
+    output.push(format!(
+        "  exit node: {}",
+        if test.exit_node_reachable {
+            "reachable"
+        } else {
+            "unreachable"
+        }
+    ));
+    output.push(format!(
+        "  dns: {}",
+        if test.dns_working {
+            "working"
+        } else {
+            "failed"
+        }
+    ));
+    output.push(format!("  result: {}", test.message));
 
     Ok(output.join("\n"))
 }
