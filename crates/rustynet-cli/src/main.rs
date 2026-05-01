@@ -14658,34 +14658,34 @@ fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
 }
 
 fn resolve_domain(domain: &str) -> Result<Vec<String>, String> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
-
-    rt.block_on(async {
-        use hickory_resolver::TokioAsyncResolver;
-        use hickory_resolver::proto::rr::RecordType;
-
-        let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
-            Ok(r) => r,
-            Err(e) => return Err(format!("failed to create resolver: {}", e)),
-        };
-
-        match resolver.lookup(domain, RecordType::A).await {
-            Ok(lookup) => {
-                let addresses: Vec<String> = lookup
-                    .record_iter()
-                    .filter_map(|record| record.data().map(|data| format!("{}", data)))
-                    .collect();
-
-                if addresses.is_empty() {
-                    Err("no A or AAAA records found".to_string())
-                } else {
-                    Ok(addresses)
-                }
+    // Diagnostic-only DNS A/AAAA lookup powering the `netcheck` /
+    // `connectivity test` rustynet subcommand. Earlier versions used
+    // `hickory-resolver` 0.24, which carries RUSTSEC-2026-0119
+    // (CPU-exhaustion via O(n²) name compression in hickory-proto
+    // <0.26.1). Upgrading to 0.26.x would pull in a new async API
+    // surface that requires a tokio runtime, an explicit Resolver
+    // builder, and changed `record.data()` typing.
+    //
+    // For a connectivity-test use case the system resolver (via
+    // `ToSocketAddrs`) is sufficient: it follows /etc/resolv.conf
+    // (or platform equivalent), gives the same answer the rest of
+    // the daemon's egress would, and removes the third-party DNS
+    // crate from rustynet-cli's supply chain entirely. The port we
+    // append is a placeholder; only the IP halves of the resolved
+    // addresses are reported back to the caller.
+    use std::net::ToSocketAddrs;
+    let host_port = format!("{domain}:0");
+    match host_port.to_socket_addrs() {
+        Ok(addrs) => {
+            let addresses: Vec<String> = addrs.map(|sa| sa.ip().to_string()).collect();
+            if addresses.is_empty() {
+                Err("no A or AAAA records found".to_string())
+            } else {
+                Ok(addresses)
             }
-            Err(e) => Err(format!("DNS lookup failed: {}", e)),
         }
-    })
+        Err(e) => Err(format!("DNS lookup failed: {e}")),
+    }
 }
 
 fn help_text() -> String {
