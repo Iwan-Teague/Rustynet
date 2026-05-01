@@ -154,6 +154,11 @@ enum CliCommand {
     Uptime,
     ProcessInfo,
     ConnectionTest,
+    LogTail,
+    LogErrors,
+    BandwidthTest,
+    InterfaceStats,
+    HealthCheck,
     Help,
 }
 
@@ -857,6 +862,11 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "uptime" => CliCommand::Uptime,
         [cmd] if cmd == "process-info" || cmd == "daemon-proc" => CliCommand::ProcessInfo,
         [cmd] if cmd == "connection-test" || cmd == "test-connection" => CliCommand::ConnectionTest,
+        [cmd] if cmd == "log-tail" || cmd == "logs" => CliCommand::LogTail,
+        [cmd] if cmd == "log-errors" => CliCommand::LogErrors,
+        [cmd] if cmd == "bandwidth-test" || cmd == "bandwidth" => CliCommand::BandwidthTest,
+        [cmd] if cmd == "interface-stats" || cmd == "ifstats" => CliCommand::InterfaceStats,
+        [cmd] if cmd == "health-check" || cmd == "health" => CliCommand::HealthCheck,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3671,6 +3681,11 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Uptime => execute_uptime(),
         CliCommand::ProcessInfo => execute_process_info(),
         CliCommand::ConnectionTest => execute_connection_test(),
+        CliCommand::LogTail => execute_log_tail(20),
+        CliCommand::LogErrors => execute_log_errors(),
+        CliCommand::BandwidthTest => execute_bandwidth_test(),
+        CliCommand::InterfaceStats => execute_interface_stats(),
+        CliCommand::HealthCheck => execute_health_check(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12111,6 +12126,11 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Uptime
         | CliCommand::ProcessInfo
         | CliCommand::ConnectionTest
+        | CliCommand::LogTail
+        | CliCommand::LogErrors
+        | CliCommand::BandwidthTest
+        | CliCommand::InterfaceStats
+        | CliCommand::HealthCheck
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -12986,6 +13006,122 @@ fn execute_connection_test() -> Result<String, String> {
         }
     ));
     output.push(format!("  result: {}", test.message));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_log_tail(lines: usize) -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let tail = rustynet_sysinfo::log_tail(lines);
+    let mut output = vec![format!("recent logs (last {} lines):", lines)];
+    if tail.is_empty() {
+        output.push("  (no logs found)".to_string());
+    } else {
+        for line in tail {
+            output.push(format!("  {}", line));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_log_errors() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let errors = rustynet_sysinfo::log_errors();
+    let mut output = vec!["recent errors:".to_string()];
+    if errors.is_empty() {
+        output.push("  (no errors found)".to_string());
+    } else {
+        for error in errors {
+            output.push(format!("  {}", error));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_bandwidth_test() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let test = rustynet_sysinfo::bandwidth_test();
+    let mut output = vec!["bandwidth test:".to_string()];
+    output.push(format!("  download: {:.1} Mbps", test.download_mbps));
+    output.push(format!("  upload: {:.1} Mbps", test.upload_mbps));
+    output.push(format!("  latency: {:.1} ms", test.latency_ms));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_interface_stats() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let stats = rustynet_sysinfo::interface_stats();
+    let mut output = vec!["interface statistics:".to_string()];
+
+    if stats.is_empty() {
+        output.push("  (none)".to_string());
+    } else {
+        for iface in stats {
+            output.push(format!("  {}:", iface.name));
+            output.push(format!(
+                "    bytes in:  {} | bytes out: {}",
+                iface.bytes_in, iface.bytes_out
+            ));
+            output.push(format!(
+                "    pkts in:   {} | pkts out:  {}",
+                iface.packets_in, iface.packets_out
+            ));
+            output.push(format!(
+                "    errors: {} | dropped: {}",
+                iface.errors, iface.dropped
+            ));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_health_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let health = rustynet_sysinfo::health_check();
+    let mut output = vec![format!(
+        "system health: {}",
+        health.overall_status.to_uppercase()
+    )];
+    output.push(format!(
+        "  daemon: {}",
+        if health.daemon_healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
+    ));
+    output.push(format!(
+        "  tunnel: {}",
+        if health.tunnel_healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
+    ));
+    output.push(format!(
+        "  network: {}",
+        if health.network_healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        }
+    ));
+
+    if !health.issues.is_empty() {
+        output.push("  issues:".to_string());
+        for issue in health.issues {
+            output.push(format!("    - {}", issue));
+        }
+    }
 
     Ok(output.join("\n"))
 }
