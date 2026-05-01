@@ -179,6 +179,11 @@ enum CliCommand {
     Ipv6Support,
     PacketLoss,
     SystemClock,
+    TcpConnections,
+    DnsResolver,
+    InterfaceSpeed,
+    DiskIo,
+    ProcessMemory,
     Help,
 }
 
@@ -907,6 +912,11 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "ipv6-support" || cmd == "ipv6" => CliCommand::Ipv6Support,
         [cmd] if cmd == "packet-loss" || cmd == "packet-loss-check" => CliCommand::PacketLoss,
         [cmd] if cmd == "system-clock" || cmd == "clock-check" => CliCommand::SystemClock,
+        [cmd] if cmd == "tcp-connections" || cmd == "tcp" => CliCommand::TcpConnections,
+        [cmd] if cmd == "dns-resolver" || cmd == "dns-servers" => CliCommand::DnsResolver,
+        [cmd] if cmd == "interface-speed" || cmd == "iface-speed" => CliCommand::InterfaceSpeed,
+        [cmd] if cmd == "disk-io" || cmd == "disk-stats" => CliCommand::DiskIo,
+        [cmd] if cmd == "process-memory" || cmd == "top-memory" => CliCommand::ProcessMemory,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3746,6 +3756,11 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Ipv6Support => execute_ipv6_support(),
         CliCommand::PacketLoss => execute_packet_loss(),
         CliCommand::SystemClock => execute_system_clock(),
+        CliCommand::TcpConnections => execute_tcp_connections(),
+        CliCommand::DnsResolver => execute_dns_resolver(),
+        CliCommand::InterfaceSpeed => execute_interface_speed(),
+        CliCommand::DiskIo => execute_disk_io(),
+        CliCommand::ProcessMemory => execute_process_memory(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12211,6 +12226,11 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Ipv6Support
         | CliCommand::PacketLoss
         | CliCommand::SystemClock
+        | CliCommand::TcpConnections
+        | CliCommand::DnsResolver
+        | CliCommand::InterfaceSpeed
+        | CliCommand::DiskIo
+        | CliCommand::ProcessMemory
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -13593,6 +13613,114 @@ fn execute_system_clock() -> Result<String, String> {
         output.push(format!("  last sync: {} seconds ago", last_sync));
     }
     output.push(format!("  status: {}", clock.status));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_tcp_connections() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let connections = rustynet_sysinfo::tcp_connections();
+    if connections.is_empty() {
+        return Ok("tcp connections: (none)".to_string());
+    }
+
+    let mut output = vec!["tcp connections:".to_string()];
+    for conn in connections.iter().take(20) {
+        output.push(format!(
+            "  {} -> {} ({})",
+            conn.local_addr, conn.remote_addr, conn.state
+        ));
+    }
+    if connections.len() > 20 {
+        output.push(format!("  ... and {} more", connections.len() - 20));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_dns_resolver() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let dns = rustynet_sysinfo::dns_resolver_info();
+    let mut output = vec!["dns resolver:".to_string()];
+    output.push(format!("  method: {}", dns.method));
+    if dns.resolvers.is_empty() {
+        output.push("  resolvers: (none)".to_string());
+    } else {
+        output.push("  resolvers:".to_string());
+        for resolver in &dns.resolvers {
+            output.push(format!("    {}", resolver));
+        }
+    }
+    if !dns.search_domains.is_empty() {
+        output.push("  search domains:".to_string());
+        for domain in &dns.search_domains {
+            output.push(format!("    {}", domain));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_interface_speed() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let speeds = rustynet_sysinfo::interface_speed();
+    if speeds.is_empty() {
+        return Ok("interface speed: (no interfaces)".to_string());
+    }
+
+    let mut output = vec!["interface speed:".to_string()];
+    for iface in speeds {
+        let speed_str = iface
+            .speed_mbps
+            .map(|s| format!("{} Mbps", s))
+            .unwrap_or_else(|| "unknown".to_string());
+        output.push(format!(
+            "  {}: {} (MTU: {})",
+            iface.name, speed_str, iface.mtu
+        ));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_disk_io() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let stats = rustynet_sysinfo::disk_io_stats();
+    if stats.is_empty() {
+        return Ok("disk io stats: (not available)".to_string());
+    }
+
+    let mut output = vec!["disk io stats:".to_string()];
+    for stat in stats {
+        output.push(format!(
+            "  {}: read_ops={} read_bytes={} write_ops={} write_bytes={}",
+            stat.device, stat.read_ops, stat.read_bytes, stat.write_ops, stat.write_bytes
+        ));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_process_memory() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let processes = rustynet_sysinfo::process_memory();
+    if processes.is_empty() {
+        return Ok("process memory: (no processes)".to_string());
+    }
+
+    let mut output = vec!["process memory (top 10):".to_string()];
+    output.push("  name                                         pid    memory".to_string());
+    for proc in processes {
+        output.push(format!(
+            "  {:<40} {:<6} {} MB",
+            proc.name, proc.pid, proc.memory_mb
+        ));
+    }
 
     Ok(output.join("\n"))
 }
