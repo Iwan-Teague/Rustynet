@@ -7018,16 +7018,12 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             emit_vm_lab_progress_outcomes("vm-lab-orchestrate-live-lab", appended.as_slice());
             warnings.extend(result.warnings);
             if let Some(ref windows_alias) = config.windows_vm {
-                let windows_outcomes = run_windows_orchestration_stages(
-                    windows_alias.as_str(),
+                let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
+                    &config,
                     inventory_path.as_path(),
-                    config.ssh_identity_file.as_path(),
-                    config.known_hosts_path.as_deref(),
-                    config.ssh_port,
-                    config.utm_documents_root.as_deref(),
-                    config.utmctl_path.as_deref(),
-                    config.dry_run,
                     report_dir.as_path(),
+                    windows_alias.as_str(),
+                    outcomes.as_slice(),
                 );
                 for outcome in &windows_outcomes {
                     emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
@@ -7083,6 +7079,25 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                     emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", &run_outcome);
                     outcomes.push(run_outcome);
                 }
+            }
+            // Run Windows orchestration even when the Linux pipeline failed
+            // downstream of the four bundle-distribution stages: the signed
+            // bundles are already on the Linux exit and the Windows peer
+            // should still be joined to mesh state. Gating happens inside
+            // the helper based on whether the Linux distribute_* stages
+            // passed in `outcomes`.
+            if let Some(ref windows_alias) = config.windows_vm {
+                let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
+                    &config,
+                    inventory_path.as_path(),
+                    report_dir.as_path(),
+                    windows_alias.as_str(),
+                    outcomes.as_slice(),
+                );
+                for outcome in &windows_outcomes {
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+                }
+                outcomes.extend(windows_outcomes);
             }
             if !config.skip_diagnose_on_failure && report_dir.join("state/stages.tsv").exists() {
                 let diagnose_result = execute_ops_vm_lab_diagnose_live_lab_failure(
@@ -7148,6 +7163,185 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             )
         }
     }
+}
+
+/// Linux distribute stage names that produce the signed bundles a
+/// Windows peer also needs (membership snapshot + per-daemon
+/// assignment/traversal/dns-zone). When all four reported PASS during
+/// the Linux pipeline, the Linux exit holds canonical bundle files
+/// under /var/lib/rustynet/, so the orchestrator can pull them and
+/// distribute them to the Windows peer to keep its mesh state in
+/// parity with the Linux peers.
+const LINUX_DISTRIBUTE_STAGES_FOR_WINDOWS_BUNDLES: &[&str] = &[
+    "distribute_membership_state",
+    "issue_and_distribute_assignments",
+    "issue_and_distribute_traversal",
+    "issue_and_distribute_dns_zone",
+];
+
+fn linux_distribute_stages_passed(outcomes: &[VmLabStageOutcome]) -> bool {
+    LINUX_DISTRIBUTE_STAGES_FOR_WINDOWS_BUNDLES
+        .iter()
+        .all(|stage_name| {
+            outcomes
+                .iter()
+                .any(|o| o.stage == *stage_name && o.status == VmLabStageStatus::Pass)
+        })
+}
+
+/// Wraps `run_windows_orchestration_stages_with_options` with an
+/// orchestrator-side bundle-locate step. The legacy bash live-lab
+/// pipeline writes its issued signed bundles into `<report_dir>/state/`
+/// as it distributes them to the Linux peers. When all four Linux
+/// `distribute_*` stages reported PASS, those local files are the
+/// authoritative copies of the exit's mesh state and are byte-identical
+/// to what `pull_windows_state_from_linux_exit` would SCP back from
+/// `/var/lib/rustynet/`. Sourcing them locally avoids a redundant
+/// network roundtrip and the requirement that the SSH user be in the
+/// `rustynetd` group on the Linux exit. The bundle paths are then fed
+/// into `WindowsOrchestrationOptions` so the four `distribute_windows_*`
+/// stages actually run instead of being Skipped. When the Linux
+/// distribute stages did not all pass (or the local bundle files cannot
+/// be located), the helper falls back to the historical bootstrap +
+/// validators-only path with no bundle distribution.
+fn run_windows_orchestration_with_pulled_bundles(
+    config: &VmLabOrchestrateLiveLabConfig,
+    inventory_path: &Path,
+    report_dir: &Path,
+    windows_alias: &str,
+    linux_outcomes: &[VmLabStageOutcome],
+) -> Vec<VmLabStageOutcome> {
+    let mut prelude_outcomes: Vec<VmLabStageOutcome> = Vec::new();
+    let mut options = WindowsOrchestrationOptions::default();
+
+    let distribute_passed = linux_distribute_stages_passed(linux_outcomes);
+    if config.dry_run {
+        prelude_outcomes.push(stage_outcome(
+            "stage_windows_bundles_for_distribution",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would stage signed bundles for {windows_alias}"),
+            vec![],
+        ));
+    } else if !distribute_passed {
+        prelude_outcomes.push(stage_outcome(
+            "stage_windows_bundles_for_distribution",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: one or more Linux bundle-distribution stages did not pass ({})",
+                LINUX_DISTRIBUTE_STAGES_FOR_WINDOWS_BUNDLES.join(", ")
+            ),
+            vec![],
+        ));
+    } else {
+        match locate_windows_bundle_paths_from_report_dir(config, inventory_path, report_dir) {
+            Ok((paths, exit_alias, exit_node_id)) => {
+                options.distribute_windows_membership_bundle = Some(paths.membership.clone());
+                options.distribute_windows_assignment_bundle = Some(paths.assignment.clone());
+                options.distribute_windows_traversal_bundle = Some(paths.traversal.clone());
+                options.distribute_windows_dns_zone_bundle = Some(paths.dns_zone.clone());
+                prelude_outcomes.push(stage_outcome(
+                    "stage_windows_bundles_for_distribution",
+                    VmLabStageStatus::Pass,
+                    format!(
+                        "located signed bundles from local report dir for exit {exit_alias} \
+                         (node_id={exit_node_id})"
+                    ),
+                    vec![
+                        paths.membership,
+                        paths.assignment,
+                        paths.traversal,
+                        paths.dns_zone,
+                    ],
+                ));
+            }
+            Err(err) => {
+                prelude_outcomes.push(stage_outcome(
+                    "stage_windows_bundles_for_distribution",
+                    VmLabStageStatus::Fail,
+                    err,
+                    vec![],
+                ));
+            }
+        }
+    }
+
+    let mut outcomes = prelude_outcomes;
+    outcomes.extend(run_windows_orchestration_stages_with_options(
+        windows_alias,
+        inventory_path,
+        config.ssh_identity_file.as_path(),
+        config.known_hosts_path.as_deref(),
+        config.ssh_port,
+        config.utm_documents_root.as_deref(),
+        config.utmctl_path.as_deref(),
+        config.dry_run,
+        report_dir,
+        options,
+    ));
+    outcomes
+}
+
+struct WindowsBundleLocalPaths {
+    membership: PathBuf,
+    assignment: PathBuf,
+    traversal: PathBuf,
+    dns_zone: PathBuf,
+}
+
+fn locate_windows_bundle_paths_from_report_dir(
+    config: &VmLabOrchestrateLiveLabConfig,
+    inventory_path: &Path,
+    report_dir: &Path,
+) -> Result<(WindowsBundleLocalPaths, String, String), String> {
+    let exit_alias = match config.exit_vm.clone() {
+        Some(alias) => alias,
+        None => default_inventory_alias_for_lab_roles(inventory_path, &["exit"])
+            .map_err(|err| format!("could not resolve Linux exit alias from inventory: {err}"))?
+            .ok_or_else(|| {
+                "no Linux exit alias resolvable from --exit-vm or inventory lab_role=exit"
+                    .to_string()
+            })?,
+    };
+    let inventory = load_inventory(inventory_path)?;
+    let exit_node_id = inventory
+        .into_iter()
+        .find(|entry| entry.alias == exit_alias)
+        .ok_or_else(|| format!("exit alias {exit_alias} not found in inventory"))?
+        .node_id
+        .ok_or_else(|| {
+            format!(
+                "inventory entry for exit alias {exit_alias} has no node_id; \
+                 cannot locate per-node signed bundles"
+            )
+        })?;
+    let state_dir = report_dir.join("state");
+    let membership = state_dir.join("membership.snapshot");
+    let assignment = state_dir.join(format!("assignment-{exit_node_id}.bundle"));
+    let traversal = state_dir.join(format!("traversal-{exit_node_id}.bundle"));
+    let dns_zone = state_dir.join(format!("dns-zone-{exit_node_id}.bundle"));
+    for (label, path) in [
+        ("membership snapshot", &membership),
+        ("assignment bundle", &assignment),
+        ("traversal bundle", &traversal),
+        ("dns-zone bundle", &dns_zone),
+    ] {
+        if !path.is_file() {
+            return Err(format!(
+                "expected {label} not found at {} (Linux distribute stages may not have written it)",
+                path.display()
+            ));
+        }
+    }
+    Ok((
+        WindowsBundleLocalPaths {
+            membership,
+            assignment,
+            traversal,
+            dns_zone,
+        },
+        exit_alias,
+        exit_node_id,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8848,9 +9042,18 @@ fn build_windows_bundle_atomic_install_script(
     let quoted_staging = powershell_quote(&staging_full)?;
     let quoted_canonical = powershell_quote(contract.canonical_path)?;
     let quoted_watermark = powershell_quote(contract.watermark_path)?;
+    // `Remove-Item -ErrorAction SilentlyContinue` against a non-existent path
+    // silences the error stream but still propagates a non-zero exit through
+    // the SSH `powershell.exe -Command` host, which the orchestrator reads as
+    // a stage failure even though the move + watermark-clear semantics are
+    // correct. Gate the watermark removal on Test-Path and end with an
+    // explicit `exit 0` so the only paths to a non-zero exit are: (1)
+    // Move-Item raising a terminating error, or (2) Remove-Item failing on
+    // a watermark that genuinely exists.
     Ok(format!(
         "Move-Item -Force -LiteralPath {quoted_staging} -Destination {quoted_canonical}; \
-         Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath {quoted_watermark}"
+         if (Test-Path -LiteralPath {quoted_watermark}) {{ Remove-Item -Force -LiteralPath {quoted_watermark} }}; \
+         exit 0"
     ))
 }
 
@@ -25624,9 +25827,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 "script must reference watermark {watermark}: {script}"
             );
             assert!(script.contains("Move-Item -Force -LiteralPath"));
-            assert!(
-                script.contains("Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath")
-            );
+            assert!(script.contains("if (Test-Path -LiteralPath"));
+            assert!(script.contains("Remove-Item -Force -LiteralPath"));
+            assert!(script.trim_end().ends_with("exit 0"));
         }
     }
 
