@@ -139,6 +139,11 @@ enum CliCommand {
     Bandwidth,
     Metrics,
     DnsTest(Option<String>),
+    Sysinfo,
+    ServiceStatus(String),
+    Network,
+    SecurityCheck,
+    DependencyCheck,
     Help,
 }
 
@@ -827,6 +832,11 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "metrics" || cmd == "stats" => CliCommand::Metrics,
         [cmd] if cmd == "dns-test" => CliCommand::DnsTest(None),
         [cmd, domain] if cmd == "dns-test" => CliCommand::DnsTest(Some(domain.clone())),
+        [cmd] if cmd == "sysinfo" || cmd == "system-info" => CliCommand::Sysinfo,
+        [cmd, service] if cmd == "service-status" => CliCommand::ServiceStatus(service.clone()),
+        [cmd] if cmd == "network" || cmd == "network-info" => CliCommand::Network,
+        [cmd] if cmd == "security-check" => CliCommand::SecurityCheck,
+        [cmd] if cmd == "dependency-check" => CliCommand::DependencyCheck,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3626,6 +3636,11 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Bandwidth => execute_bandwidth(),
         CliCommand::Metrics => execute_metrics(),
         CliCommand::DnsTest(domain) => execute_dns_test(domain),
+        CliCommand::Sysinfo => execute_sysinfo(),
+        CliCommand::ServiceStatus(service) => execute_service_status(&service),
+        CliCommand::Network => execute_network_info(),
+        CliCommand::SecurityCheck => execute_security_check(),
+        CliCommand::DependencyCheck => execute_dependency_check(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12051,6 +12066,11 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Bandwidth
         | CliCommand::Metrics
         | CliCommand::DnsTest(_)
+        | CliCommand::Sysinfo
+        | CliCommand::ServiceStatus(_)
+        | CliCommand::Network
+        | CliCommand::SecurityCheck
+        | CliCommand::DependencyCheck
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -12596,6 +12616,117 @@ fn execute_tunnel_info() -> Result<String, String> {
         ));
     } else {
         output.push("  status: interface not found".to_string());
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_sysinfo() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let info = rustynet_sysinfo::system_info();
+    let mut output = vec!["system information:".to_string()];
+    output.push(format!("  os: {}", info.os));
+    output.push(format!("  arch: {}", info.arch));
+    output.push(format!("  cpu count: {}", info.cpu_count));
+    if let Some(version) = info.kernel_version {
+        output.push(format!("  kernel: {}", version));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_service_status(service_name: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let status = rustynet_sysinfo::service_status(service_name);
+    let mut output = vec![format!("service status: {}", service_name)];
+    output.push(format!(
+        "  running: {}",
+        if status.running { "yes" } else { "no" }
+    ));
+    output.push(format!("  status: {}", status.status_message));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_network_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let interfaces = rustynet_sysinfo::network_interfaces();
+    let mut output = vec!["network interfaces:".to_string()];
+
+    for iface in interfaces {
+        output.push(format!(
+            "  {} ({})",
+            iface.name,
+            if iface.up { "up" } else { "down" }
+        ));
+        if !iface.addresses.is_empty() {
+            for addr in iface.addresses {
+                output.push(format!("    {}", addr));
+            }
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_security_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let result = rustynet_sysinfo::security_checks("");
+    let mut output = if result.passed {
+        vec!["security check: passed".to_string()]
+    } else {
+        vec!["security check: failed".to_string()]
+    };
+
+    if !result.issues.is_empty() {
+        output.push("  issues:".to_string());
+        for issue in result.issues {
+            output.push(format!("    - {}", issue));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_dependency_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let deps = rustynet_sysinfo::check_dependencies();
+    let mut output = vec!["dependency check:".to_string()];
+    output.push(format!(
+        "  wireguard: {}",
+        if deps.wireguard_available {
+            "available"
+        } else {
+            "missing"
+        }
+    ));
+    output.push(format!(
+        "  git: {}",
+        if deps.git_available {
+            "available"
+        } else {
+            "missing"
+        }
+    ));
+    output.push(format!(
+        "  dns tools: {}",
+        if deps.dns_tools_available {
+            "available"
+        } else {
+            "missing"
+        }
+    ));
+
+    if !deps.messages.is_empty() {
+        output.push("  messages:".to_string());
+        for msg in deps.messages {
+            output.push(format!("    - {}", msg));
+        }
     }
 
     Ok(output.join("\n"))
