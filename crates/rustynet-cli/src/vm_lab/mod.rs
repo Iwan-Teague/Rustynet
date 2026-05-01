@@ -17094,13 +17094,18 @@ fn utm_exec_root_raw(
     ensure_no_control_chars("UTM exec command", command_script)?;
     let utmctl_path = utmctl_binary_path()?;
     let mut command = Command::new(utmctl_path);
-    command
-        .arg("exec")
-        .arg(utm_name)
-        .arg("--cmd")
-        .arg("/bin/bash")
-        .arg("-lc")
-        .arg(command_script);
+    command.arg("exec").arg(utm_name);
+    // Prefix every argv element with its own `--cmd`. utmctl's
+    // `--cmd <cmd> ...` is a repeated option; passing a single
+    // `--cmd <bin>` followed by bare positional args works under most
+    // utmctl versions but intermittently serializes the bare positionals
+    // into a single argv element on the guest side (observed for the
+    // Windows powershell.exe flavor of this call in livelab4/5). Using
+    // explicit `--cmd` per arg matches utmctl's documented syntax and
+    // never collapses.
+    for arg in ["/bin/bash", "-lc", command_script] {
+        command.arg("--cmd").arg(arg);
+    }
     run_status_with_timeout(&mut command, timeout)
 }
 
@@ -17269,17 +17274,21 @@ exit 0
     let host_status = {
         let utmctl_path = utmctl_binary_path()?;
         let mut command = Command::new(utmctl_path);
-        command
-            .arg("exec")
-            .arg(utm_name)
-            .arg("--cmd")
-            .arg("/bin/bash")
-            .arg(remote_wrapper_path.as_str())
-            .arg(ssh_user)
-            .arg(home)
-            .arg(remote_command_path.as_str())
-            .arg(remote_output_path.as_str())
-            .arg(remote_rc_path.as_str());
+        command.arg("exec").arg(utm_name);
+        // Explicit `--cmd` per arg (matches utmctl's documented syntax,
+        // never collapses positional args). See utm_exec_root_raw above
+        // for the same fix on the bash-utmctl path.
+        for arg in [
+            "/bin/bash",
+            remote_wrapper_path.as_str(),
+            ssh_user,
+            home,
+            remote_command_path.as_str(),
+            remote_output_path.as_str(),
+            remote_rc_path.as_str(),
+        ] {
+            command.arg("--cmd").arg(arg);
+        }
         run_status_with_timeout(&mut command, timeout + Duration::from_secs(30))?
     };
     if !host_status.success() {
@@ -18676,20 +18685,38 @@ fn utm_exec_windows_raw(
     let encoded = encode_powershell_command(wrapped_script.as_str())?;
     let utmctl_path = utmctl_binary_path()?;
     let mut command = Command::new(utmctl_path);
-    command
-        .arg("exec")
-        .arg(utm_name)
-        .arg("--cmd")
-        .arg(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        .arg("-NoLogo")
-        .arg("-NoProfile")
-        .arg("-NonInteractive")
-        .arg("-OutputFormat")
-        .arg("Text")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-EncodedCommand")
-        .arg(encoded);
+    command.arg("exec").arg(utm_name);
+    // utmctl exec's `--cmd <cmd> ...` takes a repeated option: each
+    // `--cmd <value>` builds up the argv. Earlier code passed a single
+    // `--cmd powershell.exe` followed by bare positional args (-NoLogo
+    // -NoProfile -EncodedCommand <base64>) and relied on the swift-
+    // argument-parser version under utmctl to interpret them as
+    // additional --cmd values. That's intermittent: under certain
+    // conditions utmctl serializes the bare positionals as a single
+    // argv element, so PowerShell starts and reads
+    // `--cmd -NoProfile --cmd -Command --cmd New-Item ...` as its
+    // STDIN/-Command body, then chokes with
+    //   At line:1 char:3
+    //   + --cmd -NoProfile --cmd -Command --cmd New-Item ...
+    //   Missing expression after unary operator '--'
+    // (observed in livelab4 / livelab5 bootstrap_windows_host
+    // failures). Prefix every arg with its own `--cmd` so utmctl
+    // always sees a clean repeated-option list and PowerShell receives
+    // each switch as a separate argv element.
+    for arg in [
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded.as_str(),
+    ] {
+        command.arg("--cmd").arg(arg);
+    }
     let output = run_output_with_timeout(&mut command, timeout)?;
     let stderr_raw = String::from_utf8_lossy(&output.stderr);
     // Strip CLIXML envelopes from the stderr stream defensively even
