@@ -2913,6 +2913,18 @@ distribute_dns_zone_worker() {
 stage_enforce_baseline_runtime() {
   run_parallel_node_stage enforce_baseline_runtime enforce_runtime_worker
   run_parallel_node_stage refresh_runtime_after_enforce refresh_runtime_state_worker
+  # Refresh trust evidence on every node BEFORE the route-advertise IPC
+  # below. enforce_runtime_worker (re)installs the systemd unit and
+  # restarts each daemon; on cold start the daemon stays in restricted-
+  # safe mode until it ingests fresh signed trust evidence. Without an
+  # explicit refresh here, the route advertise IPC at the next line is
+  # a mutating command and can be refused with "daemon is in
+  # restricted-safe mode" — same fail-closed pattern fixed in the live
+  # test bins (cca0418, fc648df, 172f8bb). The downstream
+  # refresh_trust_after_traversal step already runs this on every node;
+  # advancing it ahead of route advertise eliminates the gap without
+  # adding a new orchestrator step.
+  run_parallel_node_stage refresh_trust_after_enforce refresh_trust_evidence_worker
   live_lab_retry_root "$(node_target_for_label exit)" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 0.0.0.0/0" 10 2 || return 1
   sleep 5
   # Refresh short-lived signed artifacts immediately before baseline validation
