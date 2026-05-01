@@ -12698,117 +12698,77 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
 fn execute_connectivity_test() -> Result<String, String> {
     let mut output = vec!["connectivity test:".to_string()];
 
+    output.push("  DNS resolution:".to_string());
+    match resolve_domain("rustynet.dev") {
+        Ok(addresses) if !addresses.is_empty() => {
+            output.push(format!("    ✓ DNS working (resolved to {})", addresses[0]));
+        }
+        _ => {
+            output.push("    ✗ DNS failed".to_string());
+        }
+    }
+
+    output.push("  Tunnel status:".to_string());
+    if tunnel_interface_exists(DEFAULT_WG_INTERFACE) {
+        output.push("    ✓ Tunnel active".to_string());
+    } else {
+        output.push("    ✗ Tunnel not active".to_string());
+    }
+
+    output.push("  Exit node reachability:".to_string());
+    if test_connectivity("8.8.8.8", 443) {
+        output.push("    ✓ Exit node reachable".to_string());
+    } else {
+        output.push("    ✗ Exit node unreachable".to_string());
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn tunnel_interface_exists(interface_name: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        output.push("  DNS resolution:".to_string());
-        if let Ok(resolve) = Command::new("nslookup")
-            .arg("rustynet.dev")
-            .arg("8.8.8.8")
-            .output()
-        {
-            if resolve.status.success() {
-                output.push("    ✓ DNS working".to_string());
-            } else {
-                output.push("    ✗ DNS failed".to_string());
-            }
-        } else {
-            output.push("    ? DNS test unavailable".to_string());
-        }
-
-        output.push("  Tunnel status:".to_string());
-        if let Ok(wg_out) = Command::new("wg")
-            .args(["show", DEFAULT_WG_INTERFACE])
-            .output()
-            && wg_out.status.success()
-        {
-            output.push("    ✓ Tunnel active".to_string());
-        } else {
-            output.push("    ✗ Tunnel not active".to_string());
-        }
-
-        output.push("  Exit node reachability:".to_string());
-        if let Ok(ping_out) = Command::new("ping")
-            .args(["-c", "1", "-W", "2", "8.8.8.8"])
-            .output()
-            && ping_out.status.success()
-        {
-            output.push("    ✓ Exit node reachable".to_string());
-        } else {
-            output.push("    ✗ Exit node unreachable".to_string());
-        }
+        let path = format!("/sys/class/net/{}", interface_name);
+        std::path::Path::new(&path).exists()
     }
 
     #[cfg(target_os = "macos")]
     {
-        output.push("  DNS resolution:".to_string());
-        if let Ok(resolve) = Command::new("nslookup").arg("rustynet.dev").output() {
-            if resolve.status.success() {
-                output.push("    ✓ DNS working".to_string());
-            } else {
-                output.push("    ✗ DNS failed".to_string());
-            }
+        if let Ok(output) = Command::new("ifconfig").arg(interface_name).output() {
+            output.status.success()
         } else {
-            output.push("    ? DNS test unavailable".to_string());
-        }
-
-        output.push("  Tunnel status:".to_string());
-        if let Ok(wg_out) = Command::new("wg")
-            .args(["show", DEFAULT_WG_INTERFACE])
-            .output()
-            && wg_out.status.success()
-        {
-            output.push("    ✓ Tunnel active".to_string());
-        } else {
-            output.push("    ✗ Tunnel not active".to_string());
-        }
-
-        output.push("  Exit node reachability:".to_string());
-        if let Ok(ping_out) = Command::new("ping").args(["-c", "1", "8.8.8.8"]).output()
-            && ping_out.status.success()
-        {
-            output.push("    ✓ Exit node reachable".to_string());
-        } else {
-            output.push("    ✗ Exit node unreachable".to_string());
+            false
         }
     }
 
     #[cfg(target_os = "windows")]
     {
-        output.push("  DNS resolution:".to_string());
-        if let Ok(resolve) = Command::new("nslookup").arg("rustynet.dev").output() {
-            if resolve.status.success() {
-                output.push("    ✓ DNS working".to_string());
+        if let Ok(output) = Command::new("ipconfig").output() {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                stdout
+                    .to_lowercase()
+                    .contains(&interface_name.to_lowercase())
             } else {
-                output.push("    ✗ DNS failed".to_string());
+                false
             }
         } else {
-            output.push("    ? DNS test unavailable".to_string());
-        }
-
-        output.push("  Tunnel status:".to_string());
-        if let Ok(wg_out) = Command::new("wg")
-            .args(["show", DEFAULT_WG_INTERFACE])
-            .output()
-            && wg_out.status.success()
-        {
-            output.push("    ✓ Tunnel active".to_string());
-        } else {
-            output.push("    ✗ Tunnel not active".to_string());
-        }
-
-        output.push("  Exit node reachability:".to_string());
-        if let Ok(ping_out) = Command::new("ping")
-            .args(["-n", "1", "-w", "2000", "8.8.8.8"])
-            .output()
-            && ping_out.status.success()
-        {
-            output.push("    ✓ Exit node reachable".to_string());
-        } else {
-            output.push("    ✗ Exit node unreachable".to_string());
+            false
         }
     }
+}
 
-    Ok(output.join("\n"))
+fn test_connectivity(host: &str, port: u16) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = format!("{}:{}", host, port);
+    TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:443".parse().unwrap()),
+        Duration::from_secs(2),
+    )
+    .is_ok()
 }
 
 fn execute_peer_stats() -> Result<String, String> {
@@ -12887,79 +12847,58 @@ fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
 
     let domain_to_test = domain.as_deref().unwrap_or("example.com");
 
-    #[cfg(target_os = "linux")]
-    {
-        output.push(format!("  resolving: {}", domain_to_test));
+    output.push(format!("  resolving: {}", domain_to_test));
 
-        let start = std::time::Instant::now();
-        if let Ok(dig_out) = Command::new("dig")
-            .arg(domain_to_test)
-            .arg("+short")
-            .output()
-        {
+    let start = std::time::Instant::now();
+
+    match resolve_domain(domain_to_test) {
+        Ok(addresses) => {
             let elapsed = start.elapsed().as_millis();
-            if dig_out.status.success() {
-                if let Ok(result_str) = String::from_utf8(dig_out.stdout) {
-                    let result = result_str.lines().next().unwrap_or("(no answer)");
-                    output.push(format!("  result:   {}", result));
-                    output.push(format!("  latency:  {}ms", elapsed));
-                    output.push("  status:   ✓ resolved through tunnel".to_string());
-                }
+            if let Some(addr) = addresses.first() {
+                output.push(format!("  result:   {}", addr));
+                output.push(format!("  latency:  {}ms", elapsed));
+                output.push("  status:   ✓ resolved through tunnel".to_string());
             } else {
-                output.push("  status:   ✗ resolution failed".to_string());
+                output.push("  status:   ✗ no addresses returned".to_string());
             }
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        output.push(format!("  resolving: {}", domain_to_test));
-
-        let start = std::time::Instant::now();
-        if let Ok(dig_out) = Command::new("dig")
-            .arg(domain_to_test)
-            .arg("+short")
-            .output()
-        {
-            let elapsed = start.elapsed().as_millis();
-            if dig_out.status.success() {
-                if let Ok(result_str) = String::from_utf8(dig_out.stdout) {
-                    let result = result_str.lines().next().unwrap_or("(no answer)");
-                    output.push(format!("  result:   {}", result));
-                    output.push(format!("  latency:  {}ms", elapsed));
-                    output.push("  status:   ✓ resolved through tunnel".to_string());
-                }
-            } else {
-                output.push("  status:   ✗ resolution failed".to_string());
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        output.push(format!("  resolving: {}", domain_to_test));
-
-        let start = std::time::Instant::now();
-        if let Ok(nslookup_out) = Command::new("nslookup").arg(domain_to_test).output() {
-            let elapsed = start.elapsed().as_millis();
-            if nslookup_out.status.success() {
-                if let Ok(result_str) = String::from_utf8(nslookup_out.stdout) {
-                    let result = result_str
-                        .lines()
-                        .find(|line| line.contains("Address:") && !line.contains("127.0.0.1"))
-                        .and_then(|line| line.split_whitespace().last())
-                        .unwrap_or("(no answer)");
-                    output.push(format!("  result:   {}", result));
-                    output.push(format!("  latency:  {}ms", elapsed));
-                    output.push("  status:   ✓ resolved through tunnel".to_string());
-                }
-            } else {
-                output.push("  status:   ✗ resolution failed".to_string());
-            }
+        Err(e) => {
+            output.push(format!("  status:   ✗ resolution failed: {}", e));
         }
     }
 
     Ok(output.join("\n"))
+}
+
+fn resolve_domain(domain: &str) -> Result<Vec<String>, String> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("failed to create tokio runtime: {}", e))?;
+
+    rt.block_on(async {
+        use hickory_resolver::TokioAsyncResolver;
+        use hickory_resolver::proto::rr::RecordType;
+
+        let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
+            Ok(r) => r,
+            Err(e) => return Err(format!("failed to create resolver: {}", e)),
+        };
+
+        match resolver.lookup(domain, RecordType::A).await {
+            Ok(lookup) => {
+                let addresses: Vec<String> = lookup
+                    .record_iter()
+                    .filter_map(|record| record.data().map(|data| format!("{}", data)))
+                    .collect();
+
+                if addresses.is_empty() {
+                    Err("no A or AAAA records found".to_string())
+                } else {
+                    Ok(addresses)
+                }
+            }
+            Err(e) => Err(format!("DNS lookup failed: {}", e)),
+        }
+    })
 }
 
 fn help_text() -> String {

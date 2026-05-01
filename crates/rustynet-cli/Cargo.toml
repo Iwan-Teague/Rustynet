@@ -8,6 +8,8 @@ default-run = "rustynet-cli"
 
 [dependencies]
 base64 = "0.22"
+hickory-resolver = "0.24"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 rustynet-control = { path = "../rustynet-control" }
 rustynet-crypto = { path = "../rustynet-crypto" }
 rustynet-dns-zone = { path = "../rustynet-dns-zone" }
