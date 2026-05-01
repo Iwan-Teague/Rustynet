@@ -181,6 +181,26 @@ pub fn system_clock_check() -> SystemClockCheck {
     system_clock_check_internal()
 }
 
+pub fn tcp_connections() -> Vec<TcpConnection> {
+    tcp_connections_internal()
+}
+
+pub fn dns_resolver_info() -> DnsResolverInfo {
+    dns_resolver_info_internal()
+}
+
+pub fn interface_speed() -> Vec<InterfaceSpeed> {
+    interface_speed_internal()
+}
+
+pub fn disk_io_stats() -> Vec<DiskIoStat> {
+    disk_io_stats_internal()
+}
+
+pub fn process_memory() -> Vec<ProcessMemory> {
+    process_memory_internal()
+}
+
 pub struct InterfaceInfo {
     pub exists: bool,
     pub is_up: bool,
@@ -422,6 +442,40 @@ pub struct SystemClockCheck {
     pub time_offset_ms: Option<i64>,
     pub last_sync_seconds_ago: Option<u64>,
     pub status: String,
+}
+
+pub struct TcpConnection {
+    pub local_addr: String,
+    pub remote_addr: String,
+    pub state: String,
+    pub pid: Option<u32>,
+}
+
+pub struct DnsResolverInfo {
+    pub resolvers: Vec<String>,
+    pub search_domains: Vec<String>,
+    pub method: String,
+}
+
+pub struct InterfaceSpeed {
+    pub name: String,
+    pub speed_mbps: Option<u64>,
+    pub duplex: Option<String>,
+    pub mtu: u32,
+}
+
+pub struct DiskIoStat {
+    pub device: String,
+    pub read_ops: u64,
+    pub read_bytes: u64,
+    pub write_ops: u64,
+    pub write_bytes: u64,
+}
+
+pub struct ProcessMemory {
+    pub name: String,
+    pub pid: u32,
+    pub memory_mb: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -3164,4 +3218,462 @@ fn measure_latency_to_host(host: &str) -> Option<f64> {
     }
 
     None
+}
+
+#[cfg(target_os = "linux")]
+fn hex_to_ip(hex: &str) -> String {
+    let hex = hex.to_lowercase();
+    if hex.len() >= 8 {
+        let bytes: Vec<u8> = (0..4)
+            .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+            .collect();
+        if bytes.len() == 4 {
+            return format!("{}.{}.{}.{}", bytes[3], bytes[2], bytes[1], bytes[0]);
+        }
+    }
+    "unknown".to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_connections_internal() -> Vec<TcpConnection> {
+    let mut connections = Vec::new();
+    if let Ok(content) = fs::read_to_string("/proc/net/tcp") {
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            if let Some(local_parts) = fields[1].split(':').collect::<Vec<_>>().split_last() {
+                if let (Some(&local_hex), Some(&local_port_hex)) =
+                    (local_parts[0].get(0..8), local_parts[0].get(8..))
+                {
+                    let local_addr = hex_to_ip(local_hex);
+                    if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
+                        let local = format!("{}:{}", local_addr, port);
+
+                        if let Some(remote_parts) =
+                            fields[2].split(':').collect::<Vec<_>>().split_last()
+                        {
+                            if let (Some(&remote_hex), Some(&remote_port_hex)) =
+                                (remote_parts[0].get(0..8), remote_parts[0].get(8..))
+                            {
+                                let remote_addr = hex_to_ip(remote_hex);
+                                if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
+                                    let remote = format!("{}:{}", remote_addr, port);
+                                    let state = fields[3].to_string();
+                                    connections.push(TcpConnection {
+                                        local_addr: local,
+                                        remote_addr: remote,
+                                        state,
+                                        pid: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    connections
+}
+
+#[cfg(target_os = "macos")]
+fn tcp_connections_internal() -> Vec<TcpConnection> {
+    let mut connections = Vec::new();
+    if let Ok(output) = std::process::Command::new("netstat")
+        .args(["-an", "-p", "tcp"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() < 4 {
+                    continue;
+                }
+                connections.push(TcpConnection {
+                    local_addr: fields[3].to_string(),
+                    remote_addr: fields[4].to_string(),
+                    state: fields[5].to_string(),
+                    pid: None,
+                });
+            }
+        }
+    }
+    connections
+}
+
+#[cfg(target_os = "windows")]
+fn tcp_connections_internal() -> Vec<TcpConnection> {
+    let mut connections = Vec::new();
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-NetTCPConnection | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State | ConvertTo-Csv -NoTypeInformation"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(1) {
+                let fields: Vec<&str> = line.split(',').collect();
+                if fields.len() >= 5 {
+                    let local = format!("{}:{}", fields[0].trim_matches('"'), fields[1].trim_matches('"'));
+                    let remote = format!("{}:{}", fields[2].trim_matches('"'), fields[3].trim_matches('"'));
+                    connections.push(TcpConnection {
+                        local_addr: local,
+                        remote_addr: remote,
+                        state: fields[4].trim_matches('"').to_string(),
+                        pid: None,
+                    });
+                }
+            }
+        }
+    }
+    connections
+}
+
+#[cfg(target_os = "linux")]
+fn dns_resolver_info_internal() -> DnsResolverInfo {
+    let mut resolvers = Vec::new();
+    let mut search_domains = Vec::new();
+
+    if let Ok(content) = fs::read_to_string("/etc/resolv.conf") {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with("nameserver ") {
+                if let Some(ip) = line.strip_prefix("nameserver ") {
+                    resolvers.push(ip.to_string());
+                }
+            } else if line.starts_with("search ") {
+                if let Some(domains) = line.strip_prefix("search ") {
+                    search_domains = domains.split_whitespace().map(|s| s.to_string()).collect();
+                }
+            }
+        }
+    }
+
+    DnsResolverInfo {
+        resolvers,
+        search_domains,
+        method: "resolv.conf".to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn dns_resolver_info_internal() -> DnsResolverInfo {
+    let mut resolvers = Vec::new();
+    let mut search_domains = Vec::new();
+
+    if let Ok(output) = std::process::Command::new("scutil")
+        .args(["-d", "-r", "State:/Network/Global/DNS"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines() {
+                if line.contains("ServerAddresses :") {
+                    if let Some(rest) = line.strip_prefix("  ServerAddresses :") {
+                        let addrs = rest
+                            .split(',')
+                            .map(|s| s.trim().trim_matches('{').trim_matches('}').to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        resolvers = addrs;
+                    }
+                }
+                if line.contains("SearchDomains :") {
+                    if let Some(rest) = line.strip_prefix("  SearchDomains :") {
+                        search_domains = rest
+                            .split(',')
+                            .map(|s| s.trim().trim_matches('{').trim_matches('}').to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                }
+            }
+        }
+    }
+
+    DnsResolverInfo {
+        resolvers,
+        search_domains,
+        method: "scutil".to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn dns_resolver_info_internal() -> DnsResolverInfo {
+    let mut resolvers = Vec::new();
+    if let Ok(output) = std::process::Command::new("ipconfig").arg("/all").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines() {
+                if line.contains("DNS Servers") {
+                    if let Some(ips) = line.split(':').nth(1) {
+                        resolvers.push(ips.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    DnsResolverInfo {
+        resolvers,
+        search_domains: Vec::new(),
+        method: "ipconfig".to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn interface_speed_internal() -> Vec<InterfaceSpeed> {
+    let mut speeds = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) {
+                let speed_path = format!("/sys/class/net/{}/speed", name);
+                let mtu_path = format!("/sys/class/net/{}/mtu", name);
+                let speed_mbps = fs::read_to_string(&speed_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let mtu = fs::read_to_string(&mtu_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(1500);
+                speeds.push(InterfaceSpeed {
+                    name,
+                    speed_mbps,
+                    duplex: None,
+                    mtu,
+                });
+            }
+        }
+    }
+    speeds
+}
+
+#[cfg(target_os = "macos")]
+fn interface_speed_internal() -> Vec<InterfaceSpeed> {
+    let mut speeds = Vec::new();
+    if let Ok(output) = std::process::Command::new("ifconfig").output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        let mut current_iface: Option<String> = None;
+        let mut mtu = 1500u32;
+        for line in s.lines() {
+            if !line.starts_with('\t') && !line.starts_with(' ') {
+                if let Some(iface) = current_iface.take() {
+                    speeds.push(InterfaceSpeed {
+                        name: iface,
+                        speed_mbps: None,
+                        duplex: None,
+                        mtu,
+                    });
+                }
+                current_iface = line.split(':').next().map(|s| s.to_string());
+            } else if current_iface.is_some()
+                && line.contains("mtu")
+                && let Some(mtu_str) = line.split("mtu").nth(1)
+                && let Some(num) = mtu_str.split_whitespace().next()
+            {
+                mtu = num.parse().unwrap_or(1500);
+            }
+        }
+        if let Some(iface) = current_iface {
+            speeds.push(InterfaceSpeed {
+                name: iface,
+                speed_mbps: None,
+                duplex: None,
+                mtu,
+            });
+        }
+    }
+    speeds
+}
+
+#[cfg(target_os = "windows")]
+fn interface_speed_internal() -> Vec<InterfaceSpeed> {
+    let mut speeds = Vec::new();
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetAdapter | Select-Object Name,LinkSpeed,MTU | ConvertTo-Csv -NoTypeInformation",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(1) {
+                let fields: Vec<&str> = line.split(',').collect();
+                if fields.len() >= 3 {
+                    let name = fields[0].trim_matches('"').to_string();
+                    let speed_str = fields[1].trim_matches('"');
+                    let speed_mbps = if speed_str.contains("Mbps") {
+                        speed_str.replace(" Mbps", "").parse::<u64>().ok()
+                    } else if speed_str.contains("Gbps") {
+                        speed_str
+                            .replace(" Gbps", "")
+                            .parse::<f64>()
+                            .ok()
+                            .map(|g| (g * 1000.0) as u64)
+                    } else {
+                        None
+                    };
+                    let mtu = fields[2].trim_matches('"').parse::<u32>().unwrap_or(1500);
+                    speeds.push(InterfaceSpeed {
+                        name,
+                        speed_mbps,
+                        duplex: None,
+                        mtu,
+                    });
+                }
+            }
+        }
+    }
+    speeds
+}
+
+#[cfg(target_os = "linux")]
+fn disk_io_stats_internal() -> Vec<DiskIoStat> {
+    let mut stats = Vec::new();
+    if let Ok(content) = fs::read_to_string("/proc/diskstats") {
+        for line in content.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 14 {
+                let device = fields[2].to_string();
+                let read_ops = fields[3].parse::<u64>().unwrap_or(0);
+                let read_bytes = fields[5].parse::<u64>().unwrap_or(0) * 512;
+                let write_ops = fields[7].parse::<u64>().unwrap_or(0);
+                let write_bytes = fields[9].parse::<u64>().unwrap_or(0) * 512;
+                stats.push(DiskIoStat {
+                    device,
+                    read_ops,
+                    read_bytes,
+                    write_ops,
+                    write_bytes,
+                });
+            }
+        }
+    }
+    stats
+}
+
+#[cfg(target_os = "macos")]
+fn disk_io_stats_internal() -> Vec<DiskIoStat> {
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn disk_io_stats_internal() -> Vec<DiskIoStat> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_internal() -> Vec<ProcessMemory> {
+    let mut processes = Vec::new();
+    let mut mem_map: Vec<(String, u32, u64)> = Vec::new();
+
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    if let Some(pid_str) = entry.file_name().to_str() {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            let status_path = format!("/proc/{}/status", pid);
+                            if let Ok(content) = fs::read_to_string(status_path) {
+                                let mut name = "unknown".to_string();
+                                let mut memory_kb = 0u64;
+                                for line in content.lines() {
+                                    if line.starts_with("Name:") {
+                                        if let Some(n) = line.strip_prefix("Name:") {
+                                            name = n.trim().to_string();
+                                        }
+                                    } else if line.starts_with("VmRSS:") {
+                                        if let Some(mem_str) = line.strip_prefix("VmRSS:") {
+                                            if let Some(num) =
+                                                mem_str.trim().split_whitespace().next()
+                                            {
+                                                memory_kb = num.parse().unwrap_or(0);
+                                            }
+                                        }
+                                    }
+                                }
+                                mem_map.push((name, pid, memory_kb));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    mem_map.sort_by(|a, b| b.2.cmp(&a.2));
+    processes = mem_map
+        .into_iter()
+        .take(10)
+        .map(|(name, pid, memory_kb)| ProcessMemory {
+            name,
+            pid,
+            memory_mb: (memory_kb / 1024).max(1),
+        })
+        .collect();
+
+    processes
+}
+
+#[cfg(target_os = "macos")]
+fn process_memory_internal() -> Vec<ProcessMemory> {
+    let mut processes = Vec::new();
+    if let Ok(output) = std::process::Command::new("ps").args(["aux"]).output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+    {
+        let mut mem_data: Vec<(String, u32, u64)> = Vec::new();
+        for line in s.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 11
+                && let Ok(pid) = fields[1].parse::<u32>()
+                && let Ok(memory_mb) = fields[5].parse::<u64>()
+            {
+                let name = fields[10..].join(" ");
+                mem_data.push((name, pid, memory_mb));
+            }
+        }
+        mem_data.sort_by(|a, b| b.2.cmp(&a.2));
+        processes = mem_data
+            .into_iter()
+            .take(10)
+            .map(|(name, pid, memory_mb)| ProcessMemory {
+                name,
+                pid,
+                memory_mb: memory_mb / 1024,
+            })
+            .collect();
+    }
+    processes
+}
+
+#[cfg(target_os = "windows")]
+fn process_memory_internal() -> Vec<ProcessMemory> {
+    let mut processes = Vec::new();
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Process | Select-Object Name,Id,WorkingSet | Sort-Object WorkingSet -Descending | Select-Object -First 10 | ConvertTo-Csv -NoTypeInformation",
+        ])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines().skip(1) {
+                let fields: Vec<&str> = line.split(',').collect();
+                if fields.len() >= 3 {
+                    let name = fields[0].trim_matches('"').to_string();
+                    if let Ok(pid) = fields[1].trim_matches('"').parse::<u32>() {
+                        if let Ok(memory_bytes) = fields[2].trim_matches('"').parse::<u64>() {
+                            processes.push(ProcessMemory {
+                                name,
+                                pid,
+                                memory_mb: memory_bytes / (1024 * 1024),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    processes
 }
