@@ -547,6 +547,27 @@ fn run() -> Result<(), i32> {
     refresh_trust_evidence(&ctx, &client_host)?;
     refresh_trust_evidence(&ctx, &blind_exit_host)?;
 
+    // The traversal coordination records inside each signed bundle have
+    // a hard-capped 30-second TTL (MAX_COORDINATION_TTL_SECS in
+    // crates/rustynetd/src/traversal.rs). Between the initial bundle
+    // issuance at refresh_signed_state_artifacts above and now (post
+    // enforce_host x3 + ensure_daemon_services_ready x3 + refresh_
+    // trust_evidence x3) the coordination records have likely expired,
+    // each daemon's reconcile loop fails repeatedly, and reconcile_
+    // failures escalates to restriction_mode=Permanent (default
+    // max_reconcile_failures=5). The route advertise that follows then
+    // sees a Permanent-restricted daemon and is refused — the failure
+    // mode that broke live_two_hop in livelab4 even with the trust
+    // refresh in place.
+    //
+    // Re-issue traversal + DNS zone bundles, redistribute, then call
+    // `state refresh` IPC on every node. State refresh is non-mutating
+    // (exempt from the restricted-safe gate) and on success explicitly
+    // resets restriction_mode to None and clears reconcile_failures
+    // (daemon.rs:3506-3508). The route advertise that follows then
+    // sees a daemon out of restricted-safe.
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
+
     logger
         .line("Advertising default route on exit")
         .map_err(|err| {
