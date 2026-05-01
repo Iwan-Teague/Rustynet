@@ -5278,11 +5278,10 @@ fn open_security_vulnerabilities_internal(advisory_db_path: &str) -> Vulnerabili
             if !line.starts_with('#') && !line.is_empty() {
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 3 {
-                    vulnerable_packages.push(VulnerablePackage {
-                        package_name: parts[0].to_string(),
-                        cve_id: parts[1].to_string(),
-                        severity: parts.get(2).copied().unwrap_or("unknown").to_string(),
-                        affected_versions: parts.get(3..).map(|p| p.join(",")).unwrap_or_default(),
+                    vulnerable_packages.push(VulnPackage {
+                        name: parts[0].to_string(),
+                        version: parts.get(3..).map(|p| p.join(",")).unwrap_or_default(),
+                        cves: vec![parts[1].to_string()],
                     });
                 }
             }
@@ -5554,10 +5553,10 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
 
                     inodes.push(InodeUsage {
                         filesystem: parts[5].to_string(),
-                        total_inodes: total,
-                        used_inodes: used,
-                        available,
-                        percent_used: percent_used as u32,
+                        total_inodes: total as u64,
+                        used_inodes: used as u64,
+                        available: available as u64,
+                        percent_used,
                     });
                 }
             }
@@ -5588,10 +5587,10 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
 
                     inodes.push(InodeUsage {
                         filesystem: parts[5].to_string(),
-                        total_inodes: total,
-                        used_inodes: used,
-                        available,
-                        percent_used: percent_used as u32,
+                        total_inodes: total as u64,
+                        used_inodes: used as u64,
+                        available: available as u64,
+                        percent_used,
                     });
                 }
             }
@@ -5781,9 +5780,9 @@ fn memory_pressure_stall_info_internal() -> PressureStallInfo {
 // ============================================================================
 
 fn rustynetd_goroutine_count_internal() -> GoroutineCount {
-    let mut count = 0u32;
-    let mut since_startup = 0u32;
-    let mut leaked_estimate = 0u32;
+    let mut count = 0usize;
+    let mut since_startup = 0u64;
+    let mut leaked_estimate = 0usize;
 
     if let Ok(output) = std::process::Command::new("pgrep")
         .arg("rustynetd")
@@ -5818,7 +5817,7 @@ fn ipc_socket_responsiveness_internal(timeout_ms: u64) -> IpcLatency {
     let mut min_ms = f64::INFINITY;
     let mut max_ms = 0.0;
     let mut avg_ms = 0.0;
-    let mut failed_attempts = 0u32;
+    let mut failed_attempts = 0usize;
     let mut responsive = false;
     let mut latencies = Vec::new();
 
@@ -5863,16 +5862,19 @@ fn daemon_crash_logs_recent_internal(lines: usize) -> Vec<CrashLog> {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 for line in s.lines() {
                     if line.contains("crash") || line.contains("panic") || line.contains("segfault") {
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
+                        let signal = if line.contains("segfault") {
+                            Some("SIGSEGV".to_string())
+                        } else if line.contains("panic") {
+                            Some("PANIC".to_string())
+                        } else {
+                            None
+                        };
 
                         logs.push(CrashLog {
-                            timestamp: timestamp.to_string(),
-                            message: line.to_string(),
-                            signal: None,
+                            timestamp: line.to_string(),
+                            exit_code: None,
+                            signal,
+                            backtrace_snippet: None,
                         });
                     }
                 }
@@ -5902,13 +5904,15 @@ fn daemon_open_file_handles_internal() -> Vec<OpenHandle> {
                             for line in s.lines().skip(1) {
                                 let parts: Vec<&str> = line.split_whitespace().collect();
                                 if parts.len() >= 9 {
+                                    let fd_str = parts.get(3).copied().unwrap_or("0");
+                                    let inode_str = parts.get(6).copied().unwrap_or("0");
+                                    let size_str = parts.get(7).copied().unwrap_or("0");
                                     handles.push(OpenHandle {
-                                        fd: parts.get(3).copied().unwrap_or("").to_string(),
-                                        file_type: parts.get(4).copied().unwrap_or("").to_string(),
-                                        device: parts.get(5).copied().unwrap_or("").to_string(),
-                                        inode: parts.get(6).copied().unwrap_or("").to_string(),
-                                        size: parts.get(7).copied().unwrap_or("").to_string(),
-                                        name: parts.get(8..).map(|p| p.join(" ")).unwrap_or_default(),
+                                        path: parts.get(8..).map(|p| p.join(" ")).unwrap_or_default(),
+                                        fd: fd_str.parse().unwrap_or(0),
+                                        handle_type: parts.get(4).copied().unwrap_or("").to_string(),
+                                        size: size_str.parse().unwrap_or(0),
+                                        inode: inode_str.parse().ok(),
                                     });
                                 }
                             }
@@ -5935,10 +5939,11 @@ fn systemd_unit_dependency_graph_internal() -> DependencyGraph {
                 for line in s.lines().skip(1) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 {
-                        units.push(DependencyUnit {
+                        units.push(UnitDeps {
                             name: parts[0].to_string(),
-                            state: parts.get(1).copied().unwrap_or("unknown").to_string(),
-                            dependencies: Vec::new(),
+                            wants: Vec::new(),
+                            requires: Vec::new(),
+                            blocking_units: Vec::new(),
                         });
                     }
                 }
@@ -6042,7 +6047,7 @@ fn disk_io_latency_histogram_internal(device: &str, duration_secs: u64) -> IoLat
 fn filesystem_journal_status_internal() -> JournalStatus {
     let mut journal_size_mb = 0u64;
     let mut recovery_needed = false;
-    let mut orphaned_inodes = 0u32;
+    let mut orphaned_inodes = 0usize;
 
     #[cfg(target_os = "linux")]
     {
@@ -6100,12 +6105,13 @@ fn block_device_error_counters_internal() -> Vec<DeviceErrors> {
                 if let Some(name) = entry.file_name().to_str() {
                     let err_path = entry.path().join("device/ioerr_cnt");
                     if let Ok(content) = fs::read_to_string(&err_path) {
-                        if let Ok(count) = content.trim().parse::<u64>() {
+                        if let Ok(count) = content.trim().parse::<usize>() {
                             errors.push(DeviceErrors {
                                 device: name.to_string(),
-                                error_count: count,
-                                last_error_type: None,
-                                threshold: 0,
+                                smart_errors: count,
+                                read_errors: 0,
+                                write_errors: 0,
+                                ata_errors: 0,
                             });
                         }
                     }
@@ -6229,7 +6235,7 @@ fn directory_size_snapshot_internal(paths: &[&str]) -> Vec<DirSize> {
 fn filesystem_cache_efficiency_internal() -> CacheEfficiency {
     let mut cache_hit_rate_percent = 0.0;
     let mut dirty_pages_mb = 0u64;
-    let mut writeback_queue_depth = 0u32;
+    let mut writeback_queue_depth = 0usize;
 
     #[cfg(target_os = "linux")]
     {
@@ -6374,13 +6380,14 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
                     }
                 }
 
+                let is_restrictive = extended_acl.is_empty();
                 results.push(AclInfo {
                     path: path.to_string(),
                     owner,
                     group,
                     mode,
                     extended_acl,
-                    is_restrictive: extended_acl.is_empty(),
+                    is_restrictive,
                 });
             }
         } else {
@@ -6423,9 +6430,12 @@ fn boot_integrity_check_internal() -> BootIntegrity {
                 .output()
             {
                 if let Ok(s) = String::from_utf8(output.stdout) {
-                    for line in s.lines() {
+                    for (idx, line) in s.lines().enumerate() {
                         if line.contains("0x") {
-                            pcrs.push(line.to_string());
+                            pcrs.push(PcrValue {
+                                pcr_index: idx as u32,
+                                value: line.to_string(),
+                            });
                         }
                     }
                     measurements_ok = !pcrs.is_empty();
@@ -6461,7 +6471,7 @@ fn system_state_snapshot_internal() -> SystemSnapshot {
         }
     }
 
-    let mut process_count = 0u32;
+    let mut process_count = 0usize;
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
             if let Ok(metadata) = entry.metadata() {
@@ -6523,24 +6533,33 @@ fn compare_to_baseline_internal(snapshot: &SystemSnapshot) -> AnomalyReport {
     let baseline = system_state_snapshot_internal();
 
     if baseline.process_count > snapshot.process_count + 50 {
-        anomalies.push(format!(
-            "Process count increased: {} → {}",
-            snapshot.process_count, baseline.process_count
-        ));
+        anomalies.push(Anomaly {
+            metric: "process_count".to_string(),
+            expected: snapshot.process_count.to_string(),
+            actual: baseline.process_count.to_string(),
+            deviation_percent: ((baseline.process_count as f64 - snapshot.process_count as f64) / snapshot.process_count.max(1) as f64) * 100.0,
+            severity: "warning".to_string(),
+        });
     }
 
     if baseline.memory_used_mb > snapshot.memory_used_mb + 256 {
-        anomalies.push(format!(
-            "Memory usage increased: {} MB → {} MB",
-            snapshot.memory_used_mb, baseline.memory_used_mb
-        ));
+        anomalies.push(Anomaly {
+            metric: "memory_used_mb".to_string(),
+            expected: snapshot.memory_used_mb.to_string(),
+            actual: baseline.memory_used_mb.to_string(),
+            deviation_percent: ((baseline.memory_used_mb as f64 - snapshot.memory_used_mb as f64) / snapshot.memory_used_mb.max(1) as f64) * 100.0,
+            severity: "warning".to_string(),
+        });
     }
 
     if baseline.load_avg_1 > snapshot.load_avg_1 + 2.0 {
-        anomalies.push(format!(
-            "Load average increased: {} → {}",
-            snapshot.load_avg_1, baseline.load_avg_1
-        ));
+        anomalies.push(Anomaly {
+            metric: "load_avg_1".to_string(),
+            expected: format!("{:.2}", snapshot.load_avg_1),
+            actual: format!("{:.2}", baseline.load_avg_1),
+            deviation_percent: ((baseline.load_avg_1 - snapshot.load_avg_1) / (snapshot.load_avg_1 + 1.0)) * 100.0,
+            severity: "info".to_string(),
+        });
     }
 
     AnomalyReport { anomalies }
@@ -6569,10 +6588,9 @@ fn performance_regression_detection_internal(
             if change_percent > 50.0 {
                 regressions.push(RegressionAnalysis {
                     metric: name,
-                    baseline_value: first as u64,
-                    current_value: last as u64,
-                    percent_change: change_percent,
-                    is_regression: true,
+                    trend: if change_percent > 0.0 { "increasing" } else { "decreasing" }.to_string(),
+                    slope_percent_per_day: change_percent,
+                    projected_failure_date: None,
                 });
             }
         }
