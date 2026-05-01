@@ -41,6 +41,26 @@ pub fn check_dependencies() -> DependencyCheck {
     check_dependencies_internal()
 }
 
+pub fn daemon_health() -> DaemonHealth {
+    daemon_health_internal()
+}
+
+pub fn validate_config() -> ConfigValidation {
+    validate_config_internal()
+}
+
+pub fn wg_addresses() -> Vec<String> {
+    wg_addresses_internal()
+}
+
+pub fn route_list() -> Vec<Route> {
+    route_list_internal()
+}
+
+pub fn key_expiry() -> KeyExpiry {
+    key_expiry_internal()
+}
+
 pub struct InterfaceInfo {
     pub exists: bool,
     pub is_up: bool,
@@ -74,6 +94,29 @@ pub struct DependencyCheck {
     pub git_available: bool,
     pub dns_tools_available: bool,
     pub messages: Vec<String>,
+}
+
+pub struct DaemonHealth {
+    pub running: bool,
+    pub uptime_secs: Option<u64>,
+    pub ipc_reachable: bool,
+    pub status_message: String,
+}
+
+pub struct ConfigValidation {
+    pub passed: bool,
+    pub issues: Vec<String>,
+}
+
+pub struct Route {
+    pub destination: String,
+    pub gateway: String,
+    pub interface: String,
+}
+
+pub struct KeyExpiry {
+    pub expiring_soon: bool,
+    pub key_details: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -524,4 +567,361 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+fn daemon_health_internal() -> DaemonHealth {
+    let mut status_message = String::new();
+    let running = check_daemon_running(&mut status_message);
+    let uptime_secs = if running { get_daemon_uptime() } else { None };
+    let ipc_reachable = test_ipc_connection();
+
+    if !running {
+        status_message = "daemon not running".to_string();
+    } else if !ipc_reachable {
+        status_message = "daemon running but IPC unreachable".to_string();
+    } else {
+        status_message = "daemon healthy".to_string();
+    }
+
+    DaemonHealth {
+        running,
+        uptime_secs,
+        ipc_reachable,
+        status_message,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_daemon_running(_msg: &mut String) -> bool {
+    std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("rustynetd")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn check_daemon_running(_msg: &mut String) -> bool {
+    std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("rustynetd")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn check_daemon_running(_msg: &mut String) -> bool {
+    std::process::Command::new("tasklist")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|output| output.contains("rustynetd"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn get_daemon_uptime() -> Option<u64> {
+    std::process::Command::new("pgrep")
+        .arg("-o")
+        .arg("-f")
+        .arg("rustynetd")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|pid_str| pid_str.trim().parse::<u32>().ok())
+        .and_then(|pid| {
+            fs::read_to_string(format!("/proc/{}/stat", pid))
+                .ok()
+                .and_then(|content| {
+                    let fields: Vec<&str> = content.split_whitespace().collect();
+                    fields.get(21).and_then(|s| s.parse::<u64>().ok())
+                })
+        })
+        .map(|start_time| {
+            let ticks_per_sec = 100u64;
+            let uptime = start_time / ticks_per_sec;
+            uptime
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn get_daemon_uptime() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn get_daemon_uptime() -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn test_ipc_connection() -> bool {
+    use std::os::unix::net::UnixStream;
+    let socket_path = std::env::var("RUSTYNET_DAEMON_SOCKET")
+        .unwrap_or_else(|_| "/var/run/rustynet/daemon.sock".to_string());
+    UnixStream::connect(&socket_path).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn test_ipc_connection() -> bool {
+    let pipe_name = std::env::var("RUSTYNET_DAEMON_PIPE")
+        .unwrap_or_else(|_| "\\\\.\\pipe\\rustynet-daemon".to_string());
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(&pipe_name)
+        .is_ok()
+}
+
+fn validate_config_internal() -> ConfigValidation {
+    let mut issues = vec![];
+
+    #[cfg(target_os = "linux")]
+    {
+        let config_paths = ["/etc/rustynet/config.yaml", "/etc/rustynet/wg.key"];
+        for path in &config_paths {
+            if !fs::metadata(path).is_ok() {
+                issues.push(format!("{}: not found", path));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs_home();
+        let config_dir = home.join(".rustynet");
+        if !config_dir.exists() {
+            issues.push(format!("{}/.rustynet: not found", home.display()));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let config_paths = [
+            "C:\\ProgramData\\Rustynet\\config.yaml",
+            "C:\\ProgramData\\Rustynet\\keys",
+        ];
+        for path in &config_paths {
+            if !fs::metadata(path).is_ok() {
+                issues.push(format!("{}: not found", path));
+            }
+        }
+    }
+
+    ConfigValidation {
+        passed: issues.is_empty(),
+        issues,
+    }
+}
+
+fn wg_addresses_internal() -> Vec<String> {
+    let mut addresses = vec![];
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("ip")
+            .args(["addr", "show", "wg0"])
+            .output()
+        {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                for line in stdout.lines() {
+                    if line.contains("inet") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() > 1 {
+                            addresses.push(parts[1].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("ifconfig")
+            .arg("utun0")
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|stdout| {
+                for line in stdout.lines() {
+                    if line.contains("inet ") && !line.contains("inet6") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() > 1 {
+                            addresses.push(parts[1].to_string());
+                        }
+                    }
+                }
+            });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("ipconfig").output() {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                let mut in_wg = false;
+                for line in stdout.lines() {
+                    if line.contains("Ethernet adapter") || line.contains("WireGuard") {
+                        in_wg = line.to_lowercase().contains("wireguard");
+                    }
+                    if in_wg && line.contains("IPv4 Address") {
+                        if let Some(addr) = line.split(':').nth(1) {
+                            addresses.push(addr.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    addresses
+}
+
+fn route_list_internal() -> Vec<Route> {
+    let mut routes = vec![];
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("ip")
+            .args(["route", "show"])
+            .output()
+        {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                for line in stdout.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        routes.push(Route {
+                            destination: parts[0].to_string(),
+                            gateway: parts.get(2).unwrap_or(&"direct").to_string(),
+                            interface: parts.get(4).unwrap_or(&"-").to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("netstat")
+            .args(["-rn"])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|stdout| {
+                for line in stdout.lines().skip(3) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 6 {
+                        routes.push(Route {
+                            destination: parts[0].to_string(),
+                            gateway: parts[1].to_string(),
+                            interface: parts[5].to_string(),
+                        });
+                    }
+                }
+            });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("route").arg("print").output() {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                for line in stdout.lines().skip(3) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        routes.push(Route {
+                            destination: parts[0].to_string(),
+                            gateway: parts[2].to_string(),
+                            interface: parts[3].to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    routes
+}
+
+fn key_expiry_internal() -> KeyExpiry {
+    let mut key_details = vec![];
+    let mut expiring_soon = false;
+
+    #[cfg(target_os = "linux")]
+    {
+        let key_paths = ["/etc/rustynet/wg.key", "/etc/rustynet/config.yaml"];
+        for path in &key_paths {
+            if let Ok(metadata) = fs::metadata(path) {
+                if let Ok(modified) = metadata.modified() {
+                    let since_epoch = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let days_old = (now - since_epoch) / 86400;
+                    if days_old > 365 {
+                        expiring_soon = true;
+                        key_details.push(format!("{}: {} days old (>1yr)", path, days_old));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs_home();
+        let key_path = home.join(".rustynet/keys");
+        if let Ok(modified) = fs::metadata(&key_path).and_then(|m| m.modified()) {
+            let since_epoch = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let days_old = (now - since_epoch) / 86400;
+            if days_old > 365 {
+                expiring_soon = true;
+                key_details.push(format!("~/.rustynet/keys: {} days old (>1yr)", days_old));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let key_paths = [
+            "C:\\ProgramData\\Rustynet\\keys",
+            "C:\\ProgramData\\Rustynet\\config.yaml",
+        ];
+        for path in &key_paths {
+            if let Ok(metadata) = fs::metadata(path) {
+                if let Ok(modified) = metadata.modified() {
+                    let since_epoch = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let days_old = (now - since_epoch) / 86400;
+                    if days_old > 365 {
+                        expiring_soon = true;
+                        key_details.push(format!("{}: {} days old (>1yr)", path, days_old));
+                    }
+                }
+            }
+        }
+    }
+
+    KeyExpiry {
+        expiring_soon,
+        key_details,
+    }
 }

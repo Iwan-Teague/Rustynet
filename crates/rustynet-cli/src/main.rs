@@ -144,6 +144,11 @@ enum CliCommand {
     Network,
     SecurityCheck,
     DependencyCheck,
+    DaemonHealth,
+    ConfigValidate,
+    WgAddresses,
+    Routes,
+    KeyExpiry,
     Help,
 }
 
@@ -837,6 +842,11 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "network" || cmd == "network-info" => CliCommand::Network,
         [cmd] if cmd == "security-check" => CliCommand::SecurityCheck,
         [cmd] if cmd == "dependency-check" => CliCommand::DependencyCheck,
+        [cmd] if cmd == "daemon-health" => CliCommand::DaemonHealth,
+        [cmd] if cmd == "config-validate" || cmd == "validate" => CliCommand::ConfigValidate,
+        [cmd] if cmd == "wg-addresses" || cmd == "tunnel-ips" => CliCommand::WgAddresses,
+        [cmd] if cmd == "routes" || cmd == "route-list" => CliCommand::Routes,
+        [cmd] if cmd == "key-expiry" || cmd == "cert-expiry" => CliCommand::KeyExpiry,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3641,6 +3651,11 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Network => execute_network_info(),
         CliCommand::SecurityCheck => execute_security_check(),
         CliCommand::DependencyCheck => execute_dependency_check(),
+        CliCommand::DaemonHealth => execute_daemon_health(),
+        CliCommand::ConfigValidate => execute_config_validate(),
+        CliCommand::WgAddresses => execute_wg_addresses(),
+        CliCommand::Routes => execute_routes(),
+        CliCommand::KeyExpiry => execute_key_expiry(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12071,6 +12086,11 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Network
         | CliCommand::SecurityCheck
         | CliCommand::DependencyCheck
+        | CliCommand::DaemonHealth
+        | CliCommand::ConfigValidate
+        | CliCommand::WgAddresses
+        | CliCommand::Routes
+        | CliCommand::KeyExpiry
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -12727,6 +12747,109 @@ fn execute_dependency_check() -> Result<String, String> {
         for msg in deps.messages {
             output.push(format!("    - {}", msg));
         }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_daemon_health() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let health = rustynet_sysinfo::daemon_health();
+    let mut output = vec!["daemon health:".to_string()];
+    output.push(format!(
+        "  running: {}",
+        if health.running { "yes" } else { "no" }
+    ));
+    output.push(format!(
+        "  ipc reachable: {}",
+        if health.ipc_reachable { "yes" } else { "no" }
+    ));
+    if let Some(uptime) = health.uptime_secs {
+        let hours = uptime / 3600;
+        let mins = (uptime % 3600) / 60;
+        output.push(format!("  uptime: {}h {}m", hours, mins));
+    }
+    output.push(format!("  status: {}", health.status_message));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_config_validate() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let result = rustynet_sysinfo::validate_config();
+    let mut output = if result.passed {
+        vec!["config validation: passed".to_string()]
+    } else {
+        vec!["config validation: failed".to_string()]
+    };
+
+    if !result.issues.is_empty() {
+        output.push("  issues:".to_string());
+        for issue in result.issues {
+            output.push(format!("    - {}", issue));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_wg_addresses() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let addresses = rustynet_sysinfo::wg_addresses();
+    let mut output = vec!["tunnel ip addresses:".to_string()];
+
+    if addresses.is_empty() {
+        output.push("  (none found)".to_string());
+    } else {
+        for addr in addresses {
+            output.push(format!("  {}", addr));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_routes() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let routes = rustynet_sysinfo::route_list();
+    let mut output = vec!["active routes:".to_string()];
+
+    if routes.is_empty() {
+        output.push("  (none found)".to_string());
+    } else {
+        output.push("  destination         gateway              interface".to_string());
+        for route in routes {
+            output.push(format!(
+                "  {:<20} {:<20} {}",
+                route.destination, route.gateway, route.interface
+            ));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_key_expiry() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let expiry = rustynet_sysinfo::key_expiry();
+    let mut output = if expiry.expiring_soon {
+        vec!["key expiry: WARNING - keys expiring soon".to_string()]
+    } else {
+        vec!["key expiry: OK".to_string()]
+    };
+
+    if !expiry.key_details.is_empty() {
+        output.push("  details:".to_string());
+        for detail in expiry.key_details {
+            output.push(format!("    {}", detail));
+        }
+    } else {
+        output.push("  (no expiring keys detected)".to_string());
     }
 
     Ok(output.join("\n"))
