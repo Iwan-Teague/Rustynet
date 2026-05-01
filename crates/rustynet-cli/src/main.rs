@@ -184,6 +184,46 @@ enum CliCommand {
     InterfaceSpeed,
     DiskIo,
     ProcessMemory,
+    ActiveNetworkRoutes,
+    MtuPathDiscovery(String),
+    DnsResolutionLatency(String),
+    BgpRouteAnnouncements,
+    ConnectionStateHistogram,
+    ArpTableEntries,
+    ListeningSocketsSummary,
+    NetworkDropStats,
+    TlsCertificateExpiry(String),
+    SelinuxStatus,
+    ApparmorProfileStatus,
+    CryptographicKeyPermissions,
+    TlsCipherSuiteStrength(String),
+    SudoersConfigurationAudit,
+    OpenSecurityVulnerabilities(String),
+    KernelSecurityParameters,
+    FileDescriptorUsage,
+    MemoryFragmentationRatio,
+    NetworkSocketLimitUsage,
+    InodeUsagePerFilesystem,
+    ProcessThreadCountAll,
+    MemoryPressureStallInfo,
+    RustynetdGoroutineCount,
+    IpcSocketResponsiveness,
+    DaemonCrashLogsRecent,
+    DaemonOpenFileHandles,
+    SystemdUnitDependencyGraph,
+    ProcessCpuTimeDistribution,
+    DiskIoLatencyHistogram(String),
+    FilesystemJournalStatus,
+    BlockDeviceErrorCounters,
+    DirectorySizeSnapshot(String),
+    FilesystemCacheEfficiency,
+    FileIntegrityCheck(String),
+    SyslogConfigurationAudit,
+    AccessControlListAudit(String),
+    BootIntegrityCheck,
+    SystemStateSnapshot,
+    CompareToBaseline,
+    PerformanceRegressionDetection,
     Help,
 }
 
@@ -917,6 +957,58 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "interface-speed" || cmd == "iface-speed" => CliCommand::InterfaceSpeed,
         [cmd] if cmd == "disk-io" || cmd == "disk-stats" => CliCommand::DiskIo,
         [cmd] if cmd == "process-memory" || cmd == "top-memory" => CliCommand::ProcessMemory,
+        [cmd] if cmd == "active-routes" || cmd == "routes" => CliCommand::ActiveNetworkRoutes,
+        [cmd, target] if cmd == "mtu-discovery" || cmd == "mtu" => {
+            CliCommand::MtuPathDiscovery(target.clone())
+        }
+        [cmd, domain] if cmd == "dns-latency" => CliCommand::DnsResolutionLatency(domain.clone()),
+        [cmd] if cmd == "bgp-status" => CliCommand::BgpRouteAnnouncements,
+        [cmd] if cmd == "conn-states" || cmd == "connection-states" => {
+            CliCommand::ConnectionStateHistogram
+        }
+        [cmd] if cmd == "arp-table" || cmd == "arp" => CliCommand::ArpTableEntries,
+        [cmd] if cmd == "listening-sockets" || cmd == "listening" => {
+            CliCommand::ListeningSocketsSummary
+        }
+        [cmd] if cmd == "network-drops" => CliCommand::NetworkDropStats,
+        [cmd, path] if cmd == "tls-cert-expiry" || cmd == "cert-expiry" => {
+            CliCommand::TlsCertificateExpiry(path.clone())
+        }
+        [cmd] if cmd == "selinux-status" => CliCommand::SelinuxStatus,
+        [cmd] if cmd == "apparmor-status" => CliCommand::ApparmorProfileStatus,
+        [cmd] if cmd == "key-permissions" => CliCommand::CryptographicKeyPermissions,
+        [cmd, host] if cmd == "tls-cipher" => CliCommand::TlsCipherSuiteStrength(host.clone()),
+        [cmd] if cmd == "sudoers-audit" => CliCommand::SudoersConfigurationAudit,
+        [cmd, db_path] if cmd == "cve-check" => {
+            CliCommand::OpenSecurityVulnerabilities(db_path.clone())
+        }
+        [cmd] if cmd == "kernel-hardening" => CliCommand::KernelSecurityParameters,
+        [cmd] if cmd == "fd-usage" || cmd == "file-descriptors" => CliCommand::FileDescriptorUsage,
+        [cmd] if cmd == "memory-frag" => CliCommand::MemoryFragmentationRatio,
+        [cmd] if cmd == "socket-limits" => CliCommand::NetworkSocketLimitUsage,
+        [cmd] if cmd == "inode-usage" => CliCommand::InodeUsagePerFilesystem,
+        [cmd] if cmd == "thread-count" => CliCommand::ProcessThreadCountAll,
+        [cmd] if cmd == "memory-pressure" => CliCommand::MemoryPressureStallInfo,
+        [cmd] if cmd == "goroutine-count" => CliCommand::RustynetdGoroutineCount,
+        [cmd] if cmd == "ipc-latency" => CliCommand::IpcSocketResponsiveness,
+        [cmd] if cmd == "daemon-crashes" => CliCommand::DaemonCrashLogsRecent,
+        [cmd] if cmd == "daemon-files" => CliCommand::DaemonOpenFileHandles,
+        [cmd] if cmd == "systemd-deps" => CliCommand::SystemdUnitDependencyGraph,
+        [cmd] if cmd == "cpu-time" => CliCommand::ProcessCpuTimeDistribution,
+        [cmd, device] if cmd == "disk-latency" => {
+            CliCommand::DiskIoLatencyHistogram(device.clone())
+        }
+        [cmd] if cmd == "filesystem-journal" => CliCommand::FilesystemJournalStatus,
+        [cmd] if cmd == "disk-errors" => CliCommand::BlockDeviceErrorCounters,
+        [cmd, path] if cmd == "dir-size" => CliCommand::DirectorySizeSnapshot(path.clone()),
+        [cmd] if cmd == "cache-efficiency" => CliCommand::FilesystemCacheEfficiency,
+        [cmd, path] if cmd == "file-integrity" => CliCommand::FileIntegrityCheck(path.clone()),
+        [cmd] if cmd == "syslog-config" => CliCommand::SyslogConfigurationAudit,
+        [cmd, path] if cmd == "acl-audit" => CliCommand::AccessControlListAudit(path.clone()),
+        [cmd] if cmd == "boot-integrity" => CliCommand::BootIntegrityCheck,
+        [cmd] if cmd == "system-snapshot" => CliCommand::SystemStateSnapshot,
+        [cmd] if cmd == "compare-baseline" => CliCommand::CompareToBaseline,
+        [cmd] if cmd == "perf-regression" => CliCommand::PerformanceRegressionDetection,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3761,6 +3853,46 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::InterfaceSpeed => execute_interface_speed(),
         CliCommand::DiskIo => execute_disk_io(),
         CliCommand::ProcessMemory => execute_process_memory(),
+        CliCommand::ActiveNetworkRoutes => execute_active_network_routes(),
+        CliCommand::MtuPathDiscovery(target) => execute_mtu_discovery(&target),
+        CliCommand::DnsResolutionLatency(domain) => execute_dns_latency(&domain),
+        CliCommand::BgpRouteAnnouncements => execute_bgp_status(),
+        CliCommand::ConnectionStateHistogram => execute_conn_states(),
+        CliCommand::ArpTableEntries => execute_arp_table(),
+        CliCommand::ListeningSocketsSummary => execute_listening_sockets(),
+        CliCommand::NetworkDropStats => execute_network_drops(),
+        CliCommand::TlsCertificateExpiry(path) => execute_tls_cert_expiry(&path),
+        CliCommand::SelinuxStatus => execute_selinux_status(),
+        CliCommand::ApparmorProfileStatus => execute_apparmor_status(),
+        CliCommand::CryptographicKeyPermissions => execute_key_permissions(),
+        CliCommand::TlsCipherSuiteStrength(host) => execute_tls_cipher(&host),
+        CliCommand::SudoersConfigurationAudit => execute_sudoers_audit(),
+        CliCommand::OpenSecurityVulnerabilities(db_path) => execute_cve_check(&db_path),
+        CliCommand::KernelSecurityParameters => execute_kernel_hardening(),
+        CliCommand::FileDescriptorUsage => execute_fd_usage(),
+        CliCommand::MemoryFragmentationRatio => execute_memory_frag(),
+        CliCommand::NetworkSocketLimitUsage => execute_socket_limits(),
+        CliCommand::InodeUsagePerFilesystem => execute_inode_usage(),
+        CliCommand::ProcessThreadCountAll => execute_thread_count(),
+        CliCommand::MemoryPressureStallInfo => execute_memory_pressure(),
+        CliCommand::RustynetdGoroutineCount => execute_goroutine_count(),
+        CliCommand::IpcSocketResponsiveness => execute_ipc_latency(),
+        CliCommand::DaemonCrashLogsRecent => execute_daemon_crashes(),
+        CliCommand::DaemonOpenFileHandles => execute_daemon_files(),
+        CliCommand::SystemdUnitDependencyGraph => execute_systemd_deps(),
+        CliCommand::ProcessCpuTimeDistribution => execute_cpu_time(),
+        CliCommand::DiskIoLatencyHistogram(device) => execute_disk_latency(&device),
+        CliCommand::FilesystemJournalStatus => execute_filesystem_journal(),
+        CliCommand::BlockDeviceErrorCounters => execute_disk_errors(),
+        CliCommand::DirectorySizeSnapshot(path) => execute_dir_size(&path),
+        CliCommand::FilesystemCacheEfficiency => execute_cache_efficiency(),
+        CliCommand::FileIntegrityCheck(path) => execute_file_integrity(&path),
+        CliCommand::SyslogConfigurationAudit => execute_syslog_config(),
+        CliCommand::AccessControlListAudit(path) => execute_acl_audit(&path),
+        CliCommand::BootIntegrityCheck => execute_boot_integrity(),
+        CliCommand::SystemStateSnapshot => execute_system_snapshot(),
+        CliCommand::CompareToBaseline => execute_compare_baseline(),
+        CliCommand::PerformanceRegressionDetection => execute_perf_regression(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12231,6 +12363,46 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::InterfaceSpeed
         | CliCommand::DiskIo
         | CliCommand::ProcessMemory
+        | CliCommand::ActiveNetworkRoutes
+        | CliCommand::MtuPathDiscovery(_)
+        | CliCommand::DnsResolutionLatency(_)
+        | CliCommand::BgpRouteAnnouncements
+        | CliCommand::ConnectionStateHistogram
+        | CliCommand::ArpTableEntries
+        | CliCommand::ListeningSocketsSummary
+        | CliCommand::NetworkDropStats
+        | CliCommand::TlsCertificateExpiry(_)
+        | CliCommand::SelinuxStatus
+        | CliCommand::ApparmorProfileStatus
+        | CliCommand::CryptographicKeyPermissions
+        | CliCommand::TlsCipherSuiteStrength(_)
+        | CliCommand::SudoersConfigurationAudit
+        | CliCommand::OpenSecurityVulnerabilities(_)
+        | CliCommand::KernelSecurityParameters
+        | CliCommand::FileDescriptorUsage
+        | CliCommand::MemoryFragmentationRatio
+        | CliCommand::NetworkSocketLimitUsage
+        | CliCommand::InodeUsagePerFilesystem
+        | CliCommand::ProcessThreadCountAll
+        | CliCommand::MemoryPressureStallInfo
+        | CliCommand::RustynetdGoroutineCount
+        | CliCommand::IpcSocketResponsiveness
+        | CliCommand::DaemonCrashLogsRecent
+        | CliCommand::DaemonOpenFileHandles
+        | CliCommand::SystemdUnitDependencyGraph
+        | CliCommand::ProcessCpuTimeDistribution
+        | CliCommand::DiskIoLatencyHistogram(_)
+        | CliCommand::FilesystemJournalStatus
+        | CliCommand::BlockDeviceErrorCounters
+        | CliCommand::DirectorySizeSnapshot(_)
+        | CliCommand::FilesystemCacheEfficiency
+        | CliCommand::FileIntegrityCheck(_)
+        | CliCommand::SyslogConfigurationAudit
+        | CliCommand::AccessControlListAudit(_)
+        | CliCommand::BootIntegrityCheck
+        | CliCommand::SystemStateSnapshot
+        | CliCommand::CompareToBaseline
+        | CliCommand::PerformanceRegressionDetection
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -13722,6 +13894,564 @@ fn execute_process_memory() -> Result<String, String> {
         ));
     }
 
+    Ok(output.join("\n"))
+}
+
+fn execute_active_network_routes() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let routes = rustynet_sysinfo::active_network_routes();
+    if routes.is_empty() {
+        return Ok("active routes: (none)".to_string());
+    }
+    let mut output = vec!["active routes:".to_string()];
+    for route in routes {
+        output.push(format!(
+            "  {} -> {} ({})",
+            route.destination, route.gateway, route.interface
+        ));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_mtu_discovery(target: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let result = rustynet_sysinfo::mtu_path_discovery(target);
+    let mtu = result.mtu.unwrap_or(0);
+    let hops = result.hops.unwrap_or(0);
+    let latency = result.latency_ms.unwrap_or(0.0);
+    Ok(format!(
+        "mtu discovery to {}:\n  mtu: {}\n  hops: {}\n  latency: {} ms",
+        result.host, mtu, hops, latency
+    ))
+}
+
+fn execute_dns_latency(domain: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let metrics = rustynet_sysinfo::dns_resolution_latency(domain, 5);
+    Ok(format!(
+        "dns latency for {}:\n  min: {} ms\n  max: {} ms\n  avg: {} ms\n  stddev: {} ms\n  failures: {}",
+        domain, metrics.min_ms, metrics.max_ms, metrics.avg_ms, metrics.stddev_ms, metrics.failures
+    ))
+}
+
+fn execute_bgp_status() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let status = rustynet_sysinfo::bgp_route_announcements();
+    let prefixes = status.announced_prefixes.join(", ");
+    Ok(format!(
+        "bgp status:\n  enabled: {}\n  announced prefixes: {}\n  peer count: {}",
+        status.enabled, prefixes, status.peer_count
+    ))
+}
+
+fn execute_conn_states() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let histogram = rustynet_sysinfo::connection_state_histogram();
+    Ok(format!(
+        "connection state histogram:\n  established: {}\n  time_wait: {}\n  syn_recv: {}\n  close_wait: {}",
+        histogram.established, histogram.time_wait, histogram.syn_recv, histogram.close_wait
+    ))
+}
+
+fn execute_arp_table() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let entries = rustynet_sysinfo::arp_table_entries();
+    if entries.is_empty() {
+        return Ok("arp table: (empty)".to_string());
+    }
+    let mut output = vec!["arp table entries:".to_string()];
+    for entry in entries.iter().take(10) {
+        output.push(format!(
+            "  {} -> {} ({})",
+            entry.ip, entry.mac, entry.interface
+        ));
+    }
+    if entries.len() > 10 {
+        output.push(format!("  ... and {} more", entries.len() - 10));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_listening_sockets() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let sockets = rustynet_sysinfo::listening_sockets_summary();
+    if sockets.is_empty() {
+        return Ok("listening sockets: (none)".to_string());
+    }
+    let mut output = vec!["listening sockets:".to_string()];
+    for socket in sockets.iter().take(10) {
+        output.push(format!(
+            "  {}:{} ({})",
+            socket.address, socket.port, socket.protocol
+        ));
+    }
+    if sockets.len() > 10 {
+        output.push(format!("  ... and {} more", sockets.len() - 10));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_network_drops() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let stats = rustynet_sysinfo::network_drop_stats();
+    if stats.is_empty() {
+        return Ok("network drops: (no stats)".to_string());
+    }
+    let mut output = vec!["network drop stats:".to_string()];
+    for stat in stats.iter().take(5) {
+        output.push(format!(
+            "  {}: rx_drops={} tx_drops={} rx_errors={} tx_errors={}",
+            stat.interface, stat.rx_drops, stat.tx_drops, stat.rx_errors, stat.tx_errors
+        ));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_tls_cert_expiry(path: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let certs = rustynet_sysinfo::tls_certificate_expiry_all(&[path]);
+    if certs.is_empty() {
+        return Ok("tls certificate expiry: (no certs found)".to_string());
+    }
+    let mut output = vec!["tls certificate expiry:".to_string()];
+    for cert in certs {
+        output.push(format!(
+            "  {}: expires in {} days ({})",
+            cert.subject, cert.days_until_expiry, cert.expires_at
+        ));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_selinux_status() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let status = rustynet_sysinfo::selinux_status();
+    let policy_version = status
+        .policy_version
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!(
+        "selinux status:\n  enabled: {}\n  mode: {}\n  policy_version: {}\n  violations since boot: {}",
+        status.enabled, status.mode, policy_version, status.violations_since_boot
+    ))
+}
+
+fn execute_apparmor_status() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let profiles = rustynet_sysinfo::apparmor_profile_status();
+    if profiles.is_empty() {
+        return Ok("apparmor profiles: (none loaded)".to_string());
+    }
+    let mut output = vec!["apparmor profiles:".to_string()];
+    for profile in profiles.iter().take(10) {
+        output.push(format!(
+            "  {}: {} (loaded: {})",
+            profile.name, profile.mode, profile.loaded
+        ));
+    }
+    if profiles.len() > 10 {
+        output.push(format!("  ... and {} more", profiles.len() - 10));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_key_permissions() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let checks = rustynet_sysinfo::cryptographic_key_permissions();
+    if checks.is_empty() {
+        return Ok("key permissions: no keys found".to_string());
+    }
+    let mut output = vec!["key permissions:".to_string()];
+    for check in checks.iter().take(10) {
+        let status = if check.is_correct { "OK" } else { "FAIL" };
+        output.push(format!("  {}: {} ({})", check.path, status, check.owner));
+        if !check.issues.is_empty() {
+            for issue in check.issues.iter().take(2) {
+                output.push(format!("    - {}", issue));
+            }
+        }
+    }
+    if checks.len() > 10 {
+        output.push(format!("  ... and {} more", checks.len() - 10));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_tls_cipher(host: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let parts: Vec<&str> = host.split(':').collect();
+    let hostname = parts.first().copied().unwrap_or("localhost");
+    let port: u16 = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(443);
+    let cipher = rustynet_sysinfo::tls_cipher_suite_strength(hostname, port);
+    Ok(format!(
+        "tls cipher suite for {}:{}:\n  suite: {}\n  strength: {} bits\n  tls_version: {}",
+        hostname, port, cipher.suite_name, cipher.strength_bits, cipher.tls_version
+    ))
+}
+
+fn execute_sudoers_audit() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let audit = rustynet_sysinfo::sudoers_configuration_audit();
+    let mut output = vec![format!(
+        "sudoers audit:\n  total rules: {}",
+        audit.total_rules
+    )];
+    if !audit.dangerous_rules.is_empty() {
+        output.push(format!(
+            "  dangerous rules: {}",
+            audit.dangerous_rules.len()
+        ));
+        for rule in audit.dangerous_rules.iter().take(5) {
+            output.push(format!("    - {}", rule));
+        }
+    }
+    output.push(format!("  nopasswd entries: {}", audit.nopasswd_entries));
+    Ok(output.join("\n"))
+}
+
+fn execute_cve_check(db_path: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let report = rustynet_sysinfo::open_security_vulnerabilities(db_path);
+    if report.vulnerable_packages.is_empty() {
+        return Ok("vulnerability report: no vulnerabilities found".to_string());
+    }
+    let mut output = vec![format!(
+        "vulnerability report ({}): ",
+        report.vulnerable_packages.len()
+    )];
+    for pkg in report.vulnerable_packages.iter().take(10) {
+        output.push(format!(
+            "  {}: {} (CVEs: {})",
+            pkg.name,
+            pkg.version,
+            pkg.cves.len()
+        ));
+    }
+    if report.vulnerable_packages.len() > 10 {
+        output.push(format!(
+            "  ... and {} more",
+            report.vulnerable_packages.len() - 10
+        ));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_kernel_hardening() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let params = rustynet_sysinfo::kernel_security_parameters();
+    Ok(format!(
+        "kernel security parameters:\n  aslr_enabled: {}\n  kptr_restrict: {}\n  dmesg_restrict: {}\n  panic_on_oops: {}",
+        params.aslr_enabled, params.kptr_restrict, params.dmesg_restrict, params.panic_on_oops
+    ))
+}
+
+fn execute_fd_usage() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let usage = rustynet_sysinfo::file_descriptor_usage();
+    let mut output = vec![format!(
+        "file descriptor usage:\n  used: {}\n  limit: {}\n  usage: {}%",
+        usage.used, usage.limit, usage.percent_used
+    )];
+    if !usage.top_processes.is_empty() {
+        output.push("  top processes:".to_string());
+        for proc in &usage.top_processes {
+            output.push(format!("    {}: {}", proc.pid, proc.fd_count));
+        }
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_memory_frag() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let frag = rustynet_sysinfo::memory_fragmentation_ratio();
+    Ok(format!(
+        "memory fragmentation:\n  heap_fragmentation: {}%\n  page_cache_hits: {}%\n  swappiness: {}",
+        frag.heap_fragmentation_percent, frag.page_cache_hits_percent, frag.swappiness
+    ))
+}
+
+fn execute_socket_limits() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let limits = rustynet_sysinfo::network_socket_limit_usage();
+    Ok(format!(
+        "socket limits:\n  ephemeral range: {}\n  used: {}\n  available: {}\n  time_wait count: {}",
+        limits.ephemeral_range, limits.used, limits.available, limits.time_wait_count
+    ))
+}
+
+fn execute_inode_usage() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let usage = rustynet_sysinfo::inode_usage_per_filesystem();
+    if usage.is_empty() {
+        return Ok("inode usage: (no filesystems)".to_string());
+    }
+    let mut output = vec!["inode usage:".to_string()];
+    for fs in usage.iter().take(5) {
+        output.push(format!(
+            "  {}: {}/{} ({}%)",
+            fs.filesystem, fs.used_inodes, fs.total_inodes, fs.percent_used
+        ));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_thread_count() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let threads = rustynet_sysinfo::process_thread_count_all();
+    let mut output = vec![format!(
+        "thread count:\n  total: {}\n  limit: {}\n  usage: {}%",
+        threads.total_threads, threads.limit, threads.percent_used
+    )];
+    if !threads.top_processes.is_empty() {
+        output.push("  top processes:".to_string());
+        for proc in &threads.top_processes {
+            output.push(format!("    {}: {} threads", proc.pid, proc.thread_count));
+        }
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_memory_pressure() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let psi = rustynet_sysinfo::memory_pressure_stall_info();
+    Ok(format!(
+        "pressure stall info (10s):\n  memory: {}%\n  cpu: {}%\n  io: {}%",
+        psi.memory_some_percent_10s, psi.cpu_some_percent_10s, psi.io_some_percent_10s
+    ))
+}
+
+fn execute_goroutine_count() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let gc = rustynet_sysinfo::rustynetd_goroutine_count();
+    Ok(format!(
+        "goroutine count:\n  count: {}\n  since startup: {} goroutines\n  leaked estimate: {}",
+        gc.count, gc.since_startup, gc.leaked_estimate
+    ))
+}
+
+fn execute_ipc_latency() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let latency = rustynet_sysinfo::ipc_socket_responsiveness(100);
+    Ok(format!(
+        "ipc socket latency:\n  min: {} ms\n  max: {} ms\n  avg: {} ms\n  responsive: {}",
+        latency.min_ms, latency.max_ms, latency.avg_ms, latency.responsive
+    ))
+}
+
+fn execute_daemon_crashes() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let crashes = rustynet_sysinfo::daemon_crash_logs_recent(10);
+    if crashes.is_empty() {
+        return Ok("daemon crashes: (none)".to_string());
+    }
+    let mut output = vec!["recent daemon crashes:".to_string()];
+    for crash in crashes {
+        let exit_code = crash.exit_code.unwrap_or(-1);
+        output.push(format!("  {}: exit_code={}", crash.timestamp, exit_code));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_daemon_files() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let handles = rustynet_sysinfo::daemon_open_file_handles();
+    if handles.is_empty() {
+        return Ok("daemon files: (none open)".to_string());
+    }
+    let mut output = vec!["daemon open files:".to_string()];
+    for handle in handles.iter().take(10) {
+        output.push(format!(
+            "  {}: type={} size={}",
+            handle.path, handle.handle_type, handle.size
+        ));
+    }
+    if handles.len() > 10 {
+        output.push(format!("  ... and {} more", handles.len() - 10));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_systemd_deps() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let graph = rustynet_sysinfo::systemd_unit_dependency_graph();
+    if graph.units.is_empty() {
+        return Ok("systemd dependencies: (no units)".to_string());
+    }
+    let mut output = vec!["systemd unit dependencies:".to_string()];
+    for unit in graph.units.iter().take(10) {
+        output.push(format!("  {}:", unit.name));
+        for req in &unit.requires {
+            output.push(format!("    requires: {}", req));
+        }
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_cpu_time() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let cpu = rustynet_sysinfo::process_cpu_time_distribution();
+    Ok(format!(
+        "cpu time distribution:\n  user: {} ms ({}%)\n  system: {} ms ({}%)\n  children: {} ms",
+        cpu.user_ms, cpu.user_percent, cpu.system_ms, cpu.system_percent, cpu.children_time_ms
+    ))
+}
+
+fn execute_disk_latency(device: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let histogram = rustynet_sysinfo::disk_io_latency_histogram(device, 10);
+    Ok(format!(
+        "disk io latency for {}:\n  p50: {} ms\n  p95: {} ms\n  p99: {} ms\n  p99.9: {} ms\n  max: {} ms",
+        device,
+        histogram.p50_ms,
+        histogram.p95_ms,
+        histogram.p99_ms,
+        histogram.p999_ms,
+        histogram.max_ms
+    ))
+}
+
+fn execute_filesystem_journal() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let journal = rustynet_sysinfo::filesystem_journal_status();
+    let next_fsck = journal
+        .next_fsck_date
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!(
+        "filesystem journal status:\n  journal_size: {} MB\n  recovery_needed: {}\n  orphaned_inodes: {}\n  next_fsck: {}",
+        journal.journal_size_mb, journal.recovery_needed, journal.orphaned_inodes, next_fsck
+    ))
+}
+
+fn execute_disk_errors() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let errors = rustynet_sysinfo::block_device_error_counters();
+    if errors.is_empty() {
+        return Ok("block device errors: (no errors)".to_string());
+    }
+    let mut output = vec!["block device errors:".to_string()];
+    for dev in errors.iter().take(5) {
+        output.push(format!(
+            "  {}: smart_errors={} read_errors={} write_errors={}",
+            dev.device, dev.smart_errors, dev.read_errors, dev.write_errors
+        ));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_dir_size(path: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let sizes = rustynet_sysinfo::directory_size_snapshot(&[path]);
+    if sizes.is_empty() {
+        return Ok(format!("directory size: {} not found", path));
+    }
+    let dir = &sizes[0];
+    Ok(format!(
+        "directory size:\n  path: {}\n  size: {} MB\n  file_count: {}",
+        dir.path,
+        dir.size_bytes / 1024 / 1024,
+        dir.file_count
+    ))
+}
+
+fn execute_cache_efficiency() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let cache = rustynet_sysinfo::filesystem_cache_efficiency();
+    Ok(format!(
+        "filesystem cache efficiency:\n  cache_hit_rate: {}%\n  dirty_pages: {} MB\n  writeback_queue_depth: {}",
+        cache.cache_hit_rate_percent, cache.dirty_pages_mb, cache.writeback_queue_depth
+    ))
+}
+
+fn execute_file_integrity(path: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let results = rustynet_sysinfo::file_integrity_check(&[path]);
+    if results.is_empty() {
+        return Ok(format!("file integrity: {} not found", path));
+    }
+    let result = &results[0];
+    let status = if result.matches_baseline {
+        "OK"
+    } else {
+        "MODIFIED"
+    };
+    Ok(format!(
+        "file integrity check: {}\n  path: {}",
+        status, result.path
+    ))
+}
+
+fn execute_syslog_config() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let audit = rustynet_sysinfo::syslog_configuration_audit();
+    Ok(format!(
+        "syslog configuration:\n  forwarding: {}\n  retention: {} days\n  permissions_ok: {}",
+        audit.forwarding_enabled, audit.log_retention_days, audit.permissions_ok
+    ))
+}
+
+fn execute_acl_audit(path: &str) -> Result<String, String> {
+    use rustynet_sysinfo;
+    let results = rustynet_sysinfo::access_control_list_audit(&[path]);
+    if results.is_empty() {
+        return Ok(format!("acl audit: {} not found", path));
+    }
+    let acl = &results[0];
+    let mut output = vec![format!(
+        "acl audit:\n  path: {}\n  owner: {}\n  mode: {}\n  restrictive: {}",
+        acl.path, acl.owner, acl.mode, acl.is_restrictive
+    )];
+    if !acl.extended_acl.is_empty() {
+        output.push("  extended acl: yes".to_string());
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_boot_integrity() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let boot = rustynet_sysinfo::boot_integrity_check();
+    Ok(format!(
+        "boot integrity:\n  secure_boot: {}\n  tpm_present: {}\n  measurements_ok: {}",
+        boot.secure_boot_enabled, boot.tpm_present, boot.measurements_ok
+    ))
+}
+
+fn execute_system_snapshot() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let snap = rustynet_sysinfo::system_state_snapshot();
+    Ok(format!(
+        "system snapshot:\n  timestamp: {}\n  uptime: {} secs\n  process_count: {}\n  memory_used: {} MB\n  load_avg_1: {}",
+        snap.timestamp, snap.uptime_secs, snap.process_count, snap.memory_used_mb, snap.load_avg_1
+    ))
+}
+
+fn execute_compare_baseline() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let report = rustynet_sysinfo::compare_to_baseline(&rustynet_sysinfo::system_state_snapshot());
+    if report.anomalies.is_empty() {
+        return Ok("baseline comparison: no anomalies detected".to_string());
+    }
+    let mut output = vec!["baseline anomalies detected:".to_string()];
+    for anomaly in report.anomalies.iter().take(10) {
+        output.push(format!(
+            "  {}: {} vs {} ({}% deviation)",
+            anomaly.metric, anomaly.actual, anomaly.expected, anomaly.deviation_percent
+        ));
+    }
+    Ok(output.join("\n"))
+}
+
+fn execute_perf_regression() -> Result<String, String> {
+    use rustynet_sysinfo;
+    let regressions = rustynet_sysinfo::performance_regression_detection(&[]);
+    if regressions.is_empty() {
+        return Ok("performance regression: no regressions detected".to_string());
+    }
+    let mut output = vec!["performance regressions detected:".to_string()];
+    for regression in regressions.iter().take(5) {
+        output.push(format!(
+            "  {}: trend={} slope={}%/day",
+            regression.metric, regression.trend, regression.slope_percent_per_day
+        ));
+    }
     Ok(output.join("\n"))
 }
 
