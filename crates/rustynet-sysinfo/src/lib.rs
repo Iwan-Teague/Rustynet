@@ -4786,20 +4786,27 @@ fn tls_certificate_expiry_all_internal(paths: &[&str]) -> Vec<CertExpiry> {
 
                 for line in s.lines() {
                     if line.starts_with("subject=") {
-                        subject = line.strip_prefix("subject=").unwrap_or("unknown").to_string();
+                        subject = line
+                            .strip_prefix("subject=")
+                            .unwrap_or("unknown")
+                            .to_string();
                     } else if line.starts_with("notAfter=") {
-                        expires_at = line.strip_prefix("notAfter=").unwrap_or("unknown").to_string();
+                        expires_at = line
+                            .strip_prefix("notAfter=")
+                            .unwrap_or("unknown")
+                            .to_string();
                     }
                 }
 
-                let is_expired = expires_at < std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|d| {
-                        let secs = d.as_secs();
-                        Some(format!("{}", secs))
-                    })
-                    .unwrap_or_default();
+                let is_expired = expires_at
+                    < std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|d| {
+                            let secs = d.as_secs();
+                            Some(format!("{}", secs))
+                        })
+                        .unwrap_or_default();
                 let is_expired = false;
 
                 results.push(CertExpiry {
@@ -4837,9 +4844,15 @@ fn tls_certificate_expiry_all_internal(paths: &[&str]) -> Vec<CertExpiry> {
 
                 for line in s.lines() {
                     if line.starts_with("subject=") {
-                        subject = line.strip_prefix("subject=").unwrap_or("unknown").to_string();
+                        subject = line
+                            .strip_prefix("subject=")
+                            .unwrap_or("unknown")
+                            .to_string();
                     } else if line.starts_with("notAfter=") {
-                        expires_at = line.strip_prefix("notAfter=").unwrap_or("unknown").to_string();
+                        expires_at = line
+                            .strip_prefix("notAfter=")
+                            .unwrap_or("unknown")
+                            .to_string();
                     }
                 }
 
@@ -5015,7 +5028,11 @@ fn cryptographic_key_permissions_internal() -> Vec<KeyPermissionCheck> {
                 let mode = parts.get(1).copied().unwrap_or("000");
 
                 let owner_parts: Vec<&str> = owner_group.split(':').collect();
-                let owner = owner_parts.first().copied().unwrap_or("unknown").to_string();
+                let owner = owner_parts
+                    .first()
+                    .copied()
+                    .unwrap_or("unknown")
+                    .to_string();
 
                 let mode_val = u32::from_str_radix(mode, 8).unwrap_or(0o777);
                 let is_correct = (mode_val & 0o077) == 0;
@@ -5288,7 +5305,9 @@ fn open_security_vulnerabilities_internal(advisory_db_path: &str) -> Vulnerabili
         }
     }
 
-    VulnerabilityReport { vulnerable_packages }
+    VulnerabilityReport {
+        vulnerable_packages,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5383,9 +5402,7 @@ fn file_descriptor_usage_internal() -> FdUsage {
 #[cfg(target_os = "macos")]
 fn file_descriptor_usage_internal() -> FdUsage {
     let mut used = 0;
-    if let Ok(output) = std::process::Command::new("lsof")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("lsof").output() {
         if let Ok(s) = String::from_utf8(output.stdout) {
             used = s.lines().count();
         }
@@ -5404,7 +5421,11 @@ fn file_descriptor_usage_internal() -> FdUsage {
     let mut handle_count = 0;
 
     if let Ok(output) = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "(Get-Process | Measure-Object Handles -Sum).Sum"])
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-Process | Measure-Object Handles -Sum).Sum",
+        ])
         .output()
     {
         if let Ok(s) = String::from_utf8(output.stdout) {
@@ -5469,10 +5490,7 @@ fn network_socket_limit_usage_internal() -> SocketLimitUsage {
     let mut time_wait_count = 0;
 
     if let Ok(content) = fs::read_to_string("/proc/net/tcp") {
-        time_wait_count = content
-            .lines()
-            .filter(|l| l.contains("06 "))
-            .count();
+        time_wait_count = content.lines().filter(|l| l.contains("06 ")).count();
     }
 
     SocketLimitUsage {
@@ -5493,10 +5511,7 @@ fn network_socket_limit_usage_internal() -> SocketLimitUsage {
         .output()
     {
         if let Ok(s) = String::from_utf8(output.stdout) {
-            time_wait_count = s
-                .lines()
-                .filter(|l| l.contains("TIME_WAIT"))
-                .count();
+            time_wait_count = s.lines().filter(|l| l.contains("TIME_WAIT")).count();
         }
     }
 
@@ -5534,10 +5549,7 @@ fn network_socket_limit_usage_internal() -> SocketLimitUsage {
 #[cfg(target_os = "linux")]
 fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
     let mut inodes = Vec::new();
-    if let Ok(output) = std::process::Command::new("df")
-        .args(["-i"])
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("df").args(["-i"]).output() {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -5568,10 +5580,7 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
 #[cfg(target_os = "macos")]
 fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
     let mut inodes = Vec::new();
-    if let Ok(output) = std::process::Command::new("df")
-        .args(["-i"])
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("df").args(["-i"]).output() {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -5644,7 +5653,9 @@ fn process_thread_count_all_internal() -> ThreadCount {
 
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() && metadata.is_dir() {
+            if let Ok(metadata) = entry.metadata()
+                && metadata.is_dir()
+            {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.parse::<u32>().is_ok() {
                         if let Ok(tasks) = fs::read_dir(entry.path().join("task")) {
@@ -5698,7 +5709,11 @@ fn process_thread_count_all_internal() -> ThreadCount {
     let mut total_threads = 0;
 
     if let Ok(output) = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "(Get-Process | Measure-Object Threads -Sum).Sum"])
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-Process | Measure-Object Threads -Sum).Sum",
+        ])
         .output()
     {
         if let Ok(s) = String::from_utf8(output.stdout) {
@@ -5861,7 +5876,8 @@ fn daemon_crash_logs_recent_internal(lines: usize) -> Vec<CrashLog> {
         {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 for line in s.lines() {
-                    if line.contains("crash") || line.contains("panic") || line.contains("segfault") {
+                    if line.contains("crash") || line.contains("panic") || line.contains("segfault")
+                    {
                         let signal = if line.contains("segfault") {
                             Some("SIGSEGV".to_string())
                         } else if line.contains("panic") {
@@ -5908,9 +5924,16 @@ fn daemon_open_file_handles_internal() -> Vec<OpenHandle> {
                                     let inode_str = parts.get(6).copied().unwrap_or("0");
                                     let size_str = parts.get(7).copied().unwrap_or("0");
                                     handles.push(OpenHandle {
-                                        path: parts.get(8..).map(|p| p.join(" ")).unwrap_or_default(),
+                                        path: parts
+                                            .get(8..)
+                                            .map(|p| p.join(" "))
+                                            .unwrap_or_default(),
                                         fd: fd_str.parse().unwrap_or(0),
-                                        handle_type: parts.get(4).copied().unwrap_or("").to_string(),
+                                        handle_type: parts
+                                            .get(4)
+                                            .copied()
+                                            .unwrap_or("")
+                                            .to_string(),
                                         size: size_str.parse().unwrap_or(0),
                                         inode: inode_str.parse().ok(),
                                     });
@@ -5968,7 +5991,12 @@ fn process_cpu_time_distribution_internal() -> ProcessCpuTime {
                 let parts: Vec<&str> = line.split(':').collect();
                 if parts.len() >= 2 {
                     let minutes = parts[0].trim().parse::<u64>().unwrap_or(0);
-                    let seconds = parts[1].split('.').next().unwrap_or("0").parse::<u64>().unwrap_or(0);
+                    let seconds = parts[1]
+                        .split('.')
+                        .next()
+                        .unwrap_or("0")
+                        .parse::<u64>()
+                        .unwrap_or(0);
                     user_ms = (minutes * 60 + seconds) * 1000;
                 }
             }
@@ -6239,17 +6267,15 @@ fn filesystem_cache_efficiency_internal() -> CacheEfficiency {
 
     #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("vmstat")
-            .arg("1")
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("vmstat").arg("1").output() {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 for line in s.lines().skip(1) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 3 {
                         if let Ok(us) = parts[0].parse::<u64>() {
                             if let Ok(sy) = parts[1].parse::<u64>() {
-                                cache_hit_rate_percent = (us as f64 / (us as f64 + sy as f64 + 1.0)) * 100.0;
+                                cache_hit_rate_percent =
+                                    (us as f64 / (us as f64 + sy as f64 + 1.0)) * 100.0;
                             }
                         }
                     }
@@ -6289,10 +6315,7 @@ fn file_integrity_check_internal(paths: &[&str]) -> Vec<IntegrityResult> {
 
     for path in paths {
         let mut current_hash = "unknown".to_string();
-        if let Ok(output) = std::process::Command::new("sha256sum")
-            .arg(path)
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("sha256sum").arg(path).output() {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 if let Some(hash) = s.split_whitespace().next() {
                     current_hash = hash.to_string();
@@ -6358,10 +6381,7 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
     let mut results = Vec::new();
 
     for path in paths {
-        if let Ok(output) = std::process::Command::new("getfacl")
-            .arg(path)
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("getfacl").arg(path).output() {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 let mut owner = "unknown".to_string();
                 let mut group = "unknown".to_string();
@@ -6370,10 +6390,18 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
 
                 for line in s.lines() {
                     if line.starts_with("# owner:") {
-                        owner = line.strip_prefix("# owner:").unwrap_or("").trim().to_string();
+                        owner = line
+                            .strip_prefix("# owner:")
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
                     }
                     if line.starts_with("# group:") {
-                        group = line.strip_prefix("# group:").unwrap_or("").trim().to_string();
+                        group = line
+                            .strip_prefix("# group:")
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
                     }
                     if line.starts_with("user:") || line.starts_with("group:") {
                         extended_acl.push(line.to_string());
@@ -6537,7 +6565,9 @@ fn compare_to_baseline_internal(snapshot: &SystemSnapshot) -> AnomalyReport {
             metric: "process_count".to_string(),
             expected: snapshot.process_count.to_string(),
             actual: baseline.process_count.to_string(),
-            deviation_percent: ((baseline.process_count as f64 - snapshot.process_count as f64) / snapshot.process_count.max(1) as f64) * 100.0,
+            deviation_percent: ((baseline.process_count as f64 - snapshot.process_count as f64)
+                / snapshot.process_count.max(1) as f64)
+                * 100.0,
             severity: "warning".to_string(),
         });
     }
@@ -6547,7 +6577,9 @@ fn compare_to_baseline_internal(snapshot: &SystemSnapshot) -> AnomalyReport {
             metric: "memory_used_mb".to_string(),
             expected: snapshot.memory_used_mb.to_string(),
             actual: baseline.memory_used_mb.to_string(),
-            deviation_percent: ((baseline.memory_used_mb as f64 - snapshot.memory_used_mb as f64) / snapshot.memory_used_mb.max(1) as f64) * 100.0,
+            deviation_percent: ((baseline.memory_used_mb as f64 - snapshot.memory_used_mb as f64)
+                / snapshot.memory_used_mb.max(1) as f64)
+                * 100.0,
             severity: "warning".to_string(),
         });
     }
@@ -6557,7 +6589,9 @@ fn compare_to_baseline_internal(snapshot: &SystemSnapshot) -> AnomalyReport {
             metric: "load_avg_1".to_string(),
             expected: format!("{:.2}", snapshot.load_avg_1),
             actual: format!("{:.2}", baseline.load_avg_1),
-            deviation_percent: ((baseline.load_avg_1 - snapshot.load_avg_1) / (snapshot.load_avg_1 + 1.0)) * 100.0,
+            deviation_percent: ((baseline.load_avg_1 - snapshot.load_avg_1)
+                / (snapshot.load_avg_1 + 1.0))
+                * 100.0,
             severity: "info".to_string(),
         });
     }
@@ -6574,9 +6608,13 @@ fn performance_regression_detection_internal(
         return regressions;
     }
 
-    let mut metrics_by_name: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+    let mut metrics_by_name: std::collections::HashMap<String, Vec<u64>> =
+        std::collections::HashMap::new();
     for (name, value) in metrics_history {
-        metrics_by_name.entry(name.clone()).or_insert_with(Vec::new).push(*value);
+        metrics_by_name
+            .entry(name.clone())
+            .or_insert_with(Vec::new)
+            .push(*value);
     }
 
     for (name, values) in metrics_by_name {
@@ -6588,7 +6626,12 @@ fn performance_regression_detection_internal(
             if change_percent > 50.0 {
                 regressions.push(RegressionAnalysis {
                     metric: name,
-                    trend: if change_percent > 0.0 { "increasing" } else { "decreasing" }.to_string(),
+                    trend: if change_percent > 0.0 {
+                        "increasing"
+                    } else {
+                        "decreasing"
+                    }
+                    .to_string(),
                     slope_percent_per_day: change_percent,
                     projected_failure_date: None,
                 });
