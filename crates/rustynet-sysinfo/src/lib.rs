@@ -895,6 +895,46 @@ fn get_daemon_uptime() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn get_daemon_uptime() -> Option<u64> {
+    if let Ok(output) = std::process::Command::new("pgrep")
+        .args(["-o", "-f", "rustynetd"])
+        .output()
+        && let Ok(pid_str) = String::from_utf8(output.stdout)
+        && let Ok(pid) = pid_str.trim().parse::<i32>()
+        && let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "etime=", "-p"])
+            .arg(pid.to_string())
+            .output()
+        && let Ok(etime) = String::from_utf8(output.stdout)
+    {
+        let etime = etime.trim();
+        let parts: Vec<&str> = etime.split(':').collect();
+
+        let total_secs = if parts.len() == 3 {
+            if let (Ok(h), Ok(m), Ok(s)) = (
+                parts[0].parse::<u64>(),
+                parts[1].parse::<u64>(),
+                parts[2].parse::<u64>(),
+            ) {
+                h * 3600 + m * 60 + s
+            } else {
+                0
+            }
+        } else if parts.len() == 2 {
+            if let (Ok(m), Ok(s)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                m * 60 + s
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        return if total_secs > 0 {
+            Some(total_secs)
+        } else {
+            None
+        };
+    }
     None
 }
 
@@ -968,7 +1008,7 @@ fn wg_addresses_internal() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
         if let Ok(output) = std::process::Command::new("ip")
-            .args(["addr", "show", "wg0"])
+            .args(["addr", "show", "rustynet0"])
             .output()
         {
             if let Ok(stdout) = String::from_utf8(output.stdout) {
@@ -1174,8 +1214,8 @@ fn key_expiry_internal() -> KeyExpiry {
 }
 
 fn tunnel_status_internal() -> TunnelStatus {
-    let iface_info = wireguard_interface_info_internal("wg0");
-    let (bytes_sent, bytes_recv) = get_interface_bytes("wg0");
+    let iface_info = wireguard_interface_info_internal("rustynet0");
+    let (bytes_sent, bytes_recv) = get_interface_bytes("rustynet0");
     let last_handshake = get_last_handshake();
 
     TunnelStatus {
@@ -1216,7 +1256,7 @@ fn get_interface_bytes(_interface: &str) -> (u64, u64) {
 #[cfg(target_os = "linux")]
 fn get_last_handshake() -> Option<u64> {
     if let Ok(output) = std::process::Command::new("wg")
-        .args(["show", "wg0", "latest-handshakes"])
+        .args(["show", "rustynet0", "latest-handshakes"])
         .output()
     {
         if let Ok(stdout) = String::from_utf8(output.stdout) {
@@ -1253,7 +1293,7 @@ fn wg_peers_internal() -> Vec<WireGuardPeer> {
     #[cfg(target_os = "linux")]
     {
         if let Ok(output) = std::process::Command::new("wg")
-            .args(["show", "wg0"])
+            .args(["show", "rustynet0"])
             .output()
         {
             if let Ok(stdout) = String::from_utf8(output.stdout) {
@@ -1272,7 +1312,28 @@ fn wg_peers_internal() -> Vec<WireGuardPeer> {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("wg")
+            .args(["show", "rustynet0"])
+            .output()
+            && let Ok(stdout) = String::from_utf8(output.stdout)
+        {
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
+                    peers.push(WireGuardPeer {
+                        name: format!("peer-{}", &parts[0][..8.min(parts[0].len())]),
+                        ip: parts.get(3).unwrap_or(&"-").to_string(),
+                        allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
+                        last_handshake_ago: None,
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     {
         peers.push(WireGuardPeer {
             name: "peer-info".to_string(),
@@ -1414,7 +1475,7 @@ fn get_process_stats(_pid: u32) -> (Option<u64>, Option<f64>) {
 }
 
 fn connection_test_internal() -> ConnectionTest {
-    let tunnel_up = wireguard_interface_info_internal("wg0").is_up;
+    let tunnel_up = wireguard_interface_info_internal("rustynet0").is_up;
     let exit_reachable = test_tcp_connection("8.8.8.8", 53).is_ok();
     let dns_ok = test_dns_resolution("google.com").is_some();
 
@@ -1619,7 +1680,7 @@ fn interface_stats_internal() -> Vec<InterfaceStats> {
 
 fn health_check_internal() -> HealthCheck {
     let daemon_health = daemon_health_internal();
-    let tunnel_health = wireguard_interface_info_internal("wg0");
+    let tunnel_health = wireguard_interface_info_internal("rustynet0");
     let connection_health = connection_test_internal();
     let config_health = validate_config_internal();
 
