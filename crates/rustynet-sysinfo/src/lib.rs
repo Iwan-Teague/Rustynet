@@ -841,7 +841,7 @@ fn daemon_health_internal() -> DaemonHealth {
 #[cfg(target_os = "linux")]
 fn check_daemon_running(_msg: &mut String) -> bool {
     std::process::Command::new("pgrep")
-        .arg("-f")
+        .arg("-x")
         .arg("rustynetd")
         .output()
         .map(|out| out.status.success())
@@ -851,7 +851,7 @@ fn check_daemon_running(_msg: &mut String) -> bool {
 #[cfg(target_os = "macos")]
 fn check_daemon_running(_msg: &mut String) -> bool {
     std::process::Command::new("pgrep")
-        .arg("-f")
+        .arg("-x")
         .arg("rustynetd")
         .output()
         .map(|out| out.status.success())
@@ -872,7 +872,7 @@ fn check_daemon_running(_msg: &mut String) -> bool {
 fn get_daemon_uptime() -> Option<u64> {
     std::process::Command::new("pgrep")
         .arg("-o")
-        .arg("-f")
+        .arg("-x")
         .arg("rustynetd")
         .output()
         .ok()
@@ -896,7 +896,7 @@ fn get_daemon_uptime() -> Option<u64> {
 #[cfg(target_os = "macos")]
 fn get_daemon_uptime() -> Option<u64> {
     if let Ok(output) = std::process::Command::new("pgrep")
-        .args(["-o", "-f", "rustynetd"])
+        .args(["-o", "-x", "rustynetd"])
         .output()
         && let Ok(pid_str) = String::from_utf8(output.stdout)
         && let Ok(pid) = pid_str.trim().parse::<i32>()
