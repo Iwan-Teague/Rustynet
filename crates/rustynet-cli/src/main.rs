@@ -159,6 +159,13 @@ enum CliCommand {
     BandwidthTest,
     InterfaceStats,
     HealthCheck,
+    SystemLoad,
+    MemoryInfo,
+    DiskInfo,
+    CpuInfo,
+    SocketStats,
+    EnvValidate,
+    ProcessList,
     Help,
 }
 
@@ -867,6 +874,13 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "bandwidth-test" || cmd == "bandwidth" => CliCommand::BandwidthTest,
         [cmd] if cmd == "interface-stats" || cmd == "ifstats" => CliCommand::InterfaceStats,
         [cmd] if cmd == "health-check" || cmd == "health" => CliCommand::HealthCheck,
+        [cmd] if cmd == "system-load" || cmd == "load" => CliCommand::SystemLoad,
+        [cmd] if cmd == "memory-info" || cmd == "memory" => CliCommand::MemoryInfo,
+        [cmd] if cmd == "disk-info" || cmd == "disk" => CliCommand::DiskInfo,
+        [cmd] if cmd == "cpu-info" || cmd == "cpu" => CliCommand::CpuInfo,
+        [cmd] if cmd == "socket-stats" || cmd == "sockets" => CliCommand::SocketStats,
+        [cmd] if cmd == "env-validate" || cmd == "env" => CliCommand::EnvValidate,
+        [cmd] if cmd == "process-list" || cmd == "processes" => CliCommand::ProcessList,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3686,6 +3700,13 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::BandwidthTest => execute_bandwidth_test(),
         CliCommand::InterfaceStats => execute_interface_stats(),
         CliCommand::HealthCheck => execute_health_check(),
+        CliCommand::SystemLoad => execute_system_load(),
+        CliCommand::MemoryInfo => execute_memory_info(),
+        CliCommand::DiskInfo => execute_disk_info(),
+        CliCommand::CpuInfo => execute_cpu_info(),
+        CliCommand::SocketStats => execute_socket_stats(),
+        CliCommand::EnvValidate => execute_env_validate(),
+        CliCommand::ProcessList => execute_process_list(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12131,6 +12152,13 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::BandwidthTest
         | CliCommand::InterfaceStats
         | CliCommand::HealthCheck
+        | CliCommand::SystemLoad
+        | CliCommand::MemoryInfo
+        | CliCommand::DiskInfo
+        | CliCommand::CpuInfo
+        | CliCommand::SocketStats
+        | CliCommand::EnvValidate
+        | CliCommand::ProcessList
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -13120,6 +13148,117 @@ fn execute_health_check() -> Result<String, String> {
         output.push("  issues:".to_string());
         for issue in health.issues {
             output.push(format!("    - {}", issue));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_system_load() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let load = rustynet_sysinfo::system_load();
+    let mut output = vec!["system load:".to_string()];
+    output.push(format!("  1 min:  {:.2}", load.cpu_load_1min));
+    output.push(format!("  5 min:  {:.2}", load.cpu_load_5min));
+    output.push(format!("  15 min: {:.2}", load.cpu_load_15min));
+    output.push(format!("  memory: {:.1}%", load.memory_percent));
+    output.push(format!("  disk:   {:.1}%", load.disk_percent));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_memory_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let mem = rustynet_sysinfo::memory_info();
+    let mut output = vec!["memory:".to_string()];
+    output.push(format!("  total:     {} MB", mem.total_mb));
+    output.push(format!("  used:      {} MB", mem.used_mb));
+    output.push(format!("  available: {} MB", mem.available_mb));
+    output.push(format!("  percent:   {:.1}%", mem.percent));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_disk_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let disks = rustynet_sysinfo::disk_info();
+    let mut output = vec!["disk:".to_string()];
+
+    if disks.is_empty() {
+        output.push("  (no disk info available)".to_string());
+    } else {
+        for disk in disks {
+            output.push(format!("  {}:", disk.mount));
+            output.push(format!("    total: {} MB", disk.total_mb));
+            output.push(format!("    used:  {} MB", disk.used_mb));
+            output.push(format!("    avail: {} MB", disk.available_mb));
+            output.push(format!("    {:.1}%", disk.percent));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_cpu_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let cpu = rustynet_sysinfo::cpu_info();
+    let mut output = vec!["cpu:".to_string()];
+    output.push(format!("  cores: {}", cpu.cores));
+    output.push(format!("  model: {}", cpu.model));
+    if let Some(freq) = cpu.freq_ghz {
+        output.push(format!("  freq:  {:.2} GHz", freq));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_socket_stats() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let stats = rustynet_sysinfo::socket_stats();
+    let mut output = vec!["socket statistics:".to_string()];
+    output.push(format!("  established: {}", stats.established));
+    output.push(format!("  listening:   {}", stats.listening));
+    output.push(format!("  time_wait:   {}", stats.time_wait));
+    output.push(format!("  total:       {}", stats.total));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_env_validate() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let issues = rustynet_sysinfo::env_validate();
+    let mut output = vec!["environment validation:".to_string()];
+
+    if issues.is_empty() {
+        output.push("  all required variables set".to_string());
+    } else {
+        for issue in issues {
+            output.push(format!("  - {}", issue));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_process_list() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let procs = rustynet_sysinfo::process_list();
+    let mut output = vec!["running rustynet processes:".to_string()];
+
+    if procs.is_empty() {
+        output.push("  (none)".to_string());
+    } else {
+        for proc in procs {
+            output.push(format!("  {} (pid {})", proc.name, proc.pid));
+            output.push(format!("    memory: {} MB", proc.memory_mb));
+            output.push(format!("    uptime: {} sec", proc.uptime_seconds));
         }
     }
 

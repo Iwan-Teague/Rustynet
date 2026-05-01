@@ -101,6 +101,34 @@ pub fn health_check() -> HealthCheck {
     health_check_internal()
 }
 
+pub fn system_load() -> SystemLoad {
+    system_load_internal()
+}
+
+pub fn memory_info() -> MemoryInfo {
+    memory_info_internal()
+}
+
+pub fn disk_info() -> Vec<DiskInfo> {
+    disk_info_internal()
+}
+
+pub fn cpu_info() -> CpuInfo {
+    cpu_info_internal()
+}
+
+pub fn socket_stats() -> SocketStats {
+    socket_stats_internal()
+}
+
+pub fn env_validate() -> Vec<String> {
+    env_validate_internal()
+}
+
+pub fn process_list() -> Vec<ProcessListEntry> {
+    process_list_internal()
+}
+
 pub struct InterfaceInfo {
     pub exists: bool,
     pub is_up: bool,
@@ -214,6 +242,49 @@ pub struct HealthCheck {
     pub tunnel_healthy: bool,
     pub network_healthy: bool,
     pub issues: Vec<String>,
+}
+
+pub struct SystemLoad {
+    pub cpu_load_1min: f64,
+    pub cpu_load_5min: f64,
+    pub cpu_load_15min: f64,
+    pub memory_percent: f64,
+    pub disk_percent: f64,
+}
+
+pub struct MemoryInfo {
+    pub total_mb: u64,
+    pub used_mb: u64,
+    pub available_mb: u64,
+    pub percent: f64,
+}
+
+pub struct DiskInfo {
+    pub mount: String,
+    pub total_mb: u64,
+    pub used_mb: u64,
+    pub available_mb: u64,
+    pub percent: f64,
+}
+
+pub struct CpuInfo {
+    pub cores: usize,
+    pub model: String,
+    pub freq_ghz: Option<f64>,
+}
+
+pub struct SocketStats {
+    pub established: usize,
+    pub listening: usize,
+    pub time_wait: usize,
+    pub total: usize,
+}
+
+pub struct ProcessListEntry {
+    pub name: String,
+    pub pid: u32,
+    pub memory_mb: u64,
+    pub uptime_seconds: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -1511,4 +1582,366 @@ fn health_check_internal() -> HealthCheck {
         network_healthy,
         issues,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn system_load_internal() -> SystemLoad {
+    let mut load_1 = 0.0;
+    let mut load_5 = 0.0;
+    let mut load_15 = 0.0;
+
+    if let Ok(content) = fs::read_to_string("/proc/loadavg") {
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        if parts.len() >= 3 {
+            load_1 = parts[0].parse().unwrap_or(0.0);
+            load_5 = parts[1].parse().unwrap_or(0.0);
+            load_15 = parts[2].parse().unwrap_or(0.0);
+        }
+    }
+
+    let mem_percent = memory_info_internal().percent;
+    let disk_percent = disk_info_internal()
+        .first()
+        .map(|d| d.percent)
+        .unwrap_or(0.0);
+
+    SystemLoad {
+        cpu_load_1min: load_1,
+        cpu_load_5min: load_5,
+        cpu_load_15min: load_15,
+        memory_percent: mem_percent,
+        disk_percent,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn system_load_internal() -> SystemLoad {
+    let mut load_1 = 0.0;
+    let mut load_5 = 0.0;
+    let mut load_15 = 0.0;
+
+    if let Ok(output) = std::process::Command::new("uptime").output()
+        && let Ok(s) = String::from_utf8(output.stdout)
+        && let Some(load_part) = s.split("load average:").nth(1)
+    {
+        let loads: Vec<&str> = load_part.split(',').collect();
+        if loads.len() >= 3 {
+            load_1 = loads[0].trim().parse().unwrap_or(0.0);
+            load_5 = loads[1].trim().parse().unwrap_or(0.0);
+            load_15 = loads[2].trim().parse().unwrap_or(0.0);
+        }
+    }
+
+    let mem_percent = memory_info_internal().percent;
+    let disk_percent = disk_info_internal()
+        .first()
+        .map(|d| d.percent)
+        .unwrap_or(0.0);
+
+    SystemLoad {
+        cpu_load_1min: load_1,
+        cpu_load_5min: load_5,
+        cpu_load_15min: load_15,
+        memory_percent: mem_percent,
+        disk_percent,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn system_load_internal() -> SystemLoad {
+    SystemLoad {
+        cpu_load_1min: 0.0,
+        cpu_load_5min: 0.0,
+        cpu_load_15min: 0.0,
+        memory_percent: memory_info_internal().percent,
+        disk_percent: disk_info_internal()
+            .first()
+            .map(|d| d.percent)
+            .unwrap_or(0.0),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn memory_info_internal() -> MemoryInfo {
+    let mut total = 0u64;
+    let mut available = 0u64;
+
+    if let Ok(content) = fs::read_to_string("/proc/meminfo") {
+        for line in content.lines() {
+            if line.starts_with("MemTotal:") {
+                total = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+            } else if line.starts_with("MemAvailable:") {
+                available = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    let used = total.saturating_sub(available);
+    let percent = if total > 0 {
+        (used as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    MemoryInfo {
+        total_mb: total / 1024,
+        used_mb: used / 1024,
+        available_mb: available / 1024,
+        percent,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn memory_info_internal() -> MemoryInfo {
+    MemoryInfo {
+        total_mb: 0,
+        used_mb: 0,
+        available_mb: 0,
+        percent: 0.0,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn memory_info_internal() -> MemoryInfo {
+    MemoryInfo {
+        total_mb: 0,
+        used_mb: 0,
+        available_mb: 0,
+        percent: 0.0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn disk_info_internal() -> Vec<DiskInfo> {
+    vec![DiskInfo {
+        mount: "/".to_string(),
+        total_mb: 0,
+        used_mb: 0,
+        available_mb: 0,
+        percent: 0.0,
+    }]
+}
+
+#[cfg(target_os = "macos")]
+fn disk_info_internal() -> Vec<DiskInfo> {
+    vec![DiskInfo {
+        mount: "/".to_string(),
+        total_mb: 0,
+        used_mb: 0,
+        available_mb: 0,
+        percent: 0.0,
+    }]
+}
+
+#[cfg(target_os = "windows")]
+fn disk_info_internal() -> Vec<DiskInfo> {
+    vec![DiskInfo {
+        mount: "C:".to_string(),
+        total_mb: 0,
+        used_mb: 0,
+        available_mb: 0,
+        percent: 0.0,
+    }]
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_info_internal() -> CpuInfo {
+    let mut cores = 1usize;
+    let mut model = "Unknown".to_string();
+
+    if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
+        let mut proc_count = 0usize;
+        for line in content.lines() {
+            if line.starts_with("processor") {
+                proc_count += 1;
+            } else if line.starts_with("model name") {
+                if let Some(name) = line.split(':').nth(1) {
+                    model = name.trim().to_string();
+                }
+            }
+        }
+        if proc_count > 0 {
+            cores = proc_count;
+        }
+    }
+
+    CpuInfo {
+        cores,
+        model,
+        freq_ghz: None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cpu_info_internal() -> CpuInfo {
+    CpuInfo {
+        cores: 1,
+        model: "Apple Silicon/Intel".to_string(),
+        freq_ghz: None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cpu_info_internal() -> CpuInfo {
+    CpuInfo {
+        cores: 1,
+        model: "Unknown".to_string(),
+        freq_ghz: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn socket_stats_internal() -> SocketStats {
+    let mut established = 0usize;
+    let mut listening = 0usize;
+    let mut time_wait = 0usize;
+
+    if let Ok(content) = fs::read_to_string("/proc/net/tcp") {
+        for line in content.lines().skip(1) {
+            if let Some(state_str) = line.split_whitespace().nth(3) {
+                match state_str {
+                    "01" => established += 1,
+                    "0A" => listening += 1,
+                    "06" => time_wait += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let total = established + listening + time_wait;
+
+    SocketStats {
+        established,
+        listening,
+        time_wait,
+        total,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn socket_stats_internal() -> SocketStats {
+    SocketStats {
+        established: 0,
+        listening: 0,
+        time_wait: 0,
+        total: 0,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn socket_stats_internal() -> SocketStats {
+    SocketStats {
+        established: 0,
+        listening: 0,
+        time_wait: 0,
+        total: 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn env_validate_internal() -> Vec<String> {
+    let required = vec!["RUSTYNET_DAEMON_SOCK", "RUSTYNET_CONFIG", "RUST_LOG"];
+
+    let mut issues = Vec::new();
+    for var in required {
+        if std::env::var(var).is_err() {
+            issues.push(format!("missing: {}", var));
+        }
+    }
+
+    issues
+}
+
+#[cfg(target_os = "macos")]
+fn env_validate_internal() -> Vec<String> {
+    let required = vec!["RUSTYNET_DAEMON_SOCK", "RUSTYNET_CONFIG"];
+
+    let mut issues = Vec::new();
+    for var in required {
+        if std::env::var(var).is_err() {
+            issues.push(format!("missing: {}", var));
+        }
+    }
+
+    issues
+}
+
+#[cfg(target_os = "windows")]
+fn env_validate_internal() -> Vec<String> {
+    let required = vec!["RUSTYNET_CONFIG"];
+
+    let mut issues = Vec::new();
+    for var in required {
+        if std::env::var(var).is_err() {
+            issues.push(format!("missing: {}", var));
+        }
+    }
+
+    issues
+}
+
+#[cfg(target_os = "linux")]
+fn process_list_internal() -> Vec<ProcessListEntry> {
+    let mut procs = Vec::new();
+
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if !metadata.is_dir() {
+                    continue;
+                }
+            }
+
+            let pid_str = entry.file_name();
+            if let Ok(pid) = pid_str.to_string_lossy().parse::<u32>() {
+                let status_path = format!("/proc/{}/status", pid);
+                if let Ok(content) = fs::read_to_string(&status_path) {
+                    let mut name = format!("pid_{}", pid);
+                    let mut memory = 0u64;
+
+                    for line in content.lines() {
+                        if line.starts_with("Name:") {
+                            if let Some(n) = line.split('\t').nth(1) {
+                                name = n.to_string();
+                            }
+                        } else if line.starts_with("VmRSS:") {
+                            if let Some(m) = line.split_whitespace().nth(1) {
+                                memory = m.parse::<u64>().unwrap_or(0);
+                            }
+                        }
+                    }
+
+                    if name.contains("rustynet") || name.contains("daemon") {
+                        procs.push(ProcessListEntry {
+                            name,
+                            pid,
+                            memory_mb: memory / 1024,
+                            uptime_seconds: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    procs
+}
+
+#[cfg(target_os = "macos")]
+fn process_list_internal() -> Vec<ProcessListEntry> {
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn process_list_internal() -> Vec<ProcessListEntry> {
+    Vec::new()
 }
