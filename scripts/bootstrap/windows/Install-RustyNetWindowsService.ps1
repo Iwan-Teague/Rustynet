@@ -439,15 +439,17 @@ function Build-ReviewedDaemonArgsJson {
     # distribute and validate the assignment; this flag does NOT
     # bypass that — it only defers the startup gate to runtime.
     #
-    # --trust-max-age-secs 86400: the trust evidence file is generated
-    # by the access bootstrap phase and may be hours old by the time
-    # install-release runs in a phase-by-phase walkthrough.  The
-    # daemon's default DEFAULT_TRUST_MAX_AGE_SECS is 300 (5 min) which
-    # is correct for production but rejects lab evidence with
-    # "trust evidence is stale".  Mesh-join phases regenerate trust
-    # evidence with a fresh signature; this lab-image flag widens the
-    # window so the per-node service-host bring-up does not fail
-    # closed in between.
+    # --trust-max-age-secs 86400: install-release issues fresh trust
+    # evidence under the runtime identity (see
+    # 'reissue-trust-evidence-under-runtime-identity' step), so the
+    # evidence is at most a few seconds old at service start. The
+    # 24-hour window is the standing freshness budget after that —
+    # the daemon's default DEFAULT_TRUST_MAX_AGE_SECS is 300 (5 min)
+    # which is correct for production with an active refresh timer
+    # but tighter than a lab guest gets without one. There is no
+    # equivalent of `rustynetd-trust-refresh.timer` on Windows yet;
+    # while that is missing, 86400s gives the lab a day before the
+    # next install-release must rotate evidence again.
     return (@(
         '--backend', $BackendLabel,
         '--auto-tunnel-enforce', 'false',
@@ -583,6 +585,67 @@ if ($LASTEXITCODE -ne 0) {
     throw "rustynetd key store-passphrase failed (exit $LASTEXITCODE): $keyStoreOutput"
 }
 Write-Host "[install-helper] rekey: passphrase blob written under SYSTEM DPAPI scope"
+
+# Re-issue the per-host trust evidence under the runtime identity. The
+# daemon's startup preflight rejects trust evidence older than
+# `--trust-max-age-secs` (lab default: 86400s / 24h). Without an issuer
+# on the Windows guest itself, the originally-provisioned evidence ages
+# out of that window and the service refuses to start with
+# "trust preflight failed: trust evidence is stale". Run the keygen +
+# issue cmdlets every install-release so each fresh service bring-up
+# starts with a freshly-signed evidence file (mirrors the systemd
+# `rustynetd-trust-refresh` timer on Linux). Trust is per-host self-
+# attestation: the verifier key written here is the same one the daemon
+# loads at startup, so rotating both signing and verifier together is
+# safe — no other peer relies on this verifier key.
+$script:InstallFailureStep = 'reissue-trust-evidence-under-runtime-identity'
+$trustDir = Join-Path $StateRoot 'trust'
+if (-not (Test-Path -LiteralPath $trustDir)) {
+    New-Item -ItemType Directory -Force -Path $trustDir | Out-Null
+}
+$trustSigningKeyPath = Join-Path $trustDir 'trust-evidence.signing.key'
+$trustVerifierKeyPath = Join-Path $trustDir 'trust-evidence.pub'
+$trustEvidencePath = Join-Path $trustDir 'rustynetd.trust'
+$trustWatermarkPath = Join-Path $trustDir 'rustynetd.trust.watermark'
+$trustPassphrasePath = Join-Path $trustDir 'trust-evidence.passphrase.tmp'
+$cliPath = Join-Path $InstallRoot 'rustynet.exe'
+if (-not (Test-Path -LiteralPath $cliPath)) {
+    throw "rustynet.exe not found at $cliPath; cannot reissue trust evidence (was copy-cli-binary skipped?)"
+}
+$trustPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
+[System.IO.File]::WriteAllText($trustPassphrasePath, $trustPlaintext)
+try {
+    $keygenOutput = (& $cliPath trust keygen `
+            --signing-key-output $trustSigningKeyPath `
+            --signing-key-passphrase-file $trustPassphrasePath `
+            --verifier-key-output $trustVerifierKeyPath `
+            --force 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "rustynet trust keygen failed (exit $LASTEXITCODE): $keygenOutput"
+    }
+    Write-Host "[install-helper] trust: keygen complete (signing + verifier keys rotated)"
+    $issueOutput = (& $cliPath trust issue `
+            --signing-key $trustSigningKeyPath `
+            --signing-key-passphrase-file $trustPassphrasePath `
+            --output $trustEvidencePath 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "rustynet trust issue failed (exit $LASTEXITCODE): $issueOutput"
+    }
+    Write-Host "[install-helper] trust: evidence issued at $trustEvidencePath"
+    # Drop any stale watermark so the daemon's WatermarkStore re-ingests the
+    # new evidence on the next refresh tick instead of trusting its old
+    # high-water mark. -ErrorAction SilentlyContinue is still safe here
+    # because the script terminates with `exit 0` semantics via the throw
+    # paths above and this Remove-Item only runs on the success branch.
+    if (Test-Path -LiteralPath $trustWatermarkPath) {
+        Remove-Item -Force -LiteralPath $trustWatermarkPath
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $trustPassphrasePath) {
+        Remove-Item -Force -LiteralPath $trustPassphrasePath
+    }
+}
 
 $configPath = Join-Path $StateRoot 'config\rustynetd.env'
 $script:InstallFailureStep = 'write-reviewed-env-file'
