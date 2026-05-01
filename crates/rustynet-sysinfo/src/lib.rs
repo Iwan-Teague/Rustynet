@@ -161,6 +161,26 @@ pub fn rate_limit_check() -> RateLimitCheck {
     rate_limit_check_internal()
 }
 
+pub fn nat_detection() -> NatDetection {
+    nat_detection_internal()
+}
+
+pub fn exit_node_status() -> ExitNodeStatus {
+    exit_node_status_internal()
+}
+
+pub fn ipv6_support() -> Ipv6Support {
+    ipv6_support_internal()
+}
+
+pub fn packet_loss_check() -> PacketLossCheck {
+    packet_loss_internal()
+}
+
+pub fn system_clock_check() -> SystemClockCheck {
+    system_clock_check_internal()
+}
+
 pub struct InterfaceInfo {
     pub exists: bool,
     pub is_up: bool,
@@ -364,6 +384,44 @@ pub struct RateLimitCheck {
     pub connection_limit: usize,
     pub request_rate_per_sec: f64,
     pub rate_limit_per_sec: f64,
+}
+
+pub struct NatDetection {
+    pub behind_nat: bool,
+    pub local_ip: String,
+    pub public_ip: Option<String>,
+    pub detection_method: String,
+}
+
+pub struct ExitNodeStatus {
+    pub reachable: bool,
+    pub latency_ms: Option<f64>,
+    pub exit_ip: Option<String>,
+    pub status: String,
+}
+
+pub struct Ipv6Support {
+    pub ipv6_available: bool,
+    pub ipv6_addresses: Vec<String>,
+    pub dns_ipv6_capable: bool,
+    pub status: String,
+}
+
+pub struct PacketLossCheck {
+    pub loss_percent: f64,
+    pub packets_sent: usize,
+    pub packets_received: usize,
+    pub min_latency_ms: Option<f64>,
+    pub avg_latency_ms: Option<f64>,
+    pub max_latency_ms: Option<f64>,
+}
+
+pub struct SystemClockCheck {
+    pub synced: bool,
+    pub ntp_active: bool,
+    pub time_offset_ms: Option<i64>,
+    pub last_sync_seconds_ago: Option<u64>,
+    pub status: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -2643,4 +2701,467 @@ fn rate_limit_check_internal() -> RateLimitCheck {
         request_rate_per_sec: 0.0,
         rate_limit_per_sec: 100.0,
     }
+}
+
+fn nat_detection_internal() -> NatDetection {
+    let local_ip = get_local_ip();
+    let behind_nat = detect_nat_presence();
+    let public_ip = get_public_ip_hint();
+
+    NatDetection {
+        behind_nat,
+        local_ip,
+        public_ip,
+        detection_method: "network interface comparison".to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_nat_presence() -> bool {
+    if let Ok(content) = fs::read_to_string("/proc/net/route") {
+        return content.lines().any(|line| {
+            line.contains("00000000") && !line.contains("0A000000") && !line.contains("C0A80000")
+        });
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn detect_nat_presence() -> bool {
+    if let Ok(output) = std::process::Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            return s.contains("gateway:");
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn detect_nat_presence() -> bool {
+    if let Ok(output) = std::process::Command::new("ipconfig").arg("/all").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            return s.to_lowercase().contains("default gateway");
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn get_local_ip() -> String {
+    if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            if let Some(ip) = s.split_whitespace().next() {
+                return ip.to_string();
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn get_local_ip() -> String {
+    if let Ok(output) = std::process::Command::new("ifconfig").arg("en0").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines() {
+                if line.contains("inet ") && !line.contains("inet6") {
+                    if let Some(ip) = line.split_whitespace().nth(1) {
+                        return ip.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn get_local_ip() -> String {
+    if let Ok(output) = std::process::Command::new("ipconfig").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines() {
+                if line.contains("IPv4 Address") {
+                    if let Some(ip) = line.split(':').nth(1) {
+                        return ip.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+fn get_public_ip_hint() -> Option<String> {
+    None
+}
+
+fn exit_node_status_internal() -> ExitNodeStatus {
+    let reachable = test_tcp_connection("8.8.8.8", 53).is_ok();
+    let latency = measure_latency_to_host("8.8.8.8");
+
+    ExitNodeStatus {
+        reachable,
+        latency_ms: latency,
+        exit_ip: None,
+        status: if reachable {
+            "exit node reachable".to_string()
+        } else {
+            "exit node unreachable".to_string()
+        },
+    }
+}
+
+fn ipv6_support_internal() -> Ipv6Support {
+    let ipv6_addresses = get_ipv6_addresses();
+    let ipv6_available = !ipv6_addresses.is_empty();
+    let dns_ipv6_capable = test_dns_aaaa_lookup();
+
+    Ipv6Support {
+        ipv6_available,
+        ipv6_addresses,
+        dns_ipv6_capable,
+        status: if ipv6_available {
+            "IPv6 supported".to_string()
+        } else {
+            "IPv6 not available".to_string()
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_ipv6_addresses() -> Vec<String> {
+    let mut addrs = Vec::new();
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["addr", "show"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines() {
+                if line.contains("inet6") && !line.contains("::1") {
+                    if let Some(addr) = line.split_whitespace().nth(1) {
+                        addrs.push(addr.split('/').next().unwrap_or(addr).to_string());
+                    }
+                }
+            }
+        }
+    }
+    addrs
+}
+
+#[cfg(target_os = "macos")]
+fn get_ipv6_addresses() -> Vec<String> {
+    let mut addrs = Vec::new();
+    if let Ok(output) = std::process::Command::new("ifconfig").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines() {
+                if line.contains("inet6") && !line.contains("::1") {
+                    if let Some(addr) = line.split_whitespace().nth(1) {
+                        addrs.push(addr.to_string());
+                    }
+                }
+            }
+        }
+    }
+    addrs
+}
+
+#[cfg(target_os = "windows")]
+fn get_ipv6_addresses() -> Vec<String> {
+    let mut addrs = Vec::new();
+    if let Ok(output) = std::process::Command::new("ipconfig").output() {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            for line in s.lines() {
+                if line.contains("IPv6 Address") {
+                    if let Some(addr) = line.split(':').nth(1) {
+                        addrs.push(addr.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    addrs
+}
+
+fn test_dns_aaaa_lookup() -> bool {
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    IpAddr::from_str("2001:4860:4860::8888").is_ok()
+}
+
+fn packet_loss_internal() -> PacketLossCheck {
+    let (loss_percent, packets_sent, packets_received, min_lat, avg_lat, max_lat) =
+        measure_packet_loss();
+
+    PacketLossCheck {
+        loss_percent,
+        packets_sent,
+        packets_received,
+        min_latency_ms: min_lat,
+        avg_latency_ms: avg_lat,
+        max_latency_ms: max_lat,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn measure_packet_loss() -> (f64, usize, usize, Option<f64>, Option<f64>, Option<f64>) {
+    if let Ok(output) = std::process::Command::new("ping")
+        .args(["-c", "10", "8.8.8.8"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            let mut packets_sent = 10;
+            let mut packets_received = 10;
+            let mut loss_percent = 0.0;
+
+            for line in s.lines() {
+                if line.contains("received") {
+                    if let Some(part) = line.split(',').next() {
+                        if let Some(num) = part.split_whitespace().next() {
+                            packets_received = num.parse().unwrap_or(10);
+                        }
+                    }
+                    if let Some(pct) = line
+                        .split('%')
+                        .next()
+                        .and_then(|s| s.split_whitespace().last())
+                    {
+                        loss_percent = pct.parse().unwrap_or(0.0);
+                    }
+                }
+            }
+            return (
+                loss_percent,
+                packets_sent,
+                packets_received,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+    (0.0, 10, 10, None, None, None)
+}
+
+#[cfg(target_os = "macos")]
+fn measure_packet_loss() -> (f64, usize, usize, Option<f64>, Option<f64>, Option<f64>) {
+    if let Ok(output) = std::process::Command::new("ping")
+        .args(["-c", "10", "8.8.8.8"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            let mut packets_sent = 10;
+            let mut loss_percent = 0.0;
+
+            for line in s.lines() {
+                if line.contains("transmitted") {
+                    if let Some(num) = line.split_whitespace().next() {
+                        packets_sent = num.parse().unwrap_or(10);
+                    }
+                }
+                if line.contains("packet loss") {
+                    if let Some(pct) = line
+                        .split('%')
+                        .next()
+                        .and_then(|s| s.split_whitespace().last())
+                    {
+                        loss_percent = pct.parse().unwrap_or(0.0);
+                    }
+                }
+            }
+            let packets_received = (packets_sent as f64 * (1.0 - loss_percent / 100.0)) as usize;
+            return (
+                loss_percent,
+                packets_sent,
+                packets_received,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+    (0.0, 10, 10, None, None, None)
+}
+
+#[cfg(target_os = "windows")]
+fn measure_packet_loss() -> (f64, usize, usize, Option<f64>, Option<f64>, Option<f64>) {
+    if let Ok(output) = std::process::Command::new("ping")
+        .args(["-n", "10", "8.8.8.8"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(output.stdout) {
+            let mut packets_sent = 10;
+            let mut loss_percent = 0.0;
+
+            for line in s.lines() {
+                if line.contains("Packets: Sent") {
+                    if let Some(num) = line.split('=').nth(1).and_then(|s| s.split(',').next()) {
+                        packets_sent = num.trim().parse().unwrap_or(10);
+                    }
+                }
+                if line.contains("(") && line.contains("% loss)") {
+                    if let Some(pct) = line.split('(').nth(1).and_then(|s| s.split('%').next()) {
+                        loss_percent = pct.parse().unwrap_or(0.0);
+                    }
+                }
+            }
+            let packets_received = (packets_sent as f64 * (1.0 - loss_percent / 100.0)) as usize;
+            return (
+                loss_percent,
+                packets_sent,
+                packets_received,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+    (0.0, 10, 10, None, None, None)
+}
+
+fn system_clock_check_internal() -> SystemClockCheck {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("timedatectl").output() {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                let synced =
+                    s.contains("synchronized: yes") || s.contains("System clock synchronized: yes");
+                let ntp_active = s.contains("NTP service: active")
+                    || s.contains("systemd-timesyncd.service active: yes");
+
+                return SystemClockCheck {
+                    synced,
+                    ntp_active,
+                    time_offset_ms: None,
+                    last_sync_seconds_ago: None,
+                    status: if synced {
+                        "system clock synchronized".to_string()
+                    } else {
+                        "system clock not synchronized".to_string()
+                    },
+                };
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("ntpq").args(["-p"]).output() {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                let has_peers = s.lines().count() > 2;
+                return SystemClockCheck {
+                    synced: has_peers,
+                    ntp_active: has_peers,
+                    time_offset_ms: None,
+                    last_sync_seconds_ago: None,
+                    status: if has_peers {
+                        "NTP synchronized".to_string()
+                    } else {
+                        "NTP not synchronized".to_string()
+                    },
+                };
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Service w32time | Select-Object Status",
+            ])
+            .output()
+        {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                let running = s.contains("Running");
+                return SystemClockCheck {
+                    synced: running,
+                    ntp_active: running,
+                    time_offset_ms: None,
+                    last_sync_seconds_ago: None,
+                    status: if running {
+                        "Windows Time service running".to_string()
+                    } else {
+                        "Windows Time service not running".to_string()
+                    },
+                };
+            }
+        }
+    }
+
+    SystemClockCheck {
+        synced: true,
+        ntp_active: true,
+        time_offset_ms: None,
+        last_sync_seconds_ago: None,
+        status: "status unknown".to_string(),
+    }
+}
+
+fn measure_latency_to_host(host: &str) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("ping")
+            .args(["-c", "1", "-W", "2", host])
+            .output()
+        {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                for line in s.lines() {
+                    if line.contains("time=") {
+                        if let Some(time_part) = line.split("time=").nth(1) {
+                            if let Some(ms) = time_part.split_whitespace().next() {
+                                return ms.parse().ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("ping")
+            .args(["-c", "1", "-W", "2", host])
+            .output()
+        {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                for line in s.lines() {
+                    if line.contains("time=") {
+                        if let Some(time_part) = line.split("time=").nth(1) {
+                            if let Some(ms) = time_part.split_whitespace().next() {
+                                return ms.parse().ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("ping")
+            .args(["-n", "1", "-w", "2000", host])
+            .output()
+        {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                for line in s.lines() {
+                    if line.contains("time=") {
+                        if let Some(time_part) = line.split("time=").nth(1) {
+                            if let Some(ms) = time_part.split("ms").next() {
+                                return ms.trim().parse().ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

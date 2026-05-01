@@ -174,6 +174,11 @@ enum CliCommand {
     PerformanceTest,
     TlsCheck,
     RateLimitCheck,
+    NatDetection,
+    ExitNodeStatus,
+    Ipv6Support,
+    PacketLoss,
+    SystemClock,
     Help,
 }
 
@@ -897,6 +902,11 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "performance-test" || cmd == "perf" => CliCommand::PerformanceTest,
         [cmd] if cmd == "tls-check" || cmd == "tls" => CliCommand::TlsCheck,
         [cmd] if cmd == "rate-limit-check" || cmd == "ratelimit" => CliCommand::RateLimitCheck,
+        [cmd] if cmd == "nat-detection" || cmd == "nat" => CliCommand::NatDetection,
+        [cmd] if cmd == "exit-node-status" || cmd == "exit-status" => CliCommand::ExitNodeStatus,
+        [cmd] if cmd == "ipv6-support" || cmd == "ipv6" => CliCommand::Ipv6Support,
+        [cmd] if cmd == "packet-loss" || cmd == "packet-loss-check" => CliCommand::PacketLoss,
+        [cmd] if cmd == "system-clock" || cmd == "clock-check" => CliCommand::SystemClock,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3731,6 +3741,11 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::PerformanceTest => execute_performance_test(),
         CliCommand::TlsCheck => execute_tls_check(),
         CliCommand::RateLimitCheck => execute_rate_limit_check(),
+        CliCommand::NatDetection => execute_nat_detection(),
+        CliCommand::ExitNodeStatus => execute_exit_node_status(),
+        CliCommand::Ipv6Support => execute_ipv6_support(),
+        CliCommand::PacketLoss => execute_packet_loss(),
+        CliCommand::SystemClock => execute_system_clock(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12191,6 +12206,11 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::PerformanceTest
         | CliCommand::TlsCheck
         | CliCommand::RateLimitCheck
+        | CliCommand::NatDetection
+        | CliCommand::ExitNodeStatus
+        | CliCommand::Ipv6Support
+        | CliCommand::PacketLoss
+        | CliCommand::SystemClock
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -13466,6 +13486,113 @@ fn execute_rate_limit_check() -> Result<String, String> {
         "  request rate: {:.1}/{:.1} req/sec",
         limits.request_rate_per_sec, limits.rate_limit_per_sec
     ));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_nat_detection() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let nat = rustynet_sysinfo::nat_detection();
+    let mut output = vec!["NAT detection:".to_string()];
+    output.push(format!(
+        "  behind NAT: {}",
+        if nat.behind_nat { "yes" } else { "no" }
+    ));
+    output.push(format!("  local IP: {}", nat.local_ip));
+    if let Some(ip) = nat.public_ip {
+        output.push(format!("  public IP: {}", ip));
+    }
+    output.push(format!("  method: {}", nat.detection_method));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_exit_node_status() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let status = rustynet_sysinfo::exit_node_status();
+    let mut output = vec!["exit node:".to_string()];
+    output.push(format!(
+        "  reachable: {}",
+        if status.reachable { "yes" } else { "no" }
+    ));
+    if let Some(latency) = status.latency_ms {
+        output.push(format!("  latency: {:.1} ms", latency));
+    }
+    if let Some(ip) = status.exit_ip {
+        output.push(format!("  IP: {}", ip));
+    }
+    output.push(format!("  status: {}", status.status));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_ipv6_support() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let ipv6 = rustynet_sysinfo::ipv6_support();
+    let mut output = vec!["IPv6:".to_string()];
+    output.push(format!(
+        "  available: {}",
+        if ipv6.ipv6_available { "yes" } else { "no" }
+    ));
+    if !ipv6.ipv6_addresses.is_empty() {
+        output.push("  addresses:".to_string());
+        for addr in ipv6.ipv6_addresses {
+            output.push(format!("    {}", addr));
+        }
+    }
+    output.push(format!(
+        "  DNS capable: {}",
+        if ipv6.dns_ipv6_capable { "yes" } else { "no" }
+    ));
+    output.push(format!("  status: {}", ipv6.status));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_packet_loss() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let loss = rustynet_sysinfo::packet_loss_check();
+    let mut output = vec!["packet loss:".to_string()];
+    output.push(format!("  loss: {:.1}%", loss.loss_percent));
+    output.push(format!("  sent: {}", loss.packets_sent));
+    output.push(format!("  received: {}", loss.packets_received));
+    if let Some(min) = loss.min_latency_ms {
+        output.push(format!("  min latency: {:.1} ms", min));
+    }
+    if let Some(avg) = loss.avg_latency_ms {
+        output.push(format!("  avg latency: {:.1} ms", avg));
+    }
+    if let Some(max) = loss.max_latency_ms {
+        output.push(format!("  max latency: {:.1} ms", max));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_system_clock() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let clock = rustynet_sysinfo::system_clock_check();
+    let mut output = vec!["system clock:".to_string()];
+    output.push(format!(
+        "  synced: {}",
+        if clock.synced { "yes" } else { "no" }
+    ));
+    output.push(format!(
+        "  NTP active: {}",
+        if clock.ntp_active { "yes" } else { "no" }
+    ));
+    if let Some(offset) = clock.time_offset_ms {
+        output.push(format!("  offset: {} ms", offset));
+    }
+    if let Some(last_sync) = clock.last_sync_seconds_ago {
+        output.push(format!("  last sync: {} seconds ago", last_sync));
+    }
+    output.push(format!("  status: {}", clock.status));
 
     Ok(output.join("\n"))
 }
