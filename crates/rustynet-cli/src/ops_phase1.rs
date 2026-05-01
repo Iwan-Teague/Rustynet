@@ -1230,6 +1230,44 @@ fn collect_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// Crates whose `unsafe` blocks the no-unsafe scanner is permitted to
+/// see. Rustynet's general policy is `#![forbid(unsafe_code)]` across
+/// every workspace crate, but a small set of crates wrap unavoidable
+/// platform FFI (Windows-sys, DPAPI, named-pipe SDDL inspection,
+/// WinVerifyTrust, etc.) where every Win32 call is itself an `unsafe`
+/// extern "system" function. Routing those through a single audited
+/// FFI crate keeps the rest of the workspace genuinely unsafe-free
+/// while still letting the daemon talk to the OS.
+///
+/// To extend this list:
+/// 1. The crate's whole purpose must be platform FFI / `unsafe`-bearing
+///    syscalls, with the unsafe code reviewable in isolation.
+/// 2. The crate must keep `#![deny(unsafe_op_in_unsafe_fn)]` or stronger
+///    locally so each unsafe block has its own explicit safety
+///    justification.
+/// 3. Document the rationale in the same commit that adds it here.
+///
+/// Each entry matches the leading segments of the path **as the
+/// scanner emits it** — i.e. relative to `--root`. The orchestrator
+/// invokes the gate with `--root crates/`, so paths arrive shaped like
+/// `<crate-name>/src/...`. Including `crates/` in the prefix would
+/// mismatch.
+const UNSAFE_SCAN_ALLOWED_CRATE_PREFIXES: &[&str] = &[
+    // Win32 FFI bindings: WinVerifyTrust, DPAPI, named-pipe SDDL
+    // inspection, and similar platform calls land here. Adding
+    // `#![forbid(unsafe_code)]` to this crate is impossible — every
+    // windows-sys call is unsafe by Rust's FFI rules — so the gate
+    // accepts unsafe in this crate by name and relies on per-crate
+    // review for safety.
+    "rustynet-windows-native/",
+];
+
+fn unsafe_scan_path_is_allowlisted(repo_relative: &str) -> bool {
+    UNSAFE_SCAN_ALLOWED_CRATE_PREFIXES
+        .iter()
+        .any(|prefix| repo_relative.starts_with(prefix))
+}
+
 pub fn execute_ops_check_no_unsafe_rust_sources(
     config: CheckNoUnsafeRustSourcesConfig,
 ) -> Result<String, String> {
@@ -1240,6 +1278,13 @@ pub fn execute_ops_check_no_unsafe_rust_sources(
     let mut findings = Vec::new();
 
     for source_path in rust_sources {
+        let repo_relative = source_path
+            .strip_prefix(root.as_path())
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| source_path.to_string_lossy().to_string());
+        if unsafe_scan_path_is_allowlisted(repo_relative.as_str()) {
+            continue;
+        }
         let source = fs::read_to_string(&source_path)
             .map_err(|err| format!("read Rust source failed ({}): {err}", source_path.display()))?;
         for (line, column) in scan_rust_source_text_for_unsafe(source.as_str()) {
