@@ -3,6 +3,16 @@
 
 use std::fs;
 use std::path::PathBuf;
+// `Path` and `PermissionsExt` are both consumed only by Linux-only
+// diagnostic functions (`#[cfg(target_os = "linux")]`). Gating the
+// imports to the same cfg keeps non-Linux builds free of unused-import
+// warnings, and on Linux exposes both `Path::new` and
+// `Permissions::mode()` (the latter is a `PermissionsExt` trait method
+// that's only in scope when the trait is imported).
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 /// System information queries without external tool dependencies.
 ///
@@ -3736,32 +3746,33 @@ fn tcp_connections_internal() -> Vec<TcpConnection> {
             if fields.len() < 4 {
                 continue;
             }
-            if let Some(local_parts) = fields[1].split(':').collect::<Vec<_>>().split_last() {
-                if let (Some(&local_hex), Some(&local_port_hex)) =
-                    (local_parts[0].get(0..8), local_parts[0].get(8..))
-                {
-                    let local_addr = hex_to_ip(local_hex);
-                    if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
-                        let local = format!("{}:{}", local_addr, port);
+            // /proc/net/tcp encodes each address as `<addr_hex>:<port_hex>`
+            // (8 hex chars + ':' + 4 hex chars for IPv4). split_once is the
+            // direct decoder. The earlier code split into a Vec, then called
+            // split_last (which returns a tuple of `(&last, rest)`), then
+            // tried to index `local_parts[0]` to access the original full
+            // string — that's a tuple-indexing type error
+            //   error[E0608]: cannot index into a value of type
+            //   `(&&str, &[&str])`
+            // and would have been semantically wrong even without the type
+            // error, since `local_parts.0` is the port, not the address+port
+            // string the slicing presumed.
+            if let Some((local_hex, local_port_hex)) = fields[1].split_once(':') {
+                let local_addr = hex_to_ip(local_hex);
+                if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
+                    let local = format!("{}:{}", local_addr, port);
 
-                        if let Some(remote_parts) =
-                            fields[2].split(':').collect::<Vec<_>>().split_last()
-                        {
-                            if let (Some(&remote_hex), Some(&remote_port_hex)) =
-                                (remote_parts[0].get(0..8), remote_parts[0].get(8..))
-                            {
-                                let remote_addr = hex_to_ip(remote_hex);
-                                if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
-                                    let remote = format!("{}:{}", remote_addr, port);
-                                    let state = fields[3].to_string();
-                                    connections.push(TcpConnection {
-                                        local_addr: local,
-                                        remote_addr: remote,
-                                        state,
-                                        pid: None,
-                                    });
-                                }
-                            }
+                    if let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') {
+                        let remote_addr = hex_to_ip(remote_hex);
+                        if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
+                            let remote = format!("{}:{}", remote_addr, port);
+                            let state = fields[3].to_string();
+                            connections.push(TcpConnection {
+                                local_addr: local,
+                                remote_addr: remote,
+                                state,
+                                pid: None,
+                            });
                         }
                     }
                 }
