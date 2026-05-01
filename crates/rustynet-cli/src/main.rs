@@ -166,6 +166,14 @@ enum CliCommand {
     SocketStats,
     EnvValidate,
     ProcessList,
+    IfaceList,
+    DnsCheck,
+    KernelInfo,
+    ServiceCheck,
+    PermissionCheck,
+    PerformanceTest,
+    TlsCheck,
+    RateLimitCheck,
     Help,
 }
 
@@ -881,6 +889,14 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "socket-stats" || cmd == "sockets" => CliCommand::SocketStats,
         [cmd] if cmd == "env-validate" || cmd == "env" => CliCommand::EnvValidate,
         [cmd] if cmd == "process-list" || cmd == "processes" => CliCommand::ProcessList,
+        [cmd] if cmd == "iface-list" || cmd == "interfaces" => CliCommand::IfaceList,
+        [cmd] if cmd == "dns-check" || cmd == "dns" => CliCommand::DnsCheck,
+        [cmd] if cmd == "kernel-info" || cmd == "kernel" => CliCommand::KernelInfo,
+        [cmd] if cmd == "service-check" || cmd == "service" => CliCommand::ServiceCheck,
+        [cmd] if cmd == "permission-check" || cmd == "perms" => CliCommand::PermissionCheck,
+        [cmd] if cmd == "performance-test" || cmd == "perf" => CliCommand::PerformanceTest,
+        [cmd] if cmd == "tls-check" || cmd == "tls" => CliCommand::TlsCheck,
+        [cmd] if cmd == "rate-limit-check" || cmd == "ratelimit" => CliCommand::RateLimitCheck,
         [cmd, subcmd] if cmd == "config" && subcmd == "show" => CliCommand::ConfigShow,
         [cmd, rest @ ..] if cmd == "logs" => {
             let mut follow = false;
@@ -3707,6 +3723,14 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::SocketStats => execute_socket_stats(),
         CliCommand::EnvValidate => execute_env_validate(),
         CliCommand::ProcessList => execute_process_list(),
+        CliCommand::IfaceList => execute_iface_list(),
+        CliCommand::DnsCheck => execute_dns_check(),
+        CliCommand::KernelInfo => execute_kernel_info(),
+        CliCommand::ServiceCheck => execute_service_check(),
+        CliCommand::PermissionCheck => execute_permission_check(),
+        CliCommand::PerformanceTest => execute_performance_test(),
+        CliCommand::TlsCheck => execute_tls_check(),
+        CliCommand::RateLimitCheck => execute_rate_limit_check(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
@@ -12159,6 +12183,14 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::SocketStats
         | CliCommand::EnvValidate
         | CliCommand::ProcessList
+        | CliCommand::IfaceList
+        | CliCommand::DnsCheck
+        | CliCommand::KernelInfo
+        | CliCommand::ServiceCheck
+        | CliCommand::PermissionCheck
+        | CliCommand::PerformanceTest
+        | CliCommand::TlsCheck
+        | CliCommand::RateLimitCheck
         | CliCommand::OperatorMenu
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
@@ -13261,6 +13293,179 @@ fn execute_process_list() -> Result<String, String> {
             output.push(format!("    uptime: {} sec", proc.uptime_seconds));
         }
     }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_iface_list() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let ifaces = rustynet_sysinfo::iface_list();
+    let mut output = vec!["network interfaces:".to_string()];
+
+    if ifaces.is_empty() {
+        output.push("  (none)".to_string());
+    } else {
+        for iface in ifaces {
+            output.push(format!(
+                "  {}: {}",
+                iface.name,
+                if iface.up { "UP" } else { "DOWN" }
+            ));
+            if let Some(mac) = iface.mac_address {
+                output.push(format!("    MAC: {}", mac));
+            }
+            if !iface.ip_addresses.is_empty() {
+                output.push(format!("    IPs: {}", iface.ip_addresses.join(", ")));
+            }
+            output.push(format!("    MTU: {}", iface.mtu));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_dns_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let dns = rustynet_sysinfo::dns_check();
+    let mut output = vec![format!(
+        "DNS: {}",
+        if dns.working {
+            "working"
+        } else {
+            "not working"
+        }
+    )];
+
+    if !dns.resolvers.is_empty() {
+        output.push("  resolvers:".to_string());
+        for resolver in dns.resolvers {
+            output.push(format!("    {}", resolver));
+        }
+    }
+
+    if !dns.test_results.is_empty() {
+        output.push("  test results:".to_string());
+        for result in dns.test_results {
+            output.push(format!("    {}", result));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_kernel_info() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let kernel = rustynet_sysinfo::kernel_info();
+    let mut output = vec!["kernel:".to_string()];
+    output.push(format!("  OS: {}", kernel.version));
+    output.push(format!("  release: {}", kernel.release));
+    output.push(format!("  arch: {}", kernel.machine));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_service_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let svc = rustynet_sysinfo::service_check();
+    let mut output = vec!["daemon:".to_string()];
+    output.push(format!(
+        "  running: {}",
+        if svc.daemon_running { "yes" } else { "no" }
+    ));
+    output.push(format!(
+        "  enabled: {}",
+        if svc.daemon_enabled { "yes" } else { "no" }
+    ));
+    output.push(format!("  status: {}", svc.status));
+    if let Some(uptime) = svc.uptime_seconds {
+        output.push(format!("  uptime: {} sec", uptime));
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_permission_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let issues = rustynet_sysinfo::permission_check();
+    let mut output = vec!["file permissions:".to_string()];
+
+    if issues.is_empty() {
+        output.push("  all permissions OK".to_string());
+    } else {
+        for issue in issues {
+            output.push(format!("  - {}", issue));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_performance_test() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let perf = rustynet_sysinfo::performance_test();
+    let mut output = vec!["performance metrics:".to_string()];
+    output.push(format!("  CPU time: {} ms", perf.cpu_time_ms));
+    output.push(format!("  memory alloc: {} MB", perf.memory_alloc_mb));
+    output.push(format!("  disk I/O ops: {}", perf.disk_io_ops));
+
+    Ok(output.join("\n"))
+}
+
+fn execute_tls_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let tls = rustynet_sysinfo::tls_check();
+    let mut output = vec![format!(
+        "TLS: {}",
+        if tls.tls_available {
+            "available"
+        } else {
+            "unavailable"
+        }
+    )];
+
+    if let Some(version) = tls.tls_version {
+        output.push(format!("  version: {}", version));
+    }
+
+    output.push(format!(
+        "  certificate: {}",
+        if tls.certificate_valid {
+            "valid"
+        } else {
+            "invalid"
+        }
+    ));
+
+    if !tls.issues.is_empty() {
+        output.push("  issues:".to_string());
+        for issue in tls.issues {
+            output.push(format!("    - {}", issue));
+        }
+    }
+
+    Ok(output.join("\n"))
+}
+
+fn execute_rate_limit_check() -> Result<String, String> {
+    use rustynet_sysinfo;
+
+    let limits = rustynet_sysinfo::rate_limit_check();
+    let mut output = vec!["rate limits:".to_string()];
+    output.push(format!(
+        "  connections: {}/{}",
+        limits.current_connections, limits.connection_limit
+    ));
+    output.push(format!(
+        "  request rate: {:.1}/{:.1} req/sec",
+        limits.request_rate_per_sec, limits.rate_limit_per_sec
+    ));
 
     Ok(output.join("\n"))
 }
