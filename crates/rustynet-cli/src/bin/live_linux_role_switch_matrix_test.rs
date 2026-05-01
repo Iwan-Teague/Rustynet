@@ -571,7 +571,17 @@ fn switch_role(
         "/run/rustynet/rustynetd.sock",
         20,
         2,
-    )
+    )?;
+    // After enforce_host the daemon comes up cold and stays in
+    // restricted-safe mode until it ingests fresh signed trust
+    // evidence. Callers of switch_role typically follow up with a
+    // mutating IPC command (apply_role_coupling, route advertise,
+    // exit-node select) before refresh_signed_state_for_transition
+    // gets a chance to run, so refresh trust here as part of the
+    // switch contract. Mirrors the explicit pre-mutation refresh
+    // pattern from live_linux_two_hop_test (commit cca0418) and
+    // live_linux_lan_toggle_test (commit fc648df).
+    refresh_trust_evidence(identity, known_hosts, host)
 }
 
 fn ensure_client_role(context: &mut ClientRoleContext<'_>) -> Result<String, String> {

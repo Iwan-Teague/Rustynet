@@ -457,6 +457,36 @@ fn run() -> Result<(), String> {
         2,
     )?;
 
+    // After enforce_host the daemons come up cold and stay in
+    // restricted-safe mode until they ingest fresh signed trust
+    // evidence. The route advertise calls below are mutating IPC
+    // commands and would be refused while restricted-safe is set.
+    // Today this stage passes because earlier orchestrator stages
+    // (enforce_baseline_runtime, role_switch_matrix) leave trust
+    // evidence fresh enough that re-enforce here doesn't re-trip the
+    // gate before the route advertise lands. That is fragile; a slower
+    // run, a reordered stage list, or an enforce_host implementation
+    // that wipes trust state would put us back in two_hop's pre-fix
+    // failure mode. Mirror the explicit refresh from
+    // live_linux_two_hop_test (commit cca0418) so the route advertise
+    // sees fresh trust independent of the orchestrator's stage timing.
+    logger.line("[exit-handoff] refreshing signed trust evidence on all nodes")?;
+    refresh_trust_evidence(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_a_host,
+    )?;
+    refresh_trust_evidence(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.exit_b_host,
+    )?;
+    refresh_trust_evidence(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        &config.client_host,
+    )?;
+
     logger.line("[exit-handoff] advertising default route on both exits")?;
     run_root(
         &config.ssh_identity_file,
