@@ -1252,6 +1252,7 @@ dependencies = [
  "rustynet-dns-zone",
  "rustynet-local-security",
  "rustynet-policy",
+ "rustynet-sysinfo",
  "rustynetd",
  "serde",
  "serde_json",
@@ -1324,6 +1325,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "rustynet-sysinfo"
+version = "0.1.0"
 
 [[package]]
 name = "rustynet-tun"
