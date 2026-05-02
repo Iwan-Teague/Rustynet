@@ -1515,11 +1515,25 @@ function Build-RustyNet {
             return
         }
 
-        & $cargoCommand $daemonBuildArgs 1>> $buildReportLayout.stdout_path 2>> $buildReportLayout.stderr_path
-        $exitCode = [int]$LASTEXITCODE
+        $daemonBuildProcess = Start-Process -FilePath $cargoCommand `
+            -ArgumentList $daemonBuildArgs `
+            -WorkingDirectory $RustyNetRoot `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $buildReportLayout.stdout_path `
+            -RedirectStandardError $buildReportLayout.stderr_path
+        $exitCode = [int]$daemonBuildProcess.ExitCode
         if ($exitCode -eq 0) {
-            & $cargoCommand $trustCliBuildArgs 1>> $buildReportLayout.stdout_path 2>> $buildReportLayout.stderr_path
-            $exitCode = [int]$LASTEXITCODE
+            $trustCliBuildProcess = Start-Process -FilePath $cargoCommand `
+                -ArgumentList $trustCliBuildArgs `
+                -WorkingDirectory $RustyNetRoot `
+                -NoNewWindow `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $buildReportLayout.stdout_path `
+                -RedirectStandardError $buildReportLayout.stderr_path
+            $exitCode = [int]$trustCliBuildProcess.ExitCode
         }
         $stderrTail = Get-FileTailOrEmpty -Path $buildReportLayout.stderr_path
         if ($exitCode -eq 0) {
