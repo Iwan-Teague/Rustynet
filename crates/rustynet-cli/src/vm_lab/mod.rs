@@ -18711,7 +18711,11 @@ fn utm_exec_windows_raw(
     append_utmctl_windows_exec_command(
         &mut command,
         &[
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            // UTM Windows guest exec accepts absolute Windows paths when
+            // the separators are forward slashes. Backslash separators can
+            // be misparsed by the guest agent and leak literal `--cmd`
+            // tokens into PowerShell.
+            "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
@@ -21792,7 +21796,12 @@ mod tests {
         let mut command = std::process::Command::new("utmctl");
         super::append_utmctl_windows_exec_command(
             &mut command,
-            &["powershell.exe", "-NoProfile", "-EncodedCommand", "QQA="],
+            &[
+                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+                "-NoProfile",
+                "-EncodedCommand",
+                "QQA=",
+            ],
         );
         let args = command
             .get_args()
@@ -21802,7 +21811,7 @@ mod tests {
             args,
             vec![
                 "--cmd".to_string(),
-                "powershell.exe".to_string(),
+                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe".to_string(),
                 "-NoProfile".to_string(),
                 "-EncodedCommand".to_string(),
                 "QQA=".to_string()
