@@ -5885,8 +5885,9 @@ fn ipc_socket_responsiveness_internal(_timeout_ms: u64) -> IpcLatency {
     }
 }
 
-fn daemon_crash_logs_recent_internal(_lines: usize) -> Vec<CrashLog> {
-    let logs = Vec::new();
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut, unused_variables))]
+fn daemon_crash_logs_recent_internal(lines: usize) -> Vec<CrashLog> {
+    let mut logs = Vec::new();
 
     #[cfg(target_os = "linux")]
     {
@@ -5969,8 +5970,9 @@ fn daemon_open_file_handles_internal() -> Vec<OpenHandle> {
     handles
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 fn systemd_unit_dependency_graph_internal() -> DependencyGraph {
-    let units = Vec::new();
+    let mut units = Vec::new();
 
     #[cfg(target_os = "linux")]
     {
@@ -6048,12 +6050,13 @@ fn process_cpu_time_distribution_internal() -> ProcessCpuTime {
 // STORAGE FUNCTIONS (5) - STUB IMPLEMENTATIONS FOR COMPLETENESS
 // ============================================================================
 
-fn disk_io_latency_histogram_internal(device: &str, _duration_secs: u64) -> IoLatencyHistogram {
-    let p50_ms = 0.0;
-    let p95_ms = 0.0;
-    let p99_ms = 0.0;
-    let p999_ms = 0.0;
-    let max_ms = 0.0;
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut, unused_variables))]
+fn disk_io_latency_histogram_internal(device: &str, duration_secs: u64) -> IoLatencyHistogram {
+    let mut p50_ms = 0.0;
+    let mut p95_ms = 0.0;
+    let mut p99_ms = 0.0;
+    let mut p999_ms = 0.0;
+    let mut max_ms = 0.0;
 
     #[cfg(target_os = "linux")]
     {
@@ -6092,10 +6095,11 @@ fn disk_io_latency_histogram_internal(device: &str, _duration_secs: u64) -> IoLa
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 fn filesystem_journal_status_internal() -> JournalStatus {
-    let journal_size_mb = 0u64;
-    let recovery_needed = false;
-    let orphaned_inodes = 0usize;
+    let mut journal_size_mb = 0u64;
+    let mut recovery_needed = false;
+    let mut orphaned_inodes = 0usize;
 
     #[cfg(target_os = "linux")]
     {
@@ -6143,8 +6147,9 @@ fn filesystem_journal_status_internal() -> JournalStatus {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 fn block_device_error_counters_internal() -> Vec<DeviceErrors> {
-    let errors = Vec::new();
+    let mut errors = Vec::new();
 
     #[cfg(target_os = "linux")]
     {
@@ -6280,10 +6285,11 @@ fn directory_size_snapshot_internal(paths: &[&str]) -> Vec<DirSize> {
     results
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 fn filesystem_cache_efficiency_internal() -> CacheEfficiency {
-    let cache_hit_rate_percent = 0.0;
-    let dirty_pages_mb = 0u64;
-    let writeback_queue_depth = 0usize;
+    let mut cache_hit_rate_percent = 0.0;
+    let mut dirty_pages_mb = 0u64;
+    let mut writeback_queue_depth = 0usize;
 
     #[cfg(target_os = "linux")]
     {
@@ -6312,7 +6318,7 @@ fn filesystem_cache_efficiency_internal() -> CacheEfficiency {
                 }
                 if line.starts_with("Writeback:") {
                     if let Some(val) = line.split_whitespace().nth(1) {
-                        writeback_queue_depth = (val.parse::<u32>().unwrap_or(0) / 4096).max(1);
+                        writeback_queue_depth = (val.parse::<usize>().unwrap_or(0) / 4096).max(1);
                     }
                 }
             }
@@ -6354,11 +6360,12 @@ fn file_integrity_check_internal(paths: &[&str]) -> Vec<IntegrityResult> {
     results
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 fn syslog_configuration_audit_internal() -> SyslogAudit {
-    let forwarding_enabled = false;
-    let destinations = Vec::new();
-    let log_retention_days = 30u32;
-    let permissions_ok = false;
+    let mut forwarding_enabled = false;
+    let mut destinations = Vec::new();
+    let mut log_retention_days = 30u32;
+    let mut permissions_ok = false;
 
     #[cfg(target_os = "linux")]
     {
@@ -6453,11 +6460,12 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
     results
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
 fn boot_integrity_check_internal() -> BootIntegrity {
-    let secure_boot_enabled = false;
-    let tpm_present = false;
-    let measurements_ok = false;
-    let pcrs = Vec::new();
+    let mut secure_boot_enabled = false;
+    let mut tpm_present = false;
+    let mut measurements_ok = false;
+    let mut pcrs = Vec::new();
 
     #[cfg(target_os = "linux")]
     {
