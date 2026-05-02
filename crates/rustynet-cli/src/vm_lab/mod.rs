@@ -42,6 +42,7 @@ const DEFAULT_PREFLIGHT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_COLLECT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
+const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 60;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
 const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
 const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
@@ -12591,20 +12592,25 @@ fn pull_windows_local_utm_guest_file_with_retry(
     timeout: Duration,
     label: &str,
 ) -> Result<(), String> {
-    let max_attempts = timeout.as_secs().max(10);
+    let retry_budget = windows_local_utm_result_pull_retry_budget(timeout);
+    let started_at = Instant::now();
     let pull_timeout = timeout.min(Duration::from_secs(20));
     let mut last_error = None::<String>;
-    for attempt in 1..=max_attempts {
+    loop {
+        let remaining = retry_budget
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = pull_timeout.min(remaining);
         let _ = fs::remove_file(local_path);
-        match utm_pull_raw(utm_name, remote_path, local_path, pull_timeout) {
+        match utm_pull_raw(utm_name, remote_path, local_path, attempt_timeout) {
             Ok(status) if status.success() => return Ok(()),
-            Ok(status) => {
+            Ok(_) => {
                 last_error = Some(format!(
                     "{label} file pull exited unsuccessfully for {utm_name}:{remote_path}"
                 ));
-                if !status.success() && attempt == max_attempts {
-                    break;
-                }
             }
             Err(err) => {
                 last_error = Some(format!(
@@ -12612,12 +12618,27 @@ fn pull_windows_local_utm_guest_file_with_retry(
                 ));
             }
         }
-        if attempt < max_attempts {
-            thread::sleep(Duration::from_secs(1));
+        let remaining = retry_budget
+            .checked_sub(started_at.elapsed())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
         }
+        thread::sleep(Duration::from_secs(1).min(remaining));
     }
     Err(last_error
         .unwrap_or_else(|| format!("{label} file pull failed for {utm_name}:{remote_path}")))
+}
+
+fn windows_local_utm_result_pull_retry_budget(timeout: Duration) -> Duration {
+    let capped = timeout.min(Duration::from_secs(
+        WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS,
+    ));
+    if capped.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        capped
+    }
 }
 
 fn read_windows_local_utm_utf8_file(path: &Path, label: &str) -> Result<String, String> {
@@ -22087,6 +22108,22 @@ mod tests {
         assert!(rendered.contains("transport failed"));
         assert!(rendered.contains("timed out after 30 seconds"));
         assert!(rendered.contains("result file pull failed"));
+    }
+
+    #[test]
+    fn windows_local_utm_result_pull_retry_budget_is_capped() {
+        assert_eq!(
+            super::windows_local_utm_result_pull_retry_budget(Duration::from_secs(360)),
+            Duration::from_secs(super::WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS)
+        );
+        assert_eq!(
+            super::windows_local_utm_result_pull_retry_budget(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            super::windows_local_utm_result_pull_retry_budget(Duration::ZERO),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
