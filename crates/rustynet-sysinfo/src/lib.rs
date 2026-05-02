@@ -5650,10 +5650,10 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
 
                     inodes.push(InodeUsage {
                         filesystem: format!("{}:\\", parts[0].trim_matches('"')),
-                        total_inodes: total as usize,
-                        used_inodes: used as usize,
-                        available: available as usize,
-                        percent_used: percent_used as u32,
+                        total_inodes: total,
+                        used_inodes: used,
+                        available,
+                        percent_used,
                     });
                 }
             }
@@ -5847,6 +5847,7 @@ fn rustynetd_goroutine_count_internal() -> GoroutineCount {
     }
 }
 
+#[cfg(target_family = "unix")]
 fn ipc_socket_responsiveness_internal(_timeout_ms: u64) -> IpcLatency {
     let socket_path = "/run/rustynet.sock";
     let mut min_ms = f64::INFINITY;
@@ -5882,6 +5883,17 @@ fn ipc_socket_responsiveness_internal(_timeout_ms: u64) -> IpcLatency {
         avg_ms,
         failed_attempts,
         responsive,
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn ipc_socket_responsiveness_internal(_timeout_ms: u64) -> IpcLatency {
+    IpcLatency {
+        min_ms: f64::INFINITY,
+        max_ms: 0.0,
+        avg_ms: 0.0,
+        failed_attempts: 3,
+        responsive: false,
     }
 }
 
