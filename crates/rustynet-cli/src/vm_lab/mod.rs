@@ -18686,37 +18686,21 @@ fn utm_exec_windows_raw(
     let utmctl_path = utmctl_binary_path()?;
     let mut command = Command::new(utmctl_path);
     command.arg("exec").arg(utm_name);
-    // utmctl exec's `--cmd <cmd> ...` takes a repeated option: each
-    // `--cmd <value>` builds up the argv. Earlier code passed a single
-    // `--cmd powershell.exe` followed by bare positional args (-NoLogo
-    // -NoProfile -EncodedCommand <base64>) and relied on the swift-
-    // argument-parser version under utmctl to interpret them as
-    // additional --cmd values. That's intermittent: under certain
-    // conditions utmctl serializes the bare positionals as a single
-    // argv element, so PowerShell starts and reads
-    // `--cmd -NoProfile --cmd -Command --cmd New-Item ...` as its
-    // STDIN/-Command body, then chokes with
-    //   At line:1 char:3
-    //   + --cmd -NoProfile --cmd -Command --cmd New-Item ...
-    //   Missing expression after unary operator '--'
-    // (observed in livelab4 / livelab5 bootstrap_windows_host
-    // failures). Prefix every arg with its own `--cmd` so utmctl
-    // always sees a clean repeated-option list and PowerShell receives
-    // each switch as a separate argv element.
-    for arg in [
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-OutputFormat",
-        "Text",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-        encoded.as_str(),
-    ] {
-        command.arg("--cmd").arg(arg);
-    }
+    append_utmctl_windows_exec_command(
+        &mut command,
+        &[
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-OutputFormat",
+            "Text",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            encoded.as_str(),
+        ],
+    );
     let output = run_output_with_timeout(&mut command, timeout)?;
     let stderr_raw = String::from_utf8_lossy(&output.stderr);
     // Strip CLIXML envelopes from the stderr stream defensively even
@@ -18735,6 +18719,19 @@ fn utm_exec_windows_raw(
         ));
     }
     Ok(output.status)
+}
+
+fn append_utmctl_windows_exec_command(command: &mut Command, args: &[&str]) {
+    // `utmctl exec <vm> --cmd <cmd> ...` accepts one variadic `--cmd`
+    // option. On the Windows guest-agent path used by the live lab,
+    // repeating `--cmd` for every argv element can return host success
+    // while the guest command never runs, leaving no result file for the
+    // orchestrator to pull. Keep the boundary argv-only by passing every
+    // element as a separate `Command` arg after a single `--cmd`.
+    command.arg("--cmd");
+    for arg in args {
+        command.arg(arg);
+    }
 }
 
 /// Remove PowerShell CLIXML serialization payloads from a stderr buffer.
@@ -21766,6 +21763,30 @@ mod tests {
         let plain = "Error from event: OSStatus error -2700.\nfailed to open file";
         let filtered = super::strip_powershell_clixml_noise(plain);
         assert_eq!(filtered, plain);
+    }
+
+    #[test]
+    fn windows_utm_exec_uses_single_variadic_cmd_option() {
+        let mut command = std::process::Command::new("utmctl");
+        super::append_utmctl_windows_exec_command(
+            &mut command,
+            &["powershell.exe", "-NoProfile", "-EncodedCommand", "QQA="],
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--cmd".to_string(),
+                "powershell.exe".to_string(),
+                "-NoProfile".to_string(),
+                "-EncodedCommand".to_string(),
+                "QQA=".to_string()
+            ]
+        );
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cmd").count(), 1);
     }
 
     #[test]
