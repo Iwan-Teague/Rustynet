@@ -476,6 +476,72 @@ function Write-ReviewedEnvFile {
     ) | Out-File -Encoding ascii $Path
 }
 
+function Set-RustyNetDnsFailClosedPosture {
+    $changes = New-Object System.Collections.Generic.List[string]
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    $dnsRows = @(Get-DnsClientServerAddress -ErrorAction Stop)
+    $seen = @{}
+    foreach ($row in $dnsRows) {
+        $key = ('{0}:{1}' -f [int]$row.InterfaceIndex, [string]$row.AddressFamily)
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+        $seen[$key] = $true
+        $family = [string]$row.AddressFamily
+        $server = if ($family -eq '2' -or $family -eq 'IPv4') { '127.0.0.1' } else { '::1' }
+        try {
+            Set-DnsClientServerAddress `
+                -InterfaceIndex ([int]$row.InterfaceIndex) `
+                -AddressFamily $row.AddressFamily `
+                -ServerAddresses $server `
+                -ErrorAction Stop
+            $changes.Add(('interface={0} family={1} server={2}' -f [string]$row.InterfaceAlias, $family, $server))
+        }
+        catch {
+            $errors.Add(('failed to set DNS interface={0} family={1}: {2}' -f [string]$row.InterfaceAlias, $family, $_.Exception.Message))
+        }
+    }
+
+    $removedRootRules = 0
+    $existingRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue)
+    foreach ($rule in $existingRules) {
+        $namespaces = @($rule.Namespace)
+        if ($namespaces -contains '.') {
+            try {
+                Remove-DnsClientNrptRule -Name $rule.Name -Force -ErrorAction Stop
+                $removedRootRules += 1
+            }
+            catch {
+                $errors.Add(('failed to remove stale root NRPT rule {0}: {1}' -f [string]$rule.Name, $_.Exception.Message))
+            }
+        }
+    }
+
+    try {
+        Add-DnsClientNrptRule `
+            -Namespace '.' `
+            -NameServers '127.0.0.1' `
+            -Comment 'RustyNet fail-closed root DNS' `
+            -ErrorAction Stop | Out-Null
+        $changes.Add('nrpt_root=127.0.0.1')
+    }
+    catch {
+        $errors.Add(('failed to add root NRPT loopback rule: {0}' -f $_.Exception.Message))
+    }
+
+    if ($errors.Count -gt 0) {
+        throw ('Windows DNS fail-closed posture configuration failed: {0}' -f ($errors -join '; '))
+    }
+
+    return [ordered]@{
+        status = 'pass'
+        interface_updates = $changes.ToArray()
+        removed_root_nrpt_rules = $removedRootRules
+        root_nrpt_name_server = '127.0.0.1'
+    }
+}
+
 $wireGuardProbe = [ordered]@{ present = $false; path = ''; detection = 'not-checked' }
 
 $script:InstallFailureStep = 'ensure-runtime-layout'
@@ -790,6 +856,10 @@ Write-Host ("[install-helper] selected backend label: {0} (wireguard.present={1}
     $backendLabel, [bool]$wireGuardProbe.present, [bool]$ForceUnsupportedBackend)
 Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel
 
+$script:InstallFailureStep = 'configure-dns-failclosed'
+$dnsFailClosedPosture = Set-RustyNetDnsFailClosedPosture
+Write-Host "[install-helper] DNS fail-closed posture configured (interface DNS + NRPT root loopback)"
+
 $script:InstallFailureStep = 'probe-runtime-support'
 $runtimeSignals = Test-RustyNetWindowsRuntimeSupport -DaemonPath $daemonDest
 $script:InstallRuntimeSignals = $runtimeSignals
@@ -1007,6 +1077,7 @@ $report = [ordered]@{
     runtime_flags_present = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
     wireguard_driver_present = $wireGuardProbe.present
     wireguard_driver_probe = $wireGuardProbe
+    dns_failclosed_posture = $dnsFailClosedPosture
     failure_step = $script:InstallFailureStep
     runtime_signals = $runtimeSignals
     notes = $notes
