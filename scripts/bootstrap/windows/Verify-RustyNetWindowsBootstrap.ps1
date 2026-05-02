@@ -361,7 +361,8 @@ $releaseRoot = Join-Path $RustyNetRoot 'target\release'
 $daemonBuildPath = Join-Path $releaseRoot 'rustynetd.exe'
 $cliBuildPath = Get-FirstExistingPath -Candidates @(
     (Join-Path $releaseRoot 'rustynet.exe'),
-    (Join-Path $releaseRoot 'rustynet-cli.exe')
+    (Join-Path $releaseRoot 'rustynet-cli.exe'),
+    (Join-Path $releaseRoot 'rustynet-windows-trust-cli.exe')
 )
 $daemonInstallPath = Join-Path $InstallRoot 'rustynetd.exe'
 $cliInstallPath = Get-FirstExistingPath -Candidates @(

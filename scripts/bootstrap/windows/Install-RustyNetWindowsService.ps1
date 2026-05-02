@@ -490,7 +490,8 @@ $daemonCandidates = @(
 )
 $cliCandidates = @(
     (Join-Path $RustyNetRoot 'target\release\rustynet.exe'),
-    (Join-Path $RustyNetRoot 'target\release\rustynet-cli.exe')
+    (Join-Path $RustyNetRoot 'target\release\rustynet-cli.exe'),
+    (Join-Path $RustyNetRoot 'target\release\rustynet-windows-trust-cli.exe')
 )
 
 $daemonSource = $daemonCandidates[0]
@@ -517,8 +518,8 @@ foreach ($candidate in $cliCandidates) {
 if (-not $cliSource) {
     throw ("rustynet CLI binary not found under release output. Looked at: " +
         ($cliCandidates -join ', ') +
-        ". Bootstrap-RustyNetWindows.ps1's build-release must invoke cargo with both " +
-        "'-p rustynetd' and '-p rustynet-cli'.")
+        ". Bootstrap-RustyNetWindows.ps1's build-release must build rustynetd and " +
+        "rustynet-windows-trust-cli.")
 }
 
 $daemonDest = Join-Path $InstallRoot 'rustynetd.exe'
