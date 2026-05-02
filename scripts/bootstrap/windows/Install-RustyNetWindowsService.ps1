@@ -483,23 +483,21 @@ function Set-RustyNetDnsFailClosedPosture {
     $dnsRows = @(Get-DnsClientServerAddress -ErrorAction Stop)
     $seen = @{}
     foreach ($row in $dnsRows) {
-        $key = ('{0}:{1}' -f [int]$row.InterfaceIndex, [string]$row.AddressFamily)
+        $key = ('{0}' -f [int]$row.InterfaceIndex)
         if ($seen.ContainsKey($key)) {
             continue
         }
         $seen[$key] = $true
-        $family = [string]$row.AddressFamily
-        $server = if ($family -eq '2' -or $family -eq 'IPv4') { '127.0.0.1' } else { '::1' }
+        $servers = @('127.0.0.1', '::1')
         try {
             Set-DnsClientServerAddress `
                 -InterfaceIndex ([int]$row.InterfaceIndex) `
-                -AddressFamily $row.AddressFamily `
-                -ServerAddresses $server `
+                -ServerAddresses $servers `
                 -ErrorAction Stop
-            $changes.Add(('interface={0} family={1} server={2}' -f [string]$row.InterfaceAlias, $family, $server))
+            $changes.Add(('interface={0} servers={1}' -f [string]$row.InterfaceAlias, ($servers -join ',')))
         }
         catch {
-            $errors.Add(('failed to set DNS interface={0} family={1}: {2}' -f [string]$row.InterfaceAlias, $family, $_.Exception.Message))
+            $errors.Add(('failed to set DNS interface={0}: {1}' -f [string]$row.InterfaceAlias, $_.Exception.Message))
         }
     }
 
