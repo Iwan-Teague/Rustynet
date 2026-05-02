@@ -17890,16 +17890,19 @@ fn scp_to_remote_for_target_with_phase(
                 //   `utm_staging_dir` (typically
                 //   C:\Users\<windows>\rustynet-utm-stage), which both the
                 //   SSH user and the SYSTEM-level guest agent can read+write.
-                // - SCP from the host runs as the SSH user `windows`, which
-                //   has full access via user-profile inheritance.
-                // - utmctl push as a transport never targets the hardened
-                //   state tree because helper paths now live under staging.
+                // - During access establishment, SSH may be down by
+                //   definition, so use utmctl push for helper/support files
+                //   under staging and fall back to SCP only if the guest
+                //   agent path fails.
+                // - Post-bootstrap paths keep using SCP so ordinary Windows
+                //   targets and SSH-only lab paths exercise the same operator
+                //   transport after access has been proven.
                 //
                 // SCP needs the staging directory to exist (it does not
-                // create intermediate directories). Use `utmctl exec` to
-                // mkdir it — that's network-independent and idempotent —
-                // before the SCP runs.
-                let _ = phase;
+                // create intermediate directories). utmctl push also needs
+                // it. Use `utmctl exec` to mkdir it — that's
+                // network-independent and idempotent — before either copy
+                // path runs.
                 if let Some(staging_dir) = context.target.utm_staging_dir.as_deref() {
                     let parent = windows_guest_parent_dir(dst.as_str()).unwrap_or_default();
                     let needs_mkdir =
@@ -17919,6 +17922,28 @@ fn scp_to_remote_for_target_with_phase(
                                 "UTM Windows staging mkdir failed for {} ({}): {err}",
                                 context.target.label, mkdir_target
                             ));
+                        }
+                    }
+                }
+                if phase == RemoteTransportPhase::AccessEstablishment {
+                    match utm_push_raw(utm_name, src, dst.as_str(), context.timeout) {
+                        Ok(status) if status.success() => return Ok(status),
+                        Ok(status) => {
+                            return fallback_scp_to_remote(
+                                context,
+                                src,
+                                dst.as_str(),
+                                format!("UTM push failed with status {}", status_code(status))
+                                    .as_str(),
+                            );
+                        }
+                        Err(err) => {
+                            return fallback_scp_to_remote(
+                                context,
+                                src,
+                                dst.as_str(),
+                                err.as_str(),
+                            );
                         }
                     }
                 }
