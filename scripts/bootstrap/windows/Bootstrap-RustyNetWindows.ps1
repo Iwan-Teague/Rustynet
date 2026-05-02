@@ -287,6 +287,24 @@ function Write-BuildReleaseToolchainReport {
     Write-TextFileAtomically -Path $Layout.toolchain_path -Content $content
 }
 
+function Invoke-CargoBuildForReport {
+    param(
+        [Parameter(Mandatory = $true)][string]$CargoCommand,
+        [Parameter(Mandatory = $true)][string[]]$CargoArgs,
+        [Parameter(Mandatory = $true)]$Layout,
+        [switch]$Append
+    )
+
+    Ensure-Directory -Path $Layout.report_root
+    if ($Append) {
+        & $CargoCommand @CargoArgs 1>> $Layout.stdout_path 2>> $Layout.stderr_path
+    }
+    else {
+        & $CargoCommand @CargoArgs 1> $Layout.stdout_path 2> $Layout.stderr_path
+    }
+    return [int]$LASTEXITCODE
+}
+
 function Write-FailClosedBuildReleaseReportIfRequested {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
 
@@ -1515,25 +1533,16 @@ function Build-RustyNet {
             return
         }
 
-        $daemonBuildProcess = Start-Process -FilePath $cargoCommand `
-            -ArgumentList $daemonBuildArgs `
-            -WorkingDirectory $RustyNetRoot `
-            -NoNewWindow `
-            -Wait `
-            -PassThru `
-            -RedirectStandardOutput $buildReportLayout.stdout_path `
-            -RedirectStandardError $buildReportLayout.stderr_path
-        $exitCode = [int]$daemonBuildProcess.ExitCode
+        $exitCode = Invoke-CargoBuildForReport `
+            -CargoCommand $cargoCommand `
+            -CargoArgs $daemonBuildArgs `
+            -Layout $buildReportLayout
         if ($exitCode -eq 0) {
-            $trustCliBuildProcess = Start-Process -FilePath $cargoCommand `
-                -ArgumentList $trustCliBuildArgs `
-                -WorkingDirectory $RustyNetRoot `
-                -NoNewWindow `
-                -Wait `
-                -PassThru `
-                -RedirectStandardOutput $buildReportLayout.stdout_path `
-                -RedirectStandardError $buildReportLayout.stderr_path
-            $exitCode = [int]$trustCliBuildProcess.ExitCode
+            $exitCode = Invoke-CargoBuildForReport `
+                -CargoCommand $cargoCommand `
+                -CargoArgs $trustCliBuildArgs `
+                -Layout $buildReportLayout `
+                -Append
         }
         $stderrTail = Get-FileTailOrEmpty -Path $buildReportLayout.stderr_path
         if ($exitCode -eq 0) {

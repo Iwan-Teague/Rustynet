@@ -12611,7 +12611,7 @@ fn pull_windows_local_utm_guest_file_with_retry(
 ) -> Result<(), String> {
     let retry_budget = windows_local_utm_result_pull_retry_budget(timeout);
     let started_at = Instant::now();
-    let pull_timeout = timeout.min(Duration::from_secs(20));
+    let pull_timeout = windows_local_utm_result_pull_attempt_timeout(timeout);
     let mut last_error = None::<String>;
     loop {
         let remaining = retry_budget
@@ -12620,7 +12620,7 @@ fn pull_windows_local_utm_guest_file_with_retry(
         if remaining.is_zero() {
             break;
         }
-        let attempt_timeout = pull_timeout.min(remaining);
+        let attempt_timeout = pull_timeout.min(remaining).max(Duration::from_secs(1));
         let _ = fs::remove_file(local_path);
         match utm_pull_raw(utm_name, remote_path, local_path, attempt_timeout) {
             Ok(status) if status.success() => return Ok(()),
@@ -12652,6 +12652,15 @@ fn windows_local_utm_result_pull_retry_budget(timeout: Duration) -> Duration {
         WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS,
     ));
     if capped.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        capped
+    }
+}
+
+fn windows_local_utm_result_pull_attempt_timeout(timeout: Duration) -> Duration {
+    let capped = timeout.min(Duration::from_secs(20));
+    if capped < Duration::from_secs(1) {
         Duration::from_secs(1)
     } else {
         capped
@@ -22140,6 +22149,22 @@ mod tests {
         assert_eq!(
             super::windows_local_utm_result_pull_retry_budget(Duration::ZERO),
             Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn windows_local_utm_result_pull_attempt_timeout_never_zero() {
+        assert_eq!(
+            super::windows_local_utm_result_pull_attempt_timeout(Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::windows_local_utm_result_pull_attempt_timeout(Duration::from_millis(100)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            super::windows_local_utm_result_pull_attempt_timeout(Duration::from_secs(360)),
+            Duration::from_secs(20)
         );
     }
 
