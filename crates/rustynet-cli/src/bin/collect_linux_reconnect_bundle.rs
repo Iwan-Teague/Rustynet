@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -1104,6 +1105,7 @@ fn repo_root() -> Result<PathBuf, String> {
         })
 }
 
+#[cfg(unix)]
 fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1121,6 +1123,14 @@ fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::rename(&temporary, path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_file(_path: &Path, _contents: &[u8]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "collect_linux_reconnect_bundle is only supported on Unix targets",
+    ))
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
