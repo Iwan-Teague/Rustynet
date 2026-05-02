@@ -1922,6 +1922,16 @@ pub fn default_utmctl_path() -> PathBuf {
     PathBuf::from(DEFAULT_UTMCTL_PATH)
 }
 
+fn windows_orchestrator_bootstrap_phases() -> &'static [bootstrap::BootstrapPhase] {
+    &[
+        bootstrap::BootstrapPhase::BuildRelease,
+        bootstrap::BootstrapPhase::SmokeServiceHost,
+        bootstrap::BootstrapPhase::InstallRelease,
+        bootstrap::BootstrapPhase::RestartRuntime,
+        bootstrap::BootstrapPhase::VerifyRuntime,
+    ]
+}
+
 fn workspace_root_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -7554,11 +7564,23 @@ fn run_windows_orchestration_stages_with_options(
                     remote: "origin",
                     timeout,
                 };
-                for phase in &[
-                    bootstrap::BootstrapPhase::InstallRelease,
-                    bootstrap::BootstrapPhase::RestartRuntime,
-                    bootstrap::BootstrapPhase::VerifyRuntime,
-                ] {
+                sync_repo_targets(
+                    std::slice::from_ref(&target),
+                    context.ssh_user,
+                    context.ssh_identity_file,
+                    context.known_hosts_path,
+                    RepoSyncSource::LocalSource {
+                        source_dir: workspace_root_path(),
+                    },
+                    context.workdir,
+                    timeout,
+                )
+                .map_err(|err| {
+                    format!(
+                        "Windows source sync before bootstrap failed for {windows_alias}: {err}"
+                    )
+                })?;
+                for phase in windows_orchestrator_bootstrap_phases() {
                     execute_bootstrap_phase_for_target(phase.as_str(), &target, &context)?;
                 }
             }
@@ -21787,6 +21809,20 @@ mod tests {
             ]
         );
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cmd").count(), 1);
+    }
+
+    #[test]
+    fn windows_orchestrator_bootstrap_phases_build_before_install() {
+        assert_eq!(
+            super::windows_orchestrator_bootstrap_phases(),
+            &[
+                super::bootstrap::BootstrapPhase::BuildRelease,
+                super::bootstrap::BootstrapPhase::SmokeServiceHost,
+                super::bootstrap::BootstrapPhase::InstallRelease,
+                super::bootstrap::BootstrapPhase::RestartRuntime,
+                super::bootstrap::BootstrapPhase::VerifyRuntime,
+            ]
+        );
     }
 
     #[test]
