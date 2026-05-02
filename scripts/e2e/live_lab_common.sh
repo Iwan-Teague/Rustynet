@@ -979,6 +979,7 @@ live_lab_ssh_via_ssh() {
     -o LogLevel=ERROR
     -o BatchMode=yes
     -o StrictHostKeyChecking=yes
+    -o UpdateHostKeys=no
     -o UserKnownHostsFile="$LIVE_LAB_KNOWN_HOSTS"
     -o ConnectTimeout=30
     -o ServerAliveInterval=60
@@ -1016,6 +1017,7 @@ live_lab_scp_to_via_ssh() {
     -o LogLevel=ERROR
     -o BatchMode=yes
     -o StrictHostKeyChecking=yes
+    -o UpdateHostKeys=no
     -o UserKnownHostsFile="$LIVE_LAB_KNOWN_HOSTS"
     -o ConnectTimeout=30
     -o ServerAliveInterval=60
@@ -1053,6 +1055,7 @@ live_lab_scp_from_via_ssh() {
     -o LogLevel=ERROR
     -o BatchMode=yes
     -o StrictHostKeyChecking=yes
+    -o UpdateHostKeys=no
     -o UserKnownHostsFile="$LIVE_LAB_KNOWN_HOSTS"
     -o ConnectTimeout=30
     -o ServerAliveInterval=60
