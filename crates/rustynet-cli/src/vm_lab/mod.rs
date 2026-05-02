@@ -6944,6 +6944,23 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                     outcomes.push(setup_outcome);
                 }
             }
+            // Run Windows orchestration even when Linux setup fails after
+            // signed bundle distribution. The Windows helper gates on the
+            // four Linux bundle-distribution outcomes and skips cleanly if
+            // setup failed too early.
+            if let Some(ref windows_alias) = config.windows_vm {
+                let windows_outcomes = run_windows_orchestration_with_pulled_bundles(
+                    &config,
+                    inventory_path.as_path(),
+                    report_dir.as_path(),
+                    windows_alias.as_str(),
+                    outcomes.as_slice(),
+                );
+                for outcome in &windows_outcomes {
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+                }
+                outcomes.extend(windows_outcomes);
+            }
             if !config.skip_diagnose_on_failure
                 && effective_profile_path.is_file()
                 && report_dir.join("state/stages.tsv").exists()
