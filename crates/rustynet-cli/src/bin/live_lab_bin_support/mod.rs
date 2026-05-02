@@ -768,6 +768,8 @@ fn ssh_base_command(identity: &Path, known_hosts: &Path, target: &str) -> Comman
         "-o",
         "StrictHostKeyChecking=yes",
         "-o",
+        "UpdateHostKeys=no",
+        "-o",
         &format!("UserKnownHostsFile={}", known_hosts.display()),
         "-o",
         "ConnectTimeout=15",
@@ -795,6 +797,8 @@ fn scp_base_command(identity: &Path, known_hosts: &Path) -> Command {
         "BatchMode=yes",
         "-o",
         "StrictHostKeyChecking=yes",
+        "-o",
+        "UpdateHostKeys=no",
         "-o",
         &format!("UserKnownHostsFile={}", known_hosts.display()),
         "-o",
@@ -1442,6 +1446,31 @@ port 22
         assert_eq!(
             resolved_target_address_from_ssh_g("debian@debian-headless-1", resolved),
             "debian-headless-1"
+        );
+    }
+
+    #[test]
+    fn ssh_and_scp_disable_known_hosts_mutation() {
+        let identity = std::path::Path::new("/tmp/id_ed25519");
+        let known_hosts = std::path::Path::new("/tmp/known_hosts");
+
+        let ssh_args: Vec<String> =
+            super::ssh_base_command(identity, known_hosts, "debian@192.168.64.4")
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+        assert!(
+            ssh_args.iter().any(|arg| arg == "UpdateHostKeys=no"),
+            "ssh must not mutate the seeded known_hosts file"
+        );
+
+        let scp_args: Vec<String> = super::scp_base_command(identity, known_hosts)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            scp_args.iter().any(|arg| arg == "UpdateHostKeys=no"),
+            "scp must not mutate the seeded known_hosts file"
         );
     }
 }
