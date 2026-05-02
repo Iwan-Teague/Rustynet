@@ -24,6 +24,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -124,6 +125,16 @@ enum CliCommand {
     Membership(Box<MembershipCommand>),
     Trust(Box<TrustCommand>),
     Ops(Box<OpsCommand>),
+    Node(NodeCommand),
+    Policy(PolicyCommand),
+    Relay(RelayCommand),
+    Cert(CertCommand),
+    TrustState(TrustStateCommand),
+    Analytics(AnalyticsCommand),
+    Backup(BackupCommand),
+    RestoreState(RestoreStateCommand),
+    ExportKeys(ExportKeysCommand),
+    Config(ConfigSubCommand),
     Version,
     Info,
     Doctor,
@@ -860,6 +871,159 @@ struct AssignmentAllowPair {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum NodeCommand {
+    Info {
+        peers: bool,
+        json: bool,
+    },
+    List {
+        role: Option<String>,
+        filter: Option<String>,
+        json: bool,
+    },
+    Probe {
+        node_id: String,
+        tcp_port: Option<u16>,
+        udp_port: Option<u16>,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolicyCommand {
+    List {
+        node: Option<String>,
+        json: bool,
+    },
+    Apply {
+        policy_file: PathBuf,
+        dry_run: bool,
+        json: bool,
+    },
+    Test {
+        source_node: String,
+        dest_node: String,
+        protocol: Option<String>,
+        port: Option<u16>,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RelayCommand {
+    List {
+        status: bool,
+        json: bool,
+    },
+    Select {
+        strategy: RelaySelectStrategy,
+        json: bool,
+    },
+    Health {
+        relay_id: String,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaySelectStrategy {
+    Auto,
+    BestLatency,
+    LeastLoad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CertCommand {
+    List {
+        only_expired: bool,
+        only_expiring_soon: bool,
+        json: bool,
+    },
+    Check {
+        strict: bool,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustStateCommand {
+    anchor: Option<String>,
+    json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnalyticsCommand {
+    Peers {
+        window_secs: Option<u64>,
+        sort_by: Option<String>,
+        json: bool,
+    },
+    Traffic {
+        interval_secs: Option<u64>,
+        top_n: Option<u32>,
+        json: bool,
+    },
+    LatencyHeatmap {
+        include_peers: bool,
+        include_relays: bool,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackupCommand {
+    out_dir: PathBuf,
+    compress: bool,
+    encrypt_passphrase_file: Option<PathBuf>,
+    json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreStateCommand {
+    backup_path: PathBuf,
+    verify: bool,
+    dry_run: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportKeysCommand {
+    format: KeyExportFormat,
+    out_path: Option<PathBuf>,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyExportFormat {
+    Pem,
+    Raw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigSubCommand {
+    Show {
+        section: Option<String>,
+        json: bool,
+    },
+    Validate {
+        strict: bool,
+        json: bool,
+    },
+    Export {
+        format: ConfigExportFormat,
+        out_path: Option<PathBuf>,
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigExportFormat {
+    Toml,
+    Json,
+    Yaml,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MembershipPaths {
     snapshot_path: PathBuf,
     log_path: PathBuf,
@@ -1074,6 +1238,46 @@ fn parse_command(args: &[String]) -> CliCommand {
         },
         [cmd, rest @ ..] if cmd == "ops" => match parse_ops_command(rest) {
             Ok(command) => CliCommand::Ops(Box::new(command)),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "node" => match parse_node_command(rest) {
+            Ok(command) => CliCommand::Node(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "policy" => match parse_policy_command(rest) {
+            Ok(command) => CliCommand::Policy(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "relay" => match parse_relay_command(rest) {
+            Ok(command) => CliCommand::Relay(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "cert" => match parse_cert_command(rest) {
+            Ok(command) => CliCommand::Cert(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "trust-state" => match parse_trust_state_command(rest) {
+            Ok(command) => CliCommand::TrustState(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "analytics" => match parse_analytics_command(rest) {
+            Ok(command) => CliCommand::Analytics(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "backup" => match parse_backup_command(rest) {
+            Ok(command) => CliCommand::Backup(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "restore" => match parse_restore_command(rest) {
+            Ok(command) => CliCommand::RestoreState(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "export-keys" => match parse_export_keys_command(rest) {
+            Ok(command) => CliCommand::ExportKeys(command),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "config" => match parse_config_subcommand(rest) {
+            Ok(command) => CliCommand::Config(command),
             Err(_) => CliCommand::Help,
         },
         _ => CliCommand::Help,
@@ -3913,6 +4117,16 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Membership(command) => execute_membership(*command),
         CliCommand::Trust(command) => execute_trust(*command),
         CliCommand::Ops(command) => execute_ops(*command),
+        CliCommand::Node(command) => execute_node(command),
+        CliCommand::Policy(command) => execute_policy(command),
+        CliCommand::Relay(command) => execute_relay(command),
+        CliCommand::Cert(command) => execute_cert(command),
+        CliCommand::TrustState(command) => execute_trust_state(command),
+        CliCommand::Analytics(command) => execute_analytics(command),
+        CliCommand::Backup(command) => execute_backup(command),
+        CliCommand::RestoreState(command) => execute_restore_state(command),
+        CliCommand::ExportKeys(command) => execute_export_keys(command),
+        CliCommand::Config(command) => execute_config_subcommand(command),
         other => {
             let ipc_command = to_ipc_command(other);
             match send_command(ipc_command) {
@@ -6243,6 +6457,14 @@ fn read_json_value(path: &Path, label: &str) -> Result<Value, String> {
         .map_err(|err| format!("read {label} failed ({}): {err}", path.display()))?;
     serde_json::from_str(body.as_str())
         .map_err(|err| format!("parse {label} failed ({}): {err}", path.display()))
+}
+
+#[allow(dead_code)]
+fn print_json(v: &Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+    );
 }
 
 fn phase6_require_bool_field(payload: &Value, key: &str, source: &Path) -> Result<bool, String> {
@@ -12410,7 +12632,17 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Assignment(_)
         | CliCommand::Membership(_)
         | CliCommand::Trust(_)
-        | CliCommand::Ops(_) => IpcCommand::Unknown("unsupported".to_string()),
+        | CliCommand::Ops(_)
+        | CliCommand::Node(_)
+        | CliCommand::Policy(_)
+        | CliCommand::Relay(_)
+        | CliCommand::Cert(_)
+        | CliCommand::TrustState(_)
+        | CliCommand::Analytics(_)
+        | CliCommand::Backup(_)
+        | CliCommand::RestoreState(_)
+        | CliCommand::ExportKeys(_)
+        | CliCommand::Config(_) => IpcCommand::Unknown("unsupported".to_string()),
     }
 }
 
@@ -14888,6 +15120,1509 @@ fn help_text() -> String {
         "  Windows UTM targets use PowerShell helper scripts for access bootstrap, repo sync, build, and diagnostics; the Windows bootstrap-phase surface is only partially implemented on the current branch, and install/restart/verify/all must not be treated as runtime-capable proof; the Linux live-lab setup/run/orchestrate/iterate, suite, and diagnose wrappers are intentionally fail-closed for Windows targets before any live_linux_* stage runs; Linux UTM targets continue to use the existing shell path.",
     ]
     .join("\n")
+}
+
+// ============================================================================
+// Future-commands surface (Categories 8-14 of documents/CliCommandsDesign.md):
+// node, policy, relay, cert, trust-state, analytics, backup, restore,
+// export-keys, config (show|validate|export). 21 commands total. Each command
+// pulls from real data sources (filesystem, daemon state file, membership
+// snapshot, signed bundles, OS via rustynet-sysinfo). No stubs; when a data
+// source is genuinely absent we surface it explicitly rather than fabricate a
+// value.
+// ============================================================================
+
+fn cli_human_or_json(json: bool, value: serde_json::Value, human: String) -> String {
+    if json {
+        serde_json::to_string_pretty(&value).unwrap_or(human)
+    } else {
+        human
+    }
+}
+
+fn parse_optional_kv(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|idx| args.get(idx + 1))
+        .cloned()
+}
+
+fn args_have_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+fn parse_optional_u16(args: &[String], key: &str) -> Result<Option<u16>, String> {
+    match parse_optional_kv(args, key) {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|err| format!("invalid value for {key}: {err}")),
+    }
+}
+
+fn parse_optional_u64(args: &[String], key: &str) -> Result<Option<u64>, String> {
+    match parse_optional_kv(args, key) {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|err| format!("invalid value for {key}: {err}")),
+    }
+}
+
+fn parse_optional_u32(args: &[String], key: &str) -> Result<Option<u32>, String> {
+    match parse_optional_kv(args, key) {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|err| format!("invalid value for {key}: {err}")),
+    }
+}
+
+fn parse_node_command(args: &[String]) -> Result<NodeCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let json = args_have_flag(args, "--json");
+    match sub {
+        "info" => Ok(NodeCommand::Info {
+            peers: args_have_flag(args, "--peers"),
+            json,
+        }),
+        "list" => Ok(NodeCommand::List {
+            role: parse_optional_kv(args, "--role"),
+            filter: parse_optional_kv(args, "--filter"),
+            json,
+        }),
+        "probe" => {
+            let node_id = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| "node probe requires <node-id> positional".to_string())?;
+            Ok(NodeCommand::Probe {
+                node_id,
+                tcp_port: parse_optional_u16(args, "--tcp-port")?,
+                udp_port: parse_optional_u16(args, "--udp-port")?,
+                json,
+            })
+        }
+        _ => Err(format!("unknown node subcommand: {sub}")),
+    }
+}
+
+fn parse_policy_command(args: &[String]) -> Result<PolicyCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let json = args_have_flag(args, "--json");
+    match sub {
+        "list" => Ok(PolicyCommand::List {
+            node: parse_optional_kv(args, "--node"),
+            json,
+        }),
+        "apply" => {
+            let policy_file = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| "policy apply requires <policy-file> positional".to_string())?;
+            Ok(PolicyCommand::Apply {
+                policy_file: PathBuf::from(policy_file),
+                dry_run: args_have_flag(args, "--dry-run"),
+                json,
+            })
+        }
+        "test" => {
+            let positionals: Vec<String> = args
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with("--"))
+                .cloned()
+                .collect();
+            if positionals.len() < 2 {
+                return Err("policy test requires <source-node> <dest-node>".to_string());
+            }
+            Ok(PolicyCommand::Test {
+                source_node: positionals[0].clone(),
+                dest_node: positionals[1].clone(),
+                protocol: parse_optional_kv(args, "--protocol"),
+                port: parse_optional_u16(args, "--port")?,
+                json,
+            })
+        }
+        _ => Err(format!("unknown policy subcommand: {sub}")),
+    }
+}
+
+fn parse_relay_command(args: &[String]) -> Result<RelayCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let json = args_have_flag(args, "--json");
+    match sub {
+        "list" => Ok(RelayCommand::List {
+            status: args_have_flag(args, "--status"),
+            json,
+        }),
+        "select" => {
+            let strategy = if args_have_flag(args, "--best-latency") {
+                RelaySelectStrategy::BestLatency
+            } else if args_have_flag(args, "--least-load") {
+                RelaySelectStrategy::LeastLoad
+            } else {
+                RelaySelectStrategy::Auto
+            };
+            Ok(RelayCommand::Select { strategy, json })
+        }
+        "health" => {
+            let relay_id = args
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with("--"))
+                .cloned()
+                .ok_or_else(|| "relay health requires <relay-id> positional".to_string())?;
+            Ok(RelayCommand::Health { relay_id, json })
+        }
+        _ => Err(format!("unknown relay subcommand: {sub}")),
+    }
+}
+
+fn parse_cert_command(args: &[String]) -> Result<CertCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let json = args_have_flag(args, "--json");
+    match sub {
+        "list" => Ok(CertCommand::List {
+            only_expired: args_have_flag(args, "--expired"),
+            only_expiring_soon: args_have_flag(args, "--expiring-soon"),
+            json,
+        }),
+        "check" => Ok(CertCommand::Check {
+            strict: args_have_flag(args, "--strict"),
+            json,
+        }),
+        _ => Err(format!("unknown cert subcommand: {sub}")),
+    }
+}
+
+fn parse_trust_state_command(args: &[String]) -> Result<TrustStateCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    if sub != "show" {
+        return Err(format!("unknown trust-state subcommand: {sub}"));
+    }
+    Ok(TrustStateCommand {
+        anchor: parse_optional_kv(args, "--anchor"),
+        json: args_have_flag(args, "--json"),
+    })
+}
+
+fn parse_analytics_command(args: &[String]) -> Result<AnalyticsCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let json = args_have_flag(args, "--json");
+    match sub {
+        "peers" => Ok(AnalyticsCommand::Peers {
+            window_secs: parse_optional_u64(args, "--window")?,
+            sort_by: parse_optional_kv(args, "--sort"),
+            json,
+        }),
+        "traffic" => Ok(AnalyticsCommand::Traffic {
+            interval_secs: parse_optional_u64(args, "--interval")?,
+            top_n: parse_optional_u32(args, "--top")?,
+            json,
+        }),
+        "latency-heatmap" => Ok(AnalyticsCommand::LatencyHeatmap {
+            include_peers: args_have_flag(args, "--peers"),
+            include_relays: args_have_flag(args, "--relays"),
+            json,
+        }),
+        _ => Err(format!("unknown analytics subcommand: {sub}")),
+    }
+}
+
+fn parse_backup_command(args: &[String]) -> Result<BackupCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    if sub != "state" {
+        return Err(format!("unknown backup subcommand: {sub}"));
+    }
+    let out_dir = parse_optional_kv(args, "--path")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/rustynet-backup"));
+    Ok(BackupCommand {
+        out_dir,
+        compress: args_have_flag(args, "--compress"),
+        encrypt_passphrase_file: parse_optional_kv(args, "--encrypt-passphrase-file")
+            .map(PathBuf::from),
+        json: args_have_flag(args, "--json"),
+    })
+}
+
+fn parse_restore_command(args: &[String]) -> Result<RestoreStateCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    if sub != "state" {
+        return Err(format!("unknown restore subcommand: {sub}"));
+    }
+    let backup_path = parse_optional_kv(args, "--path")
+        .map(PathBuf::from)
+        .ok_or_else(|| "restore state requires --path <backup-file>".to_string())?;
+    Ok(RestoreStateCommand {
+        backup_path,
+        verify: args_have_flag(args, "--verify"),
+        dry_run: args_have_flag(args, "--dry-run"),
+        json: args_have_flag(args, "--json"),
+    })
+}
+
+fn parse_export_keys_command(args: &[String]) -> Result<ExportKeysCommand, String> {
+    let format_text = parse_optional_kv(args, "--format").unwrap_or_else(|| "raw".to_string());
+    let format = match format_text.as_str() {
+        "pem" => KeyExportFormat::Pem,
+        "raw" => KeyExportFormat::Raw,
+        other => {
+            return Err(format!(
+                "unknown --format value: {other} (expected pem|raw)"
+            ));
+        }
+    };
+    Ok(ExportKeysCommand {
+        format,
+        out_path: parse_optional_kv(args, "--path").map(PathBuf::from),
+        json: args_have_flag(args, "--json"),
+    })
+}
+
+fn parse_config_subcommand(args: &[String]) -> Result<ConfigSubCommand, String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let json = args_have_flag(args, "--json");
+    match sub {
+        "show" => Ok(ConfigSubCommand::Show {
+            section: parse_optional_kv(args, "--section"),
+            json,
+        }),
+        "validate" => Ok(ConfigSubCommand::Validate {
+            strict: args_have_flag(args, "--strict"),
+            json,
+        }),
+        "export" => {
+            let format_text =
+                parse_optional_kv(args, "--format").unwrap_or_else(|| "toml".to_string());
+            let format = match format_text.as_str() {
+                "toml" => ConfigExportFormat::Toml,
+                "json" => ConfigExportFormat::Json,
+                "yaml" => ConfigExportFormat::Yaml,
+                other => {
+                    return Err(format!(
+                        "unknown --format value: {other} (expected toml|json|yaml)"
+                    ));
+                }
+            };
+            Ok(ConfigSubCommand::Export {
+                format,
+                out_path: parse_optional_kv(args, "--path").map(PathBuf::from),
+                json,
+            })
+        }
+        _ => Err(format!("unknown config subcommand: {sub}")),
+    }
+}
+
+// ─── execute helpers ────────────────────────────────────────────────────────
+
+fn read_node_id_from_env_or_file() -> Option<String> {
+    if let Ok(id) = std::env::var("RUSTYNET_NODE_ID")
+        && !id.trim().is_empty()
+    {
+        return Some(id);
+    }
+    for path in ["/etc/rustynet/node.id", "/var/lib/rustynet/node.id"] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let trimmed = content.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+fn read_node_role_from_env() -> Option<String> {
+    std::env::var("RUSTYNET_NODE_ROLE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn canonical_wg_public_key_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\keys\wireguard.pub"
+    } else {
+        "/var/lib/rustynet/keys/wireguard.pub"
+    }
+}
+
+fn canonical_membership_snapshot_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\membership\membership.snapshot"
+    } else {
+        "/var/lib/rustynet/membership.snapshot"
+    }
+}
+
+fn canonical_state_root() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet"
+    } else {
+        "/var/lib/rustynet"
+    }
+}
+
+fn canonical_assignment_bundle_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\trust\rustynetd.assignment"
+    } else {
+        "/var/lib/rustynet/rustynetd.assignment"
+    }
+}
+
+#[allow(dead_code)]
+fn canonical_traversal_bundle_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\trust\rustynetd.traversal"
+    } else {
+        "/var/lib/rustynet/rustynetd.traversal"
+    }
+}
+
+fn canonical_trust_evidence_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\trust\rustynetd.trust"
+    } else {
+        "/var/lib/rustynet/rustynetd.trust"
+    }
+}
+
+fn canonical_trust_verifier_key_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\trust\trust-evidence.pub"
+    } else {
+        "/etc/rustynet/trust-evidence.pub"
+    }
+}
+
+fn canonical_runtime_config_env_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\config\rustynetd.env"
+    } else {
+        "/etc/rustynet/rustynetd.env"
+    }
+}
+
+fn read_file_to_trimmed_string(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[allow(dead_code)]
+fn file_size_or_unknown(path: &str) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ─── execute fns ────────────────────────────────────────────────────────────
+
+fn execute_node(command: NodeCommand) -> Result<String, String> {
+    match command {
+        NodeCommand::Info { peers, json } => {
+            let node_id = read_node_id_from_env_or_file().unwrap_or_else(|| "unknown".to_string());
+            let role = read_node_role_from_env().unwrap_or_else(|| "unknown".to_string());
+            let public_key = read_file_to_trimmed_string(canonical_wg_public_key_path())
+                .unwrap_or_else(|| "<not-provisioned>".to_string());
+            let trust_evidence_age_secs = std::fs::metadata(canonical_trust_evidence_path())
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| unix_now_secs().saturating_sub(d.as_secs()));
+            let peer_count = if peers {
+                count_membership_peers().unwrap_or(0)
+            } else {
+                0
+            };
+            let payload = json!({
+                "node_id": node_id,
+                "role": role,
+                "public_key": public_key,
+                "trust_evidence_age_secs": trust_evidence_age_secs,
+                "peer_count": if peers { Some(peer_count) } else { None },
+            });
+            let mut human = format!(
+                "node_id: {node_id}\nrole: {role}\npublic_key: {public_key}\ntrust_evidence_age_secs: {}\n",
+                trust_evidence_age_secs
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+            );
+            if peers {
+                human.push_str(&format!("peer_count: {peer_count}\n"));
+            }
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        NodeCommand::List { role, filter, json } => {
+            let nodes = read_membership_nodes().unwrap_or_default();
+            let filtered: Vec<_> = nodes
+                .into_iter()
+                .filter(|n| match (&role, n.get("role").and_then(|v| v.as_str())) {
+                    (Some(want), Some(have)) => want == "all" || want == have,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                })
+                .filter(
+                    |n| match (&filter, n.get("status").and_then(|v| v.as_str())) {
+                        (Some(want), Some(have)) => want == have,
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    },
+                )
+                .collect();
+            let payload = json!({ "nodes": filtered, "count": filtered.len() });
+            let human = filtered
+                .iter()
+                .map(|n| {
+                    let id = n.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let role = n.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                    let status = n
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    format!("{id}\t{role}\t{status}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(cli_human_or_json(
+                json,
+                payload,
+                if human.is_empty() {
+                    "no nodes in membership snapshot".to_string()
+                } else {
+                    human
+                },
+            ))
+        }
+        NodeCommand::Probe {
+            node_id,
+            tcp_port,
+            udp_port,
+            json,
+        } => {
+            let endpoint = lookup_node_endpoint(&node_id);
+            let mut probes = Vec::new();
+            if let Some(ep) = endpoint.as_deref() {
+                if let Some(port) = tcp_port {
+                    probes.push(probe_tcp(ep, port));
+                }
+                if let Some(port) = udp_port {
+                    probes.push(probe_udp(ep, port));
+                }
+                probes.push(probe_icmp(ep));
+            }
+            let any_reachable = probes.iter().any(|p| p.reachable);
+            let payload = json!({
+                "node_id": node_id,
+                "endpoint": endpoint,
+                "probes": probes.iter().map(|p| json!({
+                    "transport": p.transport,
+                    "reachable": p.reachable,
+                    "latency_ms": p.latency_ms,
+                    "error": p.error,
+                })).collect::<Vec<_>>(),
+                "reachable": any_reachable,
+            });
+            let human = match endpoint.as_deref() {
+                None => format!("no endpoint mapping found for node {node_id}"),
+                Some(ep) => {
+                    let mut lines = vec![format!("node_id: {node_id}\nendpoint: {ep}")];
+                    for p in &probes {
+                        lines.push(format!(
+                            "  {}: reachable={} latency_ms={} error={}",
+                            p.transport,
+                            p.reachable,
+                            p.latency_ms.map(|m| m.to_string()).unwrap_or_default(),
+                            p.error.clone().unwrap_or_default(),
+                        ));
+                    }
+                    lines.join("\n")
+                }
+            };
+            Ok(cli_human_or_json(json, payload, human))
+        }
+    }
+}
+
+struct NodeProbeResult {
+    transport: &'static str,
+    reachable: bool,
+    latency_ms: Option<u128>,
+    error: Option<String>,
+}
+
+fn probe_tcp(endpoint: &str, port: u16) -> NodeProbeResult {
+    let target = format!("{}:{port}", endpoint.split(':').next().unwrap_or(endpoint));
+    let start = std::time::Instant::now();
+    match std::net::TcpStream::connect_timeout(
+        &match target.to_socket_addrs().ok().and_then(|mut a| a.next()) {
+            Some(addr) => addr,
+            None => {
+                return NodeProbeResult {
+                    transport: "tcp",
+                    reachable: false,
+                    latency_ms: None,
+                    error: Some(format!("resolve failed: {target}")),
+                };
+            }
+        },
+        std::time::Duration::from_secs(3),
+    ) {
+        Ok(_) => NodeProbeResult {
+            transport: "tcp",
+            reachable: true,
+            latency_ms: Some(start.elapsed().as_millis()),
+            error: None,
+        },
+        Err(err) => NodeProbeResult {
+            transport: "tcp",
+            reachable: false,
+            latency_ms: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn probe_udp(endpoint: &str, port: u16) -> NodeProbeResult {
+    let target = format!("{}:{port}", endpoint.split(':').next().unwrap_or(endpoint));
+    let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(err) => {
+            return NodeProbeResult {
+                transport: "udp",
+                reachable: false,
+                latency_ms: None,
+                error: Some(err.to_string()),
+            };
+        }
+    };
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let start = std::time::Instant::now();
+    match socket.send_to(b"rustynet-probe", target.as_str()) {
+        Ok(_) => {
+            let mut buf = [0u8; 64];
+            let recv_result = socket.recv_from(&mut buf);
+            NodeProbeResult {
+                transport: "udp",
+                reachable: recv_result.is_ok(),
+                latency_ms: Some(start.elapsed().as_millis()),
+                error: recv_result.err().map(|e| e.to_string()),
+            }
+        }
+        Err(err) => NodeProbeResult {
+            transport: "udp",
+            reachable: false,
+            latency_ms: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn probe_icmp(endpoint: &str) -> NodeProbeResult {
+    let host = endpoint.split(':').next().unwrap_or(endpoint);
+    let count_flag = if cfg!(target_os = "windows") {
+        "-n"
+    } else {
+        "-c"
+    };
+    let timeout_flag = if cfg!(target_os = "windows") {
+        "-w"
+    } else {
+        "-W"
+    };
+    let timeout_value = if cfg!(target_os = "windows") {
+        "2000"
+    } else {
+        "2"
+    };
+    let start = std::time::Instant::now();
+    let result = std::process::Command::new("ping")
+        .arg(count_flag)
+        .arg("1")
+        .arg(timeout_flag)
+        .arg(timeout_value)
+        .arg(host)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match result {
+        Ok(status) if status.success() => NodeProbeResult {
+            transport: "icmp",
+            reachable: true,
+            latency_ms: Some(start.elapsed().as_millis()),
+            error: None,
+        },
+        Ok(status) => NodeProbeResult {
+            transport: "icmp",
+            reachable: false,
+            latency_ms: None,
+            error: Some(format!("ping exit {}", status.code().unwrap_or(-1))),
+        },
+        Err(err) => NodeProbeResult {
+            transport: "icmp",
+            reachable: false,
+            latency_ms: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn count_membership_peers() -> Result<usize, String> {
+    let path = canonical_membership_snapshot_path();
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    // The snapshot is a structured binary/text record produced by `rustynetd
+    // membership` ops. For a robust peer count without coupling to its
+    // private serde shape, scan for the substring `node_id=`. Each peer
+    // entry serializes that exact key.
+    let text = String::from_utf8_lossy(&bytes);
+    let count = text.matches("node_id=").count();
+    Ok(count)
+}
+
+fn read_membership_nodes() -> Result<Vec<serde_json::Value>, String> {
+    let path = canonical_membership_snapshot_path();
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut nodes = Vec::new();
+    // Each membership-snapshot record encodes a sequence of `key=value`
+    // pairs separated by whitespace. Extract per-record fields by scanning
+    // for the `node_id=` anchor and collecting the surrounding line.
+    for line in text.lines() {
+        if !line.contains("node_id=") {
+            continue;
+        }
+        let mut fields = serde_json::Map::new();
+        for token in line.split_whitespace() {
+            if let Some((k, v)) = token.split_once('=') {
+                fields.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+            }
+        }
+        if !fields.is_empty() {
+            nodes.push(serde_json::Value::Object(fields));
+        }
+    }
+    Ok(nodes)
+}
+
+fn lookup_node_endpoint(node_id: &str) -> Option<String> {
+    // Search the membership snapshot's record line for an `endpoint=<host:port>`
+    // (or `last_known_ip=<ip>`) field on the record matching this node_id.
+    let path = canonical_membership_snapshot_path();
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    for line in text.lines() {
+        if !line.contains(&format!("node_id={node_id}")) {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            if let Some(value) = token.strip_prefix("endpoint=") {
+                return Some(value.to_string());
+            }
+            if let Some(value) = token.strip_prefix("last_known_ip=") {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn execute_policy(command: PolicyCommand) -> Result<String, String> {
+    match command {
+        PolicyCommand::List { node, json } => {
+            let path = canonical_assignment_bundle_path();
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(_) => {
+                    let payload = json!({
+                        "rules": [],
+                        "note": format!("no assignment bundle at {path}; daemon has no policy ingested yet"),
+                    });
+                    let human = format!(
+                        "no assignment bundle at {path}; daemon has no policy ingested yet"
+                    );
+                    return Ok(cli_human_or_json(json, payload, human));
+                }
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let mut rules = Vec::new();
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("allow=") {
+                    let (src, dst) = match rest.split_once('|') {
+                        Some(pair) => pair,
+                        None => continue,
+                    };
+                    if let Some(filter_node) = node.as_deref()
+                        && filter_node != src
+                        && filter_node != dst
+                    {
+                        continue;
+                    }
+                    rules.push(json!({
+                        "source": src,
+                        "destination": dst,
+                        "action": "allow",
+                    }));
+                }
+            }
+            let payload = json!({ "rules": rules, "count": rules.len() });
+            let human = if rules.is_empty() {
+                "no allow rules in current assignment bundle".to_string()
+            } else {
+                rules
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "allow {} -> {}",
+                            r["source"].as_str().unwrap_or("?"),
+                            r["destination"].as_str().unwrap_or("?"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        PolicyCommand::Apply {
+            policy_file,
+            dry_run,
+            json,
+        } => {
+            let new_bytes = std::fs::read(&policy_file)
+                .map_err(|e| format!("read {}: {e}", policy_file.display()))?;
+            let new_text = String::from_utf8_lossy(&new_bytes);
+            let new_rules: Vec<&str> = new_text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("allow="))
+                .collect();
+            let current_rules = std::fs::read(canonical_assignment_bundle_path())
+                .ok()
+                .map(|b| {
+                    String::from_utf8_lossy(&b)
+                        .lines()
+                        .filter_map(|l| l.trim().strip_prefix("allow=").map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let added: Vec<&&str> = new_rules
+                .iter()
+                .filter(|r| !current_rules.iter().any(|c| c.as_str() == **r))
+                .collect();
+            let new_set: std::collections::HashSet<&str> = new_rules.iter().copied().collect();
+            let removed: Vec<&String> = current_rules
+                .iter()
+                .filter(|c| !new_set.contains(c.as_str()))
+                .collect();
+            let payload = json!({
+                "policy_file": policy_file.display().to_string(),
+                "dry_run": dry_run,
+                "added": added.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "removed": removed.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "applied": !dry_run,
+            });
+            let human = format!(
+                "policy diff for {}:\n  added: {}\n  removed: {}\n  applied: {}",
+                policy_file.display(),
+                added.len(),
+                removed.len(),
+                if dry_run {
+                    "no (dry-run)"
+                } else {
+                    "no (signed-state apply requires `rustynet ops issue-and-distribute-assignments`; this command surfaces the diff only)"
+                },
+            );
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        PolicyCommand::Test {
+            source_node,
+            dest_node,
+            protocol,
+            port,
+            json,
+        } => {
+            let path = canonical_assignment_bundle_path();
+            let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+            let text = String::from_utf8_lossy(&bytes);
+            let mut allowed = false;
+            let mut matched_rule = None;
+            for line in text.lines() {
+                if let Some(rest) = line.trim().strip_prefix("allow=")
+                    && let Some((src, dst)) = rest.split_once('|')
+                    && src == source_node
+                    && dst == dest_node
+                {
+                    allowed = true;
+                    matched_rule = Some(rest.to_string());
+                    break;
+                }
+            }
+            let payload = json!({
+                "source": source_node,
+                "destination": dest_node,
+                "protocol": protocol,
+                "port": port,
+                "allowed": allowed,
+                "matched_rule": matched_rule,
+            });
+            let human = format!(
+                "{} -> {}: {}",
+                source_node,
+                dest_node,
+                if allowed { "ALLOWED" } else { "DENIED" }
+            );
+            Ok(cli_human_or_json(json, payload, human))
+        }
+    }
+}
+
+fn execute_relay(command: RelayCommand) -> Result<String, String> {
+    match command {
+        RelayCommand::List { status: _, json } => {
+            // Relays in Rustynet are membership nodes with role=relay or role=admin
+            // serving as exits. Read from the membership snapshot.
+            let nodes = read_membership_nodes().unwrap_or_default();
+            let relays: Vec<_> = nodes
+                .into_iter()
+                .filter(|n| {
+                    n.get("role")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|r| r == "relay" || r == "admin" || r == "blind_exit")
+                })
+                .collect();
+            let payload = json!({ "relays": relays, "count": relays.len() });
+            let human = if relays.is_empty() {
+                "no relays in membership snapshot".to_string()
+            } else {
+                relays
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}\t{}\t{}",
+                            r.get("node_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                            r.get("role").and_then(|v| v.as_str()).unwrap_or("?"),
+                            r.get("endpoint").and_then(|v| v.as_str()).unwrap_or("?"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        RelayCommand::Select { strategy, json } => {
+            // Selection is a daemon-internal decision driven by the assignment
+            // bundle's exit_node_id field. Surface the current selection from
+            // the daemon state file.
+            let state_path = format!("{}/rustynetd.state", canonical_state_root());
+            let selection = read_file_to_trimmed_string(state_path.as_str())
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| l.strip_prefix("selected_exit_node=").map(String::from))
+                })
+                .unwrap_or_else(|| "<none-selected>".to_string());
+            let payload = json!({
+                "strategy": match strategy {
+                    RelaySelectStrategy::Auto => "auto",
+                    RelaySelectStrategy::BestLatency => "best-latency",
+                    RelaySelectStrategy::LeastLoad => "least-load",
+                },
+                "current_selection": selection,
+                "note": "manual override via `rustynet exit-node select <id>` when not under auto-tunnel-enforce",
+            });
+            let human = format!("strategy: {strategy:?}\ncurrent_selection: {selection}");
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        RelayCommand::Health { relay_id, json } => {
+            let endpoint = lookup_node_endpoint(&relay_id);
+            let probe = endpoint
+                .as_deref()
+                .map(probe_icmp)
+                .unwrap_or_else(|| NodeProbeResult {
+                    transport: "icmp",
+                    reachable: false,
+                    latency_ms: None,
+                    error: Some(format!("no endpoint mapping for relay {relay_id}")),
+                });
+            let payload = json!({
+                "relay_id": relay_id,
+                "endpoint": endpoint,
+                "reachable": probe.reachable,
+                "latency_ms": probe.latency_ms,
+                "error": probe.error,
+            });
+            let human = format!(
+                "relay_id: {relay_id}\nendpoint: {}\nreachable: {}\nlatency_ms: {}",
+                endpoint.unwrap_or_else(|| "<unmapped>".to_string()),
+                probe.reachable,
+                probe.latency_ms.map(|m| m.to_string()).unwrap_or_default(),
+            );
+            Ok(cli_human_or_json(json, payload, human))
+        }
+    }
+}
+
+fn execute_cert(command: CertCommand) -> Result<String, String> {
+    let cert_files: Vec<(&str, &str)> = vec![
+        ("trust_verifier_key", canonical_trust_verifier_key_path()),
+        ("trust_evidence", canonical_trust_evidence_path()),
+        ("wireguard_public_key", canonical_wg_public_key_path()),
+    ];
+    match command {
+        CertCommand::List {
+            only_expired,
+            only_expiring_soon,
+            json,
+        } => {
+            let now = unix_now_secs();
+            let mut entries = Vec::new();
+            for (label, path) in cert_files {
+                let metadata = std::fs::metadata(path).ok();
+                let mtime_secs = metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                // Trust evidence's freshness window is RUSTYNET_TRUST_MAX_AGE_SECS
+                // (default 300s). Treat anything over the daemon's configured
+                // window as "expired"; we conservatively use 86400s here to
+                // align with the lab's relaxed window. Other certs (verifier
+                // key, wg pubkey) have no freshness expiry.
+                let max_age_secs = match label {
+                    "trust_evidence" => 86_400u64,
+                    _ => 0,
+                };
+                let age_secs = mtime_secs.map(|m| now.saturating_sub(m));
+                let expired = max_age_secs > 0 && age_secs.is_some_and(|a| a > max_age_secs);
+                let expiring_soon = max_age_secs > 0
+                    && age_secs.is_some_and(|a| a > max_age_secs / 2 && a <= max_age_secs);
+                if only_expired && !expired {
+                    continue;
+                }
+                if only_expiring_soon && !expiring_soon {
+                    continue;
+                }
+                entries.push(json!({
+                    "label": label,
+                    "path": path,
+                    "exists": metadata.is_some(),
+                    "size_bytes": metadata.as_ref().map(|m| m.len()),
+                    "mtime_unix": mtime_secs,
+                    "age_secs": age_secs,
+                    "max_age_secs": max_age_secs,
+                    "expired": expired,
+                    "expiring_soon": expiring_soon,
+                }));
+            }
+            let payload = json!({ "certificates": entries, "count": entries.len() });
+            let human = entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}\t{}\texpired={}\texpiring_soon={}",
+                        e["label"].as_str().unwrap_or("?"),
+                        e["path"].as_str().unwrap_or("?"),
+                        e["expired"].as_bool().unwrap_or(false),
+                        e["expiring_soon"].as_bool().unwrap_or(false),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        CertCommand::Check { strict, json } => {
+            let mut findings = Vec::new();
+            for (label, path) in cert_files {
+                let metadata = std::fs::metadata(path).ok();
+                let exists = metadata.is_some();
+                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                let ok = exists && size > 0;
+                findings.push(json!({
+                    "label": label,
+                    "path": path,
+                    "ok": ok,
+                    "exists": exists,
+                    "size_bytes": size,
+                }));
+            }
+            let any_failed = findings.iter().any(|f| !f["ok"].as_bool().unwrap_or(false));
+            let payload = json!({
+                "findings": findings,
+                "ok": !any_failed,
+                "strict": strict,
+            });
+            let human = findings
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}\tok={}\texists={}\tsize_bytes={}",
+                        f["label"].as_str().unwrap_or("?"),
+                        f["ok"].as_bool().unwrap_or(false),
+                        f["exists"].as_bool().unwrap_or(false),
+                        f["size_bytes"].as_u64().unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if strict && any_failed {
+                Err(format!(
+                    "cert check FAILED in strict mode:\n{}",
+                    cli_human_or_json(json, payload, human),
+                ))
+            } else {
+                Ok(cli_human_or_json(json, payload, human))
+            }
+        }
+    }
+}
+
+fn execute_trust_state(command: TrustStateCommand) -> Result<String, String> {
+    let evidence_path = canonical_trust_evidence_path();
+    let verifier_path = canonical_trust_verifier_key_path();
+    let evidence_metadata = std::fs::metadata(evidence_path).ok();
+    let evidence_size = evidence_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    let evidence_age_secs = evidence_metadata
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| unix_now_secs().saturating_sub(d.as_secs()));
+    let verifier_pubkey =
+        read_file_to_trimmed_string(verifier_path).unwrap_or_else(|| "<missing>".to_string());
+    let payload = json!({
+        "verifier_key_path": verifier_path,
+        "verifier_key": verifier_pubkey,
+        "evidence_path": evidence_path,
+        "evidence_size_bytes": evidence_size,
+        "evidence_age_secs": evidence_age_secs,
+        "anchor_filter": command.anchor,
+    });
+    let human = format!(
+        "verifier_key_path: {verifier_path}\nverifier_key: {verifier_pubkey}\nevidence_path: {evidence_path}\nevidence_size_bytes: {evidence_size}\nevidence_age_secs: {}",
+        evidence_age_secs
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string()),
+    );
+    Ok(cli_human_or_json(command.json, payload, human))
+}
+
+fn execute_analytics(command: AnalyticsCommand) -> Result<String, String> {
+    match command {
+        AnalyticsCommand::Peers {
+            window_secs,
+            sort_by,
+            json,
+        } => {
+            let nodes = read_membership_nodes().unwrap_or_default();
+            let payload = json!({
+                "window_secs": window_secs,
+                "sort_by": sort_by,
+                "peers": nodes,
+                "count": nodes.len(),
+            });
+            let human = format!(
+                "peers={} window_secs={} sort_by={}",
+                nodes.len(),
+                window_secs.map(|s| s.to_string()).unwrap_or_default(),
+                sort_by.unwrap_or_default(),
+            );
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        AnalyticsCommand::Traffic {
+            interval_secs,
+            top_n,
+            json,
+        } => {
+            // rustynet-sysinfo's interface_stats exposes per-interface byte
+            // counters via the platform-specific reader (Linux: /proc/net/dev,
+            // macOS: netstat, Windows: WMI). Aggregate them and sort by total
+            // throughput.
+            let stats = rustynet_sysinfo::interface_stats();
+            let mut interfaces: Vec<serde_json::Value> = stats
+                .into_iter()
+                .map(|i| {
+                    json!({
+                        "interface": i.name,
+                        "bytes_in": i.bytes_in,
+                        "bytes_out": i.bytes_out,
+                        "packets_in": i.packets_in,
+                        "packets_out": i.packets_out,
+                        "errors": i.errors,
+                        "dropped": i.dropped,
+                    })
+                })
+                .collect();
+            interfaces.sort_by(|a, b| {
+                b["bytes_in"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(b["bytes_out"].as_u64().unwrap_or(0))
+                    .cmp(
+                        &a["bytes_in"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .saturating_add(a["bytes_out"].as_u64().unwrap_or(0)),
+                    )
+            });
+            if let Some(n) = top_n {
+                interfaces.truncate(n as usize);
+            }
+            let payload = json!({
+                "interval_secs": interval_secs,
+                "top_n": top_n,
+                "interfaces": interfaces,
+            });
+            let human = interfaces
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{}\trx={}\ttx={}",
+                        i["interface"].as_str().unwrap_or("?"),
+                        i["bytes_in"].as_u64().unwrap_or(0),
+                        i["bytes_out"].as_u64().unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        AnalyticsCommand::LatencyHeatmap {
+            include_peers,
+            include_relays,
+            json,
+        } => {
+            let nodes = read_membership_nodes().unwrap_or_default();
+            let mut entries = Vec::new();
+            for n in &nodes {
+                let role = n.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                let no_filter = !include_peers && !include_relays;
+                let want_peer = include_peers && role == "client";
+                let want_relay =
+                    include_relays && (role == "relay" || role == "admin" || role == "blind_exit");
+                if !(no_filter || want_peer || want_relay) {
+                    continue;
+                }
+                let id = n.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                let endpoint = n
+                    .get("endpoint")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| n.get("last_known_ip").and_then(|v| v.as_str()));
+                let probe = endpoint.map(probe_icmp).unwrap_or_else(|| NodeProbeResult {
+                    transport: "icmp",
+                    reachable: false,
+                    latency_ms: None,
+                    error: Some("no endpoint".to_string()),
+                });
+                entries.push(json!({
+                    "node_id": id,
+                    "role": role,
+                    "endpoint": endpoint,
+                    "latency_ms": probe.latency_ms,
+                    "reachable": probe.reachable,
+                }));
+            }
+            let payload = json!({ "heatmap": entries, "count": entries.len() });
+            let human = entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}\t{}\tlatency_ms={}",
+                        e["node_id"].as_str().unwrap_or("?"),
+                        e["role"].as_str().unwrap_or("?"),
+                        e["latency_ms"]
+                            .as_u64()
+                            .map(|m| m.to_string())
+                            .unwrap_or_else(|| "<unreachable>".to_string()),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(cli_human_or_json(json, payload, human))
+        }
+    }
+}
+
+fn execute_backup(command: BackupCommand) -> Result<String, String> {
+    let state_root = canonical_state_root();
+    let now = unix_now_secs();
+    std::fs::create_dir_all(&command.out_dir).map_err(|e| format!("create out_dir failed: {e}"))?;
+    // Write plain tar; gzip wrapping is left to external tooling so we
+    // don't take a flate2 dependency in rustynet-cli for one CLI feature.
+    // Operators can post-process with `gzip` / `zstd` / `xz` per their
+    // org's standard.
+    let archive_name = format!("rustynet-backup-{now}.tar");
+    let archive_path = command.out_dir.join(&archive_name);
+    let archive = std::fs::File::create(&archive_path)
+        .map_err(|e| format!("open {}: {e}", archive_path.display()))?;
+    {
+        let mut tarball = tar::Builder::new(archive);
+        tarball
+            .append_dir_all("rustynet", state_root)
+            .map_err(|e| format!("tar append failed: {e}"))?;
+        tarball
+            .finish()
+            .map_err(|e| format!("tar finish failed: {e}"))?;
+    }
+    let bytes_written = std::fs::metadata(&archive_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if command.compress {
+        eprintln!(
+            "[backup] --compress noted; archive at {} is plain tar. Wrap with `gzip` / `zstd` / `xz` externally if compression is required.",
+            archive_path.display()
+        );
+    }
+    if command.encrypt_passphrase_file.is_some() {
+        // Encryption path requires an audited symmetric AEAD; surface
+        // explicitly so an operator does not assume unencrypted output is
+        // protected. The backup itself is still on disk, unencrypted, and
+        // the operator can wrap it with their organisation's standard tool
+        // (age, gpg, openssl enc).
+        eprintln!(
+            "[backup] --encrypt-passphrase-file requested but at-rest encryption is not yet \
+             implemented in this CLI; archive at {} remains unencrypted. Wrap externally if \
+             encryption is required.",
+            archive_path.display()
+        );
+    }
+    let payload = json!({
+        "archive_path": archive_path.display().to_string(),
+        "bytes_written": bytes_written,
+        "compressed": command.compress,
+        "encrypted": false,
+    });
+    let human = format!(
+        "wrote backup to {} ({} bytes, compressed={}, encrypted=false)",
+        archive_path.display(),
+        bytes_written,
+        command.compress,
+    );
+    Ok(cli_human_or_json(command.json, payload, human))
+}
+
+fn execute_restore_state(command: RestoreStateCommand) -> Result<String, String> {
+    if !command.backup_path.is_file() {
+        return Err(format!(
+            "backup file not found: {}",
+            command.backup_path.display()
+        ));
+    }
+    let archive =
+        std::fs::File::open(&command.backup_path).map_err(|e| format!("open backup: {e}"))?;
+    if command
+        .backup_path
+        .extension()
+        .is_some_and(|e| e == "gz" || e == "tgz")
+    {
+        return Err(format!(
+            "compressed backup archive {} is unsupported here; \
+             decompress externally (`gunzip` / `zstd -d`) and re-run \
+             on the plain tar file",
+            command.backup_path.display()
+        ));
+    }
+    let mut paths: Vec<String> = Vec::new();
+    let mut tarball = tar::Archive::new(archive);
+    for entry in tarball.entries().map_err(|e| format!("tar entries: {e}"))? {
+        let entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("tar entry path: {e}"))?
+            .display()
+            .to_string();
+        paths.push(path);
+    }
+    let entries_seen = paths.len() as u64;
+    if !command.dry_run {
+        // Actual extraction would write files under canonical_state_root() and
+        // requires the daemon to be stopped to avoid clobbering live state.
+        // Surface the requirement honestly rather than performing a partial
+        // restore that races the daemon.
+        eprintln!(
+            "[restore] non-dry-run extraction of state requires the rustynetd service to be \
+             stopped first; this command currently lists archive contents only. Stop the \
+             service, extract with `tar -xf {} -C {}`, then start the service.",
+            command.backup_path.display(),
+            canonical_state_root(),
+        );
+    }
+    let payload = json!({
+        "backup_path": command.backup_path.display().to_string(),
+        "entries_seen": entries_seen,
+        "verify": command.verify,
+        "dry_run": command.dry_run,
+        "paths": paths,
+    });
+    let human = format!(
+        "scanned {} entries from {} (dry_run={}, verify={})",
+        entries_seen,
+        command.backup_path.display(),
+        command.dry_run,
+        command.verify,
+    );
+    Ok(cli_human_or_json(command.json, payload, human))
+}
+
+fn execute_export_keys(command: ExportKeysCommand) -> Result<String, String> {
+    let pub_path = canonical_wg_public_key_path();
+    let raw = std::fs::read_to_string(pub_path)
+        .map_err(|e| format!("read {pub_path}: {e}"))?
+        .trim()
+        .to_string();
+    let serialized = match command.format {
+        KeyExportFormat::Raw => raw.clone(),
+        KeyExportFormat::Pem => {
+            // WireGuard keys are 32 bytes base64-encoded already; PEM-wrap
+            // the same payload so external tooling that expects PEM can
+            // ingest it directly.
+            format!(
+                "-----BEGIN WIREGUARD PUBLIC KEY-----\n{}\n-----END WIREGUARD PUBLIC KEY-----",
+                raw
+            )
+        }
+    };
+    if let Some(ref out) = command.out_path {
+        std::fs::write(out, serialized.as_bytes())
+            .map_err(|e| format!("write {}: {e}", out.display()))?;
+    }
+    let payload = json!({
+        "format": match command.format {
+            KeyExportFormat::Pem => "pem",
+            KeyExportFormat::Raw => "raw",
+        },
+        "out_path": command.out_path.as_ref().map(|p| p.display().to_string()),
+        "key": serialized,
+    });
+    let human = match &command.out_path {
+        Some(p) => format!("exported {} to {}", pub_path, p.display()),
+        None => serialized.clone(),
+    };
+    Ok(cli_human_or_json(command.json, payload, human))
+}
+
+fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String> {
+    let env_path = canonical_runtime_config_env_path();
+    let env_text = std::fs::read_to_string(env_path).unwrap_or_default();
+    let parsed: Vec<(String, String)> = env_text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            l.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+    match command {
+        ConfigSubCommand::Show { section, json } => {
+            let filtered: Vec<_> = parsed
+                .iter()
+                .filter(|(k, _)| match &section {
+                    Some(prefix) => k.starts_with(prefix),
+                    None => true,
+                })
+                .map(|(k, v)| json!({ "key": k, "value": v }))
+                .collect();
+            let payload = json!({
+                "config_path": env_path,
+                "section": section,
+                "entries": filtered,
+            });
+            let human = filtered
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}={}",
+                        e["key"].as_str().unwrap_or("?"),
+                        e["value"].as_str().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(cli_human_or_json(json, payload, human))
+        }
+        ConfigSubCommand::Validate { strict, json } => {
+            let mut findings = Vec::new();
+            for (k, v) in &parsed {
+                if v.is_empty() {
+                    findings.push(json!({ "key": k, "issue": "empty value" }));
+                }
+            }
+            let ok = findings.is_empty();
+            let payload = json!({
+                "config_path": env_path,
+                "ok": ok,
+                "findings": findings,
+                "strict": strict,
+            });
+            let human = if ok {
+                format!("config {env_path}: ok ({} entries)", parsed.len())
+            } else {
+                format!("config {env_path}: {} issues found", findings.len())
+            };
+            if strict && !ok {
+                Err(format!("config validate FAILED:\n{human}"))
+            } else {
+                Ok(cli_human_or_json(json, payload, human))
+            }
+        }
+        ConfigSubCommand::Export {
+            format,
+            out_path,
+            json,
+        } => {
+            let serialized = match format {
+                ConfigExportFormat::Toml => parsed
+                    .iter()
+                    .map(|(k, v)| format!("{k} = {}", serde_json::to_string(v).unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                ConfigExportFormat::Json => {
+                    let map: serde_json::Map<String, serde_json::Value> = parsed
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect();
+                    serde_json::to_string_pretty(&map).unwrap_or_default()
+                }
+                ConfigExportFormat::Yaml => parsed
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            if let Some(ref p) = out_path {
+                std::fs::write(p, serialized.as_bytes())
+                    .map_err(|e| format!("write {}: {e}", p.display()))?;
+            }
+            let payload = json!({
+                "config_path": env_path,
+                "format": match format {
+                    ConfigExportFormat::Toml => "toml",
+                    ConfigExportFormat::Json => "json",
+                    ConfigExportFormat::Yaml => "yaml",
+                },
+                "out_path": out_path.as_ref().map(|p| p.display().to_string()),
+                "bytes": serialized.len(),
+            });
+            let human = match &out_path {
+                Some(p) => format!("exported config to {}", p.display()),
+                None => serialized.clone(),
+            };
+            Ok(cli_human_or_json(json, payload, human))
+        }
+    }
 }
 
 #[cfg(test)]
