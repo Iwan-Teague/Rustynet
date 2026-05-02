@@ -45,6 +45,7 @@ These explain architecture, phase boundaries, and longer-running design work.
 - [phase10.md](./phase10.md)
 - [MembershipConsensus.md](./MembershipConsensus.md)
 - [MembershipImplementationPlan.md](./MembershipImplementationPlan.md)
+- [CliCommandsDesign.md](./CliCommandsDesign.md)
 
 ## Mobile Planning Documents
 
