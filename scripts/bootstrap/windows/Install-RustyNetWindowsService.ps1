@@ -450,16 +450,31 @@ function Build-ReviewedDaemonArgsJson {
     # equivalent of `rustynetd-trust-refresh.timer` on Windows yet;
     # while that is missing, 86400s gives the lab a day before the
     # next install-release must rotate evidence again.
+    #
+    # --traversal-max-age-secs 86400: the traversal bundle is issued
+    # with TRAVERSAL_TTL_SECS=120 (the hard cap enforced by ops_e2e),
+    # so the bundle itself is always short-lived. However the Windows
+    # lab orchestration pipeline (bootstrap → distribute membership →
+    # distribute assignment → distribute traversal → restart service →
+    # validate mesh-join) can take 30+ minutes end-to-end, meaning
+    # the traversal bundle has expired long before the daemon's
+    # startup preflight runs. There is no traversal-refresh timer on
+    # Windows yet; setting 86400s here allows the lab to proceed for
+    # up to 24h between re-orchestrations without the daemon rejecting
+    # its own traversal bundle as stale. DEFAULT_TRAVERSAL_MAX_AGE_SECS
+    # is 120s which is correct for production with an active refresh
+    # service but too tight for a single-run lab pipeline.
     return (@(
         '--backend', $BackendLabel,
         '--auto-tunnel-enforce', 'false',
         '--trust-max-age-secs', '86400',
+        '--traversal-max-age-secs', '86400',
         '--node-id', 'windows-client-1'
     ) | ConvertTo-Json -Compress)
 }
-# (--trust-max-age-secs is parsed by rustynetd's daemon command — added to
-# the CLI flag set in 4b23484+follow-on; threads through DaemonConfig and
-# is read by the trust preflight in run_daemon.)
+# (--trust-max-age-secs and --traversal-max-age-secs are parsed by
+# rustynetd's daemon command; they thread through DaemonConfig and are read
+# by the trust and traversal preflights in run_daemon respectively.)
 
 function Write-ReviewedEnvFile {
     param(
