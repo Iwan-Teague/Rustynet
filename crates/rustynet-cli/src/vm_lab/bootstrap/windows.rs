@@ -870,10 +870,11 @@ impl WindowsBootstrapProvider {
             )
         })?;
         stage_windows_helper_support_files(&helper_context, invocation.helper_file_name)?;
+        let unique_bootstrap_name = format!("Bootstrap-RustyNetWindows.{}.ps1", unique_suffix());
         let remote_path = stage_windows_helper_script_from_path_with_phase(
             &helper_context,
             windows_bootstrap_helper_script_local_path().as_path(),
-            invocation.remote_file_name,
+            unique_bootstrap_name.as_str(),
             RemoteTransportPhase::AccessEstablishment,
         )?;
         let (_report_root, remote_manifest_path, remote_probe_path) =

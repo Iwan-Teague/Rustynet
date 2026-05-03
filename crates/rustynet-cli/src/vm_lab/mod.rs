@@ -6636,8 +6636,14 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             .windows_vm
             .as_deref()
             .ok_or_else(|| "--windows-only requires --windows-vm to be set".to_string())?;
-        if !unready_aliases.is_empty() {
-            let unready_str = unready_aliases.join(", ");
+        // Only the Windows VM needs to be ready for a Windows-only run; ignore Linux VMs.
+        let windows_unready: Vec<String> = unready_aliases
+            .iter()
+            .filter(|a| a.as_str() == windows_alias)
+            .cloned()
+            .collect();
+        if !windows_unready.is_empty() {
+            let unready_str = windows_unready.join(", ");
             materialize_orchestration_staging_dir(
                 pre_setup_orchestration_dir.as_path(),
                 orchestration_dir.as_path(),
@@ -17109,7 +17115,9 @@ fn utm_push_raw(
     command.arg("file").arg("push").arg(utm_name).arg(dst);
     command.stdin(Stdio::from(stdin));
     command.stdout(Stdio::null());
-    let output = run_output_with_timeout(&mut command, timeout)?;
+    command.stderr(Stdio::piped());
+    // Use _preserve to avoid run_output_with_timeout overriding our stdin setup.
+    let output = run_output_with_timeout_preserve(&mut command, timeout)?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stderr.is_empty() {
         return Err(format!(
@@ -18799,24 +18807,42 @@ fn utm_exec_windows_raw(
             encoded.as_str(),
         ],
     );
-    let output = run_output_with_timeout(&mut command, timeout)?;
-    let stderr_raw = String::from_utf8_lossy(&output.stderr);
-    // Strip CLIXML envelopes from the stderr stream defensively even
-    // after the preference suppression above: nested PowerShell calls
-    // (like the build-release wrapper invoking another powershell.exe
-    // -EncodedCommand) can re-emit them.  CLIXML payloads start with
-    // "#< CLIXML" and continue as XML; everything around them (real
-    // utmctl host errors like "OSStatus error -2700" / "Access is
-    // denied") is what we actually care about.
-    let stderr_filtered = strip_powershell_clixml_noise(stderr_raw.as_ref())
-        .trim()
-        .to_string();
-    if !stderr_filtered.is_empty() {
-        return Err(format!(
-            "UTM Windows exec reported error for {utm_name}: {stderr_filtered}"
-        ));
+    // Retry up to 3 times: rapid back-to-back utmctl exec calls intermittently
+    // return exit 1 with empty stderr on macOS when the UTM guest agent is still
+    // processing the previous command's Apple Event.  This is not a script error
+    // (PowerShell exit codes are not forwarded by utmctl) — it is a host-side
+    // transient.  Sleep briefly and retry; keep the last attempt's result.
+    const UTMCTL_EXEC_RETRIES: u32 = 3;
+    const UTMCTL_EXEC_RETRY_SLEEP_MS: u64 = 600;
+    let mut last_output = None;
+    for attempt in 0..=UTMCTL_EXEC_RETRIES {
+        let output = run_output_with_timeout(&mut command, timeout)?;
+        let stderr_raw = String::from_utf8_lossy(&output.stderr);
+        // Strip CLIXML envelopes from the stderr stream defensively even
+        // after the preference suppression above: nested PowerShell calls
+        // (like the build-release wrapper invoking another powershell.exe
+        // -EncodedCommand) can re-emit them.  CLIXML payloads start with
+        // "#< CLIXML" and continue as XML; everything around them (real
+        // utmctl host errors like "OSStatus error -2700" / "Access is
+        // denied") is what we actually care about.
+        let stderr_filtered = strip_powershell_clixml_noise(stderr_raw.as_ref())
+            .trim()
+            .to_string();
+        if !stderr_filtered.is_empty() {
+            return Err(format!(
+                "UTM Windows exec reported error for {utm_name}: {stderr_filtered}"
+            ));
+        }
+        if output.status.success() || attempt == UTMCTL_EXEC_RETRIES {
+            last_output = Some(output);
+            break;
+        }
+        // exit non-zero + empty stderr = UTM agent transient; retry after brief sleep
+        thread::sleep(Duration::from_millis(UTMCTL_EXEC_RETRY_SLEEP_MS));
     }
-    Ok(output.status)
+    Ok(last_output
+        .expect("retry loop always sets last_output")
+        .status)
 }
 
 fn append_utmctl_windows_exec_command(command: &mut Command, args: &[&str]) {
@@ -19177,7 +19203,7 @@ fn build_windows_helper_invocation_script(
     let mut script = format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; {helper_command}"
     );
-    script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -ne $lastExitCode) { $lastExitValue = $lastExitCode.Value; if ($lastExitValue -is [System.Management.Automation.PSVariable]) { $lastExitValue = $lastExitValue.Value }; if ($null -ne $lastExitValue -and [string]$lastExitValue -match '^-?[0-9]+$' -and [int]$lastExitValue -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f [int]$lastExitValue) } }");
+    script.push_str("; if (-not $?) { throw 'Windows helper invocation failed' }; $_helperExitCodeParsed = 0; if ([int]::TryParse([string]$LASTEXITCODE, [ref]$_helperExitCodeParsed) -and $_helperExitCodeParsed -ne 0) { throw (\"Windows helper invocation failed with exit code {0}\" -f $_helperExitCodeParsed) }");
     Ok(script)
 }
 
@@ -19196,7 +19222,8 @@ fn build_windows_result_file_helper_invocation_script(
         helper_args.push(remote_result_path.to_string());
     }
     let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
-    let helper_command_literal = powershell_quote(helper_command.as_str())?;
+    let encoded_helper = encode_powershell_command(helper_command.as_str())?;
+    let encoded_helper_literal = powershell_quote(encoded_helper.as_str())?;
     ensure_no_control_chars("Windows result helper label", helper_label)?;
     Ok(format!(
         "Set-StrictMode -Version Latest; \
@@ -19212,20 +19239,15 @@ fn build_windows_result_file_helper_invocation_script(
          $helperExit = 0; \
          $captured = ''; \
          $failureMessage = ''; \
-         $helperCommand = {helper_command}; \
-         $psExe = Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; \
-         if (-not (Test-Path -LiteralPath $psExe)) {{ $psExe = 'powershell.exe' }}; \
+         $LASTEXITCODE = 0; \
+         $encodedHelper = {encoded_helper}; \
          try {{ \
-           $captured = (& $psExe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -Command $helperCommand *>&1 | Out-String); \
-           $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; \
-           if ($null -ne $lastExitCode) {{ \
-             $lastExitValue = $lastExitCode.Value; \
-             if ($lastExitValue -is [System.Management.Automation.PSVariable]) {{ $lastExitValue = $lastExitValue.Value }}; \
-             if ($null -ne $lastExitValue -and [string]$lastExitValue -match '^-?[0-9]+$') {{ \
-               $helperExit = [int]$lastExitValue \
-             }} else {{ \
-               $helperExit = 1 \
-             }} \
+           $decodedHelper = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($encodedHelper)); \
+           $helperBlock = [ScriptBlock]::Create($decodedHelper); \
+           $captured = (& $helperBlock *>&1 | Out-String); \
+           $_exitCodeParsed = 0; \
+           if ([int]::TryParse([string]$LASTEXITCODE, [ref]$_exitCodeParsed)) {{ \
+             $helperExit = $_exitCodeParsed \
            }} elseif (-not $?) {{ \
              $helperExit = 1 \
            }} \
@@ -19283,7 +19305,7 @@ fn build_windows_result_file_helper_invocation_script(
          }}; \
          exit $helperExit",
         result_path = powershell_quote(remote_result_path)?,
-        helper_command = helper_command_literal,
+        encoded_helper = encoded_helper_literal,
         helper_label = helper_label,
     ))
 }
@@ -19578,10 +19600,16 @@ fn bootstrap_windows_access_for_target(
             })?;
             let local_path = windows_bootstrap_helper_script_local_path();
             stage_windows_helper_support_files(&context, WINDOWS_BOOTSTRAP_HELPER_FILE)?;
+            // Use a unique per-run remote name so a Defender file lock on the
+            // previously-executed copy does not block the UTM push (OSStatus
+            // -2700 / "file in use").  The result file already uses this
+            // pattern; apply it to the script itself for the same reason.
+            let remote_bootstrap_name =
+                format!("Bootstrap-RustyNetWindows.{}.ps1", unique_suffix());
             let remote_path = stage_windows_helper_script_from_path_with_phase(
                 &context,
                 local_path.as_path(),
-                WINDOWS_BOOTSTRAP_HELPER_FILE,
+                remote_bootstrap_name.as_str(),
                 RemoteTransportPhase::AccessEstablishment,
             )?;
             let remote_result_name = format!(
@@ -22287,7 +22315,9 @@ mod tests {
         assert!(script.contains("Windows service-host smoke helper did not write result file"));
         assert!(script.contains("Windows service-host smoke helper wrote empty result file"));
         assert!(script.contains("Remove-Item -LiteralPath $resultPath -Force"));
-        assert!(script.contains("-Command $helperCommand"));
+        assert!(script.contains("$encodedHelper"));
+        assert!(script.contains("[ScriptBlock]::Create($decodedHelper)"));
+        assert!(script.contains("& $helperBlock *>&1 | Out-String"));
     }
 
     #[test]
@@ -22304,12 +22334,30 @@ mod tests {
             "Windows verify helper",
         )
         .expect("result-file helper invocation script should inject output path");
+        // Verify -OutputPath was injected by checking the encoded helper contains it
+        let expected_cmd = super::build_windows_helper_command(
+            r"C:\ProgramData\Rustynet\vm-lab\Verify-RustyNetWindowsBootstrap.ps1",
+            &[
+                "-RustyNetRoot".to_string(),
+                r"C:\Rustynet".to_string(),
+                "-InstallRoot".to_string(),
+                r"C:\Program Files\RustyNet".to_string(),
+                "-OutputPath".to_string(),
+                r"C:\ProgramData\Rustynet\vm-lab\verify.json".to_string(),
+            ],
+        )
+        .expect("expected cmd should build");
+        let expected_b64 = super::encode_powershell_command(expected_cmd.as_str())
+            .expect("expected b64 should encode");
         assert!(
-            script
-                .contains("C:\\ProgramData\\Rustynet\\vm-lab\\Verify-RustyNetWindowsBootstrap.ps1")
+            script.contains(expected_b64.as_str()),
+            "script should contain base64-encoded helper with injected -OutputPath"
         );
-        assert!(script.contains("-OutputPath ''C:\\ProgramData\\Rustynet\\vm-lab\\verify.json''"));
-        assert!(script.contains("-Command $helperCommand"));
+        // Outer wrapper still embeds the result path as a literal
+        assert!(script.contains("C:\\ProgramData\\Rustynet\\vm-lab\\verify.json"));
+        assert!(script.contains("$encodedHelper"));
+        assert!(script.contains("[ScriptBlock]::Create($decodedHelper)"));
+        assert!(script.contains("& $helperBlock *>&1 | Out-String"));
     }
 
     #[test]
