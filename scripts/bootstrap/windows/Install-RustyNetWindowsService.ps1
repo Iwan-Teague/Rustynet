@@ -453,7 +453,8 @@ function Build-ReviewedDaemonArgsJson {
     return (@(
         '--backend', $BackendLabel,
         '--auto-tunnel-enforce', 'false',
-        '--trust-max-age-secs', '86400'
+        '--trust-max-age-secs', '86400',
+        '--node-id', 'windows-client-1'
     ) | ConvertTo-Json -Compress)
 }
 # (--trust-max-age-secs is parsed by rustynetd's daemon command — added to
