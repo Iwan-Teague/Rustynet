@@ -296,6 +296,11 @@ function Invoke-CargoBuildForReport {
     )
 
     Ensure-Directory -Path $Layout.report_root
+    # PS5.1: $ErrorActionPreference='Stop' treats native-command stderr as a
+    # terminating NativeCommandError even when stderr is redirected to a file.
+    # Lower to Continue for the cargo invocation so build output is captured
+    # and $LASTEXITCODE is used for success/failure instead of an exception.
+    $ErrorActionPreference = 'Continue'
     if ($Append) {
         & $CargoCommand @CargoArgs 1>> $Layout.stdout_path 2>> $Layout.stderr_path
     }

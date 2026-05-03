@@ -933,6 +933,33 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
     }
 
     if (-not $serviceConfigError) {
+        # Remove distribute-stage artifacts from any prior install run.
+        # A fresh install starts with clean distributed state; the
+        # distribute stages re-establish bundles and verifier keys after
+        # bootstrap completes.  Stale bundles without matching verifier
+        # keys (or vice versa) cause the daemon's startup preflight to
+        # fail closed on the *next* install attempt.
+        $script:InstallFailureStep = 'purge-stale-distribute-state'
+        $membershipDir = Join-Path $StateRoot 'membership'
+        foreach ($stalePath in @(
+            (Join-Path $trustDir 'rustynetd.traversal'),
+            (Join-Path $trustDir 'rustynetd.traversal.watermark'),
+            (Join-Path $trustDir 'traversal.pub'),
+            (Join-Path $trustDir 'rustynetd.assignment'),
+            (Join-Path $trustDir 'rustynetd.assignment.watermark'),
+            (Join-Path $trustDir 'assignment.pub'),
+            (Join-Path $trustDir 'rustynetd.dns-zone'),
+            (Join-Path $trustDir 'rustynetd.dns-zone.watermark'),
+            (Join-Path $trustDir 'dns-zone.pub'),
+            (Join-Path $membershipDir 'membership.snapshot'),
+            (Join-Path $membershipDir 'membership.log'),
+            (Join-Path $membershipDir 'membership.watermark')
+        )) {
+            if (Test-Path -LiteralPath $stalePath) {
+                Remove-Item -Force -LiteralPath $stalePath
+            }
+        }
+
         $serviceStartAttempted = $true
         try {
             $script:InstallFailureStep = 'start-runtime-service'

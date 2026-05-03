@@ -8200,8 +8200,12 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
     validate_trust_verifier_key_permissions(&config.trust_verifier_key_path)?;
-    validate_membership_snapshot_permissions(&config.membership_snapshot_path)?;
-    validate_membership_log_permissions(&config.membership_log_path)?;
+    if config.membership_snapshot_path.exists() {
+        validate_membership_snapshot_permissions(&config.membership_snapshot_path)?;
+        if config.membership_log_path.exists() {
+            validate_membership_log_permissions(&config.membership_log_path)?;
+        }
+    }
     if config.traversal_bundle_path.exists() {
         validate_traversal_verifier_key_permissions(&config.traversal_verifier_key_path)?;
         validate_traversal_bundle_permissions(&config.traversal_bundle_path)?;
@@ -8256,18 +8260,27 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         watermark,
     )
     .map_err(|err| DaemonError::InvalidConfig(format!("trust preflight failed: {err}")))?;
-    let membership_snapshot =
-        load_membership_snapshot(&config.membership_snapshot_path).map_err(|err| {
-            DaemonError::InvalidConfig(format!("membership snapshot preflight failed: {err}"))
-        })?;
-    let membership_entries = load_membership_log(&config.membership_log_path).map_err(|err| {
-        DaemonError::InvalidConfig(format!("membership log preflight failed: {err}"))
-    })?;
-    let _ =
-        replay_membership_snapshot_and_log(&membership_snapshot, &membership_entries, unix_now())
+    if config.membership_snapshot_path.exists() {
+        let membership_snapshot = load_membership_snapshot(&config.membership_snapshot_path)
             .map_err(|err| {
+                DaemonError::InvalidConfig(format!("membership snapshot preflight failed: {err}"))
+            })?;
+        let membership_entries = if config.membership_log_path.exists() {
+            load_membership_log(&config.membership_log_path).map_err(|err| {
+                DaemonError::InvalidConfig(format!("membership log preflight failed: {err}"))
+            })?
+        } else {
+            Vec::new()
+        };
+        let _ = replay_membership_snapshot_and_log(
+            &membership_snapshot,
+            &membership_entries,
+            unix_now(),
+        )
+        .map_err(|err| {
             DaemonError::InvalidConfig(format!("membership replay preflight failed: {err}"))
         })?;
+    }
 
     let auto_tunnel_preflight = if config.auto_tunnel_enforce {
         let bundle_path = config.auto_tunnel_bundle_path.as_ref().ok_or_else(|| {
