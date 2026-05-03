@@ -15986,10 +15986,33 @@ fn probe_tcp_port_status(
         .trim()
         .parse::<IpAddr>()
         .map_err(|err| format!("invalid SSH probe IP {ip:?}: {err}"))?;
-    let socket = SocketAddr::new(parsed_ip, port);
-    match TcpStream::connect_timeout(&socket, timeout) {
-        Ok(_) => Ok(("open".to_string(), None)),
-        Err(err) => Ok(("closed".to_string(), Some(format!("{err}")))),
+    let socket_addr = SocketAddr::new(parsed_ip, port);
+    match TcpStream::connect_timeout(&socket_addr, timeout) {
+        Ok(_) => return Ok(("open".to_string(), None)),
+        Err(primary_err) => {
+            // On macOS, the 192.168.64.0/24 UTM shared-network route is SCOPED to bridge100
+            // and absent from the global routing table. TcpStream::connect_timeout uses the
+            // global table → routes via en0 → fails. Retry by binding to 192.168.64.1 so the
+            // OS selects the bridge100-scoped route instead.
+            if let IpAddr::V4(v4) = parsed_ip {
+                let octets = v4.octets();
+                if octets[0] == 192 && octets[1] == 168 && octets[2] == 64 {
+                    use socket2::{Domain, SockAddr, Socket, Type};
+                    if let Ok(sock) = Socket::new(Domain::IPV4, Type::STREAM, None) {
+                        let bind: SocketAddr = "192.168.64.1:0".parse().unwrap();
+                        if sock.bind(&SockAddr::from(bind)).is_ok() {
+                            if sock
+                                .connect_timeout(&SockAddr::from(socket_addr), timeout)
+                                .is_ok()
+                            {
+                                return Ok(("open".to_string(), None));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(("closed".to_string(), Some(format!("{primary_err}"))))
+        }
     }
 }
 
