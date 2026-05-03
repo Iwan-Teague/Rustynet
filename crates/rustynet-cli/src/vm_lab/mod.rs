@@ -7285,6 +7285,9 @@ fn run_windows_orchestration_with_pulled_bundles(
                     Some(paths.traversal_verifier_key.clone());
                 options.distribute_windows_dns_zone_verifier_key =
                     Some(paths.dns_zone_verifier_key.clone());
+                // Pass exit alias so the orchestrator can amend membership
+                // and issue a Windows-specific assignment after bootstrap.
+                options.linux_exit_alias = Some(exit_alias.clone());
                 prelude_outcomes.push(stage_outcome(
                     "stage_windows_bundles_for_distribution",
                     VmLabStageStatus::Pass,
@@ -7485,6 +7488,14 @@ pub struct WindowsOrchestrationOptions {
     /// Local path to the mesh's DNS-zone verifier public key. Loaded
     /// by the daemon at `C:\ProgramData\RustyNet\trust\dns-zone.pub`.
     pub distribute_windows_dns_zone_verifier_key: Option<PathBuf>,
+    /// Alias of the Linux exit node in the inventory. When `Some`, the
+    /// orchestrator adds the Windows node to the Linux membership on the
+    /// exit and issues a Windows-specific assignment bundle after all
+    /// security validators pass. Required for `validate_windows_mesh_join`
+    /// to succeed — without it membership distribution lands a snapshot
+    /// that does not include the Windows node and the daemon stays in
+    /// `LocalNodeNotActive` fail-closed.
+    pub linux_exit_alias: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8110,6 +8121,151 @@ fn run_windows_orchestration_stages_with_options(
 
     let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
 
+    // Stage 7a: amend_membership_for_windows (W4.2 prerequisite)
+    //
+    // When `linux_exit_alias` is configured the orchestrator adds the Windows
+    // node to the Linux mesh membership before distributing signed bundles.
+    // Without this the Windows daemon receives a membership snapshot that does
+    // not include its own node_id and stays in `LocalNodeNotActive` fail-closed
+    // regardless of the assigned backend.
+    let amend_membership_log_path = logs_dir.join("amend_membership_for_windows.log");
+    let mut windows_wg_pubkey_hex: Option<String> = None;
+    let mut amended_membership_path: Option<PathBuf> = None;
+    let amend_membership_outcome = if dry_run {
+        stage_outcome(
+            "amend_membership_for_windows",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would amend Linux membership to include {windows_alias}"),
+            vec![],
+        )
+    } else if options.linux_exit_alias.is_none() {
+        stage_outcome(
+            "amend_membership_for_windows",
+            VmLabStageStatus::Skipped,
+            "skipped: no linux_exit_alias configured; Windows membership amendment disabled"
+                .to_string(),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "amend_membership_for_windows",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let exit_alias = options.linux_exit_alias.as_deref().unwrap();
+        match amend_membership_for_windows_node(
+            windows_alias,
+            exit_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+            report_dir,
+            &mut windows_wg_pubkey_hex,
+            &mut amended_membership_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&amend_membership_log_path, summary.as_str());
+                stage_outcome(
+                    "amend_membership_for_windows",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![amend_membership_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&amend_membership_log_path, reason.as_str());
+                stage_outcome(
+                    "amend_membership_for_windows",
+                    VmLabStageStatus::Fail,
+                    format!("Windows membership amendment failed for {windows_alias}: {reason}"),
+                    vec![amend_membership_log_path.clone()],
+                )
+            }
+        }
+    };
+    let amend_membership_passed = amend_membership_outcome.status == VmLabStageStatus::Pass;
+
+    // Stage 7b: issue_windows_assignment (W4.2 prerequisite)
+    //
+    // Issues a signed assignment bundle for the Windows node using the existing
+    // Linux assignment env as a basis. Only the Windows node's bundle is
+    // (re-)issued; the Linux peers' assignments are unchanged.
+    let issue_assignment_log_path = logs_dir.join("issue_windows_assignment.log");
+    let mut issued_assignment_path: Option<PathBuf> = None;
+    let issue_windows_assignment_outcome = if dry_run {
+        stage_outcome(
+            "issue_windows_assignment",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would issue Windows assignment bundle for {windows_alias}"),
+            vec![],
+        )
+    } else if options.linux_exit_alias.is_none() {
+        stage_outcome(
+            "issue_windows_assignment",
+            VmLabStageStatus::Skipped,
+            "skipped: no linux_exit_alias configured; Windows assignment issuance disabled"
+                .to_string(),
+            vec![],
+        )
+    } else if !amend_membership_passed {
+        stage_outcome(
+            "issue_windows_assignment",
+            VmLabStageStatus::Skipped,
+            format!("skipped: amend_membership_for_windows did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let exit_alias = options.linux_exit_alias.as_deref().unwrap();
+        let wg_hex = windows_wg_pubkey_hex.as_deref().unwrap();
+        match issue_assignment_for_windows_node(
+            windows_alias,
+            exit_alias,
+            wg_hex,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+            report_dir,
+            &mut issued_assignment_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&issue_assignment_log_path, summary.as_str());
+                stage_outcome(
+                    "issue_windows_assignment",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![issue_assignment_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&issue_assignment_log_path, reason.as_str());
+                stage_outcome(
+                    "issue_windows_assignment",
+                    VmLabStageStatus::Fail,
+                    format!("Windows assignment issuance failed for {windows_alias}: {reason}"),
+                    vec![issue_assignment_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    // Override membership / assignment bundle paths when fresh bundles were
+    // produced by the amend/issue stages. When linux_exit_alias is Some but
+    // the stages failed the effective path is None, causing the downstream
+    // distribute stage to emit "no local bundle path provided" (Skipped) rather
+    // than distributing a stale bundle that does not include the Windows node.
+    let effective_membership_bundle: Option<PathBuf> = if options.linux_exit_alias.is_some() {
+        amended_membership_path.clone()
+    } else {
+        options.distribute_windows_membership_bundle.clone()
+    };
+    let effective_assignment_bundle: Option<PathBuf> = if options.linux_exit_alias.is_some() {
+        issued_assignment_path.clone()
+    } else {
+        options.distribute_windows_assignment_bundle.clone()
+    };
+
     // Stages 8-11: distribute_windows_{membership,assignment,traversal,dns-zone}
     // (W4.5)
     //
@@ -8224,7 +8380,7 @@ fn run_windows_orchestration_stages_with_options(
     let distribute_membership_outcome = run_distribute(
         "distribute_windows_membership",
         distribute_membership_log_path.as_path(),
-        options.distribute_windows_membership_bundle.as_deref(),
+        effective_membership_bundle.as_deref(),
         run_distribute_windows_membership_stage,
     );
     // Verifier keys MUST land before the corresponding bundles. The
@@ -8258,7 +8414,7 @@ fn run_windows_orchestration_stages_with_options(
     let distribute_assignment_outcome = run_distribute(
         "distribute_windows_assignment",
         distribute_assignment_log_path.as_path(),
-        options.distribute_windows_assignment_bundle.as_deref(),
+        effective_assignment_bundle.as_deref(),
         run_distribute_windows_assignment_stage,
     );
     let distribute_traversal_outcome = run_distribute(
@@ -8389,6 +8545,8 @@ fn run_windows_orchestration_stages_with_options(
         custody_outcome,
         authenticode_outcome,
         dns_failclosed_outcome,
+        amend_membership_outcome,
+        issue_windows_assignment_outcome,
         distribute_membership_outcome,
         distribute_assignment_verifier_outcome,
         distribute_traversal_verifier_outcome,
@@ -9527,6 +9685,327 @@ pub fn run_distribute_windows_dns_zone_verifier_key_stage(
         known_hosts_path,
         local_verifier_key_path,
     )
+}
+
+// =====================================================================
+// Windows membership/assignment helpers (W4.2 live-mesh prep)
+//
+// These functions implement the two orchestration stages that prepare
+// the Windows node to join the mesh: amending the Linux membership to
+// include the Windows node, and issuing a Windows-specific signed
+// assignment bundle. Both helpers are called only when `linux_exit_alias`
+// is populated in `WindowsOrchestrationOptions`.
+// =====================================================================
+
+/// Validates that `id` is safe for use as a node-id in CLI flags and spec
+/// strings: ASCII alphanumeric + hyphen + underscore, 1-63 chars.
+fn validate_mesh_node_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 63 {
+        return Err(format!("node ID must be 1-63 characters: {id:?}"));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "node ID must be ASCII alphanumeric + hyphen + underscore: {id:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that `addr` is safe for use as an endpoint address in NODES_SPEC:
+/// ASCII alphanumeric + dot + colon + hyphen, rejecting the `|` and `;`
+/// separators used in the spec format.
+fn validate_mesh_endpoint_address(addr: &str) -> Result<(), String> {
+    if addr.is_empty() {
+        return Err("endpoint address must not be empty".to_string());
+    }
+    if !addr
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '-')
+    {
+        return Err(format!(
+            "endpoint address contains invalid characters: {addr:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Extracts the unquoted value of `key` from a simple `KEY="value"` env file
+/// body. Returns `None` when the key is absent. Delegates to `parse_env_value`
+/// so it handles the same escape sequences as `format_env_assignment`.
+fn extract_env_var_from_text(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((k, raw_value)) = trimmed.split_once('=')
+            && k == key
+        {
+            return parse_env_value(raw_value).ok();
+        }
+    }
+    None
+}
+
+/// Adds `windows_alias` to the Linux mesh membership on `exit_alias` and
+/// fetches the updated `membership.snapshot`.
+///
+/// Collects the Windows WireGuard pubkey via PowerShell, runs
+/// `rustynet ops e2e-membership-add` on the exit node, then captures the
+/// updated snapshot to `<report_dir>/state/windows-membership.snapshot`.
+///
+/// On success sets `*out_wg_pubkey_hex` (64-char hex) and
+/// `*out_membership_path` (local snapshot path).
+#[allow(clippy::too_many_arguments)]
+fn amend_membership_for_windows_node(
+    windows_alias: &str,
+    exit_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    report_dir: &Path,
+    out_wg_pubkey_hex: &mut Option<String>,
+    out_membership_path: &mut Option<PathBuf>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let windows_entry = inventory
+        .iter()
+        .find(|e| e.alias == windows_alias)
+        .ok_or_else(|| format!("Windows alias {windows_alias:?} not found in inventory"))?
+        .clone();
+    let windows_node_id = windows_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?;
+    validate_mesh_node_id(windows_node_id)?;
+    let windows_target = remote_target_from_inventory_entry(&windows_entry, None);
+    let exit_entry = inventory
+        .iter()
+        .find(|e| e.alias == exit_alias)
+        .ok_or_else(|| format!("exit alias {exit_alias:?} not found in inventory"))?
+        .clone();
+    let exit_node_id = exit_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
+    let exit_target = remote_target_from_inventory_entry(&exit_entry, None);
+
+    // Collect the Windows WireGuard public key (base64 on disk → hex).
+    // The key file is written by the daemon at startup.
+    let wg_pub_ps = concat!(
+        "$b=[Convert]::FromBase64String(",
+        "(Get-Content -LiteralPath 'C:\\ProgramData\\RustyNet\\keys\\wireguard.pub' -Raw).Trim());",
+        " -join($b|%{$_.ToString('x2')})"
+    );
+    let raw_hex = capture_remote_shell_command_for_target(
+        &windows_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        wg_pub_ps,
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("collect Windows WireGuard pubkey from {windows_alias} failed: {e}"))?;
+    let pubkey_hex = raw_hex.trim().to_string();
+    if pubkey_hex.len() != 64 || !pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Windows WireGuard pubkey from {windows_alias} is not a 64-char lowercase hex \
+             string: {pubkey_hex:?}"
+        ));
+    }
+
+    // Add the Windows node to the Linux membership on the exit node.
+    let owner_approver_id = format!("{exit_node_id}-owner");
+    let add_script = format!(
+        "set -eu; sudo -n rustynet ops e2e-membership-add \
+         --client-node-id {node_id} \
+         --client-pubkey-hex {pubkey} \
+         --owner-approver-id {approver}",
+        node_id = shell_quote(windows_node_id),
+        pubkey = shell_quote(pubkey_hex.as_str()),
+        approver = shell_quote(owner_approver_id.as_str()),
+    );
+    let add_out = capture_remote_shell_command_for_target(
+        &exit_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        add_script.as_str(),
+        Duration::from_secs(60),
+    )
+    .map_err(|e| format!("e2e-membership-add on {exit_alias} failed: {e}"))?;
+
+    // Fetch the updated membership snapshot from the exit node.
+    let snapshot_path = report_dir.join("state").join("windows-membership.snapshot");
+    capture_remote_file_to_local(
+        &exit_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        "/var/lib/rustynet/membership.snapshot",
+        snapshot_path.as_path(),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("fetch membership.snapshot from {exit_alias} failed: {e}"))?;
+
+    *out_wg_pubkey_hex = Some(pubkey_hex.clone());
+    *out_membership_path = Some(snapshot_path.clone());
+
+    Ok(format!(
+        "amended Linux membership to include {windows_alias} ({windows_node_id}) on \
+         {exit_alias}: pubkey={pubkey_hex} add_output={} snapshot={}",
+        add_out.trim(),
+        snapshot_path.display(),
+    ))
+}
+
+/// Issues a signed assignment bundle for the Windows node.
+///
+/// Reads the existing Linux assignment env (`<report_dir>/state/issue_assignments.env`),
+/// appends the Windows node to `NODES_SPEC` and `ALLOW_SPEC`, sets
+/// `ASSIGNMENTS_SPEC` to only the Windows node (the Linux peers' bundles are
+/// unchanged), SCPs the extended env to the exit node, runs
+/// `e2e-issue-assignment-bundles-from-env`, and fetches the produced bundle.
+///
+/// On success sets `*out_assignment_path` to the local bundle path.
+#[allow(clippy::too_many_arguments)]
+fn issue_assignment_for_windows_node(
+    windows_alias: &str,
+    exit_alias: &str,
+    windows_wg_pubkey_hex: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    report_dir: &Path,
+    out_assignment_path: &mut Option<PathBuf>,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let windows_entry = inventory
+        .iter()
+        .find(|e| e.alias == windows_alias)
+        .ok_or_else(|| format!("Windows alias {windows_alias:?} not found in inventory"))?
+        .clone();
+    let windows_node_id = windows_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?;
+    validate_mesh_node_id(windows_node_id)?;
+    let windows_ip = windows_entry
+        .last_known_ip
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no last_known_ip"))?;
+    validate_mesh_endpoint_address(windows_ip)?;
+    let exit_entry = inventory
+        .iter()
+        .find(|e| e.alias == exit_alias)
+        .ok_or_else(|| format!("exit alias {exit_alias:?} not found in inventory"))?
+        .clone();
+    let exit_node_id = exit_entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
+    let exit_target = remote_target_from_inventory_entry(&exit_entry, None);
+
+    // Read and parse the base assignment env produced by the Linux bash orchestrator.
+    let base_env_path = report_dir.join("state").join("issue_assignments.env");
+    if !base_env_path.is_file() {
+        return Err(format!(
+            "base assignment env not found at {}; run Linux issue stages first",
+            base_env_path.display()
+        ));
+    }
+    let env_text = std::fs::read_to_string(&base_env_path)
+        .map_err(|e| format!("read base assignment env failed: {e}"))?;
+    let nodes_spec = extract_env_var_from_text(env_text.as_str(), "NODES_SPEC")
+        .ok_or_else(|| "NODES_SPEC not found in base assignment env".to_string())?;
+    let allow_spec = extract_env_var_from_text(env_text.as_str(), "ALLOW_SPEC")
+        .ok_or_else(|| "ALLOW_SPEC not found in base assignment env".to_string())?;
+
+    // Extend the specs with the Windows node.
+    // Port 51820 matches the hardcoded WireGuard listen port used by
+    // `build_onehop_specs` in the Linux bash orchestrator.
+    let windows_node_spec = format!("{windows_node_id}|{windows_ip}:51820|{windows_wg_pubkey_hex}");
+    let extended_nodes_spec = format!("{nodes_spec};{windows_node_spec}");
+    let extended_allow_spec =
+        format!("{allow_spec};{windows_node_id}|{exit_node_id};{exit_node_id}|{windows_node_id}");
+    let windows_assignments_spec = format!("{windows_node_id}|{exit_node_id}");
+
+    // Write the extended env to a local temp file.
+    let windows_env_path = report_dir
+        .join("state")
+        .join("issue_windows_assignment.env");
+    let env_body = [
+        format_env_assignment("NODES_SPEC", extended_nodes_spec.as_str())
+            .map_err(|e| format!("format NODES_SPEC failed: {e}"))?,
+        format_env_assignment("ALLOW_SPEC", extended_allow_spec.as_str())
+            .map_err(|e| format!("format ALLOW_SPEC failed: {e}"))?,
+        format_env_assignment("ASSIGNMENTS_SPEC", windows_assignments_spec.as_str())
+            .map_err(|e| format!("format ASSIGNMENTS_SPEC failed: {e}"))?,
+    ]
+    .join("\n");
+    std::fs::write(windows_env_path.as_path(), env_body.as_str())
+        .map_err(|e| format!("write Windows assignment env failed: {e}"))?;
+
+    // SCP env to exit, issue bundle, cleanup.
+    let remote_env = format!("/tmp/rn-windows-assignment-{}.env", unique_suffix());
+    ensure_success_status(
+        scp_to_remote_for_target(
+            &exit_target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            windows_env_path.as_path(),
+            remote_env.as_str(),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| format!("SCP Windows assignment env to {exit_alias} failed: {e}"))?,
+        "SCP Windows assignment env to exit",
+    )?;
+    let issue_script = format!(
+        "set -eu; \
+         sudo -n mkdir -p /run/rustynet/assignment-issue; \
+         sudo -n rustynet ops e2e-issue-assignment-bundles-from-env \
+           --env-file {remote_env}; \
+         sudo -n rm -f {remote_env}",
+        remote_env = shell_quote(remote_env.as_str()),
+    );
+    capture_remote_shell_command_for_target(
+        &exit_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        issue_script.as_str(),
+        Duration::from_secs(60),
+    )
+    .map_err(|e| format!("issue Windows assignment bundle on {exit_alias} failed: {e}"))?;
+
+    // Fetch the issued bundle.
+    let remote_bundle_path =
+        format!("/run/rustynet/assignment-issue/rn-assignment-{windows_node_id}.assignment");
+    let local_bundle_path = report_dir
+        .join("state")
+        .join(format!("assignment-{windows_node_id}.bundle"));
+    capture_remote_file_to_local(
+        &exit_target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        remote_bundle_path.as_str(),
+        local_bundle_path.as_path(),
+        Duration::from_secs(30),
+    )
+    .map_err(|e| format!("fetch Windows assignment bundle from {exit_alias} failed: {e}"))?;
+
+    *out_assignment_path = Some(local_bundle_path.clone());
+
+    Ok(format!(
+        "issued assignment bundle for {windows_alias} ({windows_node_id}) via {exit_alias}; \
+         bundle={}",
+        local_bundle_path.display(),
+    ))
 }
 
 // =====================================================================
