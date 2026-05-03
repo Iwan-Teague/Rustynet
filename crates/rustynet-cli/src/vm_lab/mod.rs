@@ -16089,7 +16089,12 @@ fn select_preferred_live_ssh_ip(
 
 fn is_viable_live_ssh_ip(candidate: IpAddr) -> bool {
     match candidate {
-        IpAddr::V4(addr) => !(addr.is_unspecified() || addr.is_loopback() || addr.is_multicast()),
+        IpAddr::V4(addr) => {
+            !(addr.is_unspecified()
+                || addr.is_loopback()
+                || addr.is_multicast()
+                || addr.is_link_local())
+        }
         IpAddr::V6(addr) => {
             !(addr.is_unspecified()
                 || addr.is_loopback()
