@@ -16079,12 +16079,31 @@ fn select_preferred_live_ssh_ip(
 ) -> Option<IpAddr> {
     let last_known_ip = last_known_ip.and_then(|value| value.parse::<IpAddr>().ok());
     let mesh_ip = mesh_ip.and_then(|value| value.parse::<IpAddr>().ok());
-    candidates
+
+    let viable: Vec<IpAddr> = candidates
         .iter()
         .copied()
-        .filter(|candidate| is_viable_live_ssh_ip(*candidate))
-        .filter(|candidate| Some(*candidate) != mesh_ip)
-        .max_by_key(|candidate| live_ssh_ip_score(*candidate, last_known_ip))
+        .filter(|c| is_viable_live_ssh_ip(*c))
+        .filter(|c| Some(*c) != mesh_ip)
+        .collect();
+
+    // If no IPv4 candidate survives (only IPv6 secondary/tunnel addresses like
+    // SLAAC ULA from bridge100 or a stale WireGuard interface), include
+    // last_known_ip as a fallback to avoid selecting a non-SSH-accessible IPv6.
+    let has_ipv4 = viable.iter().any(IpAddr::is_ipv4);
+    let mut all_candidates = viable;
+    if !has_ipv4 {
+        if let Some(lk) = last_known_ip {
+            if lk.is_ipv4() && is_viable_live_ssh_ip(lk) && Some(lk) != mesh_ip {
+                all_candidates.push(lk);
+            }
+        }
+    }
+
+    all_candidates
+        .iter()
+        .copied()
+        .max_by_key(|c| live_ssh_ip_score(*c, last_known_ip))
 }
 
 fn is_viable_live_ssh_ip(candidate: IpAddr) -> bool {
