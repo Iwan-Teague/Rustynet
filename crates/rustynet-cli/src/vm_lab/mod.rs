@@ -17698,17 +17698,21 @@ fn utm_exec_root_raw(
     let utmctl_path = utmctl_binary_path()?;
     let mut command = Command::new(utmctl_path);
     command.arg("exec").arg(utm_name);
-    // Prefix every argv element with its own `--cmd`. utmctl's
-    // `--cmd <cmd> ...` is a repeated option; passing a single
-    // `--cmd <bin>` followed by bare positional args works under most
-    // utmctl versions but intermittently serializes the bare positionals
-    // into a single argv element on the guest side (observed for the
-    // Windows powershell.exe flavor of this call in livelab4/5). Using
-    // explicit `--cmd` per arg matches utmctl's documented syntax and
-    // never collapses.
-    for arg in ["/bin/bash", "-lc", command_script] {
-        command.arg("--cmd").arg(arg);
-    }
+    // Use a single `--cmd` followed by bare positional args. The Linux
+    // QEMU guest agent delivers subsequent `--cmd` tokens as literal argv
+    // elements to the executed binary (i.e. bash receives "--cmd" as an
+    // unknown option and exits 2). Passing a single `--cmd /bin/bash`
+    // then bare positionals keeps the argv clean on both Linux QEMU and
+    // the Windows UTM guest-agent path. The collapsing issue observed for
+    // the Windows powershell.exe path in livelab4/5 was specific to the
+    // Windows guest agent and does not affect Linux; the Windows exec path
+    // uses `utm_exec_windows_raw`/`append_utmctl_windows_exec_command`
+    // instead of this function.
+    command
+        .arg("--cmd")
+        .arg("/bin/bash")
+        .arg("-lc")
+        .arg(command_script);
     run_status_with_timeout(&mut command, timeout)
 }
 
