@@ -6364,6 +6364,10 @@ impl DaemonRuntime {
         self.last_reconcile_error = None;
         let now_unix = unix_now();
         self.maybe_preexpiry_refresh_traversal(now_unix);
+        // Load fresh traversal hints here, after any pre-expiry download, so
+        // apply_traversal_authority_to_peers has valid state on the very first
+        // reconcile tick (not only after the second tick).
+        self.refresh_traversal_hint_state(false);
         self.maybe_preexpiry_refresh_dns_zone(now_unix, auto_bundle.as_ref());
         self.maybe_trigger_endpoint_change_refresh();
 
@@ -6511,6 +6515,15 @@ impl DaemonRuntime {
                     self.bootstrap_error = None;
                     self.reconcile_failures = 0;
                     self.local_route_reconcile_pending = false;
+                    // Persist runtime state after every successful dataplane apply so
+                    // external validators (e.g. windows-mesh-status-check) can observe
+                    // a current snapshot without requiring an operator command.
+                    // persist_state() already calls restrict_permanent + force_fail_closed
+                    // on write failure, so an Err here means the daemon has already
+                    // transitioned to a permanent restriction; just log it for diagnostics.
+                    if let Err(err) = self.persist_state() {
+                        log::warn!("reconcile: state persist failed after successful apply: {err}");
+                    }
                 }
                 (Err(err), Ok(())) => {
                     self.reconcile_failures = self.reconcile_failures.saturating_add(1);
@@ -6545,7 +6558,6 @@ impl DaemonRuntime {
         }
 
         self.poll_endpoint_monitor_and_maybe_refresh();
-        self.refresh_traversal_hint_state(false);
         self.maintain_exit_port_forward(
             self.is_serving_exit_node(self.selected_exit_node.as_deref()),
         );
@@ -19683,5 +19695,38 @@ mod tests {
         assert!(fetcher.traversal_url.is_none());
         assert!(fetcher.assignment_url.is_none());
         assert!(fetcher.dns_zone_url.is_none());
+    }
+
+    /// Verify that a successful reconcile() writes the state file so that
+    /// external validators (e.g. windows-mesh-status-check) can observe a
+    /// current snapshot without requiring an explicit operator command.
+    ///
+    /// Prior to the fix, persist_state() was only called from explicit command
+    /// handlers (exit-select, route-advertise, etc.) and never from reconcile(),
+    /// so the state file was never written for Windows nodes whose only active
+    /// driver is the periodic reconcile loop.
+    #[test]
+    fn reconcile_success_writes_state_file() {
+        let relay_addr: SocketAddr = "203.0.113.42:40099".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-reconcile-writes-state",
+            relay_addr,
+            "relay-test",
+        );
+
+        let state_path = runtime.state_path.clone();
+        assert!(
+            !state_path.exists(),
+            "state file must not exist before first reconcile"
+        );
+
+        runtime.reconcile();
+
+        assert!(
+            state_path.exists(),
+            "state file must be written after a successful reconcile"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 }
