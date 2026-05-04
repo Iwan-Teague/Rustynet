@@ -40,8 +40,29 @@ struct DnsRefreshConfig<'a> {
     targets: &'a [DnsRefreshTarget<'a>],
 }
 
+/// Assignment bundle issuance is repeated during the convergence loop so that
+/// `rustynet state refresh` calls on nodes never see a stale assignment bundle.
+/// The daemon enforces `auto_tunnel_max_age_secs = 300` (5 min); without
+/// periodic re-issuance the LAN-toggle stage would exceed that window.
+#[derive(Clone, Copy)]
+struct AssignmentRefreshConfig<'a> {
+    signer_host: &'a str,
+    exit_host: &'a str,
+    client_host: &'a str,
+    blind_exit_host: &'a str,
+    env_local: &'a Path,
+    assign_pub_local: &'a Path,
+    exit_assignment_local: &'a Path,
+    client_assignment_local: &'a Path,
+    blind_exit_assignment_local: &'a Path,
+    exit_node_id: &'a str,
+    client_node_id: &'a str,
+    blind_exit_node_id: &'a str,
+}
+
 #[derive(Clone, Copy)]
 struct SignedStateRefreshConfig<'a> {
+    assignment: AssignmentRefreshConfig<'a>,
     traversal: TraversalRefreshConfig<'a>,
     dns: DnsRefreshConfig<'a>,
 }
@@ -487,6 +508,20 @@ fn run() -> Result<(), i32> {
         },
     ];
     let signed_state_refresh = SignedStateRefreshConfig {
+        assignment: AssignmentRefreshConfig {
+            signer_host: exit_host.as_str(),
+            exit_host: exit_host.as_str(),
+            client_host: client_host.as_str(),
+            blind_exit_host: blind_exit_host.as_str(),
+            env_local: issue_env.as_path(),
+            assign_pub_local: assign_pub_local.as_path(),
+            exit_assignment_local: exit_assignment_local.as_path(),
+            client_assignment_local: client_assignment_local.as_path(),
+            blind_exit_assignment_local: blind_exit_assignment_local.as_path(),
+            exit_node_id: exit_node_id.as_str(),
+            client_node_id: client_node_id.as_str(),
+            blind_exit_node_id: blind_exit_node_id.as_str(),
+        },
         traversal: traversal_refresh,
         dns: DnsRefreshConfig {
             signer_host: exit_host.as_str(),
@@ -1430,12 +1465,67 @@ fn refresh_signed_state_artifacts(
     logger: &Logger,
     config: &SignedStateRefreshConfig<'_>,
 ) -> Result<(), i32> {
+    // Re-issue assignment bundles before refreshing state so that the daemon's
+    // 300-second max-age check never sees a stale bundle during long convergence
+    // loops that span multiple traversal refresh cycles.
+    refresh_assignment_bundles(ctx, logger, &config.assignment)?;
     refresh_traversal_bundles(ctx, logger, &config.traversal)?;
     refresh_dns_zone_bundles(ctx, logger, &config.dns)?;
     for target in config.dns.targets {
         refresh_trust_evidence(ctx, target.host)?;
         refresh_signed_state_now(ctx, target.host)?;
     }
+    Ok(())
+}
+
+fn refresh_assignment_bundles(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    config: &AssignmentRefreshConfig<'_>,
+) -> Result<(), i32> {
+    logger
+        .line("Refreshing signed assignment bundles for LAN-toggle participants")
+        .map_err(|err| {
+            eprintln!("{err}");
+            1
+        })?;
+    issue_assignment_bundles_from_env(ctx, config.signer_host, config.env_local, "/tmp/rn_issue_lan.env")?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        "/run/rustynet/assignment-issue/rn-assignment.pub",
+        config.assign_pub_local,
+    )?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        &format!(
+            "/run/rustynet/assignment-issue/rn-assignment-{}.assignment",
+            config.exit_node_id
+        ),
+        config.exit_assignment_local,
+    )?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        &format!(
+            "/run/rustynet/assignment-issue/rn-assignment-{}.assignment",
+            config.client_node_id
+        ),
+        config.client_assignment_local,
+    )?;
+    capture_remote_file(
+        ctx,
+        config.signer_host,
+        &format!(
+            "/run/rustynet/assignment-issue/rn-assignment-{}.assignment",
+            config.blind_exit_node_id
+        ),
+        config.blind_exit_assignment_local,
+    )?;
+    install_assignment_bundle(ctx, config.exit_host, config.assign_pub_local, config.exit_assignment_local)?;
+    install_assignment_bundle(ctx, config.client_host, config.assign_pub_local, config.client_assignment_local)?;
+    install_assignment_bundle(ctx, config.blind_exit_host, config.assign_pub_local, config.blind_exit_assignment_local)?;
     Ok(())
 }
 
