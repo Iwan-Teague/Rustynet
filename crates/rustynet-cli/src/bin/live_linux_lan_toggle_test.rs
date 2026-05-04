@@ -1489,7 +1489,12 @@ fn refresh_assignment_bundles(
             eprintln!("{err}");
             1
         })?;
-    issue_assignment_bundles_from_env(ctx, config.signer_host, config.env_local, "/tmp/rn_issue_lan.env")?;
+    issue_assignment_bundles_from_env(
+        ctx,
+        config.signer_host,
+        config.env_local,
+        "/tmp/rn_issue_lan.env",
+    )?;
     capture_remote_file(
         ctx,
         config.signer_host,
@@ -1523,9 +1528,24 @@ fn refresh_assignment_bundles(
         ),
         config.blind_exit_assignment_local,
     )?;
-    install_assignment_bundle(ctx, config.exit_host, config.assign_pub_local, config.exit_assignment_local)?;
-    install_assignment_bundle(ctx, config.client_host, config.assign_pub_local, config.client_assignment_local)?;
-    install_assignment_bundle(ctx, config.blind_exit_host, config.assign_pub_local, config.blind_exit_assignment_local)?;
+    install_assignment_bundle(
+        ctx,
+        config.exit_host,
+        config.assign_pub_local,
+        config.exit_assignment_local,
+    )?;
+    install_assignment_bundle(
+        ctx,
+        config.client_host,
+        config.assign_pub_local,
+        config.client_assignment_local,
+    )?;
+    install_assignment_bundle(
+        ctx,
+        config.blind_exit_host,
+        config.assign_pub_local,
+        config.blind_exit_assignment_local,
+    )?;
     Ok(())
 }
 
