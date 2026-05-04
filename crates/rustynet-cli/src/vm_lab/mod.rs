@@ -15988,7 +15988,7 @@ fn probe_tcp_port_status(
         .map_err(|err| format!("invalid SSH probe IP {ip:?}: {err}"))?;
     let socket_addr = SocketAddr::new(parsed_ip, port);
     match TcpStream::connect_timeout(&socket_addr, timeout) {
-        Ok(_) => return Ok(("open".to_string(), None)),
+        Ok(_) => Ok(("open".to_string(), None)),
         Err(primary_err) => {
             // On macOS, the 192.168.64.0/24 UTM shared-network route is SCOPED to bridge100
             // and absent from the global routing table. TcpStream::connect_timeout uses the
@@ -16000,13 +16000,12 @@ fn probe_tcp_port_status(
                     use socket2::{Domain, SockAddr, Socket, Type};
                     if let Ok(sock) = Socket::new(Domain::IPV4, Type::STREAM, None) {
                         let bind: SocketAddr = "192.168.64.1:0".parse().unwrap();
-                        if sock.bind(&SockAddr::from(bind)).is_ok() {
-                            if sock
+                        if sock.bind(&SockAddr::from(bind)).is_ok()
+                            && sock
                                 .connect_timeout(&SockAddr::from(socket_addr), timeout)
                                 .is_ok()
-                            {
-                                return Ok(("open".to_string(), None));
-                            }
+                        {
+                            return Ok(("open".to_string(), None));
                         }
                     }
                 }
@@ -16092,12 +16091,13 @@ fn select_preferred_live_ssh_ip(
     // last_known_ip as a fallback to avoid selecting a non-SSH-accessible IPv6.
     let has_ipv4 = viable.iter().any(IpAddr::is_ipv4);
     let mut all_candidates = viable;
-    if !has_ipv4 {
-        if let Some(lk) = last_known_ip {
-            if lk.is_ipv4() && is_viable_live_ssh_ip(lk) && Some(lk) != mesh_ip {
-                all_candidates.push(lk);
-            }
-        }
+    if !has_ipv4
+        && let Some(lk) = last_known_ip
+        && lk.is_ipv4()
+        && is_viable_live_ssh_ip(lk)
+        && Some(lk) != mesh_ip
+    {
+        all_candidates.push(lk);
     }
 
     all_candidates

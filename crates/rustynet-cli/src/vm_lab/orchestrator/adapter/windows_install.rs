@@ -398,7 +398,8 @@ fn run_windows_e2e_bootstrap(
          if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key store-passphrase failed: $kspOut\" }}; \
          $aclOut = (& {rustynetd_q} windows-runtime-acls-check 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0) {{ throw \"runtime ACL check failed (startup would fail): $aclOut\" }}; \
-         Start-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
+         Stop-Service -Name {svc_q} -Force -ErrorAction SilentlyContinue; \
+         Start-Service -Name {svc_q}; \
          Start-Sleep -Seconds 8; \
          $svcStatus = (Get-Service -Name {svc_q} -ErrorAction SilentlyContinue).Status; \
          if ($svcStatus -ne 'Running') {{ \
