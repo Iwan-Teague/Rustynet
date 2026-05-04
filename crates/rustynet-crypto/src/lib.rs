@@ -554,7 +554,18 @@ fn store_in_windows_dpapi(key_id: &str, key_material: &[u8]) -> Result<(), Crypt
     }
     let mut protected = dpapi_protect(
         key_material,
-        WindowsDpapiScope::CurrentUser,
+        // LocalMachine scope is required so the daemon service (running as
+        // NT AUTHORITY\SYSTEM / LocalSystem) can decrypt key material that
+        // was stored by the bootstrap/install helper (running as the SSH
+        // user or an interactive admin). CurrentUser scope ties the blob
+        // to the encrypting user's master key, which is inaccessible to
+        // LocalSystem and causes CryptoError::DecryptionFailed at service
+        // startup (prepare_runtime_wireguard_key_material). NTFS ACLs on
+        // the key-custody directory (set by windows-runtime-acls-check and
+        // validated by validate_windows_dpapi_root/file) are the access
+        // boundary; DPAPI LocalMachine encryption provides at-rest
+        // protection against off-machine extraction.
+        WindowsDpapiScope::LocalMachine,
         &format!("RustyNet key {key_id}"),
     )
     .map_err(|_| CryptoError::EncryptionFailed)?;
