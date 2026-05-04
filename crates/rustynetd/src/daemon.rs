@@ -8361,14 +8361,32 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
             DaemonError::InvalidConfig(format!("traversal watermark preflight failed: {err}"))
         })?;
     if config.traversal_bundle_path.exists() {
-        let _ = load_traversal_bundle_set(
+        match load_traversal_bundle_set(
             &config.traversal_bundle_path,
             &config.traversal_verifier_key_path,
             config.traversal_max_age_secs.get(),
             TrustPolicy::default(),
             traversal_watermark,
-        )
-        .map_err(|err| DaemonError::InvalidConfig(format!("traversal preflight failed: {err}")))?;
+        ) {
+            Ok(_) => {}
+            // A stale bundle is non-fatal at startup: the orchestrator may distribute a
+            // fresh bundle after the service starts.  The reconcile loop will refuse to use
+            // it until a valid bundle is in place, so the node is safe but not yet
+            // forwarding traffic.  Any other error (bad signature, replay, format) is still
+            // fatal because it indicates data corruption or an active attack.
+            Err(TraversalBootstrapError::Stale) => {
+                eprintln!(
+                    "rustynetd startup warning: traversal bundle is stale ({}); daemon \
+                     will start and reload when a fresh bundle is distributed",
+                    config.traversal_bundle_path.display()
+                );
+            }
+            Err(err) => {
+                return Err(DaemonError::InvalidConfig(format!(
+                    "traversal preflight failed: {err}"
+                )));
+            }
+        }
     }
 
     let mut system = daemon_system(config)?;
