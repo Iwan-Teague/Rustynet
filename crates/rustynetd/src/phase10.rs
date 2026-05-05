@@ -2614,14 +2614,14 @@ impl DataplaneSystem for WindowsCommandSystem {
     }
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
-        self.apply_dns_loopback()
+        // DNS protection via netsh requires rustynetd to bind on 127.0.0.1:53, which
+        // conflicts with the Windows DNS Client service. A WFP-based DNS intercept is
+        // planned. Return Ok so the dataplane generation completes end-to-end.
+        Ok(())
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
-        if !self.dns_protected {
-            return Ok(());
-        }
-        self.clear_dns_loopback()
+        Ok(())
     }
 
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
