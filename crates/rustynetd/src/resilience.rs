@@ -207,8 +207,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ResilienceError> {
         return Err(ResilienceError::Io);
     }
 
-    let parent_dir = File::open(parent).map_err(|_| ResilienceError::Io)?;
-    parent_dir.sync_all().map_err(|_| ResilienceError::Io)?;
+    #[cfg(unix)]
+    {
+        let parent_dir = File::open(parent).map_err(|_| ResilienceError::Io)?;
+        parent_dir.sync_all().map_err(|_| ResilienceError::Io)?;
+    }
     Ok(())
 }
 

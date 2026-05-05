@@ -2780,7 +2780,10 @@ impl DaemonRuntime {
                 contexts: vec![TrafficContext::Mesh, TrafficContext::SharedExit],
             }],
         };
-        let trust_policy = TrustPolicy::default();
+        let trust_policy = TrustPolicy {
+            max_signed_data_age_secs: config.trust_max_age_secs.get(),
+            max_clock_skew_secs: TrustPolicy::default().max_clock_skew_secs,
+        };
         let backend = DaemonBackend::from_config(config)?;
         let relay_client = load_relay_client(config)?;
         let transport_socket_identity_blocker = backend
@@ -5454,6 +5457,10 @@ impl DaemonRuntime {
 
         self.restriction_mode = RestrictionMode::None;
         self.bootstrap_error = None;
+        if let Err(err) = self.persist_state() {
+            eprintln!("rustynetd: bootstrap: initial state persist failed: {err}");
+            return;
+        }
         self.poll_endpoint_monitor_and_maybe_refresh();
         self.refresh_traversal_hint_state(false);
         self.maybe_preexpiry_refresh_dns_zone(unix_now(), auto_bundle.as_ref());
@@ -6636,11 +6643,13 @@ impl DaemonRuntime {
         if self.restriction_mode == RestrictionMode::Permanent {
             return;
         }
+        eprintln!("rustynetd: restrict_recoverable: {message}");
         self.restriction_mode = RestrictionMode::Recoverable;
         self.bootstrap_error = Some(message);
     }
 
     fn restrict_permanent(&mut self, message: String) {
+        eprintln!("rustynetd: restrict_permanent: {message}");
         self.restriction_mode = RestrictionMode::Permanent;
         self.bootstrap_error = Some(message);
     }
@@ -8991,7 +9000,7 @@ fn persist_trust_watermark(
     watermark: TrustWatermark,
 ) -> Result<(), TrustBootstrapError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+        fs::create_dir_all(parent).map_err(|err| TrustBootstrapError::Io(format!("create_dir_all({}): {}", parent.display(), err)))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -9026,25 +9035,27 @@ fn persist_trust_watermark(
     }
     let mut temp = options
         .open(&temp_path)
-        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+        .map_err(|err| TrustBootstrapError::Io(format!("create_temp({}): {}", temp_path.display(), err)))?;
     if let Err(err) = temp.write_all(payload.as_bytes()) {
         let _ = fs::remove_file(&temp_path);
-        return Err(TrustBootstrapError::Io(err.to_string()));
+        return Err(TrustBootstrapError::Io(format!("write_temp: {err}")));
     }
     if let Err(err) = temp.sync_all() {
         let _ = fs::remove_file(&temp_path);
-        return Err(TrustBootstrapError::Io(err.to_string()));
+        return Err(TrustBootstrapError::Io(format!("sync_temp: {err}")));
     }
+    drop(temp);
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
-        return Err(TrustBootstrapError::Io(err.to_string()));
+        return Err(TrustBootstrapError::Io(format!("rename({} -> {}): {}", temp_path.display(), path.display(), err)));
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        let parent_dir =
-            fs::File::open(parent).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+        let parent_dir = fs::File::open(parent)
+            .map_err(|err| TrustBootstrapError::Io(format!("open_parent_dir({}): {}", parent.display(), err)))?;
         parent_dir
             .sync_all()
-            .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+            .map_err(|err| TrustBootstrapError::Io(format!("sync_parent_dir: {err}")))?;
     }
     Ok(())
 }
@@ -9129,6 +9140,7 @@ fn persist_membership_watermark(
         let _ = fs::remove_file(&temp_path);
         return Err(err.to_string());
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         let parent_dir = fs::File::open(parent).map_err(|err| err.to_string())?;
         parent_dir.sync_all().map_err(|err| err.to_string())?;
@@ -9665,6 +9677,7 @@ fn persist_auto_tunnel_watermark(
         let _ = fs::remove_file(&temp_path);
         return Err(AutoTunnelBootstrapError::Io(err.to_string()));
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         let parent_dir =
             fs::File::open(parent).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
@@ -9882,6 +9895,7 @@ fn persist_dns_zone_watermark(
         let _ = fs::remove_file(&temp_path);
         return Err(DnsZoneBootstrapError::Io(err.to_string()));
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         let parent_dir =
             fs::File::open(parent).map_err(|err| DnsZoneBootstrapError::Io(err.to_string()))?;
@@ -10983,6 +10997,7 @@ fn persist_traversal_watermark(
         let _ = fs::remove_file(&temp_path);
         return Err(TraversalBootstrapError::Io(err.to_string()));
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         let parent_dir =
             fs::File::open(parent).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
