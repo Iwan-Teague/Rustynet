@@ -252,6 +252,11 @@ pub struct VmLabValidateWindowsSecurityConfig {
     pub dry_run: bool,
     pub skip_access_bootstrap: bool,
     pub skip_install: bool,
+    /// When true, a failed `validate_windows_authenticode` stage is
+    /// recorded as a waived pass rather than a hard failure so that
+    /// subsequent stages (including `validate_windows_mesh_join`) still
+    /// run. Use for dev/lab builds that are not yet Authenticode-signed.
+    pub no_fail_on_authenticode: bool,
     /// Local signed-bundle paths for the W4.5 orchestrator-side
     /// distribution stages. `None` skips the corresponding stage with
     /// reason "no local bundle path provided".
@@ -283,6 +288,7 @@ pub fn run_validate_windows_security(
         WindowsOrchestrationOptions {
             skip_access_bootstrap: config.skip_access_bootstrap,
             skip_install: config.skip_install,
+            no_fail_on_authenticode: config.no_fail_on_authenticode,
             distribute_windows_membership_bundle: config
                 .distribute_windows_membership_bundle
                 .clone(),
@@ -812,6 +818,11 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// Requires `--windows-vm`. Use when the Linux lab is already known-good and only
     /// the Windows client path needs to be exercised.
     pub windows_only: bool,
+    /// When true, a failed `validate_windows_authenticode` stage is
+    /// recorded as a waived pass rather than a hard failure, allowing
+    /// `validate_windows_mesh_join` to proceed. Use for dev/lab builds
+    /// that are not yet Authenticode-signed.
+    pub no_fail_on_authenticode: bool,
     /// When true, after the live-lab install + 5-node test path completes,
     /// dispatch the new `rustynetd linux-*-check` daemon-side validator
     /// chainer against every selected Linux alias. Adds 6 stages × N peers
@@ -7252,7 +7263,10 @@ fn run_windows_orchestration_with_pulled_bundles(
     linux_outcomes: &[VmLabStageOutcome],
 ) -> Vec<VmLabStageOutcome> {
     let mut prelude_outcomes: Vec<VmLabStageOutcome> = Vec::new();
-    let mut options = WindowsOrchestrationOptions::default();
+    let mut options = WindowsOrchestrationOptions {
+        no_fail_on_authenticode: config.no_fail_on_authenticode,
+        ..WindowsOrchestrationOptions::default()
+    };
 
     let distribute_passed = linux_distribute_stages_passed(linux_outcomes);
     if config.dry_run {
@@ -7462,6 +7476,11 @@ pub struct WindowsOrchestrationOptions {
     /// at the reviewed install path is already current and you only want to
     /// re-run the security validation stages.
     pub skip_install: bool,
+    /// When true, a failed `validate_windows_authenticode` stage is
+    /// recorded as a waived pass rather than a hard failure, allowing
+    /// `validate_windows_mesh_join` to proceed. Intended for dev/lab
+    /// builds that are not yet Authenticode-signed.
+    pub no_fail_on_authenticode: bool,
     /// Local path to a signed-membership snapshot to push to the
     /// Windows guest's canonical membership path. `None` skips the
     /// distribute_windows_membership stage.
@@ -8014,12 +8033,26 @@ fn run_windows_orchestration_stages_with_options(
                     format!("{reason}\n--- raw report ---\n{raw_report}")
                 };
                 let _ = std::fs::write(&authenticode_log_path, log_body.as_str());
-                stage_outcome(
-                    "validate_windows_authenticode",
-                    VmLabStageStatus::Fail,
-                    format!("Windows Authenticode validation failed for {windows_alias}: {reason}"),
-                    vec![authenticode_log_path.clone()],
-                )
+                if options.no_fail_on_authenticode {
+                    stage_outcome(
+                        "validate_windows_authenticode",
+                        VmLabStageStatus::Pass,
+                        format!(
+                            "Windows Authenticode drift waived for {windows_alias} \
+                             (--no-fail-on-authenticode): {reason}"
+                        ),
+                        vec![authenticode_log_path.clone()],
+                    )
+                } else {
+                    stage_outcome(
+                        "validate_windows_authenticode",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Windows Authenticode validation failed for {windows_alias}: {reason}"
+                        ),
+                        vec![authenticode_log_path.clone()],
+                    )
+                }
             }
         }
     };
@@ -27989,6 +28022,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             dry_run: true,
             skip_access_bootstrap: false,
             skip_install: false,
+            no_fail_on_authenticode: false,
             distribute_windows_membership_bundle: None,
             distribute_windows_assignment_bundle: None,
             distribute_windows_traversal_bundle: None,
@@ -28838,6 +28872,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             node_assignments: Vec::new(),
             legacy_bash_orchestrator: false,
             orchestrate_ssh_allow_cidrs: None,
+            no_fail_on_authenticode: false,
         }
     }
 
