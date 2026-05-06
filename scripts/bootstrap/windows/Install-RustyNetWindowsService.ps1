@@ -253,7 +253,7 @@ function Get-ServiceRuntimeState {
     param([Parameter(Mandatory = $true)][string]$ServiceName)
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     $serviceStatus = if ($service) { [string]$service.Status } else { 'missing' }
-    $cimService = Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $ServiceName.Replace("'", "''") + "'") -ErrorAction SilentlyContinue
+    $cimService = Get-CimInstance -ClassName Win32_Service -FilterHashtable @{ Name = $ServiceName } -ErrorAction SilentlyContinue
     $imagePath = Get-ServiceImagePath -ServiceName $ServiceName
     return [ordered]@{
         present = [bool]$service
@@ -306,11 +306,11 @@ function Repair-RustyNetRuntimeAcl {
         return
     }
 
-    & icacls $Path /setowner $AdministratorsName | Out-Null
+    & icacls "$Path" /setowner $AdministratorsName | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /setowner failed for $Path"
     }
-    & icacls $Path /inheritance:r | Out-Null
+    & icacls "$Path" /inheritance:r | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /inheritance:r failed for $Path"
     }
@@ -334,7 +334,7 @@ function Repair-RustyNetRuntimeAcl {
         $systemGrant = "$LocalSystemName`:F"
         $serviceGrant = "$ServiceIdentity`:M"
     }
-    & icacls $Path /grant:r $adminGrant $systemGrant $serviceGrant | Out-Null
+    & icacls "$Path" /grant:r $adminGrant $systemGrant $serviceGrant | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /grant:r failed for $Path"
     }
@@ -358,15 +358,15 @@ function Repair-RustyNetServiceBinaryAcl {
         throw "Repair-RustyNetServiceBinaryAcl: $Path does not exist"
     }
 
-    & icacls $Path /setowner $AdministratorsName | Out-Null
+    & icacls "$Path" /setowner $AdministratorsName | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /setowner failed for $Path"
     }
-    & icacls $Path /inheritance:r | Out-Null
+    & icacls "$Path" /inheritance:r | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /inheritance:r failed for $Path"
     }
-    & icacls $Path /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" "$ServiceIdentity`:RX" | Out-Null
+    & icacls "$Path" /grant:r "$AdministratorsName`:F" "$LocalSystemName`:F" "$ServiceIdentity`:RX" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "icacls /grant:r failed for binary $Path"
     }
@@ -903,7 +903,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
             if ($existing.Status -eq 'Running') {
                 Stop-Service -Name $ServiceName -Force -ErrorAction Stop
             }
-            $deleteOutput = (& sc.exe delete $ServiceName 2>&1 | Out-String)
+            $deleteOutput = (& sc.exe delete "$ServiceName" 2>&1 | Out-String)
             if ($LASTEXITCODE -ne 0) {
                 throw "sc.exe delete failed: $deleteOutput"
             }

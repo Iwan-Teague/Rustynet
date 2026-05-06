@@ -185,7 +185,7 @@ function Get-ServiceRuntimeState {
     param([Parameter(Mandatory = $true)][string]$ServiceName)
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     $serviceStatus = if ($service) { [string]$service.Status } else { 'missing' }
-    $cimService = Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $ServiceName.Replace("'", "''") + "'") -ErrorAction SilentlyContinue
+    $cimService = Get-CimInstance -ClassName Win32_Service -FilterHashtable @{ Name = $ServiceName } -ErrorAction SilentlyContinue
     $imagePath = Get-ServiceImagePath -ServiceName $ServiceName
     return [ordered]@{
         present = [bool]$service

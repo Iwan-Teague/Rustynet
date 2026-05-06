@@ -266,7 +266,7 @@ if ($service) {
         & sc.exe qsidtype $ServiceName
     }
     Write-CommandOutput -Path (Join-Path $OutputRoot 'service-cim.txt') -Script {
-        Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $ServiceName.Replace("'", "''") + "'") | Format-List *
+        Get-CimInstance -ClassName Win32_Service -FilterHashtable @{ Name = $ServiceName } | Format-List *
     }
 }
 
@@ -285,7 +285,8 @@ foreach ($commandText in @(
 )) {
     $toolingLines += "## $commandText"
     try {
-        $toolingLines += (cmd.exe /c $commandText 2>&1 | Out-String).TrimEnd()
+        $argParts = $commandText -split '\s+'
+        $toolingLines += (& $argParts[0] $argParts[1..($argParts.Length - 1)] 2>&1 | Out-String).TrimEnd()
     }
     catch {
         $toolingLines += ($_ | Out-String).TrimEnd()

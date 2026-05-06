@@ -565,7 +565,8 @@ function Format-WindowsBootstrapToolingStateReport {
     )) {
         $lines += "## $commandText"
         try {
-            $lines += (cmd.exe /c $commandText 2>&1 | Out-String).TrimEnd()
+            $argParts = $commandText -split '\s+'
+            $lines += (& $argParts[0] $argParts[1..($argParts.Length - 1)] 2>&1 | Out-String).TrimEnd()
         }
         catch {
             $lines += ($_ | Out-String).TrimEnd()
@@ -1357,7 +1358,7 @@ function Enter-VsBuildEnvironment {
     if (-not $devCmd) {
         throw 'VsDevCmd.bat not found; Build Tools do not appear to be installed correctly'
     }
-    foreach ($line in (cmd.exe /s /c "`"$devCmd`" -arch=x64 -host_arch=x64 >nul && set")) {
+    foreach ($line in (& cmd.exe /s /c ('"' + $devCmd + '" -arch=x64 -host_arch=x64 >nul && set'))) {
         if ($line -match '^(.*?)=(.*)$') {
             [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2])
         }
