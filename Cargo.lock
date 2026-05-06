@@ -844,6 +844,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-backend-userspace"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rustynet-backend-api",
+ "rustynet-backend-wireguard",
+ "tempfile",
+]
+
+[[package]]
 name = "rustynet-backend-wireguard"
 version = "0.1.0"
 dependencies = [
