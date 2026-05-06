@@ -2519,6 +2519,9 @@ impl WindowsCommandSystem {
         Ok(PathBuf::from(raw))
     }
 
+    // DNS loopback helpers — unused while apply_dns_protection is stubbed;
+    // preserved for the planned WFP-based implementation.
+    #[allow(dead_code)]
     fn run_netsh(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_netsh_binary()?;
         let output = Command::new(&binary).args(args).output().map_err(|err| {
@@ -2531,6 +2534,7 @@ impl WindowsCommandSystem {
         })
     }
 
+    #[allow(dead_code)]
     fn run_netsh_success(&self, args: &[String]) -> Result<(), SystemError> {
         let output = self.run_netsh(args)?;
         if output.success() {
@@ -2542,6 +2546,7 @@ impl WindowsCommandSystem {
         )))
     }
 
+    #[allow(dead_code)]
     fn apply_dns_loopback(&mut self) -> Result<(), SystemError> {
         validate_windows_dns_bind_addr(self.dns_resolver_bind_addr)?;
         let args = windows_dns_set_args(
@@ -2554,6 +2559,7 @@ impl WindowsCommandSystem {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn clear_dns_loopback(&mut self) -> Result<(), SystemError> {
         let args = windows_dns_clear_args(self.interface_name.as_str());
         self.run_netsh_success(&args)
@@ -3951,6 +3957,7 @@ fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemErro
     Ok(())
 }
 
+#[allow(dead_code)]
 fn validate_windows_dns_bind_addr(addr: SocketAddr) -> Result<(), SystemError> {
     if !addr.ip().is_loopback() {
         return Err(SystemError::DnsApplyFailed(
@@ -3965,6 +3972,7 @@ fn validate_windows_dns_bind_addr(addr: SocketAddr) -> Result<(), SystemError> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn windows_dns_set_args(
     interface_name: &str,
     dns_server: IpAddr,
@@ -3986,6 +3994,7 @@ fn windows_dns_set_args(
     ])
 }
 
+#[allow(dead_code)]
 fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
     vec![
         "interface".to_string(),
