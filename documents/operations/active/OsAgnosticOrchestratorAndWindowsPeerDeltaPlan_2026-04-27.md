@@ -2272,6 +2272,23 @@ conservatively.
     legitimately contain commas need a future repeatable-arg surface
     in `OptionParser`. Today no peer ID format includes a comma so
     this is theoretical-only.
+- [x] W2.5b PowerShell defense-in-depth remediations (2026-05-05)
+  - Landed the three deferred W2.5 remediations:
+    3. Replaced `cmd.exe /c $commandText` with argv-only `&` operator
+       invocation (Bootstrap tooling loop, Collect tooling loop,
+       VsDevCmd env-capture uses explicit string concatenation).
+    4. Replaced `Get-CimInstance -Filter "Name='...'"` WQL string
+       construction with `-FilterHashtable @{ Name = $ServiceName }`
+       (parametric) in Install, Smoke, Verify, Collect scripts.
+    5. Quoted `icacls "$Path"` and `sc.exe delete "$ServiceName"` args
+       explicitly in Install and Uninstall scripts.
+  - Updated SecurityHardeningAudit_2026-04-28.md §A.3.6 items 3/4/5
+    to LANDED and investigated+closed B.8.1 (SidType=restricted not
+    feasible — daemon's Win32 API surface blocks system objects
+    without per-service SID grants).
+  - `cargo clippy --workspace --all-features -- -D warnings` clean;
+    all tests pass.
+  - Commit: e2b64a0
 - [ ] W4.3 Windows traffic-test peer participation
 - [ ] W4.4 Windows route + DNS lifecycle stages
 - [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived

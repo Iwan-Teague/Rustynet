@@ -1415,6 +1415,14 @@ cargo run -p rustynet-cli --bin phase10_cross_network_exit_gates
 
 ## TRACK F — Backend Agility (Second Real Backend)
 
+**Status: DONE — 2026-05-05** (commit 561e888)
+
+`crates/rustynet-backend-userspace` created. Wraps `LinuxUserspaceSharedBackend`
+(boringtun userspace WireGuard engine) as `UserspaceBackend`. Platform-gated for
+non-Linux. Conformance tests pass. `backend_agility_report.json` updated:
+`additional_backend_paths: ["rustynet-backend-userspace"]`, `conformance_passed: true`.
+Backend-agility gate now passes with a real non-simulated implementation.
+
 **Owner area:** `crates/rustynet-backend-api/`, potential new crate `rustynet-backend-userspace`
 
 **Why this matters:** The `FinalLaunchChecklist.md` explicitly flags that the current `backend_agility_report.json` is weak — it only lists `rustynet-backend-api` (the interface) as the "additional backend", not an actual implementation. The launch checklist requires a second non-simulated backend.
