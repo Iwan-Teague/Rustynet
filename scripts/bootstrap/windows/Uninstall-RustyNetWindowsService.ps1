@@ -172,7 +172,7 @@ function Remove-RustyNetServiceRegistration {
     # compatibility. The argv has no spaces or quotes so the PS5.1
     # native-arg quoting bug that pushed New-Service over sc.exe create on
     # the install side does not apply here.
-    $deleteOutput = (& sc.exe delete $ServiceName 2>&1 | Out-String)
+    $deleteOutput = (& sc.exe delete "$ServiceName" 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) {
         throw "sc.exe delete failed: $deleteOutput"
     }

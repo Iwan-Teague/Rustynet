@@ -227,22 +227,26 @@ prompt; key categories below.
    reviewed `C:\Program Files\RustyNet` / `C:\ProgramData\RustyNet`
    roots so the helper cannot install RustyNet under an unreviewed
    layout.
-3. **[ ] DEFERRED** — Replace `cmd.exe /c $commandText` in
-   `Bootstrap-RustyNetWindows.ps1:460, 1031` and
-   `Collect-RustyNetWindowsDiagnostics.ps1:288` with direct
-   `Start-Process` -ArgumentList arrays. Bigger refactor; not in
-   this slice.
-4. **[ ] DEFERRED** — Replace `Get-CimInstance -Filter
-   "Name='...'"` with `Get-Service -Name $ServiceName
-   -ErrorAction SilentlyContinue` pattern (which we already use
-   elsewhere). Theoretical-only since `$ServiceName` charset is
-   now validated by the Test-RustyNetServiceName helper that
-   landed in item 1.
-5. **[ ] DEFERRED** — Quote every `icacls $Path` and `sc.exe
-   delete $ServiceName` arg with explicit `"$Path"` even though
-   PS5.1 usually wraps it. Theoretical-only since `$Path` values
-   come from validated `$InstallRoot` / `$StateRoot` per item 2,
-   and `$ServiceName` is validated per item 1.
+3. **[x] LANDED** — Replaced `cmd.exe /c $commandText` in
+   `Bootstrap-RustyNetWindows.ps1` (tooling-probe loop and the
+   VS env-capture loop) and `Collect-RustyNetWindowsDiagnostics.ps1`
+   (tooling-probe loop) with argv-only invocation: the probe loop
+   splits `$commandText` on whitespace and uses the PowerShell `&`
+   operator so no shell string is formed; the VsDevCmd env-capture
+   uses explicit string concatenation rather than PS interpolation
+   to build the cmd argument, removing `$devCmd` from an
+   interpolated string context.
+4. **[x] LANDED** — Replaced `Get-CimInstance -Filter
+   ("Name='" + $ServiceName.Replace(...) + "'")` with
+   `-FilterHashtable @{ Name = $ServiceName }` (parametric,
+   no WQL string construction) in `Install-RustyNetWindowsService.ps1`,
+   `Smoke-RustyNetWindowsServiceHost.ps1`,
+   `Verify-RustyNetWindowsBootstrap.ps1`, and
+   `Collect-RustyNetWindowsDiagnostics.ps1`.
+5. **[x] LANDED** — Quoted every `icacls "$Path"` and
+   `sc.exe delete "$ServiceName"` arg explicitly in
+   `Install-RustyNetWindowsService.ps1` and
+   `Uninstall-RustyNetWindowsService.ps1`.
 
 **Verdict:** Audit complete. None of the findings are
 attacker-reachable today (script values come from controlled
@@ -474,16 +478,20 @@ that need to access a specific path tree under
 `SY:F BA:F svc:RX` and the runtime ACLs lock the state tree to
 SYSTEM + Administrators.
 
-**Gap:** [B.8.1, LOW, deferred] Investigate whether
-`SidType = restricted` is feasible. The trade-off: `restricted`
-service SIDs can only access resources that explicitly grant
-the per-service SID — every reviewed runtime root would need an
-explicit grant, AND the binary itself would need an explicit
-grant for the service SID. Rustynet's existing install helper
-already grants `NT SERVICE\<svc>:RX` on the binary and `(OI)(CI)(M)`
-on every runtime root, so the SID-restricted mode might just work.
+**Gap:** [B.8.1, LOW, INVESTIGATED 2026-05-05 — not feasible]
+`SidType = restricted` was investigated. Under Windows restricted
+tokens the per-service SID must pass the ACL check on every object the
+process opens — including system DLLs, registry hives (HKLM\SYSTEM),
+DPAPI keys, SCM, and network stack handles. These objects cannot
+practically be granted `NT SERVICE\RustyNet` without OS-level ACL
+surgery that would break system maintenance and Windows Update.
+`SidType = unrestricted` with explicit runtime-dir and binary ACLs
+(SYSTEM+BA:F, service SID:RX/M) is the correct posture.
+**Closed as not feasible.** The effective defence-in-depth already
+comes from the installed binary and state-root ACLs that were
+validated by the W2.2 verifier.
 
-**Severity:** LOW, deferred. Tracked here as B.8.1.
+**Severity:** LOW, closed 2026-05-05.
 
 ---
 
@@ -584,10 +592,17 @@ depth additions, none security-bar:
   3× documentation rejections + 3 explicit accepts (RFC1918 10/8,
   RFC1918 192.168/16, tailnet-style 100.64/10). Commit:
   to-be-filled-in by the next slice's commit message.
-- **B.8.1 [LOW, deferred]** Investigate `SidType = restricted` for
-  the Windows service registration. Tighter posture than the
-  current `unrestricted`; viability depends on existing runtime-ACL
-  grants matching the restricted SID's access list.
+- **B.8.1 [LOW, investigated 2026-05-05, NOT feasible]** `SidType = restricted`
+  was investigated. Under Windows restricted tokens, the per-service SID
+  `NT SERVICE\RustyNet` must appear in the restricted SID list AND every
+  object the service opens must grant that SID explicitly. The daemon calls
+  WinVerifyTrust, GetFileSecurityW, OpenSCManager, DPAPI, and the IP/network
+  stack — all of which open system DLLs, registry hives, and kernel objects
+  that carry no per-service SID grant. Granting `NT SERVICE\RustyNet` on those
+  system objects is not feasible without OS-level ACL surgery that would break
+  Windows Update and system maintenance. `SidType = unrestricted` remains the
+  correct choice; the defense-in-depth comes from the binary and runtime-dir
+  ACLs already in place (SYSTEM+BA:F, service SID:RX/M). Closed as not feasible.
 - **B.9.1 [LOW, LANDED 2026-04-28]** Publish a "how to deliver the
   membership owner public key to a new node" runbook in
   `documents/SecurityMinimumBar.md` so the out-of-band TOFU step
@@ -601,15 +616,15 @@ security-focused slice.
 ## 4) Phase C — Post-Audit Quick-Win Applications (TODO)
 
 Phase B identified three deferred items (B.4.1, B.8.1, B.9.1).
-The first one (RFC1918-rebind filter) is the only security-grade
-gap; B.8.1 is exploratory hardening; B.9.1 is documentation. Each
-is its own committable slice:
+Status as of 2026-05-05:
 
-- B.9.1 doc-only runbook addition: ~30 min, lowest risk.
-- B.8.1 SidType=restricted investigation: 1-2 hours, maybe blocked
-  by Win32-API requirements.
-- B.4.1 RFC1918 filter: 2-4 hours, requires understanding the
-  daemon's DNS resolver layer.
+- **B.9.1** doc-only runbook: LANDED 2026-04-28 (SecurityMinimumBar §6.B).
+- **B.8.1** SidType=restricted investigation: CLOSED 2026-05-05 — not
+  feasible (see §B.8 for rationale). No code change needed.
+- **B.4.1** RFC1918 resolver-output filter: still open; requires the
+  daemon's DNS protocol handler (currently absent). The bundle-layer
+  defence landed in 2026-04-28 (parse_expected_ip loopback/link-local/
+  test-net rejection). Resolver-layer filter is future work.
 
 The work is intentionally not bundled into one big commit — each
 should be its own slice with its own residual-risk note + commit
