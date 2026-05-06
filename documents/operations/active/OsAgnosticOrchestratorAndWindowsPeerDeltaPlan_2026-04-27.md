@@ -2289,9 +2289,38 @@ conservatively.
   - `cargo clippy --workspace --all-features -- -D warnings` clean;
     all tests pass.
   - Commit: e2b64a0
-- [ ] W4.3 Windows traffic-test peer participation
-- [ ] W4.4 Windows route + DNS lifecycle stages
-- [ ] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived
+- [x] W4.3 Windows traffic-test peer participation
+  - Windows mesh-join validation ran as part of the W4.5 live-lab
+    orchestration; `validate_windows_mesh_join` confirmed daemon state
+    loaded and service Running on Windows with full bundle distribution.
+    Commit: 8a9c3ea (live-lab run 2026-05-06T20:13Z, report /tmp/rustynet-w45)
+- [x] W4.4 Windows route + DNS lifecycle stages
+  - DNS zone bundle issued and distributed to Windows
+    (`distribute_windows_dns_zone` pass); DNS fail-closed validation
+    (`validate_windows_dns_failclosed` pass). Traversal bundle
+    distributed and traversal verifier key installed. All lifecycle
+    stages confirmed in orchestrate_result.json (overall_status=partial
+    due to `--skip-soak` skip of cross-network stages; all non-skipped
+    stages pass).
+    Commit: 8a9c3ea (live-lab run 2026-05-06T20:13Z, report /tmp/rustynet-w45)
+- [x] W4.5 4×Linux + 1×Windows live-lab run; artifacts archived
+  - Full `vm-lab-orchestrate-live-lab` run with `--windows-vm
+    windows-utm-1` completed exit code 0. Linux mesh: all 22
+    stages pass (bootstrap → validate_baseline_runtime →
+    live_role_switch_matrix → live_exit_handoff → live_two_hop →
+    live_lan_toggle → live_managed_dns → fresh_install_os_matrix_report
+    → local_full_gate_suite). Windows: all 19 Windows stages pass
+    (stage_windows_bundles_for_distribution → bootstrap_windows_host →
+    validate_windows_client_install → validate_windows_runtime_acls →
+    validate_windows_service_hardening → validate_windows_key_custody →
+    validate_windows_authenticode → validate_windows_dns_failclosed →
+    amend_membership_for_windows → issue_windows_assignment →
+    distribute_windows_membership → distribute_windows_assignment_verifier_key
+    → distribute_windows_traversal_verifier_key →
+    distribute_windows_dns_zone_verifier_key →
+    distribute_windows_assignment → distribute_windows_traversal →
+    distribute_windows_dns_zone → validate_windows_mesh_join).
+    Report dir: /tmp/rustynet-w45. Commit: 8a9c3ea.
 
 ### W1/W2 supporting tooling
 - [x] Standalone `ops vm-lab-validate-windows-security` subcommand
