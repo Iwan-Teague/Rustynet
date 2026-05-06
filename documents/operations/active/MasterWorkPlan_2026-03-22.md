@@ -1907,6 +1907,21 @@ Status: complete (for this slice)
   - Live lab topology prerequisites are currently unmet for full Track E completion:
     - E1 full cross-platform report requires five-node topology (entry, aux, extra).
     - E2 canonical cross-network reports require distinct client/exit underlay prefixes and cross-network stage execution.
+
+## W4.5 Live-lab Run — Windows as Full Mesh Peer (2026-05-06)
+
+- **Milestone**: W4.3 + W4.4 + W4.5 from OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md
+- **Result**: All 41 non-skipped stages pass (exit code 0). `overall_status=partial` due to
+  `--skip-soak` skipping 11 cross-network stages; no failures.
+- **Linux mesh** (22 stages): preflight → local_full_gate_suite (all pass).
+- **Windows** (19 stages): bootstrap → amend_membership → issue_windows_assignment →
+  distribute all bundles (membership, assignment, traversal, dns-zone, verifier keys) →
+  validate_windows_mesh_join (pass, overall_ok=true, service=Running).
+- Changed files: `OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` (W4.3/W4.4/W4.5 checked off)
+- Commit: 8a9c3ea (fix: Get-CimInstance -FilterHashtable → -Filter, prerequisite fix)
+- Report dir: /tmp/rustynet-w45 (orchestrate_result.json, all per-stage logs)
+- Run timestamp: 2026-05-06T20:13Z → 2026-05-06T21:09Z (≈56 min total)
+
 ## Agent Update Rules
 
 Use these rules every time you modify this document during implementation work.
