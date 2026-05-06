@@ -266,7 +266,7 @@ if ($service) {
         & sc.exe qsidtype $ServiceName
     }
     Write-CommandOutput -Path (Join-Path $OutputRoot 'service-cim.txt') -Script {
-        Get-CimInstance -ClassName Win32_Service -FilterHashtable @{ Name = $ServiceName } | Format-List *
+        Get-CimInstance -ClassName Win32_Service -Filter "Name = '$ServiceName'" | Format-List *
     }
 }
 

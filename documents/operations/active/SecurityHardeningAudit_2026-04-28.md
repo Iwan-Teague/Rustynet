@@ -202,8 +202,10 @@ prompt; key categories below.
   Defense-in-depth would still benefit from explicit quoting.
 - `Get-CimInstance -Filter ("Name='" + $ServiceName.Replace("'",
   "''") + "'")` WQL filter construction in `Install-`, `Smoke-`,
-  `Verify-`. Replace-based escaping is correct but fragile;
-  `-FilterHashtable` would be parametric.
+  `Verify-`. Replace-based escaping is correct but fragile. Note:
+  `Get-CimInstance` has no `-FilterHashtable` parameter (`Get-WinEvent`
+  does); safe approach is `-Filter "Name = '$ServiceName'"` gated by
+  the `Test-RustyNetServiceName` validator (landed).
 - `git clone --branch $Branch $RepoUrl` in `Bootstrap-RustyNetWindows
   .ps1:1058-1080` passes parameter values directly to git; git
   itself validates URL/ref shape but no pre-validation in the
@@ -236,13 +238,14 @@ prompt; key categories below.
    uses explicit string concatenation rather than PS interpolation
    to build the cmd argument, removing `$devCmd` from an
    interpolated string context.
-4. **[x] LANDED** — Replaced `Get-CimInstance -Filter
-   ("Name='" + $ServiceName.Replace(...) + "'")` with
-   `-FilterHashtable @{ Name = $ServiceName }` (parametric,
-   no WQL string construction) in `Install-RustyNetWindowsService.ps1`,
-   `Smoke-RustyNetWindowsServiceHost.ps1`,
-   `Verify-RustyNetWindowsBootstrap.ps1`, and
-   `Collect-RustyNetWindowsDiagnostics.ps1`.
+4. **[x] LANDED** — Reverted erroneous `-FilterHashtable` (a
+   `Get-WinEvent` parameter that does not exist on `Get-CimInstance`)
+   back to `-Filter "Name = '$ServiceName'"`. The filter string is
+   safe because `$ServiceName` is validated by `Test-RustyNetServiceName`
+   (`^[A-Za-z0-9_-]+$`) before any CIM call, preventing WQL injection.
+   Live-lab run 2026-05-06 confirmed `-FilterHashtable` on
+   `Get-CimInstance` throws `"A parameter cannot be found"` on Windows 11
+   PowerShell 5.1; fix landed in all four affected scripts.
 5. **[x] LANDED** — Quoted every `icacls "$Path"` and
    `sc.exe delete "$ServiceName"` arg explicitly in
    `Install-RustyNetWindowsService.ps1` and
