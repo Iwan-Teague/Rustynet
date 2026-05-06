@@ -1,0 +1,15 @@
+[package]
+name = "rustynet-backend-userspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Boringtun userspace WireGuard backend for Rustynet"
+
+[dependencies]
+rustynet-backend-api = { path = "../rustynet-backend-api" }
+rustynet-backend-wireguard = { path = "../rustynet-backend-wireguard" }
+
+[dev-dependencies]
+base64 = "0.22"
+tempfile = "3"
