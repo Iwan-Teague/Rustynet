@@ -757,7 +757,7 @@ fn decode_hex_nibble(value: u8) -> Result<u8, ()> {
     }
 }
 
-pub const MAX_COORDINATION_TTL_SECS: u64 = 30;
+pub const MAX_COORDINATION_TTL_SECS: u64 = 300;
 pub const MAX_COORDINATION_FUTURE_START_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

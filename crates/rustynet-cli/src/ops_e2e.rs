@@ -1322,9 +1322,9 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
         })
         .transpose()?
         .unwrap_or(120);
-    if ttl_secs == 0 || ttl_secs > 120 {
+    if ttl_secs == 0 || ttl_secs > 300 {
         return Err(format!(
-            "TRAVERSAL_TTL_SECS must be a positive integer <= 120 (got: {ttl_secs})"
+            "TRAVERSAL_TTL_SECS must be a positive integer <= 300 (got: {ttl_secs})"
         ));
     }
 
@@ -1746,7 +1746,7 @@ fn issue_traversal_bundle_artifacts(
     let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
     let generated_at_unix = unix_now();
     let snapshot_nonce = traversal_nonce(generated_at_unix, 0);
-    let coordination_ttl_secs = ttl_secs.min(30);
+    let coordination_ttl_secs = ttl_secs.min(300);
     let mut aggregate_bundles = BTreeMap::<String, String>::new();
     let mut pair_bundles = Vec::new();
     let mut emitted_coordination_pairs = BTreeSet::new();
