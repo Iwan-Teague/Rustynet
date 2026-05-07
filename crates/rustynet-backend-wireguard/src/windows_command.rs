@@ -162,6 +162,12 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
                 format!("interface={}", self.tunnel_name),
                 next_hop.to_string(),
                 "store=active".to_string(),
+                // Use a low metric so WireGuard routes take precedence over the
+                // physical NIC default route. Without this, the auto-calculated
+                // interface metric (typically 200+) loses to the physical NIC
+                // default route (typically metric 10–25), causing FullTunnel
+                // traffic to bypass the WireGuard interface entirely.
+                "metric=1".to_string(),
             ],
         )
     }
@@ -938,6 +944,7 @@ mod tests {
                             "interface=rustynet0".to_string(),
                             "nexthop=0.0.0.0".to_string(),
                             "store=active".to_string(),
+                            "metric=1".to_string(),
                         ]
             }),
             "mesh route should be installed through netsh"
@@ -955,6 +962,7 @@ mod tests {
                             "interface=rustynet0".to_string(),
                             "nexthop=0.0.0.0".to_string(),
                             "store=active".to_string(),
+                            "metric=1".to_string(),
                         ]
             }),
             "default route should be installed only after exit mode enables it"

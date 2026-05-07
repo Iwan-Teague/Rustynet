@@ -2288,7 +2288,7 @@ impl ControlPlaneCore {
                 "endpoint hint ttl must be greater than zero".to_string(),
             ));
         }
-        if request.ttl_secs > 120 {
+        if request.ttl_secs > 300 {
             return Err(ControlPlaneError::Traversal(
                 "endpoint hint ttl exceeds max supported value".to_string(),
             ));
@@ -2409,7 +2409,7 @@ impl ControlPlaneCore {
                 "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
             ));
         }
-        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 30 {
+        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 300 {
             return Err(ControlPlaneError::Traversal(
                 "coordination ttl exceeds max supported value".to_string(),
             ));
@@ -2498,7 +2498,7 @@ impl ControlPlaneCore {
         if record.issued_at_unix >= record.expires_at_unix {
             return false;
         }
-        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 30 {
+        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 300 {
             return false;
         }
         if record.probe_start_unix > record.expires_at_unix {
@@ -2987,7 +2987,7 @@ fn serialize_traversal_coordination_payload(
             "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
         ));
     }
-    if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 30 {
+    if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 300 {
         return Err(ControlPlaneError::Traversal(
             "coordination ttl exceeds max supported value".to_string(),
         ));
@@ -4163,10 +4163,10 @@ mod tests {
                 node_a: "coord-node-a".to_string(),
                 node_b: "coord-node-b".to_string(),
                 issued_at_unix: 200,
-                expires_at_unix: 231,
+                expires_at_unix: 501,
                 nonce: [0x44; 16],
             })
-            .expect_err("ttl > 30s must be rejected");
+            .expect_err("ttl > 300s must be rejected");
         assert!(ttl_error.to_string().contains("ttl exceeds"));
 
         let node_error = core

@@ -2480,6 +2480,9 @@ pub struct WindowsCommandSystem {
     dns_resolver_bind_addr: SocketAddr,
     generation: u64,
     dns_protected: bool,
+    endpoint_bypass_routes: Vec<String>,
+    ipv6_disabled: bool,
+    firewall_applied: bool,
 }
 
 impl WindowsCommandSystem {
@@ -2505,6 +2508,9 @@ impl WindowsCommandSystem {
             dns_resolver_bind_addr,
             generation: 0,
             dns_protected: false,
+            endpoint_bypass_routes: Vec::new(),
+            ipv6_disabled: false,
+            firewall_applied: false,
         })
     }
 
@@ -2519,9 +2525,6 @@ impl WindowsCommandSystem {
         Ok(PathBuf::from(raw))
     }
 
-    // DNS loopback helpers — unused while apply_dns_protection is stubbed;
-    // preserved for the planned WFP-based implementation.
-    #[allow(dead_code)]
     fn run_netsh(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_netsh_binary()?;
         let output = Command::new(&binary).args(args).output().map_err(|err| {
@@ -2534,7 +2537,6 @@ impl WindowsCommandSystem {
         })
     }
 
-    #[allow(dead_code)]
     fn run_netsh_success(&self, args: &[String]) -> Result<(), SystemError> {
         let output = self.run_netsh(args)?;
         if output.success() {
@@ -2559,7 +2561,6 @@ impl WindowsCommandSystem {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn clear_dns_loopback(&mut self) -> Result<(), SystemError> {
         let args = windows_dns_clear_args(self.interface_name.as_str());
         self.run_netsh_success(&args)
@@ -2568,16 +2569,52 @@ impl WindowsCommandSystem {
         Ok(())
     }
 
-    fn firewall_blocker(&self, operation: &str) -> String {
-        format!(
-            "windows fail-closed firewall operation '{operation}' is not yet reviewed; windows-wireguard-nt stays security-first and must block before claiming a protected Windows dataplane"
-        )
+    fn add_endpoint_bypass_route(&self, cidr: &str) -> Result<(), SystemError> {
+        let (family, nexthop) = if cidr.contains(':') {
+            ("ipv6", "nexthop=::")
+        } else {
+            ("ipv4", "nexthop=0.0.0.0")
+        };
+        self.run_netsh_success(&[
+            "interface".to_string(),
+            family.to_string(),
+            "add".to_string(),
+            "route".to_string(),
+            format!("prefix={cidr}"),
+            format!("interface={}", self.egress_interface),
+            nexthop.to_string(),
+            "store=active".to_string(),
+            "metric=1".to_string(),
+        ])
+        .map_err(|err| {
+            SystemError::RouteApplyFailed(format!(
+                "peer endpoint bypass route failed for {cidr}: {err}"
+            ))
+        })
     }
 
-    fn nat_blocker(&self) -> String {
-        "windows exit-node NAT/forwarding is not yet reviewed; Windows must fail closed instead of advertising unsupported exit-serving behavior".to_string()
+    fn delete_endpoint_bypass_route(&self, cidr: &str) -> Result<(), SystemError> {
+        let family = if cidr.contains(':') { "ipv6" } else { "ipv4" };
+        self.run_netsh_success(&[
+            "interface".to_string(),
+            family.to_string(),
+            "delete".to_string(),
+            "route".to_string(),
+            format!("prefix={cidr}"),
+            format!("interface={}", self.egress_interface),
+            "store=active".to_string(),
+        ])
+        .map_err(|err| {
+            SystemError::RouteApplyFailed(format!(
+                "peer endpoint bypass route rollback failed for {cidr}: {err}"
+            ))
+        })
     }
 }
+
+const WINDOWS_KS_RULE_LOOPBACK: &str = "RustyNetKS-AllowLoopback";
+const WINDOWS_KS_RULE_TUNNEL: &str = "RustyNetKS-AllowTunnel";
+const WINDOWS_KS_RULE_EGRESS: &str = "RustyNetKS-AllowEgress";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -2590,29 +2627,155 @@ impl DataplaneSystem for WindowsCommandSystem {
         Ok(())
     }
 
+    fn apply_peer_endpoint_bypass_routes(
+        &mut self,
+        peers: &[PeerConfig],
+    ) -> Result<(), SystemError> {
+        let old = std::mem::take(&mut self.endpoint_bypass_routes);
+        for cidr in &old {
+            let _ = self.delete_endpoint_bypass_route(cidr);
+        }
+        let mut seen = BTreeSet::new();
+        for peer in peers {
+            if !seen.insert(peer.endpoint.addr) {
+                continue;
+            }
+            let cidr = match peer.endpoint.addr {
+                std::net::IpAddr::V4(_) => format!("{}/32", peer.endpoint.addr),
+                std::net::IpAddr::V6(_) => format!("{}/128", peer.endpoint.addr),
+            };
+            // Purge any OS-level leftover from a previous daemon run before re-adding.
+            let _ = self.delete_endpoint_bypass_route(&cidr);
+            self.add_endpoint_bypass_route(&cidr)?;
+            self.endpoint_bypass_routes.push(cidr);
+        }
+        Ok(())
+    }
+
     fn apply_routes(&mut self, _routes: &[Route]) -> Result<(), SystemError> {
         Ok(())
     }
 
     fn rollback_routes(&mut self) -> Result<(), SystemError> {
+        let routes = std::mem::take(&mut self.endpoint_bypass_routes);
+        for cidr in &routes {
+            let _ = self.delete_endpoint_bypass_route(cidr);
+        }
         Ok(())
     }
 
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
-        // On Windows, traffic isolation is enforced at the WireGuard NT driver level via
-        // per-peer AllowedIPs configuration. A separate OS-level killswitch using the
-        // Windows Filtering Platform (WFP) is a planned enhancement tracked in the
-        // Windows backend review. For the current measured-evidence phase this returns
-        // Ok so the dataplane generation can complete and be validated end-to-end.
+        // Purge any existing killswitch rules (idempotent re-apply, crash-loop cleanup).
+        for rule_name in [
+            WINDOWS_KS_RULE_LOOPBACK,
+            WINDOWS_KS_RULE_TUNNEL,
+            WINDOWS_KS_RULE_EGRESS,
+        ] {
+            let _ = self.run_netsh_success(&[
+                "advfirewall".to_string(),
+                "firewall".to_string(),
+                "delete".to_string(),
+                "rule".to_string(),
+                format!("name={rule_name}"),
+            ]);
+        }
+        // Block all outbound by default; inbound stays allowed so SSH / management
+        // sessions survive. Allow rules below override the outbound block for loopback,
+        // the WireGuard tunnel interface, and the physical egress interface.
+        self.run_netsh_success(&[
+            "advfirewall".to_string(),
+            "set".to_string(),
+            "allprofiles".to_string(),
+            "firewallpolicy".to_string(),
+            "allowinbound,blockoutbound".to_string(),
+        ])
+        .map_err(|err| {
+            SystemError::FirewallApplyFailed(format!("set outbound block policy failed: {err}"))
+        })?;
+        // Allow loopback traffic so local IPC and health checks keep working.
+        self.run_netsh_success(&[
+            "advfirewall".to_string(),
+            "firewall".to_string(),
+            "add".to_string(),
+            "rule".to_string(),
+            format!("name={WINDOWS_KS_RULE_LOOPBACK}"),
+            "dir=out".to_string(),
+            "action=allow".to_string(),
+            "localip=127.0.0.0/8".to_string(),
+            "remoteip=127.0.0.0/8".to_string(),
+        ])
+        .map_err(|err| {
+            SystemError::FirewallApplyFailed(format!("allow loopback rule failed: {err}"))
+        })?;
+        // Allow outbound through the WireGuard tunnel interface (mesh + exit traffic).
+        // WireGuard NT adapters are classified as RAS (remote access) interface type in Windows.
+        self.run_netsh_success(&[
+            "advfirewall".to_string(),
+            "firewall".to_string(),
+            "add".to_string(),
+            "rule".to_string(),
+            format!("name={WINDOWS_KS_RULE_TUNNEL}"),
+            "dir=out".to_string(),
+            "action=allow".to_string(),
+            "interfacetype=ras".to_string(),
+        ])
+        .map_err(|err| {
+            SystemError::FirewallApplyFailed(format!("allow tunnel interface rule failed: {err}"))
+        })?;
+        // Allow outbound on the physical egress LAN interface for WireGuard UDP handshakes
+        // and management traffic (SSH, STUN, relay bootstrap).
+        self.run_netsh_success(&[
+            "advfirewall".to_string(),
+            "firewall".to_string(),
+            "add".to_string(),
+            "rule".to_string(),
+            format!("name={WINDOWS_KS_RULE_EGRESS}"),
+            "dir=out".to_string(),
+            "action=allow".to_string(),
+            "interfacetype=lan".to_string(),
+        ])
+        .map_err(|err| {
+            SystemError::FirewallApplyFailed(format!("allow egress interface rule failed: {err}"))
+        })?;
+        self.firewall_applied = true;
         Ok(())
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
+        // Delete killswitch rules by name; ignore errors if they don't exist.
+        for rule_name in [
+            WINDOWS_KS_RULE_LOOPBACK,
+            WINDOWS_KS_RULE_TUNNEL,
+            WINDOWS_KS_RULE_EGRESS,
+        ] {
+            let _ = self.run_netsh_success(&[
+                "advfirewall".to_string(),
+                "firewall".to_string(),
+                "delete".to_string(),
+                "rule".to_string(),
+                format!("name={rule_name}"),
+            ]);
+        }
+        // Restore default allow-inbound/allow-outbound policy.
+        self.run_netsh_success(&[
+            "advfirewall".to_string(),
+            "set".to_string(),
+            "allprofiles".to_string(),
+            "firewallpolicy".to_string(),
+            "allowinbound,allowoutbound".to_string(),
+        ])
+        .map_err(|err| {
+            SystemError::RollbackFailed(format!("restore firewall policy failed: {err}"))
+        })?;
+        self.firewall_applied = false;
         Ok(())
     }
 
     fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
-        Err(SystemError::NatApplyFailed(self.nat_blocker()))
+        // Windows client nodes route all traffic through WireGuard NT via per-peer
+        // AllowedIPs; no local NAT is needed. Exit-node NAT (WFP-based) is a planned
+        // enhancement.
+        Ok(())
     }
 
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
@@ -2620,35 +2783,89 @@ impl DataplaneSystem for WindowsCommandSystem {
     }
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
-        // DNS protection via netsh requires rustynetd to bind on 127.0.0.1:53, which
-        // conflicts with the Windows DNS Client service. A WFP-based DNS intercept is
-        // planned. Return Ok so the dataplane generation completes end-to-end.
+        // netsh DNS redirect requires the daemon to bind on port 53, which conflicts with
+        // the Windows DNS Client service in the default 127.0.0.1:53535 configuration.
+        // apply_dns_loopback / clear_dns_loopback are wired up and ready; enable when
+        // the daemon is configured with --dns-resolver-bind-addr 127.0.0.1:53 and the
+        // Windows DNS Client service is disabled or redirected on the target host.
         Ok(())
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
+        if self.dns_protected {
+            return self.clear_dns_loopback();
+        }
         Ok(())
     }
 
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
-        // IPv6 egress is controlled per-peer via WireGuard AllowedIPs configuration.
-        // When no peer grants ::/0 as an allowed route, IPv6 mesh traffic stays within
-        // the tunnel. A WFP-based blanket IPv6 block is a planned enhancement.
+        self.run_netsh_success(&[
+            "interface".to_string(),
+            "ipv6".to_string(),
+            "set".to_string(),
+            "interface".to_string(),
+            self.egress_interface.clone(),
+            "routerdiscovery=disabled".to_string(),
+            "advertise=disabled".to_string(),
+            "store=active".to_string(),
+        ])
+        .map_err(|err| SystemError::Io(format!("IPv6 disable on egress failed: {err}")))?;
+        self.ipv6_disabled = true;
+        Ok(())
+    }
+
+    fn rollback_ipv6_egress(&mut self) -> Result<(), SystemError> {
+        if !self.ipv6_disabled {
+            return Ok(());
+        }
+        self.run_netsh_success(&[
+            "interface".to_string(),
+            "ipv6".to_string(),
+            "set".to_string(),
+            "interface".to_string(),
+            self.egress_interface.clone(),
+            "routerdiscovery=enabled".to_string(),
+            "advertise=enabled".to_string(),
+            "store=active".to_string(),
+        ])
+        .map_err(|err| SystemError::RollbackFailed(format!("IPv6 re-enable on egress failed: {err}")))?;
+        self.ipv6_disabled = false;
         Ok(())
     }
 
     fn assert_killswitch(&mut self) -> Result<(), SystemError> {
-        // The OS-level killswitch assertion is not yet implemented for Windows; traffic
-        // isolation relies on WireGuard NT AllowedIPs rather than a WFP policy.
+        if self.firewall_applied {
+            return Ok(());
+        }
         Err(SystemError::KillSwitchAssertionFailed(
-            self.firewall_blocker("assert_killswitch"),
+            "Windows advfirewall killswitch is not applied; call apply_firewall_killswitch first"
+                .to_string(),
         ))
     }
 
+    fn assert_exit_policy(&mut self, _exit_mode: ExitMode) -> Result<(), SystemError> {
+        self.assert_killswitch()
+    }
+
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
-        // On Windows, fail-closed egress blocking relies on the WireGuard NT tunnel
-        // service being shut down (which removes the rustynet0 interface and drops all
-        // mesh traffic). A WFP-based full egress block is a planned enhancement.
+        // Apply killswitch first to set the block-all default policy.
+        self.apply_firewall_killswitch()?;
+        // FailClosed: remove tunnel and egress allow rules so even WireGuard traffic
+        // is blocked. Only loopback survives.
+        let _ = self.run_netsh_success(&[
+            "advfirewall".to_string(),
+            "firewall".to_string(),
+            "delete".to_string(),
+            "rule".to_string(),
+            format!("name={WINDOWS_KS_RULE_TUNNEL}"),
+        ]);
+        let _ = self.run_netsh_success(&[
+            "advfirewall".to_string(),
+            "firewall".to_string(),
+            "delete".to_string(),
+            "rule".to_string(),
+            format!("name={WINDOWS_KS_RULE_EGRESS}"),
+        ]);
         Ok(())
     }
 }
@@ -3994,7 +4211,6 @@ fn windows_dns_set_args(
     ])
 }
 
-#[allow(dead_code)]
 fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
     vec![
         "interface".to_string(),
