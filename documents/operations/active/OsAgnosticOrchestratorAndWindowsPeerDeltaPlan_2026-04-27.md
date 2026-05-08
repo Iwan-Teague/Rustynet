@@ -1100,9 +1100,20 @@ conservatively.
       `windows_runtime_boundary` self-check already does for a
       synthetic blob. Combining this with W2.4 is a follow-up if needed.
     - Same pre-existing baseline blockers as the rest of W1/W2.
-- [ ] W2.4-followup: DPAPI round-trip self-test for the live runtime
+- [x] W2.4-followup: DPAPI round-trip self-test for the live runtime
       passphrase (currently only synthesized in
       `windows_runtime_boundary::run_windows_runtime_boundary_check`).
+  - Pattern A implemented: `verify_dpapi_passphrase_roundtrip` added to
+    `crates/rustynetd/src/key_material.rs` — called inside `decrypt_private_key`
+    after `read_passphrase_file` resolves the live passphrase. The in-memory
+    `dpapi_protect → dpapi_unprotect` round-trip runs before the passphrase is
+    committed to key-decryption; fail-closed on protect failure, unprotect failure,
+    or byte mismatch. cfg(not(windows)) variant is a documented no-op.
+  - Tests added: `dpapi_passphrase_roundtrip_returns_ok_for_valid_input` (positive,
+    all platforms), `dpapi_passphrase_roundtrip_noop_on_non_windows_never_errors`
+    (confirms no-op on non-Windows), `dpapi_protect_stub_returns_err_on_non_windows`
+    (confirms the Windows stub returns Err so the cfg guard cannot be silently
+    bypassed). All 3 pass on macOS/Linux host (2026-05-08).
 - [x] W2.5 Wrapper-hygiene audit (audit complete; defense-in-depth
       remediations deferred to a W2.5b follow-up slice)
   - Audit performed across the five reviewed PowerShell helpers

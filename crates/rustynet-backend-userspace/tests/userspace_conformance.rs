@@ -6,26 +6,30 @@
 //! (RUSTYNET_USERSPACE_CONFORMANCE_KEY) so they can be skipped in CI
 //! environments without TUN capability.
 //!
+//! On macOS, UserspaceBackend delegates to MacosUserspaceSharedBackend (Phase 1
+//! scaffolding): construction succeeds but all operational methods return an
+//! internal error. Platform invariant tests verify this Phase 1 contract.
+//!
 //! Platform invariant tests (capability advertisement, constructor error
 //! handling) run unconditionally on all platforms.
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_os = "macos"))]
 use rustynet_backend_api::BackendErrorKind;
+use rustynet_backend_api::TunnelBackend;
 use rustynet_backend_userspace::UserspaceBackend;
 
 // ── Platform-invariant tests ──────────────────────────────────────────────────
 
 #[test]
 fn userspace_backend_name_is_stable() {
-
-    // On non-Linux the constructor returns an error; verify the name is
-    // accessible from a successfully-constructed instance only on Linux, and
-    // verify the error type on other platforms.
+    // On Linux, use a guaranteed-invalid key path so the constructor rejects
+    // it without touching the network — we still get a valid error type.
+    // On macOS, Phase 1 scaffolding construction succeeds; verify name.
+    // On other platforms, construction returns an Internal error.
     #[cfg(target_os = "linux")]
     {
-        // Use a guaranteed-invalid key path so the constructor rejects it
-        // without touching the network — we still get a valid error type.
         let result = UserspaceBackend::new("rustynet0", "/nonexistent/key.key", 51820);
         match result {
             Ok(mut b) => {
@@ -42,12 +46,20 @@ fn userspace_backend_name_is_stable() {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Phase 1: construction succeeds; name is stable.
+        let b = UserspaceBackend::new("utun9", "/any/key", 51820)
+            .expect("MacosUserspaceSharedBackend Phase 1 construction must succeed");
+        assert_eq!(b.name(), "userspace-wireguard");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let result = UserspaceBackend::new("rustynet0", "/any/key", 51820);
         assert!(
             result.is_err(),
-            "UserspaceBackend must fail on non-Linux platform"
+            "UserspaceBackend must fail on unsupported platform"
         );
         let err = result.err().expect("already asserted is_err");
         assert_eq!(err.kind, BackendErrorKind::Internal);
@@ -56,8 +68,8 @@ fn userspace_backend_name_is_stable() {
 
 #[test]
 fn userspace_backend_capabilities_struct_is_well_formed() {
-    // Capabilities is available even without starting; on Linux we can
-    // inspect it from a constructed instance; on non-Linux we verify the
+    // Capabilities is available even without starting; on Linux and macOS we
+    // inspect it from a constructed instance; on other platforms we verify the
     // platform error path.
     #[cfg(target_os = "linux")]
     {
@@ -67,10 +79,25 @@ fn userspace_backend_capabilities_struct_is_well_formed() {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Phase 1: construction succeeds; capabilities is well-formed.
+        let b = UserspaceBackend::new("utun9", "/any/key", 51820)
+            .expect("MacosUserspaceSharedBackend Phase 1 construction must succeed");
+        let caps = b.capabilities();
+        assert!(
+            caps.supports_exit_nodes,
+            "macOS userspace-shared backend declares exit-node support"
+        );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let result = UserspaceBackend::new("rustynet0", "/any/key", 51820);
-        assert!(result.is_err(), "non-Linux must reject construction");
+        assert!(
+            result.is_err(),
+            "unsupported platform must reject construction"
+        );
         let err = result.err().expect("already asserted is_err");
         assert_eq!(err.kind, BackendErrorKind::Internal);
     }
@@ -82,9 +109,7 @@ fn userspace_backend_capabilities_struct_is_well_formed() {
 /// set and the file exists, otherwise None (test is skipped).
 #[cfg(target_os = "linux")]
 fn conformance_key_path() -> Option<std::path::PathBuf> {
-    let path = std::path::PathBuf::from(
-        std::env::var("RUSTYNET_USERSPACE_CONFORMANCE_KEY").ok()?,
-    );
+    let path = std::path::PathBuf::from(std::env::var("RUSTYNET_USERSPACE_CONFORMANCE_KEY").ok()?);
     if path.exists() { Some(path) } else { None }
 }
 

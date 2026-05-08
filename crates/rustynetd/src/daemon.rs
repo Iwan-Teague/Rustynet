@@ -800,7 +800,7 @@ impl DaemonBackendMode {
     fn userspace_shared_blocker(self) -> Option<&'static str> {
         match self {
             DaemonBackendMode::MacosWireguardUserspaceShared => Some(
-                "macos-wireguard-userspace-shared backend is not implemented: crates/rustynet-backend-wireguard currently contains only the command-only macOS wireguard-go adapter plus the in-memory shared-transport test backend, and the repository does not yet provide a backend-owned Rust userspace WireGuard engine or TUN/runtime datapath that can own the authoritative peer UDP socket for peer traffic, STUN, and relay control on the same transport identity",
+                "macos-wireguard-userspace-shared backend is phase 1 scaffolding only: MacosUserspaceSharedBackend type exists in crates/rustynet-backend-wireguard but the macOS utun lifecycle, UDP socket, boringtun engine, and async runtime worker are not yet implemented",
             ),
             _ => None,
         }
@@ -9000,7 +9000,9 @@ fn persist_trust_watermark(
     watermark: TrustWatermark,
 ) -> Result<(), TrustBootstrapError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| TrustBootstrapError::Io(format!("create_dir_all({}): {}", parent.display(), err)))?;
+        fs::create_dir_all(parent).map_err(|err| {
+            TrustBootstrapError::Io(format!("create_dir_all({}): {}", parent.display(), err))
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -9033,9 +9035,9 @@ fn persist_trust_watermark(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut temp = options
-        .open(&temp_path)
-        .map_err(|err| TrustBootstrapError::Io(format!("create_temp({}): {}", temp_path.display(), err)))?;
+    let mut temp = options.open(&temp_path).map_err(|err| {
+        TrustBootstrapError::Io(format!("create_temp({}): {}", temp_path.display(), err))
+    })?;
     if let Err(err) = temp.write_all(payload.as_bytes()) {
         let _ = fs::remove_file(&temp_path);
         return Err(TrustBootstrapError::Io(format!("write_temp: {err}")));
@@ -9047,12 +9049,18 @@ fn persist_trust_watermark(
     drop(temp);
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
-        return Err(TrustBootstrapError::Io(format!("rename({} -> {}): {}", temp_path.display(), path.display(), err)));
+        return Err(TrustBootstrapError::Io(format!(
+            "rename({} -> {}): {}",
+            temp_path.display(),
+            path.display(),
+            err
+        )));
     }
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        let parent_dir = fs::File::open(parent)
-            .map_err(|err| TrustBootstrapError::Io(format!("open_parent_dir({}): {}", parent.display(), err)))?;
+        let parent_dir = fs::File::open(parent).map_err(|err| {
+            TrustBootstrapError::Io(format!("open_parent_dir({}): {}", parent.display(), err))
+        })?;
         parent_dir
             .sync_all()
             .map_err(|err| TrustBootstrapError::Io(format!("sync_parent_dir: {err}")))?;
@@ -13612,11 +13620,16 @@ mod tests {
             ..DaemonConfig::default()
         };
         let err = validate_daemon_config(&config)
-            .expect_err("unimplemented macos userspace-shared backend must fail closed");
+            .expect_err("phase-1 macos userspace-shared backend must fail closed");
         let message = err.to_string();
-        assert!(message.contains("macos-wireguard-userspace-shared backend is not implemented"));
-        assert!(message.contains("backend-owned Rust userspace WireGuard engine"));
-        assert!(message.contains("authoritative peer UDP socket"));
+        assert!(
+            message.contains("macos-wireguard-userspace-shared backend is phase 1 scaffolding"),
+            "expected phase-1 blocker message, got: {message}"
+        );
+        assert!(
+            message.contains("MacosUserspaceSharedBackend"),
+            "expected type reference in blocker, got: {message}"
+        );
     }
 
     #[cfg(not(windows))]

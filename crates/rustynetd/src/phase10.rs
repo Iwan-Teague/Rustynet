@@ -2828,7 +2828,9 @@ impl DataplaneSystem for WindowsCommandSystem {
             "advertise=enabled".to_string(),
             "store=active".to_string(),
         ])
-        .map_err(|err| SystemError::RollbackFailed(format!("IPv6 re-enable on egress failed: {err}")))?;
+        .map_err(|err| {
+            SystemError::RollbackFailed(format!("IPv6 re-enable on egress failed: {err}"))
+        })?;
         self.ipv6_disabled = false;
         Ok(())
     }
