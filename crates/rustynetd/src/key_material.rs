@@ -346,6 +346,37 @@ fn looks_like_windows_dpapi_passphrase_blob(blob: &[u8]) -> bool {
     blob.len() >= header_len && blob.starts_with(WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC)
 }
 
+// W2.4-followup: In-memory DPAPI round-trip self-test on the live passphrase bytes.
+// Proves that the machine DPAPI key can protect and recover before the passphrase
+// is committed to key-decryption. Fail-closed on any mismatch or DPAPI error.
+// On non-Windows this is a no-op; the platform uses a different custody mechanism.
+#[cfg(windows)]
+fn verify_dpapi_passphrase_roundtrip(plaintext: &[u8]) -> Result<(), String> {
+    let mut protected = dpapi_protect(
+        plaintext,
+        WindowsDpapiScope::LocalMachine,
+        "RustyNet DPAPI passphrase round-trip self-test",
+    )
+    .map_err(|err| format!("DPAPI passphrase self-test protect failed: {err}"))?;
+    let roundtrip = dpapi_unprotect(protected.as_slice()).map_err(|err| {
+        protected.zeroize();
+        format!("DPAPI passphrase self-test unprotect failed: {err}")
+    })?;
+    protected.zeroize();
+    if roundtrip != plaintext {
+        return Err(
+            "DPAPI passphrase self-test: round-trip bytes do not match original — fail closed"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_dpapi_passphrase_roundtrip(_plaintext: &[u8]) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn read_passphrase_from_macos_keychain(account: &str) -> Result<Zeroizing<String>, String> {
     let value =
@@ -400,6 +431,8 @@ pub fn decrypt_private_key(
     passphrase_path: &Path,
 ) -> Result<Vec<u8>, String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
+    // W2.4-followup: fail-closed if the live DPAPI round-trip cannot be proven.
+    verify_dpapi_passphrase_roundtrip(passphrase.as_bytes())?;
     let manager = key_custody_manager(encrypted_key_path, passphrase)?;
     let key_id = key_custody_key_id(encrypted_key_path);
     let mut key = manager
@@ -1253,6 +1286,64 @@ mod tests {
         assert!(target.exists(), "symlink target must remain untouched");
 
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    // W2.4-followup: DPAPI round-trip self-test unit coverage.
+    //
+    // On non-Windows: the function is a no-op and must return Ok for any input,
+    // confirming the cfg gate keeps DPAPI logic off non-Windows production paths.
+    // On Windows: the real DPAPI is used and the round-trip must succeed.
+
+    #[test]
+    fn dpapi_passphrase_roundtrip_returns_ok_for_valid_input() {
+        // Positive test: the self-test must succeed for a well-formed passphrase.
+        // On non-Windows this exercises the no-op path; on Windows it uses real DPAPI.
+        let result = super::verify_dpapi_passphrase_roundtrip(b"correct-horse-battery-staple-0A");
+        assert!(
+            result.is_ok(),
+            "DPAPI passphrase round-trip self-test should succeed: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn dpapi_passphrase_roundtrip_noop_on_non_windows_never_errors() {
+        // On non-Windows the function must be a no-op regardless of input, confirming
+        // it does not call into the Windows DPAPI stubs (which always return Err).
+        for input in &[
+            b"" as &[u8],
+            b"short",
+            b"a-long-passphrase-exceeding-sixteen-chars",
+        ] {
+            let result = super::verify_dpapi_passphrase_roundtrip(input);
+            assert!(
+                result.is_ok(),
+                "non-Windows no-op must not return Err for input {:?}: {result:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn dpapi_protect_stub_returns_err_on_non_windows() {
+        // Verify the non-Windows stub always returns Err so the cfg(windows) branch
+        // cannot silently appear on non-Windows builds and mask a missing guard.
+        use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect};
+        let result = dpapi_protect(
+            b"test-value",
+            WindowsDpapiScope::LocalMachine,
+            "test-description",
+        );
+        assert!(
+            result.is_err(),
+            "dpapi_protect must return Err on non-Windows; got Ok"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("Windows"),
+            "error message should mention Windows: {err_msg}"
+        );
     }
 
     #[test]

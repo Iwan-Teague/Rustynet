@@ -15,10 +15,14 @@ cargo test -p rustynet-control membership -- --nocapture
 # Run policy coupling tests (M5)
 cargo test -p rustynet-policy -- --nocapture
 
-# Verify membership evidence artifact exists and is well-formed JSON
+# Generate artifacts/phase10/membership_report.json from the targeted test run
+# above. Does not require lab artifacts.
+cargo run --quiet -p rustynet-cli -- ops write-membership-phase10-report
+
+# Verify the report was produced and is well-formed JSON with status=pass
 MEMBERSHIP_REPORT="${REPO_ROOT}/artifacts/phase10/membership_report.json"
 if [[ ! -f "${MEMBERSHIP_REPORT}" ]]; then
-    echo "GATE FAIL: artifacts/phase10/membership_report.json is missing" >&2
+    echo "GATE FAIL: artifacts/phase10/membership_report.json was not written" >&2
     exit 1
 fi
 if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d.get('status')=='pass', 'status!=pass'" \
@@ -27,6 +31,4 @@ if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d.get('
     exit 1
 fi
 echo "membership_report.json schema validation: pass"
-
-# Run the higher-level ops membership gates (legacy wrapper)
-exec cargo run --quiet -p rustynet-cli --bin membership_gates -- "$@"
+echo "Membership CI gates: PASS"

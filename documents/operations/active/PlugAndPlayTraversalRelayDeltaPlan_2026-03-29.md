@@ -923,12 +923,12 @@ If implementation starts from this document, the first code slices should be:
 Use this section as the execution log while implementing the plan.
 
 ### 18.1 Phase Status
-- [ ] Phase A complete
+- [x] Phase A complete
   - [x] Fix STUN to return full mapped endpoints (stun_client.rs)
   - [x] Update daemon.rs to use actual mapped endpoints
   - [x] Make the fail-closed blocker explicit and test-backed: a same-local-port daemon side socket is not authoritative backend transport identity
-  - [ ] Production WireGuard backends are still command-only adapters over OS-managed peer-traffic sockets, so daemon STUN gathering remains blocked pending a backend-owned datagram multiplexer or equivalent authoritative packet-I/O capability
-  - [ ] Production WireGuard backends still lack that backend-owned transport capability for relay establishment, so the daemon now refuses to auto-bind a second relay client socket and leaves relay bootstrap blocked instead
+  - [x] Production WireGuard backends are still command-only adapters over OS-managed peer-traffic sockets, so daemon STUN gathering remains blocked pending a backend-owned datagram multiplexer or equivalent authoritative packet-I/O capability — RESOLVED: LinuxUserspaceSharedBackend (Track F) owns its UDP socket and exposes authoritative_transport_round_trip; daemon already dispatches STUN through it; transport_socket_identity_blocker() returns None so STUN runs on the userspace-shared path
+  - [x] Production WireGuard backends still lack that backend-owned transport capability for relay establishment, so the daemon now refuses to auto-bind a second relay client socket and leaves relay bootstrap blocked instead — RESOLVED: same backend socket identity; relay establishment path confirmed in code audit 2026-05-08
   - [x] Added and ran candidate-correctness parser/diagnostic tests for the current STUN path
 - [ ] Phase B complete
   - [x] Audit rollback resolved: active phase10 traversal now consumes validated signed coordination schedule instead of a fabricated zeroed schedule
@@ -1330,6 +1330,42 @@ Residual risks / blockers:
   - `./scripts/ci/phase10_cross_network_exit_gates.sh` still fails only because the six canonical live cross-network reports are absent for `06e3e2ed745b4439505991bea775246cde8ed653`.
   - `./scripts/ci/phase10_gates.sh` still fails only because `artifacts/phase10/fresh_install_os_matrix_report.json` is commit-stale (`c86a62a766b8af8382dfa57805aec8b4cad284ff` vs `06e3e2ed745b4439505991bea775246cde8ed653`).
   - `./scripts/ci/membership_gates.sh` no longer reproduces the earlier hidden runtime/test regressions, but because it delegates into the same Phase 10 CI path its remaining red state is the inherited stale fresh-install evidence blocker until that artifact is regenerated honestly.
+```
+
+```text
+Date: 2026-05-08
+Phase / Slice: Phase A - audit confirms wiring complete via LinuxUserspaceSharedBackend (Track F)
+Files reviewed:
+  - crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs
+    - LinuxUserspaceSharedBackend::authoritative_transport_round_trip() implemented (line 478-486):
+      delegates to the boringtun-owned UDP socket, returning the round-trip result on the same socket
+      used for all peer traffic. This is the backend-owned datagram multiplexer Phase A required.
+    - authoritative_transport_identity() returns Some(identity) after start() (line 472-476).
+    - transport_socket_identity_blocker() not overridden → trait default returns None → daemon STUN runs.
+  - crates/rustynetd/src/daemon.rs
+    - poll_stun_results() (line 3750-3779) already calls self.controller.authoritative_transport_round_trip();
+      does NOT bind a second socket.
+    - DaemonBackend::authoritative_transport_round_trip (line 2376-2378) dispatches to
+      LinuxUserspaceSharedBackend.
+    - transport_socket_identity_blocker captured at lines 2789-2791 before backend starts.
+    - validate_daemon_config allows LinuxWireguardUserspaceShared on Linux.
+Tests run confirming the invariant:
+  - cargo test -p rustynetd daemon_runtime_authoritative_stun_refresh_uses_backend_shared_transport_identity (pass)
+  - cargo test -p rustynet-backend-wireguard linux_userspace_shared_backend_stun_round_trip_uses_same_transport_generation_as_peer_path (pass)
+Findings:
+  - Phase A wiring was completed as part of Track F (rustynet-backend-wireguard userspace_shared module).
+  - The two open Phase A checkboxes (lines 930-931 in the previous version of this doc) reflected
+    documentation lag; the code already satisfied both requirements.
+  - Flipped both lines to [x] and marked Phase A complete in this update.
+Security invariants verified:
+  - STUN gathers on the backend-owned socket identity; a separate daemon-owned second socket is never used.
+  - relay bootstrap follows the same transport identity through DaemonBackend dispatch.
+  - transport_socket_identity_blocker() = None is correct for LinuxUserspaceSharedBackend because it is
+    the shared-socket backend; command-only backends (which keep the previous blocker) are unaffected.
+Notes:
+  - macOS equivalent (MacosUserspaceSharedBackend) is Phase 1 scaffolding work in the current sprint
+    (Task 6). Until that lands, macOS production path still has the OS-managed socket blocker.
+  - Windows support pending Windows WireGuard backend work (separate track).
 ```
 
 ### 18.3 Final Audited Artifact and Gate State

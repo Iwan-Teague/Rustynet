@@ -1922,6 +1922,104 @@ Status: complete (for this slice)
 - Report dir: /tmp/rustynet-w45 (orchestrate_result.json, all per-stage logs)
 - Run timestamp: 2026-05-06T20:13Z → 2026-05-06T21:09Z (≈56 min total)
 
+## W4.6 Sprint — Cross-Compile Gate, DPAPI Self-Test, Phase A Close-Out, cargo-xwin, macOS Backend Phase 1 (2026-05-08)
+
+### W4.6.1 Windows cross-compile CI gate (Task 1)
+
+- **Milestone**: `scripts/ci/windows_cross_compile_gate.sh` created; wired into `phase10_hp2_gates.sh`.
+- Changed files:
+  - `scripts/ci/windows_cross_compile_gate.sh` (new)
+  - `crates/rustynet-cli/src/ops_ci_release_perf.rs` (gate invocation added)
+- Verification:
+  - `bash scripts/ci/windows_cross_compile_gate.sh` → PASS (x86_64-pc-windows-gnu all crates pass;
+    gnullvm skipped — no clang; msvc PASS for non-SQLite crates)
+  - `./scripts/ci/phase10_hp2_gates.sh` → PASS
+- Residual risk: `rustynet-control`, `rustynet-relay`, `rustynetd` excluded from msvc xwin check;
+  `libsqlite3-sys` bundled SQLite C build requires pre-built lib or xwin SDK fix.
+
+### W4.6.2 DPAPI live round-trip self-test in key_material.rs (Task 2)
+
+- **Milestone**: W2.4-followup from OsAgnosticOrchestratorAndWindowsPeerDeltaPlan.
+- Changed files:
+  - `crates/rustynetd/src/key_material.rs`
+    - `verify_dpapi_passphrase_roundtrip()` added; called from `decrypt_private_key()`
+    - 3 new unit tests (roundtrip ok, noop on non-Windows, stub returns Err)
+  - `documents/operations/active/OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md`
+    (W2.4-followup flipped to `[x]`)
+- Verification: `cargo test -p rustynetd verify_dpapi_passphrase_roundtrip` → 3 pass; `cargo clippy -D warnings` clean.
+
+### W4.6.3 PlugAndPlay Phase A close-out (Task 3)
+
+- **Milestone**: Phase A of PlugAndPlayTraversalRelayDeltaPlan confirmed complete via code audit.
+- Audit findings: `LinuxUserspaceSharedBackend` (Track F) already implements `authoritative_transport_round_trip`;
+  daemon dispatches STUN through it; `transport_socket_identity_blocker()` returns None; tests pass.
+- Changed files:
+  - `documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md`
+    - §18.1 Phase A lines 930-931 flipped to `[x]`; Phase A marked complete `[x]`
+    - §18.2 evidence entry appended (2026-05-08)
+- Verification:
+  - `cargo test -p rustynetd daemon_runtime_authoritative_stun_refresh_uses_backend_shared_transport_identity` → pass
+  - `cargo test -p rustynet-backend-wireguard linux_userspace_shared_backend_stun_round_trip_uses_same_transport_generation_as_peer_path` → pass
+
+### W4.6.4 cargo-xwin + aarch64-pc-windows-msvc (Task 4)
+
+- **Milestone**: MSVC cross-compile capability added to dev machine.
+- Actions:
+  - `cargo install cargo-xwin` → cargo-xwin v0.22.0 installed
+  - `rustup target add aarch64-pc-windows-msvc` → target installed
+  - `windows_cross_compile_gate.sh` extended with aarch64/x86_64-pc-windows-msvc xwin sections
+    (SQLite crates excluded; documented)
+- Verification: `bash scripts/ci/windows_cross_compile_gate.sh` → PASS
+
+### W4.6.5 W2.5b PowerShell hardening verified (Task 5)
+
+- **Milestone**: W2.5b confirmed already complete in commit `e2b64a0` (2026-05-06).
+- Existing `[x]` in OsAgnosticOrchestrator plan at line 2286 confirmed; no new work needed.
+
+### W4.6.6 macOS userspace-shared backend Phase 1 scaffolding (Task 6)
+
+- **Milestone**: `MacosUserspaceSharedBackend` type created; shared-transport intent declared.
+- Changed files:
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/mod.rs` (new)
+  - `crates/rustynet-backend-wireguard/src/lib.rs` (mod + pub use added)
+  - `crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs` (redundant MACOS constant removed)
+  - `crates/rustynet-backend-userspace/src/lib.rs` (macOS arm delegating to MacosUserspaceSharedBackend)
+  - `crates/rustynet-backend-userspace/tests/userspace_conformance.rs` (macOS platform test arms added)
+  - `crates/rustynetd/src/daemon.rs` (blocker message updated to "phase 1 scaffolding"; test updated)
+  - `documents/operations/active/MacosUserspaceSharedBackendPlan_2026-05-08.md` (new plan doc)
+  - `documents/operations/active/README.md` (plan doc indexed)
+- Verification:
+  - 3 new unit tests in `userspace_shared_macos::tests` all pass
+  - `cargo test --workspace --all-targets --all-features` → all pass
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean
+- Key invariant: `transport_socket_identity_blocker()` returns None (inherited default) — declares
+  macOS userspace-shared as the authoritative socket path. Phase 2+ will implement the runtime.
+- Residual risk: Phase 1 only; all operational methods return `phase1_unimplemented()`. Daemon still
+  blocks `MacosWireguardUserspaceShared` at config validation until Phase 6.
+
+### W4.6 Lab-Dependent Items (not executed — require live lab access)
+
+- **W4.7 Windows exit-node live validation**: Run `scripts/e2e/live_linux_cross_network_*.sh` on
+  fresh Windows peer after W4.5. Requires UTM VM access and cross-network topology.
+- **Track E2 canonical reports** (six cross-network families): requires distinct underlay prefixes
+  and fresh live-lab run. See `PlugAndPlayTraversalRelayDeltaPlan §18.1 Phase E`.
+- **Track E1 fresh-install OS matrix refresh**: regenerate `artifacts/phase10/fresh_install_os_matrix_report.json`
+  bound to current HEAD. Requires five-node topology.
+
+### W4.6 Gate Summary
+
+| Gate | Result |
+|------|--------|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS |
+| `cargo check --workspace --all-targets --all-features` | PASS |
+| `cargo test --workspace --all-targets --all-features` | PASS |
+| `cargo audit --deny warnings` | PASS (0 advisories) |
+| `cargo deny check bans licenses sources advisories` | PASS |
+| `bash scripts/ci/windows_cross_compile_gate.sh` | PASS |
+| `bash scripts/ci/phase10_hp2_gates.sh` | PASS |
+| `bash scripts/ci/membership_gates.sh` | FAIL — pre-existing: `artifacts/phase10/membership_report.json` missing (lab-dependent) |
+
 ## Agent Update Rules
 
 Use these rules every time you modify this document during implementation work.

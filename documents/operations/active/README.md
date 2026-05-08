@@ -31,6 +31,7 @@ Start with these when you need current status, remaining work, or the public imp
 - [WindowsUtmTransportArchitecture_2026-04-30.md](./WindowsUtmTransportArchitecture_2026-04-30.md)
 - [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 - [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
+- [MacosUserspaceSharedBackendPlan_2026-05-08.md](./MacosUserspaceSharedBackendPlan_2026-05-08.md)
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)
 - [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md)

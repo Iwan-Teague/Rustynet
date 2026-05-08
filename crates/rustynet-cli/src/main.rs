@@ -447,6 +447,7 @@ enum OpsCommand {
     RunPhase9CiGates,
     RunPhase10CiGates,
     RunMembershipCiGates,
+    WriteMembershipPhase10Report,
     RunSupplyChainIntegrityGates,
     RunSecurityRegressionGates,
     RunActiveNetworkSecurityGates,
@@ -1391,6 +1392,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 return Err("ops run-membership-ci-gates does not accept options".to_string());
             }
             Ok(OpsCommand::RunMembershipCiGates)
+        }
+        "write-membership-phase10-report" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops write-membership-phase10-report does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::WriteMembershipPhase10Report)
         }
         "run-supply-chain-integrity-gates" => {
             if args.len() != 1 {
@@ -4923,6 +4932,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::RunPhase10CiGates => ops_ci_release_perf::execute_ops_run_phase10_ci_gates(),
         OpsCommand::RunMembershipCiGates => {
             ops_ci_release_perf::execute_ops_run_membership_ci_gates()
+        }
+        OpsCommand::WriteMembershipPhase10Report => {
+            ops_ci_release_perf::execute_ops_write_membership_phase10_report()
         }
         OpsCommand::RunSupplyChainIntegrityGates => {
             ops_ci_release_perf::execute_ops_run_supply_chain_integrity_gates()

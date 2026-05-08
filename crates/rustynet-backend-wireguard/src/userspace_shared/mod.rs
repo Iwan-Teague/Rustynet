@@ -29,8 +29,6 @@ use tun::{
 };
 
 pub(crate) const LINUX_USERSPACE_SHARED_BACKEND_MODE: &str = "linux-wireguard-userspace-shared";
-#[allow(dead_code)]
-pub(crate) const MACOS_USERSPACE_SHARED_BACKEND_MODE: &str = "macos-wireguard-userspace-shared";
 
 pub struct LinuxUserspaceSharedBackend {
     interface_name: String,
