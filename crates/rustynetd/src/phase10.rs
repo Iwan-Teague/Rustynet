@@ -1403,6 +1403,22 @@ impl LinuxCommandSystem {
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        // Add loopback accept immediately after chain creation so the managed DNS
+        // resolver on 127.0.0.1:53535 is never blocked during rule setup.
+        self.run(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                table.as_str(),
+                "killswitch",
+                "oifname",
+                "lo",
+                "accept",
+            ],
+        )
+        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         self.apply_fail_closed_management_allow_rules(table.as_str())?;
         self.apply_traversal_bootstrap_allow_rules(table.as_str())?;
         self.firewall_table = Some(table.clone());
@@ -1640,20 +1656,6 @@ impl DataplaneSystem for LinuxCommandSystem {
                 "drop",
                 ";",
                 "}",
-            ],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                table.as_str(),
-                "killswitch",
-                "oifname",
-                "lo",
-                "accept",
             ],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
