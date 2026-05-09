@@ -10478,10 +10478,11 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
     remove_file_if_present(watermark_path.as_path())?;
     let _ = run_systemctl_action("reset-failed", "rustynetd-privileged-helper.service");
     let _ = run_systemctl_action("reset-failed", "rustynetd.service");
+    let _ = run_systemctl_action("reset-failed", "rustynetd-assignment-refresh.service");
     run_systemctl_action("start", "rustynetd-assignment-refresh.service")?;
     run_systemctl_action("restart", "rustynetd.service")?;
-    wait_for_socket_path(socket_path.as_path(), Duration::from_secs(20))?;
-    wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(30))?;
+    wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))?;
+    wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))?;
     Ok(())
 }
 
