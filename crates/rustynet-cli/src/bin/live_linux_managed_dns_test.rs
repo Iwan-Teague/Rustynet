@@ -28,8 +28,10 @@ const DNS_RECORDS_REMOTE: &str = "/tmp/rn-dns-records.manifest";
 const TRAVERSAL_ENV_REMOTE: &str = "/tmp/rn_issue_dns_traversal.env";
 const TRAVERSAL_PUB_REMOTE: &str = "/run/rustynet/traversal-issue/rn-traversal.pub";
 const REPLAY_PROBE_ALIAS: &str = "gatewayreplay";
-const SOAK_SSH_RETRY_ATTEMPTS: u32 = 10;
-const SOAK_SSH_RETRY_SLEEP_SECS: u64 = 3;
+// 20 attempts × 15 s = 5 min window; tolerates UTM VM transient network
+// glitches and slower-than-expected SSH restarts during the extended soak.
+const SOAK_SSH_RETRY_ATTEMPTS: u32 = 20;
+const SOAK_SSH_RETRY_SLEEP_SECS: u64 = 15;
 
 fn main() {
     let code = match run() {
