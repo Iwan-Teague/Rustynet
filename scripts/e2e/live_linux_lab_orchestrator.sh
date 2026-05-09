@@ -5892,6 +5892,7 @@ stage_run_reboot_recovery_report() {
   fi
 
   if [[ "$exit_return" == "pass" && "$exit_boot_change" == "pass" ]]; then
+    live_lab_run_root "$exit_target" "root rustynet ops force-local-assignment-refresh-now"
     if run_periodic_managed_dns_refresh "soak_post_exit_reboot_pre_two_hop"; then
       post_exit_dns_refresh="pass"
     if has_label extra; then
@@ -5971,6 +5972,7 @@ stage_run_reboot_recovery_report() {
   fi
 
   if [[ "$client_return" == "pass" && "$client_boot_change" == "pass" ]]; then
+    live_lab_run_root "$client_target" "root rustynet ops force-local-assignment-refresh-now"
     if run_periodic_managed_dns_refresh "soak_post_client_reboot_pre_two_hop"; then
       post_client_dns_refresh="pass"
     if has_label extra; then
