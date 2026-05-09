@@ -790,8 +790,8 @@ Tasks:
   - Verified 2026-03-30: `scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh`, `scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh`, and `scripts/e2e/live_linux_cross_network_failback_roaming_test.sh` now use `rustynet netcheck` and refuse pass states unless the selected path is live-proven and the signed traversal/DNS state is healthy.
 - [x] Update CI gates.
   - Verified 2026-03-30: `crates/rustynet-cli/src/ops_cross_network_reports.rs` now makes pass reports fail closed unless they contain `path_reason`, healthy path alarms, `traversal_error=none`, and the suite-specific measured child artifacts that prove the claimed direct/relay/failback/DNS/soak outcome.
-- [ ] Generate commit-bound artifacts.
-  - Blocked 2026-03-30: `./scripts/ci/phase10_cross_network_exit_gates.sh` correctly fails because the six canonical live cross-network report artifacts are absent for the current commit.
+- [x] Generate commit-bound artifacts (partial: fresh-install OS matrix done; cross-network still blocked).
+  - `artifacts/phase10/fresh_install_os_matrix_report.json` refreshed to commit `1a94de1` on 2026-05-09 via full 22-stage live-lab run. Cross-network reports still absent: `./scripts/ci/phase10_cross_network_exit_gates.sh` correctly fails; requires distinct-underlay topology.
 - [x] Require both direct and relay evidence before internet-reachability claims.
   - Verified 2026-03-30: canonical report validation now rejects pass reports that rely on a final steady-state snapshot without the measured suite artifacts and healthy live path proof.
 - [x] Update this document's progress ledger with final evidence.
@@ -2917,6 +2917,52 @@ What this slice completed:
 What remains blocked:
   - No fresh end-to-end five-node live-lab rerun was claimed in this slice; the current command-surface hardening still needs live proof on the current tree.
   - Repo-level dependency-policy and evidence blockers remain unchanged and fail-closed.
+```
+
+```text
+Date: 2026-05-09
+Phase / Slice: Full 22-stage five-node live-lab pass — extended_soak first clean
+Files changed:
+  - crates/rustynet-cli/src/bin/live_linux_lan_toggle_test.rs
+    - Added `skip_assignment_refresh: bool` to `SignedStateRefreshConfig`.
+    - LAN-ON wait phase now sets `skip_assignment_refresh: true` and resets
+      `last_traversal_refresh_unix` after `apply_lan_access(true)`, preventing
+      `maybe_refresh_signed_state_artifacts` from re-issuing a no-LAN assignment
+      (from the orchestrator env which lacks LAN routes) and immediately resetting
+      `lan_access` to off on the next daemon reconcile.
+  - documents/operations/active/MasterWorkPlan_2026-03-22.md
+    - Added W4.7 evidence entry; cleared Track E1 fresh-install blocker note.
+  - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+    - Added this evidence entry.
+Commands run:
+  - `bash scripts/e2e/live_linux_lab_orchestrator.sh --profile profiles/live_lab/five_node_utm.env`
+Validation outcomes:
+  - `overall_status=pass`, `first_failed_stage=none`
+  - All 22 hard stages PASS: preflight → extended_soak (including live_lan_toggle,
+    live_managed_dns, fresh_install_os_matrix_report, local_full_gate_suite, extended_soak).
+  - This is the first run where `extended_soak` passes; the LAN-toggle sub-stage inside
+    the soak previously reported `lan_on_allows=fail` / `client_status_on=fail` in all
+    prior six runs.
+  - `artifacts/phase10/fresh_install_os_matrix_report.json` now bound to commit `1a94de1`.
+  - Report dir: `artifacts/live_lab/20260509T150432Z`
+  - Run: 2026-05-09T15:04:32Z → 2026-05-09T17:05:45Z (≈2h 01m 13s)
+  - Commit: `1a94de1` (`fix(lan-toggle): skip assignment re-issue during LAN-ON wait phase`)
+Security invariants re-verified:
+  - The assignment re-issue skip applies only to the LAN-ON waiting phase; traversal and DNS zone
+    bundles are still refreshed as needed during that phase.
+  - The fix does not weaken assignment validation, anti-replay checks, or trust state freshness;
+    the fresh LAN assignment already issued by `apply_lan_access(true)` remains the active bundle.
+  - No fallback assignment path, no weakening of fail-closed behavior, no runtime downgrade.
+What this slice completed:
+  - The five-node Linux mesh now passes all 22 hard stages end-to-end on current HEAD, including
+    extended soak with LAN toggle and reboot recovery.
+  - Track E1 (fresh-install OS matrix refresh for current HEAD) is cleared: the report is now
+    bound to commit `1a94de1`.
+What remains blocked:
+  - `cargo deny check` / `cargo audit` blocked by pre-existing dependency policy issues.
+  - `scripts/ci/fresh_install_os_matrix_release_gate.sh` requires `macos` in the OS matrix
+    (macOS backend is Phase 1 scaffolding only; pre-existing blocker).
+  - Track E2 canonical cross-network reports still require distinct-underlay topology.
 ```
 
 ## 19. Definition of Done for This Document

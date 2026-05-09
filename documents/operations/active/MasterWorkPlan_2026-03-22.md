@@ -2003,8 +2003,7 @@ Status: complete (for this slice)
   fresh Windows peer after W4.5. Requires UTM VM access and cross-network topology.
 - **Track E2 canonical reports** (six cross-network families): requires distinct underlay prefixes
   and fresh live-lab run. See `PlugAndPlayTraversalRelayDeltaPlan §18.1 Phase E`.
-- **Track E1 fresh-install OS matrix refresh**: regenerate `artifacts/phase10/fresh_install_os_matrix_report.json`
-  bound to current HEAD. Requires five-node topology.
+- ~~**Track E1 fresh-install OS matrix refresh**~~: DONE in W4.7 — see below.
 
 ### W4.6 Gate Summary
 
@@ -2019,6 +2018,24 @@ Status: complete (for this slice)
 | `bash scripts/ci/windows_cross_compile_gate.sh` | PASS |
 | `bash scripts/ci/phase10_hp2_gates.sh` | PASS |
 | `bash scripts/ci/membership_gates.sh` | FAIL — pre-existing: `artifacts/phase10/membership_report.json` missing (lab-dependent) |
+
+## W4.7 Live-lab Run — Full 22-Stage Pass, extended_soak First Clean (2026-05-09)
+
+- **Milestone**: First complete clean run of all 22 mandatory stages on five-node UTM ARM Debian mesh (commit `1a94de1`).
+- **Result**: `overall_status=pass`. All 22 hard stages PASS. Cross-network stages skipped (same-underlay topology).
+- **Commit**: `1a94de1` (`fix(lan-toggle): skip assignment re-issue during LAN-ON wait phase`)
+- **Run timestamp**: 2026-05-09T15:04:32Z → 2026-05-09T17:05:45Z (≈2h 01m 13s)
+- **Report dir**: `artifacts/live_lab/20260509T150432Z`
+- **Key stage results**:
+  - `extended_soak`: PASS (first clean pass; previously failed in six prior runs)
+  - `live_lan_toggle`: PASS (both standalone and within extended soak)
+  - `fresh_install_os_matrix_report`: PASS — `artifacts/phase10/fresh_install_os_matrix_report.json` now bound to commit `1a94de1` (clears Track E1 blocker)
+  - `local_full_gate_suite`: PASS
+- **Root cause fixed** (commit `1a94de1`): `maybe_refresh_signed_state_artifacts` inside `wait_for_lan_access_state` was re-issuing no-LAN assignments from the orchestrator env during the LAN-ON wait phase. Added `skip_assignment_refresh: bool` to `SignedStateRefreshConfig`; LAN-ON wait phase sets it `true` and resets `last_traversal_refresh_unix` after `apply_lan_access(true)`.
+- **Residual blockers**:
+  - `cargo deny check` / `cargo audit` blocked by pre-existing dependency policy issues (unchanged).
+  - `scripts/ci/fresh_install_os_matrix_release_gate.sh` fails because release gate requires `macos` in the OS matrix (pre-existing; macOS backend is Phase 1 scaffolding only).
+  - Track E2 canonical cross-network reports still require distinct-underlay topology.
 
 ## Agent Update Rules
 
