@@ -65,6 +65,11 @@ struct SignedStateRefreshConfig<'a> {
     assignment: AssignmentRefreshConfig<'a>,
     traversal: TraversalRefreshConfig<'a>,
     dns: DnsRefreshConfig<'a>,
+    // When true, skip re-issuing assignment bundles. Use this during the LAN-ON
+    // waiting phase: apply-lan-access-coupling just issued a fresh LAN assignment
+    // (300s TTL), so re-issuing from the orchestrator env (which lacks LAN routes)
+    // would overwrite it and reset lan_access to off on the next reconcile.
+    skip_assignment_refresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,6 +536,7 @@ fn run() -> Result<(), i32> {
             allow_spec: allow_spec.as_str(),
             targets: &dns_targets,
         },
+        skip_assignment_refresh: false,
     };
     logger
         .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")
@@ -692,12 +698,22 @@ fn run() -> Result<(), i32> {
         .unwrap_or_default();
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
-    last_traversal_refresh_unix = unix_now();
     apply_lan_access(&ctx, &client_host, true, LAN_TEST_CIDR)?;
+    // Reset the traversal refresh timestamp after apply_lan_access returns: that
+    // call may take >15s, which would cause maybe_refresh_signed_state_artifacts to
+    // fire on the very first poll iteration and re-issue a no-LAN assignment from
+    // the orchestrator env, immediately resetting lan_access to off.  Use a config
+    // variant that skips assignment re-issuance for the duration of the LAN-ON
+    // phase; traversal and DNS zone bundles are still refreshed as needed.
+    last_traversal_refresh_unix = unix_now();
+    let signed_state_refresh_lan_on = SignedStateRefreshConfig {
+        skip_assignment_refresh: true,
+        ..signed_state_refresh
+    };
     let lan_on_state = wait_for_lan_access_state(
         &ctx,
         &logger,
-        &signed_state_refresh,
+        &signed_state_refresh_lan_on,
         &mut last_traversal_refresh_unix,
         &client_host,
         true,
@@ -707,7 +723,7 @@ fn run() -> Result<(), i32> {
         wait_for_lan_probe_state(
             &ctx,
             &logger,
-            &signed_state_refresh,
+            &signed_state_refresh_lan_on,
             &mut last_traversal_refresh_unix,
             &client_host,
             "reachable",
@@ -1468,7 +1484,12 @@ fn refresh_signed_state_artifacts(
     // Re-issue assignment bundles before refreshing state so that the daemon's
     // 300-second max-age check never sees a stale bundle during long convergence
     // loops that span multiple traversal refresh cycles.
-    refresh_assignment_bundles(ctx, logger, &config.assignment)?;
+    // Skip when apply-lan-access-coupling just issued a fresh LAN assignment:
+    // re-issuing from the orchestrator env (which lacks LAN routes) would overwrite
+    // it and immediately reset lan_access to off on the next reconcile.
+    if !config.skip_assignment_refresh {
+        refresh_assignment_bundles(ctx, logger, &config.assignment)?;
+    }
     refresh_traversal_bundles(ctx, logger, &config.traversal)?;
     refresh_dns_zone_bundles(ctx, logger, &config.dns)?;
     for target in config.dns.targets {
