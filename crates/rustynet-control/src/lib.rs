@@ -3105,6 +3105,29 @@ impl ControlPlaneCore {
         if bundle.generated_at_unix > bundle.expires_at_unix {
             return false;
         }
+        // Cross-check that the outer struct fields a downstream consumer
+        // might trust actually match the bytes that were signed.  Without
+        // this, an attacker (or buggy emitter) could pair a valid signed
+        // payload for `node-a` with an outer struct claiming `node-evil`
+        // and the verifier would still return true.  The endpoint-hint
+        // verifier applies the same pattern.
+        if !auto_tunnel_payload_field_matches(&bundle.payload, "node_id", bundle.node_id.as_str()) {
+            return false;
+        }
+        if !auto_tunnel_payload_field_matches(
+            &bundle.payload,
+            "generated_at_unix",
+            &bundle.generated_at_unix.to_string(),
+        ) {
+            return false;
+        }
+        if !auto_tunnel_payload_field_matches(
+            &bundle.payload,
+            "expires_at_unix",
+            &bundle.expires_at_unix.to_string(),
+        ) {
+            return false;
+        }
         let signature_bytes = match decode_hex_to_fixed::<64>(&bundle.signature_hex) {
             Ok(bytes) => bytes,
             Err(()) => return false,
@@ -3441,6 +3464,25 @@ fn serialize_auto_tunnel_payload(
         payload.push_str(&format!("route.{index}.kind={kind}\n"));
     }
     payload
+}
+
+/// Look up the first occurrence of `key=` in an auto-tunnel payload and
+/// confirm the value matches `expected`.  Returns `false` if the key is
+/// absent or the value differs.  Used by the verifier to cross-check outer
+/// struct fields (`node_id`, `generated_at_unix`, `expires_at_unix`)
+/// against the signed payload bytes; without this, an attacker holding a
+/// valid signed bundle could re-frame the outer struct and the verifier
+/// would still return true.
+fn auto_tunnel_payload_field_matches(payload: &str, key: &str, expected: &str) -> bool {
+    for line in payload.lines() {
+        let Some((line_key, line_value)) = line.split_once('=') else {
+            continue;
+        };
+        if line_key == key {
+            return line_value == expected;
+        }
+    }
+    false
 }
 
 fn host_ip_from_host_cidr(value: &str) -> Option<String> {
@@ -3958,12 +4000,13 @@ mod tests {
         EnrollmentRequest, LockoutConfig, MAX_RELAY_SESSION_TOKEN_TTL_SECS, PolicyCheckRequest,
         PolicyDecision, PolicyGuard, RELAY_TOKEN_SCOPE, RelayFleetBundleRequest,
         RelayFleetNodeDescriptor, RelaySessionToken, RelaySessionTokenRequest, ReplayPolicy,
-        ReusableCredentialPolicy, ReusableCredentialRequest, SignedDnsZoneBundleRequest,
-        SignedTokenClaims, ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims,
-        TransportPolicyError, TraversalCoordinationRecord, TrustState,
-        canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_signing_seed,
-        hex_bytes, load_trust_state, parse_relay_session_token_wire,
-        parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
+        ReusableCredentialPolicy, ReusableCredentialRequest, SignedAutoTunnelBundle,
+        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
+        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
+        TrustState, auto_tunnel_payload_field_matches, canonical_relay_id_from_label,
+        derive_endpoint_hint_signing_key, derive_signing_seed, hex_bytes, load_trust_state,
+        parse_relay_session_token_wire, parse_signed_relay_fleet_bundle_wire, persist_trust_state,
+        relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
@@ -4557,6 +4600,198 @@ mod tests {
             payload_field(&bundle_b.payload, "peer.0.allowed_ips"),
             Some(assigned_a.clone())
         );
+    }
+
+    /// Build an allow-all `ControlPlaneCore` with two enrolled nodes
+    /// `node-a` and `node-b` so auto-tunnel verifier tests can issue
+    /// bundles without re-pasting enrollment boilerplate.
+    fn auto_tunnel_test_core() -> ControlPlaneCore {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("at-cred-a", "node-a", "198.51.100.80:51820", [80; 32]),
+            ("at-cred-b", "node-b", "198.51.100.81:51820", [81; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+        core
+    }
+
+    fn auto_tunnel_request() -> AutoTunnelBundleRequest {
+        AutoTunnelBundleRequest {
+            node_id: "node-a".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 300,
+            nonce: 17,
+            mesh_cidr: "100.64.0.0/10".to_string(),
+            exit_node_id: None,
+            lan_routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn auto_tunnel_verifier_accepts_unmodified_bundle() {
+        // Regression guard: the cross-check pattern must not break the
+        // happy path.  An untouched signer-emitted bundle must verify.
+        let core = auto_tunnel_test_core();
+        let bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("auto tunnel bundle should be emitted");
+        assert!(
+            core.verify_signed_auto_tunnel_bundle(&bundle),
+            "unmodified signer output must verify"
+        );
+    }
+
+    #[test]
+    fn auto_tunnel_verifier_rejects_outer_node_id_mismatched_to_payload() {
+        // Real security gap: a bundle signed for node-a paired with an
+        // outer struct claiming node-evil must fail verification, not
+        // silently mislead a downstream consumer reading bundle.node_id.
+        let core = auto_tunnel_test_core();
+        let mut bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("auto tunnel bundle should be emitted");
+        assert!(core.verify_signed_auto_tunnel_bundle(&bundle));
+        bundle.node_id = "node-evil".to_string();
+        assert!(
+            !core.verify_signed_auto_tunnel_bundle(&bundle),
+            "outer node_id mismatched to signed payload must fail"
+        );
+    }
+
+    #[test]
+    fn auto_tunnel_verifier_rejects_outer_generated_at_mismatched_to_payload() {
+        let core = auto_tunnel_test_core();
+        let mut bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("auto tunnel bundle should be emitted");
+        assert!(core.verify_signed_auto_tunnel_bundle(&bundle));
+        // Pick a value that still satisfies generated_at <= expires_at so
+        // we exercise the cross-check, not the temporal-order gate.
+        bundle.generated_at_unix = bundle.generated_at_unix.saturating_sub(1);
+        assert!(
+            !core.verify_signed_auto_tunnel_bundle(&bundle),
+            "outer generated_at_unix mismatched to signed payload must fail"
+        );
+    }
+
+    #[test]
+    fn auto_tunnel_verifier_rejects_outer_expires_at_mismatched_to_payload() {
+        let core = auto_tunnel_test_core();
+        let mut bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("auto tunnel bundle should be emitted");
+        assert!(core.verify_signed_auto_tunnel_bundle(&bundle));
+        bundle.expires_at_unix = bundle.expires_at_unix.saturating_add(1);
+        assert!(
+            !core.verify_signed_auto_tunnel_bundle(&bundle),
+            "outer expires_at_unix mismatched to signed payload must fail"
+        );
+    }
+
+    #[test]
+    fn auto_tunnel_verifier_rejects_payload_swap_with_valid_signature() {
+        // A second, fully-valid signed bundle for node-b cannot be paired
+        // with an outer struct claiming node-a — the payload's node_id
+        // line will not match outer.node_id even though the signature
+        // still verifies the payload bytes.
+        let core = auto_tunnel_test_core();
+        let bundle_a = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("auto tunnel bundle a should be emitted");
+        let bundle_b = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                node_id: "node-b".to_string(),
+                ..auto_tunnel_request()
+            })
+            .expect("auto tunnel bundle b should be emitted");
+        assert!(core.verify_signed_auto_tunnel_bundle(&bundle_a));
+        assert!(core.verify_signed_auto_tunnel_bundle(&bundle_b));
+        let frankenbundle = SignedAutoTunnelBundle {
+            payload: bundle_b.payload.clone(),
+            signature_hex: bundle_b.signature_hex.clone(),
+            generated_at_unix: bundle_b.generated_at_unix,
+            expires_at_unix: bundle_b.expires_at_unix,
+            // Outer-struct lie: claim this bundle is for node-a.
+            node_id: bundle_a.node_id.clone(),
+        };
+        assert!(
+            !core.verify_signed_auto_tunnel_bundle(&frankenbundle),
+            "swapped payload with mismatched outer node_id must fail"
+        );
+    }
+
+    #[test]
+    fn auto_tunnel_payload_field_matches_helper_handles_edge_cases() {
+        // Pin the never-default-true contract.  A missing key MUST return
+        // false; otherwise an attacker could strip the line from the
+        // payload and bypass the cross-check.
+        let payload = "version=1\n\
+            node_id=node-a\n\
+            generated_at_unix=200\n\
+            expires_at_unix=500\n\
+            no-equals-sign-line\n";
+        // Exact match.
+        assert!(auto_tunnel_payload_field_matches(
+            payload, "node_id", "node-a"
+        ));
+        // Mismatched value rejects.
+        assert!(!auto_tunnel_payload_field_matches(
+            payload, "node_id", "node-b"
+        ));
+        // Missing key rejects (NEVER defaults to true).
+        assert!(!auto_tunnel_payload_field_matches(
+            payload,
+            "absent_key",
+            "anything"
+        ));
+        // Empty payload rejects (NEVER defaults to true).
+        assert!(!auto_tunnel_payload_field_matches("", "node_id", "node-a"));
+        // Numeric value compared as exact string.
+        assert!(auto_tunnel_payload_field_matches(
+            payload,
+            "generated_at_unix",
+            "200"
+        ));
+        assert!(!auto_tunnel_payload_field_matches(
+            payload,
+            "generated_at_unix",
+            "200 "
+        ));
+        // Lines without `=` must be skipped (not crash, not match).
+        assert!(!auto_tunnel_payload_field_matches(
+            payload,
+            "no-equals-sign-line",
+            ""
+        ));
     }
 
     #[test]
