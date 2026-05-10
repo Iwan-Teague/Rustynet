@@ -2349,6 +2349,14 @@ impl ControlPlaneCore {
     }
 
     pub fn verify_signed_peer_map(&self, map: &SignedPeerMap) -> bool {
+        // NOTE: peer-map's wire format is `node_id|hostname|os|owner|last_seen|pubkey\n`
+        // line records — there is no `version=N` line to gate on.  A version
+        // prefix would be a wire-format change that breaks compatibility with
+        // existing peer maps and is tracked as a separate followup.  Until
+        // that wire bump, this verifier relies on signature verification and
+        // the controlled construction path (`signed_peer_map`) to enforce
+        // the format.  Do NOT add a `payload_field_matches` gate here without
+        // a coordinated wire-format change.
         self.verify_peer_map_signature(&map.payload, &map.signature)
     }
 
@@ -2966,6 +2974,15 @@ impl ControlPlaneCore {
         if bundle.source_node_id.trim() == bundle.target_node_id.trim() {
             return false;
         }
+        // Reject any payload that does not declare the only currently
+        // supported wire version.  Without this, a future version=2
+        // bundle signed by the same key could silently verify against
+        // this verifier and a v1-only consumer could parse the v2 bytes
+        // under v1 assumptions.  Same vulnerability class as the outer-
+        // vs-payload mismatches handled below.
+        if !endpoint_hint_payload_field_matches(&bundle.payload, "version", "1") {
+            return false;
+        }
         // Cross-check that the outer struct fields a downstream consumer
         // might trust actually match the bytes that were signed.  Without
         // this, an attacker (or buggy emitter) could pair a valid signed
@@ -3041,6 +3058,15 @@ impl ControlPlaneCore {
         if record.nonce.iter().all(|value| *value == 0) {
             return false;
         }
+        // Explicit version gate.  The canonical-payload comparison below
+        // already enforces version=1 implicitly (the canonical builder
+        // always emits version=1), but pinning the contract here keeps
+        // the gate visible and prevents a future regression that allows
+        // alternative canonical forms from silently accepting a payload
+        // signed under a different version assumption.
+        if !endpoint_hint_payload_field_matches(&record.payload, "version", "1") {
+            return false;
+        }
 
         let expected_payload =
             match serialize_traversal_coordination_payload(&TraversalCoordinationRecord {
@@ -3090,6 +3116,15 @@ impl ControlPlaneCore {
     }
 
     pub fn verify_signed_dns_zone_bundle(&self, bundle: &SignedDnsZoneBundle) -> bool {
+        // Reject any payload that does not declare the only currently
+        // supported wire version.  The dns-zone wire parser already
+        // gates version=1, but a `SignedDnsZoneBundle` value can be
+        // constructed without going through the wire parser (e.g. via
+        // the builder or a deserializer), so the verifier itself must
+        // enforce the version explicitly.
+        if !endpoint_hint_payload_field_matches(&bundle.payload, "version", "1") {
+            return false;
+        }
         let verifying_key = match VerifyingKey::from_bytes(&self.dns_zone_verifying_key) {
             Ok(key) => key,
             Err(_) => return false,
@@ -3103,6 +3138,13 @@ impl ControlPlaneCore {
 
     pub fn verify_signed_auto_tunnel_bundle(&self, bundle: &SignedAutoTunnelBundle) -> bool {
         if bundle.generated_at_unix > bundle.expires_at_unix {
+            return false;
+        }
+        // Reject any payload that does not declare the only currently
+        // supported wire version.  Without this, a future version=2
+        // bundle signed by the same key could silently verify and a
+        // v1-only consumer could parse the v2 bytes under v1 assumptions.
+        if !auto_tunnel_payload_field_matches(&bundle.payload, "version", "1") {
             return false;
         }
         // Cross-check that the outer struct fields a downstream consumer
@@ -6033,6 +6075,166 @@ mod tests {
             "source_node_id",
             "node-a",
         ));
+    }
+
+    // ─── Signed-bundle version=N gates (slice 11) ────────────────────────────
+    //
+    // Every signed-bundle verifier must reject a payload whose `version=` line
+    // is not the current canonical version.  Without this gate, a future
+    // version=N+1 bundle signed by the same key could silently verify and a
+    // version=N-only consumer would parse the new bytes under old assumptions.
+    // These tests pin the gate by mutating the payload's version line on a
+    // valid signer-emitted bundle and asserting the verifier rejects.  The
+    // version check is positioned BEFORE signature verification in each
+    // verifier (see comments above each `*_payload_field_matches(... "version"
+    // ...)` call), so the rejection path here is the version gate itself.
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_payload_with_unknown_version() {
+        let core = endpoint_hint_test_core();
+        let mut bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        assert!(core.verify_signed_endpoint_hint_bundle(&bundle));
+        bundle.payload = bundle.payload.replacen("version=1", "version=2", 1);
+        assert!(
+            !core.verify_signed_endpoint_hint_bundle(&bundle),
+            "endpoint-hint verifier must reject unknown version even with otherwise valid bundle"
+        );
+    }
+
+    #[test]
+    fn auto_tunnel_verifier_rejects_payload_with_unknown_version() {
+        let core = auto_tunnel_test_core();
+        let mut bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("auto tunnel bundle should be emitted");
+        assert!(core.verify_signed_auto_tunnel_bundle(&bundle));
+        bundle.payload = bundle.payload.replacen("version=1", "version=2", 1);
+        assert!(
+            !core.verify_signed_auto_tunnel_bundle(&bundle),
+            "auto-tunnel verifier must reject unknown version even with otherwise valid bundle"
+        );
+    }
+
+    #[test]
+    fn dns_zone_verifier_rejects_payload_with_unknown_version() {
+        let core = endpoint_hint_test_core();
+        let request = SignedDnsZoneBundleRequest {
+            zone_name: "rustynet".to_string(),
+            subject_node_id: "node-a".to_string(),
+            generated_at_unix: 1_000,
+            ttl_secs: 60,
+            nonce: 7,
+            records: vec![DnsRecordRequest {
+                label: "host".to_string(),
+                target_node_id: "node-a".to_string(),
+                ttl_secs: 30,
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                aliases: vec![],
+            }],
+        };
+        let mut bundle = core
+            .signed_dns_zone_bundle(request)
+            .expect("dns zone bundle should be emitted");
+        assert!(core.verify_signed_dns_zone_bundle(&bundle));
+        bundle.payload = bundle.payload.replacen("version=1", "version=2", 1);
+        assert!(
+            !core.verify_signed_dns_zone_bundle(&bundle),
+            "dns-zone verifier must reject unknown version even with otherwise valid bundle"
+        );
+    }
+
+    #[test]
+    fn relay_fleet_verifier_rejects_payload_with_unknown_version() {
+        let core = endpoint_hint_test_core();
+        let mut bundle = core
+            .signed_relay_fleet_bundle(RelayFleetBundleRequest {
+                generated_at_unix: 300,
+                ttl_secs: 60,
+                nonce: 9,
+                relays: vec![RelayFleetNodeDescriptor {
+                    relay_id: "relay-us-1".to_string(),
+                    region: "us-east".to_string(),
+                    endpoint: "203.0.113.45:443".to_string(),
+                    priority: 20,
+                    capacity: 1024,
+                    enabled: true,
+                }],
+            })
+            .expect("relay fleet bundle should issue");
+        assert!(core.verify_signed_relay_fleet_bundle(&bundle));
+        bundle.payload = bundle.payload.replacen("version=1", "version=2", 1);
+        assert!(
+            !core.verify_signed_relay_fleet_bundle(&bundle),
+            "relay-fleet verifier must reject unknown version even with otherwise valid bundle"
+        );
+    }
+
+    // NOTE: peer_map_verifier_rejects_payload_with_unknown_version is
+    // intentionally NOT included.  Peer-map's wire format is line-pipe-
+    // delimited (`node_id|hostname|...`), not `version=N\nkey=value\n`,
+    // so a payload-field version gate cannot be added without a wire-
+    // format change.  Tracked as a future followup.
+
+    #[test]
+    fn traversal_coordination_record_verifier_rejects_payload_with_unknown_version() {
+        // Use the same enrollment + signing pattern as the existing
+        // `traversal_coordination_record_is_signed_and_tamper_detected`
+        // test below, then mutate the payload's version line.
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("coord-cred-x", "coord-node-x", "198.51.100.180:51820", [180; 32]),
+            ("coord-cred-y", "coord-node-y", "198.51.100.181:51820", [181; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("node enrollment should succeed");
+        }
+        let mut record = core
+            .signed_traversal_coordination_record(TraversalCoordinationRecord {
+                session_id: [0x33; 16],
+                probe_start_unix: 205,
+                node_a: "coord-node-x".to_string(),
+                node_b: "coord-node-y".to_string(),
+                issued_at_unix: 200,
+                expires_at_unix: 225,
+                nonce: [0x44; 16],
+            })
+            .expect("coordination record should sign");
+        assert!(core.verify_signed_traversal_coordination_record(&record));
+        record.payload = record.payload.replacen("version=1", "version=2", 1);
+        assert!(
+            !core.verify_signed_traversal_coordination_record(&record),
+            "coordination-record verifier must reject unknown version"
+        );
     }
 
     #[test]
