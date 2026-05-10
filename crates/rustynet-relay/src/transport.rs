@@ -154,8 +154,16 @@ impl RelayTransport {
         // open a replay window between the time a nonce is pruned and the
         // time `is_expired` would finally reject the token. Clamping is
         // fail-closed (stricter expiry) and preserves the existing API.
-        let clock_skew_tolerance_secs =
-            clock_skew_tolerance_secs.min(MAX_CLOCK_SKEW_TOLERANCE_SECS);
+        let (clock_skew_tolerance_secs, was_clamped) =
+            compute_clamped_skew(clock_skew_tolerance_secs);
+        if was_clamped {
+            // `tracing` is only available behind the `daemon` feature in this
+            // crate; emit a structured stderr line so the warning is visible
+            // in non-daemon builds (tests, library consumers) too.
+            eprintln!(
+                "warn relay_transport: clock_skew_tolerance_secs clamped to {MAX_CLOCK_SKEW_TOLERANCE_SECS} (operator-supplied value exceeded the safe ceiling; replay window would otherwise reopen)"
+            );
+        }
         Self {
             relay_id,
             sessions: HashMap::new(),
@@ -192,6 +200,17 @@ impl RelayTransport {
     pub fn set_max_total_sessions(&mut self, max_total_sessions: usize) -> Result<(), String> {
         if max_total_sessions == 0 {
             return Err("max total relay sessions must be greater than 0".to_string());
+        }
+        // Refuse to shrink below the live session count. Silent eviction would
+        // be an operator footgun: legitimate sessions disappear without an
+        // observable error, and evicting the oldest is a heuristic the caller
+        // didn't necessarily ask for. A clear error gives the operator
+        // feedback so they can drain sessions explicitly before shrinking.
+        let live = self.sessions.len();
+        if max_total_sessions < live {
+            return Err(format!(
+                "cannot shrink max total relay sessions to {max_total_sessions} below live count {live}; drain sessions first"
+            ));
         }
         self.max_total_sessions = max_total_sessions;
         Ok(())
@@ -693,34 +712,64 @@ impl NonceStore {
     }
 
     fn insert(&mut self, nonce: [u8; 16]) -> Result<(), String> {
-        let mut next = self.nonces.clone();
-        next.insert(nonce, now_unix());
-        self.persist_map(&next)?;
-        self.nonces = next;
+        // Insert directly, persist, and roll back on failure. Avoids the
+        // O(n) clone of the entire nonce map per accepted hello (which at
+        // 4096 sessions × 240 s retention gave O(n²) total work). The
+        // persist-failure consistency property is preserved: in-memory
+        // state matches on-disk state, OR the operation fails closed
+        // without mutating either.
+        let prior = self.nonces.insert(nonce, now_unix());
+        if let Err(err) = self.persist() {
+            // Restore previous state (either remove the new entry, or
+            // re-insert whatever was there before — defensive against
+            // an unexpected duplicate).
+            match prior {
+                Some(previous) => {
+                    self.nonces.insert(nonce, previous);
+                }
+                None => {
+                    self.nonces.remove(&nonce);
+                }
+            }
+            return Err(err);
+        }
         Ok(())
     }
 
     fn prune(&mut self, retention: Duration) -> Result<(), String> {
         let now = now_unix();
         let retention_secs = retention.as_secs();
-        let mut next = self.nonces.clone();
-        next.retain(|_, inserted_at| now.saturating_sub(*inserted_at) < retention_secs);
-        if next.len() != self.nonces.len() {
-            self.persist_map(&next)?;
-            self.nonces = next;
+        // Collect keys to drop without cloning the full map. The drop set
+        // is bounded by the number of expiring nonces (typically a small
+        // fraction of total), not by the map size.
+        let to_remove: Vec<([u8; 16], u64)> = self
+            .nonces
+            .iter()
+            .filter(|(_, inserted_at)| now.saturating_sub(**inserted_at) >= retention_secs)
+            .map(|(nonce, inserted_at)| (*nonce, *inserted_at))
+            .collect();
+        if to_remove.is_empty() {
+            return Ok(());
+        }
+        for (nonce, _) in &to_remove {
+            self.nonces.remove(nonce);
+        }
+        if let Err(err) = self.persist() {
+            // Restore evicted entries with their original timestamps so
+            // a later prune retry sees the same state as before.
+            for (nonce, inserted_at) in to_remove {
+                self.nonces.insert(nonce, inserted_at);
+            }
+            return Err(err);
         }
         Ok(())
     }
 
     fn persist(&self) -> Result<(), String> {
-        self.persist_map(&self.nonces)
-    }
-
-    fn persist_map(&self, nonces: &HashMap<[u8; 16], u64>) -> Result<(), String> {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
-        persist_nonce_map(path, nonces)
+        persist_nonce_map(path, &self.nonces)
     }
 }
 
@@ -731,19 +780,60 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+/// Pure helper that clamps an operator-supplied clock-skew tolerance to the
+/// safe ceiling and reports whether clamping occurred. Extracted so the
+/// clamp decision is testable without depending on a logging subscriber.
+///
+/// Returns `(clamped_value, was_clamped)`. `was_clamped == true` is the
+/// signal that a `warn`-level log line would be emitted.
+fn compute_clamped_skew(input: u64) -> (u64, bool) {
+    if input > MAX_CLOCK_SKEW_TOLERANCE_SECS {
+        (MAX_CLOCK_SKEW_TOLERANCE_SECS, true)
+    } else {
+        (input, false)
+    }
+}
+
+/// Pure helper that decides whether a `symlink_metadata` failure during
+/// replay-store path validation is "expected" (file not yet created, fresh
+/// install) or "unexpected" (permission denied, I/O error, etc.) and should
+/// produce a warning. Extracted so the warn-or-not decision is testable
+/// without depending on a logging subscriber.
+///
+/// Returns `true` iff a warning would be emitted.
+fn should_warn_replay_stat_skip(err: &std::io::Error) -> bool {
+    err.kind() != std::io::ErrorKind::NotFound
+}
+
 fn validate_replay_store_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("replay store path must not be empty".to_string());
     }
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return Err("replay store path must be a regular file".to_string());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err("replay store path must be a regular file".to_string());
+            }
+            #[cfg(unix)]
+            {
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    return Err(format!("replay store permissions too broad: {mode:o}"));
+                }
+            }
         }
-        #[cfg(unix)]
-        {
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(format!("replay store permissions too broad: {mode:o}"));
+        Err(err) => {
+            // NotFound is expected on first-run / fresh-install: the parent
+            // directory is the relevant security surface and is checked
+            // below. Any *other* stat error (permission denied, I/O error)
+            // means we couldn't actually verify the file's safety. Log a
+            // warning so an operator with a corrupted state directory can
+            // see that the permission check was skipped.
+            if should_warn_replay_stat_skip(&err) {
+                eprintln!(
+                    "warn relay_transport: replay store permission check skipped — symlink_metadata({}) failed: {err}",
+                    path.display()
+                );
             }
         }
     }
@@ -2877,5 +2967,195 @@ mod tests {
             !transport.sessions.contains_key(&ack_b.session_id),
             "untouched idle session should be cleaned up"
         );
+    }
+
+    // ── Followup-audit regression tests ──────────────────────────────────────
+    //
+    // Pin the contracts for the four DoS / footgun followups flagged by the
+    // previous audit:
+    //   1. NonceStore::insert no longer clones the entire map per accepted
+    //      hello — verified via large-batch insertion timing budget plus
+    //      direct rollback-on-persist-failure check.
+    //   2. compute_clamped_skew exposes the (value, was_clamped) decision
+    //      the warn log line is gated on.
+    //   3. set_max_total_sessions rejects shrinking below the live count.
+    //   4. should_warn_replay_stat_skip exposes the decision the warn log
+    //      line is gated on.
+
+    #[test]
+    fn nonce_store_insert_handles_large_batches_without_quadratic_clone() {
+        // Followup #1: insert previously cloned the entire HashMap on each
+        // call (O(n) per call, O(n²) total). Pin a bound that the
+        // pre-fix implementation would blow through on slow CI: inserting
+        // 1000 nonces into an in-memory store (no persist path) must
+        // finish in well under 200 ms. The pre-fix implementation copied
+        // (1 + 2 + ... + 1000) ≈ 500 000 entries; the new implementation
+        // copies zero. We pick a generous threshold to avoid flakes on
+        // shared CI runners.
+        let mut store = NonceStore::default();
+        let mut nonce = [0u8; 16];
+        let start = Instant::now();
+        for i in 0..1000u64 {
+            nonce[0..8].copy_from_slice(&i.to_le_bytes());
+            store
+                .insert(nonce)
+                .expect("in-memory insert must not fail without a persist path");
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(
+            store.nonces.len(),
+            1000,
+            "all 1000 distinct nonces must be retained"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "1000 inserts must complete well under 200 ms (took {elapsed:?}); \
+             a regression to clone-on-write would scale O(n²) and blow the budget"
+        );
+    }
+
+    #[test]
+    fn nonce_store_insert_persist_failure_rolls_back_in_memory_state() {
+        // Followup #1: the new insert path mutates self.nonces *first* and
+        // then persists; on persist failure it must roll back. This pins
+        // the same property the existing
+        // `nonce_store_failed_persist_keeps_in_memory_state_consistent`
+        // test pins at the daemon entry point, but exercised directly on
+        // NonceStore so the rollback path is unit-pinned.
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-relay-rollback-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir must be created");
+        #[cfg(unix)]
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("temp dir permissions must be tight");
+        let path = dir.join("replay.store");
+        let mut store = NonceStore::load(path).expect("fresh store should initialize");
+        // Yank the parent so subsequent persist calls fail.
+        fs::remove_dir_all(&dir).expect("parent removal should succeed");
+
+        let nonce = [0xAB; 16];
+        let result = store.insert(nonce);
+        assert!(
+            result.is_err(),
+            "insert with vanished parent must surface a persist error"
+        );
+        assert!(
+            !store.nonces.contains_key(&nonce),
+            "failed persist must not leave a phantom nonce in memory"
+        );
+    }
+
+    #[test]
+    fn compute_clamped_skew_reports_clamp_decision() {
+        // Followup #2: the clamp decision is silent at construction time.
+        // Pin the pure helper that the warn log is gated on so future
+        // refactors cannot accidentally silence the warning.
+        let (val, clamped) = compute_clamped_skew(0);
+        assert_eq!((val, clamped), (0, false), "zero skew must pass through");
+
+        let (val, clamped) = compute_clamped_skew(MAX_CLOCK_SKEW_TOLERANCE_SECS - 1);
+        assert!(!clamped, "value below ceiling must not clamp");
+        assert_eq!(val, MAX_CLOCK_SKEW_TOLERANCE_SECS - 1);
+
+        let (val, clamped) = compute_clamped_skew(MAX_CLOCK_SKEW_TOLERANCE_SECS);
+        assert!(!clamped, "value at exact ceiling must not clamp");
+        assert_eq!(val, MAX_CLOCK_SKEW_TOLERANCE_SECS);
+
+        let (val, clamped) = compute_clamped_skew(MAX_CLOCK_SKEW_TOLERANCE_SECS + 1);
+        assert!(clamped, "value one above ceiling must clamp");
+        assert_eq!(
+            val, MAX_CLOCK_SKEW_TOLERANCE_SECS,
+            "clamped value must equal the ceiling"
+        );
+
+        let (val, clamped) = compute_clamped_skew(u64::MAX);
+        assert!(clamped, "u64::MAX must clamp");
+        assert_eq!(val, MAX_CLOCK_SKEW_TOLERANCE_SECS);
+    }
+
+    #[test]
+    fn set_max_total_sessions_refuses_to_shrink_below_live_count() {
+        // Followup #3: an operator who shrinks the cap below the current
+        // live session count must get a clear error rather than silent
+        // eviction (or, worse, a config that admits the change but lets
+        // the live set continue exceeding the cap).
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        // Seed two live sessions
+        let hello_a = make_hello(&sk, "node-a", "node-b");
+        let hello_b = make_hello(&sk, "node-c", "node-d");
+        match transport.handle_hello(hello_a) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("first hello must be accepted: {other:?}"),
+        }
+        match transport.handle_hello(hello_b) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("second hello must be accepted: {other:?}"),
+        }
+        assert_eq!(transport.session_count(), 2);
+
+        let err = transport
+            .set_max_total_sessions(1)
+            .expect_err("shrinking below live count must fail closed");
+        assert!(
+            err.contains("cannot shrink") && err.contains("live count"),
+            "error must clearly signal the shrink-below-live problem: {err}"
+        );
+        // And the underlying state must not have been mutated.
+        assert_eq!(
+            transport.session_count(),
+            2,
+            "rejected shrink must not have evicted sessions"
+        );
+
+        // Equal-to-live is fine (does not regress observable cap).
+        transport
+            .set_max_total_sessions(2)
+            .expect("cap == live must succeed");
+        // Strictly above live is fine.
+        transport
+            .set_max_total_sessions(10)
+            .expect("cap > live must succeed");
+        // Zero is still rejected (existing contract preserved).
+        let err = transport
+            .set_max_total_sessions(0)
+            .expect_err("zero cap must still fail");
+        assert!(err.contains("greater than 0"));
+    }
+
+    #[test]
+    fn should_warn_replay_stat_skip_treats_not_found_as_silent() {
+        // Followup #4: the warn log line for "permission check skipped due
+        // to unexpected stat error" is gated on this helper. NotFound is
+        // the *expected* fresh-install case and must not warn; any other
+        // io error means we couldn't actually verify safety and must warn.
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(
+            !should_warn_replay_stat_skip(&not_found),
+            "NotFound is expected on fresh install and must not warn"
+        );
+
+        let permission_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(
+            should_warn_replay_stat_skip(&permission_denied),
+            "PermissionDenied means we could not verify safety and must warn"
+        );
+
+        // A handful of other unexpected kinds — all must warn so the
+        // decision boundary is not "only PermissionDenied".
+        for kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let err = std::io::Error::from(kind);
+            assert!(
+                should_warn_replay_stat_skip(&err),
+                "unexpected io kind {kind:?} must warn"
+            );
+        }
     }
 }
