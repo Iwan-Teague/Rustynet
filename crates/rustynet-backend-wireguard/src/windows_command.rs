@@ -635,6 +635,17 @@ fn validate_cidr(value: &str) -> Result<(), BackendError> {
 }
 
 fn validate_windows_tunnel_name(name: &str) -> Result<(), BackendError> {
+    // The tunnel name is interpolated into netsh argv values of the form
+    // `interface=<name>` (see `add_os_route` / `delete_os_route`).  Allowing
+    // `=` in the name would let a caller-supplied identifier collide with the
+    // netsh `key=value` separator and turn `interface=foo=bar` into a value
+    // netsh parses ambiguously, so we reject `=` here.  We also reject
+    // control chars, non-ASCII, and whitespace for the same class of reasons
+    // (corrupted log lines, ambiguous argv shape, mismatched DPAPI config
+    // file names which are derived from this value).  Real WireGuard for
+    // Windows tunnel names are short ASCII identifiers — this matches the
+    // hardened `validate_windows_interface_alias` model in rustynetd's
+    // phase10 system.
     const RESERVED_NAMES: [&str; 22] = [
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -642,6 +653,26 @@ fn validate_windows_tunnel_name(name: &str) -> Result<(), BackendError> {
     if name.is_empty() || name.len() > 32 {
         return Err(BackendError::invalid_input(
             "windows tunnel name length must be between 1 and 32",
+        ));
+    }
+    if !name.is_ascii() {
+        return Err(BackendError::invalid_input(
+            "windows tunnel name must be ASCII",
+        ));
+    }
+    if name.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(BackendError::invalid_input(
+            "windows tunnel name must not contain control characters",
+        ));
+    }
+    if name.chars().any(|ch| ch.is_ascii_whitespace()) {
+        return Err(BackendError::invalid_input(
+            "windows tunnel name must not contain whitespace",
+        ));
+    }
+    if name.contains('=') {
+        return Err(BackendError::invalid_input(
+            "windows tunnel name must not contain '='",
         ));
     }
     if RESERVED_NAMES
@@ -654,7 +685,7 @@ fn validate_windows_tunnel_name(name: &str) -> Result<(), BackendError> {
     }
     if !name
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '=' | '+' | '.' | '-'))
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '.' | '-'))
     {
         return Err(BackendError::invalid_input(
             "windows tunnel name contains invalid characters",
@@ -1046,5 +1077,428 @@ mod tests {
                 "rustynet0".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn windows_tunnel_name_validator_rejects_equals_and_unsafe_chars() {
+        // The tunnel name is interpolated into a netsh argv value of the form
+        // `interface=<tunnel_name>` and used to derive the DPAPI config file
+        // name.  A name containing `=` would create an ambiguous netsh
+        // `key=value` argument; whitespace, control characters, and non-ASCII
+        // would corrupt log lines and the DPAPI filename.  Pin those rejects
+        // so a future regression that loosens the validator fails CI in the
+        // same way the parallel phase10 `validate_windows_interface_alias`
+        // hardening did.
+        let rejected = [
+            "rustynet=0",
+            "rustynet 0",
+            "rustynet\t0",
+            "rustynet\n0",
+            "rustynet\u{0007}0",
+            "rüstynet0",
+            "",
+        ];
+        for bad in rejected {
+            assert!(
+                validate_windows_tunnel_name(bad).is_err(),
+                "validator must reject {bad:?}"
+            );
+        }
+        // 33-char name (the max is 32).
+        let too_long = "a".repeat(33);
+        assert!(validate_windows_tunnel_name(&too_long).is_err());
+        // Reserved device name (case-insensitive).
+        assert!(validate_windows_tunnel_name("CON").is_err());
+        assert!(validate_windows_tunnel_name("com1").is_err());
+    }
+
+    #[test]
+    fn windows_tunnel_name_validator_accepts_reviewed_identifiers() {
+        // The validator must keep accepting reviewed real-world values so
+        // production deployments don't regress.
+        for ok in [
+            "rustynet0",
+            "rustynet-mesh",
+            "rustynet_mesh.1",
+            "RN+demo",
+            "abcdefghijklmnopqrstuvwxyzABCDEF", // 32 chars, the maximum.
+        ] {
+            assert!(
+                validate_windows_tunnel_name(ok).is_ok(),
+                "validator must accept {ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_route_helpers_render_reviewed_netsh_argv() {
+        // Pin the exact netsh argv shape for `add` and `delete` route paths
+        // — the same render-reviewed-args contract that `phase10.rs`'s
+        // `windows_dns_helpers_render_reviewed_netsh_args` enforces for the
+        // killswitch helpers.  A regression that drops `metric=1`, the
+        // `store=active` qualifier, or that flips ipv4↔ipv6 family selection
+        // must fail CI here rather than at first contact with a Windows lab.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        let peer = sample_peer("peer-a");
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        backend
+            .configure_peer(peer.clone())
+            .expect("peer should configure");
+        backend
+            .apply_routes(vec![Route {
+                destination_cidr: "2001:db8::/64".to_string(),
+                via_node: peer.node_id.clone(),
+                kind: RouteKind::Mesh,
+            }])
+            .expect("ipv6 route should apply");
+
+        let recorded = runner.recorded();
+        // ipv6 add must select the ipv6 family and the unspecified next hop.
+        assert!(
+            recorded.iter().any(|(program, args)| {
+                program == &netsh_path.to_string_lossy()
+                    && args
+                        == &vec![
+                            "interface".to_string(),
+                            "ipv6".to_string(),
+                            "add".to_string(),
+                            "route".to_string(),
+                            "prefix=2001:db8::/64".to_string(),
+                            "interface=rustynet0".to_string(),
+                            "nexthop=::".to_string(),
+                            "store=active".to_string(),
+                            "metric=1".to_string(),
+                        ]
+            }),
+            "ipv6 mesh route must use the reviewed netsh argv with metric=1 and store=active"
+        );
+
+        backend
+            .apply_routes(Vec::new())
+            .expect("route removal should succeed");
+        let recorded = runner.recorded();
+        // ipv6 delete must use the ipv6 family and store=active, but does not
+        // need the nexthop or metric arguments.
+        assert!(
+            recorded.iter().any(|(program, args)| {
+                program == &netsh_path.to_string_lossy()
+                    && args
+                        == &vec![
+                            "interface".to_string(),
+                            "ipv6".to_string(),
+                            "delete".to_string(),
+                            "route".to_string(),
+                            "prefix=2001:db8::/64".to_string(),
+                            "interface=rustynet0".to_string(),
+                            "store=active".to_string(),
+                        ]
+            }),
+            "ipv6 mesh route delete must use the reviewed netsh argv shape"
+        );
+    }
+
+    #[test]
+    fn windows_route_helpers_select_ipv4_or_ipv6_family_per_destination() {
+        // Direct-call contract on the routing helpers: the family selector
+        // and next-hop sentinel must be derived from the destination CIDR
+        // shape, not from caller-supplied data.  Pinning this makes a future
+        // refactor that mistakenly threads the family from a peer field
+        // (instead of the destination) fail CI immediately.
+        let (family, next_hop) =
+            route_family_and_next_hop("100.64.0.0/10").expect("ipv4 routing tuple");
+        assert_eq!(family, "ipv4");
+        assert_eq!(next_hop, "nexthop=0.0.0.0");
+        let (family, next_hop) =
+            route_family_and_next_hop("2001:db8::/64").expect("ipv6 routing tuple");
+        assert_eq!(family, "ipv6");
+        assert_eq!(next_hop, "nexthop=::");
+    }
+
+    #[test]
+    fn windows_command_paths_are_argv_only_with_no_shell_construction() {
+        // This test pins the architectural property that distinguishes the
+        // hardened Windows backend from a shelled-out implementation: every
+        // recorded command program must be one of the validated absolute
+        // binary paths, and every recorded argument must be a plain argv
+        // value — never a shell metacharacter sequence (`|`, `&`, `;`, `>`,
+        // backticks) and never an interpolated PowerShell command line.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        let peer = sample_peer("peer-a");
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        backend
+            .configure_peer(peer.clone())
+            .expect("peer should configure");
+        backend
+            .apply_routes(vec![Route {
+                destination_cidr: "100.64.20.0/24".to_string(),
+                via_node: peer.node_id.clone(),
+                kind: RouteKind::Mesh,
+            }])
+            .expect("route should apply");
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("full-tunnel mode should apply");
+
+        let allowed_programs: BTreeSet<String> = [
+            wireguard_path.to_string_lossy().to_string(),
+            wg_path.to_string_lossy().to_string(),
+            netsh_path.to_string_lossy().to_string(),
+        ]
+        .into_iter()
+        .collect();
+
+        for (program, args) in runner.recorded() {
+            assert!(
+                allowed_programs.contains(&program),
+                "command program {program:?} must be one of the validated binary paths"
+            );
+            // The Windows backend must never invoke PowerShell — that family
+            // of helpers lives in rustynetd's phase10 system, not here.  A
+            // regression that smuggles a PowerShell command into the
+            // backend argv path would also need to satisfy the per-arg
+            // metacharacter guard below, but pinning the program list
+            // gives a clearer failure signal first.
+            let lower = program.to_lowercase();
+            assert!(
+                !lower.contains("powershell") && !lower.contains("pwsh") && !lower.contains("cmd.exe"),
+                "windows wireguard backend must not shell out to PowerShell or cmd.exe (saw {program:?})"
+            );
+            for arg in &args {
+                for forbidden in ['|', '&', ';', '>', '<', '`', '\n', '\r'] {
+                    assert!(
+                        !arg.contains(forbidden),
+                        "argv value {arg:?} must not contain shell metacharacter {forbidden:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_install_tunnel_service_uses_argv_only_path_arguments() {
+        // Pin the argv shape for the privileged `wireguard.exe
+        // /installtunnelservice` invocation.  The tunnel-service install is
+        // the single point where rustynetd hands a config-file path to the
+        // WireGuard tunnel manager service; it must remain a pure argv
+        // pair (`/installtunnelservice <path>`), with no shell or PS
+        // wrapping, so the privileged process boundary stays sealed.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+
+        let recorded = runner.recorded();
+        let install = recorded
+            .iter()
+            .find(|(_, args)| args.first().map(|a| a.as_str()) == Some("/installtunnelservice"))
+            .expect("install command should be recorded");
+        assert_eq!(install.0, wireguard_path.to_string_lossy());
+        assert_eq!(install.1.len(), 2);
+        assert_eq!(install.1[0], "/installtunnelservice");
+        assert_eq!(install.1[1], config_path.display().to_string());
+    }
+
+    #[test]
+    fn windows_remove_peer_issues_argv_only_wg_set_remove() {
+        // Pin the argv shape for `wg set <tunnel> peer <pubkey> remove` —
+        // the same pure-argv contract phase10 enforces on its NetNat
+        // helpers, but for the WireGuard control plane.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        let peer = sample_peer("peer-a");
+        let public_key = encode_wg_public_key_base64(&peer.public_key);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        backend
+            .configure_peer(peer.clone())
+            .expect("peer should configure");
+        backend
+            .remove_peer(&peer.node_id)
+            .expect("peer should remove");
+
+        let recorded = runner.recorded();
+        let remove = recorded
+            .iter()
+            .find(|(program, args)| {
+                program == &wg_path.to_string_lossy()
+                    && args.iter().any(|a| a == "remove")
+            })
+            .expect("remove command should be recorded");
+        assert_eq!(
+            remove.1,
+            vec![
+                "set".to_string(),
+                "rustynet0".to_string(),
+                "peer".to_string(),
+                public_key,
+                "remove".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_ensure_running_fails_closed_on_missing_start() {
+        // The `ensure_running` gate is the backend's flag-only fail-closed
+        // assertion — any operation that goes through it must refuse to
+        // touch the OS until `start` has succeeded.  This pins the contract
+        // so a future refactor that drops the gate (or replaces it with a
+        // fall-through) fails CI.  This is the WireGuard-backend analogue
+        // of `assert_killswitch`'s pre-fix flag check; the OS-state-aware
+        // fail-closed for tunnel posture is already covered by phase10's
+        // `assert_killswitch` and is intentionally not duplicated here.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+
+        let peer = sample_peer("peer-a");
+        assert!(backend.configure_peer(peer.clone()).is_err());
+        assert!(
+            backend
+                .apply_routes(vec![Route {
+                    destination_cidr: "100.64.20.0/24".to_string(),
+                    via_node: peer.node_id.clone(),
+                    kind: RouteKind::Mesh,
+                }])
+                .is_err()
+        );
+        assert!(backend.set_exit_mode(ExitMode::FullTunnel).is_err());
+        assert!(backend.remove_peer(&peer.node_id).is_err());
+        assert!(backend.shutdown().is_err());
+        assert!(backend.stats().is_err());
+
+        // No commands should have been recorded because every
+        // `ensure_running` gate must short-circuit before reaching the
+        // runner.
+        assert!(
+            runner.recorded().is_empty(),
+            "no command should reach the runner before start() succeeds"
+        );
+    }
+
+    #[test]
+    fn windows_validate_cidr_rejects_shell_and_argv_metachars() {
+        // The CIDR validator is the single guard between caller-supplied
+        // route/allowed-IP strings and netsh argv values like
+        // `prefix=<cidr>`.  Pin that it rejects characters that would
+        // either corrupt the netsh argv shape or open a shell-construction
+        // path.  Mirrors the spirit of phase10's argv-only metacharacter
+        // tests but applied to the WireGuard backend's CIDR ingress point.
+        for bad in [
+            "100.64.0.0/24=foo",
+            "100.64.0.0/24 extra",
+            "100.64.0.0/24;rm -rf /",
+            "100.64.0.0/24|cmd",
+            "100.64.0.0/24`",
+            "100.64.0.0/24\n",
+            "",
+            "no-slash",
+        ] {
+            assert!(
+                validate_cidr(bad).is_err(),
+                "validate_cidr must reject {bad:?}"
+            );
+        }
+        for ok in ["100.64.0.0/10", "0.0.0.0/0", "::/0", "2001:db8::/64"] {
+            assert!(
+                validate_cidr(ok).is_ok(),
+                "validate_cidr must accept {ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_private_key_validator_rejects_unsafe_content() {
+        // The private-key file content is rendered into the WireGuard
+        // config body; a stray newline or shell metacharacter in the value
+        // would corrupt the rendered `[Interface]` section.  This is a
+        // structural fail-closed check parallel to phase10's argv guards
+        // — a regression that loosened the validator would let a malformed
+        // key file produce a structurally-broken config file.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("bad.key");
+
+        for bad in ["", "   \n  \n", "abc def", "abc\tdef", "abc;rm", "abc\u{0007}d"] {
+            fs::write(&path, bad).expect("write key");
+            assert!(
+                read_private_key_value(&path).is_err(),
+                "read_private_key_value must reject {bad:?}"
+            );
+        }
     }
 }
