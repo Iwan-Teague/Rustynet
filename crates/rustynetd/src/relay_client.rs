@@ -21,15 +21,25 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::fs;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rustynet_backend_api::{NodeId, SocketEndpoint};
-use rustynet_control::RelaySessionToken;
+pub use rustynet_control::MAX_RELAY_SESSION_TOKEN_TTL_SECS;
+use rustynet_control::{RELAY_TOKEN_SCOPE, RelaySessionToken, parse_relay_session_token_wire};
 use rustynet_relay::{RelayHello, RelayHelloAck, SessionId};
+
+const RELAY_SESSION_TOKEN_CLIENT_CLOCK_SKEW_SECS: u64 = 90;
+const PREISSUED_RELAY_TOKEN_MAX_BYTES: u64 = 4096;
+const PREISSUED_RELAY_TOKEN_MAX_FILES: usize = 128;
+const PREISSUED_RELAY_TOKEN_EXTENSION: &str = "relay-token";
 
 /// Configuration for relay client behavior.
 #[derive(Debug, Clone)]
@@ -82,6 +92,138 @@ pub struct RelayClientSession {
     pub relay_id: [u8; 16],
     /// When the session token expires according to the control-plane signer.
     pub token_expires_at_unix: u64,
+}
+
+/// Issues signed relay session tokens for session establishment.
+///
+/// Production deployments should prefer a control-plane-backed issuer. The
+/// local signing-key issuer exists for reviewed lab or control-plane-collocated
+/// deployments only, and is gated by daemon configuration before construction.
+pub trait RelaySessionTokenIssuer: Send + Sync {
+    fn issue_token(
+        &self,
+        node_id: &NodeId,
+        peer_node_id: &NodeId,
+        relay_id: [u8; 16],
+        ttl_secs: u64,
+    ) -> Result<RelaySessionToken, RelayClientError>;
+}
+
+/// Local relay session token issuer backed by an Ed25519 signing key.
+pub struct LocalRelaySessionTokenIssuer {
+    signing_key: Arc<SigningKey>,
+}
+
+impl LocalRelaySessionTokenIssuer {
+    pub fn new(signing_key: Arc<SigningKey>) -> Self {
+        Self { signing_key }
+    }
+}
+
+impl RelaySessionTokenIssuer for LocalRelaySessionTokenIssuer {
+    fn issue_token(
+        &self,
+        node_id: &NodeId,
+        peer_node_id: &NodeId,
+        relay_id: [u8; 16],
+        ttl_secs: u64,
+    ) -> Result<RelaySessionToken, RelayClientError> {
+        Ok(RelaySessionToken::sign(
+            &self.signing_key,
+            node_id.as_str(),
+            peer_node_id.as_str(),
+            relay_id,
+            ttl_secs,
+        ))
+    }
+}
+
+/// Relay session token issuer backed by pre-issued control-plane token files.
+///
+/// This keeps daemon runtime out of the token-signing trust boundary while
+/// still allowing a hardened local deployment model: an external control-plane
+/// process writes signed one-use token artifacts into a restricted spool.
+pub struct PreissuedRelaySessionTokenIssuer {
+    spool_dir: PathBuf,
+    verifier_key: VerifyingKey,
+}
+
+impl PreissuedRelaySessionTokenIssuer {
+    pub fn new(spool_dir: PathBuf, verifier_key: VerifyingKey) -> Result<Self, RelayClientError> {
+        validate_preissued_token_spool_dir(&spool_dir)?;
+        Ok(Self {
+            spool_dir,
+            verifier_key,
+        })
+    }
+}
+
+impl RelaySessionTokenIssuer for PreissuedRelaySessionTokenIssuer {
+    fn issue_token(
+        &self,
+        node_id: &NodeId,
+        peer_node_id: &NodeId,
+        relay_id: [u8; 16],
+        ttl_secs: u64,
+    ) -> Result<RelaySessionToken, RelayClientError> {
+        let now_unix = current_unix();
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&self.spool_dir).map_err(|err| {
+            RelayClientError::TokenSigning(format!("read relay token spool failed: {err}"))
+        })? {
+            let entry = entry.map_err(|err| {
+                RelayClientError::TokenSigning(format!(
+                    "read relay token spool entry failed: {err}"
+                ))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str())
+                != Some(PREISSUED_RELAY_TOKEN_EXTENSION)
+            {
+                continue;
+            }
+            entries.push(path);
+            if entries.len() > PREISSUED_RELAY_TOKEN_MAX_FILES {
+                return Err(RelayClientError::TokenSigning(
+                    "relay token spool contains too many token artifacts".to_string(),
+                ));
+            }
+        }
+        entries.sort();
+
+        for path in entries {
+            let token = read_preissued_relay_token(&path)?;
+            token.verify_signature(&self.verifier_key).map_err(|err| {
+                RelayClientError::TokenSigning(format!(
+                    "preissued relay token signature invalid: {err}"
+                ))
+            })?;
+            if token.node_id != node_id.as_str()
+                || token.peer_node_id != peer_node_id.as_str()
+                || token.relay_id != relay_id
+            {
+                continue;
+            }
+            validate_issued_relay_session_token(
+                &token,
+                node_id,
+                peer_node_id,
+                relay_id,
+                ttl_secs,
+                now_unix,
+            )?;
+            fs::remove_file(&path).map_err(|err| {
+                RelayClientError::TokenSigning(format!(
+                    "consume preissued relay token failed: {err}"
+                ))
+            })?;
+            return Ok(token);
+        }
+
+        Err(RelayClientError::TokenSigning(
+            "no matching preissued relay session token available".to_string(),
+        ))
+    }
 }
 
 impl RelayClientSession {
@@ -176,8 +318,8 @@ impl From<io::Error> for RelayClientError {
 pub struct RelayClient {
     /// Our node ID.
     node_id: NodeId,
-    /// The signing key used to create relay session tokens.
-    signing_key: Arc<SigningKey>,
+    /// Relay session token issuer.
+    token_issuer: Arc<dyn RelaySessionTokenIssuer>,
     /// Active sessions indexed by peer node ID.
     sessions: HashMap<NodeId, RelayClientSession>,
     /// Configuration for relay behavior.
@@ -193,9 +335,22 @@ pub struct RelayClient {
 impl RelayClient {
     /// Creates a new relay client.
     pub fn new(node_id: NodeId, signing_key: Arc<SigningKey>, config: RelayClientConfig) -> Self {
+        Self::new_with_token_issuer(
+            node_id,
+            Arc::new(LocalRelaySessionTokenIssuer::new(signing_key)),
+            config,
+        )
+    }
+
+    /// Creates a relay client with an explicit token issuer.
+    pub fn new_with_token_issuer(
+        node_id: NodeId,
+        token_issuer: Arc<dyn RelaySessionTokenIssuer>,
+        config: RelayClientConfig,
+    ) -> Self {
         Self {
             node_id,
-            signing_key,
+            token_issuer,
             sessions: HashMap::new(),
             config,
             socket: None,
@@ -291,20 +446,11 @@ impl RelayClient {
             relay_id,
             ttl_secs,
             |target, hello_bytes, timeout| {
-                socket.set_read_timeout(Some(timeout))?;
                 socket.send_to(hello_bytes, target)?;
-                let mut buf = [0u8; 1500];
-                loop {
-                    match socket.recv_from(&mut buf) {
-                        Ok((len, from_addr)) if from_addr == relay_addr => {
-                            return Ok((buf[..len].to_vec(), from_addr));
-                        }
-                        Ok(_) => continue,
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                        Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-                        Err(e) => return Err(RelayClientError::Io(e)),
-                    }
-                }
+                recv_relay_response_with_deadline(relay_addr, timeout, |remaining, buf| {
+                    socket.set_read_timeout(Some(remaining))?;
+                    socket.recv_from(buf)
+                })
             },
         )
     }
@@ -323,14 +469,23 @@ impl RelayClient {
         if self.sessions.len() >= self.config.max_sessions_per_peer * 16 {
             return Err(RelayClientError::CapacityExceeded);
         }
+        if ttl_secs == 0 || ttl_secs > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
+            return Err(RelayClientError::TokenSigning(format!(
+                "relay token ttl must be 1..={MAX_RELAY_SESSION_TOKEN_TTL_SECS} seconds"
+            )));
+        }
 
-        let token = RelaySessionToken::sign(
-            &self.signing_key,
-            self.node_id.as_str(),
-            peer_node_id.as_str(),
+        let token =
+            self.token_issuer
+                .issue_token(&self.node_id, peer_node_id, relay_id, ttl_secs)?;
+        validate_issued_relay_session_token(
+            &token,
+            &self.node_id,
+            peer_node_id,
             relay_id,
             ttl_secs,
-        );
+            current_unix(),
+        )?;
         let token_expires_at_unix = token.expires_at_unix;
 
         #[cfg(test)]
@@ -373,6 +528,11 @@ impl RelayClient {
         }
         match parse_relay_hello_ack(&response) {
             Ok(ack) => {
+                if ack.allocated_port == relay_addr.port() {
+                    return Err(RelayClientError::InvalidResponse(
+                        "relay ack allocated control port".to_string(),
+                    ));
+                }
                 let now = Instant::now();
                 let session = RelayClientSession {
                     session_id: ack.session_id,
@@ -426,6 +586,18 @@ impl RelayClient {
     pub fn cleanup_idle_sessions(&mut self, idle_timeout: Duration) {
         self.sessions
             .retain(|_, session| !session.is_idle(idle_timeout));
+    }
+
+    /// Cleans up idle or expired sessions.
+    pub fn cleanup_inactive_sessions(&mut self, idle_timeout: Duration, now_unix: u64) {
+        self.sessions
+            .retain(|_, session| !session.is_idle(idle_timeout) && !session.is_expired(now_unix));
+    }
+
+    /// Cleans up expired sessions while preserving idle-but-refreshable ones.
+    pub fn cleanup_expired_sessions(&mut self, now_unix: u64) {
+        self.sessions
+            .retain(|_, session| !session.is_expired(now_unix));
     }
 
     /// Removes a specific session for a peer.
@@ -603,6 +775,149 @@ const RELAY_HELLO_ACK_MSG_TYPE: u8 = 0x02;
 const RELAY_REJECT_MSG_TYPE: u8 = 0x03;
 const RELAY_KEEPALIVE_MSG_TYPE: u8 = 0x04;
 
+fn recv_relay_response_with_deadline<F>(
+    relay_addr: SocketAddr,
+    timeout: Duration,
+    mut recv_from: F,
+) -> Result<(Vec<u8>, SocketAddr), RelayClientError>
+where
+    F: FnMut(Duration, &mut [u8]) -> io::Result<(usize, SocketAddr)>,
+{
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(RelayClientError::Timeout)?;
+    let mut buf = [0u8; 1500];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(RelayClientError::Timeout);
+        }
+        match recv_from(deadline.saturating_duration_since(now), &mut buf) {
+            Ok((len, from_addr)) if from_addr == relay_addr => {
+                return Ok((buf[..len].to_vec(), from_addr));
+            }
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Err(RelayClientError::Timeout);
+            }
+            Err(e) => return Err(RelayClientError::Io(e)),
+        }
+    }
+}
+
+fn validate_issued_relay_session_token(
+    token: &RelaySessionToken,
+    node_id: &NodeId,
+    peer_node_id: &NodeId,
+    relay_id: [u8; 16],
+    requested_ttl_secs: u64,
+    now_unix: u64,
+) -> Result<(), RelayClientError> {
+    let invalid = |reason: String| {
+        RelayClientError::TokenSigning(format!(
+            "relay token issuer returned invalid token: {reason}"
+        ))
+    };
+    if token.node_id != node_id.as_str() {
+        return Err(invalid("node_id mismatch".to_string()));
+    }
+    if token.peer_node_id != peer_node_id.as_str() {
+        return Err(invalid("peer_node_id mismatch".to_string()));
+    }
+    if token.relay_id != relay_id {
+        return Err(invalid("relay_id mismatch".to_string()));
+    }
+    if token.scope != RELAY_TOKEN_SCOPE {
+        return Err(invalid("scope mismatch".to_string()));
+    }
+    if token.nonce == [0u8; 16] {
+        return Err(invalid("nonce must not be all zero".to_string()));
+    }
+    let ttl_secs = token.ttl_secs();
+    if ttl_secs == 0 || ttl_secs > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
+        return Err(invalid(format!(
+            "ttl must be 1..={MAX_RELAY_SESSION_TOKEN_TTL_SECS} seconds"
+        )));
+    }
+    if ttl_secs > requested_ttl_secs {
+        return Err(invalid("ttl exceeds requested ttl".to_string()));
+    }
+    if token.expires_at_unix <= now_unix {
+        return Err(invalid("token already expired".to_string()));
+    }
+    if token.issued_at_unix > now_unix.saturating_add(RELAY_SESSION_TOKEN_CLIENT_CLOCK_SKEW_SECS) {
+        return Err(invalid("issued_at_unix too far in the future".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_preissued_token_spool_dir(path: &Path) -> Result<(), RelayClientError> {
+    if !path.is_absolute() {
+        return Err(RelayClientError::TokenSigning(
+            "relay token spool dir must be absolute".to_string(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        RelayClientError::TokenSigning(format!("stat relay token spool dir failed: {err}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(RelayClientError::TokenSigning(
+            "relay token spool dir must be a real directory".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(RelayClientError::TokenSigning(format!(
+                "relay token spool dir permissions too broad: {mode:o}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_preissued_relay_token(path: &Path) -> Result<RelaySessionToken, RelayClientError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        RelayClientError::TokenSigning(format!("stat relay token artifact failed: {err}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(RelayClientError::TokenSigning(
+            "relay token artifact must be a regular file".to_string(),
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > PREISSUED_RELAY_TOKEN_MAX_BYTES {
+        return Err(RelayClientError::TokenSigning(
+            "relay token artifact size is invalid".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(RelayClientError::TokenSigning(format!(
+                "relay token artifact permissions too broad: {mode:o}"
+            )));
+        }
+    }
+    let wire = fs::read_to_string(path).map_err(|err| {
+        RelayClientError::TokenSigning(format!("read relay token artifact failed: {err}"))
+    })?;
+    parse_relay_session_token_wire(&wire).map_err(|err| {
+        RelayClientError::TokenSigning(format!("parse relay token artifact failed: {err}"))
+    })
+}
+
+fn current_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after UNIX_EPOCH")
+        .as_secs()
+}
+
 /// Serializes a RelayHello message for wire transmission.
 fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
@@ -675,14 +990,23 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
             if data.len() < 19 {
                 return Err("ack message too short".to_string());
             }
+            if data.len() != 19 {
+                return Err("ack message has trailing bytes".to_string());
+            }
             // Session ID (16 bytes)
             let session_id_bytes: [u8; 16] =
                 data[1..17].try_into().map_err(|_| "invalid session id")?;
+            if session_id_bytes == [0u8; 16] {
+                return Err("ack session id must not be all zero".to_string());
+            }
             let session_id = SessionId::from(session_id_bytes);
 
             // Allocated port (2 bytes)
             let port_bytes: [u8; 2] = data[17..19].try_into().map_err(|_| "invalid port")?;
             let allocated_port = u16::from_be_bytes(port_bytes);
+            if allocated_port == 0 {
+                return Err("ack allocated port must not be 0".to_string());
+            }
 
             Ok(RelayHelloAck {
                 session_id,
@@ -797,6 +1121,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_relay_hello_ack_rejects_malformed_ack_fields() {
+        let valid_session_id = [0x55; 16];
+
+        let mut zero_port = vec![RELAY_HELLO_ACK_MSG_TYPE];
+        zero_port.extend_from_slice(&valid_session_id);
+        zero_port.extend_from_slice(&0u16.to_be_bytes());
+        assert!(
+            parse_relay_hello_ack(&zero_port)
+                .expect_err("zero allocated port must fail")
+                .contains("port")
+        );
+
+        let mut zero_session = vec![RELAY_HELLO_ACK_MSG_TYPE];
+        zero_session.extend_from_slice(&[0u8; 16]);
+        zero_session.extend_from_slice(&5000u16.to_be_bytes());
+        assert!(
+            parse_relay_hello_ack(&zero_session)
+                .expect_err("zero session id must fail")
+                .contains("session id")
+        );
+
+        let mut trailing = vec![RELAY_HELLO_ACK_MSG_TYPE];
+        trailing.extend_from_slice(&valid_session_id);
+        trailing.extend_from_slice(&5000u16.to_be_bytes());
+        trailing.push(0);
+        assert!(
+            parse_relay_hello_ack(&trailing)
+                .expect_err("trailing bytes must fail")
+                .contains("trailing")
+        );
+    }
+
+    #[test]
     fn parse_relay_hello_ack_reject() {
         let mut data = vec![RELAY_REJECT_MSG_TYPE];
         data.extend_from_slice(b"capacity exceeded");
@@ -817,6 +1174,493 @@ mod tests {
         assert_eq!(client.active_session_count(), 0);
         assert!(!client.has_session(&test_node_id("peer-b")));
         assert!(!client.is_bound());
+    }
+
+    #[test]
+    fn local_relay_session_token_issuer_signs_bound_token() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[8u8; 32]));
+        let issuer = LocalRelaySessionTokenIssuer::new(Arc::clone(&signing_key));
+        let relay_id = [0xCC; 16];
+        let token = issuer
+            .issue_token(
+                &test_node_id("node-a"),
+                &test_node_id("peer-b"),
+                relay_id,
+                60,
+            )
+            .expect("local issuer should sign token");
+
+        assert_eq!(token.node_id, "node-a");
+        assert_eq!(token.peer_node_id, "peer-b");
+        assert_eq!(token.relay_id, relay_id);
+        token
+            .verify_signature(&signing_key.verifying_key())
+            .expect("token should verify");
+    }
+
+    #[test]
+    fn preissued_relay_session_token_issuer_consumes_matching_signed_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let relay_id = [0xCC; 16];
+        let token = RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            relay_id,
+            current_unix(),
+            60,
+        );
+        let token_path = dir.path().join("0001.relay-token");
+        fs::write(
+            &token_path,
+            rustynet_control::relay_session_token_to_wire(&token),
+        )
+        .expect("write token");
+        #[cfg(unix)]
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let issuer = PreissuedRelaySessionTokenIssuer::new(
+            dir.path().to_path_buf(),
+            signing_key.verifying_key(),
+        )
+        .expect("restricted spool should be accepted");
+        let issued = issuer
+            .issue_token(
+                &test_node_id("node-a"),
+                &test_node_id("peer-b"),
+                relay_id,
+                60,
+            )
+            .expect("matching preissued token should issue");
+
+        assert!(token.ct_eq(&issued));
+        assert!(!token_path.exists(), "token artifact must be one-use");
+    }
+
+    #[test]
+    fn preissued_relay_session_token_issuer_rejects_tampered_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let relay_id = [0xCC; 16];
+        let token = RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            relay_id,
+            current_unix(),
+            60,
+        );
+        let token_path = dir.path().join("0001.relay-token");
+        let wire = rustynet_control::relay_session_token_to_wire(&token)
+            .replace("peer_node_id=peer-b", "peer_node_id=peer-c");
+        fs::write(&token_path, wire).expect("write token");
+        #[cfg(unix)]
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let issuer = PreissuedRelaySessionTokenIssuer::new(
+            dir.path().to_path_buf(),
+            signing_key.verifying_key(),
+        )
+        .expect("restricted spool should be accepted");
+        let err = issuer
+            .issue_token(
+                &test_node_id("node-a"),
+                &test_node_id("peer-b"),
+                relay_id,
+                60,
+            )
+            .expect_err("tampered token must fail closed");
+
+        assert!(err.to_string().contains("signature invalid"));
+        assert!(
+            token_path.exists(),
+            "rejected token artifact must remain for audit"
+        );
+    }
+
+    struct FailingRelaySessionTokenIssuer;
+
+    impl RelaySessionTokenIssuer for FailingRelaySessionTokenIssuer {
+        fn issue_token(
+            &self,
+            _node_id: &NodeId,
+            _peer_node_id: &NodeId,
+            _relay_id: [u8; 16],
+            _ttl_secs: u64,
+        ) -> Result<RelaySessionToken, RelayClientError> {
+            Err(RelayClientError::TokenSigning(
+                "issuer unavailable".to_string(),
+            ))
+        }
+    }
+
+    struct StaticRelaySessionTokenIssuer {
+        token: RelaySessionToken,
+    }
+
+    impl RelaySessionTokenIssuer for StaticRelaySessionTokenIssuer {
+        fn issue_token(
+            &self,
+            _node_id: &NodeId,
+            _peer_node_id: &NodeId,
+            _relay_id: [u8; 16],
+            _ttl_secs: u64,
+        ) -> Result<RelaySessionToken, RelayClientError> {
+            Ok(self.token.clone())
+        }
+    }
+
+    #[test]
+    fn relay_client_fails_closed_when_token_issuer_fails() {
+        let peer_id = test_node_id("peer-b");
+        let mut client = RelayClient::new_with_token_issuer(
+            test_node_id("node-a"),
+            Arc::new(FailingRelaySessionTokenIssuer),
+            RelayClientConfig::default(),
+        );
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                "192.168.1.1:4500".parse().unwrap(),
+                [0xCC; 16],
+                60,
+                |_target, _hello, _timeout| unreachable!("token failure must happen before I/O"),
+            )
+            .expect_err("token issuer failure must fail closed");
+
+        assert!(matches!(err, RelayClientError::TokenSigning(_)));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_unbound_issuer_token_before_io() {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut token = RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "wrong-peer",
+            [0xCC; 16],
+            current_unix(),
+            60,
+        );
+        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        let peer_id = test_node_id("peer-b");
+        let mut client = RelayClient::new_with_token_issuer(
+            test_node_id("node-a"),
+            Arc::new(StaticRelaySessionTokenIssuer { token }),
+            RelayClientConfig::default(),
+        );
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                "192.168.1.1:4500".parse().unwrap(),
+                [0xCC; 16],
+                60,
+                |_target, _hello, _timeout| {
+                    unreachable!("issuer token validation must happen before I/O")
+                },
+            )
+            .expect_err("unbound issuer token must fail closed");
+
+        assert!(matches!(err, RelayClientError::TokenSigning(_)));
+        assert!(err.to_string().contains("peer_node_id mismatch"));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_stale_or_oversized_issuer_token_before_io() {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let peer_id = test_node_id("peer-b");
+        let now = current_unix();
+
+        for (token, expected) in [
+            (
+                RelaySessionToken::sign_at(
+                    &signing_key,
+                    "node-a",
+                    "peer-b",
+                    [0xCC; 16],
+                    now.saturating_sub(120),
+                    60,
+                ),
+                "already expired",
+            ),
+            (
+                RelaySessionToken::sign_at(
+                    &signing_key,
+                    "node-a",
+                    "peer-b",
+                    [0xCC; 16],
+                    now,
+                    MAX_RELAY_SESSION_TOKEN_TTL_SECS + 1,
+                ),
+                "ttl must",
+            ),
+            (
+                RelaySessionToken::sign_at(
+                    &signing_key,
+                    "node-a",
+                    "peer-b",
+                    [0xCC; 16],
+                    now.saturating_add(RELAY_SESSION_TOKEN_CLIENT_CLOCK_SKEW_SECS + 1),
+                    60,
+                ),
+                "future",
+            ),
+        ] {
+            let mut client = RelayClient::new_with_token_issuer(
+                test_node_id("node-a"),
+                Arc::new(StaticRelaySessionTokenIssuer { token }),
+                RelayClientConfig::default(),
+            );
+            let err = client
+                .establish_session_with_round_trip(
+                    &peer_id,
+                    "192.168.1.1:4500".parse().unwrap(),
+                    [0xCC; 16],
+                    60,
+                    |_target, _hello, _timeout| {
+                        unreachable!("issuer token validation must happen before I/O")
+                    },
+                )
+                .expect_err("invalid issuer token must fail closed");
+
+            assert!(matches!(err, RelayClientError::TokenSigning(_)));
+            assert!(
+                err.to_string().contains(expected),
+                "expected '{expected}' in '{err}'"
+            );
+            assert!(!client.has_session(&peer_id));
+        }
+    }
+
+    #[test]
+    fn relay_client_rejects_token_ttl_outside_relay_bounds_before_io() {
+        let peer_id = test_node_id("peer-b");
+        let signing_key = Arc::new(SigningKey::from_bytes(&[9u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        for ttl_secs in [0, MAX_RELAY_SESSION_TOKEN_TTL_SECS + 1] {
+            let err = client
+                .establish_session_with_round_trip(
+                    &peer_id,
+                    "192.168.1.1:4500".parse().unwrap(),
+                    [0xCC; 16],
+                    ttl_secs,
+                    |_target, _hello, _timeout| {
+                        unreachable!("ttl validation must happen before I/O")
+                    },
+                )
+                .expect_err("out-of-bounds relay token ttl must fail closed");
+            assert!(matches!(err, RelayClientError::TokenSigning(_)));
+            assert!(!client.has_session(&peer_id));
+        }
+    }
+
+    #[test]
+    fn relay_client_rejects_token_with_node_id_mismatch_before_io() {
+        // The token's own `node_id` field must match the client's node_id.
+        // A token issued for a different node would let an attacker who
+        // captured it impersonate that node against the relay.
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut token = RelaySessionToken::sign_at(
+            &signing_key,
+            "wrong-node",
+            "peer-b",
+            [0xCC; 16],
+            current_unix(),
+            60,
+        );
+        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        let peer_id = test_node_id("peer-b");
+        let mut client = RelayClient::new_with_token_issuer(
+            test_node_id("node-a"),
+            Arc::new(StaticRelaySessionTokenIssuer { token }),
+            RelayClientConfig::default(),
+        );
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                "192.168.1.1:4500".parse().unwrap(),
+                [0xCC; 16],
+                60,
+                |_target, _hello, _timeout| {
+                    unreachable!("node_id validation must happen before I/O")
+                },
+            )
+            .expect_err("token with node_id mismatch must fail closed");
+
+        assert!(matches!(err, RelayClientError::TokenSigning(_)));
+        assert!(err.to_string().contains("node_id mismatch"));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_token_with_relay_id_mismatch_before_io() {
+        // The token must be bound to the same relay_id the client is connecting
+        // to.  A token issued for relay-A must not be redeemable at relay-B,
+        // even if both are in the same signed fleet.
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut token = RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            [0xAA; 16], // token bound to relay-AA
+            current_unix(),
+            60,
+        );
+        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        let peer_id = test_node_id("peer-b");
+        let mut client = RelayClient::new_with_token_issuer(
+            test_node_id("node-a"),
+            Arc::new(StaticRelaySessionTokenIssuer { token }),
+            RelayClientConfig::default(),
+        );
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                "192.168.1.1:4500".parse().unwrap(),
+                [0xBB; 16], // client requesting relay-BB
+                60,
+                |_target, _hello, _timeout| {
+                    unreachable!("relay_id validation must happen before I/O")
+                },
+            )
+            .expect_err("token with relay_id mismatch must fail closed");
+
+        assert!(matches!(err, RelayClientError::TokenSigning(_)));
+        assert!(err.to_string().contains("relay_id mismatch"));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_token_with_wrong_scope_before_io() {
+        // The token must carry the canonical relay-session scope label so a
+        // token forged with a different scope (e.g. one issued for a separate
+        // ceremony) cannot be replayed against the relay session protocol.
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut token = RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            [0xCC; 16],
+            current_unix(),
+            60,
+        );
+        token.scope = "rustynet.relay.OTHER_SCOPE".to_string();
+        let peer_id = test_node_id("peer-b");
+        let mut client = RelayClient::new_with_token_issuer(
+            test_node_id("node-a"),
+            Arc::new(StaticRelaySessionTokenIssuer { token }),
+            RelayClientConfig::default(),
+        );
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                "192.168.1.1:4500".parse().unwrap(),
+                [0xCC; 16],
+                60,
+                |_target, _hello, _timeout| unreachable!("scope validation must happen before I/O"),
+            )
+            .expect_err("token with wrong scope must fail closed");
+
+        assert!(matches!(err, RelayClientError::TokenSigning(_)));
+        assert!(err.to_string().contains("scope mismatch"));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_token_with_all_zero_nonce_before_io() {
+        // An all-zero nonce is the signature of a forged or uninitialised
+        // token — any genuine token signed with a CSPRNG will have a non-zero
+        // nonce.  Accepting an all-zero nonce would let an attacker who
+        // controlled the issuer trivially construct tokens with predictable
+        // bytes (and risk replay if the relay caches by nonce).
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut token = RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            [0xCC; 16],
+            current_unix(),
+            60,
+        );
+        // Force the nonce to all zeros after signing.
+        token.nonce = [0u8; 16];
+        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        let peer_id = test_node_id("peer-b");
+        let mut client = RelayClient::new_with_token_issuer(
+            test_node_id("node-a"),
+            Arc::new(StaticRelaySessionTokenIssuer { token }),
+            RelayClientConfig::default(),
+        );
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                "192.168.1.1:4500".parse().unwrap(),
+                [0xCC; 16],
+                60,
+                |_target, _hello, _timeout| unreachable!("nonce validation must happen before I/O"),
+            )
+            .expect_err("token with all-zero nonce must fail closed");
+
+        assert!(matches!(err, RelayClientError::TokenSigning(_)));
+        assert!(err.to_string().contains("nonce"));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_token_with_ttl_exceeding_requested_ttl_before_io() {
+        // The token's encoded TTL must not exceed the TTL the client asked
+        // the issuer for — otherwise an issuer-side bug or compromise could
+        // grant a longer-lived session than the client is willing to hold.
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut token = RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            [0xCC; 16],
+            current_unix(),
+            120, // token TTL = 120s
+        );
+        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        let peer_id = test_node_id("peer-b");
+        let mut client = RelayClient::new_with_token_issuer(
+            test_node_id("node-a"),
+            Arc::new(StaticRelaySessionTokenIssuer { token }),
+            RelayClientConfig::default(),
+        );
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                "192.168.1.1:4500".parse().unwrap(),
+                [0xCC; 16],
+                60, // client only asked for 60s
+                |_target, _hello, _timeout| {
+                    unreachable!("ttl-exceeds validation must happen before I/O")
+                },
+            )
+            .expect_err("token TTL exceeding requested TTL must fail closed");
+
+        assert!(matches!(err, RelayClientError::TokenSigning(_)));
+        assert!(err.to_string().contains("ttl exceeds requested"));
+        assert!(!client.has_session(&peer_id));
     }
 
     #[test]
@@ -851,6 +1695,55 @@ mod tests {
         assert_eq!(client.active_session_count(), 1);
         client.cleanup_idle_sessions(Duration::from_secs(60));
         assert_eq!(client.active_session_count(), 0);
+    }
+
+    #[test]
+    fn relay_client_cleanup_inactive_removes_expired_sessions() {
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_key = Arc::new(SigningKey::from_bytes(&[1u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+
+        let expired_peer = test_node_id("peer-expired");
+        client.sessions.insert(
+            expired_peer.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x34; 16]),
+                relay_addr: "192.168.1.1:4500".parse().unwrap(),
+                allocated_port: 5001,
+                peer_node_id: expired_peer.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0xAA; 16],
+                token_expires_at_unix: now_unix,
+            },
+        );
+
+        let live_peer = test_node_id("peer-live");
+        client.sessions.insert(
+            live_peer.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x35; 16]),
+                relay_addr: "192.168.1.1:4500".parse().unwrap(),
+                allocated_port: 5002,
+                peer_node_id: live_peer.clone(),
+                established_at: Instant::now(),
+                last_activity: Instant::now(),
+                relay_id: [0xAA; 16],
+                token_expires_at_unix: now_unix + 60,
+            },
+        );
+
+        client.cleanup_inactive_sessions(Duration::from_secs(60), now_unix);
+
+        assert!(!client.has_session(&expired_peer));
+        assert!(client.has_session(&live_peer));
     }
 
     #[test]
@@ -1195,6 +2088,103 @@ mod tests {
     }
 
     #[test]
+    fn relay_client_establish_round_trip_timeout_leaves_no_session() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[10u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                |_target, _payload, _timeout| Err(RelayClientError::Timeout),
+            )
+            .expect_err("relay timeout must fail closed");
+
+        assert!(matches!(err, RelayClientError::Timeout));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_response_deadline_returns_timeout_on_socket_timeout() {
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let err = recv_relay_response_with_deadline(
+            relay_addr,
+            Duration::from_secs(1),
+            |_remaining, _buf| Err(io::Error::new(io::ErrorKind::TimedOut, "synthetic timeout")),
+        )
+        .expect_err("socket timeout must terminate relay response wait");
+
+        assert!(matches!(err, RelayClientError::Timeout));
+    }
+
+    #[test]
+    fn relay_response_deadline_ignores_unrelated_source_then_times_out() {
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let unrelated_addr: SocketAddr = "192.168.1.2:4500".parse().unwrap();
+        let mut calls = 0usize;
+
+        let err = recv_relay_response_with_deadline(
+            relay_addr,
+            Duration::from_secs(1),
+            |_remaining, buf| {
+                calls += 1;
+                if calls == 1 {
+                    buf[..3].copy_from_slice(b"ack");
+                    Ok((3, unrelated_addr))
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "synthetic timeout",
+                    ))
+                }
+            },
+        )
+        .expect_err("unrelated relay response source must not satisfy establishment");
+
+        assert!(matches!(err, RelayClientError::Timeout));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn relay_client_rejects_ack_allocating_control_port() {
+        let signing_key = Arc::new(SigningKey::from_bytes(&[10u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let session_id = [0x66; 16];
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                |_target, _payload, _timeout| {
+                    let mut ack = vec![RELAY_HELLO_ACK_MSG_TYPE];
+                    ack.extend_from_slice(&session_id);
+                    ack.extend_from_slice(&relay_addr.port().to_be_bytes());
+                    Ok((ack, relay_addr))
+                },
+            )
+            .expect_err("control-port allocation must fail closed");
+
+        assert!(matches!(err, RelayClientError::InvalidResponse(_)));
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
     fn relay_client_send_keepalive_with_sender_uses_allocated_port() {
         let signing_key = Arc::new(SigningKey::from_bytes(&[11u8; 32]));
         let mut client = RelayClient::new(
@@ -1278,7 +2268,7 @@ mod tests {
     /// Verifies that session cleanup preserves live sessions while removing only
     /// expired/idle ones. This ensures fail-closed behavior during transitions.
     #[test]
-    fn relay_client_cleanup_preserves_live_sessions_removes_only_idle() {
+    fn relay_client_cleanup_preserves_live_sessions_removes_inactive() {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1322,15 +2312,31 @@ mod tests {
             },
         );
 
-        assert_eq!(client.active_session_count(), 2);
+        let expired_peer = test_node_id("expired-peer");
+        client.sessions.insert(
+            expired_peer.clone(),
+            RelayClientSession {
+                session_id: SessionId::from([0x33; 16]),
+                relay_addr: "192.168.1.1:4500".parse().unwrap(),
+                allocated_port: 5002,
+                peer_node_id: expired_peer.clone(),
+                established_at: Instant::now() - Duration::from_secs(10),
+                last_activity: Instant::now() - Duration::from_secs(5),
+                relay_id: [0xCC; 16],
+                token_expires_at_unix: now_unix,
+            },
+        );
+
+        assert_eq!(client.active_session_count(), 3);
 
         // Cleanup with 60-second idle threshold
-        client.cleanup_idle_sessions(Duration::from_secs(60));
+        client.cleanup_inactive_sessions(Duration::from_secs(60), now_unix);
 
-        // Live session should remain, idle session should be removed
+        // Live session should remain, idle and expired sessions should be removed
         assert_eq!(client.active_session_count(), 1);
         assert!(client.has_session(&live_peer));
         assert!(!client.has_session(&idle_peer));
+        assert!(!client.has_session(&expired_peer));
     }
 
     /// Verifies that expired tokens are correctly identified for refresh,

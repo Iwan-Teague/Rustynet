@@ -45,7 +45,10 @@ use crate::privileged_helper::{
     DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS as HELPER_DEFAULT_TIMEOUT_MS, PrivilegedCommandClient,
     PrivilegedCommandProgram,
 };
-use crate::relay_client::{RelayClient, RelayClientConfig, RelayClientError};
+use crate::relay_client::{
+    MAX_RELAY_SESSION_TOKEN_TTL_SECS, PreissuedRelaySessionTokenIssuer, RelayClient,
+    RelayClientConfig, RelayClientError,
+};
 use crate::resilience::{
     ResilienceError, SessionStateSnapshot, load_session_snapshot, persist_session_snapshot,
 };
@@ -126,7 +129,11 @@ use rustynet_control::membership::{
     MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
     replay_membership_snapshot_and_log,
 };
-use rustynet_control::{SignedTraversalCoordinationRecord, derive_endpoint_hint_signing_key};
+use rustynet_control::{
+    RelayFleetNodeDescriptor, SignedRelayFleetBundle, SignedTraversalCoordinationRecord,
+    canonical_relay_id_from_label, derive_endpoint_hint_signing_key,
+    parse_signed_relay_fleet_bundle_wire, verify_signed_relay_fleet_bundle_with_key,
+};
 use rustynet_dns_zone::{
     DnsZoneError, DnsZoneWatermark, SignedDnsZoneBundle as DnsZoneBundle,
     canonicalize_dns_zone_name, dns_zone_payload_digest, dns_zone_watermark_ordering,
@@ -196,10 +203,16 @@ pub const DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS: u64 = 300;
 const ASSIGNMENT_SIGNING_SECRET_ENV: &str = "RUSTYNET_ASSIGNMENT_SIGNING_SECRET";
 const ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV: &str =
     "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE";
+const RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV: &str = "RUSTYNET_RELAY_SESSION_LOCAL_TOKEN_ISSUER";
+const RELAY_SESSION_TOKEN_SPOOL_DIR_ENV: &str = "RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR";
 #[cfg(not(windows))]
 pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.traversal";
 #[cfg(windows)]
 pub const DEFAULT_TRAVERSAL_BUNDLE_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH;
+#[cfg(not(windows))]
+pub const DEFAULT_RELAY_FLEET_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.relay-fleet";
+#[cfg(windows)]
+pub const DEFAULT_RELAY_FLEET_BUNDLE_PATH: &str = r"C:\ProgramData\Rustynet\rustynetd.relay-fleet";
 #[cfg(not(windows))]
 pub const DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH: &str = "/etc/rustynet/traversal.pub";
 #[cfg(windows)]
@@ -209,10 +222,18 @@ pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.traversal.watermark";
 #[cfg(windows)]
 pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH;
+#[cfg(not(windows))]
+pub const DEFAULT_RELAY_FLEET_WATERMARK_PATH: &str =
+    "/var/lib/rustynet/rustynetd.relay-fleet.watermark";
+#[cfg(windows)]
+pub const DEFAULT_RELAY_FLEET_WATERMARK_PATH: &str =
+    r"C:\ProgramData\Rustynet\rustynetd.relay-fleet.watermark";
 pub const DEFAULT_TRAVERSAL_MAX_AGE_SECS: u64 = 120;
 const DEFAULT_RELAY_SESSION_TOKEN_TTL_SECS: u64 = 120;
 const DEFAULT_RELAY_SESSION_REFRESH_MARGIN_SECS: u64 = 15;
 const DEFAULT_RELAY_SESSION_IDLE_TIMEOUT_SECS: u64 = 30;
+const RELAY_FLEET_BUNDLE_PATH_ENV: &str = "RUSTYNET_RELAY_FLEET_BUNDLE_PATH";
+const RELAY_FLEET_WATERMARK_PATH_ENV: &str = "RUSTYNET_RELAY_FLEET_WATERMARK_PATH";
 #[cfg(not(windows))]
 pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone";
 #[cfg(windows)]
@@ -294,8 +315,11 @@ const MAX_AUTO_TUNNEL_PEER_COUNT: usize = 128;
 const MAX_AUTO_TUNNEL_ROUTE_COUNT: usize = 256;
 const MAX_DNS_ZONE_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_TRAVERSAL_BUNDLE_BYTES: usize = 64 * 1024;
+const MAX_RELAY_FLEET_BUNDLE_BYTES: usize = 64 * 1024;
 const MAX_TRAVERSAL_BUNDLE_LINES: usize = 1_024;
+const MAX_RELAY_FLEET_BUNDLE_LINES: usize = 512;
 const MAX_TRAVERSAL_LINE_BYTES: usize = 1_024;
+const MAX_RELAY_FLEET_LINE_BYTES: usize = 512;
 const MAX_TRAVERSAL_KEY_BYTES: usize = 64;
 const MAX_TRAVERSAL_VALUE_BYTES: usize = 512;
 const MAX_TRAVERSAL_KEY_DEPTH: usize = 3;
@@ -1006,6 +1030,8 @@ pub struct DaemonConfig {
     pub traversal_bundle_path: PathBuf,
     pub traversal_verifier_key_path: PathBuf,
     pub traversal_watermark_path: PathBuf,
+    pub relay_fleet_bundle_path: Option<PathBuf>,
+    pub relay_fleet_watermark_path: Option<PathBuf>,
     pub traversal_max_age_secs: NonZeroU64,
     pub traversal_probe_max_candidates: NonZeroUsize,
     pub traversal_probe_max_pairs: NonZeroUsize,
@@ -1025,6 +1051,8 @@ pub struct DaemonConfig {
     pub wg_public_key_path: Option<PathBuf>,
     pub relay_session_signing_secret_path: Option<PathBuf>,
     pub relay_session_signing_secret_passphrase_path: Option<PathBuf>,
+    pub relay_session_local_token_issuer_enabled: bool,
+    pub relay_session_token_spool_dir: Option<PathBuf>,
     pub relay_session_token_ttl_secs: NonZeroU64,
     pub relay_session_refresh_margin_secs: NonZeroU64,
     pub relay_session_idle_timeout_secs: NonZeroU64,
@@ -1082,6 +1110,14 @@ impl Default for DaemonConfig {
             traversal_bundle_path: PathBuf::from(DEFAULT_TRAVERSAL_BUNDLE_PATH),
             traversal_verifier_key_path: PathBuf::from(DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH),
             traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
+            relay_fleet_bundle_path: Some(relay_fleet_default_path_from_env(
+                RELAY_FLEET_BUNDLE_PATH_ENV,
+                DEFAULT_RELAY_FLEET_BUNDLE_PATH,
+            )),
+            relay_fleet_watermark_path: Some(relay_fleet_default_path_from_env(
+                RELAY_FLEET_WATERMARK_PATH_ENV,
+                DEFAULT_RELAY_FLEET_WATERMARK_PATH,
+            )),
             traversal_max_age_secs: NonZeroU64::new(DEFAULT_TRAVERSAL_MAX_AGE_SECS)
                 .expect("default traversal max age must be non-zero"),
             traversal_probe_max_candidates: NonZeroUsize::new(
@@ -1130,6 +1166,14 @@ impl Default for DaemonConfig {
                 ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV,
             )
             .map(PathBuf::from),
+            relay_session_local_token_issuer_enabled: std::env::var(
+                RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV,
+            )
+            .ok()
+            .and_then(|value| parse_bool(value.as_str()))
+            .unwrap_or(false),
+            relay_session_token_spool_dir: std::env::var_os(RELAY_SESSION_TOKEN_SPOOL_DIR_ENV)
+                .map(PathBuf::from),
             relay_session_token_ttl_secs: NonZeroU64::new(DEFAULT_RELAY_SESSION_TOKEN_TTL_SECS)
                 .expect("default relay session token ttl must be non-zero"),
             relay_session_refresh_margin_secs: NonZeroU64::new(
@@ -1417,6 +1461,13 @@ struct TraversalCoordinationEnvelope {
 struct TraversalBundleSetEnvelope {
     bundles: Vec<TraversalBundleEnvelope>,
     coordinations: Vec<TraversalCoordinationEnvelope>,
+    verifier_key_bytes: [u8; 32],
+    watermark: TraversalWatermark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayFleetBundleEnvelope {
+    bundle: SignedRelayFleetBundle,
     verifier_key_bytes: [u8; 32],
     watermark: TraversalWatermark,
 }
@@ -2664,6 +2715,7 @@ struct DaemonRuntime {
     dns_zone_preexpiry_refresh_events: u64,
     dns_zone_last_preexpiry_refresh_unix: Option<u64>,
     traversal_hints: Option<TraversalBundleSetEnvelope>,
+    relay_fleet: Option<SignedRelayFleetBundle>,
     verified_traversal_index: VerifiedTraversalIndex,
     verified_traversal_coordination_index:
         BTreeMap<(String, String), SignedTraversalCoordinationRecord>,
@@ -2741,6 +2793,34 @@ impl SignedStateRefreshReason {
 }
 
 fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, DaemonError> {
+    if config.relay_session_token_spool_dir.is_some()
+        && (config.relay_session_signing_secret_path.is_some()
+            || config
+                .relay_session_signing_secret_passphrase_path
+                .is_some()
+            || config.relay_session_local_token_issuer_enabled)
+    {
+        return Err(DaemonError::InvalidConfig(
+            "preissued relay token spool cannot be combined with daemon-local relay token signing"
+                .to_string(),
+        ));
+    }
+    if let Some(spool_dir) = config.relay_session_token_spool_dir.as_ref() {
+        let verifier_key = load_traversal_verifying_key(&config.traversal_verifier_key_path)
+            .map_err(|err| {
+                DaemonError::InvalidConfig(format!("relay token verifier key invalid: {err}"))
+            })?;
+        let issuer = PreissuedRelaySessionTokenIssuer::new(spool_dir.clone(), verifier_key)
+            .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+        let relay_client = RelayClient::new_with_token_issuer(
+            NodeId::new(config.node_id.clone())
+                .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
+            Arc::new(issuer),
+            RelayClientConfig::default(),
+        );
+        return Ok(Some(relay_client));
+    }
+
     match (
         config.relay_session_signing_secret_path.as_ref(),
         config.relay_session_signing_secret_passphrase_path.as_ref(),
@@ -2753,6 +2833,11 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             "{ASSIGNMENT_SIGNING_SECRET_ENV} is required when {ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV} is set"
         ))),
         (Some(secret_path), Some(passphrase_path)) => {
+            if !config.relay_session_local_token_issuer_enabled {
+                return Err(DaemonError::InvalidConfig(format!(
+                    "local relay session token issuer is disabled; set {RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV}=true only for reviewed lab/control-plane-collocated deployments"
+                )));
+            }
             let signing_secret =
                 decrypt_private_key(secret_path, passphrase_path).map_err(DaemonError::Io)?;
             let signing_key = derive_endpoint_hint_signing_key(signing_secret);
@@ -2765,6 +2850,48 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             Ok(Some(relay_client))
         }
     }
+}
+
+fn load_optional_relay_fleet(
+    config: &DaemonConfig,
+    trust_policy: TrustPolicy,
+) -> Result<Option<SignedRelayFleetBundle>, DaemonError> {
+    let Some(fleet_path) = config.relay_fleet_bundle_path.as_ref() else {
+        return Ok(None);
+    };
+    if !fleet_path.exists() {
+        return Ok(None);
+    };
+    let watermark_path = config.relay_fleet_watermark_path.as_ref().ok_or_else(|| {
+        DaemonError::InvalidConfig(
+            "relay fleet watermark path is required when relay fleet bundle path is set"
+                .to_string(),
+        )
+    })?;
+    let previous_watermark = load_traversal_watermark(watermark_path.as_path()).map_err(|err| {
+        DaemonError::InvalidConfig(format!("relay fleet watermark preflight failed: {err}"))
+    })?;
+    let envelope = load_relay_fleet_bundle(
+        fleet_path.as_path(),
+        &config.traversal_verifier_key_path,
+        config.traversal_max_age_secs.get(),
+        trust_policy,
+        previous_watermark,
+    )
+    .map_err(|err| DaemonError::InvalidConfig(format!("relay fleet preflight failed: {err}")))?;
+    persist_traversal_watermark(watermark_path.as_path(), envelope.watermark).map_err(|err| {
+        DaemonError::InvalidConfig(format!("relay fleet watermark persist failed: {err}"))
+    })?;
+    Ok(Some(envelope.bundle))
+}
+
+fn relay_fleet_default_path_from_env(env_name: &str, default_path: &str) -> PathBuf {
+    let raw = std::env::var(env_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_path.to_string());
+    PathBuf::from(raw)
 }
 
 impl DaemonRuntime {
@@ -2786,6 +2913,7 @@ impl DaemonRuntime {
         };
         let backend = DaemonBackend::from_config(config)?;
         let relay_client = load_relay_client(config)?;
+        let relay_fleet = load_optional_relay_fleet(config, trust_policy)?;
         let transport_socket_identity_blocker = backend
             .transport_socket_identity_blocker()
             .filter(|_| !config.traversal_stun_servers.is_empty() || relay_client.is_some());
@@ -2911,6 +3039,7 @@ impl DaemonRuntime {
             dns_zone_preexpiry_refresh_events: 0,
             dns_zone_last_preexpiry_refresh_unix: None,
             traversal_hints: None,
+            relay_fleet,
             verified_traversal_index: VerifiedTraversalIndex::new(),
             verified_traversal_coordination_index: BTreeMap::new(),
             traversal_coordination_replay_window: CoordinationReplayWindow::default(),
@@ -4181,6 +4310,7 @@ impl DaemonRuntime {
             for node_id in active_relay_peers {
                 relay_client.touch_session(&node_id);
             }
+            relay_client.cleanup_expired_sessions(now_unix);
             if self.transport_socket_identity_blocker.is_none() {
                 for peer_node_id in relay_client.sessions_needing_keepalive() {
                     if let Err(err) = relay_client.send_keepalive_with_sender(
@@ -4481,7 +4611,10 @@ impl DaemonRuntime {
         let Some(relay_client) = self.relay_client.as_ref() else {
             return Ok(false);
         };
-        let Some(relay_candidate) = select_runtime_relay_candidate(&bundle.bundle.candidates)?
+        let Some(relay_candidate) = select_runtime_relay_candidate_with_verified_fleet(
+            &bundle.bundle.candidates,
+            self.relay_fleet.as_ref(),
+        )?
         else {
             return Ok(false);
         };
@@ -4502,7 +4635,10 @@ impl DaemonRuntime {
         if self.transport_socket_identity_blocker.is_some() {
             return Ok(None);
         }
-        let Some(relay_candidate) = select_runtime_relay_candidate(&bundle.bundle.candidates)?
+        let Some(relay_candidate) = select_runtime_relay_candidate_with_verified_fleet(
+            &bundle.bundle.candidates,
+            self.relay_fleet.as_ref(),
+        )?
         else {
             return Ok(None);
         };
@@ -7794,6 +7930,28 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         "traversal verifier key",
     )?;
     validate_runtime_file_path(&config.traversal_watermark_path, "traversal watermark")?;
+    match (
+        config.relay_fleet_bundle_path.as_ref(),
+        config.relay_fleet_watermark_path.as_ref(),
+    ) {
+        (Some(bundle_path), Some(watermark_path)) => {
+            validate_runtime_file_path(bundle_path, "relay fleet bundle")?;
+            validate_runtime_file_path(watermark_path, "relay fleet watermark")?;
+        }
+        (Some(_), None) => {
+            return Err(DaemonError::InvalidConfig(
+                "relay fleet watermark path is required when relay fleet bundle path is set"
+                    .to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DaemonError::InvalidConfig(
+                "relay fleet bundle path is required when relay fleet watermark path is set"
+                    .to_string(),
+            ));
+        }
+        (None, None) => {}
+    }
     if config.traversal_probe_max_candidates.get() > MAX_TRAVERSAL_CANDIDATE_COUNT {
         return Err(DaemonError::InvalidConfig(format!(
             "traversal probe max candidates must be at most {MAX_TRAVERSAL_CANDIDATE_COUNT}"
@@ -7940,6 +8098,26 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         }
         validate_runtime_file_path(path, "relay session signing secret passphrase")?;
     }
+    if let Some(path) = config.relay_session_token_spool_dir.as_ref() {
+        if path.as_os_str().is_empty() {
+            return Err(DaemonError::InvalidConfig(
+                "relay session token spool dir must not be empty".to_string(),
+            ));
+        }
+        validate_runtime_file_path(path, "relay session token spool dir")?;
+    }
+    if config.relay_session_token_spool_dir.is_some()
+        && (config.relay_session_signing_secret_path.is_some()
+            || config
+                .relay_session_signing_secret_passphrase_path
+                .is_some()
+            || config.relay_session_local_token_issuer_enabled)
+    {
+        return Err(DaemonError::InvalidConfig(
+            "preissued relay token spool cannot be combined with daemon-local relay token signing"
+                .to_string(),
+        ));
+    }
     if config.relay_session_signing_secret_path.is_some()
         && config
             .relay_session_signing_secret_passphrase_path
@@ -7958,10 +8136,25 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "{ASSIGNMENT_SIGNING_SECRET_ENV} is required when {ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV} is set"
         )));
     }
+    if (config.relay_session_signing_secret_path.is_some()
+        || config
+            .relay_session_signing_secret_passphrase_path
+            .is_some())
+        && !config.relay_session_local_token_issuer_enabled
+    {
+        return Err(DaemonError::InvalidConfig(format!(
+            "local relay session token issuer is disabled; set {RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV}=true only for reviewed lab/control-plane-collocated deployments"
+        )));
+    }
     if config.relay_session_refresh_margin_secs.get() >= config.relay_session_token_ttl_secs.get() {
         return Err(DaemonError::InvalidConfig(
             "relay session refresh margin must be less than relay session token ttl".to_string(),
         ));
+    }
+    if config.relay_session_token_ttl_secs.get() > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
+        return Err(DaemonError::InvalidConfig(format!(
+            "relay session token ttl must be <= {MAX_RELAY_SESSION_TOKEN_TTL_SECS} seconds"
+        )));
     }
     if config.auto_tunnel_enforce
         && (config.auto_tunnel_bundle_path.is_none()
@@ -8041,11 +8234,12 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
 }
 
 fn resolve_configured_egress_interface(config: &mut DaemonConfig) -> Result<(), DaemonError> {
-    config.egress_interface = resolve_egress_interface_value(
-        config.egress_interface.as_str(),
-        detect_default_egress_interface,
-    )
-    .map_err(DaemonError::InvalidConfig)?;
+    let tunnel_alias = config.wg_interface.clone();
+    config.egress_interface =
+        resolve_egress_interface_value(config.egress_interface.as_str(), || {
+            detect_default_egress_interface(&tunnel_alias)
+        })
+        .map_err(DaemonError::InvalidConfig)?;
     Ok(())
 }
 
@@ -8063,27 +8257,93 @@ where
     detect()
 }
 
+// On non-Windows platforms the function is only called from tests; suppress the
+// dead_code lint that Rust emits when it cannot see test-module call sites.
+#[cfg_attr(not(windows), allow(dead_code))]
+/// Parse and validate the raw interface alias string from Windows egress interface detection.
+///
+/// Fails closed when the output is empty, contains invalid characters, or the detected alias
+/// equals the WireGuard tunnel alias (which means the tunnel itself is the default route,
+/// e.g. after a daemon crash with stale tunnel routes still in the routing table).
+///
+/// This is a pure function so it can be unit-tested on any host platform.
+fn parse_windows_default_egress_interface_output(
+    raw: &str,
+    tunnel_alias: &str,
+) -> Result<String, String> {
+    let alias = raw.trim().to_string();
+    if alias.is_empty() {
+        return Err(
+            "Windows egress detection returned no interface (no non-tunnel default route?)"
+                .to_string(),
+        );
+    }
+    if !alias.is_ascii() {
+        return Err(format!(
+            "Windows egress detection returned non-ASCII interface alias: {alias:?}"
+        ));
+    }
+    if alias.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(format!(
+            "Windows egress detection returned interface alias with control characters: {alias:?}"
+        ));
+    }
+    if alias.contains('=') {
+        return Err(format!(
+            "Windows egress detection returned interface alias containing '=': {alias:?}"
+        ));
+    }
+    if alias.len() > 64 {
+        return Err(format!(
+            "Windows egress detection returned interface alias that is too long ({} chars)",
+            alias.len()
+        ));
+    }
+    // Fail closed if the detected interface is the WireGuard tunnel itself.  The
+    // PowerShell script filters the tunnel alias before selecting the best route, but
+    // this Rust guard catches the edge case where tunnel_alias is empty or the filter
+    // did not exclude the tunnel (e.g. because the alias case differs).
+    if !tunnel_alias.is_empty() && alias.eq_ignore_ascii_case(tunnel_alias) {
+        return Err(format!(
+            "Windows egress detection returned the WireGuard tunnel interface ({alias:?}); \
+             set egress_interface explicitly when only a tunnel default route exists"
+        ));
+    }
+    Ok(alias)
+}
+
+/// PowerShell script that returns the lowest-metric non-tunnel IPv4 default-route interface
+/// alias.  The tunnel alias is passed as a script parameter so it is never interpolated into
+/// the script body.
+#[cfg(windows)]
+const WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE: &str = "& { param($TunnelAlias) $ErrorActionPreference = 'Stop'; \
+     $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | \
+         Where-Object { $_.InterfaceAlias -ne $TunnelAlias } | \
+         Sort-Object -Property RouteMetric | Select-Object -First 1; \
+     if ($null -ne $route) { $route.InterfaceAlias } }";
+
 #[cfg(target_os = "linux")]
-fn detect_default_egress_interface() -> Result<String, String> {
+fn detect_default_egress_interface(_tunnel_alias: &str) -> Result<String, String> {
     detect_route_interface("ip", &["-o", "route", "show", "to", "default"])
 }
 
 #[cfg(target_os = "macos")]
-fn detect_default_egress_interface() -> Result<String, String> {
+fn detect_default_egress_interface(_tunnel_alias: &str) -> Result<String, String> {
     detect_route_interface("route", &["-n", "get", "default"])
 }
 
 #[cfg(windows)]
-fn detect_default_egress_interface() -> Result<String, String> {
-    // Use PowerShell Get-NetRoute to find the best default-route interface alias.
-    // The InterfaceAlias (e.g. "Ethernet 0") is the string the daemon uses for
-    // egress operations on Windows.
+fn detect_default_egress_interface(tunnel_alias: &str) -> Result<String, String> {
+    // Use PowerShell Get-NetRoute to find the lowest-metric default-route interface
+    // that is not the WireGuard tunnel adapter.  The tunnel alias is passed as a
+    // PowerShell script parameter so it is never interpolated into the script body.
     let output = Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object -Property RouteMetric | Select-Object -First 1).InterfaceAlias",
+            WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE,
+            tunnel_alias,
         ])
         .output()
         .map_err(|err| format!("spawn powershell for egress detection failed: {err}"))?;
@@ -8096,17 +8356,11 @@ fn detect_default_egress_interface() -> Result<String, String> {
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| "powershell egress detection returned non-utf8 output".to_string())?;
-    let interface = stdout.trim().to_string();
-    if interface.is_empty() {
-        return Err(
-            "powershell egress detection returned empty interface (no default route?)".to_string(),
-        );
-    }
-    Ok(interface)
+    parse_windows_default_egress_interface_output(stdout.trim(), tunnel_alias)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn detect_default_egress_interface() -> Result<String, String> {
+fn detect_default_egress_interface(_tunnel_alias: &str) -> Result<String, String> {
     Err("egress interface auto-detect is unsupported on this platform".to_string())
 }
 
@@ -8813,6 +9067,24 @@ fn is_allowed_traversal_key(key: &str) -> bool {
         return matches!(
             suffix,
             "type" | "addr" | "port" | "family" | "relay_id" | "priority"
+        );
+    }
+
+    false
+}
+
+fn is_allowed_relay_fleet_key(key: &str) -> bool {
+    if matches!(
+        key,
+        "version" | "generated_at_unix" | "expires_at_unix" | "nonce" | "relay_count" | "signature"
+    ) {
+        return true;
+    }
+
+    if let Some((_index, suffix)) = parse_indexed_key(key, "relay.") {
+        return matches!(
+            suffix,
+            "id" | "region" | "addr" | "port" | "priority" | "capacity" | "enabled"
         );
     }
 
@@ -10032,6 +10304,122 @@ fn load_traversal_bundle_set(
     })
 }
 
+fn load_relay_fleet_bundle(
+    path: &Path,
+    verifier_key_path: &Path,
+    max_age_secs: u64,
+    trust_policy: TrustPolicy,
+    previous_watermark: Option<TraversalWatermark>,
+) -> Result<RelayFleetBundleEnvelope, TraversalBootstrapError> {
+    if !path.exists() {
+        return Err(TraversalBootstrapError::Missing);
+    }
+
+    let verifying_key = load_traversal_verifying_key(verifier_key_path)?;
+    let verifier_key_bytes = verifying_key.to_bytes();
+    let content = read_relay_fleet_bundle_content(path)?;
+    validate_relay_fleet_bundle_wire_shape(content.as_str())?;
+    let bundle = parse_signed_relay_fleet_bundle_wire(content.as_str())
+        .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
+    if !verify_signed_relay_fleet_bundle_with_key(&bundle, &verifying_key) {
+        return Err(TraversalBootstrapError::SignatureInvalid);
+    }
+
+    let now = unix_now();
+    if bundle.generated_at_unix > now.saturating_add(trust_policy.max_clock_skew_secs) {
+        return Err(TraversalBootstrapError::FutureDated);
+    }
+    if now > bundle.expires_at_unix || now.saturating_sub(bundle.generated_at_unix) > max_age_secs {
+        return Err(TraversalBootstrapError::Stale);
+    }
+
+    let payload_digest = sha256_digest(bundle.payload.as_bytes());
+    let watermark = TraversalWatermark {
+        generated_at_unix: bundle.generated_at_unix,
+        nonce: bundle.nonce,
+        payload_digest: Some(payload_digest),
+    };
+    if let Some(existing) = previous_watermark {
+        match traversal_watermark_ordering(&watermark, &existing) {
+            std::cmp::Ordering::Less => return Err(TraversalBootstrapError::ReplayDetected),
+            std::cmp::Ordering::Equal => {
+                let existing_digest = existing
+                    .payload_digest
+                    .ok_or(TraversalBootstrapError::ReplayDetected)?;
+                if existing_digest != payload_digest {
+                    return Err(TraversalBootstrapError::ReplayDetected);
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    Ok(RelayFleetBundleEnvelope {
+        bundle,
+        verifier_key_bytes,
+        watermark,
+    })
+}
+
+fn read_relay_fleet_bundle_content(path: &Path) -> Result<String, TraversalBootstrapError> {
+    enforce_text_artifact_size_limit(path, "relay fleet bundle", MAX_RELAY_FLEET_BUNDLE_BYTES)
+        .map_err(TraversalBootstrapError::InvalidFormat)?;
+    let content =
+        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
+    if content.len() > MAX_RELAY_FLEET_BUNDLE_BYTES {
+        return Err(TraversalBootstrapError::InvalidFormat(format!(
+            "relay fleet bundle exceeds maximum size of {MAX_RELAY_FLEET_BUNDLE_BYTES} bytes"
+        )));
+    }
+    Ok(content)
+}
+
+fn validate_relay_fleet_bundle_wire_shape(content: &str) -> Result<(), TraversalBootstrapError> {
+    let mut line_count = 0usize;
+    let mut signature_seen = false;
+    for line in content.lines() {
+        line_count = line_count.saturating_add(1);
+        if line_count > MAX_RELAY_FLEET_BUNDLE_LINES {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "relay fleet bundle exceeds maximum line count of {MAX_RELAY_FLEET_BUNDLE_LINES}"
+            )));
+        }
+        if signature_seen {
+            return Err(TraversalBootstrapError::InvalidFormat(
+                "relay fleet signature must be the final line".to_string(),
+            ));
+        }
+        let (key, _value) = parse_limited_key_value_line(
+            line,
+            line_count,
+            MAX_RELAY_FLEET_LINE_BYTES,
+            MAX_TRAVERSAL_KEY_BYTES,
+            MAX_TRAVERSAL_VALUE_BYTES,
+            MAX_TRAVERSAL_KEY_DEPTH,
+        )
+        .map_err(TraversalBootstrapError::InvalidFormat)?;
+        if !is_allowed_relay_fleet_key(key) {
+            return Err(TraversalBootstrapError::InvalidFormat(format!(
+                "unknown relay fleet key {key}"
+            )));
+        }
+        if key == "signature" {
+            signature_seen = true;
+        }
+    }
+    if line_count == 0 {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "relay fleet bundle is empty".to_string(),
+        ));
+    }
+    if !signature_seen {
+        return Err(TraversalBootstrapError::InvalidFormat(
+            "relay fleet bundle missing signature".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn read_traversal_bundle_content(path: &Path) -> Result<String, TraversalBootstrapError> {
     enforce_text_artifact_size_limit(path, "traversal bundle", MAX_TRAVERSAL_BUNDLE_BYTES)
         .map_err(TraversalBootstrapError::InvalidFormat)?;
@@ -10658,24 +11046,16 @@ struct RuntimeRelayCandidate {
     relay_id: [u8; 16],
 }
 
-fn relay_transport_id_from_label(label: &str) -> Result<[u8; 16], String> {
-    let trimmed = label.trim();
-    if trimmed.is_empty() {
-        return Err("relay candidate relay_id must not be empty".to_string());
-    }
-    if !trimmed.is_ascii() {
-        return Err("relay candidate relay_id must be ASCII".to_string());
-    }
-    if trimmed.len() > 16 {
-        return Err("relay candidate relay_id must be at most 16 ASCII bytes".to_string());
-    }
-    let mut relay_id = [0u8; 16];
-    relay_id[..trimmed.len()].copy_from_slice(trimmed.as_bytes());
-    Ok(relay_id)
-}
-
+#[cfg(test)]
 fn select_runtime_relay_candidate(
     candidates: &[TraversalCandidate],
+) -> Result<Option<RuntimeRelayCandidate>, String> {
+    select_runtime_relay_candidate_with_verified_fleet(candidates, None)
+}
+
+fn select_runtime_relay_candidate_with_verified_fleet(
+    candidates: &[TraversalCandidate],
+    relay_fleet: Option<&SignedRelayFleetBundle>,
 ) -> Result<Option<RuntimeRelayCandidate>, String> {
     let Some(candidate) = candidates
         .iter()
@@ -10688,15 +11068,106 @@ fn select_runtime_relay_candidate(
         .relay_id
         .as_deref()
         .ok_or_else(|| "relay candidate missing relay_id".to_string())?;
-    if let std::net::IpAddr::V4(v4) = candidate.endpoint.ip()
-        && (v4.is_private() || is_shared_carrier_grade_nat_ipv4(v4))
-    {
-        return Err("relay candidate must not use private transport address".to_string());
-    }
-    Ok(Some(RuntimeRelayCandidate {
+    validate_runtime_relay_candidate_endpoint(candidate.endpoint)?;
+    let selected = RuntimeRelayCandidate {
         endpoint: candidate.endpoint,
-        relay_id: relay_transport_id_from_label(relay_id_label)?,
-    }))
+        relay_id: canonical_relay_id_from_label(relay_id_label)
+            .map_err(|err| format!("relay candidate {err}"))?,
+    };
+    if let Some(relay_fleet) = relay_fleet {
+        ensure_runtime_relay_candidate_in_verified_fleet(selected, relay_fleet)?;
+    }
+    Ok(Some(selected))
+}
+
+fn ensure_runtime_relay_candidate_in_verified_fleet(
+    candidate: RuntimeRelayCandidate,
+    relay_fleet: &SignedRelayFleetBundle,
+) -> Result<(), String> {
+    let fleet_index = verified_relay_fleet_endpoint_index(relay_fleet)?;
+    let Some(endpoints) = fleet_index.get(&candidate.relay_id) else {
+        return Err("relay candidate relay_id is absent from signed relay fleet".to_string());
+    };
+    if !endpoints.contains(&candidate.endpoint) {
+        return Err("relay candidate endpoint is absent from signed relay fleet".to_string());
+    }
+    Ok(())
+}
+
+fn verified_relay_fleet_endpoint_index(
+    relay_fleet: &SignedRelayFleetBundle,
+) -> Result<BTreeMap<[u8; 16], BTreeSet<SocketAddr>>, String> {
+    let mut index = BTreeMap::<[u8; 16], BTreeSet<SocketAddr>>::new();
+    for relay in &relay_fleet.relays {
+        if !relay.enabled {
+            continue;
+        }
+        validate_runtime_relay_fleet_descriptor(relay)?;
+        let relay_id = canonical_relay_id_from_label(relay.relay_id.as_str())
+            .map_err(|err| format!("relay fleet {err}"))?;
+        let endpoint = relay
+            .endpoint
+            .parse::<SocketAddr>()
+            .map_err(|_| "relay fleet endpoint is invalid".to_string())?;
+        validate_runtime_relay_candidate_endpoint(endpoint)
+            .map_err(|err| format!("relay fleet {err}"))?;
+        index.entry(relay_id).or_default().insert(endpoint);
+    }
+    if index.is_empty() {
+        return Err("signed relay fleet contains no enabled relays".to_string());
+    }
+    Ok(index)
+}
+
+fn validate_runtime_relay_fleet_descriptor(relay: &RelayFleetNodeDescriptor) -> Result<(), String> {
+    let relay_id = relay.relay_id.trim();
+    if relay_id
+        .bytes()
+        .any(|byte| matches!(byte, b'\n' | b'\r' | b'='))
+    {
+        return Err("relay fleet relay_id must be a single-line payload value".to_string());
+    }
+    let region = relay.region.trim();
+    if region.is_empty()
+        || !region.is_ascii()
+        || region.len() > 64
+        || region
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | b'='))
+    {
+        return Err("relay fleet region must be a bounded single-line ASCII value".to_string());
+    }
+    if relay.capacity == 0 {
+        return Err("relay fleet capacity must be greater than zero".to_string());
+    }
+    Ok(())
+}
+
+fn validate_runtime_relay_candidate_endpoint(endpoint: SocketAddr) -> Result<(), String> {
+    if endpoint.port() == 0 {
+        return Err("relay candidate must not use port 0".to_string());
+    }
+    if endpoint.ip().is_unspecified() || endpoint.ip().is_loopback() || endpoint.ip().is_multicast()
+    {
+        return Err("relay candidate must not use special transport address".to_string());
+    }
+    match endpoint.ip() {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || is_shared_carrier_grade_nat_ipv4(v4)
+            {
+                return Err("relay candidate must not use private transport address".to_string());
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_unicast_link_local() || v6.is_unique_local() {
+                return Err("relay candidate must not use private transport address".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn traversal_direct_probe_candidates(
@@ -11453,8 +11924,9 @@ mod tests {
     use std::io::Write;
     use std::net::{IpAddr, SocketAddr, UdpSocket};
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -11466,7 +11938,9 @@ mod tests {
     };
     #[cfg(not(target_os = "macos"))]
     use crate::key_material::encrypt_private_key;
-    use crate::relay_client::{RelayClient, RelayClientConfig, RelayClientError};
+    use crate::relay_client::{
+        MAX_RELAY_SESSION_TOKEN_TTL_SECS, RelayClient, RelayClientConfig, RelayClientError,
+    };
 
     use ed25519_dalek::{Signer, SigningKey};
     use rustynet_backend_api::{
@@ -11478,25 +11952,30 @@ mod tests {
         MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
         persist_membership_snapshot,
     };
+    use rustynet_control::{RelayFleetNodeDescriptor, SignedRelayFleetBundle};
 
     use super::{
         AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
         DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
         DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonRuntime,
         DnsZoneBootstrapError, DnsZoneLoadContext, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
-        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_TRAVERSAL_BUNDLE_BYTES,
-        MAX_TRAVERSAL_CANDIDATE_COUNT, MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS,
-        MAX_TRUST_EVIDENCE_BYTES, MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, StateFetcher,
-        TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TrustEvidenceRecord, TrustPolicy,
-        TrustWatermark, build_dns_response, collect_traversal_host_candidate_snapshot_with_retry,
+        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
+        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
+        MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
+        MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, StateFetcher,
+        TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TraversalCandidate, TraversalCandidateType,
+        TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
+        collect_traversal_host_candidate_snapshot_with_retry,
         is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
-        load_dns_zone_bundle, load_traversal_bundle, load_traversal_bundle_set,
-        load_traversal_watermark, load_trust_evidence, load_trust_watermark,
-        parse_route_interface_token, passphrase_disallowed_mode_mask,
+        load_dns_zone_bundle, load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
+        load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
+        load_trust_watermark, parse_route_interface_token,
+        parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
         persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
         run_preflight_checks, sanitize_dataplane_routes_for_node_role,
-        scrub_runtime_wireguard_key_material, sha256_digest,
+        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
+        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
         snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
         validate_daemon_config, validate_file_security, zeroize_optional_bytes,
     };
@@ -12897,6 +13376,45 @@ mod tests {
         );
     }
 
+    fn write_relay_fleet_file(
+        path: &Path,
+        verifier_path: &Path,
+        nonce: u64,
+        tamper_after_sign: bool,
+    ) {
+        write_relay_fleet_file_with_generated(
+            path,
+            verifier_path,
+            nonce,
+            unix_now(),
+            60,
+            tamper_after_sign,
+        );
+    }
+
+    fn write_relay_fleet_file_with_generated(
+        path: &Path,
+        verifier_path: &Path,
+        nonce: u64,
+        generated: u64,
+        ttl_secs: u64,
+        tamper_after_sign: bool,
+    ) {
+        let expires = generated.saturating_add(ttl_secs);
+        let payload = format!(
+            "version=1\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\nrelay_count=1\nrelay.0.id=relay-eu-1\nrelay.0.region=eu-west\nrelay.0.addr=203.0.113.77\nrelay.0.port=443\nrelay.0.priority=10\nrelay.0.capacity=100\nrelay.0.enabled=true\n"
+        );
+        write_signed_kv_artifact(path, verifier_path, [41u8; 32], payload.as_str());
+        if tamper_after_sign {
+            let tampered = std::fs::read_to_string(path).expect("relay fleet should be readable");
+            std::fs::write(
+                path,
+                tampered.replace("relay.0.capacity=100", "relay.0.capacity=101"),
+            )
+            .expect("tampered relay fleet should be written");
+        }
+    }
+
     fn write_traversal_file_with_coordination(
         path: &Path,
         verifier_path: &Path,
@@ -13694,6 +14212,103 @@ mod tests {
     }
 
     #[test]
+    fn validate_daemon_config_rejects_relative_relay_token_spool_dir() {
+        let config = DaemonConfig {
+            relay_session_token_spool_dir: Some(std::path::PathBuf::from("relay-token-spool")),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("relative relay token spool dir path must be rejected");
+        assert!(
+            err.to_string()
+                .contains("relay session token spool dir path must be absolute")
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_relay_token_spool_with_local_signer() {
+        let config = DaemonConfig {
+            relay_session_signing_secret_path: Some(std::path::PathBuf::from("/tmp/relay.secret")),
+            relay_session_signing_secret_passphrase_path: Some(std::path::PathBuf::from(
+                "/tmp/relay.passphrase",
+            )),
+            relay_session_local_token_issuer_enabled: true,
+            relay_session_token_spool_dir: Some(std::path::PathBuf::from(
+                "/var/lib/rustynet/relay-token-spool",
+            )),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("spool and local signing authority must be mutually exclusive");
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with daemon-local relay token signing")
+        );
+    }
+
+    #[test]
+    fn load_relay_client_uses_preissued_token_spool_without_local_signing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool_dir = dir.path().join("relay-token-spool");
+        std::fs::create_dir(&spool_dir).expect("create spool dir");
+        std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_path = dir.path().join("traversal.pub");
+        std::fs::write(
+            &verifier_path,
+            hex_encode(signing_key.verifying_key().as_bytes()),
+        )
+        .expect("write verifier key");
+
+        let config = DaemonConfig {
+            traversal_verifier_key_path: verifier_path,
+            relay_session_token_spool_dir: Some(spool_dir),
+            relay_session_signing_secret_path: None,
+            relay_session_signing_secret_passphrase_path: None,
+            relay_session_local_token_issuer_enabled: false,
+            ..DaemonConfig::default()
+        };
+        let client = load_relay_client(&config)
+            .expect("preissued token spool should configure relay client")
+            .expect("relay client should be present");
+
+        assert_eq!(client.local_port(), None);
+        assert!(!client.is_bound());
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_local_relay_token_issuer_without_opt_in() {
+        let config = DaemonConfig {
+            relay_session_signing_secret_path: Some(std::path::PathBuf::from("/tmp/relay.secret")),
+            relay_session_signing_secret_passphrase_path: Some(std::path::PathBuf::from(
+                "/tmp/relay.passphrase",
+            )),
+            relay_session_local_token_issuer_enabled: false,
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("local relay token issuer must require explicit opt-in");
+        assert!(
+            err.to_string()
+                .contains("local relay session token issuer is disabled")
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_allows_local_relay_token_issuer_with_explicit_opt_in() {
+        let config = DaemonConfig {
+            relay_session_signing_secret_path: Some(std::path::PathBuf::from("/tmp/relay.secret")),
+            relay_session_signing_secret_passphrase_path: Some(std::path::PathBuf::from(
+                "/tmp/relay.passphrase",
+            )),
+            relay_session_local_token_issuer_enabled: true,
+            ..DaemonConfig::default()
+        };
+        validate_daemon_config(&config)
+            .expect("local relay token issuer should be allowed only with explicit opt-in");
+    }
+
+    #[test]
     fn validate_daemon_config_rejects_relay_session_refresh_margin_not_less_than_ttl() {
         let config = DaemonConfig {
             relay_session_token_ttl_secs: NonZeroU64::new(30)
@@ -13708,6 +14323,18 @@ mod tests {
             err.to_string()
                 .contains("relay session refresh margin must be less than relay session token ttl")
         );
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_relay_session_token_ttl_above_relay_bound() {
+        let config = DaemonConfig {
+            relay_session_token_ttl_secs: NonZeroU64::new(MAX_RELAY_SESSION_TOKEN_TTL_SECS + 1)
+                .expect("relay token ttl should be non-zero"),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("relay token ttl above relay max must be rejected");
+        assert!(err.to_string().contains("relay session token ttl"));
     }
 
     #[test]
@@ -14225,6 +14852,111 @@ mod tests {
     }
 
     #[test]
+    fn load_relay_fleet_bundle_accepts_signed_fleet_and_rejects_tamper() {
+        let test_dir = secure_test_dir("rustynetd-relay-fleet-signed-tamper");
+        let fleet_path = test_dir.join("relay-fleet.bundle");
+        let verifier_path = test_dir.join("relay-fleet.verifier.pub");
+
+        write_relay_fleet_file(&fleet_path, &verifier_path, 1, false);
+        let envelope = load_relay_fleet_bundle(
+            &fleet_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed relay fleet should load");
+        assert_eq!(envelope.bundle.relay_count, 1);
+        assert_eq!(envelope.bundle.relays[0].relay_id, "relay-eu-1");
+        assert_eq!(envelope.bundle.relays[0].endpoint, "203.0.113.77:443");
+        assert_eq!(envelope.verifier_key_bytes.len(), 32);
+        assert!(envelope.watermark.payload_digest.is_some());
+
+        write_relay_fleet_file(&fleet_path, &verifier_path, 2, true);
+        let tampered = load_relay_fleet_bundle(
+            &fleet_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("tampered relay fleet must fail signature verification");
+        assert!(matches!(
+            tampered,
+            super::TraversalBootstrapError::SignatureInvalid
+        ));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_relay_fleet_bundle_rejects_replay_and_stale() {
+        let test_dir = secure_test_dir("rustynetd-relay-fleet-replay-stale");
+        let fleet_path = test_dir.join("relay-fleet.bundle");
+        let verifier_path = test_dir.join("relay-fleet.verifier.pub");
+
+        write_relay_fleet_file(&fleet_path, &verifier_path, 3, false);
+        let envelope = load_relay_fleet_bundle(
+            &fleet_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first relay fleet load should succeed");
+        let replay = load_relay_fleet_bundle(
+            &fleet_path,
+            &verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            Some(super::TraversalWatermark {
+                generated_at_unix: envelope.watermark.generated_at_unix,
+                nonce: envelope.watermark.nonce,
+                payload_digest: Some([0x42u8; 32]),
+            }),
+        )
+        .expect_err("equal relay fleet watermark with mismatched digest must fail");
+        assert!(matches!(
+            replay,
+            super::TraversalBootstrapError::ReplayDetected
+        ));
+
+        write_relay_fleet_file_with_generated(
+            &fleet_path,
+            &verifier_path,
+            4,
+            unix_now().saturating_sub(10),
+            60,
+            false,
+        );
+        let stale =
+            load_relay_fleet_bundle(&fleet_path, &verifier_path, 1, TrustPolicy::default(), None)
+                .expect_err("relay fleet older than max age must fail closed");
+        assert!(matches!(stale, super::TraversalBootstrapError::Stale));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn relay_fleet_operator_paths_must_be_absolute() {
+        let test_dir = secure_test_dir("rustynetd-relay-fleet-path-validation");
+        let config = DaemonConfig {
+            relay_fleet_bundle_path: Some(test_dir.join("relay-fleet.bundle")),
+            relay_fleet_watermark_path: Some(test_dir.join("relay-fleet.watermark")),
+            ..DaemonConfig::default()
+        };
+        validate_daemon_config(&config).expect("absolute relay fleet paths should validate");
+
+        let config = DaemonConfig {
+            relay_fleet_bundle_path: Some(PathBuf::from("relative/relay-fleet.bundle")),
+            relay_fleet_watermark_path: Some(test_dir.join("relay-fleet.watermark")),
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("relative relay fleet path must fail closed");
+        assert!(err.to_string().contains("must be absolute"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn artifact_limitgate_rejects_oversized_bundle_files() {
         let test_dir = secure_test_dir("rustynetd-artifact-limit-oversized");
         let trust_path = test_dir.join("trust.evidence");
@@ -14298,6 +15030,28 @@ mod tests {
             super::TraversalBootstrapError::InvalidFormat(_)
         ));
         assert!(traversal_err.to_string().contains("exceeds maximum size"));
+
+        let relay_fleet_path = test_dir.join("relay-fleet.bundle");
+        let relay_fleet_verifier_path = test_dir.join("relay-fleet.verifier.pub");
+        write_relay_fleet_file(&relay_fleet_path, &relay_fleet_verifier_path, 20, false);
+        std::fs::write(
+            &relay_fleet_path,
+            vec![b'd'; MAX_RELAY_FLEET_BUNDLE_BYTES + 1],
+        )
+        .expect("oversized relay fleet bundle should be writable");
+        let relay_fleet_err = load_relay_fleet_bundle(
+            &relay_fleet_path,
+            &relay_fleet_verifier_path,
+            DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect_err("oversized relay fleet bundle must fail closed");
+        assert!(matches!(
+            relay_fleet_err,
+            super::TraversalBootstrapError::InvalidFormat(_)
+        ));
+        assert!(relay_fleet_err.to_string().contains("exceeds maximum size"));
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -14925,6 +15679,98 @@ mod tests {
             resolve_egress_interface_value(DEFAULT_EGRESS_INTERFACE, || Ok("enp0s8".to_string()))
                 .expect("auto interface should use detector");
         assert_eq!(detected, "enp0s8");
+    }
+
+    #[test]
+    fn parse_windows_egress_output_accepts_common_interface_names() {
+        // Plain adapter names without spaces.
+        assert_eq!(
+            parse_windows_default_egress_interface_output("Ethernet", "rustynet0")
+                .expect("simple Ethernet alias must be accepted"),
+            "Ethernet"
+        );
+        // Adapters with spaces in their names — common in Windows when there are
+        // multiple ports of the same type ("Ethernet 2") or Hyper-V adapters
+        // ("vEthernet (Default Switch)").
+        assert_eq!(
+            parse_windows_default_egress_interface_output("Ethernet 2\r\n", "rustynet0")
+                .expect("alias with space and trailing CRLF must be trimmed and accepted"),
+            "Ethernet 2"
+        );
+        assert_eq!(
+            parse_windows_default_egress_interface_output("Wi-Fi", "")
+                .expect("Wi-Fi alias with empty tunnel must be accepted"),
+            "Wi-Fi"
+        );
+    }
+
+    #[test]
+    fn parse_windows_egress_output_fails_closed_for_empty_or_invalid_output() {
+        // Empty output means no non-tunnel default route exists.
+        parse_windows_default_egress_interface_output("", "rustynet0")
+            .expect_err("empty output must fail closed");
+        parse_windows_default_egress_interface_output("  \r\n  ", "rustynet0")
+            .expect_err("whitespace-only output must fail closed");
+
+        // Control characters in the alias are not valid Windows interface names
+        // and would corrupt log lines or format strings.
+        parse_windows_default_egress_interface_output("eth\n0", "rustynet0")
+            .expect_err("alias with newline must fail closed");
+        parse_windows_default_egress_interface_output("eth\t0", "rustynet0")
+            .expect_err("alias with tab must fail closed");
+
+        // '=' would corrupt the key=value netsh argument format.
+        parse_windows_default_egress_interface_output("interface=eth0", "rustynet0")
+            .expect_err("alias containing '=' must fail closed");
+
+        // Non-ASCII is not valid in standard Windows adapter names.
+        parse_windows_default_egress_interface_output("Éthernetø", "rustynet0")
+            .expect_err("non-ASCII alias must fail closed");
+
+        // Excessively long aliases are invalid.
+        parse_windows_default_egress_interface_output(&"x".repeat(65), "rustynet0")
+            .expect_err("alias longer than 64 chars must fail closed");
+    }
+
+    #[test]
+    fn parse_windows_egress_output_fails_closed_when_tunnel_is_best_default_route() {
+        // If the WireGuard tunnel interface is the detected egress interface, the
+        // daemon is likely restarting with stale tunnel routes from a previous
+        // session.  We must fail closed rather than using the tunnel as the
+        // physical egress for NAT and bypass routes.
+        let err = parse_windows_default_egress_interface_output("rustynet0", "rustynet0")
+            .expect_err("tunnel alias as best route must fail closed");
+        assert!(
+            err.contains("tunnel interface"),
+            "error must identify this as a tunnel-interface problem: {err}"
+        );
+
+        // Case-insensitive comparison so "RustyNet0" and "rustynet0" match.
+        parse_windows_default_egress_interface_output("RustyNet0", "rustynet0")
+            .expect_err("case-variant tunnel alias must also fail closed");
+
+        // An empty tunnel alias disables the tunnel-exclusion check; the alias is
+        // then treated as a regular physical interface.
+        parse_windows_default_egress_interface_output("rustynet0", "")
+            .expect("empty tunnel alias must disable the exclusion check");
+    }
+
+    #[test]
+    fn parse_windows_egress_output_script_uses_param_not_interpolation() {
+        // The PowerShell script for egress detection must bind the tunnel alias as a
+        // script parameter, never concatenate it into the script body.
+        #[cfg(windows)]
+        {
+            use super::WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE;
+            assert!(
+                WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE.contains("param($TunnelAlias)"),
+                "script must bind TunnelAlias as a parameter, not interpolate it"
+            );
+            assert!(
+                !WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE.contains("rustynet"),
+                "script body must not contain hard-coded tunnel alias values"
+            );
+        }
     }
 
     #[test]
@@ -18112,6 +18958,163 @@ mod tests {
         ));
         assert!(err.to_string().contains("relay candidate"));
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn runtime_relay_candidate_uses_shared_relay_id_canonicalization() {
+        let candidate = TraversalCandidate {
+            candidate_type: TraversalCandidateType::Relay,
+            endpoint: "203.0.113.77:443"
+                .parse()
+                .expect("relay endpoint should parse"),
+            relay_id: Some(" relay-eu-1 ".to_string()),
+            priority: 20,
+        };
+
+        let selected = select_runtime_relay_candidate(&[candidate])
+            .expect("relay candidate should parse")
+            .expect("relay candidate should be selected");
+        let mut expected = [0u8; 16];
+        expected[..10].copy_from_slice(b"relay-eu-1");
+        assert_eq!(selected.relay_id, expected);
+    }
+
+    #[test]
+    fn runtime_relay_candidate_rejects_ambiguous_relay_id_label() {
+        let candidate = TraversalCandidate {
+            candidate_type: TraversalCandidateType::Relay,
+            endpoint: "203.0.113.77:443"
+                .parse()
+                .expect("relay endpoint should parse"),
+            relay_id: Some("relay-label-too-long".to_string()),
+            priority: 20,
+        };
+
+        let err = select_runtime_relay_candidate(&[candidate])
+            .expect_err("ambiguous relay id must be rejected");
+        assert!(err.contains("relay candidate relay_id"));
+    }
+
+    #[test]
+    fn runtime_relay_candidate_rejects_unsafe_transport_addresses() {
+        for endpoint in [
+            "127.0.0.1:443",
+            "0.0.0.0:443",
+            "10.0.0.10:443",
+            "100.64.0.10:443",
+            "203.0.113.77:0",
+            "[fc00::1]:443",
+            "[fe80::1]:443",
+        ] {
+            let candidate = TraversalCandidate {
+                candidate_type: TraversalCandidateType::Relay,
+                endpoint: endpoint.parse().expect("test relay endpoint should parse"),
+                relay_id: Some("relay-eu-1".to_string()),
+                priority: 20,
+            };
+            select_runtime_relay_candidate(&[candidate])
+                .expect_err("unsafe relay endpoint must fail closed");
+        }
+    }
+
+    fn test_relay_fleet(relays: Vec<RelayFleetNodeDescriptor>) -> SignedRelayFleetBundle {
+        SignedRelayFleetBundle {
+            payload: String::new(),
+            signature_hex: String::new(),
+            generated_at_unix: 1,
+            expires_at_unix: 60,
+            nonce: 1,
+            relay_count: relays.len(),
+            relays,
+        }
+    }
+
+    fn test_relay_descriptor(
+        relay_id: &str,
+        endpoint: &str,
+        enabled: bool,
+    ) -> RelayFleetNodeDescriptor {
+        RelayFleetNodeDescriptor {
+            relay_id: relay_id.to_string(),
+            region: "test-region".to_string(),
+            endpoint: endpoint.to_string(),
+            priority: 10,
+            capacity: 100,
+            enabled,
+        }
+    }
+
+    #[test]
+    fn runtime_relay_candidate_matches_verified_fleet_entry() {
+        let candidate = TraversalCandidate {
+            candidate_type: TraversalCandidateType::Relay,
+            endpoint: "203.0.113.77:443"
+                .parse()
+                .expect("relay endpoint should parse"),
+            relay_id: Some(" relay-eu-1 ".to_string()),
+            priority: 20,
+        };
+        let fleet = test_relay_fleet(vec![test_relay_descriptor(
+            "relay-eu-1",
+            "203.0.113.77:443",
+            true,
+        )]);
+
+        let selected =
+            select_runtime_relay_candidate_with_verified_fleet(&[candidate], Some(&fleet))
+                .expect("relay candidate should match verified fleet")
+                .expect("relay candidate should be selected");
+
+        assert_eq!(
+            selected.endpoint,
+            "203.0.113.77:443"
+                .parse::<SocketAddr>()
+                .expect("relay endpoint should parse")
+        );
+    }
+
+    #[test]
+    fn runtime_relay_candidate_rejects_endpoint_absent_from_verified_fleet() {
+        let candidate = TraversalCandidate {
+            candidate_type: TraversalCandidateType::Relay,
+            endpoint: "203.0.113.77:443"
+                .parse()
+                .expect("relay endpoint should parse"),
+            relay_id: Some("relay-eu-1".to_string()),
+            priority: 20,
+        };
+        let fleet = test_relay_fleet(vec![test_relay_descriptor(
+            "relay-eu-1",
+            "203.0.113.78:443",
+            true,
+        )]);
+
+        let err = select_runtime_relay_candidate_with_verified_fleet(&[candidate], Some(&fleet))
+            .expect_err("relay candidate outside verified fleet must fail closed");
+
+        assert!(err.contains("endpoint is absent from signed relay fleet"));
+    }
+
+    #[test]
+    fn runtime_relay_candidate_rejects_disabled_verified_fleet_entry() {
+        let candidate = TraversalCandidate {
+            candidate_type: TraversalCandidateType::Relay,
+            endpoint: "203.0.113.77:443"
+                .parse()
+                .expect("relay endpoint should parse"),
+            relay_id: Some("relay-eu-1".to_string()),
+            priority: 20,
+        };
+        let fleet = test_relay_fleet(vec![test_relay_descriptor(
+            "relay-eu-1",
+            "203.0.113.77:443",
+            false,
+        )]);
+
+        let err = select_runtime_relay_candidate_with_verified_fleet(&[candidate], Some(&fleet))
+            .expect_err("disabled fleet relay must fail closed");
+
+        assert!(err.contains("no enabled relays"));
     }
 
     #[test]

@@ -54,6 +54,9 @@ const WINDOWS_BOOTSTRAP_VSCONFIG_FILE: &str = "RustyNetBuildTools.vsconfig";
 const WINDOWS_ENABLE_ACCESS_HELPER_FILE: &str = "Enable-WindowsVmLabAccess.ps1";
 const WINDOWS_SERVICE_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsService.ps1";
 const WINDOWS_SERVICE_UNINSTALL_HELPER_FILE: &str = "Uninstall-RustyNetWindowsService.ps1";
+const WINDOWS_RELAY_SERVICE_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsRelayService.ps1";
+const WINDOWS_RELAY_SERVICE_UNINSTALL_HELPER_FILE: &str =
+    "Uninstall-RustyNetWindowsRelayService.ps1";
 const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
@@ -1547,6 +1550,14 @@ fn windows_service_install_helper_script_local_path() -> PathBuf {
 #[allow(dead_code)]
 fn windows_service_uninstall_helper_script_local_path() -> PathBuf {
     windows_helper_script_local_path(WINDOWS_SERVICE_UNINSTALL_HELPER_FILE)
+}
+
+fn windows_relay_service_install_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_RELAY_SERVICE_INSTALL_HELPER_FILE)
+}
+
+fn windows_relay_service_uninstall_helper_script_local_path() -> PathBuf {
+    windows_helper_script_local_path(WINDOWS_RELAY_SERVICE_UNINSTALL_HELPER_FILE)
 }
 
 fn windows_verify_helper_script_local_path() -> PathBuf {
@@ -19749,6 +19760,9 @@ fn stage_windows_helper_support_files(
         WINDOWS_BOOTSTRAP_WINGET_CONFIG_FILE,
         WINDOWS_BOOTSTRAP_VSCONFIG_FILE,
         WINDOWS_SERVICE_INSTALL_HELPER_FILE,
+        WINDOWS_SERVICE_UNINSTALL_HELPER_FILE,
+        WINDOWS_RELAY_SERVICE_INSTALL_HELPER_FILE,
+        WINDOWS_RELAY_SERVICE_UNINSTALL_HELPER_FILE,
         WINDOWS_VERIFY_HELPER_FILE,
         WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
     ] {
@@ -20008,6 +20022,15 @@ fn invoke_windows_helper_script_for_target(
     let local_path = match invocation.helper_file_name {
         WINDOWS_BOOTSTRAP_HELPER_FILE => windows_bootstrap_helper_script_local_path(),
         WINDOWS_SERVICE_INSTALL_HELPER_FILE => windows_service_install_helper_script_local_path(),
+        WINDOWS_SERVICE_UNINSTALL_HELPER_FILE => {
+            windows_service_uninstall_helper_script_local_path()
+        }
+        WINDOWS_RELAY_SERVICE_INSTALL_HELPER_FILE => {
+            windows_relay_service_install_helper_script_local_path()
+        }
+        WINDOWS_RELAY_SERVICE_UNINSTALL_HELPER_FILE => {
+            windows_relay_service_uninstall_helper_script_local_path()
+        }
         WINDOWS_VERIFY_HELPER_FILE => windows_verify_helper_script_local_path(),
         WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE => windows_diagnostics_helper_script_local_path(),
         WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE => {
@@ -21664,6 +21687,8 @@ mod tests {
         summarize_live_lab_report, transition_local_utm_vm_with_process_probe,
         validate_live_lab_run_artifacts, windows_bootstrap_helper_script_local_path,
         windows_diagnostics_helper_script_local_path, windows_helper_script_remote_path,
+        windows_relay_service_install_helper_script_local_path,
+        windows_relay_service_uninstall_helper_script_local_path,
         windows_service_host_smoke_helper_script_local_path,
         windows_service_install_helper_script_local_path,
         windows_service_uninstall_helper_script_local_path,
@@ -22701,6 +22726,53 @@ mod tests {
             body.contains("Stop-Service"),
             "uninstall helper must stop the service before deletion"
         );
+    }
+
+    #[test]
+    fn windows_relay_service_install_helper_selection_uses_canonical_script_path() {
+        assert!(
+            windows_relay_service_install_helper_script_local_path().ends_with(Path::new(
+                "scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1"
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_relay_service_uninstall_helper_selection_uses_canonical_script_path() {
+        assert!(
+            windows_relay_service_uninstall_helper_script_local_path().ends_with(Path::new(
+                "scripts/bootstrap/windows/Uninstall-RustyNetWindowsRelayService.ps1"
+            ))
+        );
+    }
+
+    #[test]
+    fn windows_relay_service_helpers_exist_and_keep_reviewed_roots() {
+        let install_path = windows_relay_service_install_helper_script_local_path();
+        let uninstall_path = windows_relay_service_uninstall_helper_script_local_path();
+        assert!(
+            install_path.is_file(),
+            "relay install helper must ship at {}",
+            install_path.display()
+        );
+        assert!(
+            uninstall_path.is_file(),
+            "relay uninstall helper must ship at {}",
+            uninstall_path.display()
+        );
+
+        let install_body =
+            std::fs::read_to_string(install_path.as_path()).expect("read relay install helper");
+        let uninstall_body =
+            std::fs::read_to_string(uninstall_path.as_path()).expect("read relay uninstall helper");
+        for body in [install_body.as_str(), uninstall_body.as_str()] {
+            assert!(body.contains(r"C:\Program Files\RustyNet"));
+            assert!(body.contains(r"C:\ProgramData\RustyNet\relay"));
+            assert!(!body.contains("Invoke-Expression"));
+        }
+        assert!(install_body.contains("windows-service-hardening-check"));
+        assert!(uninstall_body.contains("preserved_artifacts"));
+        assert!(!uninstall_body.contains("Remove-Item -Recurse"));
     }
 
     #[test]

@@ -2965,6 +2965,1122 @@ What remains blocked:
   - Track E2 canonical cross-network reports still require distinct-underlay topology.
 ```
 
+```text
+Date: 2026-05-10
+Phase / Slice: Relay allocated-port authority hardening
+Files changed:
+  - crates/rustynet-relay/src/transport.rs
+    - Split hello validation from session commit so forged, stale, replayed, or
+      over-limit hellos can be rejected before the relay daemon binds an allocated UDP port.
+    - Added `handle_hello_from_tuple_with_allocated_port()` so committed transport
+      state records the daemon-owned real UDP dataplane port instead of an internal
+      synthetic `50000+n` port.
+    - Added regression coverage proving forward targets use the daemon-allocated
+      ports returned in relay hello acks.
+  - crates/rustynet-relay/src/main.rs
+    - Changed relay hello handling to validate first, allocate a real UDP port second,
+      then commit the session with that same port.
+    - If the second stateful commit check rejects after allocation, the socket is
+      dropped and a reject response is returned.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay test_forward_target_uses_daemon_allocated_port -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-relay --all-features`
+  - `cargo clippy -p rustynet-relay --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Focused allocated-port regression: pass.
+  - Full relay crate tests with daemon feature: 50 passed.
+  - Relay crate check/clippy with all features: pass.
+  - Base commit at start of slice: `53f7fac`.
+Security invariants re-verified:
+  - Relay remains ciphertext-only; forwarding still returns opaque payload bytes unchanged.
+  - Invalid relay hellos still fail before session creation and now also fail before UDP port binding.
+  - Allocated relay ports have one authority: the daemon-owned UDP socket port is the
+    same port stored in `RelayTransport` and returned in the client ack.
+  - The commit path re-checks signature, freshness, replay nonce, peer binding, relay binding,
+    scope, and session capacity before creating relay state.
+What this slice completed:
+  - Removed the production mismatch where `rustynet-relay` acknowledged one real UDP port
+    while `RelayTransport` forwarded by a separate synthetic port.
+What remains blocked:
+  - Relay ID canonicalization, durable replay across restart, production shared transport,
+    relay fleet discovery, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay ID canonicalization shared by daemon and relay server
+Files changed:
+  - crates/rustynet-control/src/lib.rs
+    - Added `canonical_relay_id_from_label()` as the shared conversion from signed
+      traversal/fleet relay labels to the 16-byte relay id carried in relay session tokens.
+    - Added tests for trimming, ASCII-only labels, 16-byte bound, and rejection of ambiguous labels.
+  - crates/rustynetd/src/daemon.rs
+    - Replaced the daemon-local relay label converter with the shared control-plane helper.
+    - Added runtime relay candidate tests proving signed relay labels map to the same token id
+      and ambiguous labels fail closed.
+  - crates/rustynet-relay/src/main.rs
+    - Replaced relay-server `--relay-id` SHA256 hashing with the same shared canonicalizer.
+    - Added relay binary tests proving `--relay-id relay-eu-1` maps to the same id the daemon uses.
+  - crates/rustynet-relay/Cargo.toml / Cargo.lock
+    - Removed the now-unused relay-local `sha2` optional dependency from the daemon feature.
+Commands run:
+  - `cargo fmt -p rustynet-control -p rustynetd -p rustynet-relay`
+  - `cargo test -p rustynet-control relay_id_label_canonicalization -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features relay_id_arg -- --nocapture`
+  - `cargo test -p rustynetd runtime_relay_candidate -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Control relay-id canonicalization tests: pass.
+  - Relay binary relay-id arg tests: pass.
+  - Daemon runtime relay candidate tests: pass.
+  - Full relay crate tests with daemon feature: 52 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Relay tokens, daemon runtime relay selection, and relay server identity now use one canonical
+    relay id conversion.
+  - Non-ASCII, empty, whitespace-only, and overlong relay ids are rejected before token/session use.
+  - No new hashing/crypto path was introduced; this removes a mismatched local transform.
+What this slice completed:
+  - Removed the production mismatch where daemon-signed relay tokens used zero-padded ASCII relay ids
+    while `rustynet-relay --relay-id` hashed the same operator label with SHA256.
+What remains blocked:
+  - Durable replay across restart, production shared transport, relay fleet discovery,
+    health/metrics/config hardening, Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay durable replay store
+Files changed:
+  - crates/rustynet-relay/src/transport.rs
+    - Added optional durable nonce-store loading for `RelayTransport`.
+    - Persisted accepted relay token nonces to a replay store before committing sessions.
+    - Added fail-closed `ReplayStoreUnavailable` rejection when the replay store cannot be updated.
+    - Added startup rejection for corrupt replay stores and Unix permission rejection for group/world-accessible stores.
+    - Added cleanup pruning for durable nonce entries after the relay nonce retention window.
+    - Added restart replay regression proving a token accepted before restart is rejected after restart.
+  - crates/rustynet-relay/src/main.rs
+    - Added required `--replay-store <PATH>` daemon arg.
+    - Relay daemon now initializes `RelayTransport` with the durable replay store and fails startup if it cannot load.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Full relay crate tests with daemon feature: 54 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Replay protection now survives relay process restart when daemon mode uses `--replay-store`.
+  - Relay startup fails closed on corrupt replay store input instead of silently losing replay history.
+  - Session commit records nonce durability before creating relay session state.
+  - If durable nonce persistence fails, relay rejects the hello instead of accepting a replayable token.
+What this slice completed:
+  - Closed the memory-only replay window for the relay daemon path by making durable replay storage mandatory for `rustynet-relay`.
+What remains blocked:
+  - Production shared transport, relay fleet discovery, health/metrics/config hardening,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay daemon config fail-closed validation
+Files changed:
+  - crates/rustynet-relay/src/main.rs
+    - Added `RelayConfig::validate()` and called it from both CLI parsing and direct daemon construction.
+    - Rejects missing relay id, verifier key path, replay store path, bind port 0,
+      port 0 in allocated range, inverted port ranges, allocated ranges that include
+      the control bind port, zero per-node session capacity, and zero cleanup interval.
+    - Added relay daemon config validation tests for accepted required paths, bad port
+      ranges, zero capacity/cleanup, and missing security paths.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features relay_config_validation -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-relay --all-targets --all-features`
+  - `cargo clippy -p rustynet-relay --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Relay config validation tests: pass.
+  - Full relay crate tests with daemon feature: 58 passed.
+  - Relay crate check/clippy: pass.
+Security invariants re-verified:
+  - Relay daemon now fails before startup on invalid resource bounds or missing security-critical paths.
+  - Invalid port ranges can no longer reach allocation arithmetic or runtime bind loops.
+  - The durable replay store remains mandatory in daemon mode.
+What this slice completed:
+  - Hardened relay daemon startup validation so invalid operator config fails closed before network service start.
+What remains blocked:
+  - Production shared transport, relay fleet discovery, health/metrics/config hardening beyond startup validation,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay pre-auth source-IP hello limiter
+Files changed:
+  - crates/rustynet-relay/src/main.rs
+    - Added pre-auth relay hello limiter keyed by observed source IP.
+    - Applied the limiter before relay hello parsing and before token signature verification.
+    - Added tests proving source-IP floods are blocked, separate source IPs are isolated,
+      and limiter windows reset.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features pre_auth_hello_limiter -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-relay --all-targets --all-features`
+  - `cargo clippy -p rustynet-relay --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Pre-auth limiter tests: pass.
+  - Full relay crate tests with daemon feature: 60 passed.
+  - Relay crate check/clippy: pass.
+Security invariants re-verified:
+  - CPU-expensive relay hello parsing/signature verification now has a source-IP shed path that
+    cannot be bypassed by rotating claimed `node_id` values.
+  - Existing signed-token, node-id, relay-id, replay, capacity, and post-auth packet limits remain unchanged.
+What this slice completed:
+  - Added cheap pre-auth DoS resistance for relay session establishment.
+What remains blocked:
+  - Production shared transport, relay fleet discovery, operator health/metrics/config surface,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay replay-store filesystem and pre-auth limiter memory hardening
+Files changed:
+  - crates/rustynet-relay/src/transport.rs
+    - Replay-store validation now rejects group/world-accessible parent directories on Unix,
+      not only broad permissions on the replay-store file itself.
+    - Replay-store tests now create restricted temp directories and include a negative test for
+      broad parent permissions.
+  - crates/rustynet-relay/src/main.rs
+    - Pre-auth source-IP hello limiter now prunes stale windows and caps tracked source-IP entries.
+    - Added regression coverage proving table cap blocks new source IPs until stale entries are pruned.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features pre_auth_hello_limiter -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features replay_store_rejects_broad_parent_permissions -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-relay --all-targets --all-features`
+  - `cargo clippy -p rustynet-relay --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Pre-auth limiter targeted tests: pass.
+  - Replay-store parent-permission negative test: pass.
+  - Full relay crate tests with daemon feature: 62 passed.
+  - Relay crate check/clippy: pass.
+Security invariants re-verified:
+  - Durable replay state cannot be placed under a group/world-accessible Unix parent directory.
+  - Pre-auth rate limiting cannot grow its source-IP table without bound during source-IP churn.
+  - Existing relay authentication, replay, tuple-binding, and ciphertext-only forwarding tests remain green.
+What this slice completed:
+  - Tightened relay daemon filesystem custody for replay state and bounded the pre-auth limiter's memory surface.
+What remains blocked:
+  - Production shared transport, relay fleet discovery, operator health/metrics/config surface,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay local token issuer opt-in
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Local relay session token issuance is now disabled by default.
+    - Daemon config validation fails closed when relay-session signing secret paths are configured
+      without explicit local-issuer opt-in.
+    - Relay client loading refuses to decrypt/use local signing secrets unless the deployment sets
+      `RUSTYNET_RELAY_SESSION_LOCAL_TOKEN_ISSUER=true`.
+  - crates/rustynetd/src/main.rs
+    - Added `--relay-session-local-token-issuer <true|false>` for reviewed lab or
+      control-plane-collocated deployments that intentionally keep the issuer local.
+  - crates/rustynetd/tests/state_fetcher.rs
+    - Kept full `DaemonConfig` test fixture aligned with the new fail-closed field.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd local_relay_token_issuer -- --nocapture`
+  - `cargo check -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Local relay token issuer config tests: pass.
+  - Local relay token issuer CLI parse tests: pass.
+  - rustynetd check/clippy: pass.
+Security invariants re-verified:
+  - Daemon no longer becomes a relay session token authority merely because signing-secret paths
+    are present in config.
+  - Local token authority remains available only behind explicit operator opt-in for controlled
+    lab/control-plane-collocated deployments.
+  - Invalid CLI opt-in values fail closed during config parse.
+What this slice completed:
+  - Reduced relay-session token authority blast radius and made local issuance an explicit,
+    auditable deployment choice.
+What remains blocked:
+  - Production shared control-plane issuance, relay fleet discovery, operator health/metrics/config surface,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay generic rejection wire responses
+Files changed:
+  - crates/rustynet-relay/src/main.rs
+    - Relay daemon now sends one generic `Rejected` reason for all unauthenticated hello rejections,
+      including pre-auth rate limiting, token validation failures, replay, peer mismatch, and capacity.
+    - Detailed rejection reasons remain server-side log data only.
+    - The reject serializer no longer accepts caller-provided reasons, preventing future call sites from
+      accidentally reintroducing detailed wire errors.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features relay_reject_wire_reason_is_generic -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Generic reject wire-format regression test: pass.
+  - Full relay crate tests with daemon feature: 63 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Remote unauthenticated peers cannot distinguish invalid signature, replay, wrong relay, wrong peer,
+    expiry, capacity, or rate-limit reasons from relay wire responses.
+  - Operator diagnostics are preserved in local logs without becoming a network oracle.
+What this slice completed:
+  - Reduced relay authentication oracle surface for production relay deployment.
+What remains blocked:
+  - Production shared control-plane issuance, relay fleet discovery, operator health/metrics/config surface,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay verifier trust-anchor custody
+Files changed:
+  - crates/rustynet-relay/src/main.rs
+    - Relay config now requires absolute paths for `--verifier-key` and `--replay-store`.
+    - Control-plane verifier public key loading now rejects relative paths, symlinks, non-regular files,
+      and group/other-writable verifier key files on Unix.
+    - Verifier key loading now rejects group/other-writable verifier key parent directories on Unix.
+    - Added regression tests for absolute-path validation and restricted verifier-key custody.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features verifier_key_loader -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features relay_config_validation_requires_absolute_security_paths -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Verifier key loader custody tests: pass.
+  - Absolute security path validation test: pass.
+  - Full relay crate tests with daemon feature: 67 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Relay trust anchor cannot be loaded from a relative, symlinked, non-file, or group/other-writable Unix path.
+  - Replay store and verifier key paths are service-context stable and explicit.
+What this slice completed:
+  - Hardened relay startup trust-anchor custody before production deployment.
+What remains blocked:
+  - Production shared control-plane issuance, relay fleet discovery, operator health/metrics/config surface,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay loopback health and metrics surface
+Files changed:
+  - crates/rustynet-relay/Cargo.toml
+    - Enabled Tokio `io-util` for the relay daemon's minimal TCP health responder.
+  - crates/rustynet-relay/src/main.rs
+    - Added optional `--health-bind <ADDR>` HTTP endpoint.
+    - Health endpoint is disabled by default and config validation rejects non-loopback or port-zero binds.
+    - If configured health binding fails during startup, the relay fails closed instead of silently running
+      without the operator-requested health surface.
+    - Added an injectable CLI parser path so health-bind validation is covered without relying on process argv.
+    - Added a real loopback TCP health/metrics test that binds, connects, sends HTTP requests, and verifies
+      response bodies.
+    - Replaced the no-daemon-feature fleet-selection demo fallback with a fail-closed binary error message.
+    - `/healthz` returns only status plus aggregate counts.
+    - `/metrics` returns only aggregate Prometheus gauges.
+    - Health/metrics renderers intentionally omit relay IDs, node IDs, tokens, verifier paths, replay-store paths,
+      and detailed auth/replay/capacity rejection causes.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features health -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Health endpoint validation/rendering/loopback TCP tests: pass.
+  - Full relay crate tests with daemon feature: 75 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Operator observability is opt-in and local-only.
+  - Health/metrics output has no secrets, trust-anchor paths, replay-store paths, relay IDs, node IDs, or auth oracle detail.
+What this slice completed:
+  - Added a production-safe local operator health/metrics surface for relay deployment.
+What remains blocked:
+  - Production shared control-plane issuance, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Daemon runtime relay endpoint fail-closed validation
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Runtime relay selection now re-validates selected relay endpoint transport shape before issuing
+      or refreshing relay sessions.
+    - Rejects relay endpoint port 0, unspecified addresses, loopback, multicast, IPv4 private/link-local/broadcast,
+      CGNAT, IPv6 unique-local, and IPv6 link-local addresses.
+    - Added regression coverage for unsafe runtime relay endpoint rejection.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd runtime_relay_candidate -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Runtime relay candidate tests: pass.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Relay session establishment cannot proceed with local, private, CGNAT, link-local, multicast,
+    unspecified, or zero-port relay endpoints even if malformed candidate state reaches runtime selection.
+What this slice completed:
+  - Added defense-in-depth between signed traversal candidate parsing and relay session token use.
+What remains blocked:
+  - Production shared control-plane issuance, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay client token issuer abstraction
+Files changed:
+  - crates/rustynetd/src/relay_client.rs
+    - Added `RelaySessionTokenIssuer` trait so relay session establishment no longer hardcodes
+      local Ed25519 signing in the client core.
+    - Added `LocalRelaySessionTokenIssuer` as the existing lab/control-plane-collocated issuer.
+    - Kept `RelayClient::new(...)` compatibility while adding `RelayClient::new_with_token_issuer(...)`.
+    - Relay session establishment now fails closed before network I/O if token issuance fails.
+    - Added tests for local token binding/signature verification and issuer failure fail-closed behavior.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd relay_client -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Relay client focused tests: pass.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Relay path remains fail-closed if token issuance is unavailable.
+  - Local signing key issuer is isolated behind an explicit issuer type, preparing the daemon for
+    production control-plane token issuance without changing relay packet/session logic.
+What this slice completed:
+  - Reduced coupling between relay client session management and local signing-key custody.
+What remains blocked:
+  - Production shared control-plane issuance implementation, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay client ACK validation hardening
+Files changed:
+  - crates/rustynetd/src/relay_client.rs
+    - Relay ACK parsing now rejects trailing bytes, all-zero session IDs, and allocated port 0.
+    - Relay session establishment now rejects an ACK that allocates the relay control port.
+    - Added regression tests proving malformed ACKs and control-port allocations fail closed without
+      creating a relay client session.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd relay_client -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Relay client focused tests: pass.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Relay client does not program malformed or ambiguous relay endpoints returned by a relay server.
+  - Relay session map remains unchanged when ACK validation fails.
+What this slice completed:
+  - Tightened client-side relay response validation before backend endpoint programming.
+What remains blocked:
+  - Production shared control-plane issuance implementation, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay transport allocated-port fail-closed guard
+Files changed:
+  - crates/rustynet-relay/src/transport.rs
+    - Relay transport now rejects daemon-supplied allocated port 0 before replay nonce persistence
+      and session creation.
+    - Added `InvalidAllocatedPort` rejection reason.
+    - Added regression coverage proving invalid allocated-port rejection does not consume the token nonce,
+      allowing a valid retry to establish normally.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features invalid_allocated_port -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Allocated-port regression test: pass.
+  - Full relay crate tests with daemon feature: 76 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Transport cannot commit a session with port 0 even if a daemon allocation bug reaches transport code.
+  - Invalid daemon allocation does not burn a replay nonce before a valid retry.
+What this slice completed:
+  - Added transport-layer defense-in-depth around daemon-owned relay port allocation.
+What remains blocked:
+  - Production shared control-plane issuance implementation, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay session TTL bound enforcement
+Files changed:
+  - crates/rustynetd/src/relay_client.rs
+    - Added shared `MAX_RELAY_SESSION_TOKEN_TTL_SECS` bound matching relay transport's 120-second max.
+    - Relay client now rejects token TTL 0 or above the relay max before token issuance or network I/O.
+    - Added focused fail-closed tests for out-of-bounds TTL requests.
+  - crates/rustynetd/src/daemon.rs
+    - Daemon config validation now rejects relay session token TTL values above the relay max.
+    - Added config validation regression coverage.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd relay_client -- --nocapture`
+  - `cargo test -p rustynetd validate_daemon_config_rejects_relay_session_token_ttl_above_relay_bound -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Relay client TTL tests: pass.
+  - Daemon config TTL max test: pass.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Daemon cannot request relay session tokens outside relay transport's accepted freshness window.
+  - Invalid TTLs fail before token issuance and before relay network I/O.
+What this slice completed:
+  - Aligned daemon/client token issuance bounds with relay transport freshness enforcement.
+What remains blocked:
+  - Production shared control-plane issuance implementation, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay global session capacity cap
+Files changed:
+  - crates/rustynet-relay/src/transport.rs
+    - Added a configurable global active-session cap with a default of 4096.
+    - Relay transport now rejects new node pairs when total session capacity is exhausted.
+    - Existing node-pair replacement is still allowed at capacity, so reconnect/refresh does not deadlock.
+    - Added regression coverage for cross-node cap enforcement and same-pair replacement at capacity.
+  - crates/rustynet-relay/src/main.rs
+    - Added `--max-total-sessions <N>` daemon flag and fail-closed validation for zero values.
+    - Wired the daemon config into relay transport initialization.
+    - Added max-total-session visibility to loopback-only `/healthz` and `/metrics`.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Full relay crate tests with daemon feature: 78 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Relay cannot grow sessions without a global upper bound.
+  - Capacity rejection happens before session creation and before endpoint programming.
+  - Health/metrics expose only aggregate capacity and count state, never token/session secrets.
+What this slice completed:
+  - Added daemon-configurable global relay session exhaustion control.
+What remains blocked:
+  - Production shared control-plane issuance implementation, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay client establishment deadline enforcement
+Files changed:
+  - crates/rustynetd/src/relay_client.rs
+    - Extracted relay response receive loop behind a deadline-enforced helper.
+    - Real relay session establishment now returns `RelayClientError::Timeout` on socket timeout or would-block
+      instead of continuing indefinitely.
+    - Unrelated UDP responses are still ignored, but the overall session deadline remains authoritative.
+    - Added deterministic tests for socket timeout, unrelated response source, and timeout fail-closed session state.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd relay_response_deadline -- --nocapture`
+  - `cargo test -p rustynetd relay_client_establish_round_trip_timeout_leaves_no_session -- --nocapture`
+  - `cargo test -p rustynetd relay_client -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Relay client focused tests: 36 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Relay session establishment cannot hang indefinitely waiting for an ACK.
+  - Timeout leaves the relay client session map unchanged.
+  - Unexpected relay response sources do not satisfy establishment.
+What this slice completed:
+  - Closed a live relay-client availability and fail-closed gap in the UDP ACK wait path.
+What remains blocked:
+  - Production shared control-plane issuance implementation, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay client expired-session pruning
+Files changed:
+  - crates/rustynetd/src/relay_client.rs
+    - Added `cleanup_inactive_sessions()` to remove both idle sessions and expired-token sessions.
+    - Added `cleanup_expired_sessions()` for daemon maintenance paths that must preserve idle-but-refreshable
+      sessions until keepalive can run.
+    - Added regression coverage proving expired sessions are removed while live sessions remain.
+  - crates/rustynetd/src/daemon.rs
+    - Traversal runtime sync now prunes expired relay sessions before sending keepalives, then applies idle
+      cleanup after keepalive processing.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd relay_client_cleanup -- --nocapture`
+  - `cargo test -p rustynetd daemon_runtime_relay_establish_and_keepalive_use_backend_shared_transport_identity -- --nocapture`
+  - `cargo test -p rustynetd relay_client -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Relay client focused tests: 39 passed.
+  - Authoritative relay establish/keepalive regression: pass.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Daemon does not keepalive expired relay sessions before refresh.
+  - Daemon still sends keepalive for idle-but-unexpired relay sessions before idle cleanup.
+  - Expired relay tokens do not keep stale client-side relay sessions alive.
+  - Live relay sessions are preserved across cleanup.
+What this slice completed:
+  - Closed a freshness lifecycle gap in daemon relay-session maintenance.
+What remains blocked:
+  - Production shared control-plane issuance implementation, relay fleet discovery, Windows relay packaging,
+    and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Control-plane relay session token issuance API
+Files changed:
+  - crates/rustynet-control/src/lib.rs
+    - Added shared `MAX_RELAY_SESSION_TOKEN_TTL_SECS` constant used by relay transport/client bounds.
+    - Added `RelaySessionTokenRequest`.
+    - Added deterministic `RelaySessionToken::sign_at()` for control-plane-issued token timestamps.
+    - Added `ControlPlaneCore::issue_relay_session_token()` using the endpoint-hint signing key, matching the
+      traversal verifier pinned by relay daemons.
+    - Enforced requested timestamp, TTL lower/upper bounds, distinct node/peer, relay-id canonicalization,
+      source/peer existence, and policy allow before signing.
+    - Added positive and negative control-plane issuance tests.
+  - crates/rustynet-relay/src/transport.rs
+    - Relay transport TTL cap now uses the shared control-plane relay-session TTL constant.
+  - crates/rustynetd/src/relay_client.rs
+    - Relay client TTL cap now re-exports the shared control-plane relay-session TTL constant.
+Commands run:
+  - `cargo fmt -p rustynet-control -p rustynet-relay -p rustynetd`
+  - `cargo test -p rustynet-control relay_session_token -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features token_ttl -- --nocapture`
+  - `cargo test -p rustynetd relay_client -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Control relay-token focused tests: 14 passed.
+  - Relay TTL regression: pass.
+  - Relay client focused tests: 37 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - Production relay token issuance now has a policy enforcement point before signing.
+  - Relay token TTL bound is shared across control-plane issuance, daemon client validation, and relay transport validation.
+  - Relay IDs are canonicalized once through the shared bounded ASCII conversion.
+  - Issued relay tokens verify under the same endpoint-hint verifier already pinned by traversal state.
+What this slice completed:
+  - Added the production control-plane API needed to replace daemon-local relay token signing.
+What remains blocked:
+  - Wiring daemon relay clients to a remote/control-plane-backed token issuer, relay fleet discovery,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay session cap to port-capacity startup guard
+Files changed:
+  - crates/rustynet-relay/src/main.rs
+    - Relay config validation now rejects `--max-total-sessions` values above the configured dataplane
+      port-range capacity.
+    - Added regression coverage for fail-closed startup validation when total session capacity cannot be
+      backed by available relay dataplane sockets.
+    - Made the loopback health endpoint socket test sandbox-tolerant while preserving pure renderer and bind-policy
+      coverage.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo test -p rustynet-relay --all-features relay_config_validation -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Relay config validation tests: 8 passed.
+  - Full relay crate tests with daemon feature: 79 passed.
+  - Affected-package check/clippy: pass.
+  - Diff whitespace check: pass.
+Security invariants re-verified:
+  - Relay daemon cannot advertise/accept more concurrent sessions than it can allocate unique dataplane ports for.
+  - Misconfiguration fails at startup validation rather than under load after token validation.
+What this slice completed:
+  - Closed a relay capacity consistency gap between transport session limits and daemon port allocation.
+What remains blocked:
+  - Wiring daemon relay clients to a remote/control-plane-backed token issuer, relay fleet discovery,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay client issuer-output validation
+Files changed:
+  - crates/rustynetd/src/relay_client.rs
+    - Relay client now validates tokens returned by any `RelaySessionTokenIssuer` before serializing or sending
+      relay hello traffic.
+    - Enforces token binding to local node, peer node, relay id, relay scope, non-zero nonce, TTL bounds,
+      requested-TTL ceiling, non-expiry, and bounded future `issued_at_unix`.
+    - Added regression coverage proving unbound, stale, oversized, and future-dated issuer tokens fail closed
+      before relay network I/O and without mutating the session map.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd issuer_token -- --nocapture`
+  - `cargo test -p rustynetd relay_client -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Issuer-token focused tests: 2 passed.
+  - Relay client focused tests: 39 passed.
+  - Affected-package check/clippy: pass.
+  - Diff whitespace check: pass.
+Security invariants re-verified:
+  - Remote/control-plane-backed issuer output is treated as untrusted until locally checked for binding and freshness.
+  - Invalid issuer output fails before any relay packet is sent.
+  - Relay client session state remains unchanged when issuer-output validation fails.
+What this slice completed:
+  - Prepared the daemon relay client for a remote/control-plane issuer without trusting malformed issuer output.
+What remains blocked:
+  - Wiring daemon relay clients to a remote/control-plane-backed token issuer, relay fleet discovery,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Signed relay fleet bundle control-plane primitive
+Files changed:
+  - crates/rustynet-control/src/lib.rs
+    - Added `RelayFleetNodeDescriptor`, `RelayFleetBundleRequest`, and `SignedRelayFleetBundle`.
+    - Added `ControlPlaneCore::signed_relay_fleet_bundle()` using the existing endpoint-hint signing key,
+      so relay fleet state verifies under the same traversal verifier trust anchor.
+    - Added typed relay descriptors on `SignedRelayFleetBundle`, wire parsing, top-level verify-with-key,
+      `verify_signed_relay_fleet_bundle()`, and wire rendering helper.
+    - Enforced generated time, TTL bounds, non-zero nonce, relay count bounds, relay-id canonicalization,
+      single-line relay-id/region payload values, bounded ASCII region, non-special endpoint addresses,
+      non-zero ports, non-zero capacity, duplicate relay-id rejection, and duplicate endpoint rejection.
+    - Added signed/sorted/tamper-detection tests, metadata/payload mismatch rejection, plus unsafe/ambiguous-entry
+      rejection tests.
+Commands run:
+  - `cargo fmt -p rustynet-control`
+  - `cargo test -p rustynet-control relay_fleet_bundle -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Relay fleet bundle focused tests: 2 passed.
+  - Affected-package check/clippy: pass.
+  - Diff whitespace check: pass.
+Security invariants re-verified:
+  - Relay fleet discovery now has a signed, bounded control-plane object instead of an unsigned in-memory-only primitive.
+  - Relay fleet wire data must parse into canonical typed descriptors before signature verification can bless it.
+  - Fleet entries cannot introduce ambiguous relay IDs, payload line-injection values, loopback/special endpoints,
+    port 0, or zero-capacity relays.
+  - Fleet bundle payload tampering and signed-payload/metadata mismatches are detected by the existing Ed25519
+    verifier path.
+What this slice completed:
+  - Added the trustable relay fleet artifact needed before daemon relay discovery can stop relying on hardcoded traversal candidates.
+What remains blocked:
+  - Daemon loading/verification of signed relay fleet bundles, relay-client-backed enforcement for all relay paths,
+    Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Daemon relay candidate fleet-match enforcement primitive
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Added daemon-side optional verified-fleet enforcement for runtime relay candidate selection.
+    - Runtime relay candidate refresh/establishment now calls the fleet-aware selector, preserving current behavior
+      when no verified fleet is loaded.
+    - Added enabled-relay indexing keyed by shared canonical relay id and endpoint.
+    - Added fail-closed validation for disabled fleet entries, absent relay ids, absent endpoints, malformed fleet
+      descriptor values, zero capacity, and unsafe relay transport endpoints.
+    - Added regression coverage for fleet match, endpoint mismatch, disabled relay, relay-id canonicalization,
+      ambiguous relay id, and unsafe relay endpoint rejection.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd runtime_relay_candidate -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+Validation outcomes:
+  - Runtime relay candidate focused tests: 6 passed.
+  - Affected-package check/clippy: pass.
+Security invariants re-verified:
+  - When a verified relay fleet is present, daemon relay establishment cannot use a traversal relay candidate
+    unless the candidate's canonical relay id and transport endpoint are present and enabled in that fleet.
+  - Disabled relays and endpoint drift fail closed before relay session establishment.
+What this slice completed:
+  - Added the daemon enforcement seam needed before signed relay fleet loading can become mandatory.
+What remains blocked:
+  - Loading and anti-replay persistence for signed relay fleet bundles, wiring the loaded fleet into daemon
+    startup/reload configuration, Windows relay packaging, and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Daemon signed relay fleet loader and watermark
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Added bounded signed relay fleet bundle loading with artifact size, line count, key allow-list, and final-signature
+      validation before parsing.
+    - Reused the existing traversal verifier trust anchor and Ed25519 verification path; no new crypto.
+    - Added relay fleet freshness checks, future-date rejection, and replay/rollback protection via generated_at/nonce
+      plus payload digest watermark.
+    - Added optional daemon startup loading from default relay-fleet custody paths, absolute operator override
+      paths via `RUSTYNET_RELAY_FLEET_BUNDLE_PATH` / `RUSTYNET_RELAY_FLEET_WATERMARK_PATH`, or explicit
+      `--relay-fleet-bundle` / `--relay-fleet-watermark` CLI flags; `--disable-relay-fleet` cleanly disables
+      optional fleet loading for lab slices that do not exercise relays.
+    - Persisted the relay-fleet watermark only after full verification succeeds.
+    - Wired loaded fleets into runtime relay candidate enforcement so enabled relay id/endpoint membership can gate
+      relay session refresh and establishment.
+    - Added regression coverage for signed fleet acceptance, tamper rejection, replay rejection, stale rejection,
+      oversized artifact rejection, runtime candidate fleet matching, and absolute-path validation for operator
+      relay-fleet custody overrides.
+Commands run:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd load_relay_fleet_bundle -- --nocapture`
+  - `cargo test -p rustynetd runtime_relay_candidate -- --nocapture`
+  - `cargo test -p rustynetd artifact_limitgate_rejects_oversized_bundle_files -- --nocapture`
+  - `cargo test -p rustynetd relay_fleet_operator_paths -- --nocapture`
+  - `cargo test -p rustynetd parse_daemon_config_parses_traversal_settings -- --nocapture`
+  - `cargo test -p rustynetd parse_daemon_config_can_disable_relay_fleet -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Relay fleet loader focused tests: 2 passed.
+  - Runtime relay candidate focused tests: 6 passed.
+  - Artifact limit gate focused test: 1 passed.
+  - Relay fleet operator path validation focused test: 1 passed.
+  - Daemon traversal/relay-fleet CLI parse focused tests: 2 passed.
+  - Affected-package check/clippy: pass.
+  - Diff whitespace check: pass.
+Security invariants re-verified:
+  - Daemon only trusts relay fleet data after bounded parsing, signature verification, freshness checks, and
+    anti-replay watermark validation.
+  - Relay fleet watermark is persisted only after full verification succeeds.
+  - Operator override paths must be absolute before daemon startup can consume them.
+  - Relay fleet loading is either fully configured with bundle plus watermark paths, or explicitly disabled.
+  - Loaded fleet entries gate relay session establishment by enabled relay id and endpoint.
+What this slice completed:
+  - Closed the unsigned relay fleet loading gap for the daemon's default, environment-overridden, and
+    CLI-configured custody paths.
+What remains blocked:
+  - Remote/control-plane-backed relay token issuance, Windows relay packaging, and live cross-network relay evidence
+    remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Preissued control-plane relay session token spool
+Files changed:
+  - crates/rustynet-control/src/lib.rs
+    - Added canonical relay session token artifact rendering and strict parsing.
+    - Parser rejects empty artifacts, duplicate keys, unknown keys, non-final signatures, noncanonical payloads,
+      invalid hex, invalid timestamps, all-zero nonces, distinct-node violations, and TTLs above relay bounds.
+  - crates/rustynetd/src/relay_client.rs
+    - Added `PreissuedRelaySessionTokenIssuer` for one-use control-plane-issued token artifacts.
+    - Enforced restricted absolute spool directories, regular token files, bounded artifact size/count, restrictive
+      Unix file permissions, local signature verification against the pinned traversal verifier key, and one-use
+      consume-on-success behavior.
+    - Kept issuer output untrusted until the existing relay-client binding/freshness/TTL checks pass.
+  - crates/rustynetd/src/daemon.rs
+    - Added `relay_session_token_spool_dir` configuration.
+    - Wired preissued token spool loading into daemon relay-client construction without requiring daemon-local
+      relay signing keys.
+    - Made preissued token spool mutually exclusive with daemon-local relay token signing.
+  - crates/rustynetd/src/main.rs
+    - Added `--relay-session-token-spool-dir <path>`.
+  - crates/rustynetd/tests/state_fetcher.rs
+    - Updated explicit daemon test config construction for the new field.
+Commands run:
+  - `cargo fmt -p rustynet-control`
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynet-control relay_session_token_wire -- --nocapture`
+  - `cargo test -p rustynetd preissued_relay_session_token_issuer -- --nocapture`
+  - `cargo test -p rustynetd relay_token_spool -- --nocapture`
+  - `cargo test -p rustynetd parse_daemon_config_parses_relay_session_token_spool_dir -- --nocapture`
+  - `cargo test -p rustynetd load_relay_client_uses_preissued_token_spool_without_local_signing -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Relay token wire parser focused tests: 2 passed.
+  - Preissued relay token issuer focused tests: 2 passed.
+  - Relay token spool config validation focused tests: 2 passed.
+  - Relay token spool CLI parse focused test: 1 passed.
+  - Relay client preissued-spool construction focused test: 1 passed.
+  - Affected-package check/clippy: pass.
+  - Diff whitespace check: pass.
+Security invariants re-verified:
+  - Production daemon relay clients can use control-plane-issued relay tokens without holding a token-signing key.
+  - Local daemon signing remains opt-in and mutually exclusive with preissued-token mode.
+  - Preissued token artifacts are parsed canonically, signature-verified locally, tuple-bound, freshness-checked,
+    bounded, and consumed on successful issuance.
+What this slice completed:
+  - Added the hardened non-local-signing bridge needed before production relay token issuance can be deployed
+    through a control-plane token drop/spool workflow.
+What remains blocked:
+  - Networked/mTLS control-plane token issuance, Windows relay packaging, and live cross-network relay evidence
+    remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Windows relay SCM host scaffold
+Files changed:
+  - crates/rustynet-relay/Cargo.toml
+    - Added `serde` for typed relay service-hardening JSON reports.
+    - Added `serde_json` for reviewed Windows relay service env-file JSON parsing.
+    - Added Windows-only `windows-service` dependency behind the relay daemon feature.
+    - Added Windows-only `rustynet-windows-native` dependency for service env-file and binary SDDL inspection.
+  - crates/rustynet-relay/src/main.rs
+    - Added `--windows-service --env-file <path> [--service-name <name>]` host selection.
+    - Required Windows relay service configuration to come from an absolute env-file containing
+      `RUSTYNET_RELAY_ARGS_JSON` as a JSON string array.
+    - Rejected inline relay flags in Windows service mode.
+    - Added duplicate-key, max-size, UTF-8, absolute-path, reviewed-root, named-pipe/UNC, Linux-root, traversal,
+      and non-empty-args validation for service env files.
+    - Added Windows service env-file ACL verification before reading relay args: regular file only, no symlink,
+      protected DACL, LocalSystem and Builtin Administrators grants, reviewed owner, and no broad principals.
+    - Added runtime validation for the env-file-provided verifier key and durable replay store paths before the
+      Windows service reports running; both paths must stay under the reviewed relay runtime root and pass ACL
+      inspection on Windows.
+    - Extended runtime verifier-key and durable replay-store ACL checks to validate parent directory ACLs as
+      protected, reviewed-principal-only directories before accepting service env-file args.
+    - Added Windows relay service runtime arg-shape validation so env-file args reject `--help`, unknown flags,
+      missing values, duplicate flags, public health binds, invalid port ranges, and zero session limits before
+      the SCM host reports `Running`.
+    - Added `windows-service-hardening-check [--no-fail-on-drift]` for the relay service, with typed JSON
+      evidence and drift evaluation over SCM argv, service SID/account posture, failure actions, env-file path,
+      env-file ACL lockdown, env-file runtime args, non-interactive mode, binary ACL lockdown, and Authenticode
+      chain trust.
+    - Made the relay SCM argv verifier reject duplicate `--env-file`, duplicate `--service-name`, or
+      service-name drift so reviewed env-file custody cannot be bypassed by ambiguous argv.
+    - Added a relay stop flag and SCM Stop/Shutdown bridge so the relay loop can exit cleanly under Windows SCM.
+Commands run:
+  - `cargo fmt -p rustynet-relay`
+  - `cargo fmt --all -- --check`
+  - `cargo test -p rustynet-relay --all-features relay_windows_service -- --nocapture`
+  - `cargo test -p rustynet-relay --all-features -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+  - `cargo check -p rustynet-relay --all-targets --all-features`
+  - `cargo clippy -p rustynet-relay --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Windows relay service host parser/env-file/path/runtime-ACL/hardening focused tests: 16 passed.
+  - Full relay crate tests with daemon feature: 96 passed.
+  - Affected-package check/clippy: pass.
+  - Relay crate focused check/clippy: pass.
+  - Diff whitespace check: pass.
+Security invariants re-verified:
+  - Windows relay service mode does not accept ad hoc inline flags from SCM registration.
+  - Relay service runtime args are structured JSON, not shell-split strings.
+  - Relay service runtime args cannot use side-effect help exits, unknown options, or ambiguous last-wins
+    duplicate flags under SCM.
+  - Windows relay service env-file paths must stay in the reviewed relay runtime root and reject named pipes,
+    UNC paths, Linux runtime roots, and traversal segments.
+  - Windows relay service env-file ACLs must be protected and limited to reviewed principals before relay args
+    are read.
+  - Windows relay service hardening check now independently reports env-file ACL, env-file parent ACL, and
+    runtime verifier/replay arg drift before live-lab deployment can report success.
+  - Windows relay verifier key and replay-store paths cannot be moved outside the reviewed runtime root through
+    env-file mutation.
+  - Windows relay verifier key and replay-store parent directories must not be writable by broad principals, so
+    hardened runtime files cannot be swapped via a weak containing directory.
+  - Windows relay service SCM registration now has a fail-closed verifier path before live-lab deployment,
+    including binary Authenticode trust.
+  - Ambiguous SCM argv cannot hide a second env-file or renamed service handler.
+  - SCM stop requests do not bypass relay cleanup paths; they request normal relay loop shutdown.
+What this slice completed:
+  - Added the Windows service packaging entrypoint and SCM hardening verifier needed before relay live-lab deployment.
+What remains blocked:
+  - Windows installer execution evidence, live Windows SCM hardening evidence, and live cross-network relay
+    evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Windows relay service installer path
+Files changed:
+  - scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1
+    - Added a reviewed Windows relay service installer for `RustyNetRelay`.
+    - Pins install root to `C:\Program Files\RustyNet`, relay runtime root to
+      `C:\ProgramData\RustyNet\relay`, and service name to `RustyNetRelay`.
+    - Writes `RUSTYNET_RELAY_ARGS_JSON` into the reviewed relay env-file using UTF-8 without BOM and
+      rejects unsafe relay id, endpoint, port-range, and runtime path shapes.
+    - Forces the relay health endpoint to loopback and rejects sharing the relay UDP control port.
+    - Requires the relay verifier key to exist before install; creates the durable replay-store file if absent.
+    - Registers the SCM service with argv-only `--windows-service --service-name RustyNetRelay --env-file ...`.
+    - Configures service SID, recovery actions, env/verifier read-only ACLs, replay-store writable ACL,
+      relay-root ACL, and relay-binary ACL.
+    - Signs the installed relay binary with a host-local code-signing certificate trusted in
+      LocalMachine\Root, matching the existing daemon installer posture.
+    - Runs `rustynet-relay.exe windows-service-hardening-check` before reporting success.
+  - crates/rustynet-cli/src/main.rs
+    - Added `ops install-windows-relay-service` and help text.
+  - crates/rustynet-cli/src/ops_e2e.rs
+    - Added the Windows command dispatcher and off-Windows fail-closed path.
+    - Added static installer hardening coverage for reviewed roots, service SID, recovery actions,
+      env-file JSON, ACL repair, and absence of `Invoke-Expression`.
+Commands run:
+  - `cargo fmt -p rustynet-cli`
+  - `cargo fmt --all -- --check`
+  - `cargo test -p rustynet-cli windows_relay_service_install_script -- --nocapture`
+  - `cargo test -p rustynet-cli install_windows_relay_service -- --nocapture`
+  - `cargo test -p rustynet-cli parse_supports_ops_commands -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Installer script static hardening test: pass.
+  - Off-Windows fail-closed relay installer test: pass.
+  - CLI ops parser test: pass.
+  - Affected-package check/clippy: pass.
+  - Diff whitespace check: pass.
+  - PowerShell syntax execution was not run on this macOS host because neither `pwsh` nor Windows PowerShell
+    is available here.
+Security invariants re-verified:
+  - Relay installer has no shell string evaluation path (`Invoke-Expression` absent).
+  - Relay service runtime args are written as structured JSON and consumed through the SCM env-file path.
+  - Service cannot modify its env-file or verifier key through the installed ACL; replay-store remains writable.
+  - Relay health/metrics endpoint cannot be installed on a public bind address.
+  - SCM registration and Authenticode chain trust are verified by the relay binary's own hardening checker before
+    install success is reported.
+What this slice completed:
+  - Added the reviewed installer path needed before Windows relay live-lab deployment.
+What remains blocked:
+  - Live Windows execution of the installer and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Windows relay service uninstall path
+Files changed:
+  - scripts/bootstrap/windows/Uninstall-RustyNetWindowsRelayService.ps1
+    - Added reviewed uninstall path for the `RustyNetRelay` SCM service.
+    - Pins install root, relay runtime root, and service name to the same reviewed values as the installer.
+    - Stops the relay service, deletes the SCM registration, waits for removal, and verifies service absence.
+    - Removes only the installed relay binary and reviewed env-file; preserves verifier key and durable replay
+      store by default.
+    - Refuses recursive deletion and emits a fail-closed JSON report when `-OutputPath` is supplied.
+  - crates/rustynet-cli/src/main.rs
+    - Added `ops uninstall-windows-relay-service` parser, dispatcher, and help text.
+  - crates/rustynet-cli/src/ops_e2e.rs
+    - Added the Windows uninstall command dispatcher and off-Windows fail-closed path.
+    - Added static uninstall coverage for reviewed roots, stop/delete lifecycle, artifact preservation, no
+      recursive deletion, and absence of `Invoke-Expression`.
+Commands run:
+  - `cargo fmt --all -- --check`
+  - `cargo test -p rustynet-cli windows_relay_service_uninstall_script -- --nocapture`
+  - `cargo test -p rustynet-cli uninstall_windows_relay_service -- --nocapture`
+  - `cargo test -p rustynet-cli parse_supports_ops_commands -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings`
+  - `git diff --check`
+Validation outcomes:
+  - Uninstall script static lifecycle/security test: pass.
+  - Off-Windows fail-closed relay uninstall test: pass.
+  - CLI ops parser test: pass.
+  - Affected-package check/clippy: pass.
+  - Diff whitespace check: pass.
+Security invariants re-verified:
+  - Relay uninstall has no shell string evaluation path (`Invoke-Expression` absent).
+  - The uninstall path only touches reviewed fixed service/root/file names.
+  - Replay anti-replay state and verifier material are preserved by default instead of being removed by an
+    operational teardown command.
+  - Service removal verifies final absence before reporting success.
+What this slice completed:
+  - Added a reversible relay SCM lifecycle path before live Windows relay deployment.
+What remains blocked:
+  - Live Windows execution of install/uninstall and live cross-network relay evidence remain open.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Windows relay service VM-lab helper catalog
+Files changed:
+  - crates/rustynet-cli/src/vm_lab/mod.rs
+    - Added canonical helper selection for `Install-RustyNetWindowsRelayService.ps1`.
+    - Added canonical helper selection for `Uninstall-RustyNetWindowsRelayService.ps1`.
+    - Added both relay service lifecycle helpers to the Windows helper support-file staging set.
+    - Added unit coverage proving both scripts ship from `scripts/bootstrap/windows`, keep reviewed roots, avoid
+      `Invoke-Expression`, and avoid recursive relay-state deletion.
+Commands run:
+  - `cargo test -p rustynet-cli windows_relay_service_helper -- --nocapture`
+  - `cargo test -p rustynet-cli windows_relay_service_helpers_exist -- --nocapture`
+Validation outcomes:
+  - Windows relay helper path/static security tests: pass.
+Security invariants re-verified:
+  - VM-lab staging now uses the same reviewed relay service scripts as the CLI installer/uninstaller path.
+  - Relay lifecycle helpers are explicit Windows PowerShell helpers; no Linux shell helper path is used for
+    Windows relay lifecycle operations.
+What this slice completed:
+  - Prevented the Windows relay service installer/uninstaller from being orphaned outside the VM-lab helper
+    staging catalog.
+What remains blocked:
+  - Live Windows relay helper invocation still awaits W5 lab execution.
+```
+
+```text
+Date: 2026-05-10
+Phase / Slice: Relay identifier canonicalization in signed traversal hints
+Files changed:
+  - crates/rustynet-control/src/lib.rs
+    - Tightened shared relay-id canonicalization to reject non-single-line payload values, including newline and
+      `=` injection shapes.
+    - Required relay candidates in signed endpoint-hint bundles to pass the same shared canonical relay-id checks
+      used by relay fleet descriptors and relay session token issuance.
+    - Added negative tests for non-ASCII, overlong, newline, and `=` relay candidate identifiers before signing.
+Commands run:
+  - `cargo test -p rustynet-control endpoint_hint_bundle_enforces_policy_and_candidate_validation -- --nocapture`
+  - `cargo test -p rustynet-control relay_id_label_canonicalization_rejects_ambiguous_labels -- --nocapture`
+Validation outcomes:
+  - Endpoint hint relay-candidate validation: pass.
+  - Shared relay-id canonicalization negative coverage: pass.
+Security invariants re-verified:
+  - Control-plane signed traversal hints cannot carry relay identifiers that would produce ambiguous signed payload
+    lines or drift from relay-token/fleet canonicalization.
+  - Relay identifiers are now canonical before signing across traversal hints, relay fleet descriptors, and relay
+    session tokens.
+What this slice completed:
+  - Closed a signed-state payload injection/canonicalization gap before relay endpoint hints are used in live
+    Windows relay validation.
+What remains blocked:
+  - Live cross-network relay evidence remains open.
+```
+
 ## 19. Definition of Done for This Document
 This delta is complete only when all are true:
 - direct path uses correct measured candidates,
