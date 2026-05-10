@@ -2795,6 +2795,255 @@ the same via pf.  Windows now does the equivalent via netsh advfirewall.
     tunnel, not the LAN router; (b) the new DNS-block rules survive a
     daemon restart and an external `netsh advfirewall reset` cycle.
 
+Evidence update (2026-05-10, slice 5 — env-file / generation invariants / trust replay):
+- Changed files:
+  - `crates/rustynet-relay/src/main.rs`
+    - Added 9 env-file parser tests for `load_windows_relay_service_args`:
+      - `relay_windows_service_env_file_skips_comments_and_blank_lines` — `#`
+        comments and whitespace-only lines parse without splitting on a `=`
+        inside a comment body.
+      - `relay_windows_service_env_file_rejects_lines_without_equals` — a line
+        without `=` is rejected so an attacker cannot smuggle a typo'd
+        `RUSTYNET_RELAY_ARGS_JSON-[]` past a careless reviewer.
+      - `relay_windows_service_env_file_rejects_lowercase_or_punctuated_keys`
+        — lowercase, hyphenated, and dotted keys are rejected.
+      - `relay_windows_service_env_file_rejects_missing_required_key`
+      - `relay_windows_service_env_file_rejects_non_array_or_non_string_json`
+        — string, object, number, mixed-type array, and array-with-null all
+        rejected.
+      - `relay_windows_service_env_file_rejects_empty_json_array`
+      - `relay_windows_service_env_file_handles_crlf_line_endings`
+      - `relay_windows_service_env_file_preserves_equals_in_json_value` —
+        split-on-first-`=` semantics keep `AB=` intact inside a JSON value.
+      - `relay_windows_service_env_file_rejects_oversized_input` — 64 KiB
+        file fails before reading the body (32 KiB cap).
+  - `crates/rustynetd/src/phase10.rs`
+    - Added 3 generation-invariant tests for `apply_dataplane_generation`:
+      - `successive_apply_dataplane_generation_increments_monotonically` — five
+        successful applies advance generation 0→1→2→3→4→5 with `last_safe_generation`
+        tracking each step.
+      - `failed_apply_after_successful_does_not_regress_last_safe_generation` —
+        critical anti-replay invariant: a failed apply after a successful
+        apply at generation N must leave `last_safe_generation >= N`.
+      - `repeated_failed_applies_do_not_advance_last_safe_generation` — three
+        consecutive failed applies all leave `last_safe_generation == 0`.
+        Without this an attacker who could induce stage failures could
+        advance the watermark past genuinely applied generations and
+        replay or skip evidence.
+  - `crates/rustynetd/src/daemon.rs`
+    - Added 4 trust-evidence replay tests for `load_trust_evidence`:
+      - `load_trust_evidence_rejects_strictly_older_updated_at_unix` — the
+        most basic replay defence: an evidence whose `updated_at_unix` is
+        strictly older than the persisted watermark must fail closed,
+        otherwise an attacker who captured any earlier signed evidence
+        could revert the daemon's trust state to that point.
+      - `load_trust_evidence_rejects_same_updated_at_smaller_nonce` — when
+        `updated_at_unix` is equal, `nonce` is the lexicographic
+        tie-breaker; a smaller nonce at the same timestamp is strictly
+        older in the ordering.
+      - `load_trust_evidence_accepts_strictly_newer_updated_at_unix` —
+        complement: a strictly newer timestamp must be accepted regardless
+        of digest mismatch (different events).
+      - `load_trust_evidence_accepts_same_updated_at_with_larger_nonce` —
+        complement: equal timestamp + larger nonce is strictly newer in
+        the ordering.  Pinned together these four tests cover every cell
+        of the `(updated_at, nonce)` ordering matrix with a digest
+        sanity check.
+- Verification:
+  - `cargo fmt --all -- --check` (clean)
+  - `cargo test -p rustynetd --all-features` (625 lib + 60 bin + 3 integration — all pass)
+  - `cargo test -p rustynet-relay --all-features` (56 lib + 54 bin — all pass)
+  - `cargo test -p rustynet-control --all-features` (97 lib — all pass)
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings` (clean)
+- Artifacts:
+  - Local unit-test evidence only.
+- Residual risk:
+  - The trust-evidence replay tests cover the comparator and watermark
+    persistence path on disk; they do not exercise the daemon's full
+    `apply_dataplane_generation` chain with a tampered watermark.  Live
+    proof is still required.
+  - Generation-invariant tests use `DryRunSystem` and `WireguardBackend`
+    in-memory mocks; they pin the state-machine contract but do not prove
+    real OS-level rollback behaviour.
+- Blocker / prerequisite:
+  - W5 live-lab run still required (see previous entries).
+
+Evidence update (2026-05-10, slice 6 — auto-tunnel / membership / fail-closed contract / Windows assert_killswitch parity):
+
+**Real security fix**: Windows `assert_killswitch` only checked an in-process
+`firewall_applied` boolean.  An external `netsh advfirewall reset` between
+apply and assertion would leave the flag at `true` while the OS firewall was
+wide open — the verifier would lie about posture in exactly the window where
+its guarantee matters most.  Linux and macOS already query the OS state.
+Windows now does too.
+
+- Changed files:
+  - `crates/rustynetd/src/phase10.rs`
+    - Added `WINDOWS_PS_ASSERT_KILLSWITCH` PowerShell script that:
+      - takes the three reviewed rule names as `param($LoopbackName, $TunnelName, $EgressName)`
+        — never interpolates them;
+      - calls `Get-NetFirewallRule -Name $name -ErrorAction Stop` for each rule
+        and verifies `Action = Allow`, `Direction = Outbound`, `Enabled = True`;
+      - calls `Get-NetFirewallProfile -ErrorAction Stop` and verifies
+        every profile has `DefaultOutboundAction = Block`.  The default-action
+        check is the critical one — without it, an external `netsh advfirewall
+        set allprofiles firewallpolicy allowinbound,allowoutbound` could leave
+        the named rules in place but flip the global default to allow,
+        defeating the killswitch entirely.
+    - Updated `WindowsCommandSystem::assert_killswitch` to keep the
+      `firewall_applied` fast-path reject (catches never-applied-yet
+      cheaply) and add the OS-state query for defense in depth.  Linux/macOS
+      parity for the kill-switch contract.
+    - 5 new tests:
+      - `windows_assert_killswitch_script_uses_param_and_stop_error_action`
+      - `windows_assert_killswitch_script_checks_rule_action_direction_and_enabled`
+      - `windows_assert_killswitch_does_not_interpolate_rule_names` —
+        ensures rule-name constants are NOT in the script body.
+      - `windows_assert_killswitch_runtime_args_pass_rule_names_as_separate_argv`
+      - `windows_command_system_assert_killswitch_fast_path_rejects_unapplied_state`
+        — verifies the fast-path reject still works on non-Windows hosts.
+    - 2 new fail-closed-contract tests for `force_fail_closed`:
+      - `force_fail_closed_returns_err_and_skips_state_transition_when_block_all_egress_fails`
+        — pins the documented contract: state stays at the prior value
+        when block_all_egress fails (claiming FailClosed without the OS
+        block would lie about posture).  Recovery happens at the next
+        reconcile via prune_owned_tables + rollback_obsolete_controls.
+      - `force_fail_closed_transitions_state_when_block_all_egress_succeeds`
+        — complement.
+  - `crates/rustynetd/src/daemon.rs`
+    - Extracted `membership_watermark_is_replay(incoming, previous)` from
+      `load_verified_membership` — a pure replay-detector function so the
+      ordering rules can be tested without building a full
+      snapshot+log+watermark on disk.  No behaviour change.
+    - 4 new auto-tunnel watermark ordering tests pinning every cell of the
+      `(generated_at_unix, nonce)` matrix:
+      - `load_auto_tunnel_bundle_rejects_strictly_older_generated_at_unix`
+      - `load_auto_tunnel_bundle_rejects_same_generated_at_smaller_nonce`
+      - `load_auto_tunnel_bundle_accepts_strictly_newer_generated_at_unix`
+      - `load_auto_tunnel_bundle_accepts_same_generated_at_with_larger_nonce`
+    - 2 new membership-watermark replay tests:
+      - `membership_watermark_replay_detector_pins_full_ordering_matrix` —
+        4 cases: older epoch (replay), same epoch + diff root (forge),
+        same epoch + same root (idempotent), newer epoch (progress).
+      - `membership_watermark_replay_detector_handles_zero_epoch_boundary`
+        — epoch 0 cannot be replayed once the daemon advances.
+- Verification:
+  - `cargo fmt --all -- --check` (clean)
+  - `cargo test -p rustynetd --all-features` (638 lib + 60 bin + 3 integration — all pass)
+  - `cargo test -p rustynet-relay --all-features` (56 lib + 54 bin — all pass)
+  - `cargo test -p rustynet-control --all-features` (97 lib — all pass)
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings` (clean)
+- Artifacts:
+  - Local unit-test evidence only.
+- Residual risk:
+  - The new Windows `assert_killswitch` PowerShell query has not been
+    proven on a live Windows host.  Specifically: PS startup adds
+    ~100-500ms per assert_killswitch call; this is acceptable since
+    assert is invoked at apply-time and exit-selection-time, not per
+    packet, but live-lab proof is still required.
+  - The membership-watermark replay tests cover the comparator only; the
+    end-to-end load_verified_membership path with snapshot + log +
+    watermark on disk is still tested only via the existing integration
+    paths.
+- Blocker / prerequisite:
+  - W5 live-lab run still required (see previous entries).  Live-lab must
+    additionally exercise: (a) `netsh advfirewall reset` between
+    daemon apply and the next assert_killswitch is correctly detected;
+    (b) external profile-default-action drift (`firewallpolicy
+    allowinbound,allowoutbound`) is correctly rejected.
+
+Evidence update (2026-05-10, slice 7 — parallel agents: DPAPI key-custody zeroize + relay replay-store skew clamp):
+
+**Two real security fixes landed in parallel** by independent audit agents working on
+non-overlapping crates.  Both fixes are contained — small surface, clear contract,
+new tests pinning each invariant.  The DPAPI audit found NO flag-trust gaps (every
+DPAPI security path already queries live OS state — better than `assert_killswitch`
+was before slice 6).
+
+**Fix 1 — DPAPI plaintext zeroize** (`crates/rustynetd/src/key_material.rs`):
+The `verify_dpapi_passphrase_roundtrip` self-test stored the unprotected plaintext
+returned by `dpapi_unprotect` in a bare `Vec<u8>`.  On every return path (success,
+mismatch, drop) the plaintext leaked to the allocator pool until reuse.  The same
+module already wraps the original passphrase + protected blob in `Zeroizing`;
+this brings the round-trip plaintext to parity.  Also: the truncated-blob
+`?` early-return in `decode_windows_dpapi_passphrase_blob` did not zeroize the
+encrypted blob (the surrounding code does on every other error path) — replaced
+with explicit `match`.
+
+**Fix 2 — Relay clock-skew clamp** (`crates/rustynet-relay/src/transport.rs`):
+`RelayTransport::new` accepted an arbitrary operator-supplied
+`clock_skew_tolerance_secs`.  `is_expired` rejects a token only when
+`now > expires_at + skew`, but the replay-store retention is hard-coded to
+`NONCE_RETENTION_SECS = MAX_RELAY_TTL_SECS * 2 = 240s`.  An operator who
+configured `clock_skew_tolerance_secs = 600s` (well-meaning over-tolerant)
+would open a 480-second replay window — the nonce gets pruned at t+240
+while the token still passes `is_expired` until t+720.  Default is 90s so
+no shipping deployment is affected, but nothing in the API stopped a
+misconfig.
+
+The fix introduces `MAX_CLOCK_SKEW_TOLERANCE_SECS = MAX_RELAY_TTL_SECS` and
+clamps the operator value via `.min(...)` in `RelayTransport::new` (and in
+`new_with_replay_store_path`, which delegates).  Plus a `const _: () = assert!(...)`
+compile-time invariant guard so a future change to either constant cannot
+silently reopen the window without the assertion firing.
+
+- Changed files:
+  - `crates/rustynetd/src/key_material.rs`
+    - `verify_dpapi_passphrase_roundtrip` wraps `dpapi_unprotect` result in
+      `Zeroizing::new(...)`.
+    - `decode_windows_dpapi_passphrase_blob` truncated-blob path replaced
+      `?` with explicit `match` so `blob` is zeroized on the early-return.
+    - 5 new tests + 2 platform-cfg sentinels:
+      - `parse_passphrase_bytes_rejects_short_passphrase_fails_closed`
+      - `parse_passphrase_bytes_rejects_oversize_input_fails_closed`
+      - `parse_passphrase_bytes_rejects_non_utf8_fails_closed`
+      - `parse_passphrase_bytes_accepts_minimum_length_passphrase`
+      - `looks_like_windows_dpapi_passphrase_blob_rejects_short_or_wrong_magic` (Windows)
+      - `looks_like_windows_dpapi_blob_module_only_compiled_on_windows` (non-Windows sentinel)
+      - `dpapi_passphrase_roundtrip_rejects_mismatch_via_zeroizing_buffer` (Windows)
+  - `crates/rustynet-relay/src/transport.rs`
+    - `MAX_CLOCK_SKEW_TOLERANCE_SECS` constant + clamp in `RelayTransport::new`.
+    - `const _: () = assert!(MAX_RELAY_TTL_SECS + MAX_CLOCK_SKEW_TOLERANCE_SECS <= NONCE_RETENTION_SECS)`
+      compile-time invariant guard.
+    - 15 new tests:
+      - `skew_tolerance_is_clamped_to_max_ttl`
+      - `skew_clamp_invariant_holds_for_replay_retention`
+      - `forward_packet_rejects_at_exact_expiry_second`
+      - `touch_session_from_tuple_rejects_at_exact_expiry_second`
+      - `validate_hello_from_tuple_does_not_consume_nonce`
+      - `commit_path_does_not_double_count_hello_rate`
+      - `replay_rejected_inside_full_skew_window`
+      - `nonce_at_exact_retention_age_is_pruned_by_cleanup`
+      - `empty_replay_store_loads_cleanly_and_persists_zero_entries`
+      - `replay_store_tolerates_blank_lines_but_rejects_extra_fields`
+      - `replay_store_rejects_short_nonce_hex`
+      - `replay_store_rejects_non_numeric_timestamp`
+      - `replay_store_rejects_symlinked_path` (Unix)
+      - `replay_store_rejects_broad_file_permissions` (Unix)
+      - `nonce_store_failed_persist_keeps_in_memory_state_consistent`
+- Verification:
+  - `cargo fmt --all -- --check` (clean)
+  - `cargo check --workspace --all-features` (clean)
+  - `cargo test -p rustynetd --all-features` (lib +5 from this slice on top of slice 6)
+  - `cargo test -p rustynet-relay --all-features` (56 → 71 lib + 54 bin)
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings` (clean)
+- Artifacts:
+  - Local unit-test evidence only.
+- Residual risk:
+  - **Important followup flagged by Agent C audit**: `verify_signed_auto_tunnel_bundle`
+    in `rustynet-control` has the same outer-struct-vs-payload weakness that the
+    pre-fix endpoint-hint verifier had — the audit will be folded into the next
+    slice once Agent C's endpoint-hint fixes land.
+  - DPAPI followups not in this slice: TOCTOU window in `validate_secret_file_security`
+    (small, parent dir is ACL-locked); `verify_dpapi_passphrase_roundtrip` runs a
+    redundant DPAPI roundtrip on every key load — could move to a one-time
+    startup self-test.
+  - Relay followups not in this slice: `NonceStore::insert` clones the entire map
+    per accepted hello (O(n) memory churn — bounded but worth profiling); skew
+    clamp is silent — consider `tracing::warn!` so operators notice the misconfig.
+- Blocker / prerequisite:
+  - W5 live-lab run still required (see previous entries).
+
 ## 11) Definition Of Done
 
 This delta closes only when **all** are true:

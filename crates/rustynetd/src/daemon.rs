@@ -3099,10 +3099,7 @@ impl DaemonRuntime {
         let previous = load_membership_watermark(&self.membership_watermark_path)
             .map_err(|err| MembershipBootstrapError::Io(err.to_string()))?;
         if let Some(previous) = previous {
-            if watermark.epoch < previous.epoch
-                || (watermark.epoch == previous.epoch
-                    && watermark.state_root != previous.state_root)
-            {
+            if membership_watermark_is_replay(&watermark, &previous) {
                 return Err(MembershipBootstrapError::WatermarkReplay);
             }
         }
@@ -9340,6 +9337,23 @@ fn persist_trust_watermark(
     Ok(())
 }
 
+/// Pure check: is `incoming` a replay relative to `previous`?
+///
+/// Replay rules for membership snapshots:
+/// - strictly older epoch → replay (rolling back the membership view)
+/// - same epoch but different state_root → replay (forging an alternative
+///   history at the same epoch — only one canonical state can exist per epoch)
+///
+/// Equal epoch + same state_root is NOT a replay (idempotent re-load is fine).
+/// Strictly newer epoch is NOT a replay regardless of state_root (progress).
+fn membership_watermark_is_replay(
+    incoming: &MembershipWatermark,
+    previous: &MembershipWatermark,
+) -> bool {
+    incoming.epoch < previous.epoch
+        || (incoming.epoch == previous.epoch && incoming.state_root != previous.state_root)
+}
+
 fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWatermark>, String> {
     if !path.exists() {
         return Ok(None);
@@ -11962,14 +11976,14 @@ mod tests {
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
         MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
-        MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, NodeRole, StateFetcher,
+        MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole, StateFetcher,
         TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TraversalCandidate, TraversalCandidateType,
         TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
         collect_traversal_host_candidate_snapshot_with_retry,
         is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
         load_dns_zone_bundle, load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
         load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
-        load_trust_watermark, parse_route_interface_token,
+        load_trust_watermark, membership_watermark_is_replay, parse_route_interface_token,
         parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
         persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
         prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
@@ -14634,6 +14648,147 @@ mod tests {
     }
 
     #[test]
+    fn load_trust_evidence_rejects_strictly_older_updated_at_unix() {
+        // The most basic replay defence: a trust evidence whose
+        // `updated_at_unix` is strictly older than the persisted watermark
+        // must fail closed.  Without this guard an attacker who captured
+        // any earlier signed evidence could revert the daemon's trust
+        // state to that point.
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-older-updated-at");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let now = unix_now();
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: now.saturating_sub(60),
+            nonce: 100,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        // Persisted watermark records a NEWER updated_at_unix than the
+        // trust file we are now trying to load.
+        let previous = TrustWatermark {
+            updated_at_unix: now, // strictly newer than `record.updated_at_unix`
+            nonce: 50,            // doesn't matter — updated_at_unix dominates
+            payload_digest: Some([0u8; 32]),
+        };
+        let err = load_trust_evidence(
+            &trust_path,
+            &verifier_path,
+            TrustPolicy::default(),
+            Some(previous),
+        )
+        .expect_err("strictly older trust evidence must be rejected as replay");
+        assert!(matches!(err, super::TrustBootstrapError::ReplayDetected));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_evidence_rejects_same_updated_at_smaller_nonce() {
+        // When `updated_at_unix` is equal, `nonce` is the tie-breaker.  A
+        // smaller nonce at the same timestamp is strictly older in the
+        // ordering and must be rejected as replay.
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-smaller-nonce");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let now = unix_now();
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: now,
+            nonce: 5,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        let previous = TrustWatermark {
+            updated_at_unix: now,
+            nonce: 10, // strictly larger than `record.nonce`
+            payload_digest: Some([0u8; 32]),
+        };
+        let err = load_trust_evidence(
+            &trust_path,
+            &verifier_path,
+            TrustPolicy::default(),
+            Some(previous),
+        )
+        .expect_err("same updated_at_unix with smaller nonce must be rejected as replay");
+        assert!(matches!(err, super::TrustBootstrapError::ReplayDetected));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_evidence_accepts_strictly_newer_updated_at_unix() {
+        // The complement of the previous test: a strictly newer
+        // updated_at_unix must be accepted regardless of payload digest
+        // mismatch — different timestamps mean different trust events.
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-newer-updated-at");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let now = unix_now();
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: now,
+            nonce: 1,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        let previous = TrustWatermark {
+            updated_at_unix: now.saturating_sub(60), // strictly older
+            nonce: 9_999,
+            payload_digest: Some([0xFFu8; 32]), // different digest, irrelevant
+        };
+        let envelope = load_trust_evidence(
+            &trust_path,
+            &verifier_path,
+            TrustPolicy::default(),
+            Some(previous),
+        )
+        .expect("strictly newer updated_at_unix must be accepted");
+        assert_eq!(envelope.watermark.updated_at_unix, now);
+        assert_eq!(envelope.watermark.nonce, 1);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_trust_evidence_accepts_same_updated_at_with_larger_nonce() {
+        // Same updated_at_unix, larger nonce is strictly newer in the
+        // (updated_at, nonce) lexicographic ordering.  Must be accepted
+        // regardless of digest mismatch.
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-larger-nonce");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let now = unix_now();
+        let record = TrustEvidenceRecord {
+            tls13_valid: true,
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: now,
+            nonce: 200,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        let previous = TrustWatermark {
+            updated_at_unix: now,
+            nonce: 100, // strictly smaller than `record.nonce`
+            payload_digest: Some([0xAAu8; 32]),
+        };
+        let envelope = load_trust_evidence(
+            &trust_path,
+            &verifier_path,
+            TrustPolicy::default(),
+            Some(previous),
+        )
+        .expect("same updated_at_unix with larger nonce must be accepted");
+        assert_eq!(envelope.watermark.nonce, 200);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn load_trust_evidence_rejects_equal_watermark_when_legacy_digest_missing() {
         let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-legacy");
         let trust_path = test_dir.join("trust.evidence");
@@ -14732,6 +14887,272 @@ mod tests {
         )
         .expect("equal watermark should be accepted when digest matches");
         assert_eq!(second.watermark, first.watermark);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_watermark_replay_detector_pins_full_ordering_matrix() {
+        // The membership watermark replay rules:
+        //   - strictly older epoch                          → replay
+        //   - same epoch, different state_root              → replay (forge)
+        //   - same epoch, same state_root                   → not replay (idempotent)
+        //   - strictly newer epoch (any state_root)         → not replay (progress)
+        //
+        // These rules are the difference between an attacker who captured
+        // an older membership snapshot being able to replay it (revert
+        // membership view, e.g. re-activate a revoked node) and being
+        // forced to use the latest signed snapshot.
+        let root_a = "aaaaaaaa".to_string();
+        let root_b = "bbbbbbbb".to_string();
+
+        // 1. Strictly older epoch → replay regardless of state_root.
+        let prev = MembershipWatermark {
+            epoch: 5,
+            state_root: root_a.clone(),
+        };
+        for new_root in [root_a.clone(), root_b.clone()] {
+            let incoming = MembershipWatermark {
+                epoch: 4,
+                state_root: new_root,
+            };
+            assert!(
+                membership_watermark_is_replay(&incoming, &prev),
+                "older epoch must be replay"
+            );
+        }
+
+        // 2. Same epoch, different state_root → replay (forge).
+        let prev = MembershipWatermark {
+            epoch: 7,
+            state_root: root_a.clone(),
+        };
+        let forged = MembershipWatermark {
+            epoch: 7,
+            state_root: root_b.clone(),
+        };
+        assert!(
+            membership_watermark_is_replay(&forged, &prev),
+            "same epoch with different state_root must be flagged as replay/forge"
+        );
+
+        // 3. Same epoch, same state_root → NOT replay (idempotent re-load
+        //    after a daemon restart is allowed).
+        let prev = MembershipWatermark {
+            epoch: 9,
+            state_root: root_a.clone(),
+        };
+        let same = MembershipWatermark {
+            epoch: 9,
+            state_root: root_a.clone(),
+        };
+        assert!(
+            !membership_watermark_is_replay(&same, &prev),
+            "same epoch with matching state_root is idempotent, not replay"
+        );
+
+        // 4. Strictly newer epoch → NOT replay regardless of state_root.
+        //    A newer epoch is genuine membership progress; the new
+        //    state_root is the canonical state for that epoch.
+        let prev = MembershipWatermark {
+            epoch: 3,
+            state_root: root_a.clone(),
+        };
+        for new_root in [root_a.clone(), root_b.clone()] {
+            let incoming = MembershipWatermark {
+                epoch: 4,
+                state_root: new_root,
+            };
+            assert!(
+                !membership_watermark_is_replay(&incoming, &prev),
+                "newer epoch must be accepted as progress"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_watermark_replay_detector_handles_zero_epoch_boundary() {
+        // Edge case: an attacker who captured the very first membership
+        // snapshot (epoch 0) must not be able to replay it after the
+        // daemon has advanced past it.
+        let prev = MembershipWatermark {
+            epoch: 1,
+            state_root: "root1".to_string(),
+        };
+        let stale = MembershipWatermark {
+            epoch: 0,
+            state_root: "root0".to_string(),
+        };
+        assert!(
+            membership_watermark_is_replay(&stale, &prev),
+            "epoch 0 after we've advanced must be flagged as replay"
+        );
+    }
+
+    #[test]
+    fn load_auto_tunnel_bundle_rejects_strictly_older_generated_at_unix() {
+        // Anti-replay: a bundle whose `generated_at_unix` is strictly older
+        // than the persisted watermark must fail closed.  Without this guard
+        // an attacker who captured an earlier auto-tunnel assignment could
+        // revert the daemon's mesh state to that point.
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-older-generated-at");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            10,
+            false,
+        );
+        let envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first load should succeed");
+        // Persist a watermark that is STRICTLY NEWER than the bundle's own.
+        let synthetic_newer = AutoTunnelWatermark {
+            generated_at_unix: envelope.watermark.generated_at_unix.saturating_add(60),
+            nonce: 1,
+            payload_digest: Some([0u8; 32]),
+        };
+        let err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(synthetic_newer),
+        )
+        .expect_err("strictly older bundle must be rejected as replay");
+        assert!(matches!(
+            err,
+            super::AutoTunnelBootstrapError::ReplayDetected
+        ));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_bundle_rejects_same_generated_at_smaller_nonce() {
+        // (generated_at_unix, nonce) is the lexicographic ordering used to
+        // detect replay; same timestamp with smaller nonce is strictly older.
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-smaller-nonce");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            5, // bundle nonce
+            false,
+        );
+        let envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first load should succeed");
+        // Persist a watermark with the SAME generated_at but a LARGER nonce.
+        let synthetic_newer_by_nonce = AutoTunnelWatermark {
+            generated_at_unix: envelope.watermark.generated_at_unix,
+            nonce: envelope.watermark.nonce.saturating_add(5),
+            payload_digest: Some([0u8; 32]),
+        };
+        let err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(synthetic_newer_by_nonce),
+        )
+        .expect_err("same generated_at with smaller nonce must be rejected as replay");
+        assert!(matches!(
+            err,
+            super::AutoTunnelBootstrapError::ReplayDetected
+        ));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_bundle_accepts_strictly_newer_generated_at_unix() {
+        // Complement: a strictly newer `generated_at_unix` must be accepted
+        // regardless of digest mismatch — different timestamps mean
+        // different assignment events.
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-newer-generated-at");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            20,
+            false,
+        );
+        let envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("baseline load should succeed");
+        let strictly_older = AutoTunnelWatermark {
+            generated_at_unix: envelope.watermark.generated_at_unix.saturating_sub(60),
+            nonce: 99_999,
+            payload_digest: Some([0xAAu8; 32]),
+        };
+        let envelope2 = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(strictly_older),
+        )
+        .expect("strictly newer generated_at_unix must be accepted");
+        assert_eq!(envelope2.watermark, envelope.watermark);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_auto_tunnel_bundle_accepts_same_generated_at_with_larger_nonce() {
+        // Equal `generated_at_unix` with larger nonce is strictly newer in
+        // the lexicographic ordering and must be accepted regardless of any
+        // digest mismatch.
+        let test_dir = secure_test_dir("rustynetd-auto-watermark-larger-nonce");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            500, // bundle nonce
+            false,
+        );
+        let envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("baseline load should succeed");
+        let smaller_nonce = AutoTunnelWatermark {
+            generated_at_unix: envelope.watermark.generated_at_unix,
+            nonce: envelope.watermark.nonce.saturating_sub(50),
+            payload_digest: Some([0xBBu8; 32]),
+        };
+        let envelope2 = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(smaller_nonce),
+        )
+        .expect("same generated_at with larger nonce must be accepted");
+        assert_eq!(envelope2.watermark.nonce, envelope.watermark.nonce);
         let _ = std::fs::remove_dir_all(test_dir);
     }
 

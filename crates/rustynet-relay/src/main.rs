@@ -2587,6 +2587,185 @@ mod daemon {
         }
 
         #[test]
+        fn relay_windows_service_env_file_skips_comments_and_blank_lines() {
+            // The parser must skip `#`-prefixed comment lines and blank/whitespace
+            // lines without ever splitting on `=` inside a comment body.  An
+            // operator audit trail in the env file should not break loading.
+            let dir = restricted_temp_dir("relay-service-env-comments");
+            let env_path = dir.join("relay.env");
+            fs::write(
+                &env_path,
+                "# Operator audit: relay-eu-1 enrolled 2026-05-10 — keep this comment\n\
+                 \n\
+                 \t  \n\
+                 # next line uses '=' inside the comment: KEY=other\n\
+                 RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/v.pub\",\"--replay-store\",\"/tmp/r.store\"]\n\
+                 # trailing comment\n",
+            )
+            .expect("env file should be written");
+            let args = load_windows_relay_service_args(&env_path)
+                .expect("env file with comments and blank lines should parse");
+            assert_eq!(args[0], "--relay-id");
+            assert_eq!(args[1], "relay-eu-1");
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_rejects_lines_without_equals() {
+            // A line that has no '=' at all is malformed; we must fail closed
+            // rather than silently ignore the directive.  An attacker could
+            // otherwise smuggle a typo'd "RUSTYNET_RELAY_ARGS_JSON-[]" past
+            // a careless reviewer.
+            let dir = restricted_temp_dir("relay-service-env-no-eq");
+            let env_path = dir.join("relay.env");
+            fs::write(
+                &env_path,
+                "RUSTYNET_RELAY_ARGS_JSON=[]\nINVALID_LINE_WITHOUT_EQUALS\n",
+            )
+            .expect("env file should be written");
+            let err = load_windows_relay_service_args(&env_path)
+                .expect_err("line without '=' must fail closed");
+            assert!(err.contains("expected KEY=VALUE"));
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_rejects_lowercase_or_punctuated_keys() {
+            // Keys must be ASCII upper / digit / underscore.  Lowercase keys,
+            // hyphenated keys, and keys with dots must all fail closed —
+            // letting them through would mask a typo in the canonical
+            // RUSTYNET_RELAY_ARGS_JSON name and the file would silently load
+            // with no relay args defined.
+            let dir = restricted_temp_dir("relay-service-env-keys");
+            let env_path = dir.join("relay.env");
+            for bad_key in ["rustynet_relay_args_json", "RELAY-ARGS", "RELAY.ARGS"] {
+                fs::write(&env_path, format!("{bad_key}=[]\n"))
+                    .expect("env file should be written");
+                let err = load_windows_relay_service_args(&env_path)
+                    .expect_err("invalid env-file key must fail closed");
+                assert!(
+                    err.contains("invalid Windows relay service env-file key"),
+                    "expected invalid-key error for {bad_key:?}, got: {err}"
+                );
+            }
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_rejects_missing_required_key() {
+            // If the canonical RUSTYNET_RELAY_ARGS_JSON variable is not
+            // defined, the loader must fail closed — there is no sensible
+            // default for relay flags.
+            let dir = restricted_temp_dir("relay-service-env-missing");
+            let env_path = dir.join("relay.env");
+            fs::write(&env_path, "RUSTYNET_RELAY_OTHER=value\n")
+                .expect("env file should be written");
+            let err = load_windows_relay_service_args(&env_path)
+                .expect_err("missing required env var must fail closed");
+            assert!(err.contains("must define RUSTYNET_RELAY_ARGS_JSON"));
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_rejects_non_array_or_non_string_json() {
+            // The JSON value must be an array of strings.  Any other shape
+            // (object, number, single string, mixed-type array) must fail
+            // closed because the runtime expects argv tokens.
+            let dir = restricted_temp_dir("relay-service-env-json");
+            let env_path = dir.join("relay.env");
+            for bad in [
+                "RUSTYNET_RELAY_ARGS_JSON=\"--bind\"\n",
+                "RUSTYNET_RELAY_ARGS_JSON={\"flag\":\"--bind\"}\n",
+                "RUSTYNET_RELAY_ARGS_JSON=42\n",
+                "RUSTYNET_RELAY_ARGS_JSON=[1, 2, 3]\n",
+                "RUSTYNET_RELAY_ARGS_JSON=[\"--bind\", null]\n",
+            ] {
+                fs::write(&env_path, bad).expect("env file should be written");
+                let err = load_windows_relay_service_args(&env_path)
+                    .expect_err("non-string-array JSON must fail closed");
+                assert!(
+                    err.contains("must be a JSON string array"),
+                    "expected JSON-shape error for {bad:?}, got: {err}"
+                );
+            }
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_rejects_empty_json_array() {
+            // An explicitly empty JSON array provides no relay flags at all.
+            // The runtime requires at least --relay-id / --verifier-key /
+            // --replay-store, so an empty array can only mean a misconfigured
+            // file.  Fail closed rather than passing an empty argv to the
+            // service binary.
+            let dir = restricted_temp_dir("relay-service-env-empty");
+            let env_path = dir.join("relay.env");
+            fs::write(&env_path, "RUSTYNET_RELAY_ARGS_JSON=[]\n")
+                .expect("env file should be written");
+            let err = load_windows_relay_service_args(&env_path)
+                .expect_err("empty JSON array must fail closed");
+            assert!(err.contains("must not be empty"));
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_handles_crlf_line_endings() {
+            // Windows-style \r\n line endings are common when the file is
+            // edited on Windows.  The loader must accept them so the operator
+            // does not have to remember to convert.  (Rust's `lines()`
+            // strips trailing \r already; this test pins that contract.)
+            let dir = restricted_temp_dir("relay-service-env-crlf");
+            let env_path = dir.join("relay.env");
+            let crlf = "# CRLF env file\r\n\
+                        RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/v.pub\",\"--replay-store\",\"/tmp/r.store\"]\r\n";
+            fs::write(&env_path, crlf).expect("env file should be written");
+            let args =
+                load_windows_relay_service_args(&env_path).expect("CRLF env file should parse");
+            assert_eq!(args[0], "--relay-id");
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_preserves_equals_in_json_value() {
+            // The env-file parser splits on the FIRST `=` only.  A JSON
+            // value that contains its own `=` (for example a base64 padding
+            // character) must not be truncated.
+            let dir = restricted_temp_dir("relay-service-env-eq");
+            let env_path = dir.join("relay.env");
+            // The string "AB=" (3-char base64 segment) appears inside the
+            // JSON value; the parser must keep it intact.
+            fs::write(
+                &env_path,
+                "RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\",\"--verifier-key\",\"/tmp/AB=/v.pub\",\"--replay-store\",\"/tmp/r.store\"]\n",
+            )
+            .expect("env file should be written");
+            let args = load_windows_relay_service_args(&env_path)
+                .expect("env file with '=' inside JSON value should parse");
+            assert!(args.iter().any(|a| a == "/tmp/AB=/v.pub"));
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
+        fn relay_windows_service_env_file_rejects_oversized_input() {
+            // A maliciously huge env-file should be rejected before we read
+            // its contents into memory.  This is a DoS / memory-pressure
+            // guard.
+            let dir = restricted_temp_dir("relay-service-env-large");
+            let env_path = dir.join("relay.env");
+            // 64 KiB > the 32 KiB cap.
+            let mut large = String::from("RUSTYNET_RELAY_ARGS_JSON=[\"--relay-id\",\"relay-eu-1\"");
+            while large.len() < 64 * 1024 {
+                large.push_str(",\"--verifier-key\",\"/tmp/x.pub\"");
+            }
+            large.push_str("]\n");
+            fs::write(&env_path, &large).expect("env file should be written");
+            let err = load_windows_relay_service_args(&env_path)
+                .expect_err("oversized env-file must fail closed");
+            assert!(err.contains("env-file is too large"));
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[test]
         fn relay_windows_service_runtime_args_require_reviewed_runtime_paths() {
             let args = vec![
                 "--relay-id".to_string(),

@@ -2843,6 +2843,11 @@ const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = '
 const WINDOWS_PS_NEW_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; New-NetNat -Name $Name -InternalIPInterfaceAddressPrefix $Prefix -ErrorAction Stop | Out-Null }";
 const WINDOWS_PS_ASSERT_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction Stop; if ($nat.InternalIPInterfaceAddressPrefix -ne $Prefix) { throw 'RustyNet NAT prefix mismatch' } }";
 const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
+/// Verify the OS still has every reviewed killswitch rule in place AND the
+/// global default outbound policy is still `Block`.  Each rule name and the
+/// expected attributes are passed as PowerShell parameters so no value is
+/// interpolated into the script body.  Throws on the first drift detected.
+const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $TunnelName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($name in @($LoopbackName, $TunnelName, $EgressName)) { $rule = Get-NetFirewallRule -Name $name -ErrorAction Stop; if ($rule.Action -ne 'Allow') { throw \"rule $name action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $name direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $name is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -3109,13 +3114,36 @@ impl DataplaneSystem for WindowsCommandSystem {
     }
 
     fn assert_killswitch(&mut self) -> Result<(), SystemError> {
-        if self.firewall_applied {
-            return Ok(());
+        // Fast-path: if we never applied the killswitch in this process, we
+        // know the assertion fails.  This catches the simple
+        // never-applied-yet case without paying for a PowerShell round trip.
+        if !self.firewall_applied {
+            return Err(SystemError::KillSwitchAssertionFailed(
+                "Windows advfirewall killswitch is not applied; call apply_firewall_killswitch first"
+                    .to_string(),
+            ));
         }
-        Err(SystemError::KillSwitchAssertionFailed(
-            "Windows advfirewall killswitch is not applied; call apply_firewall_killswitch first"
-                .to_string(),
-        ))
+        // Defense in depth: verify the OS still has every reviewed
+        // killswitch rule AND the global default outbound policy is
+        // still Block.  Without this query, an external
+        // `netsh advfirewall reset` between apply and assertion would
+        // leave self.firewall_applied=true while the OS firewall is wide
+        // open — `assert_killswitch` would lie about posture in exactly
+        // the window where its guarantee matters most.  Linux and macOS
+        // already query the OS state here; this brings Windows to parity.
+        self.run_powershell_success(
+            WINDOWS_PS_ASSERT_KILLSWITCH,
+            &[
+                WINDOWS_KS_RULE_LOOPBACK.to_string(),
+                WINDOWS_KS_RULE_TUNNEL.to_string(),
+                WINDOWS_KS_RULE_EGRESS.to_string(),
+            ],
+        )
+        .map_err(|err| {
+            SystemError::KillSwitchAssertionFailed(format!(
+                "Windows advfirewall killswitch verification failed: {err}"
+            ))
+        })
     }
 
     fn assert_exit_policy(&mut self, _exit_mode: ExitMode) -> Result<(), SystemError> {
@@ -6623,6 +6651,122 @@ mod tests {
     }
 
     #[test]
+    fn windows_assert_killswitch_script_uses_param_and_stop_error_action() {
+        // The new OS-state-verifying assert_killswitch script must:
+        //  - bind every rule name as a PowerShell parameter (no
+        //    interpolation of identifiers into the script body);
+        //  - use $ErrorActionPreference = 'Stop' and -ErrorAction Stop on
+        //    every cmdlet so a missing rule or query failure is surfaced
+        //    as a thrown exception, not a silently-empty result.
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("param($LoopbackName, $TunnelName, $EgressName)"),
+            "assert_killswitch script must bind rule names as parameters"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("$ErrorActionPreference = 'Stop'"),
+            "assert_killswitch script must use $ErrorActionPreference = 'Stop'"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH
+                .contains("Get-NetFirewallRule -Name $name -ErrorAction Stop"),
+            "Get-NetFirewallRule must use -ErrorAction Stop on the per-rule lookup"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("Get-NetFirewallProfile -ErrorAction Stop"),
+            "Get-NetFirewallProfile must use -ErrorAction Stop"
+        );
+    }
+
+    #[test]
+    fn windows_assert_killswitch_script_checks_rule_action_direction_and_enabled() {
+        // The verifier must reject a rule that has the right name but
+        // wrong attributes — an attacker who could redirect a rule's
+        // action from Allow to Block (or vice versa) should not pass.
+        // We pin all three attribute checks here.
+        for required_check in ["Allow", "Outbound", "True"] {
+            assert!(
+                WINDOWS_PS_ASSERT_KILLSWITCH.contains(required_check),
+                "assert_killswitch script must check for {required_check:?} attribute"
+            );
+        }
+        // Profile default outbound action must be Block — without this
+        // check, an external `netsh advfirewall set allprofiles
+        // firewallpolicy allowinbound,allowoutbound` could leave the
+        // named rules in place but flip the global default to allow,
+        // defeating the killswitch entirely.
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("DefaultOutboundAction"),
+            "assert_killswitch script must verify global DefaultOutboundAction"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("'Block'"),
+            "assert_killswitch script must check the default action is 'Block'"
+        );
+    }
+
+    #[test]
+    fn windows_assert_killswitch_does_not_interpolate_rule_names() {
+        // The reviewed rule-name constants must NOT appear in the script
+        // body — the script binds them as parameters at invocation time.
+        // Hard-coded rule names would let a bug rename the constant
+        // without renaming the script reference, silently breaking the
+        // verifier.
+        for forbidden in [
+            WINDOWS_KS_RULE_LOOPBACK,
+            WINDOWS_KS_RULE_TUNNEL,
+            WINDOWS_KS_RULE_EGRESS,
+        ] {
+            assert!(
+                !WINDOWS_PS_ASSERT_KILLSWITCH.contains(forbidden),
+                "assert_killswitch script must not hard-code rule name {forbidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_assert_killswitch_runtime_args_pass_rule_names_as_separate_argv() {
+        // The runtime invocation must build argv where each rule name is a
+        // distinct argument, not concatenated or interpolated into a single
+        // string.  This pins the safety contract of the script-parameter
+        // binding at the call site.
+        let args = windows_powershell_command_args(
+            WINDOWS_PS_ASSERT_KILLSWITCH,
+            &[
+                WINDOWS_KS_RULE_LOOPBACK.to_string(),
+                WINDOWS_KS_RULE_TUNNEL.to_string(),
+                WINDOWS_KS_RULE_EGRESS.to_string(),
+            ],
+        );
+        assert_eq!(args[0], "-NoProfile");
+        assert_eq!(args[1], "-NonInteractive");
+        assert_eq!(args[2], "-Command");
+        assert_eq!(args[3], WINDOWS_PS_ASSERT_KILLSWITCH);
+        assert_eq!(args[4], WINDOWS_KS_RULE_LOOPBACK);
+        assert_eq!(args[5], WINDOWS_KS_RULE_TUNNEL);
+        assert_eq!(args[6], WINDOWS_KS_RULE_EGRESS);
+    }
+
+    #[test]
+    fn windows_command_system_assert_killswitch_fast_path_rejects_unapplied_state() {
+        // Fast-path check: if `firewall_applied = false` (the daemon
+        // never called apply_firewall_killswitch), assert_killswitch must
+        // reject without attempting the OS-state PowerShell query.  This
+        // catches the never-applied-yet case at minimal cost AND lets us
+        // unit-test the assertion contract on non-Windows hosts.
+        let mut system = WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("windows command system should initialize");
+
+        let err = DataplaneSystem::assert_killswitch(&mut system)
+            .expect_err("assert_killswitch must reject when firewall_applied=false (fast path)");
+        assert!(matches!(err, SystemError::KillSwitchAssertionFailed(_)));
+        assert!(err.to_string().contains("not applied"));
+    }
+
+    #[test]
     fn windows_interface_alias_validator_accepts_real_windows_names() {
         // Common Windows physical adapter aliases must be accepted.
         for alias in ["Ethernet", "Wi-Fi", "Ethernet 2", "Local Area Connection"] {
@@ -7022,6 +7166,247 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(controller.state(), DataplaneState::FailClosed);
         assert_eq!(controller.last_safe_generation(), 0);
+    }
+
+    #[test]
+    fn successive_apply_dataplane_generation_increments_monotonically() {
+        // Each successful apply must produce a strictly higher generation
+        // than the last.  A regression in `last_safe_generation` would let
+        // an attacker who captured an older trust evidence replay it through
+        // a stale state-machine snapshot, defeating anti-replay.
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        assert_eq!(controller.generation(), 0);
+        assert_eq!(controller.last_safe_generation(), 0);
+
+        for expected_generation in 1..=5 {
+            controller
+                .apply_dataplane_generation(
+                    trust_ok(),
+                    test_runtime_context(),
+                    vec![sample_peer("node-b")],
+                    vec![Route {
+                        destination_cidr: "100.100.20.0/24".to_string(),
+                        via_node: NodeId::new("node-b").expect("node should parse"),
+                        kind: RouteKind::Mesh,
+                    }],
+                    ApplyOptions::default(),
+                )
+                .unwrap_or_else(|err| {
+                    panic!("apply #{expected_generation} should succeed: {err:?}")
+                });
+            assert_eq!(
+                controller.generation(),
+                expected_generation,
+                "generation must increment by 1 per successful apply"
+            );
+            assert_eq!(
+                controller.last_safe_generation(),
+                expected_generation,
+                "last_safe_generation must track successful generation"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_apply_after_successful_does_not_regress_last_safe_generation() {
+        // If a previously successful apply landed at generation N and a
+        // subsequent apply fails mid-stage, `last_safe_generation` must stay
+        // at N — an attacker who can induce a stage failure must not be
+        // able to roll back the safe generation to 0 (or any older value)
+        // and replay an earlier trust evidence.
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("first apply should succeed");
+
+        let safe_after_first = controller.last_safe_generation();
+        assert_eq!(safe_after_first, 1);
+
+        // Switch the system to one that fails on apply_dns_protection so the
+        // next apply triggers the rollback + force_fail_closed path.
+        controller.system = DryRunSystem::default().fail_on("apply_dns_protection");
+        let failing = controller.apply_dataplane_generation(
+            trust_ok(),
+            test_runtime_context(),
+            vec![sample_peer("node-c")],
+            vec![Route {
+                destination_cidr: "0.0.0.0/0".to_string(),
+                via_node: NodeId::new("node-c").expect("node should parse"),
+                kind: RouteKind::ExitNodeDefault,
+            }],
+            ApplyOptions {
+                protected_dns: true,
+                ..ApplyOptions::default()
+            },
+        );
+        assert!(failing.is_err());
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        // Critical anti-replay invariant: the safe generation must not
+        // regress.  It can stay the same; it must never go backward.
+        assert!(
+            controller.last_safe_generation() >= safe_after_first,
+            "last_safe_generation regressed: {} -> {}",
+            safe_after_first,
+            controller.last_safe_generation()
+        );
+    }
+
+    #[test]
+    fn repeated_failed_applies_do_not_advance_last_safe_generation() {
+        // Every failed apply must leave `last_safe_generation` unchanged.
+        // A bug that incremented it on failure would let an attacker who
+        // can force apply failures advance the watermark past genuinely
+        // applied generations and either replay or skip evidence.
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default().fail_on("apply_dns_protection"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        for attempt in 1..=3 {
+            let failing = controller.apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    protected_dns: true,
+                    ..ApplyOptions::default()
+                },
+            );
+            assert!(failing.is_err(), "attempt {attempt} should fail");
+            assert_eq!(
+                controller.last_safe_generation(),
+                0,
+                "failed apply {attempt} must not advance last_safe_generation"
+            );
+        }
+    }
+
+    #[test]
+    fn force_fail_closed_returns_err_and_skips_state_transition_when_block_all_egress_fails() {
+        // Documented contract: force_fail_closed only transitions the state
+        // machine to FailClosed AFTER the OS-level block_all_egress
+        // succeeds.  If block_all_egress fails (e.g. firewall daemon
+        // crashed, advfirewall service unavailable), we propagate the error
+        // and leave the state machine at its previous state — claiming
+        // FailClosed when the OS is not actually blocked would lie about
+        // the security posture.
+        //
+        // The next reconcile cycle is the recovery point: the daemon's
+        // main loop calls apply_dataplane_generation again, which runs
+        // prune_owned_tables + rollback_obsolete_controls before
+        // re-applying.  That sequence cleans up any leftover OS state from
+        // the partial fail-closed attempt.
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        // Drive the controller to DataplaneApplied first so we have a
+        // non-Init state to verify is preserved on failure.
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("baseline apply should succeed");
+        assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
+
+        // Swap the system for one that fails on block_all_egress.
+        controller.system = DryRunSystem::default().fail_on("block_all_egress");
+
+        let result = controller.force_fail_closed("test_block_all_egress_failure");
+        assert!(
+            result.is_err(),
+            "force_fail_closed must propagate block_all_egress failure"
+        );
+        assert_ne!(
+            controller.state(),
+            DataplaneState::FailClosed,
+            "state must NOT be FailClosed when block_all_egress failed; \
+             claiming FailClosed without an OS-level block would lie about posture"
+        );
+        assert_eq!(
+            controller.state(),
+            DataplaneState::DataplaneApplied,
+            "state must stay at the prior value when force_fail_closed fails"
+        );
+    }
+
+    #[test]
+    fn force_fail_closed_transitions_state_when_block_all_egress_succeeds() {
+        // Complement to the previous test: when block_all_egress succeeds
+        // the state machine MUST transition to FailClosed.  The contract
+        // is binary — either we get the OS block AND the state, or we get
+        // neither.  No "claimed FailClosed without OS block" middle
+        // ground.
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            WireguardBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions::default(),
+            )
+            .expect("baseline apply should succeed");
+
+        controller
+            .force_fail_closed("test_clean_force_fail_closed")
+            .expect("force_fail_closed must succeed when block_all_egress succeeds");
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
     }
 
     #[test]
