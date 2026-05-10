@@ -8,11 +8,14 @@ Start with these when you need current status, remaining work, or the public imp
 
 - [MasterWorkPlan_2026-03-22.md](./MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
+- [OpenWorkIndex_2026-04-17.md](./OpenWorkIndex_2026-04-17.md)
 
 ## Active Plans And Backlogs
 
 - [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./CrossNetworkRemoteExitNodePlan_2026-03-16.md)
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
+- [DiagnosticFunctionsRoadmap.md](./DiagnosticFunctionsRoadmap.md)
+- [HeterogeneousLiveLabEvidence_2026-04-28.md](./HeterogeneousLiveLabEvidence_2026-04-28.md)
 - [LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./MagicDnsSignedZoneSchema_2026-03-09.md)
 - [OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md](./OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)
@@ -27,12 +30,14 @@ Start with these when you need current status, remaining work, or the public imp
 - [VmLabCapabilityCookbook_2026-04-14.md](./VmLabCapabilityCookbook_2026-04-14.md)
 - [VmLabCapabilityReportingPlan_2026-04-14.md](./VmLabCapabilityReportingPlan_2026-04-14.md)
 - [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md)
+- [WindowsExitAndRelayDeltaPlan_2026-05-10.md](./WindowsExitAndRelayDeltaPlan_2026-05-10.md)
 - [WindowsLabVmStabilityAndSessionModel_2026-04-30.md](./WindowsLabVmStabilityAndSessionModel_2026-04-30.md)
 - [WindowsUtmTransportArchitecture_2026-04-30.md](./WindowsUtmTransportArchitecture_2026-04-30.md)
 - [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 - [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
 - [MacosUserspaceSharedBackendPlan_2026-05-08.md](./MacosUserspaceSharedBackendPlan_2026-05-08.md)
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
+- [RustyfinExtensionTrustPlan_2026-05-10.md](./RustyfinExtensionTrustPlan_2026-05-10.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)
 - [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md)
 - [SecurityHardeningBacklog_2026-03-09.md](./SecurityHardeningBacklog_2026-03-09.md)
@@ -45,6 +50,7 @@ Start with these when you need current status, remaining work, or the public imp
 ## Active Lab Assets
 
 - [UTMVirtualMachineInventory_2026-03-31.md](./UTMVirtualMachineInventory_2026-03-31.md)
+- [rustynet_blind_exit_pcb_report_2026-05-10.docx](./rustynet_blind_exit_pcb_report_2026-05-10.docx)
 - `vm_lab_inventory.json`
 
 ## Rules
