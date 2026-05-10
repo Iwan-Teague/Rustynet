@@ -6193,8 +6193,18 @@ mod tests {
         };
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
         for (credential_id, node_id, endpoint, public_key) in [
-            ("coord-cred-x", "coord-node-x", "198.51.100.180:51820", [180; 32]),
-            ("coord-cred-y", "coord-node-y", "198.51.100.181:51820", [181; 32]),
+            (
+                "coord-cred-x",
+                "coord-node-x",
+                "198.51.100.180:51820",
+                [180; 32],
+            ),
+            (
+                "coord-cred-y",
+                "coord-node-y",
+                "198.51.100.181:51820",
+                [181; 32],
+            ),
         ] {
             core.credentials
                 .create(
