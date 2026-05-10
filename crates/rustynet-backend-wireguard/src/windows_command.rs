@@ -779,6 +779,52 @@ fn validate_host_absolute_path(path: &Path, label: &str) -> Result<(), BackendEr
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ensure_prerequisites_covers_wg_exe_and_wireguard_service_availability() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+
+        let runner = RecordingRunner::default();
+        let backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+
+        backend
+            .ensure_prerequisites()
+            .expect("prerequisites should be satisfied");
+
+        std::fs::remove_file(&wg_path).expect("delete wg.exe");
+        let err = backend
+            .ensure_prerequisites()
+            .expect_err("wg.exe missing should fail");
+        assert!(
+            err.to_string().contains("windows wg.exe binary"),
+            "Error must reference missing wg.exe binary prep: {}",
+            err
+        );
+
+        std::fs::write(&wg_path, "dummy").expect("dummy file");
+        std::fs::remove_file(&wireguard_path).expect("delete wireguard.exe");
+        let err2 = backend
+            .ensure_prerequisites()
+            .expect_err("wireguard.exe missing should fail");
+        assert!(
+            err2.to_string().contains("windows wireguard.exe binary"),
+            "Error must reference missing wireguard.exe binary prep: {}",
+            err2
+        );
+    }
+
     use super::*;
     use base64::prelude::*;
     use rustynet_backend_api::RouteKind;
@@ -1294,7 +1340,9 @@ mod tests {
             // gives a clearer failure signal first.
             let lower = program.to_lowercase();
             assert!(
-                !lower.contains("powershell") && !lower.contains("pwsh") && !lower.contains("cmd.exe"),
+                !lower.contains("powershell")
+                    && !lower.contains("pwsh")
+                    && !lower.contains("cmd.exe"),
                 "windows wireguard backend must not shell out to PowerShell or cmd.exe (saw {program:?})"
             );
             for arg in &args {
@@ -1384,8 +1432,7 @@ mod tests {
         let remove = recorded
             .iter()
             .find(|(program, args)| {
-                program == &wg_path.to_string_lossy()
-                    && args.iter().any(|a| a == "remove")
+                program == &wg_path.to_string_lossy() && args.iter().any(|a| a == "remove")
             })
             .expect("remove command should be recorded");
         assert_eq!(
@@ -1493,7 +1540,14 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let path = temp_dir.path().join("bad.key");
 
-        for bad in ["", "   \n  \n", "abc def", "abc\tdef", "abc;rm", "abc\u{0007}d"] {
+        for bad in [
+            "",
+            "   \n  \n",
+            "abc def",
+            "abc\tdef",
+            "abc;rm",
+            "abc\u{0007}d",
+        ] {
             fs::write(&path, bad).expect("write key");
             assert!(
                 read_private_key_value(&path).is_err(),
