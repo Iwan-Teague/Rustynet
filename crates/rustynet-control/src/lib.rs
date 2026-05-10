@@ -2635,6 +2635,21 @@ impl ControlPlaneCore {
                 "endpoint hints exceed max candidate count".to_string(),
             ));
         }
+        if !is_valid_node_id_text(request.source_node_id.as_str()) {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hint source_node_id must not be empty".to_string(),
+            ));
+        }
+        if !is_valid_node_id_text(request.target_node_id.as_str()) {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hint target_node_id must not be empty".to_string(),
+            ));
+        }
+        if request.source_node_id.trim() == request.target_node_id.trim() {
+            return Err(ControlPlaneError::Traversal(
+                "endpoint hints require distinct source and target".to_string(),
+            ));
+        }
 
         let source = self.nodes.get(&request.source_node_id)?.ok_or_else(|| {
             ControlPlaneError::Traversal("source node does not exist".to_string())
@@ -2930,7 +2945,59 @@ impl ControlPlaneCore {
     }
 
     pub fn verify_signed_endpoint_hint_bundle(&self, bundle: &SignedEndpointHintBundle) -> bool {
+        if bundle.generated_at_unix == 0 {
+            return false;
+        }
         if bundle.generated_at_unix >= bundle.expires_at_unix {
+            return false;
+        }
+        if bundle
+            .expires_at_unix
+            .saturating_sub(bundle.generated_at_unix)
+            > 300
+        {
+            return false;
+        }
+        if !is_valid_node_id_text(bundle.source_node_id.as_str())
+            || !is_valid_node_id_text(bundle.target_node_id.as_str())
+        {
+            return false;
+        }
+        if bundle.source_node_id.trim() == bundle.target_node_id.trim() {
+            return false;
+        }
+        // Cross-check that the outer struct fields a downstream consumer
+        // might trust actually match the bytes that were signed.  Without
+        // this, an attacker (or buggy emitter) could pair a valid signed
+        // payload for `node-a -> node-b` with an outer struct claiming
+        // `node-evil -> node-victim` and the verifier would still return
+        // true.
+        if !endpoint_hint_payload_field_matches(
+            &bundle.payload,
+            "source_node_id",
+            bundle.source_node_id.trim(),
+        ) {
+            return false;
+        }
+        if !endpoint_hint_payload_field_matches(
+            &bundle.payload,
+            "target_node_id",
+            bundle.target_node_id.trim(),
+        ) {
+            return false;
+        }
+        if !endpoint_hint_payload_field_matches(
+            &bundle.payload,
+            "generated_at_unix",
+            &bundle.generated_at_unix.to_string(),
+        ) {
+            return false;
+        }
+        if !endpoint_hint_payload_field_matches(
+            &bundle.payload,
+            "expires_at_unix",
+            &bundle.expires_at_unix.to_string(),
+        ) {
             return false;
         }
         let signature_bytes = match decode_hex_to_fixed::<64>(&bundle.signature_hex) {
@@ -3382,6 +3449,22 @@ fn host_ip_from_host_cidr(value: &str) -> Option<String> {
         return None;
     }
     Some(ip.to_string())
+}
+
+/// Look up the first occurrence of `key=` in an endpoint-hint payload and
+/// confirm the value matches `expected`.  Returns `false` if the key is
+/// absent or the value differs.  Used by the verifier to cross-check outer
+/// struct fields against the signed payload bytes.
+fn endpoint_hint_payload_field_matches(payload: &str, key: &str, expected: &str) -> bool {
+    for line in payload.lines() {
+        let Some((line_key, line_value)) = line.split_once('=') else {
+            continue;
+        };
+        if line_key == key {
+            return line_value == expected;
+        }
+    }
+    false
 }
 
 fn serialize_endpoint_hint_payload(
@@ -5087,6 +5170,634 @@ mod tests {
                 "expected '{expected}' in '{err}'"
             );
         }
+    }
+
+    /// Build an allow-all `ControlPlaneCore` with two enrolled nodes
+    /// `node-a` and `node-b` so endpoint-hint tests can issue bundles
+    /// without re-pasting enrollment boilerplate.
+    fn endpoint_hint_test_core() -> ControlPlaneCore {
+        let policy = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), policy);
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("eh-cred-a", "node-a", "198.51.100.90:51820", [90; 32]),
+            ("eh-cred-b", "node-b", "198.51.100.91:51820", [91; 32]),
+        ] {
+            core.credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core.enroll_with_throwaway(EnrollmentRequest {
+                credential_id: credential_id.to_string(),
+                node_id: node_id.to_string(),
+                hostname: node_id.to_string(),
+                os: "linux".to_string(),
+                tags: vec!["servers".to_string()],
+                owner: "alice@example.local".to_string(),
+                endpoint: endpoint.to_string(),
+                public_key,
+                now_unix: 120,
+            })
+            .expect("enrollment should succeed");
+        }
+        core
+    }
+
+    fn endpoint_hint_request() -> EndpointHintBundleRequest {
+        EndpointHintBundleRequest {
+            source_node_id: "node-a".to_string(),
+            target_node_id: "node-b".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 60,
+            nonce: 17,
+            candidates: vec![EndpointHintCandidate {
+                candidate_type: EndpointHintCandidateType::Host,
+                endpoint: "10.0.0.5:51820".to_string(),
+                relay_id: None,
+                priority: 10,
+            }],
+        }
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_self_addressed_bundle() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.target_node_id = "node-a".to_string();
+        let result = core.signed_endpoint_hint_bundle(request);
+        assert!(
+            result
+                .expect_err("self-addressed endpoint hints must fail")
+                .to_string()
+                .contains("distinct source and target")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_self_addressed_with_whitespace() {
+        // Trim-equality must reject `"node-a"` vs `" node-a "` to prevent
+        // bypass of the distinct-source-target check.
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.source_node_id = " node-a ".to_string();
+        request.target_node_id = "node-a".to_string();
+        let result = core.signed_endpoint_hint_bundle(request);
+        // Either node-not-found (untrimmed lookup) or distinct-source-target
+        // is acceptable; the only unacceptable outcome is a successfully
+        // issued self-addressed bundle.
+        assert!(
+            result.is_err(),
+            "whitespace-padded self-addressed hints must be rejected"
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_empty_node_ids() {
+        let core = endpoint_hint_test_core();
+        let mut empty_source = endpoint_hint_request();
+        empty_source.source_node_id = String::new();
+        assert!(core.signed_endpoint_hint_bundle(empty_source).is_err());
+
+        let mut whitespace_target = endpoint_hint_request();
+        whitespace_target.target_node_id = "   ".to_string();
+        assert!(core.signed_endpoint_hint_bundle(whitespace_target).is_err());
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_zero_generated_at() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.generated_at_unix = 0;
+        let result = core.signed_endpoint_hint_bundle(request);
+        assert!(
+            result
+                .expect_err("generated_at_unix=0 must fail")
+                .to_string()
+                .contains("generated_at_unix must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_zero_ttl() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.ttl_secs = 0;
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("ttl=0 must fail")
+                .to_string()
+                .contains("ttl must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_ttl_above_max() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.ttl_secs = 301;
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("ttl=301 must fail")
+                .to_string()
+                .contains("ttl exceeds max supported value")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_accepts_ttl_at_max_boundary() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.ttl_secs = 300;
+        let bundle = core
+            .signed_endpoint_hint_bundle(request)
+            .expect("ttl=300 (boundary) must succeed");
+        assert!(core.verify_signed_endpoint_hint_bundle(&bundle));
+        assert_eq!(bundle.expires_at_unix - bundle.generated_at_unix, 300);
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_empty_candidates() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates.clear();
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("empty candidates must fail")
+                .to_string()
+                .contains("at least one candidate")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_too_many_candidates() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates = (0..9u16)
+            .map(|i| EndpointHintCandidate {
+                candidate_type: EndpointHintCandidateType::Host,
+                endpoint: format!("10.0.0.{}:51820", i + 10),
+                relay_id: None,
+                priority: i,
+            })
+            .collect();
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("9 candidates must fail")
+                .to_string()
+                .contains("exceed max candidate count")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_accepts_max_candidates_at_boundary() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates = (0..8u16)
+            .map(|i| EndpointHintCandidate {
+                candidate_type: EndpointHintCandidateType::Host,
+                endpoint: format!("10.0.0.{}:51820", i + 10),
+                relay_id: None,
+                priority: i,
+            })
+            .collect();
+        let bundle = core
+            .signed_endpoint_hint_bundle(request)
+            .expect("8 candidates (boundary) must succeed");
+        assert!(core.verify_signed_endpoint_hint_bundle(&bundle));
+        assert_eq!(
+            payload_field(&bundle.payload, "candidate_count").as_deref(),
+            Some("8")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_zero_port() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates[0].endpoint = "10.0.0.5:0".to_string();
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("port=0 must fail")
+                .to_string()
+                .contains("port must be non-zero")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_unparseable_endpoint() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates[0].endpoint = "not-an-address".to_string();
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("invalid endpoint must fail")
+                .to_string()
+                .contains("invalid")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_relay_id_on_non_relay_candidate() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates[0].relay_id = Some("relay-eu-1".to_string());
+        request.candidates[0].candidate_type = EndpointHintCandidateType::Host;
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("relay_id on host candidate must fail")
+                .to_string()
+                .contains("only valid for relay candidates")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_rejects_whitespace_only_relay_id() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates = vec![EndpointHintCandidate {
+            candidate_type: EndpointHintCandidateType::Relay,
+            endpoint: "203.0.113.55:443".to_string(),
+            relay_id: Some("   ".to_string()),
+            priority: 1,
+        }];
+        assert!(
+            core.signed_endpoint_hint_bundle(request)
+                .expect_err("whitespace-only relay_id must fail")
+                .to_string()
+                .contains("relay candidates require relay_id")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_payload_pins_canonical_ordering() {
+        // Pin priority-desc, then type-asc, then endpoint-asc, then
+        // relay_id-asc.  Re-arranging input must produce identical bytes.
+        let core = endpoint_hint_test_core();
+        let request_a = EndpointHintBundleRequest {
+            source_node_id: "node-a".to_string(),
+            target_node_id: "node-b".to_string(),
+            generated_at_unix: 200,
+            ttl_secs: 60,
+            nonce: 1,
+            candidates: vec![
+                EndpointHintCandidate {
+                    candidate_type: EndpointHintCandidateType::Host,
+                    endpoint: "10.0.0.4:51820".to_string(),
+                    relay_id: None,
+                    priority: 5,
+                },
+                EndpointHintCandidate {
+                    candidate_type: EndpointHintCandidateType::Relay,
+                    endpoint: "203.0.113.10:443".to_string(),
+                    relay_id: Some("relay-eu-1".to_string()),
+                    priority: 30,
+                },
+                EndpointHintCandidate {
+                    candidate_type: EndpointHintCandidateType::ServerReflexive,
+                    endpoint: "198.51.100.5:54321".to_string(),
+                    relay_id: None,
+                    priority: 30,
+                },
+            ],
+        };
+        let mut request_b = request_a.clone();
+        request_b.candidates.reverse();
+        let bundle_a = core
+            .signed_endpoint_hint_bundle(request_a)
+            .expect("bundle a must succeed");
+        let bundle_b = core
+            .signed_endpoint_hint_bundle(request_b)
+            .expect("bundle b must succeed");
+        assert_eq!(
+            bundle_a.payload, bundle_b.payload,
+            "payload must be order-independent (canonical sort)"
+        );
+        // Highest priority must come first; tie broken by type-asc
+        // ('relay' < 'srflx').
+        assert_eq!(
+            payload_field(&bundle_a.payload, "candidate.0.type").as_deref(),
+            Some("relay")
+        );
+        assert_eq!(
+            payload_field(&bundle_a.payload, "candidate.1.type").as_deref(),
+            Some("srflx")
+        );
+        assert_eq!(
+            payload_field(&bundle_a.payload, "candidate.2.type").as_deref(),
+            Some("host")
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_signer_payload_pins_required_fields_and_order() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let lines: Vec<&str> = bundle.payload.lines().collect();
+        assert_eq!(lines[0], "version=1");
+        assert_eq!(lines[1], "path_policy=direct_preferred_relay_allowed");
+        assert!(lines[2].starts_with("source_node_id="));
+        assert!(lines[3].starts_with("target_node_id="));
+        assert!(lines[4].starts_with("generated_at_unix="));
+        assert!(lines[5].starts_with("expires_at_unix="));
+        assert!(lines[6].starts_with("nonce="));
+        assert!(lines[7].starts_with("candidate_count="));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_zero_generated_at() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle;
+        tampered.generated_at_unix = 0;
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_generated_at_eq_expires_at() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.expires_at_unix = tampered.generated_at_unix;
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_generated_at_gt_expires_at() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.expires_at_unix = tampered.generated_at_unix - 1;
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_ttl_window_above_max() {
+        // The signer caps TTL at 300s.  The verifier MUST also enforce
+        // this bound — otherwise an attacker who reuses a leaked signing
+        // key could mint arbitrarily long-lived bundles.
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.expires_at_unix = tampered.generated_at_unix + 301;
+        assert!(
+            !core.verify_signed_endpoint_hint_bundle(&tampered),
+            "verifier must reject TTL window > 300s"
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_self_addressed_outer_struct() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.target_node_id = tampered.source_node_id.clone();
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_empty_node_id_in_outer_struct() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut empty_source = bundle.clone();
+        empty_source.source_node_id = String::new();
+        assert!(!core.verify_signed_endpoint_hint_bundle(&empty_source));
+
+        let mut empty_target = bundle.clone();
+        empty_target.target_node_id = "   ".to_string();
+        assert!(!core.verify_signed_endpoint_hint_bundle(&empty_target));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_outer_source_mismatched_to_payload() {
+        // Attacker takes a valid signed bundle for `node-a -> node-b` and
+        // reframes the outer struct as `node-evil -> node-b`.  Without the
+        // cross-check, a downstream consumer that trusts
+        // `bundle.source_node_id` would be misled.
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.source_node_id = "node-evil".to_string();
+        assert!(
+            !core.verify_signed_endpoint_hint_bundle(&tampered),
+            "outer source_node_id must match payload"
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_outer_target_mismatched_to_payload() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.target_node_id = "node-evil".to_string();
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_outer_generated_at_mismatched_to_payload() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        // Move forward but stay inside the 300s window so we don't trip
+        // the TTL bound first.
+        tampered.generated_at_unix = bundle.generated_at_unix + 1;
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_outer_expires_at_mismatched_to_payload() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.expires_at_unix = bundle.expires_at_unix + 1;
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_payload_with_swapped_source_target() {
+        // If only the payload's source/target lines are swapped, the
+        // signature naturally breaks AND the cross-check between outer
+        // struct and payload fails — both layers catch it.
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.payload = tampered
+            .payload
+            .replace("source_node_id=node-a", "source_node_id=node-b-swap-tmp")
+            .replace("target_node_id=node-b", "target_node_id=node-a")
+            .replace("source_node_id=node-b-swap-tmp", "source_node_id=node-b");
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_corrupt_signature_hex() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered.signature_hex = "not-hex".to_string();
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_short_signature_hex() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        tampered
+            .signature_hex
+            .truncate(tampered.signature_hex.len() - 2);
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_tampered_payload_byte() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        let mut tampered = bundle.clone();
+        // Flip the last visible byte of the version line.
+        tampered.payload = tampered.payload.replacen("version=1", "version=2", 1);
+        assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_signature_from_wrong_signing_key() {
+        // A bundle signed by a different control plane (different signing
+        // secret) must not verify against this core's verifying key.
+        let core_a = endpoint_hint_test_core();
+        let policy_b = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_string(),
+                dst: "*".to_string(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let core_b = ControlPlaneCore::new(b"different-secret".to_vec(), policy_b);
+        for (credential_id, node_id, endpoint, public_key) in [
+            ("eh-cred-a", "node-a", "198.51.100.92:51820", [92; 32]),
+            ("eh-cred-b", "node-b", "198.51.100.93:51820", [93; 32]),
+        ] {
+            core_b
+                .credentials
+                .create(
+                    credential_id.to_string(),
+                    "admin".to_string(),
+                    "tag:servers".to_string(),
+                    100,
+                    60,
+                )
+                .expect("credential should be created");
+            core_b
+                .enroll_with_throwaway(EnrollmentRequest {
+                    credential_id: credential_id.to_string(),
+                    node_id: node_id.to_string(),
+                    hostname: node_id.to_string(),
+                    os: "linux".to_string(),
+                    tags: vec!["servers".to_string()],
+                    owner: "alice@example.local".to_string(),
+                    endpoint: endpoint.to_string(),
+                    public_key,
+                    now_unix: 120,
+                })
+                .expect("enrollment should succeed");
+        }
+        let bundle_b = core_b
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed under core_b");
+        // Sanity: verifies under its own core.
+        assert!(core_b.verify_signed_endpoint_hint_bundle(&bundle_b));
+        // But MUST NOT verify under a different core.
+        assert!(
+            !core_a.verify_signed_endpoint_hint_bundle(&bundle_b),
+            "bundle signed with different key must not verify"
+        );
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_accepts_unmodified_bundle() {
+        let core = endpoint_hint_test_core();
+        let bundle = core
+            .signed_endpoint_hint_bundle(endpoint_hint_request())
+            .expect("bundle must succeed");
+        // Round-trip the wire form to confirm verifier accepts identical
+        // bytes.
+        let wire = ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&bundle);
+        assert!(wire.contains("signature="));
+        assert!(wire.starts_with("version=1\n"));
+        assert!(core.verify_signed_endpoint_hint_bundle(&bundle));
+    }
+
+    #[test]
+    fn endpoint_hint_payload_field_matches_helper_handles_edge_cases() {
+        // Direct unit test of the cross-check helper used by the verifier.
+        let payload = "version=1\nsource_node_id=node-a\ntarget_node_id=node-b\n";
+        assert!(super::endpoint_hint_payload_field_matches(
+            payload,
+            "source_node_id",
+            "node-a",
+        ));
+        assert!(!super::endpoint_hint_payload_field_matches(
+            payload,
+            "source_node_id",
+            "node-b",
+        ));
+        // Missing key MUST be rejected — never default to `true`.
+        assert!(!super::endpoint_hint_payload_field_matches(
+            payload,
+            "absent_key",
+            "anything",
+        ));
+        // Empty-value match still requires presence of the key.
+        assert!(!super::endpoint_hint_payload_field_matches(
+            payload, "absent", "",
+        ));
+        // Lines without `=` must be skipped, not split spuriously.
+        let weird = "version=1\nno-equals-line\nsource_node_id=node-a\n";
+        assert!(super::endpoint_hint_payload_field_matches(
+            weird,
+            "source_node_id",
+            "node-a",
+        ));
     }
 
     #[test]

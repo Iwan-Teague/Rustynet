@@ -3044,6 +3044,84 @@ silently reopen the window without the assertion firing.
 - Blocker / prerequisite:
   - W5 live-lab run still required (see previous entries).
 
+Evidence update (2026-05-10, slice 8 — endpoint-hint outer-vs-payload cross-check + 33 hardening tests):
+
+**Real security fix — load-bearing outer-struct/payload mismatch.**
+`verify_signed_endpoint_hint_bundle` blindly trusted the outer struct's
+`source_node_id`, `target_node_id`, `generated_at_unix`, and `expires_at_unix`.
+Anyone holding a valid signed bundle could re-frame the outer struct (e.g.
+claim source = "node-evil") and the verifier still returned `true`.  A
+downstream consumer reading fields off the outer struct would be misled into
+treating an attacker's claimed framing as authoritative.  The
+coordination-record verifier already does the equivalent cross-check;
+endpoint-hint verifier did not.
+
+Plus four other gaps fixed in the same audit:
+* TTL bound (signer caps at 300s; verifier did not)
+* `generated_at_unix == 0` reject on verify (signer rejects; verifier did not)
+* Empty / whitespace node-id reject on verify
+* Self-addressed bundles (`source_node_id == target_node_id`) accepted by
+  signer; coordination-record signer rejects.  Now rejected here too,
+  including whitespace-padded variants caught via `is_valid_node_id_text`
+  + trim-equality.
+
+- Changed files:
+  - `crates/rustynet-control/src/lib.rs`
+    - `signed_endpoint_hint_bundle` (signer): `is_valid_node_id_text` checks
+      on source/target IDs and trim-equality reject for self-addressed
+      bundles, before policy/node lookup.
+    - `verify_signed_endpoint_hint_bundle` (verifier): added (a)
+      `generated_at_unix == 0` reject, (b) TTL window > 300s reject, (c)
+      empty / whitespace node-id reject, (d) trim-equal self-addressed
+      reject, (e) cross-check that outer-struct `source_node_id` /
+      `target_node_id` / `generated_at_unix` / `expires_at_unix` literally
+      match the four corresponding lines in the signed payload.
+    - New free fn `endpoint_hint_payload_field_matches(payload, key, expected)
+      -> bool`.  Returns false on missing key (never defaults to true) and
+      on mismatch.
+    - 33 new tests:
+      - 16 signer tests (self-addressed reject, whitespace handling, zero
+        generated_at, zero TTL, TTL above max, max-TTL boundary, empty
+        candidates, too-many candidates, max-candidates boundary, zero
+        port, unparseable endpoint, relay_id on non-relay candidate,
+        whitespace-only relay_id, canonical payload ordering, required
+        fields and order)
+      - 16 verifier tests (zero generated_at, generated_at == expires_at,
+        generated_at > expires_at, TTL above max, self-addressed outer
+        struct, empty node-id outer struct, four outer-struct-mismatch
+        tests covering every field, swapped source/target in payload,
+        corrupt sig hex, short sig hex, tampered payload byte, sig from
+        wrong signing key, accepts unmodified bundle)
+      - 1 helper test (`endpoint_hint_payload_field_matches_helper_handles_edge_cases`)
+- Verification:
+  - `cargo fmt --all -- --check` (clean)
+  - `cargo test -p rustynet-control --all-features` (97 → 130 lib, +33)
+  - `cargo test -p rustynetd --all-features` (643 lib + 60 bin + 3 integration unchanged)
+  - `cargo test -p rustynet-relay --all-features` (71 lib + 54 bin unchanged)
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings` (clean)
+- Artifacts:
+  - Local unit-test evidence only.
+- Residual risk:
+  - **Auto-tunnel verifier has the same outer-struct-vs-payload weakness.**
+    `verify_signed_auto_tunnel_bundle` only does sig verify +
+    `generated_at <= expires_at`, no cross-check.  Flagged for the next
+    slice — same fix pattern (`endpoint_hint_payload_field_matches`-style
+    helper) should apply.  Not fixed in this slice to keep scope contained.
+  - No replay store on the endpoint-hint verifier.  Each `(source, target,
+    nonce, generated_at_unix)` is verifiable arbitrarily many times.  Per
+    design, replay defence belongs to the receiver — but no such
+    receiver-side store currently exists in this crate.
+  - No version gate on either endpoint-hint or coordination-record
+    verifiers.  Both accept `version=1` implicitly because re-canonicalisation
+    isn't done; any future `version=2` would silently verify if signed by
+    the same key.  Worth adding an explicit `version=1\n` prefix check in
+    both verifiers.
+  - Node-id case sensitivity: `nodes.get` is case-sensitive; if duplicate
+    enrolment with different case ever lands, hint bundles for `Node-A`
+    vs `node-a` would be distinct.  Cross-cutting concern beyond this file.
+- Blocker / prerequisite:
+  - W5 live-lab run still required (see previous entries).
+
 ## 11) Definition Of Done
 
 This delta closes only when **all** are true:
