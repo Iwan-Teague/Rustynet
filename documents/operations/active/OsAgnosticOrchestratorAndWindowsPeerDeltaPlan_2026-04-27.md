@@ -2509,6 +2509,292 @@ conservatively.
       [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
       DoD met
 
+Evidence update (2026-05-10):
+- Changed files:
+  - `crates/rustynetd/src/phase10.rs`
+    - Threaded mesh CIDR plus exit intent into `DataplaneSystem::apply_nat_forwarding(...)`.
+    - Added Windows exit-node serving setup with `Set-NetIPInterface` forwarding and `New-NetNat`.
+    - Kept PowerShell scripts fixed and passed NAT names / interface aliases / CIDRs as separate process args.
+    - Added owned NetNat naming, IPv4-only mesh prefix validation, forwarding pre-state capture, apply-time
+      verification, and rollback restoration/removal.
+    - Added committed dataplane stage tracking so shutdown/service-stop rolls back owned OS controls before
+      claiming the dataplane is stopped.
+    - Made apply-failure rollback best-effort and still force fail-closed even when one cleanup step fails.
+    - Made shutdown cleanup failures transition to `FailClosed` instead of incorrectly reporting `Init`.
+    - Added obsolete-control rollback on successful role changes so switching from Windows exit-serving back to
+      plain mesh removes previously owned NAT/forwarding, DNS, and IPv6 controls instead of leaving stale OS state.
+    - Retired only obsolete committed-stage markers during role-change cleanup while preserving still-live
+      previous-generation markers after failed same-role exit re-apply, so shutdown can always remove live
+      NAT/DNS/IPv6 controls without replaying already-retired ones.
+    - Made backend cleanup idempotent for already-stopped backends during rollback so OS-control cleanup can still
+      complete after a failed re-apply stops the backend first.
+    - Preserved Windows full-tunnel client behavior when consuming a remote exit node; that path still does not
+      require local NAT.
+    - Added regression tests for Windows NAT helper validation, PowerShell argv separation, and Windows exit-client
+      no-op NAT behavior.
+- Verification:
+  - `cargo fmt -p rustynetd`
+  - `cargo test -p rustynetd windows_exit -- --nocapture`
+  - `cargo test -p rustynetd nat -- --nocapture`
+  - `cargo test -p rustynetd apply_rollback -- --nocapture`
+  - `cargo test -p rustynetd shutdown_rolls_back_exit_serving_nat_and_os_controls -- --nocapture`
+  - `cargo test -p rustynetd shutdown_cleanup_failure_reports_fail_closed_not_init -- --nocapture`
+  - `cargo test -p rustynetd role_change_from_exit_serving_rolls_back_obsolete_nat -- --nocapture`
+  - `cargo test -p rustynetd failed_reapply_after_exit_rolls_back_without_stale_exit_markers -- --nocapture`
+  - `cargo test -p rustynetd failed_exit_reapply_preserves_live_exit_markers_for_shutdown_cleanup -- --nocapture`
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features`
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd --all-targets --all-features -- -D warnings`
+- Artifacts:
+  - Local unit-test evidence only; no new live Windows lab artifact was produced in this slice.
+- Residual risk:
+  - Windows-as-exit still requires W5 live-lab proof before posture promotion.
+  - Current Windows NetNat implementation is IPv4-only; IPv6 exit serving remains fail-closed.
+  - Live Windows service-stop proof must still confirm NetNat removal and forwarding restoration under SCM context.
+- Blocker / prerequisite:
+  - W5 must prove SCM-context NetNat availability, forwarding enable/restore, NAT removal, DNS fail-closed behavior,
+    and client internet reachability through the Windows exit before Windows exit-node support is claimed.
+
+Evidence update (2026-05-10, slice 2 — egress interface hardening):
+- Changed files:
+  - `crates/rustynetd/src/phase10.rs`
+    - Fixed `validate_windows_interface_alias` to accept spaces and parentheses that appear in
+      common real Windows adapter names ("Ethernet 2", "vEthernet (Default Switch)").  Previous
+      validator rejected any space, making real deployments impossible.
+    - Still rejects control characters (newlines, tabs, null bytes — would corrupt log lines and
+      format strings) and '=' (would corrupt the key=value netsh argument format).  Extended max
+      length from 32 to 64 chars to cover long Hyper-V interface names.
+    - Added `windows_interface_alias_validator_accepts_real_windows_names` — verifies that
+      "Ethernet", "Wi-Fi", "Ethernet 2", "Local Area Connection", and "vEthernet (Default Switch)"
+      all pass validation.
+    - Added `windows_interface_alias_validator_rejects_dangerous_characters` — verifies that
+      newline, tab, null byte, '=', non-ASCII, empty, and >64-char aliases all fail closed.
+    - Added `windows_command_system_accepts_interface_alias_with_space` — constructs
+      `WindowsCommandSystem` with egress alias "Ethernet 2" and confirms construction succeeds.
+    - Added `windows_nat_name_embeds_alias_and_rejects_invalid_aliases` — verifies that the NAT
+      name for "Ethernet 2" is "RustyNetExit-Ethernet 2", that a newline alias is rejected, and
+      that an '=' alias is rejected.
+  - `crates/rustynetd/src/daemon.rs`
+    - Added `parse_windows_default_egress_interface_output(raw, tunnel_alias)` — pure
+      platform-agnostic function that parses and validates the PowerShell egress detection output.
+      Fails closed on: empty output, non-ASCII, control characters, '=', >64 chars, and when the
+      detected alias equals the WireGuard tunnel alias (stale-route protection).
+    - Updated Windows `detect_default_egress_interface` to use a new parameterised PowerShell
+      script `WINDOWS_PS_DETECT_DEFAULT_EGRESS_INTERFACE` that filters the tunnel adapter out of
+      default-route candidates via `Where-Object { $_.InterfaceAlias -ne $TunnelAlias }` before
+      selecting the lowest-metric route.  The tunnel alias is a PowerShell script parameter
+      (`param($TunnelAlias)`) — never interpolated into the script body.
+    - Updated `resolve_configured_egress_interface` to capture `config.wg_interface` and pass it
+      to the detection closure so the correct tunnel alias is excluded at detection time.
+    - Updated Linux and macOS `detect_default_egress_interface` signatures to accept
+      `_tunnel_alias: &str` (unused on those platforms, matching the new generic contract).
+    - Added 4 unit tests (testable on all host platforms):
+      - `parse_windows_egress_output_accepts_common_interface_names` — "Ethernet", "Ethernet 2"
+        (with trailing CRLF), "Wi-Fi" with empty tunnel alias.
+      - `parse_windows_egress_output_fails_closed_for_empty_or_invalid_output` — empty,
+        whitespace-only, newline, tab, '=', non-ASCII, >64-char aliases.
+      - `parse_windows_egress_output_fails_closed_when_tunnel_is_best_default_route` — alias
+        equals tunnel alias (exact and case-variant), plus confirms empty tunnel alias skips check.
+      - `parse_windows_egress_output_script_uses_param_not_interpolation` — verifies the Windows
+        PS script binds `$TunnelAlias` as a parameter and contains no hard-coded tunnel values.
+- Verification:
+  - `cargo fmt --all -- --check` (clean)
+  - `cargo test -p rustynetd windows -- --nocapture` (all pass)
+  - `cargo test -p rustynetd egress -- --nocapture` (all pass)
+  - `cargo test -p rustynetd nat -- --nocapture` (all pass)
+  - `cargo test -p rustynetd --all-features` (590 lib + 60 bin + 3 integration — all pass)
+  - `cargo test -p rustynet-relay --all-features` (56 lib + 40 bin — all pass)
+  - `cargo test -p rustynet-control relay` (20 pass)
+  - `cargo check -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features` (clean)
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings` (clean)
+- Artifacts:
+  - Local unit-test evidence only; no new live Windows lab artifact.
+- Residual risk:
+  - Windows-as-exit still requires W5 live-lab proof before posture promotion.
+  - IPv6 exit serving remains fail-closed (IPv4 NetNat only).
+  - Live proof of SCM-context egress detection excluding stale tunnel routes is not yet available.
+- Blocker / prerequisite:
+  - W5 live-lab run still required (see previous entry).
+
+Evidence update (2026-05-10, slice 3 — PS script structure / relay-id / argv parser / IPv6 egress):
+- Changed files:
+  - `crates/rustynetd/src/phase10.rs`
+    - Extracted IPv6 egress netsh argv into pure helpers `windows_ipv6_egress_disable_args` and
+      `windows_ipv6_egress_rollback_args` so the argv structure can be statically verified.
+    - Added 3 PowerShell-script structural tests:
+      - `windows_exit_cmdlet_check_enumerates_all_required_cmdlets` — verifies the cmdlet
+        pre-flight script names every cmdlet the exit-serving path actually invokes
+        (`Get-NetIPInterface`, `Set-NetIPInterface`, `New-NetNat`, `Get-NetNat`, `Remove-NetNat`)
+        and uses `$ErrorActionPreference = 'Stop'`.  This is the single fail-closed point that
+        catches Windows Home / RemoteAccess-disabled SKUs.
+      - `windows_exit_powershell_scripts_use_stop_error_action_and_param_binding` — every NAT /
+        forwarding helper script uses `$ErrorActionPreference = 'Stop'`, binds untrusted values
+        as `param(...)`, and the live-state cmdlets use `-ErrorAction Stop`.
+      - `windows_exit_powershell_scripts_do_not_interpolate_known_data_values` — static guard
+        that no interface alias, NAT name, or forwarding state is hard-coded into a script body.
+    - Added 4 IPv6 egress argv tests:
+      - `windows_ipv6_egress_helpers_render_reviewed_netsh_args` — exact argv match.
+      - `windows_ipv6_egress_helpers_keep_alias_with_space_as_one_argv_token` — interface alias
+        with space ("Ethernet 2", "vEthernet (Default Switch)") stays one argv token; no shell
+        quoting embedded.
+      - `windows_ipv6_egress_disable_and_rollback_args_differ_only_in_flag_state` — disable and
+        rollback arg sequences are byte-identical except for `*=disabled` vs `*=enabled`,
+        guaranteeing rollback exactly undoes disable on the same interface and store.
+      - `windows_command_system_rollback_ipv6_is_no_op_when_not_disabled` — verifies rollback
+        on a freshly-constructed system does not call netsh, so we never re-enable IPv6
+        router-discovery on an interface whose original state we never captured.
+  - `crates/rustynet-control/src/lib.rs`
+    - Added 4 relay-id canonicalisation tests:
+      - `relay_id_label_canonicalization_is_case_sensitive` — case-different labels
+        ("Relay-EU-1" / "relay-eu-1" / "Relay-eu-1") canonicalise to *different* relay IDs,
+        preventing accidental impersonation if we ever added implicit lowercasing.
+      - `relay_id_label_canonicalization_zero_pads_short_labels` — short labels are zero-padded
+        in the tail; the tail bytes are byte-equal across different short labels so collisions
+        cannot arise from leftover memory.
+      - `relay_id_label_canonicalization_accepts_exact_16_byte_label` — exact 16 bytes accepted,
+        17 bytes rejected (boundary).
+      - `relay_id_label_canonicalization_distinguishes_internal_whitespace_from_concatenation`
+        — "relay 1" and "relay1" canonicalise to different IDs (no silent space stripping).
+    - Extended `relay_id_label_canonicalization_rejects_ambiguous_labels` to also reject CR
+      (`\r`).
+  - `crates/rustynet-relay/src/main.rs`
+    - Added 5 image-path argv parser tests for `parse_windows_image_path_argv`:
+      - `relay_windows_image_path_parser_returns_empty_for_empty_or_whitespace_input`
+      - `relay_windows_image_path_parser_handles_unquoted_path_without_spaces`
+      - `relay_windows_image_path_parser_collapses_runs_of_whitespace` — multiple spaces / tabs
+        collapse to a single delimiter, matching CommandLineToArgvW so an attacker cannot craft
+        an SCM ImagePath with extra whitespace that produces different argv than the hardening
+        checker expects.
+      - `relay_windows_image_path_parser_preserves_whitespace_inside_quotes`
+      - `relay_windows_image_path_parser_joins_concatenated_quoted_and_unquoted_segments`
+- Verification:
+  - `cargo fmt --all -- --check` (clean)
+  - `cargo test -p rustynetd --all-features` (597 lib + 60 bin + 3 integration — all pass)
+  - `cargo test -p rustynet-relay --all-features` (56 lib + 45 bin — all pass)
+  - `cargo test -p rustynet-control --all-features` (97 lib — all pass)
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings` (clean)
+- Artifacts:
+  - Local unit-test evidence only; no new live Windows lab artifact.
+- Residual risk:
+  - Live proof of SCM-context cmdlet pre-flight on Windows Home (where the cmdlets are
+    expected to be missing) is not yet available; the unit test only verifies the script
+    structure.
+  - The Windows IPv6 egress disable still relies on the firewall killswitch as the primary
+    block; it adds defense-in-depth against SLAAC auto-configuration but does not by itself
+    block IPv6 traffic.  This is consistent with prior design intent.
+- Blocker / prerequisite:
+  - W5 live-lab run still required (see previous entries).
+
+Evidence update (2026-05-10, slice 4 — DNS leak fix / firewall / token / Authenticode):
+
+**Security gap closed**: Windows `apply_dns_protection` was a silent no-op
+(`Ok(())` with a comment that read like a TODO).  The killswitch allows all LAN
+outbound for the WireGuard handshake, so without DNS protection an app could
+talk directly to a router/ISP DNS server and leak the user's lookup history.
+Linux blocks port 53 outbound on non-tunnel interfaces via nft; macOS blocks
+the same via pf.  Windows now does the equivalent via netsh advfirewall.
+
+- Changed files:
+  - `crates/rustynetd/src/phase10.rs`
+    - Replaced the no-op `apply_dns_protection` on Windows with two netsh
+      advfirewall block rules that match Linux/macOS DNS-protection semantics:
+      - `RustyNetDNS-BlockLanUdp`: outbound UDP/53 on `interfacetype=lan`
+      - `RustyNetDNS-BlockLanTcp`: outbound TCP/53 on `interfacetype=lan`
+      Block rules in Windows advfirewall always take precedence over allow
+      rules, so this overrides the killswitch's blanket LAN-allow rule for
+      port-53 traffic specifically while leaving the WireGuard handshake on
+      LAN and tunnel-internal DNS untouched.
+    - Updated `rollback_dns_protection` on Windows to delete both rules and
+      surface a `RollbackFailed` if either delete encounters a real netsh
+      error (a missing rule is not treated as a failure).
+    - Apply path is best-effort idempotent: stale rules from a previous run
+      are purged before re-add; if the TCP rule add fails after the UDP rule
+      succeeded, the UDP rule is rolled back so we never leave a half-applied
+      state.
+    - Extracted 5 testable netsh-arg helpers (no behaviour change to existing
+      Linux/macOS paths):
+      - `windows_dns_block_lan_args(rule_name, protocol)`
+      - `windows_firewall_delete_rule_args(rule_name)`
+      - `windows_firewall_block_outbound_policy_args()`
+      - `windows_firewall_allow_loopback_args(rule_name)`
+      - `windows_firewall_allow_interfacetype_args(rule_name, iface_type)`
+      `apply_firewall_killswitch` now delegates to those helpers.
+    - Added `#[allow(dead_code)]` to `clear_dns_loopback` and
+      `windows_dns_clear_args` (the optional NRPT/interface-DNS path that
+      requires the daemon to bind 127.0.0.1:53 — kept for future opt-in).
+    - 9 new tests:
+      - `windows_dns_block_lan_helper_renders_reviewed_netsh_block_args` —
+        exact UDP and TCP block-rule argv match.
+      - `windows_dns_block_lan_helper_uses_block_action_targeting_lan_only` —
+        action MUST be `block` (not `allow`) and interface MUST be `lan`
+        (not `any` or `ras`); otherwise the rule could either block tunnel
+        DNS (breaking resolution) or allow LAN DNS (defeating the protection).
+      - `windows_firewall_delete_rule_helper_renders_reviewed_args`
+      - `windows_dns_protection_rule_names_are_distinct_from_killswitch_rule_names`
+        — DNS rules must not collide with KS rule names; the idempotent
+        purge-by-name at apply would otherwise remove a control we still need.
+      - `windows_command_system_rollback_dns_protection_is_no_op_when_not_applied`
+      - `windows_firewall_block_outbound_policy_targets_all_profiles` —
+        `allowinbound,blockoutbound` on `allprofiles`; never the inverse.
+      - `windows_firewall_allow_loopback_helper_constrains_to_loopback_subnet`
+        — both `localip` AND `remoteip` must be `127.0.0.0/8`; missing
+        `remoteip` would let local processes reach any remote.
+      - `windows_firewall_allow_interfacetype_helper_renders_correct_args`
+      - `windows_firewall_killswitch_rules_have_distinct_names` — distinct
+        names + `RustyNetKS-` prefix invariant.
+  - `crates/rustynetd/src/relay_client.rs`
+    - Added 5 fail-closed tests for `validate_issued_relay_session_token`
+      via `establish_session_with_round_trip` — every test confirms the
+      validation rejects BEFORE any I/O occurs (the round-trip closure is
+      `unreachable!()`):
+      - `relay_client_rejects_token_with_node_id_mismatch_before_io`
+      - `relay_client_rejects_token_with_relay_id_mismatch_before_io`
+      - `relay_client_rejects_token_with_wrong_scope_before_io`
+      - `relay_client_rejects_token_with_all_zero_nonce_before_io`
+      - `relay_client_rejects_token_with_ttl_exceeding_requested_ttl_before_io`
+  - `crates/rustynetd/src/windows_authenticode.rs`
+    - Added 7 PE-parser boundary tests:
+      - `parse_accepts_pe32_optional_header_magic` — PE32 (32-bit) accepted
+        in addition to PE32+; a refused PE32 parse would mistakenly mark
+        signed 32-bit admin tools as unsigned.
+      - `parse_flags_mixed_pkcs_and_non_pkcs_entries_with_count_and_drift` —
+        mixed-cert binary still reports `signature_present=true` but flags
+        the stray entry; aggregate "no PKCS entry" message must NOT appear.
+      - `parse_rejects_certificate_table_extending_one_byte_past_eof` —
+        off-by-one EOF boundary.
+      - `parse_flags_win_certificate_with_length_exceeding_table_bounds` —
+        oversized entry length within the table is flagged as drift, not
+        parsed as a real entry pulling bytes from beyond the table.
+      - `parse_accepts_minimum_pkcs_certificate_with_no_payload` — 8-byte
+        header-only entry parses (chain check happens in a separate stage).
+      - `parse_rejects_pe_with_dos_header_e_lfanew_past_end` — `e_lfanew`
+        pointing 0x80000000 ahead must fail closed, not panic.
+      - `parse_rejects_pe_with_zero_size_optional_header` — `SizeOfOptionalHeader=0`
+        must fail closed (no data directories means no Cert Table to inspect).
+- Verification:
+  - `cargo fmt --all -- --check` (clean)
+  - `cargo test -p rustynetd --all-features` (618 lib + 60 bin + 3 integration — all pass)
+  - `cargo test -p rustynet-relay --all-features` (56 lib + 45 bin — all pass)
+  - `cargo test -p rustynet-control --all-features` (97 lib — all pass)
+  - `cargo clippy -p rustynet-control -p rustynet-relay -p rustynetd -p rustynet-cli --all-targets --all-features -- -D warnings` (clean)
+- Artifacts:
+  - Local unit-test evidence only; no live Windows lab artifact.
+- Residual risk:
+  - Live Windows proof of the new DNS-block rules is not yet available.
+    Specifically: it must be verified that block rules truly take precedence
+    over the killswitch's LAN-allow rule on port 53 on a real Windows host.
+  - The optional NRPT + interface-DNS fail-closed path (consumed by the
+    existing `windows_dns_failclosed.rs` verifier) remains opt-in / dead
+    code; it requires the daemon to bind 127.0.0.1:53 and is not the
+    Windows-vs-Linux parity gate.
+  - The new tests cover unit-level structure and pre-I/O validation logic
+    only; they do not exercise actual Win32 firewall application or
+    `WinVerifyTrust` chain validation (those are Windows-only run-paths).
+- Blocker / prerequisite:
+  - W5 live-lab run still required (see previous entries).  Live-lab must
+    additionally exercise: (a) DNS query on a Windows mesh peer reaches the
+    tunnel, not the LAN router; (b) the new DNS-block rules survive a
+    daemon restart and an external `netsh advfirewall reset` cycle.
+
 ## 11) Definition Of Done
 
 This delta closes only when **all** are true:

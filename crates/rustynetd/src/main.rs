@@ -6,7 +6,8 @@ use rustynetd::daemon::{
     DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
     DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
     DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
-    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, DEFAULT_SOCKET_PATH,
+    DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_RELAY_FLEET_BUNDLE_PATH,
+    DEFAULT_RELAY_FLEET_WATERMARK_PATH, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, DEFAULT_SOCKET_PATH,
     DEFAULT_STATE_PATH, DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
     DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS, DEFAULT_TRAVERSAL_PROBE_MAX_CANDIDATES,
     DEFAULT_TRAVERSAL_PROBE_MAX_PAIRS, DEFAULT_TRAVERSAL_PROBE_RELAY_SWITCH_AFTER_FAILURES,
@@ -1396,6 +1397,25 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 config.traversal_watermark_path = value.into();
                 index += 2;
             }
+            Some("--relay-fleet-bundle") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--relay-fleet-bundle requires a value".to_string())?;
+                config.relay_fleet_bundle_path = Some(value.into());
+                index += 2;
+            }
+            Some("--relay-fleet-watermark") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--relay-fleet-watermark requires a value".to_string())?;
+                config.relay_fleet_watermark_path = Some(value.into());
+                index += 2;
+            }
+            Some("--disable-relay-fleet") => {
+                config.relay_fleet_bundle_path = None;
+                config.relay_fleet_watermark_path = None;
+                index += 1;
+            }
             Some("--traversal-max-age-secs") => {
                 let value = args
                     .get(index + 1)
@@ -1589,6 +1609,29 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--wg-public-key requires a value".to_string())?;
                 config.wg_public_key_path = Some(value.into());
+                index += 2;
+            }
+            Some("--relay-session-local-token-issuer") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--relay-session-local-token-issuer requires a value".to_string()
+                })?;
+                config.relay_session_local_token_issuer_enabled = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        return Err(
+                            "invalid relay-session-local-token-issuer value: expected true/false"
+                                .to_string(),
+                        );
+                    }
+                };
+                index += 2;
+            }
+            Some("--relay-session-token-spool-dir") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--relay-session-token-spool-dir requires a value".to_string()
+                })?;
+                config.relay_session_token_spool_dir = Some(value.into());
                 index += 2;
             }
             Some("--egress-interface") => {
@@ -2087,7 +2130,7 @@ fn help_text() -> String {
     [
         "rustynetd usage:",
         windows_service_help_line(),
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -2123,6 +2166,8 @@ fn help_text() -> String {
         &format!("  traversal_bundle={DEFAULT_TRAVERSAL_BUNDLE_PATH}"),
         &format!("  traversal_verifier_key={DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH}"),
         &format!("  traversal_watermark={DEFAULT_TRAVERSAL_WATERMARK_PATH}"),
+        &format!("  relay_fleet_bundle={DEFAULT_RELAY_FLEET_BUNDLE_PATH}"),
+        &format!("  relay_fleet_watermark={DEFAULT_RELAY_FLEET_WATERMARK_PATH}"),
         &format!("  traversal_max_age_secs={DEFAULT_TRAVERSAL_MAX_AGE_SECS}"),
         "  traversal_stun_servers=<empty>",
         &format!(
@@ -2616,6 +2661,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_daemon_config_parses_local_relay_token_issuer() {
+        let args = vec![
+            "--relay-session-local-token-issuer".to_string(),
+            "true".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.relay_session_local_token_issuer_enabled);
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_relay_session_token_spool_dir() {
+        let args = vec![
+            "--relay-session-token-spool-dir".to_string(),
+            "/var/lib/rustynet/relay-token-spool".to_string(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(
+            config.relay_session_token_spool_dir,
+            Some(PathBuf::from("/var/lib/rustynet/relay-token-spool"))
+        );
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_local_relay_token_issuer() {
+        let args = vec![
+            "--relay-session-local-token-issuer".to_string(),
+            "maybe".to_string(),
+        ];
+        let err = parse_daemon_config(&args)
+            .expect_err("invalid local relay token issuer value should fail");
+        assert!(err.contains("invalid relay-session-local-token-issuer value"));
+    }
+
+    #[test]
     fn parse_daemon_config_parses_traversal_settings() {
         let args = vec![
             "--traversal-bundle".to_string(),
@@ -2624,6 +2703,10 @@ mod tests {
             "/tmp/rustynet.traversal.pub".to_string(),
             "--traversal-watermark".to_string(),
             "/tmp/rustynet.traversal.watermark".to_string(),
+            "--relay-fleet-bundle".to_string(),
+            "/tmp/rustynet.relay-fleet".to_string(),
+            "--relay-fleet-watermark".to_string(),
+            "/tmp/rustynet.relay-fleet.watermark".to_string(),
             "--traversal-max-age-secs".to_string(),
             "90".to_string(),
             "--traversal-stun-servers".to_string(),
@@ -2658,6 +2741,14 @@ mod tests {
             config.traversal_watermark_path,
             std::path::PathBuf::from("/tmp/rustynet.traversal.watermark")
         );
+        assert_eq!(
+            config.relay_fleet_bundle_path.as_deref(),
+            Some(std::path::Path::new("/tmp/rustynet.relay-fleet"))
+        );
+        assert_eq!(
+            config.relay_fleet_watermark_path.as_deref(),
+            Some(std::path::Path::new("/tmp/rustynet.relay-fleet.watermark"))
+        );
         assert_eq!(config.traversal_max_age_secs.get(), 90);
         assert_eq!(
             config.traversal_stun_servers,
@@ -2676,6 +2767,14 @@ mod tests {
         assert_eq!(config.traversal_probe_relay_switch_after_failures.get(), 2);
         assert_eq!(config.traversal_probe_handshake_freshness_secs.get(), 15);
         assert_eq!(config.traversal_probe_reprobe_interval_secs.get(), 45);
+    }
+
+    #[test]
+    fn parse_daemon_config_can_disable_relay_fleet() {
+        let args = vec!["--disable-relay-fleet".to_string()];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.relay_fleet_bundle_path.is_none());
+        assert!(config.relay_fleet_watermark_path.is_none());
     }
 
     #[test]

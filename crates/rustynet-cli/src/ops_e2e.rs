@@ -733,6 +733,30 @@ pub fn execute_ops_install_windows_service() -> Result<String, String> {
     Err("ops install-windows-service is only supported on Windows hosts".to_string())
 }
 
+/// Install the `rustynet-relay` Windows service.
+///
+/// Runs `Install-RustyNetWindowsRelayService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+///
+/// On non-Windows hosts this always returns an error.
+#[cfg(not(windows))]
+pub fn execute_ops_install_windows_relay_service() -> Result<String, String> {
+    Err("ops install-windows-relay-service is only supported on Windows hosts".to_string())
+}
+
+/// Uninstall the `rustynet-relay` Windows service.
+///
+/// Runs `Uninstall-RustyNetWindowsRelayService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+///
+/// On non-Windows hosts this always returns an error.
+#[cfg(not(windows))]
+pub fn execute_ops_uninstall_windows_relay_service() -> Result<String, String> {
+    Err("ops uninstall-windows-relay-service is only supported on Windows hosts".to_string())
+}
+
 /// Install the `rustynetd` Windows service.
 ///
 /// Runs `Install-RustyNetWindowsService.ps1` from the source root resolved via
@@ -777,6 +801,98 @@ pub fn execute_ops_install_windows_service() -> Result<String, String> {
         "Windows service install script failed",
     )?;
     Ok("RustyNet Windows service installed and started".to_string())
+}
+
+/// Install the `rustynet-relay` Windows service.
+///
+/// Runs `Install-RustyNetWindowsRelayService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+#[cfg(windows)]
+pub fn execute_ops_install_windows_relay_service() -> Result<String, String> {
+    ensure_running_as_root()?;
+    let source_root = resolve_windows_install_source_root()?;
+    let script_path = source_root
+        .join("scripts")
+        .join("bootstrap")
+        .join("windows")
+        .join("Install-RustyNetWindowsRelayService.ps1");
+    if !script_path.is_file() {
+        return Err(format!(
+            "Windows relay service install script not found at {}; \
+             ensure RUSTYNET_INSTALL_SOURCE_ROOT points to the repo root",
+            script_path.display()
+        ));
+    }
+    let script_str = script_path.to_string_lossy().to_string();
+    let source_root_str = source_root.to_string_lossy().to_string();
+    run_status(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_str.as_str(),
+            "-RustyNetRoot",
+            source_root_str.as_str(),
+            "-InstallRoot",
+            r"C:\Program Files\RustyNet",
+            "-RelayRoot",
+            r"C:\ProgramData\RustyNet\relay",
+            "-ServiceName",
+            "RustyNetRelay",
+        ],
+        &[],
+        "Windows relay service install script failed",
+    )?;
+    Ok("RustyNet Windows relay service installed and hardening-verified".to_string())
+}
+
+/// Uninstall the `rustynet-relay` Windows service.
+///
+/// Runs `Uninstall-RustyNetWindowsRelayService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+#[cfg(windows)]
+pub fn execute_ops_uninstall_windows_relay_service() -> Result<String, String> {
+    ensure_running_as_root()?;
+    let source_root = resolve_windows_install_source_root()?;
+    let script_path = source_root
+        .join("scripts")
+        .join("bootstrap")
+        .join("windows")
+        .join("Uninstall-RustyNetWindowsRelayService.ps1");
+    if !script_path.is_file() {
+        return Err(format!(
+            "Windows relay service uninstall script not found at {}; \
+             ensure RUSTYNET_INSTALL_SOURCE_ROOT points to the repo root",
+            script_path.display()
+        ));
+    }
+    let script_str = script_path.to_string_lossy().to_string();
+    run_status(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_str.as_str(),
+            "-InstallRoot",
+            r"C:\Program Files\RustyNet",
+            "-RelayRoot",
+            r"C:\ProgramData\RustyNet\relay",
+            "-ServiceName",
+            "RustyNetRelay",
+        ],
+        &[],
+        "Windows relay service uninstall script failed",
+    )?;
+    Ok(
+        "RustyNet Windows relay service uninstalled; verifier key and replay store preserved"
+            .to_string(),
+    )
 }
 
 #[cfg(windows)]
@@ -5700,6 +5816,102 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
     #[test]
     fn install_windows_service_returns_error_on_non_windows() {
         let err = super::execute_ops_install_windows_service()
+            .expect_err("must fail on non-Windows hosts");
+        assert!(
+            err.contains("only supported on Windows"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_relay_service_install_script_contains_hardening_gates() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service install script should exist");
+        for expected in [
+            "Test-ReviewedRelayServiceName",
+            "C:\\ProgramData\\RustyNet\\relay",
+            "RUSTYNET_RELAY_ARGS_JSON",
+            "Ensure-ServiceSidTypeUnrestricted",
+            "Set-RelayServiceFailureActions",
+            "windows-service-hardening-check",
+            "Repair-RelayBinaryAcl",
+            "Repair-RelayRuntimeAcl",
+            "ServiceReadOnly",
+            "Sign-RelayBinaryForAuthenticode",
+            "signtool.exe",
+            "New-SelfSignedCertificate",
+            "-RequireLoopback",
+            "relay health bind port must not equal",
+            "UTF8Encoding($false)",
+        ] {
+            assert!(
+                body.contains(expected),
+                "relay service install script missing hardening gate: {expected}"
+            );
+        }
+        assert!(
+            !body.contains("Invoke-Expression"),
+            "relay service install script must not use Invoke-Expression"
+        );
+    }
+
+    #[test]
+    fn windows_relay_service_uninstall_script_preserves_security_state() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Uninstall-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service uninstall script should exist");
+        for expected in [
+            "Test-ReviewedRelayServiceName",
+            "C:\\Program Files\\RustyNet",
+            "C:\\ProgramData\\RustyNet\\relay",
+            "Stop-Service",
+            "sc.exe",
+            "delete",
+            "rustynet-relay.exe",
+            "relay.env",
+            "preserved_artifacts",
+            "relay-verifier.key",
+            "relay-replay.nonces",
+        ] {
+            assert!(
+                body.contains(expected),
+                "relay service uninstall script missing lifecycle gate: {expected}"
+            );
+        }
+        assert!(
+            !body.contains("Remove-Item -Recurse"),
+            "relay service uninstall script must not recursively delete relay state"
+        );
+        assert!(
+            !body.contains("Invoke-Expression"),
+            "relay service uninstall script must not use Invoke-Expression"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn install_windows_relay_service_returns_error_on_non_windows() {
+        let err = super::execute_ops_install_windows_relay_service()
+            .expect_err("must fail on non-Windows hosts");
+        assert!(
+            err.contains("only supported on Windows"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn uninstall_windows_relay_service_returns_error_on_non_windows() {
+        let err = super::execute_ops_uninstall_windows_relay_service()
             .expect_err("must fail on non-Windows hosts");
         assert!(
             err.contains("only supported on Windows"),

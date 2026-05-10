@@ -7,7 +7,7 @@ pub mod operations;
 pub mod persistence;
 pub mod scale;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -1424,6 +1424,153 @@ pub struct SignedEndpointHintBundle {
     pub target_node_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayFleetNodeDescriptor {
+    pub relay_id: String,
+    pub region: String,
+    pub endpoint: String,
+    pub priority: u16,
+    pub capacity: u32,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayFleetBundleRequest {
+    pub generated_at_unix: u64,
+    pub ttl_secs: u64,
+    pub nonce: u64,
+    pub relays: Vec<RelayFleetNodeDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedRelayFleetBundle {
+    pub payload: String,
+    pub signature_hex: String,
+    pub generated_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: u64,
+    pub relay_count: usize,
+    pub relays: Vec<RelayFleetNodeDescriptor>,
+}
+
+pub fn parse_signed_relay_fleet_bundle_wire(
+    wire: &str,
+) -> Result<SignedRelayFleetBundle, ControlPlaneError> {
+    let (payload, signature_hex) = split_signed_relay_fleet_wire(wire)?;
+    let fields = parse_relay_fleet_payload_fields(payload.as_str())?;
+    let generated_at_unix = parse_relay_fleet_required_u64(&fields, "generated_at_unix")?;
+    let expires_at_unix = parse_relay_fleet_required_u64(&fields, "expires_at_unix")?;
+    let nonce = parse_relay_fleet_required_u64(&fields, "nonce")?;
+    let relay_count = parse_relay_fleet_required_usize(&fields, "relay_count")?;
+    if parse_relay_fleet_required_u64(&fields, "version")? != 1 {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet bundle unsupported version".to_string(),
+        ));
+    }
+    if generated_at_unix == 0 || generated_at_unix >= expires_at_unix {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet bundle invalid generated/expires ordering".to_string(),
+        ));
+    }
+    if expires_at_unix.saturating_sub(generated_at_unix) > 300 {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet bundle ttl exceeds max supported value".to_string(),
+        ));
+    }
+    if nonce == 0 {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet bundle nonce must be greater than zero".to_string(),
+        ));
+    }
+    if relay_count == 0 || relay_count > 64 {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet bundle relay_count out of range".to_string(),
+        ));
+    }
+    let relays = parse_relay_fleet_descriptors(&fields, relay_count)?;
+    let expected_payload =
+        serialize_relay_fleet_payload(generated_at_unix, expires_at_unix, nonce, &relays)?;
+    if expected_payload != payload {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet bundle payload is not canonical".to_string(),
+        ));
+    }
+    Ok(SignedRelayFleetBundle {
+        payload,
+        signature_hex,
+        generated_at_unix,
+        expires_at_unix,
+        nonce,
+        relay_count,
+        relays,
+    })
+}
+
+pub fn verify_signed_relay_fleet_bundle_with_key(
+    bundle: &SignedRelayFleetBundle,
+    verifying_key: &VerifyingKey,
+) -> bool {
+    if bundle.generated_at_unix >= bundle.expires_at_unix {
+        return false;
+    }
+    if bundle
+        .expires_at_unix
+        .saturating_sub(bundle.generated_at_unix)
+        > 300
+    {
+        return false;
+    }
+    if bundle.relay_count == 0 || bundle.relay_count > 64 {
+        return false;
+    }
+    if bundle.relays.len() != bundle.relay_count {
+        return false;
+    }
+    if relay_fleet_payload_u64(bundle.payload.as_str(), "version") != Some(1) {
+        return false;
+    }
+    if relay_fleet_payload_u64(bundle.payload.as_str(), "generated_at_unix")
+        != Some(bundle.generated_at_unix)
+    {
+        return false;
+    }
+    if relay_fleet_payload_u64(bundle.payload.as_str(), "expires_at_unix")
+        != Some(bundle.expires_at_unix)
+    {
+        return false;
+    }
+    if relay_fleet_payload_u64(bundle.payload.as_str(), "nonce") != Some(bundle.nonce) {
+        return false;
+    }
+    let Some(payload_count) = relay_fleet_payload_usize(bundle.payload.as_str(), "relay_count")
+    else {
+        return false;
+    };
+    if payload_count != bundle.relay_count {
+        return false;
+    }
+    let expected_payload = match serialize_relay_fleet_payload(
+        bundle.generated_at_unix,
+        bundle.expires_at_unix,
+        bundle.nonce,
+        &bundle.relays,
+    ) {
+        Ok(payload) => payload,
+        Err(_) => return false,
+    };
+    if expected_payload != bundle.payload {
+        return false;
+    }
+    let signature_bytes = match decode_hex_to_fixed::<64>(&bundle.signature_hex) {
+        Ok(bytes) => bytes,
+        Err(()) => return false,
+    };
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(bundle.payload.as_bytes(), &signature)
+        .is_ok()
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct TraversalCoordinationRecord {
     pub session_id: [u8; 16],
@@ -1482,6 +1629,30 @@ impl fmt::Debug for SignedTraversalCoordinationRecord {
 /// A token with any other scope value must be rejected at the relay.
 pub const RELAY_TOKEN_SCOPE: &str = "forward_ciphertext_only";
 
+/// Maximum relay session token TTL accepted by relay servers.
+pub const MAX_RELAY_SESSION_TOKEN_TTL_SECS: u64 = 120;
+
+/// Convert an operator-facing relay label into the 16-byte relay id carried in
+/// signed relay session tokens.
+pub fn canonical_relay_id_from_label(label: &str) -> Result<[u8; 16], String> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return Err("relay_id must not be empty".to_string());
+    }
+    if !trimmed.is_ascii() {
+        return Err("relay_id must be ASCII".to_string());
+    }
+    if !is_single_line_payload_value(trimmed) {
+        return Err("relay_id must be a single-line payload value".to_string());
+    }
+    if trimmed.len() > 16 {
+        return Err("relay_id must be at most 16 ASCII bytes".to_string());
+    }
+    let mut relay_id = [0u8; 16];
+    relay_id[..trimmed.len()].copy_from_slice(trimmed.as_bytes());
+    Ok(relay_id)
+}
+
 /// Signed relay session token issued by the control plane.
 ///
 /// `PartialEq`/`Eq` are intentionally **not** derived to prevent accidental
@@ -1499,6 +1670,15 @@ pub struct RelaySessionToken {
     pub expires_at_unix: u64,
     pub nonce: [u8; 16],
     pub signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaySessionTokenRequest {
+    pub node_id: String,
+    pub peer_node_id: String,
+    pub relay_id: String,
+    pub requested_at_unix: u64,
+    pub ttl_secs: u64,
 }
 
 impl fmt::Debug for RelaySessionToken {
@@ -1533,6 +1713,24 @@ impl RelaySessionToken {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock must be after UNIX_EPOCH")
             .as_secs();
+        Self::sign_at(
+            signing_key,
+            node_id,
+            peer_node_id,
+            relay_id,
+            now_unix,
+            ttl_secs,
+        )
+    }
+
+    pub fn sign_at(
+        signing_key: &SigningKey,
+        node_id: &str,
+        peer_node_id: &str,
+        relay_id: [u8; 16],
+        issued_at_unix: u64,
+        ttl_secs: u64,
+    ) -> Self {
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng
             .try_fill_bytes(&mut nonce)
@@ -1542,8 +1740,8 @@ impl RelaySessionToken {
             peer_node_id: peer_node_id.to_string(),
             relay_id,
             scope: RELAY_TOKEN_SCOPE.to_string(),
-            issued_at_unix: now_unix,
-            expires_at_unix: now_unix.saturating_add(ttl_secs),
+            issued_at_unix,
+            expires_at_unix: issued_at_unix.saturating_add(ttl_secs),
             nonce,
             signature: [0u8; 64],
         };
@@ -1613,6 +1811,135 @@ impl RelaySessionToken {
         let expires_eq = self.expires_at_unix == other.expires_at_unix;
         nonce_eq & sig_eq & relay_eq & node_eq & peer_eq & scope_eq & issued_eq & expires_eq
     }
+}
+
+pub fn relay_session_token_to_wire(token: &RelaySessionToken) -> String {
+    format!(
+        "{}signature={}\n",
+        token.canonical_payload(),
+        hex_bytes(&token.signature)
+    )
+}
+
+pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, ControlPlaneError> {
+    if wire.trim().is_empty() {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token wire is empty".to_string(),
+        ));
+    }
+
+    let mut payload = String::new();
+    let mut fields = BTreeMap::new();
+    let mut seen_keys = BTreeSet::new();
+    let mut signature_hex: Option<String> = None;
+
+    for line in wire.lines() {
+        if signature_hex.is_some() {
+            return Err(ControlPlaneError::Traversal(
+                "relay session token signature must be the final line".to_string(),
+            ));
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(ControlPlaneError::Traversal(
+                "relay session token line missing key/value separator".to_string(),
+            ));
+        };
+        if !is_allowed_relay_session_token_key(key) {
+            return Err(ControlPlaneError::Traversal(format!(
+                "relay session token key is not allowed: {key}"
+            )));
+        }
+        if key == "signature" {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(ControlPlaneError::Traversal(
+                    "relay session token signature must not be empty".to_string(),
+                ));
+            }
+            signature_hex = Some(value.to_string());
+            continue;
+        }
+        if !seen_keys.insert(key.to_string()) {
+            return Err(ControlPlaneError::Traversal(format!(
+                "relay session token duplicate key: {key}"
+            )));
+        }
+        fields.insert(key.to_string(), value.to_string());
+        payload.push_str(line);
+        payload.push('\n');
+    }
+
+    let signature_hex = signature_hex.ok_or_else(|| {
+        ControlPlaneError::Traversal("relay session token missing signature".to_string())
+    })?;
+    let version = required_relay_token_field(&fields, "version")?;
+    if version != "1" {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token version must be 1".to_string(),
+        ));
+    }
+    let scope = required_relay_token_field(&fields, "scope")?;
+    if scope != RELAY_TOKEN_SCOPE {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token scope is invalid".to_string(),
+        ));
+    }
+    let node_id = required_relay_token_field(&fields, "node_id")?.to_string();
+    let peer_node_id = required_relay_token_field(&fields, "peer_node_id")?.to_string();
+    if node_id.is_empty() || peer_node_id.is_empty() {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token node ids must not be empty".to_string(),
+        ));
+    }
+    if node_id == peer_node_id {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token requires distinct node and peer".to_string(),
+        ));
+    }
+
+    let relay_id = decode_hex_to_fixed::<16>(required_relay_token_field(&fields, "relay_id")?)
+        .map_err(|_| ControlPlaneError::Traversal("relay session token relay_id invalid".into()))?;
+    let nonce = decode_hex_to_fixed::<16>(required_relay_token_field(&fields, "nonce")?)
+        .map_err(|_| ControlPlaneError::Traversal("relay session token nonce invalid".into()))?;
+    if nonce == [0u8; 16] {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token nonce must not be all zero".to_string(),
+        ));
+    }
+    let signature = decode_hex_to_fixed::<64>(&signature_hex).map_err(|_| {
+        ControlPlaneError::Traversal("relay session token signature invalid".to_string())
+    })?;
+    let issued_at_unix =
+        parse_relay_token_u64(required_relay_token_field(&fields, "issued_at_unix")?)?;
+    let expires_at_unix =
+        parse_relay_token_u64(required_relay_token_field(&fields, "expires_at_unix")?)?;
+    if issued_at_unix == 0 || expires_at_unix <= issued_at_unix {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token timestamps are invalid".to_string(),
+        ));
+    }
+
+    let token = RelaySessionToken {
+        node_id,
+        peer_node_id,
+        relay_id,
+        scope: scope.to_string(),
+        issued_at_unix,
+        expires_at_unix,
+        nonce,
+        signature,
+    };
+    if token.ttl_secs() > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
+        return Err(ControlPlaneError::Traversal(format!(
+            "relay session token ttl exceeds max supported value ({MAX_RELAY_SESSION_TOKEN_TTL_SECS})"
+        )));
+    }
+    if token.canonical_payload() != payload {
+        return Err(ControlPlaneError::Traversal(
+            "relay session token payload is not canonical".to_string(),
+        ));
+    }
+    Ok(token)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2345,6 +2672,7 @@ impl ControlPlaneCore {
                         "relay candidates require relay_id".to_string(),
                     ));
                 }
+                canonical_relay_id_from_label(relay_id).map_err(ControlPlaneError::Traversal)?;
             } else if candidate.relay_id.is_some() {
                 return Err(ControlPlaneError::Traversal(
                     "relay_id is only valid for relay candidates".to_string(),
@@ -2388,6 +2716,134 @@ impl ControlPlaneCore {
             source_node_id: request.source_node_id,
             target_node_id: request.target_node_id,
         })
+    }
+
+    pub fn signed_relay_fleet_bundle(
+        &self,
+        request: RelayFleetBundleRequest,
+    ) -> Result<SignedRelayFleetBundle, ControlPlaneError> {
+        if request.generated_at_unix == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet generated_at_unix must be greater than zero".to_string(),
+            ));
+        }
+        if request.ttl_secs == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet ttl must be greater than zero".to_string(),
+            ));
+        }
+        if request.ttl_secs > 300 {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet ttl exceeds max supported value".to_string(),
+            ));
+        }
+        if request.nonce == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet nonce must be greater than zero".to_string(),
+            ));
+        }
+        if request.relays.is_empty() {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet requires at least one relay".to_string(),
+            ));
+        }
+        if request.relays.len() > 64 {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet exceeds max relay count".to_string(),
+            ));
+        }
+        let expires_at_unix = request.generated_at_unix.saturating_add(request.ttl_secs);
+        if request.generated_at_unix >= expires_at_unix {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet invalid generated/expires ordering".to_string(),
+            ));
+        }
+
+        let mut seen_relay_ids = HashSet::new();
+        let mut seen_endpoints = HashSet::new();
+        for relay in &request.relays {
+            validate_relay_fleet_node_descriptor(relay)?;
+            let relay_id = relay.relay_id.trim().to_string();
+            if !seen_relay_ids.insert(relay_id) {
+                return Err(ControlPlaneError::Traversal(
+                    "duplicate relay fleet relay_id".to_string(),
+                ));
+            }
+            let endpoint = relay.endpoint.parse::<SocketAddr>().map_err(|_| {
+                ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string())
+            })?;
+            if !seen_endpoints.insert(endpoint) {
+                return Err(ControlPlaneError::Traversal(
+                    "duplicate relay fleet endpoint".to_string(),
+                ));
+            }
+        }
+
+        let payload = serialize_relay_fleet_payload(
+            request.generated_at_unix,
+            expires_at_unix,
+            request.nonce,
+            &request.relays,
+        )?;
+        let signature = self.endpoint_hint_signing_key.sign(payload.as_bytes());
+        Ok(SignedRelayFleetBundle {
+            payload,
+            signature_hex: hex_bytes(&signature.to_bytes()),
+            generated_at_unix: request.generated_at_unix,
+            expires_at_unix,
+            nonce: request.nonce,
+            relay_count: request.relays.len(),
+            relays: sorted_relay_fleet_descriptors(&request.relays),
+        })
+    }
+
+    pub fn issue_relay_session_token(
+        &self,
+        request: RelaySessionTokenRequest,
+    ) -> Result<RelaySessionToken, ControlPlaneError> {
+        if request.requested_at_unix == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "relay token requested_at_unix must be greater than zero".to_string(),
+            ));
+        }
+        if request.ttl_secs == 0 {
+            return Err(ControlPlaneError::Traversal(
+                "relay token ttl must be greater than zero".to_string(),
+            ));
+        }
+        if request.ttl_secs > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
+            return Err(ControlPlaneError::Traversal(format!(
+                "relay token ttl exceeds max supported value ({MAX_RELAY_SESSION_TOKEN_TTL_SECS})"
+            )));
+        }
+        if request.node_id == request.peer_node_id {
+            return Err(ControlPlaneError::Traversal(
+                "relay token requires distinct node and peer".to_string(),
+            ));
+        }
+        let relay_id = canonical_relay_id_from_label(&request.relay_id)
+            .map_err(ControlPlaneError::Traversal)?;
+
+        let source = self.nodes.get(&request.node_id)?.ok_or_else(|| {
+            ControlPlaneError::Traversal("relay token source node does not exist".to_string())
+        })?;
+        let target = self.nodes.get(&request.peer_node_id)?.ok_or_else(|| {
+            ControlPlaneError::Traversal("relay token peer node does not exist".to_string())
+        })?;
+        if !self.policy_allows_node_pair(&source, &target) {
+            return Err(ControlPlaneError::Traversal(
+                "relay token denied by policy".to_string(),
+            ));
+        }
+
+        Ok(RelaySessionToken::sign_at(
+            &self.endpoint_hint_signing_key,
+            request.node_id.as_str(),
+            request.peer_node_id.as_str(),
+            relay_id,
+            request.requested_at_unix,
+            request.ttl_secs,
+        ))
     }
 
     pub fn signed_traversal_coordination_record(
@@ -2550,7 +3006,19 @@ impl ControlPlaneCore {
             .is_ok()
     }
 
+    pub fn verify_signed_relay_fleet_bundle(&self, bundle: &SignedRelayFleetBundle) -> bool {
+        let verifying_key = match VerifyingKey::from_bytes(&self.endpoint_hint_verifying_key) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        verify_signed_relay_fleet_bundle_with_key(bundle, &verifying_key)
+    }
+
     pub fn signed_endpoint_hint_bundle_to_wire(bundle: &SignedEndpointHintBundle) -> String {
+        format!("{}signature={}\n", bundle.payload, bundle.signature_hex)
+    }
+
+    pub fn signed_relay_fleet_bundle_to_wire(bundle: &SignedRelayFleetBundle) -> String {
         format!("{}signature={}\n", bundle.payload, bundle.signature_hex)
     }
 
@@ -2810,6 +3278,37 @@ fn decode_hex_nibble(value: u8) -> Result<u8, ()> {
     }
 }
 
+fn is_allowed_relay_session_token_key(key: &str) -> bool {
+    matches!(
+        key,
+        "version"
+            | "node_id"
+            | "peer_node_id"
+            | "relay_id"
+            | "scope"
+            | "issued_at_unix"
+            | "expires_at_unix"
+            | "nonce"
+            | "signature"
+    )
+}
+
+fn required_relay_token_field<'a>(
+    fields: &'a BTreeMap<String, String>,
+    key: &str,
+) -> Result<&'a str, ControlPlaneError> {
+    fields
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| ControlPlaneError::Traversal(format!("relay session token missing {key}")))
+}
+
+fn parse_relay_token_u64(value: &str) -> Result<u64, ControlPlaneError> {
+    value.parse::<u64>().map_err(|_| {
+        ControlPlaneError::Traversal("relay session token timestamp is invalid".to_string())
+    })
+}
+
 fn selectors_for_node(node: &NodeMetadata) -> Vec<String> {
     let mut selectors = vec![
         format!("node:{}", node.node_id),
@@ -2945,6 +3444,7 @@ fn serialize_endpoint_hint_payload(
                     "relay candidates require relay_id".to_string(),
                 ));
             }
+            canonical_relay_id_from_label(relay_id).map_err(ControlPlaneError::Traversal)?;
         } else if !relay_id.is_empty() {
             return Err(ControlPlaneError::Traversal(
                 "relay_id is only valid for relay candidates".to_string(),
@@ -2965,6 +3465,329 @@ fn serialize_endpoint_hint_payload(
         ));
     }
     Ok(payload)
+}
+
+fn validate_relay_fleet_node_descriptor(
+    relay: &RelayFleetNodeDescriptor,
+) -> Result<(), ControlPlaneError> {
+    let relay_id = relay.relay_id.trim();
+    if !is_single_line_payload_value(relay_id) {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet relay_id must be a single-line payload value".to_string(),
+        ));
+    }
+    canonical_relay_id_from_label(relay_id).map_err(ControlPlaneError::Traversal)?;
+    let region = relay.region.trim();
+    if region.is_empty() {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet region must not be empty".to_string(),
+        ));
+    }
+    if !region.is_ascii() || region.len() > 64 {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet region must be bounded ASCII".to_string(),
+        ));
+    }
+    if !is_single_line_payload_value(region) {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet region must be a single-line payload value".to_string(),
+        ));
+    }
+    let endpoint = relay
+        .endpoint
+        .parse::<SocketAddr>()
+        .map_err(|_| ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string()))?;
+    if endpoint.port() == 0 {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet endpoint port must be non-zero".to_string(),
+        ));
+    }
+    if endpoint.ip().is_unspecified() || endpoint.ip().is_loopback() || endpoint.ip().is_multicast()
+    {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet endpoint must not use special transport address".to_string(),
+        ));
+    }
+    if relay.capacity == 0 {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet capacity must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_single_line_payload_value(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .bytes()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | b'='))
+}
+
+fn sorted_relay_fleet_descriptors(
+    relays: &[RelayFleetNodeDescriptor],
+) -> Vec<RelayFleetNodeDescriptor> {
+    let mut relays = relays.to_vec();
+    relays.sort_by(|left, right| {
+        left.relay_id
+            .trim()
+            .cmp(right.relay_id.trim())
+            .then(left.endpoint.cmp(&right.endpoint))
+    });
+    relays
+}
+
+fn serialize_relay_fleet_payload(
+    generated_at_unix: u64,
+    expires_at_unix: u64,
+    nonce: u64,
+    relays: &[RelayFleetNodeDescriptor],
+) -> Result<String, ControlPlaneError> {
+    let relays = sorted_relay_fleet_descriptors(relays);
+
+    let mut payload = String::new();
+    payload.push_str("version=1\n");
+    payload.push_str(&format!("generated_at_unix={generated_at_unix}\n"));
+    payload.push_str(&format!("expires_at_unix={expires_at_unix}\n"));
+    payload.push_str(&format!("nonce={nonce}\n"));
+    payload.push_str(&format!("relay_count={}\n", relays.len()));
+    for (index, relay) in relays.iter().enumerate() {
+        validate_relay_fleet_node_descriptor(relay)?;
+        let endpoint = relay.endpoint.parse::<SocketAddr>().map_err(|_| {
+            ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string())
+        })?;
+        payload.push_str(&format!("relay.{index}.id={}\n", relay.relay_id.trim()));
+        payload.push_str(&format!("relay.{index}.region={}\n", relay.region.trim()));
+        payload.push_str(&format!("relay.{index}.addr={}\n", endpoint.ip()));
+        payload.push_str(&format!("relay.{index}.port={}\n", endpoint.port()));
+        payload.push_str(&format!("relay.{index}.priority={}\n", relay.priority));
+        payload.push_str(&format!("relay.{index}.capacity={}\n", relay.capacity));
+        payload.push_str(&format!("relay.{index}.enabled={}\n", relay.enabled));
+    }
+    Ok(payload)
+}
+
+fn split_signed_relay_fleet_wire(wire: &str) -> Result<(String, String), ControlPlaneError> {
+    if wire.trim().is_empty() {
+        return Err(ControlPlaneError::Traversal(
+            "relay fleet bundle wire is empty".to_string(),
+        ));
+    }
+    let mut payload = String::new();
+    let mut signature_hex: Option<String> = None;
+    for line in wire.lines() {
+        if signature_hex.is_some() {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet bundle signature must be the final line".to_string(),
+            ));
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet bundle line missing key/value separator".to_string(),
+            ));
+        };
+        if key == "signature" {
+            if value.trim().is_empty() {
+                return Err(ControlPlaneError::Traversal(
+                    "relay fleet bundle signature must not be empty".to_string(),
+                ));
+            }
+            signature_hex = Some(value.trim().to_string());
+        } else {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+    }
+    let signature_hex = signature_hex.ok_or_else(|| {
+        ControlPlaneError::Traversal("relay fleet bundle missing signature".to_string())
+    })?;
+    Ok((payload, signature_hex))
+}
+
+fn parse_relay_fleet_payload_fields(
+    payload: &str,
+) -> Result<BTreeMap<String, String>, ControlPlaneError> {
+    let mut fields = BTreeMap::new();
+    for line in payload.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet payload line missing key/value separator".to_string(),
+            ));
+        };
+        if key.is_empty() {
+            return Err(ControlPlaneError::Traversal(
+                "relay fleet payload key must not be empty".to_string(),
+            ));
+        }
+        if fields.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(ControlPlaneError::Traversal(format!(
+                "duplicate relay fleet payload key {key}"
+            )));
+        }
+    }
+    Ok(fields)
+}
+
+fn parse_relay_fleet_required_u64(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<u64, ControlPlaneError> {
+    fields
+        .get(key)
+        .ok_or_else(|| ControlPlaneError::Traversal(format!("missing relay fleet field {key}")))?
+        .parse::<u64>()
+        .map_err(|_| ControlPlaneError::Traversal(format!("invalid relay fleet field {key}")))
+}
+
+fn parse_relay_fleet_required_usize(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<usize, ControlPlaneError> {
+    fields
+        .get(key)
+        .ok_or_else(|| ControlPlaneError::Traversal(format!("missing relay fleet field {key}")))?
+        .parse::<usize>()
+        .map_err(|_| ControlPlaneError::Traversal(format!("invalid relay fleet field {key}")))
+}
+
+fn parse_relay_fleet_required_string(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<String, ControlPlaneError> {
+    fields
+        .get(key)
+        .cloned()
+        .ok_or_else(|| ControlPlaneError::Traversal(format!("missing relay fleet field {key}")))
+}
+
+fn parse_relay_fleet_required_bool(
+    fields: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<bool, ControlPlaneError> {
+    match fields.get(key).map(String::as_str) {
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(ControlPlaneError::Traversal(format!(
+            "invalid relay fleet field {key}"
+        ))),
+        None => Err(ControlPlaneError::Traversal(format!(
+            "missing relay fleet field {key}"
+        ))),
+    }
+}
+
+fn parse_relay_fleet_descriptors(
+    fields: &BTreeMap<String, String>,
+    relay_count: usize,
+) -> Result<Vec<RelayFleetNodeDescriptor>, ControlPlaneError> {
+    let expected_global = [
+        "version",
+        "generated_at_unix",
+        "expires_at_unix",
+        "nonce",
+        "relay_count",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    let mut expected_keys = expected_global;
+    let mut relays = Vec::with_capacity(relay_count);
+    for index in 0..relay_count {
+        let id_key = format!("relay.{index}.id");
+        let region_key = format!("relay.{index}.region");
+        let addr_key = format!("relay.{index}.addr");
+        let port_key = format!("relay.{index}.port");
+        let priority_key = format!("relay.{index}.priority");
+        let capacity_key = format!("relay.{index}.capacity");
+        let enabled_key = format!("relay.{index}.enabled");
+        for key in [
+            &id_key,
+            &region_key,
+            &addr_key,
+            &port_key,
+            &priority_key,
+            &capacity_key,
+            &enabled_key,
+        ] {
+            expected_keys.insert((*key).clone());
+        }
+        let relay_id = parse_relay_fleet_required_string(fields, &id_key)?;
+        let region = parse_relay_fleet_required_string(fields, &region_key)?;
+        let addr = parse_relay_fleet_required_string(fields, &addr_key)?;
+        let port = parse_relay_fleet_required_u64(fields, &port_key)?;
+        let priority = parse_relay_fleet_required_u64(fields, &priority_key)?;
+        let capacity = parse_relay_fleet_required_u64(fields, &capacity_key)?;
+        let enabled = parse_relay_fleet_required_bool(fields, &enabled_key)?;
+        let ip = addr
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| ControlPlaneError::Traversal("invalid relay fleet address".to_string()))?;
+        let port = u16::try_from(port)
+            .map_err(|_| ControlPlaneError::Traversal("invalid relay fleet port".to_string()))?;
+        let endpoint = SocketAddr::new(ip, port).to_string();
+        let relay = RelayFleetNodeDescriptor {
+            relay_id,
+            region,
+            endpoint,
+            priority: u16::try_from(priority).map_err(|_| {
+                ControlPlaneError::Traversal("invalid relay fleet priority".to_string())
+            })?,
+            capacity: u32::try_from(capacity).map_err(|_| {
+                ControlPlaneError::Traversal("invalid relay fleet capacity".to_string())
+            })?,
+            enabled,
+        };
+        validate_relay_fleet_node_descriptor(&relay)?;
+        relays.push(relay);
+    }
+    for key in fields.keys() {
+        if !expected_keys.contains(key) {
+            return Err(ControlPlaneError::Traversal(format!(
+                "unknown relay fleet payload key {key}"
+            )));
+        }
+    }
+    validate_relay_fleet_descriptor_set(&relays)?;
+    Ok(relays)
+}
+
+fn validate_relay_fleet_descriptor_set(
+    relays: &[RelayFleetNodeDescriptor],
+) -> Result<(), ControlPlaneError> {
+    let mut seen_relay_ids = HashSet::new();
+    let mut seen_endpoints = HashSet::new();
+    for relay in relays {
+        validate_relay_fleet_node_descriptor(relay)?;
+        let relay_id = relay.relay_id.trim().to_string();
+        if !seen_relay_ids.insert(relay_id) {
+            return Err(ControlPlaneError::Traversal(
+                "duplicate relay fleet relay_id".to_string(),
+            ));
+        }
+        let endpoint = relay.endpoint.parse::<SocketAddr>().map_err(|_| {
+            ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string())
+        })?;
+        if !seen_endpoints.insert(endpoint) {
+            return Err(ControlPlaneError::Traversal(
+                "duplicate relay fleet endpoint".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn relay_fleet_payload_u64(payload: &str, key: &str) -> Option<u64> {
+    payload.lines().find_map(|line| {
+        line.strip_prefix(key)
+            .and_then(|value| value.strip_prefix('='))
+            .and_then(|value| value.parse::<u64>().ok())
+    })
+}
+
+fn relay_fleet_payload_usize(payload: &str, key: &str) -> Option<usize> {
+    payload.lines().find_map(|line| {
+        line.strip_prefix(key)
+            .and_then(|value| value.strip_prefix('='))
+            .and_then(|value| value.parse::<usize>().ok())
+    })
 }
 
 fn serialize_traversal_coordination_payload(
@@ -3049,13 +3872,17 @@ mod tests {
         ControlPlaneCore, ControlPlanePersistence, ControlPlaneTlsVersion, CredentialError,
         DnsRecordRequest, DnsRecordType, DnsTargetAddrKind, ENDPOINT_HINT_SIGNING_SEED_INFO_V1,
         EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
-        EnrollmentRequest, LockoutConfig, PolicyCheckRequest, PolicyDecision, PolicyGuard,
-        RELAY_TOKEN_SCOPE, RelaySessionToken, ReplayPolicy, ReusableCredentialPolicy,
-        ReusableCredentialRequest, SignedDnsZoneBundleRequest, SignedTokenClaims,
-        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
-        TraversalCoordinationRecord, TrustState, derive_endpoint_hint_signing_key,
-        derive_signing_seed, hex_bytes, load_trust_state, persist_trust_state,
+        EnrollmentRequest, LockoutConfig, MAX_RELAY_SESSION_TOKEN_TTL_SECS, PolicyCheckRequest,
+        PolicyDecision, PolicyGuard, RELAY_TOKEN_SCOPE, RelayFleetBundleRequest,
+        RelayFleetNodeDescriptor, RelaySessionToken, RelaySessionTokenRequest, ReplayPolicy,
+        ReusableCredentialPolicy, ReusableCredentialRequest, SignedDnsZoneBundleRequest,
+        SignedTokenClaims, ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims,
+        TransportPolicyError, TraversalCoordinationRecord, TrustState,
+        canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_signing_seed,
+        hex_bytes, load_trust_state, parse_relay_session_token_wire,
+        parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
     };
+    use ed25519_dalek::SigningKey;
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 
@@ -4036,6 +4863,230 @@ mod tests {
                 .to_string()
                 .contains("relay candidates require relay_id")
         );
+
+        for relay_id in ["relay-éu-1", "relay-label-too-long", "relay\nx", "relay=x"] {
+            let err = allow_all
+                .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
+                    source_node_id: "node-c".to_string(),
+                    target_node_id: "node-d".to_string(),
+                    generated_at_unix: 200,
+                    ttl_secs: 60,
+                    nonce: 4,
+                    candidates: vec![EndpointHintCandidate {
+                        candidate_type: EndpointHintCandidateType::Relay,
+                        endpoint: "203.0.113.55:443".to_string(),
+                        relay_id: Some(relay_id.to_string()),
+                        priority: 1,
+                    }],
+                })
+                .expect_err("non-canonical relay candidate id must fail closed");
+            assert!(
+                err.to_string().contains("relay_id"),
+                "unexpected error for relay_id={relay_id:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_fleet_bundle_is_signed_sorted_and_tamper_detected() {
+        let core = allow_all_control_plane();
+        let bundle = core
+            .signed_relay_fleet_bundle(RelayFleetBundleRequest {
+                generated_at_unix: 300,
+                ttl_secs: 60,
+                nonce: 9,
+                relays: vec![
+                    RelayFleetNodeDescriptor {
+                        relay_id: "relay-us-1".to_string(),
+                        region: "us-east".to_string(),
+                        endpoint: "203.0.113.45:443".to_string(),
+                        priority: 20,
+                        capacity: 1024,
+                        enabled: true,
+                    },
+                    RelayFleetNodeDescriptor {
+                        relay_id: "relay-eu-1".to_string(),
+                        region: "eu-west".to_string(),
+                        endpoint: "203.0.113.44:443".to_string(),
+                        priority: 10,
+                        capacity: 2048,
+                        enabled: true,
+                    },
+                ],
+            })
+            .expect("relay fleet bundle should issue");
+
+        assert!(core.verify_signed_relay_fleet_bundle(&bundle));
+        assert_eq!(bundle.generated_at_unix, 300);
+        assert_eq!(bundle.expires_at_unix, 360);
+        assert_eq!(bundle.nonce, 9);
+        assert_eq!(bundle.relay_count, 2);
+        assert_eq!(
+            payload_field(&bundle.payload, "relay_count").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "relay.0.id").as_deref(),
+            Some("relay-eu-1")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "relay.0.port").as_deref(),
+            Some("443")
+        );
+        let wire = ControlPlaneCore::signed_relay_fleet_bundle_to_wire(&bundle);
+        assert!(wire.contains("signature="));
+        let parsed =
+            parse_signed_relay_fleet_bundle_wire(&wire).expect("relay fleet wire should parse");
+        assert_eq!(parsed.generated_at_unix, bundle.generated_at_unix);
+        assert_eq!(parsed.expires_at_unix, bundle.expires_at_unix);
+        assert_eq!(parsed.nonce, bundle.nonce);
+        assert_eq!(parsed.relay_count, bundle.relay_count);
+        assert_eq!(parsed.relays, bundle.relays);
+        assert!(core.verify_signed_relay_fleet_bundle(&parsed));
+
+        let mut tampered = bundle.clone();
+        tampered.payload = tampered
+            .payload
+            .replace("relay.0.capacity=2048", "relay.0.capacity=1");
+        assert!(!core.verify_signed_relay_fleet_bundle(&tampered));
+
+        let mut metadata_tampered = bundle.clone();
+        metadata_tampered.nonce = 10;
+        assert!(!core.verify_signed_relay_fleet_bundle(&metadata_tampered));
+    }
+
+    #[test]
+    fn relay_fleet_bundle_rejects_unsafe_or_ambiguous_entries() {
+        let core = allow_all_control_plane();
+        let nonce_err = core
+            .signed_relay_fleet_bundle(RelayFleetBundleRequest {
+                generated_at_unix: 300,
+                ttl_secs: 60,
+                nonce: 0,
+                relays: vec![RelayFleetNodeDescriptor {
+                    relay_id: "relay-eu-1".to_string(),
+                    region: "eu-west".to_string(),
+                    endpoint: "203.0.113.44:443".to_string(),
+                    priority: 10,
+                    capacity: 1,
+                    enabled: true,
+                }],
+            })
+            .expect_err("zero relay fleet nonce must fail closed");
+        assert!(nonce_err.to_string().contains("nonce"));
+
+        for (relays, expected) in [
+            (
+                vec![RelayFleetNodeDescriptor {
+                    relay_id: "relay-éu-1".to_string(),
+                    region: "eu-west".to_string(),
+                    endpoint: "203.0.113.44:443".to_string(),
+                    priority: 10,
+                    capacity: 1,
+                    enabled: true,
+                }],
+                "ASCII",
+            ),
+            (
+                vec![RelayFleetNodeDescriptor {
+                    relay_id: "relay-eu-1".to_string(),
+                    region: "eu\nwest".to_string(),
+                    endpoint: "203.0.113.44:443".to_string(),
+                    priority: 10,
+                    capacity: 1,
+                    enabled: true,
+                }],
+                "single-line payload value",
+            ),
+            (
+                vec![RelayFleetNodeDescriptor {
+                    relay_id: "relay-eu-1".to_string(),
+                    region: "".to_string(),
+                    endpoint: "203.0.113.44:443".to_string(),
+                    priority: 10,
+                    capacity: 1,
+                    enabled: true,
+                }],
+                "region",
+            ),
+            (
+                vec![RelayFleetNodeDescriptor {
+                    relay_id: "relay-eu-1".to_string(),
+                    region: "eu-west".to_string(),
+                    endpoint: "127.0.0.1:443".to_string(),
+                    priority: 10,
+                    capacity: 1,
+                    enabled: true,
+                }],
+                "special transport address",
+            ),
+            (
+                vec![RelayFleetNodeDescriptor {
+                    relay_id: "relay-eu-1".to_string(),
+                    region: "eu-west".to_string(),
+                    endpoint: "203.0.113.44:443".to_string(),
+                    priority: 10,
+                    capacity: 0,
+                    enabled: true,
+                }],
+                "capacity",
+            ),
+            (
+                vec![
+                    RelayFleetNodeDescriptor {
+                        relay_id: "relay-eu-1".to_string(),
+                        region: "eu-west".to_string(),
+                        endpoint: "203.0.113.44:443".to_string(),
+                        priority: 10,
+                        capacity: 1,
+                        enabled: true,
+                    },
+                    RelayFleetNodeDescriptor {
+                        relay_id: " relay-eu-1 ".to_string(),
+                        region: "eu-west".to_string(),
+                        endpoint: "203.0.113.45:443".to_string(),
+                        priority: 20,
+                        capacity: 1,
+                        enabled: true,
+                    },
+                ],
+                "duplicate relay fleet relay_id",
+            ),
+            (
+                vec![
+                    RelayFleetNodeDescriptor {
+                        relay_id: "relay-eu-1".to_string(),
+                        region: "eu-west".to_string(),
+                        endpoint: "203.0.113.44:443".to_string(),
+                        priority: 10,
+                        capacity: 1,
+                        enabled: true,
+                    },
+                    RelayFleetNodeDescriptor {
+                        relay_id: "relay-eu-2".to_string(),
+                        region: "eu-west".to_string(),
+                        endpoint: "203.0.113.44:443".to_string(),
+                        priority: 20,
+                        capacity: 1,
+                        enabled: true,
+                    },
+                ],
+                "duplicate relay fleet endpoint",
+            ),
+        ] {
+            let err = core
+                .signed_relay_fleet_bundle(RelayFleetBundleRequest {
+                    generated_at_unix: 300,
+                    ttl_secs: 60,
+                    nonce: 10,
+                    relays,
+                })
+                .expect_err("invalid relay fleet entry must fail closed");
+            assert!(
+                err.to_string().contains(expected),
+                "expected '{expected}' in '{err}'"
+            );
+        }
     }
 
     #[test]
@@ -4766,6 +5817,309 @@ mod tests {
     //
     // These tests verify the relay session token signing, verification,
     // expiry, and constant-time comparison behavior.
+
+    #[test]
+    fn relay_id_label_canonicalization_is_shared_and_bounded() {
+        let relay_id = canonical_relay_id_from_label(" relay-eu-1 ").expect("valid relay label");
+        let mut expected = [0u8; 16];
+        expected[..10].copy_from_slice(b"relay-eu-1");
+        assert_eq!(relay_id, expected);
+    }
+
+    #[test]
+    fn relay_id_label_canonicalization_rejects_ambiguous_labels() {
+        assert!(canonical_relay_id_from_label("").is_err());
+        assert!(canonical_relay_id_from_label("   ").is_err());
+        assert!(canonical_relay_id_from_label("relay-éu-1").is_err());
+        assert!(canonical_relay_id_from_label("relay-label-too-long").is_err());
+        assert!(canonical_relay_id_from_label("relay\nx").is_err());
+        assert!(canonical_relay_id_from_label("relay=x").is_err());
+        // CR also breaks the single-line payload format and must be rejected.
+        assert!(canonical_relay_id_from_label("relay\rx").is_err());
+    }
+
+    #[test]
+    fn relay_id_label_canonicalization_is_case_sensitive() {
+        // Case-different labels must canonicalize to *different* relay IDs.
+        // If we ever lowercased silently, two operators with "Relay-EU-1" and
+        // "relay-eu-1" would collide and one's signed-fleet membership could
+        // be impersonated by the other.
+        let upper = canonical_relay_id_from_label("Relay-EU-1").expect("upper-case label valid");
+        let lower = canonical_relay_id_from_label("relay-eu-1").expect("lower-case label valid");
+        let mixed = canonical_relay_id_from_label("Relay-eu-1").expect("mixed-case label valid");
+        assert_ne!(upper, lower, "case-different labels must not collide");
+        assert_ne!(upper, mixed);
+        assert_ne!(lower, mixed);
+    }
+
+    #[test]
+    fn relay_id_label_canonicalization_zero_pads_short_labels() {
+        // A short label must be zero-padded out to 16 bytes.  Any non-zero tail
+        // byte would mean two different short labels could collide if their
+        // tails happened to overlap with another label's body bytes.
+        let id = canonical_relay_id_from_label("relay-a").expect("short label valid");
+        assert_eq!(&id[..7], b"relay-a");
+        assert!(
+            id[7..].iter().all(|&b| b == 0),
+            "short relay-id label must zero-pad the tail; got {id:?}"
+        );
+
+        // Two short labels must produce identifiers that differ only in the
+        // body bytes (and have identical zero tails).
+        let a = canonical_relay_id_from_label("relay-a").expect("short label A valid");
+        let b = canonical_relay_id_from_label("relay-b").expect("short label B valid");
+        assert_ne!(a, b);
+        assert_eq!(a[7..], b[7..]);
+    }
+
+    #[test]
+    fn relay_id_label_canonicalization_accepts_exact_16_byte_label() {
+        // Exactly 16 ASCII bytes is the boundary; anything larger must fail.
+        let exact = "relay-region-001"; // 16 bytes
+        assert_eq!(exact.len(), 16);
+        let id = canonical_relay_id_from_label(exact).expect("16-byte label must be accepted");
+        assert_eq!(&id[..], exact.as_bytes());
+
+        // 17 bytes — even by a single character — must fail closed.
+        let too_long = "relay-region-0001"; // 17 bytes
+        assert_eq!(too_long.len(), 17);
+        assert!(canonical_relay_id_from_label(too_long).is_err());
+    }
+
+    #[test]
+    fn relay_id_label_canonicalization_distinguishes_internal_whitespace_from_concatenation() {
+        // A label with an internal space must not collide with the same label
+        // without the space — this guards against subtle ambiguity if an
+        // operator types "relay 1" but the routing layer expects "relay1".
+        let spaced = canonical_relay_id_from_label("relay 1").expect("internal-space label valid");
+        let joined = canonical_relay_id_from_label("relay1").expect("no-space label valid");
+        assert_ne!(spaced, joined);
+        // The internal space is preserved in the canonical bytes.
+        assert_eq!(&spaced[..7], b"relay 1");
+    }
+
+    fn allow_all_control_plane() -> ControlPlaneCore {
+        ControlPlaneCore::new(
+            b"control-secret".to_vec(),
+            PolicySet {
+                rules: vec![PolicyRule {
+                    src: "*".to_string(),
+                    dst: "*".to_string(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                }],
+            },
+        )
+    }
+
+    fn enroll_relay_token_test_node(
+        core: &ControlPlaneCore,
+        credential_id: &str,
+        node_id: &str,
+        public_key_byte: u8,
+    ) {
+        core.credentials
+            .create(
+                credential_id.to_string(),
+                "admin".to_string(),
+                "tag:servers".to_string(),
+                100,
+                60,
+            )
+            .expect("credential should be created");
+        core.enroll_with_throwaway(EnrollmentRequest {
+            credential_id: credential_id.to_string(),
+            node_id: node_id.to_string(),
+            hostname: node_id.to_string(),
+            os: "linux".to_string(),
+            tags: vec!["servers".to_string()],
+            owner: "alice@example.local".to_string(),
+            endpoint: format!("198.51.100.{public_key_byte}:51820"),
+            public_key: [public_key_byte; 32],
+            now_unix: 120,
+        })
+        .expect("node enrollment should succeed");
+    }
+
+    #[test]
+    fn control_plane_issues_policy_authorized_relay_session_token() {
+        let core = allow_all_control_plane();
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+
+        let token = core
+            .issue_relay_session_token(RelaySessionTokenRequest {
+                node_id: "node-a".to_string(),
+                peer_node_id: "node-b".to_string(),
+                relay_id: " relay-eu-1 ".to_string(),
+                requested_at_unix: 500,
+                ttl_secs: 60,
+            })
+            .expect("authorized relay token should issue");
+        let verifier = ed25519_dalek::VerifyingKey::from_bytes(&core.endpoint_hint_verifying_key)
+            .expect("endpoint hint verifier should parse");
+
+        assert_eq!(token.node_id, "node-a");
+        assert_eq!(token.peer_node_id, "node-b");
+        assert_eq!(token.issued_at_unix, 500);
+        assert_eq!(token.expires_at_unix, 560);
+        assert_eq!(
+            token.relay_id,
+            canonical_relay_id_from_label("relay-eu-1").expect("relay id should canonicalize")
+        );
+        token
+            .verify_signature(&verifier)
+            .expect("relay token must verify with endpoint-hint verifier");
+    }
+
+    #[test]
+    fn relay_session_token_wire_round_trip_is_canonical() {
+        let core = allow_all_control_plane();
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+
+        let token = core
+            .issue_relay_session_token(RelaySessionTokenRequest {
+                node_id: "node-a".to_string(),
+                peer_node_id: "node-b".to_string(),
+                relay_id: "relay-eu-1".to_string(),
+                requested_at_unix: 500,
+                ttl_secs: 60,
+            })
+            .expect("authorized relay token should issue");
+        let wire = relay_session_token_to_wire(&token);
+        let parsed = parse_relay_session_token_wire(&wire).expect("canonical token should parse");
+
+        assert!(token.ct_eq(&parsed));
+        assert_eq!(wire, relay_session_token_to_wire(&parsed));
+    }
+
+    #[test]
+    fn relay_session_token_wire_rejects_tamper_and_noncanonical_shape() {
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let token = RelaySessionToken::sign_at(&sk, "node-a", "node-b", [0xAA; 16], 500, 60);
+        let wire = relay_session_token_to_wire(&token);
+
+        let tampered = wire.replace("peer_node_id=node-b", "peer_node_id=node-c");
+        assert!(
+            parse_relay_session_token_wire(&tampered)
+                .expect("parser only checks shape; signature verifier checks tamper")
+                .verify_signature(&sk.verifying_key())
+                .is_err()
+        );
+
+        let duplicate = wire.replace("scope=", "scope=forward_ciphertext_only\nscope=");
+        let err =
+            parse_relay_session_token_wire(&duplicate).expect_err("duplicate key must fail closed");
+        assert!(err.to_string().contains("duplicate key"));
+
+        let trailing = format!("{wire}extra=value\n");
+        let err =
+            parse_relay_session_token_wire(&trailing).expect_err("signature must be final line");
+        assert!(err.to_string().contains("final line"));
+
+        let noncanonical = wire.replace("relay_id=aaaaaaaa", "relay_id=AAAAAAAA");
+        let err = parse_relay_session_token_wire(&noncanonical)
+            .expect_err("uppercase hex is not canonical");
+        assert!(err.to_string().contains("canonical"));
+    }
+
+    #[test]
+    fn control_plane_rejects_policy_denied_relay_session_token() {
+        let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet { rules: vec![] });
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+
+        let err = core
+            .issue_relay_session_token(RelaySessionTokenRequest {
+                node_id: "node-a".to_string(),
+                peer_node_id: "node-b".to_string(),
+                relay_id: "relay-eu-1".to_string(),
+                requested_at_unix: 500,
+                ttl_secs: 60,
+            })
+            .expect_err("policy denied relay token must fail closed");
+
+        assert!(err.to_string().contains("denied by policy"));
+    }
+
+    #[test]
+    fn control_plane_rejects_invalid_relay_session_token_requests() {
+        let core = allow_all_control_plane();
+        enroll_relay_token_test_node(&core, "cred-a", "node-a", 70);
+        enroll_relay_token_test_node(&core, "cred-b", "node-b", 71);
+
+        for (request, expected) in [
+            (
+                RelaySessionTokenRequest {
+                    node_id: "node-a".to_string(),
+                    peer_node_id: "node-b".to_string(),
+                    relay_id: "relay-eu-1".to_string(),
+                    requested_at_unix: 0,
+                    ttl_secs: 60,
+                },
+                "requested_at_unix",
+            ),
+            (
+                RelaySessionTokenRequest {
+                    node_id: "node-a".to_string(),
+                    peer_node_id: "node-b".to_string(),
+                    relay_id: "relay-eu-1".to_string(),
+                    requested_at_unix: 500,
+                    ttl_secs: 0,
+                },
+                "ttl",
+            ),
+            (
+                RelaySessionTokenRequest {
+                    node_id: "node-a".to_string(),
+                    peer_node_id: "node-b".to_string(),
+                    relay_id: "relay-eu-1".to_string(),
+                    requested_at_unix: 500,
+                    ttl_secs: MAX_RELAY_SESSION_TOKEN_TTL_SECS + 1,
+                },
+                "ttl exceeds",
+            ),
+            (
+                RelaySessionTokenRequest {
+                    node_id: "node-a".to_string(),
+                    peer_node_id: "node-a".to_string(),
+                    relay_id: "relay-eu-1".to_string(),
+                    requested_at_unix: 500,
+                    ttl_secs: 60,
+                },
+                "distinct",
+            ),
+            (
+                RelaySessionTokenRequest {
+                    node_id: "node-a".to_string(),
+                    peer_node_id: "node-b".to_string(),
+                    relay_id: "relay-éu-1".to_string(),
+                    requested_at_unix: 500,
+                    ttl_secs: 60,
+                },
+                "ASCII",
+            ),
+            (
+                RelaySessionTokenRequest {
+                    node_id: "node-a".to_string(),
+                    peer_node_id: "missing-peer".to_string(),
+                    relay_id: "relay-eu-1".to_string(),
+                    requested_at_unix: 500,
+                    ttl_secs: 60,
+                },
+                "peer node does not exist",
+            ),
+        ] {
+            let err = core
+                .issue_relay_session_token(request)
+                .expect_err("invalid relay token request must fail closed");
+            assert!(
+                err.to_string().contains(expected),
+                "expected error containing '{expected}', got '{err}'"
+            );
+        }
+    }
 
     #[test]
     fn relay_session_token_sign_and_verify() {

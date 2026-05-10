@@ -78,6 +78,7 @@ const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
 const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
 const KILL_BINARY_PATH_ENV: &str = "RUSTYNET_KILL_BINARY_PATH";
 const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
+const WINDOWS_POWERSHELL_BINARY_PATH_ENV: &str = "RUSTYNET_POWERSHELL_BINARY_PATH";
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_NFT_BINARY_PATH: &str = "/usr/sbin/nft";
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
@@ -88,6 +89,8 @@ const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
 const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
 const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
 const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32\netsh.exe";
+const DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH: &str =
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManagementCidr {
@@ -412,7 +415,12 @@ pub trait DataplaneSystem {
     fn rollback_routes(&mut self) -> Result<(), SystemError>;
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError>;
     fn rollback_firewall(&mut self) -> Result<(), SystemError>;
-    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError>;
+    fn apply_nat_forwarding(
+        &mut self,
+        serve_exit_node: bool,
+        exit_mode: ExitMode,
+        mesh_cidr: &str,
+    ) -> Result<(), SystemError>;
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError>;
     fn apply_dns_protection(&mut self) -> Result<(), SystemError>;
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError>;
@@ -512,7 +520,19 @@ impl DataplaneSystem for DryRunSystem {
         self.step("rollback_firewall")
     }
 
-    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
+    fn apply_nat_forwarding(
+        &mut self,
+        serve_exit_node: bool,
+        exit_mode: ExitMode,
+        mesh_cidr: &str,
+    ) -> Result<(), SystemError> {
+        self.operations.push(format!(
+            "apply_nat_forwarding:serve_exit_node={serve_exit_node}:exit_mode={}:mesh_cidr={mesh_cidr}",
+            match exit_mode {
+                ExitMode::Off => "off",
+                ExitMode::FullTunnel => "full_tunnel",
+            }
+        ));
         self.step("apply_nat_forwarding")
     }
 
@@ -1758,7 +1778,12 @@ impl DataplaneSystem for LinuxCommandSystem {
         Ok(())
     }
 
-    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
+    fn apply_nat_forwarding(
+        &mut self,
+        _serve_exit_node: bool,
+        _exit_mode: ExitMode,
+        _mesh_cidr: &str,
+    ) -> Result<(), SystemError> {
         self.prior_ipv4_forwarding = Some(Self::read_sysctl_bool(
             "/proc/sys/net/ipv4/ip_forward",
             "net.ipv4.ip_forward",
@@ -2374,7 +2399,12 @@ impl DataplaneSystem for MacosCommandSystem {
         Ok(())
     }
 
-    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
+    fn apply_nat_forwarding(
+        &mut self,
+        _serve_exit_node: bool,
+        _exit_mode: ExitMode,
+        _mesh_cidr: &str,
+    ) -> Result<(), SystemError> {
         self.allow_egress_interface = true;
         self.apply_pf_rules(false)
             .map_err(|err| SystemError::NatApplyFailed(err.to_string()))
@@ -2485,6 +2515,34 @@ pub struct WindowsCommandSystem {
     endpoint_bypass_routes: Vec<String>,
     ipv6_disabled: bool,
     firewall_applied: bool,
+    nat_applied: bool,
+    nat_name: String,
+    previous_forwarding: Vec<(String, WindowsForwardingState)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsForwardingState {
+    Enabled,
+    Disabled,
+}
+
+impl WindowsForwardingState {
+    fn as_powershell_value(self) -> &'static str {
+        match self {
+            Self::Enabled => "Enabled",
+            Self::Disabled => "Disabled",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, SystemError> {
+        match raw.trim() {
+            "Enabled" => Ok(Self::Enabled),
+            "Disabled" => Ok(Self::Disabled),
+            other => Err(SystemError::NatApplyFailed(format!(
+                "unexpected Windows forwarding state: {other}"
+            ))),
+        }
+    }
 }
 
 impl WindowsCommandSystem {
@@ -2505,6 +2563,7 @@ impl WindowsCommandSystem {
             ));
         }
         Ok(Self {
+            nat_name: windows_nat_name(interface_name.as_str())?,
             interface_name,
             egress_interface,
             dns_resolver_bind_addr,
@@ -2513,6 +2572,8 @@ impl WindowsCommandSystem {
             endpoint_bypass_routes: Vec::new(),
             ipv6_disabled: false,
             firewall_applied: false,
+            nat_applied: false,
+            previous_forwarding: Vec::new(),
         })
     }
 
@@ -2524,6 +2585,17 @@ impl WindowsCommandSystem {
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_WINDOWS_NETSH_BINARY_PATH);
         validate_windows_binary_path(raw, "netsh")?;
+        Ok(PathBuf::from(raw))
+    }
+
+    fn resolve_powershell_binary() -> Result<PathBuf, SystemError> {
+        let configured = std::env::var(WINDOWS_POWERSHELL_BINARY_PATH_ENV).ok();
+        let raw = configured
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH);
+        validate_windows_binary_path(raw, "powershell")?;
         Ok(PathBuf::from(raw))
     }
 
@@ -2550,6 +2622,59 @@ impl WindowsCommandSystem {
         )))
     }
 
+    fn run_powershell(
+        &self,
+        script: &'static str,
+        args: &[String],
+    ) -> Result<PrivilegedCommandOutput, SystemError> {
+        let binary = Self::resolve_powershell_binary()?;
+        let command_args = windows_powershell_command_args(script, args);
+        let output = Command::new(&binary)
+            .args(&command_args)
+            .output()
+            .map_err(|err| {
+                SystemError::Io(format!(
+                    "powershell spawn failed ({}): {err}",
+                    binary.display()
+                ))
+            })?;
+        Ok(PrivilegedCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    }
+
+    fn run_powershell_success(
+        &self,
+        script: &'static str,
+        args: &[String],
+    ) -> Result<(), SystemError> {
+        let output = self.run_powershell(script, args)?;
+        if output.success() {
+            return Ok(());
+        }
+        Err(SystemError::Io(format!(
+            "powershell exited unsuccessfully: status={} stderr={}",
+            output.status, output.stderr
+        )))
+    }
+
+    fn run_powershell_stdout(
+        &self,
+        script: &'static str,
+        args: &[String],
+    ) -> Result<String, SystemError> {
+        let output = self.run_powershell(script, args)?;
+        if output.success() {
+            return Ok(output.stdout);
+        }
+        Err(SystemError::Io(format!(
+            "powershell exited unsuccessfully: status={} stderr={}",
+            output.status, output.stderr
+        )))
+    }
+
     #[allow(dead_code)]
     fn apply_dns_loopback(&mut self) -> Result<(), SystemError> {
         validate_windows_dns_bind_addr(self.dns_resolver_bind_addr)?;
@@ -2563,6 +2688,7 @@ impl WindowsCommandSystem {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn clear_dns_loopback(&mut self) -> Result<(), SystemError> {
         let args = windows_dns_clear_args(self.interface_name.as_str());
         self.run_netsh_success(&args)
@@ -2612,11 +2738,111 @@ impl WindowsCommandSystem {
             ))
         })
     }
+
+    fn read_forwarding_state(
+        &self,
+        interface_alias: &str,
+    ) -> Result<WindowsForwardingState, SystemError> {
+        validate_windows_interface_alias(interface_alias).map_err(|message| {
+            SystemError::NatApplyFailed(format!("invalid Windows interface alias: {message}"))
+        })?;
+        let stdout =
+            self.run_powershell_stdout(WINDOWS_PS_GET_FORWARDING, &[interface_alias.to_string()])?;
+        WindowsForwardingState::parse(stdout.trim())
+    }
+
+    fn set_forwarding_state(
+        &self,
+        interface_alias: &str,
+        state: WindowsForwardingState,
+    ) -> Result<(), SystemError> {
+        validate_windows_interface_alias(interface_alias).map_err(|message| {
+            SystemError::NatApplyFailed(format!("invalid Windows interface alias: {message}"))
+        })?;
+        self.run_powershell_success(
+            WINDOWS_PS_SET_FORWARDING,
+            &[
+                interface_alias.to_string(),
+                state.as_powershell_value().to_string(),
+            ],
+        )
+    }
+
+    fn apply_windows_exit_nat_forwarding(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        let mesh_cidr = validate_windows_nat_prefix(mesh_cidr)?;
+        self.run_powershell_success(WINDOWS_PS_REQUIRE_EXIT_CMDLETS, &[])
+            .map_err(|err| {
+                SystemError::NatApplyFailed(format!(
+                    "Windows exit prerequisites missing or unavailable: {err}"
+                ))
+            })?;
+
+        self.previous_forwarding.clear();
+        for interface_alias in [&self.interface_name, &self.egress_interface] {
+            let prior = self.read_forwarding_state(interface_alias)?;
+            self.previous_forwarding
+                .push((interface_alias.clone(), prior));
+            self.set_forwarding_state(interface_alias, WindowsForwardingState::Enabled)
+                .map_err(|err| {
+                    SystemError::NatApplyFailed(format!(
+                        "enable Windows IP forwarding on {interface_alias} failed: {err}"
+                    ))
+                })?;
+        }
+
+        self.run_powershell_success(WINDOWS_PS_REMOVE_NAT, std::slice::from_ref(&self.nat_name))
+            .map_err(|err| {
+                SystemError::NatApplyFailed(format!("remove stale RustyNet NAT failed: {err}"))
+            })?;
+        self.run_powershell_success(
+            WINDOWS_PS_NEW_NAT,
+            &[self.nat_name.clone(), mesh_cidr.to_string()],
+        )
+        .map_err(|err| {
+            SystemError::NatApplyFailed(format!("create Windows NetNat failed: {err}"))
+        })?;
+
+        self.run_powershell_success(
+            WINDOWS_PS_ASSERT_NAT,
+            &[self.nat_name.clone(), mesh_cidr.to_string()],
+        )
+        .map_err(|err| {
+            SystemError::NatApplyFailed(format!("verify Windows NetNat failed: {err}"))
+        })?;
+        for interface_alias in [&self.interface_name, &self.egress_interface] {
+            self.run_powershell_success(
+                WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
+                std::slice::from_ref(interface_alias),
+            )
+            .map_err(|err| {
+                SystemError::NatApplyFailed(format!(
+                    "verify Windows IP forwarding on {interface_alias} failed: {err}"
+                ))
+            })?;
+        }
+
+        self.nat_applied = true;
+        Ok(())
+    }
 }
 
 const WINDOWS_KS_RULE_LOOPBACK: &str = "RustyNetKS-AllowLoopback";
 const WINDOWS_KS_RULE_TUNNEL: &str = "RustyNetKS-AllowTunnel";
 const WINDOWS_KS_RULE_EGRESS: &str = "RustyNetKS-AllowEgress";
+/// Block UDP/53 outbound on non-tunnel (LAN) interfaces.  Forces DNS through the
+/// WireGuard tunnel — equivalent to the Linux nft rule
+/// `udp dport 53 oifname != $tunnel drop`.
+const WINDOWS_DNS_RULE_BLOCK_LAN_UDP: &str = "RustyNetDNS-BlockLanUdp";
+/// Block TCP/53 outbound on non-tunnel (LAN) interfaces.  Symmetric to the UDP
+/// rule above; without it, an app that opted into TCP DNS could still leak.
+const WINDOWS_DNS_RULE_BLOCK_LAN_TCP: &str = "RustyNetDNS-BlockLanTcp";
+const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null }";
+const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
+const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
+const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
+const WINDOWS_PS_NEW_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; New-NetNat -Name $Name -InternalIPInterfaceAddressPrefix $Prefix -ErrorAction Stop | Out-Null }";
+const WINDOWS_PS_ASSERT_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction Stop; if ($nat.InternalIPInterfaceAddressPrefix -ne $Prefix) { throw 'RustyNet NAT prefix mismatch' } }";
+const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -2673,69 +2899,37 @@ impl DataplaneSystem for WindowsCommandSystem {
             WINDOWS_KS_RULE_TUNNEL,
             WINDOWS_KS_RULE_EGRESS,
         ] {
-            let _ = self.run_netsh_success(&[
-                "advfirewall".to_string(),
-                "firewall".to_string(),
-                "delete".to_string(),
-                "rule".to_string(),
-                format!("name={rule_name}"),
-            ]);
+            let _ = self.run_netsh_success(&windows_firewall_delete_rule_args(rule_name));
         }
         // Block all outbound by default; inbound stays allowed so SSH / management
         // sessions survive. Allow rules below override the outbound block for loopback,
         // the WireGuard tunnel interface, and the physical egress interface.
-        self.run_netsh_success(&[
-            "advfirewall".to_string(),
-            "set".to_string(),
-            "allprofiles".to_string(),
-            "firewallpolicy".to_string(),
-            "allowinbound,blockoutbound".to_string(),
-        ])
-        .map_err(|err| {
-            SystemError::FirewallApplyFailed(format!("set outbound block policy failed: {err}"))
-        })?;
+        self.run_netsh_success(&windows_firewall_block_outbound_policy_args())
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!("set outbound block policy failed: {err}"))
+            })?;
         // Allow loopback traffic so local IPC and health checks keep working.
-        self.run_netsh_success(&[
-            "advfirewall".to_string(),
-            "firewall".to_string(),
-            "add".to_string(),
-            "rule".to_string(),
-            format!("name={WINDOWS_KS_RULE_LOOPBACK}"),
-            "dir=out".to_string(),
-            "action=allow".to_string(),
-            "localip=127.0.0.0/8".to_string(),
-            "remoteip=127.0.0.0/8".to_string(),
-        ])
+        self.run_netsh_success(&windows_firewall_allow_loopback_args(
+            WINDOWS_KS_RULE_LOOPBACK,
+        ))
         .map_err(|err| {
             SystemError::FirewallApplyFailed(format!("allow loopback rule failed: {err}"))
         })?;
         // Allow outbound through the WireGuard tunnel interface (mesh + exit traffic).
         // WireGuard NT adapters are classified as RAS (remote access) interface type in Windows.
-        self.run_netsh_success(&[
-            "advfirewall".to_string(),
-            "firewall".to_string(),
-            "add".to_string(),
-            "rule".to_string(),
-            format!("name={WINDOWS_KS_RULE_TUNNEL}"),
-            "dir=out".to_string(),
-            "action=allow".to_string(),
-            "interfacetype=ras".to_string(),
-        ])
+        self.run_netsh_success(&windows_firewall_allow_interfacetype_args(
+            WINDOWS_KS_RULE_TUNNEL,
+            "ras",
+        ))
         .map_err(|err| {
             SystemError::FirewallApplyFailed(format!("allow tunnel interface rule failed: {err}"))
         })?;
         // Allow outbound on the physical egress LAN interface for WireGuard UDP handshakes
         // and management traffic (SSH, STUN, relay bootstrap).
-        self.run_netsh_success(&[
-            "advfirewall".to_string(),
-            "firewall".to_string(),
-            "add".to_string(),
-            "rule".to_string(),
-            format!("name={WINDOWS_KS_RULE_EGRESS}"),
-            "dir=out".to_string(),
-            "action=allow".to_string(),
-            "interfacetype=lan".to_string(),
-        ])
+        self.run_netsh_success(&windows_firewall_allow_interfacetype_args(
+            WINDOWS_KS_RULE_EGRESS,
+            "lan",
+        ))
         .map_err(|err| {
             SystemError::FirewallApplyFailed(format!("allow egress interface rule failed: {err}"))
         })?;
@@ -2773,44 +2967,128 @@ impl DataplaneSystem for WindowsCommandSystem {
         Ok(())
     }
 
-    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
-        // Windows client nodes route all traffic through WireGuard NT via per-peer
-        // AllowedIPs; no local NAT is needed. Exit-node NAT (WFP-based) is a planned
-        // enhancement.
-        Ok(())
+    fn apply_nat_forwarding(
+        &mut self,
+        serve_exit_node: bool,
+        _exit_mode: ExitMode,
+        mesh_cidr: &str,
+    ) -> Result<(), SystemError> {
+        if !serve_exit_node {
+            // Windows client nodes can consume an exit node by routing traffic through
+            // WireGuard NT via per-peer AllowedIPs; no local NAT is needed in that mode.
+            return Ok(());
+        }
+        self.apply_windows_exit_nat_forwarding(mesh_cidr)
     }
 
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
-        Ok(())
-    }
-
-    fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
-        // netsh DNS redirect requires the daemon to bind on port 53, which conflicts with
-        // the Windows DNS Client service in the default 127.0.0.1:53535 configuration.
-        // apply_dns_loopback / clear_dns_loopback are wired up and ready; enable when
-        // the daemon is configured with --dns-resolver-bind-addr 127.0.0.1:53 and the
-        // Windows DNS Client service is disabled or redirected on the target host.
-        Ok(())
-    }
-
-    fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
-        if self.dns_protected {
-            return self.clear_dns_loopback();
+        if self.nat_applied {
+            self.run_powershell_success(
+                WINDOWS_PS_REMOVE_NAT,
+                std::slice::from_ref(&self.nat_name),
+            )
+            .map_err(|err| {
+                SystemError::RollbackFailed(format!("remove Windows NetNat failed: {err}"))
+            })?;
+            self.nat_applied = false;
+        }
+        let previous = std::mem::take(&mut self.previous_forwarding);
+        for (interface_alias, state) in previous {
+            self.set_forwarding_state(interface_alias.as_str(), state)
+                .map_err(|err| {
+                    SystemError::RollbackFailed(format!(
+                        "restore Windows IP forwarding on {interface_alias} failed: {err}"
+                    ))
+                })?;
         }
         Ok(())
     }
 
+    fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
+        // Block UDP/TCP port-53 outbound on LAN (non-tunnel) interfaces so all
+        // DNS traffic is forced through the WireGuard tunnel.  This is the
+        // moral equivalent of the Linux nft rule
+        // `udp dport 53 oifname != $tunnel drop` and is the protection that
+        // prevents an app talking directly to a router/ISP DNS server from
+        // leaking the user's lookup history.
+        //
+        // Block rules in Windows advfirewall always take precedence over allow
+        // rules, so this rule overrides the LAN-allow rule from the killswitch
+        // for port-53 traffic specifically while leaving the WireGuard
+        // handshake (UDP/varying ports on LAN) and tunnel-internal DNS
+        // (RAS/tunnel interface) untouched.
+        //
+        // The optional `apply_dns_loopback` / `clear_dns_loopback` helpers
+        // remain available for deployments that bind the daemon resolver on
+        // 127.0.0.1:53 and want a stronger control that also redirects the
+        // interface DNS.  Those are opt-in; the firewall block here is the
+        // baseline parity control with Linux/macOS.
+
+        // Purge any stale DNS-block rules from a previous daemon run before
+        // re-applying.  Uses ignore-result because no-rule deletes are not a
+        // failure on Windows advfirewall.
+        for rule_name in [
+            WINDOWS_DNS_RULE_BLOCK_LAN_UDP,
+            WINDOWS_DNS_RULE_BLOCK_LAN_TCP,
+        ] {
+            let _ = self.run_netsh_success(&windows_firewall_delete_rule_args(rule_name));
+        }
+
+        self.run_netsh_success(&windows_dns_block_lan_args(
+            WINDOWS_DNS_RULE_BLOCK_LAN_UDP,
+            "udp",
+        ))
+        .map_err(|err| {
+            SystemError::DnsApplyFailed(format!("DNS UDP/53 LAN-block rule failed: {err}"))
+        })?;
+        self.run_netsh_success(&windows_dns_block_lan_args(
+            WINDOWS_DNS_RULE_BLOCK_LAN_TCP,
+            "tcp",
+        ))
+        .map_err(|err| {
+            // Best-effort cleanup of the UDP rule we just installed so we do
+            // not leave a half-applied DNS-block in place on rollback failure.
+            let _ = self.run_netsh_success(&windows_firewall_delete_rule_args(
+                WINDOWS_DNS_RULE_BLOCK_LAN_UDP,
+            ));
+            SystemError::DnsApplyFailed(format!("DNS TCP/53 LAN-block rule failed: {err}"))
+        })?;
+        self.dns_protected = true;
+        Ok(())
+    }
+
+    fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
+        if !self.dns_protected {
+            return Ok(());
+        }
+        // Delete both DNS-block rules.  Best-effort: a missing rule is not a
+        // failure (it might have been removed by an external administrator),
+        // but a real netsh error must be surfaced so the caller can decide
+        // whether to fail closed.
+        let mut errors: Vec<String> = Vec::new();
+        for rule_name in [
+            WINDOWS_DNS_RULE_BLOCK_LAN_UDP,
+            WINDOWS_DNS_RULE_BLOCK_LAN_TCP,
+        ] {
+            if let Err(err) = self.run_netsh_success(&windows_firewall_delete_rule_args(rule_name))
+            {
+                errors.push(format!("delete {rule_name}: {err}"));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(SystemError::RollbackFailed(format!(
+                "Windows DNS block rules: {}",
+                errors.join("; ")
+            )));
+        }
+        self.dns_protected = false;
+        Ok(())
+    }
+
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
-        self.run_netsh_success(&[
-            "interface".to_string(),
-            "ipv6".to_string(),
-            "set".to_string(),
-            "interface".to_string(),
-            self.egress_interface.clone(),
-            "routerdiscovery=disabled".to_string(),
-            "advertise=disabled".to_string(),
-            "store=active".to_string(),
-        ])
+        self.run_netsh_success(&windows_ipv6_egress_disable_args(
+            self.egress_interface.as_str(),
+        ))
         .map_err(|err| SystemError::Io(format!("IPv6 disable on egress failed: {err}")))?;
         self.ipv6_disabled = true;
         Ok(())
@@ -2820,16 +3098,9 @@ impl DataplaneSystem for WindowsCommandSystem {
         if !self.ipv6_disabled {
             return Ok(());
         }
-        self.run_netsh_success(&[
-            "interface".to_string(),
-            "ipv6".to_string(),
-            "set".to_string(),
-            "interface".to_string(),
-            self.egress_interface.clone(),
-            "routerdiscovery=enabled".to_string(),
-            "advertise=enabled".to_string(),
-            "store=active".to_string(),
-        ])
+        self.run_netsh_success(&windows_ipv6_egress_rollback_args(
+            self.egress_interface.as_str(),
+        ))
         .map_err(|err| {
             SystemError::RollbackFailed(format!("IPv6 re-enable on egress failed: {err}"))
         })?;
@@ -2967,12 +3238,25 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
-    fn apply_nat_forwarding(&mut self) -> Result<(), SystemError> {
+    fn apply_nat_forwarding(
+        &mut self,
+        serve_exit_node: bool,
+        exit_mode: ExitMode,
+        mesh_cidr: &str,
+    ) -> Result<(), SystemError> {
         match self {
-            RuntimeSystem::DryRun(system) => system.apply_nat_forwarding(),
-            RuntimeSystem::Linux(system) => system.apply_nat_forwarding(),
-            RuntimeSystem::Macos(system) => system.apply_nat_forwarding(),
-            RuntimeSystem::Windows(system) => system.apply_nat_forwarding(),
+            RuntimeSystem::DryRun(system) => {
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+            }
+            RuntimeSystem::Linux(system) => {
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+            }
+            RuntimeSystem::Macos(system) => {
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+            }
+            RuntimeSystem::Windows(system) => {
+                system.apply_nat_forwarding(serve_exit_node, exit_mode, mesh_cidr)
+            }
         }
     }
 
@@ -3088,6 +3372,7 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     advertised_lan_routes: HashMap<NodeId, BTreeSet<String>>,
     lan_route_acl: HashMap<(String, String), bool>,
     managed_peers: BTreeMap<NodeId, ManagedPeer>,
+    active_stages: Vec<StageMarker>,
     current_routes: Vec<Route>,
     current_exit_mode: ExitMode,
     /// How long a Direct candidate must be continuously observed before committing (ms).
@@ -3119,6 +3404,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             advertised_lan_routes: HashMap::new(),
             lan_route_acl: HashMap::new(),
             managed_peers: BTreeMap::new(),
+            active_stages: Vec::new(),
             current_routes: Vec::new(),
             current_exit_mode: ExitMode::Off,
             direct_stability_window_ms: 3_000,
@@ -3195,7 +3481,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         self.system.prune_owned_tables()?;
+        if let Err(err) = self.rollback_obsolete_controls(options) {
+            self.force_fail_closed("obsolete_control_rollback_failed")?;
+            return Err(err);
+        }
 
+        let mesh_cidr = context.mesh_cidr.clone();
         let mut applied_stages = Vec::new();
         match self.backend.start(context) {
             Ok(()) => applied_stages.push(StageMarker::BackendStarted),
@@ -3206,14 +3497,26 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             }
         }
 
-        let result = self.apply_generation_stages(peers, routes, options, &mut applied_stages);
+        let result = self.apply_generation_stages(
+            peers,
+            routes,
+            options,
+            mesh_cidr.as_str(),
+            &mut applied_stages,
+        );
 
         if let Err(err) = result {
-            self.rollback_generation(applied_stages)?;
-            self.force_fail_closed("apply_failed")?;
+            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let fail_closed_result = self.force_fail_closed("apply_failed");
+            if let Err(rollback_err) = rollback_result {
+                let _ = fail_closed_result;
+                return Err(rollback_err);
+            }
+            fail_closed_result?;
             return Err(err);
         }
 
+        self.active_stages = applied_stages;
         self.generation = self.generation.saturating_add(1);
         self.last_safe_generation = self.generation;
 
@@ -3234,6 +3537,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         peers: Vec<PeerConfig>,
         routes: Vec<Route>,
         options: ApplyOptions,
+        mesh_cidr: &str,
         applied_stages: &mut Vec<StageMarker>,
     ) -> Result<(), Phase10Error> {
         for peer in &peers {
@@ -3271,7 +3575,11 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         applied_stages.push(StageMarker::FirewallApplied);
 
         if options.exit_mode == ExitMode::FullTunnel || options.serve_exit_node {
-            self.system.apply_nat_forwarding()?;
+            self.system.apply_nat_forwarding(
+                options.serve_exit_node,
+                options.exit_mode,
+                mesh_cidr,
+            )?;
             applied_stages.push(StageMarker::NatApplied);
         }
 
@@ -3294,50 +3602,106 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         Ok(())
     }
 
-    fn rollback_generation(
+    fn rollback_obsolete_controls(&mut self, options: ApplyOptions) -> Result<(), Phase10Error> {
+        let previous_stages = self.active_stages.clone();
+        if previous_stages.contains(&StageMarker::NatApplied)
+            && options.exit_mode != ExitMode::FullTunnel
+            && !options.serve_exit_node
+        {
+            self.system.rollback_nat_forwarding()?;
+            self.active_stages
+                .retain(|stage| *stage != StageMarker::NatApplied);
+        }
+        if previous_stages.contains(&StageMarker::DnsApplied) && !options.protected_dns {
+            self.system.rollback_dns_protection()?;
+            self.active_stages
+                .retain(|stage| *stage != StageMarker::DnsApplied);
+        }
+        if previous_stages.contains(&StageMarker::Ipv6Blocked) && options.ipv6_parity_supported {
+            self.system.rollback_ipv6_egress()?;
+            self.active_stages
+                .retain(|stage| *stage != StageMarker::Ipv6Blocked);
+        }
+        Ok(())
+    }
+
+    fn rollback_generation_best_effort(
         &mut self,
         applied_stages: Vec<StageMarker>,
     ) -> Result<(), Phase10Error> {
+        let mut rollback_errors = Vec::new();
         for stage in applied_stages.into_iter().rev() {
             match stage {
                 StageMarker::ExitModeApplied => {
-                    let _ = self.backend.set_exit_mode(ExitMode::Off);
+                    if let Err(err) = self.backend.set_exit_mode(ExitMode::Off)
+                        && err.kind != BackendErrorKind::NotRunning
+                    {
+                        rollback_errors.push(format!("set exit mode off: {err}"));
+                    }
                     self.current_exit_mode = ExitMode::Off;
                 }
                 StageMarker::Ipv6Blocked => {
-                    self.system.rollback_ipv6_egress()?;
+                    if let Err(err) = self.system.rollback_ipv6_egress() {
+                        rollback_errors.push(format!("rollback ipv6 egress: {err}"));
+                    }
                 }
                 StageMarker::DnsApplied => {
-                    self.system.rollback_dns_protection()?;
+                    if let Err(err) = self.system.rollback_dns_protection() {
+                        rollback_errors.push(format!("rollback dns protection: {err}"));
+                    }
                 }
                 StageMarker::NatApplied => {
-                    self.system.rollback_nat_forwarding()?;
+                    if let Err(err) = self.system.rollback_nat_forwarding() {
+                        rollback_errors.push(format!("rollback nat forwarding: {err}"));
+                    }
                 }
                 StageMarker::FirewallApplied => {
-                    self.system.rollback_firewall()?;
+                    if let Err(err) = self.system.rollback_firewall() {
+                        rollback_errors.push(format!("rollback firewall: {err}"));
+                    }
                 }
                 StageMarker::EndpointBypassApplied => {
-                    self.system.rollback_routes()?;
+                    if let Err(err) = self.system.rollback_routes() {
+                        rollback_errors.push(format!("rollback endpoint bypass routes: {err}"));
+                    }
                 }
                 StageMarker::SystemRoutesApplied => {
-                    self.system.rollback_routes()?;
+                    if let Err(err) = self.system.rollback_routes() {
+                        rollback_errors.push(format!("rollback system routes: {err}"));
+                    }
                 }
                 StageMarker::BackendRoutesApplied => {
-                    self.backend.apply_routes(Vec::new())?;
+                    if let Err(err) = self.backend.apply_routes(Vec::new())
+                        && err.kind != BackendErrorKind::NotRunning
+                    {
+                        rollback_errors.push(format!("clear backend routes: {err}"));
+                    }
                     self.current_routes.clear();
                 }
                 StageMarker::PeerApplied => {
                     if let Some(node_id) = self.managed_peers.keys().next().cloned() {
-                        self.backend.remove_peer(&node_id)?;
+                        if let Err(err) = self.backend.remove_peer(&node_id)
+                            && err.kind != BackendErrorKind::NotRunning
+                        {
+                            rollback_errors
+                                .push(format!("remove peer {}: {err}", node_id.as_str()));
+                        }
                         self.managed_peers.remove(&node_id);
                     }
                 }
                 StageMarker::BackendStarted => {
-                    let _ = self.backend.shutdown();
+                    if let Err(err) = self.backend.shutdown()
+                        && err.kind != BackendErrorKind::NotRunning
+                    {
+                        rollback_errors.push(format!("backend shutdown: {err}"));
+                    }
                 }
             }
         }
 
+        if !rollback_errors.is_empty() {
+            return Err(SystemError::RollbackFailed(rollback_errors.join("; ")).into());
+        }
         Ok(())
     }
 
@@ -3896,13 +4260,27 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     }
 
     pub fn shutdown(&mut self) -> Result<(), Phase10Error> {
-        let _ = self.backend.set_exit_mode(ExitMode::Off);
-        self.backend.shutdown()?;
+        let active_stages = std::mem::take(&mut self.active_stages);
+        let rollback_stopped_backend = active_stages.contains(&StageMarker::BackendStarted);
+        let rollback_result = self.rollback_generation_best_effort(active_stages);
+        let backend_shutdown_result = if rollback_stopped_backend {
+            Ok(())
+        } else {
+            self.backend.shutdown().map_err(Phase10Error::Backend)
+        };
         self.selected_exit_node = None;
         self.lan_access_enabled = false;
         self.managed_peers.clear();
         self.current_routes.clear();
         self.current_exit_mode = ExitMode::Off;
+        if let Err(err) = rollback_result {
+            self.transition_to(DataplaneState::FailClosed, "shutdown_cleanup_failed");
+            return Err(err);
+        }
+        if let Err(err) = backend_shutdown_result {
+            self.transition_to(DataplaneState::FailClosed, "shutdown_cleanup_failed");
+            return Err(err);
+        }
         self.transition_to(DataplaneState::Init, "shutdown");
         Ok(())
     }
@@ -4156,16 +4534,62 @@ fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
 }
 
 fn validate_windows_interface_alias(value: &str) -> Result<(), &'static str> {
-    if value.is_empty() || value.len() > 32 {
-        return Err("Windows interface alias length must be between 1 and 32 characters");
+    // Windows interface aliases can contain letters, digits, spaces, hyphens,
+    // underscores, dots, parentheses, and other ASCII printable characters.
+    // Real names in the wild include "Ethernet 2", "Wi-Fi", and
+    // "vEthernet (Default Switch)".  We reject non-ASCII (not valid in standard
+    // adapter names), control characters (would corrupt log lines and format
+    // strings), and '=' (would corrupt the key=value netsh argument format).
+    if value.is_empty() || value.len() > 64 {
+        return Err("Windows interface alias length must be between 1 and 64 characters");
     }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '+' | '='))
-    {
-        return Err("Windows interface alias contains invalid characters");
+    if !value.is_ascii() {
+        return Err("Windows interface alias must be ASCII");
+    }
+    if value.chars().any(|ch| ch.is_ascii_control()) {
+        return Err("Windows interface alias must not contain control characters");
+    }
+    if value.contains('=') {
+        return Err("Windows interface alias must not contain '='");
     }
     Ok(())
+}
+
+fn windows_nat_name(interface_alias: &str) -> Result<String, SystemError> {
+    validate_windows_interface_alias(interface_alias).map_err(|message| {
+        SystemError::PrerequisiteCheckFailed(format!(
+            "invalid Windows NAT interface alias: {message}"
+        ))
+    })?;
+    Ok(format!("RustyNetExit-{interface_alias}"))
+}
+
+fn validate_windows_nat_prefix(value: &str) -> Result<&str, SystemError> {
+    let cidr = value
+        .parse::<ManagementCidr>()
+        .map_err(SystemError::NatApplyFailed)?;
+    if cidr.is_ipv6() {
+        return Err(SystemError::NatApplyFailed(
+            "Windows NetNat exit serving currently supports IPv4 mesh CIDRs only".to_string(),
+        ));
+    }
+    if cidr.prefix == 0 || cidr.prefix > 32 {
+        return Err(SystemError::NatApplyFailed(
+            "Windows NetNat mesh CIDR prefix must be 1..=32".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+fn windows_powershell_command_args(script: &'static str, args: &[String]) -> Vec<String> {
+    let mut command_args = vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-Command".to_string(),
+        script.to_string(),
+    ];
+    command_args.extend_from_slice(args);
+    command_args
 }
 
 fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemError> {
@@ -4215,6 +4639,7 @@ fn windows_dns_set_args(
     ])
 }
 
+#[allow(dead_code)]
 fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
     vec![
         "interface".to_string(),
@@ -4223,6 +4648,125 @@ fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
         "dnsservers".to_string(),
         format!("name={interface_name}"),
         "all".to_string(),
+    ]
+}
+
+/// Build the netsh argv that sets the global Windows advfirewall policy to
+/// "allow inbound, block outbound" across all profiles.  This is the foundation
+/// of the Windows killswitch — every allow rule layered on top must explicitly
+/// permit each kind of traffic that should be allowed to leave the host.
+fn windows_firewall_block_outbound_policy_args() -> Vec<String> {
+    vec![
+        "advfirewall".to_string(),
+        "set".to_string(),
+        "allprofiles".to_string(),
+        "firewallpolicy".to_string(),
+        "allowinbound,blockoutbound".to_string(),
+    ]
+}
+
+/// Build the netsh argv that adds an outbound allow rule covering loopback
+/// traffic only (127.0.0.0/8 -> 127.0.0.0/8).  Required so the daemon's local
+/// IPC and the health-check probe keep working under the global outbound block.
+fn windows_firewall_allow_loopback_args(rule_name: &str) -> Vec<String> {
+    vec![
+        "advfirewall".to_string(),
+        "firewall".to_string(),
+        "add".to_string(),
+        "rule".to_string(),
+        format!("name={rule_name}"),
+        "dir=out".to_string(),
+        "action=allow".to_string(),
+        "localip=127.0.0.0/8".to_string(),
+        "remoteip=127.0.0.0/8".to_string(),
+    ]
+}
+
+/// Build the netsh argv that adds an outbound allow rule for a Windows
+/// interface type — `ras` for the WireGuard tunnel (Remote Access Service
+/// adapters) or `lan` for the physical underlay.  These rules carve specific
+/// holes in the global outbound block; they are intentionally narrow because
+/// any leak past one of them would bypass the killswitch.
+fn windows_firewall_allow_interfacetype_args(rule_name: &str, iface_type: &str) -> Vec<String> {
+    vec![
+        "advfirewall".to_string(),
+        "firewall".to_string(),
+        "add".to_string(),
+        "rule".to_string(),
+        format!("name={rule_name}"),
+        "dir=out".to_string(),
+        "action=allow".to_string(),
+        format!("interfacetype={iface_type}"),
+    ]
+}
+
+/// Build the netsh argv that adds an outbound block rule for the given protocol
+/// (`udp` or `tcp`) and remote port 53 on `interfacetype=lan`.  The rule blocks
+/// DNS traffic on every non-tunnel interface so all DNS is forced through the
+/// WireGuard tunnel — equivalent to the Linux nft rule
+/// `<proto> dport 53 oifname != $tunnel drop`.
+fn windows_dns_block_lan_args(rule_name: &str, protocol: &str) -> Vec<String> {
+    vec![
+        "advfirewall".to_string(),
+        "firewall".to_string(),
+        "add".to_string(),
+        "rule".to_string(),
+        format!("name={rule_name}"),
+        "dir=out".to_string(),
+        "action=block".to_string(),
+        format!("protocol={protocol}"),
+        "remoteport=53".to_string(),
+        "interfacetype=lan".to_string(),
+    ]
+}
+
+/// Build the netsh argv that deletes a named advfirewall rule.  Used for
+/// idempotent re-apply (purge stale rules from a previous run) and for
+/// rollback.
+fn windows_firewall_delete_rule_args(rule_name: &str) -> Vec<String> {
+    vec![
+        "advfirewall".to_string(),
+        "firewall".to_string(),
+        "delete".to_string(),
+        "rule".to_string(),
+        format!("name={rule_name}"),
+    ]
+}
+
+/// Build the netsh argv that disables IPv6 router-discovery and advertise on the
+/// underlay egress adapter so SLAAC cannot auto-configure a global IPv6 address
+/// behind the daemon's back while the killswitch + WireGuard tunnel are active.
+///
+/// The egress alias is passed as a positional `interface` parameter (its own
+/// argv element) so spaces inside common Windows aliases like "Ethernet 2" are
+/// preserved by `Command::args()` without any shell interpolation.
+fn windows_ipv6_egress_disable_args(egress_interface: &str) -> Vec<String> {
+    vec![
+        "interface".to_string(),
+        "ipv6".to_string(),
+        "set".to_string(),
+        "interface".to_string(),
+        egress_interface.to_string(),
+        "routerdiscovery=disabled".to_string(),
+        "advertise=disabled".to_string(),
+        "store=active".to_string(),
+    ]
+}
+
+/// Build the netsh argv that re-enables IPv6 router-discovery and advertise on
+/// the underlay egress adapter during rollback.  Symmetric to
+/// [`windows_ipv6_egress_disable_args`] except the two `*=disabled` flags become
+/// `*=enabled`.
+fn windows_ipv6_egress_rollback_args(egress_interface: &str) -> Vec<String> {
+    vec![
+        "interface".to_string(),
+        "ipv6".to_string(),
+        "set".to_string(),
+        "interface".to_string(),
+        egress_interface.to_string(),
+        "routerdiscovery=enabled".to_string(),
+        "advertise=enabled".to_string(),
+        "store=active".to_string(),
     ]
 }
 
@@ -4438,6 +4982,300 @@ mod tests {
                 "all".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn windows_dns_block_lan_helper_renders_reviewed_netsh_block_args() {
+        // UDP/53 LAN block — the moral equivalent of the Linux nft rule
+        // `udp dport 53 oifname != $tunnel drop`.
+        assert_eq!(
+            windows_dns_block_lan_args(WINDOWS_DNS_RULE_BLOCK_LAN_UDP, "udp"),
+            vec![
+                "advfirewall".to_string(),
+                "firewall".to_string(),
+                "add".to_string(),
+                "rule".to_string(),
+                format!("name={WINDOWS_DNS_RULE_BLOCK_LAN_UDP}"),
+                "dir=out".to_string(),
+                "action=block".to_string(),
+                "protocol=udp".to_string(),
+                "remoteport=53".to_string(),
+                "interfacetype=lan".to_string(),
+            ]
+        );
+        // TCP/53 LAN block — without it an app that opted into TCP DNS could
+        // still leak past the UDP-only block.
+        assert_eq!(
+            windows_dns_block_lan_args(WINDOWS_DNS_RULE_BLOCK_LAN_TCP, "tcp"),
+            vec![
+                "advfirewall".to_string(),
+                "firewall".to_string(),
+                "add".to_string(),
+                "rule".to_string(),
+                format!("name={WINDOWS_DNS_RULE_BLOCK_LAN_TCP}"),
+                "dir=out".to_string(),
+                "action=block".to_string(),
+                "protocol=tcp".to_string(),
+                "remoteport=53".to_string(),
+                "interfacetype=lan".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_dns_block_lan_helper_uses_block_action_targeting_lan_only() {
+        // Critical security property: action must be `block` (not `allow`) and
+        // interfacetype must be `lan` (not `any` and not `ras`).  An `any`
+        // scope would also block DNS through the tunnel and break resolution
+        // entirely; a `ras` scope would block tunnel-internal DNS instead of
+        // the underlay LAN, exactly inverting the intended protection.
+        let args = windows_dns_block_lan_args(WINDOWS_DNS_RULE_BLOCK_LAN_UDP, "udp");
+        assert!(args.iter().any(|a| a == "action=block"));
+        assert!(!args.iter().any(|a| a == "action=allow"));
+        assert!(args.iter().any(|a| a == "interfacetype=lan"));
+        assert!(!args.iter().any(|a| a == "interfacetype=any"));
+        assert!(!args.iter().any(|a| a == "interfacetype=ras"));
+        assert!(args.iter().any(|a| a == "dir=out"));
+        assert!(args.iter().any(|a| a == "remoteport=53"));
+    }
+
+    #[test]
+    fn windows_firewall_delete_rule_helper_renders_reviewed_args() {
+        assert_eq!(
+            windows_firewall_delete_rule_args("RustyNetTest-Rule"),
+            vec![
+                "advfirewall".to_string(),
+                "firewall".to_string(),
+                "delete".to_string(),
+                "rule".to_string(),
+                "name=RustyNetTest-Rule".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_firewall_block_outbound_policy_targets_all_profiles() {
+        // The global default policy is the foundation of the killswitch.  It
+        // MUST set `allowinbound,blockoutbound` on `allprofiles` — anything
+        // narrower would leave a profile unmanaged and a profile switch (e.g.
+        // domain ↔ private ↔ public) could let traffic out without the
+        // explicit allow rules being involved.
+        let args = windows_firewall_block_outbound_policy_args();
+        assert_eq!(
+            args,
+            vec![
+                "advfirewall".to_string(),
+                "set".to_string(),
+                "allprofiles".to_string(),
+                "firewallpolicy".to_string(),
+                "allowinbound,blockoutbound".to_string(),
+            ]
+        );
+        // Static guards: never accidentally swap to "allow,allow" or drop the
+        // outbound block.
+        assert!(args.iter().any(|a| a == "allowinbound,blockoutbound"));
+        assert!(!args.iter().any(|a| a == "allowinbound,allowoutbound"));
+        assert!(!args.iter().any(|a| a == "blockinbound,blockoutbound"));
+    }
+
+    #[test]
+    fn windows_firewall_allow_loopback_helper_constrains_to_loopback_subnet() {
+        // The loopback allow rule must constrain BOTH localip and remoteip to
+        // 127.0.0.0/8.  An allow rule that omitted remoteip would let local
+        // processes reach any remote host, defeating the killswitch.
+        let args = windows_firewall_allow_loopback_args(WINDOWS_KS_RULE_LOOPBACK);
+        assert_eq!(args[0], "advfirewall");
+        assert_eq!(args[2], "add");
+        assert_eq!(args[4], format!("name={WINDOWS_KS_RULE_LOOPBACK}"));
+        assert!(args.iter().any(|a| a == "dir=out"));
+        assert!(args.iter().any(|a| a == "action=allow"));
+        assert!(args.iter().any(|a| a == "localip=127.0.0.0/8"));
+        assert!(args.iter().any(|a| a == "remoteip=127.0.0.0/8"));
+        // The rule must NOT bind to "any" address — that would defeat the
+        // killswitch by allowing arbitrary outbound traffic.
+        assert!(!args.iter().any(|a| a.starts_with("remoteip=any")));
+        assert!(!args.iter().any(|a| a == "remoteip=0.0.0.0/0"));
+    }
+
+    #[test]
+    fn windows_firewall_allow_interfacetype_helper_renders_correct_args() {
+        // Tunnel allow: `interfacetype=ras` (RAS = Remote Access Service —
+        // WireGuard NT adapters report as RAS).
+        let tunnel = windows_firewall_allow_interfacetype_args(WINDOWS_KS_RULE_TUNNEL, "ras");
+        assert_eq!(
+            tunnel,
+            vec![
+                "advfirewall".to_string(),
+                "firewall".to_string(),
+                "add".to_string(),
+                "rule".to_string(),
+                format!("name={WINDOWS_KS_RULE_TUNNEL}"),
+                "dir=out".to_string(),
+                "action=allow".to_string(),
+                "interfacetype=ras".to_string(),
+            ]
+        );
+
+        // Egress LAN allow: `interfacetype=lan`.
+        let lan = windows_firewall_allow_interfacetype_args(WINDOWS_KS_RULE_EGRESS, "lan");
+        assert_eq!(lan[7], "interfacetype=lan");
+        assert_eq!(lan[4], format!("name={WINDOWS_KS_RULE_EGRESS}"));
+    }
+
+    #[test]
+    fn windows_firewall_killswitch_rules_have_distinct_names() {
+        // Each killswitch rule is purged-by-name at apply time.  If two rules
+        // shared a name, applying the killswitch would silently remove one of
+        // them on the second pass, leaving a hole.
+        let rules = [
+            WINDOWS_KS_RULE_LOOPBACK,
+            WINDOWS_KS_RULE_TUNNEL,
+            WINDOWS_KS_RULE_EGRESS,
+        ];
+        for (i, a) in rules.iter().enumerate() {
+            for b in rules.iter().skip(i + 1) {
+                assert_ne!(a, b, "killswitch rules must have distinct names");
+            }
+        }
+        // The rule-name prefix encodes the owning subsystem so an external
+        // operator can tell the rules apart from custom rules.  Every
+        // killswitch rule must use the RustyNetKS- prefix; DNS-block rules
+        // use a distinct RustyNetDNS- prefix verified separately.
+        for rule in rules {
+            assert!(
+                rule.starts_with("RustyNetKS-"),
+                "killswitch rule {rule:?} must use RustyNetKS- prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_dns_protection_rule_names_are_distinct_from_killswitch_rule_names() {
+        // The DNS-block rules must not collide with the killswitch allow rules,
+        // otherwise an idempotent purge (delete rule by name) at apply time
+        // would remove a control we still need.
+        let dns_names = [
+            WINDOWS_DNS_RULE_BLOCK_LAN_UDP,
+            WINDOWS_DNS_RULE_BLOCK_LAN_TCP,
+        ];
+        let ks_names = [
+            WINDOWS_KS_RULE_LOOPBACK,
+            WINDOWS_KS_RULE_TUNNEL,
+            WINDOWS_KS_RULE_EGRESS,
+        ];
+        for d in dns_names {
+            for k in ks_names {
+                assert_ne!(d, k, "DNS rule name {d} must not collide with KS rule {k}");
+            }
+        }
+        assert_ne!(
+            WINDOWS_DNS_RULE_BLOCK_LAN_UDP, WINDOWS_DNS_RULE_BLOCK_LAN_TCP,
+            "DNS UDP and TCP block rules must have distinct names"
+        );
+    }
+
+    #[test]
+    fn windows_command_system_rollback_dns_protection_is_no_op_when_not_applied() {
+        // A freshly-constructed system has `dns_protected = false`.  Rollback
+        // in this state must not run netsh — calling delete-rule on a name
+        // that was never installed would mask a real configuration drift on
+        // the next apply cycle.
+        let mut system = WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("windows command system should initialize");
+
+        DataplaneSystem::rollback_dns_protection(&mut system)
+            .expect("rollback must be a no-op when DNS protection was never applied");
+    }
+
+    #[test]
+    fn windows_ipv6_egress_helpers_render_reviewed_netsh_args() {
+        // Disable: must turn off both router-discovery and advertise on the
+        // egress adapter and persist the change in the active store.
+        assert_eq!(
+            windows_ipv6_egress_disable_args("Ethernet"),
+            vec![
+                "interface".to_string(),
+                "ipv6".to_string(),
+                "set".to_string(),
+                "interface".to_string(),
+                "Ethernet".to_string(),
+                "routerdiscovery=disabled".to_string(),
+                "advertise=disabled".to_string(),
+                "store=active".to_string(),
+            ]
+        );
+
+        // Rollback: must re-enable both, also persisted to the active store.
+        assert_eq!(
+            windows_ipv6_egress_rollback_args("Ethernet"),
+            vec![
+                "interface".to_string(),
+                "ipv6".to_string(),
+                "set".to_string(),
+                "interface".to_string(),
+                "Ethernet".to_string(),
+                "routerdiscovery=enabled".to_string(),
+                "advertise=enabled".to_string(),
+                "store=active".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_ipv6_egress_helpers_keep_alias_with_space_as_one_argv_token() {
+        // The egress alias must be its own argv element so `Command::args()`
+        // delivers e.g. "Ethernet 2" to netsh as a single argument with the
+        // space preserved (no shell interpolation, no key=value coupling that
+        // a space could split).
+        let disable = windows_ipv6_egress_disable_args("Ethernet 2");
+        assert_eq!(disable[4], "Ethernet 2", "alias must be its own argv token");
+        assert!(
+            !disable.iter().any(|arg| arg.contains('"')),
+            "args must not embed shell-style quoting; positional argv handles spaces"
+        );
+
+        let rollback = windows_ipv6_egress_rollback_args("vEthernet (Default Switch)");
+        assert_eq!(rollback[4], "vEthernet (Default Switch)");
+    }
+
+    #[test]
+    fn windows_ipv6_egress_disable_and_rollback_args_differ_only_in_flag_state() {
+        // The disable and rollback arg sequences must be byte-identical except
+        // for the two `*=disabled` / `*=enabled` flags.  This guarantees that
+        // rollback exactly undoes the disable on the same interface and store.
+        let disable = windows_ipv6_egress_disable_args("Ethernet");
+        let rollback = windows_ipv6_egress_rollback_args("Ethernet");
+        assert_eq!(disable.len(), rollback.len());
+        for (idx, (d, r)) in disable.iter().zip(rollback.iter()).enumerate() {
+            if idx == 5 || idx == 6 {
+                assert_ne!(d, r, "arg {idx} must differ between disable and rollback");
+                assert!(d.ends_with("=disabled"));
+                assert!(r.ends_with("=enabled"));
+            } else {
+                assert_eq!(d, r, "arg {idx} must match between disable and rollback");
+            }
+        }
+    }
+
+    #[test]
+    fn windows_command_system_rollback_ipv6_is_no_op_when_not_disabled() {
+        // A freshly-constructed system has `ipv6_disabled = false`.  Calling
+        // rollback in this state must not attempt to run netsh — that would
+        // re-enable IPv6 router-discovery on an interface whose original state
+        // we never captured, masking a real configuration drift.
+        let mut system = WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("windows command system should initialize");
+
+        DataplaneSystem::rollback_ipv6_egress(&mut system)
+            .expect("rollback must be a no-op when IPv6 was never disabled");
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -5605,6 +6443,555 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(controller.state(), DataplaneState::FailClosed);
+    }
+
+    #[test]
+    fn windows_exit_nat_helpers_validate_ipv4_mesh_and_owned_nat_name() {
+        let nat_name = windows_nat_name("rustynet0").expect("valid NAT name");
+        assert_eq!(nat_name, "RustyNetExit-rustynet0");
+        assert_eq!(
+            validate_windows_nat_prefix("100.64.0.0/10").expect("valid IPv4 mesh prefix"),
+            "100.64.0.0/10"
+        );
+
+        let err = validate_windows_nat_prefix("fd00::/64")
+            .expect_err("Windows NetNat must reject IPv6 mesh prefixes until supported");
+        assert!(matches!(err, SystemError::NatApplyFailed(_)));
+        assert!(err.to_string().contains("IPv4 mesh CIDRs only"));
+    }
+
+    #[test]
+    fn windows_exit_powershell_invocation_keeps_values_as_args() {
+        let args = windows_powershell_command_args(
+            WINDOWS_PS_NEW_NAT,
+            &[
+                "RustyNetExit-rustynet0".to_string(),
+                "100.64.0.0/10".to_string(),
+            ],
+        );
+
+        assert_eq!(args[0], "-NoProfile");
+        assert_eq!(args[1], "-NonInteractive");
+        assert_eq!(args[2], "-Command");
+        assert_eq!(args[3], WINDOWS_PS_NEW_NAT);
+        assert_eq!(args[4], "RustyNetExit-rustynet0");
+        assert_eq!(args[5], "100.64.0.0/10");
+        assert!(
+            WINDOWS_PS_NEW_NAT.contains("param($Name, $Prefix)"),
+            "script must bind untrusted values as PowerShell parameters"
+        );
+        assert!(
+            !WINDOWS_PS_NEW_NAT.contains("100.64.0.0/10"),
+            "script must not interpolate operator-provided CIDRs"
+        );
+    }
+
+    #[test]
+    fn windows_exit_cmdlet_check_enumerates_all_required_cmdlets() {
+        // The cmdlet pre-flight check is the single fail-closed point that catches a
+        // Windows SKU (e.g. Home) or feature configuration (e.g. RemoteAccess role
+        // missing) where NetNat / forwarding cmdlets are not available.  Every cmdlet
+        // the exit-serving path actually invokes must be in this check or the daemon
+        // could partially apply NAT state and then fail when removing it.
+        for required_cmdlet in [
+            "Get-NetIPInterface",
+            "Set-NetIPInterface",
+            "New-NetNat",
+            "Get-NetNat",
+            "Remove-NetNat",
+        ] {
+            assert!(
+                WINDOWS_PS_REQUIRE_EXIT_CMDLETS.contains(&format!("Get-Command {required_cmdlet}")),
+                "exit cmdlet pre-flight script must check {required_cmdlet}"
+            );
+        }
+        assert!(
+            WINDOWS_PS_REQUIRE_EXIT_CMDLETS.contains("$ErrorActionPreference = 'Stop'"),
+            "exit cmdlet pre-flight script must use $ErrorActionPreference = 'Stop'"
+        );
+    }
+
+    #[test]
+    fn windows_exit_powershell_scripts_use_stop_error_action_and_param_binding() {
+        // Every PowerShell helper that touches NAT / forwarding state must:
+        //  - run with `$ErrorActionPreference = 'Stop'` so failures propagate (no silent skip);
+        //  - bind operator-controlled values via `param(...)` rather than string interpolation;
+        //  - explicitly use `-ErrorAction Stop` on cmdlets so missing/incorrect
+        //    state does not silently no-op.
+        for (label, script) in [
+            ("WINDOWS_PS_GET_FORWARDING", WINDOWS_PS_GET_FORWARDING),
+            ("WINDOWS_PS_SET_FORWARDING", WINDOWS_PS_SET_FORWARDING),
+            ("WINDOWS_PS_REMOVE_NAT", WINDOWS_PS_REMOVE_NAT),
+            ("WINDOWS_PS_NEW_NAT", WINDOWS_PS_NEW_NAT),
+            ("WINDOWS_PS_ASSERT_NAT", WINDOWS_PS_ASSERT_NAT),
+            (
+                "WINDOWS_PS_ASSERT_FORWARDING_ENABLED",
+                WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
+            ),
+        ] {
+            assert!(
+                script.contains("$ErrorActionPreference = 'Stop'"),
+                "{label} must use $ErrorActionPreference = 'Stop'"
+            );
+            assert!(
+                script.contains("param("),
+                "{label} must bind values as PowerShell parameters"
+            );
+        }
+
+        // Cmdlets that read live OS state must use -ErrorAction Stop so a missing or
+        // mistyped interface fails closed rather than producing $null silently.
+        assert!(
+            WINDOWS_PS_GET_FORWARDING.contains("-ErrorAction Stop"),
+            "Get-NetIPInterface must use -ErrorAction Stop"
+        );
+        assert!(
+            WINDOWS_PS_SET_FORWARDING.contains("-ErrorAction Stop"),
+            "Set-NetIPInterface must use -ErrorAction Stop"
+        );
+        assert!(
+            WINDOWS_PS_NEW_NAT.contains("-ErrorAction Stop"),
+            "New-NetNat must use -ErrorAction Stop"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_FORWARDING_ENABLED.contains("-ErrorAction Stop"),
+            "post-apply forwarding assertion must use -ErrorAction Stop"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_NAT.contains("-ErrorAction Stop"),
+            "post-apply NAT assertion must use -ErrorAction Stop"
+        );
+
+        // Remove-NetNat is allowed to use SilentlyContinue while looking up the NAT,
+        // because removing a NAT that does not exist is the desired no-op.  The
+        // actual remove call itself must still use -ErrorAction Stop.
+        assert!(
+            WINDOWS_PS_REMOVE_NAT.contains("Remove-NetNat -Confirm:$false -ErrorAction Stop"),
+            "Remove-NetNat must use -Confirm:$false -ErrorAction Stop on the actual remove"
+        );
+    }
+
+    #[test]
+    fn windows_exit_powershell_scripts_do_not_interpolate_known_data_values() {
+        // Ensure none of the operator-controlled or runtime-derived data values are
+        // hard-coded into a script body.  This is a static guard that complements
+        // `windows_exit_powershell_invocation_keeps_values_as_args`, which checks
+        // the runtime invocation path.
+        for (label, script, forbidden) in [
+            (
+                "WINDOWS_PS_GET_FORWARDING",
+                WINDOWS_PS_GET_FORWARDING,
+                "Ethernet",
+            ),
+            (
+                "WINDOWS_PS_SET_FORWARDING",
+                WINDOWS_PS_SET_FORWARDING,
+                "Ethernet",
+            ),
+            ("WINDOWS_PS_NEW_NAT", WINDOWS_PS_NEW_NAT, "RustyNetExit-"),
+            (
+                "WINDOWS_PS_REMOVE_NAT",
+                WINDOWS_PS_REMOVE_NAT,
+                "RustyNetExit-",
+            ),
+            (
+                "WINDOWS_PS_ASSERT_NAT",
+                WINDOWS_PS_ASSERT_NAT,
+                "RustyNetExit-",
+            ),
+            (
+                "WINDOWS_PS_ASSERT_FORWARDING_ENABLED",
+                WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
+                "Ethernet",
+            ),
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "{label} must not contain hard-coded {forbidden:?} value"
+            );
+        }
+        // None of the scripts should hard-code 'Enabled' / 'Disabled' as a state
+        // assignment; the state must come from the param binding.
+        assert!(
+            !WINDOWS_PS_SET_FORWARDING.contains("-Forwarding Enabled"),
+            "set-forwarding script must not hard-code Enabled state"
+        );
+        assert!(
+            !WINDOWS_PS_SET_FORWARDING.contains("-Forwarding Disabled"),
+            "set-forwarding script must not hard-code Disabled state"
+        );
+    }
+
+    #[test]
+    fn windows_interface_alias_validator_accepts_real_windows_names() {
+        // Common Windows physical adapter aliases must be accepted.
+        for alias in ["Ethernet", "Wi-Fi", "Ethernet 2", "Local Area Connection"] {
+            validate_windows_interface_alias(alias)
+                .unwrap_or_else(|err| panic!("valid alias {alias:?} rejected: {err}"));
+        }
+        // Hyper-V virtual switch alias (has parentheses and spaces).
+        validate_windows_interface_alias("vEthernet (Default Switch)")
+            .expect("Hyper-V vEthernet alias must be accepted");
+        // Simple alphanumeric names used for WireGuard tunnel adapters.
+        validate_windows_interface_alias("rustynet0").expect("tunnel alias must be accepted");
+    }
+
+    #[test]
+    fn windows_interface_alias_validator_rejects_dangerous_characters() {
+        // Control characters (newline, tab, null) must be rejected: they corrupt
+        // log lines and would break format-string-based error messages.
+        for bad in ["eth\n0", "eth\t0", "eth\x000"] {
+            validate_windows_interface_alias(bad)
+                .expect_err("alias with control character must be rejected");
+        }
+        // '=' must be rejected: it would corrupt the key=value netsh argument format
+        // when embedded in format!("interface={}", alias).
+        validate_windows_interface_alias("interface=eth0")
+            .expect_err("alias containing '=' must be rejected");
+        // Non-ASCII must be rejected.
+        validate_windows_interface_alias("Ét hernet")
+            .expect_err("non-ASCII alias must be rejected");
+        // Empty and overlong must be rejected.
+        validate_windows_interface_alias("").expect_err("empty alias must be rejected");
+        validate_windows_interface_alias(&"x".repeat(65))
+            .expect_err("alias longer than 64 chars must be rejected");
+    }
+
+    #[test]
+    fn windows_command_system_accepts_interface_alias_with_space() {
+        // "Ethernet 2" is a common Windows adapter name; the system must accept it
+        // at construction and the resulting NAT name must embed it correctly.
+        WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet 2",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("Windows command system must accept egress alias containing a space");
+    }
+
+    #[test]
+    fn windows_nat_name_embeds_alias_and_rejects_invalid_aliases() {
+        // Alias with space: NAT name must include the space verbatim.
+        let nat = windows_nat_name("Ethernet 2").expect("valid NAT name with space");
+        assert_eq!(nat, "RustyNetExit-Ethernet 2");
+        // Alias with control character must be rejected.
+        windows_nat_name("eth\n0").expect_err("alias with newline must be rejected");
+        // Alias with '=' must be rejected.
+        windows_nat_name("eth=0").expect_err("alias with '=' must be rejected");
+    }
+
+    #[test]
+    fn windows_exit_client_nat_forwarding_noops_for_full_tunnel_consumer() {
+        let mut system = WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("windows command system should initialize");
+
+        DataplaneSystem::apply_nat_forwarding(
+            &mut system,
+            false,
+            ExitMode::FullTunnel,
+            "100.64.0.0/10",
+        )
+        .expect("windows full-tunnel consumer should not require local NAT");
+    }
+
+    #[test]
+    fn shutdown_rolls_back_exit_serving_nat_and_os_controls() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+
+        let shutdown_ops_start = controller.system.operations.len();
+        controller
+            .shutdown()
+            .expect("shutdown cleanup should succeed");
+        let shutdown_ops = &controller.system.operations[shutdown_ops_start..];
+
+        assert_eq!(controller.state(), DataplaneState::Init);
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
+        assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        assert!(
+            shutdown_ops.contains(&"rollback_nat_forwarding".to_string()),
+            "shutdown must remove exit-serving NAT/forwarding state"
+        );
+        assert!(
+            shutdown_ops.contains(&"rollback_dns_protection".to_string())
+                && shutdown_ops.contains(&"rollback_firewall".to_string())
+                && shutdown_ops.contains(&"rollback_routes".to_string())
+                && shutdown_ops.contains(&"rollback_ipv6_egress".to_string()),
+            "shutdown must rollback owned DNS, firewall, route, and IPv6 controls; ops={shutdown_ops:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_cleanup_failure_reports_fail_closed_not_init() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+
+        controller.system.fail_operation = Some("rollback_nat_forwarding".to_string());
+        let err = controller
+            .shutdown()
+            .expect_err("cleanup failure must be surfaced");
+
+        assert!(matches!(
+            err,
+            Phase10Error::System(SystemError::RollbackFailed(_))
+        ));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            controller
+                .transition_audit()
+                .iter()
+                .any(|event| event.reason == "shutdown_cleanup_failed"),
+            "failed cleanup must not be recorded as clean shutdown"
+        );
+    }
+
+    #[test]
+    fn role_change_from_exit_serving_rolls_back_obsolete_nat() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+
+        let second_apply_start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    protected_dns: false,
+                    ipv6_parity_supported: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("plain mesh apply should remove obsolete exit controls");
+        let second_apply_ops = &controller.system.operations[second_apply_start..];
+
+        assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
+        assert!(
+            second_apply_ops.contains(&"rollback_nat_forwarding".to_string()),
+            "turning off exit serving must remove old NAT/forwarding state"
+        );
+        assert!(
+            second_apply_ops.contains(&"rollback_dns_protection".to_string())
+                && second_apply_ops.contains(&"rollback_ipv6_egress".to_string()),
+            "turning off protected controls must rollback stale DNS/IPv6 state; ops={second_apply_ops:?}"
+        );
+        assert!(
+            !second_apply_ops
+                .iter()
+                .any(|op| op == "apply_nat_forwarding"),
+            "plain mesh generation must not re-apply NAT after stale NAT rollback"
+        );
+    }
+
+    #[test]
+    fn failed_reapply_after_exit_rolls_back_without_stale_exit_markers() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+
+        controller.system.fail_operation = Some("apply_firewall_killswitch".to_string());
+        let second_apply_start = controller.system.operations.len();
+        let err = controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    protected_dns: false,
+                    ipv6_parity_supported: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("failed plain reapply should fail closed");
+        assert!(matches!(
+            err,
+            Phase10Error::System(SystemError::RollbackFailed(_))
+        ));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        let second_apply_ops = &controller.system.operations[second_apply_start..];
+        assert!(
+            second_apply_ops.contains(&"rollback_nat_forwarding".to_string())
+                && second_apply_ops.contains(&"rollback_dns_protection".to_string())
+                && second_apply_ops.contains(&"rollback_ipv6_egress".to_string()),
+            "failed role change must still retire obsolete exit controls before fail-close; ops={second_apply_ops:?}"
+        );
+
+        controller.system.fail_operation = None;
+        let shutdown_start = controller.system.operations.len();
+        controller
+            .shutdown()
+            .expect("shutdown after failed reapply should not replay stale exit rollback markers");
+        let shutdown_ops = &controller.system.operations[shutdown_start..];
+        assert!(
+            !shutdown_ops.contains(&"rollback_nat_forwarding".to_string())
+                && !shutdown_ops.contains(&"rollback_dns_protection".to_string())
+                && !shutdown_ops.contains(&"rollback_ipv6_egress".to_string()),
+            "shutdown must not replay stale exit-control rollback after failed reapply; ops={shutdown_ops:?}"
+        );
+        assert_eq!(controller.state(), DataplaneState::Init);
+    }
+
+    #[test]
+    fn failed_exit_reapply_preserves_live_exit_markers_for_shutdown_cleanup() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+
+        controller.system.fail_operation = Some("apply_firewall_killswitch".to_string());
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("failed exit reapply should fail closed");
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+
+        controller.system.fail_operation = None;
+        let shutdown_start = controller.system.operations.len();
+        controller
+            .shutdown()
+            .expect("shutdown after failed same-role reapply should cleanup live exit controls");
+        let shutdown_ops = &controller.system.operations[shutdown_start..];
+        assert!(
+            shutdown_ops.contains(&"rollback_nat_forwarding".to_string())
+                && shutdown_ops.contains(&"rollback_dns_protection".to_string())
+                && shutdown_ops.contains(&"rollback_ipv6_egress".to_string()),
+            "shutdown must still cleanup live previous exit controls after failed same-role reapply; ops={shutdown_ops:?}"
+        );
+        assert_eq!(controller.state(), DataplaneState::Init);
     }
 
     #[test]

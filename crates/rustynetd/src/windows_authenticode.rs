@@ -658,4 +658,195 @@ mod tests {
             report.drift_reasons
         );
     }
+
+    /// Build a minimal valid PE32 (32-bit) binary in memory.  PE32 differs from
+    /// PE32+ in that the data directories start 16 bytes earlier in the
+    /// optional header (96 bytes of standard fields, not 112).  The reviewed
+    /// parser must accept BOTH magics — refusing PE32 would lock out 32-bit
+    /// supplementary tools that ship with the install.
+    fn build_pe32_with_cert_table(cert_table_bytes: &[u8]) -> Vec<u8> {
+        // Layout:
+        //   0x00  DOS header
+        //   0x40  PE header magic
+        //   0x44  COFF header (20 bytes)
+        //   0x58  Optional header (PE32, 96 bytes through standard fields)
+        //   0xB8  Data directories (16 entries * 8 bytes = 128 bytes)
+        //   0x138 Certificate Table content
+        let mut buf = vec![0u8; 0x138];
+        buf[0..2].copy_from_slice(PE_DOS_MAGIC);
+        buf[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        buf[0x40..0x44].copy_from_slice(PE_HEADER_MAGIC);
+        // SizeOfOptionalHeader = 96 + 128 = 224.
+        buf[0x54..0x56].copy_from_slice(&224u16.to_le_bytes());
+        buf[0x58..0x5A].copy_from_slice(&PE_OPTIONAL_HEADER_MAGIC_PE32.to_le_bytes());
+        // Data directory index 4 (Security) at 0xB8 + 4*8 = 0xD8.
+        let cert_offset = buf.len() as u32;
+        let cert_size = cert_table_bytes.len() as u32;
+        buf[0xD8..0xDC].copy_from_slice(&cert_offset.to_le_bytes());
+        buf[0xDC..0xE0].copy_from_slice(&cert_size.to_le_bytes());
+        buf.extend_from_slice(cert_table_bytes);
+        buf
+    }
+
+    #[test]
+    fn parse_accepts_pe32_optional_header_magic() {
+        // The parser must accept PE32 (32-bit) binaries — supplementary admin
+        // tools (e.g. older signed Windows utilities) may still be 32-bit and
+        // a refused parse would mistakenly mark them as unsigned.
+        let cert_table = build_win_certificate(
+            WIN_CERT_REVISION_2_0,
+            WIN_CERT_TYPE_PKCS_SIGNED_DATA,
+            b"pe32-pkcs7-payload",
+        );
+        let pe = build_pe32_with_cert_table(cert_table.as_slice());
+        let parsed = parse_authenticode_signature(pe.as_slice())
+            .expect("PE32 with PKCS Authenticode must parse");
+        assert!(parsed.signature_present);
+        assert_eq!(parsed.certificates.len(), 1);
+        assert!(
+            parsed.drift_reasons.is_empty(),
+            "no drift expected: {:?}",
+            parsed.drift_reasons
+        );
+    }
+
+    #[test]
+    fn parse_flags_mixed_pkcs_and_non_pkcs_entries_with_count_and_drift() {
+        // A binary that has BOTH a real PKCS Authenticode entry and a stray
+        // X.509-only entry must still report `signature_present = true` (the
+        // PKCS entry is genuine) but must flag the stray entry in drift so
+        // the operator notices the unusual layout.  This is the "one good,
+        // one bad" case that's easy to miss in a one-or-the-other test.
+        let mut cert_table = build_win_certificate(
+            WIN_CERT_REVISION_2_0,
+            WIN_CERT_TYPE_PKCS_SIGNED_DATA,
+            b"genuine-pkcs",
+        );
+        cert_table.extend(build_win_certificate(
+            WIN_CERT_REVISION_2_0,
+            0x0001, // X.509-only — not the canonical Authenticode type
+            b"stray-x509",
+        ));
+        let pe = build_pe_with_cert_table(cert_table.as_slice());
+        let parsed = parse_authenticode_signature(pe.as_slice()).expect("mixed-cert PE must parse");
+        assert!(parsed.signature_present, "PKCS entry counts");
+        assert_eq!(parsed.certificates.len(), 2);
+        assert!(
+            parsed
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("not a PKCS-signed Authenticode entry")),
+            "missing drift for stray X.509: {:?}",
+            parsed.drift_reasons
+        );
+        // The aggregate "no PKCS-signed Authenticode entry" message must NOT
+        // appear, because we DID find one PKCS entry.
+        assert!(
+            !parsed
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("contains no PKCS-signed Authenticode entry")),
+            "must not claim no PKCS entry when one exists: {:?}",
+            parsed.drift_reasons
+        );
+    }
+
+    #[test]
+    fn parse_rejects_certificate_table_extending_one_byte_past_eof() {
+        // Boundary check: Cert Table size that puts the last byte exactly
+        // one past EOF must fail, not silently truncate.
+        let mut buf = vec![0u8; 0x148];
+        buf[0..2].copy_from_slice(PE_DOS_MAGIC);
+        buf[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        buf[0x40..0x44].copy_from_slice(PE_HEADER_MAGIC);
+        buf[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        buf[0x58..0x5A].copy_from_slice(&PE_OPTIONAL_HEADER_MAGIC_PE32_PLUS.to_le_bytes());
+        // Cert Table starts inside the binary but extends 1 byte past EOF.
+        let cert_offset = (buf.len() - 16) as u32;
+        let cert_size = 17u32;
+        buf[0xE8..0xEC].copy_from_slice(&cert_offset.to_le_bytes());
+        buf[0xEC..0xF0].copy_from_slice(&cert_size.to_le_bytes());
+        let err = parse_authenticode_signature(buf.as_slice())
+            .expect_err("Cert Table extending past EOF by one byte must fail");
+        assert!(
+            err.contains("Certificate Table extends from"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flags_win_certificate_with_length_exceeding_table_bounds() {
+        // A WIN_CERTIFICATE header inside the table whose declared length
+        // would run past the table end must be flagged as drift, not parsed
+        // as a real entry that pulls bytes from beyond the cert table.
+        let mut cert_bytes = Vec::new();
+        // length = 0x100 — far larger than the 16 bytes of payload we'll
+        // actually put after this header.
+        cert_bytes.extend_from_slice(&0x100u32.to_le_bytes());
+        cert_bytes.extend_from_slice(&WIN_CERT_REVISION_2_0.to_le_bytes());
+        cert_bytes.extend_from_slice(&WIN_CERT_TYPE_PKCS_SIGNED_DATA.to_le_bytes());
+        cert_bytes.extend_from_slice(&[0u8; 8]); // only 8 bytes of payload.
+        let pe = build_pe_with_cert_table(cert_bytes.as_slice());
+        let parsed = parse_authenticode_signature(pe.as_slice())
+            .expect("PE w/ oversized cert entry still parses outer structure");
+        assert!(!parsed.signature_present);
+        assert!(
+            parsed
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("exceeds Certificate Table bounds")),
+            "missing oversized-entry drift: {:?}",
+            parsed.drift_reasons
+        );
+    }
+
+    #[test]
+    fn parse_accepts_minimum_pkcs_certificate_with_no_payload() {
+        // A WIN_CERTIFICATE entry with exactly 8 bytes (just the header, no
+        // payload) is technically the smallest valid entry per the file
+        // format.  The parser must accept it as a PKCS entry if revision and
+        // type match.  Note: the actual PKCS payload would be invalid, but
+        // chain validation happens in a separate WinVerifyTrust step;
+        // structural parsing here must still succeed.
+        let mut cert_bytes = Vec::new();
+        cert_bytes.extend_from_slice(&8u32.to_le_bytes()); // length = 8 (header only)
+        cert_bytes.extend_from_slice(&WIN_CERT_REVISION_2_0.to_le_bytes());
+        cert_bytes.extend_from_slice(&WIN_CERT_TYPE_PKCS_SIGNED_DATA.to_le_bytes());
+        let pe = build_pe_with_cert_table(cert_bytes.as_slice());
+        let parsed = parse_authenticode_signature(pe.as_slice())
+            .expect("minimum-size PKCS entry must parse");
+        assert!(parsed.signature_present);
+        assert_eq!(parsed.certificates.len(), 1);
+        assert_eq!(parsed.certificates[0].length, 8);
+    }
+
+    #[test]
+    fn parse_rejects_pe_with_dos_header_e_lfanew_past_end() {
+        // e_lfanew points 0x80000000 bytes ahead — well past the end of any
+        // real binary.  Must fail closed, not panic on a slice index.
+        let mut buf = vec![0u8; 0x80];
+        buf[0..2].copy_from_slice(PE_DOS_MAGIC);
+        buf[0x3C..0x40].copy_from_slice(&0x80000000u32.to_le_bytes());
+        let err =
+            parse_authenticode_signature(buf.as_slice()).expect_err("e_lfanew past end must fail");
+        assert!(
+            err.contains("PE header offset") && err.contains("runs past end"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_pe_with_zero_size_optional_header() {
+        // SizeOfOptionalHeader = 0 means there are no data directories,
+        // which means there is no Certificate Table directory entry to
+        // inspect.  This must fail closed (treated as unsigned), not crash.
+        let mut buf = vec![0u8; 0x148];
+        buf[0..2].copy_from_slice(PE_DOS_MAGIC);
+        buf[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        buf[0x40..0x44].copy_from_slice(PE_HEADER_MAGIC);
+        buf[0x54..0x56].copy_from_slice(&0u16.to_le_bytes());
+        let err = parse_authenticode_signature(buf.as_slice())
+            .expect_err("SizeOfOptionalHeader=0 must fail");
+        assert!(err.contains("SizeOfOptionalHeader=0"));
+    }
 }

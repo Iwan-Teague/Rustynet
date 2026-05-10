@@ -733,6 +733,8 @@ enum OpsCommand {
     CollectPlatformParityBundle,
     InstallSystemd,
     InstallWindowsService,
+    InstallWindowsRelayService,
+    UninstallWindowsRelayService,
     PrepareSystemDirs,
     RestartRuntimeService,
     StopRuntimeService,
@@ -3316,6 +3318,20 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::InstallWindowsService)
         }
+        "install-windows-relay-service" => {
+            if args.len() != 1 {
+                return Err("ops install-windows-relay-service does not accept options".to_string());
+            }
+            Ok(OpsCommand::InstallWindowsRelayService)
+        }
+        "uninstall-windows-relay-service" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops uninstall-windows-relay-service does not accept options".to_string(),
+                );
+            }
+            Ok(OpsCommand::UninstallWindowsRelayService)
+        }
         "prepare-system-dirs" => {
             if args.len() != 1 {
                 return Err("ops prepare-system-dirs does not accept options".to_string());
@@ -5238,6 +5254,12 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
         OpsCommand::InstallWindowsService => ops_e2e::execute_ops_install_windows_service(),
+        OpsCommand::InstallWindowsRelayService => {
+            ops_e2e::execute_ops_install_windows_relay_service()
+        }
+        OpsCommand::UninstallWindowsRelayService => {
+            ops_e2e::execute_ops_uninstall_windows_relay_service()
+        }
         OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
         OpsCommand::RestartRuntimeService => execute_ops_restart_runtime_service(),
         OpsCommand::StopRuntimeService => execute_ops_stop_runtime_service(),
@@ -15101,6 +15123,8 @@ fn help_text() -> String {
         "  ops collect-platform-parity-bundle",
         "  ops install-systemd",
         "  ops install-windows-service",
+        "  ops install-windows-relay-service",
+        "  ops uninstall-windows-relay-service",
         "  ops prepare-system-dirs",
         "  ops restart-runtime-service",
         "  ops stop-runtime-service",
@@ -18483,6 +18507,18 @@ mod tests {
         let windows_installer =
             parse_command(&["ops".to_string(), "install-windows-service".to_string()]);
         assert!(format!("{windows_installer:?}").contains("InstallWindowsService"));
+
+        let windows_relay_installer = parse_command(&[
+            "ops".to_string(),
+            "install-windows-relay-service".to_string(),
+        ]);
+        assert!(format!("{windows_relay_installer:?}").contains("InstallWindowsRelayService"));
+
+        let windows_relay_uninstaller = parse_command(&[
+            "ops".to_string(),
+            "uninstall-windows-relay-service".to_string(),
+        ]);
+        assert!(format!("{windows_relay_uninstaller:?}").contains("UninstallWindowsRelayService"));
 
         let prepare_dirs = parse_command(&["ops".to_string(), "prepare-system-dirs".to_string()]);
         assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));
