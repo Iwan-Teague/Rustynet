@@ -666,4 +666,326 @@ mod tests {
             Ok((len, self.expected_server))
         }
     }
+
+    // ---------- Adversarial-input hardening tests ----------
+    //
+    // These tests exercise the STUN parser against attacker-crafted byte
+    // sequences. The STUN server is untrusted: every byte of the response
+    // is attacker-controlled and the parser must reject malformed input
+    // without panicking, looping, or reading past the buffer.
+
+    fn build_response_header(length: u16, magic: u32, tx_id: &[u8; 12]) -> Vec<u8> {
+        let mut response = Vec::with_capacity(20 + length as usize);
+        response.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        response.extend_from_slice(&length.to_be_bytes());
+        response.extend_from_slice(&magic.to_be_bytes());
+        response.extend_from_slice(tx_id);
+        response
+    }
+
+    #[test]
+    fn stun_parser_handles_empty_buffer() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let err = client
+            .parse_binding_response(&[], &[0u8; 12])
+            .expect_err("empty buffer must be rejected");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_truncated_header() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        // 19 bytes — one short of the 20-byte STUN header.
+        let buf = [0u8; 19];
+        let err = client
+            .parse_binding_response(&buf, &[0u8; 12])
+            .expect_err("truncated header must be rejected");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_single_byte_buffer() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let err = client
+            .parse_binding_response(&[0xFF], &[0u8; 12])
+            .expect_err("single byte must be rejected");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_message_with_wrong_magic_cookie() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0x42; 12];
+        // Magic cookie set to bogus 0xDEADBEEF.
+        let response = build_response_header(0, 0xDEADBEEF, &tx_id);
+        let err = client
+            .parse_binding_response(&response, &tx_id)
+            .expect_err("wrong magic cookie must be rejected");
+        assert!(err.contains("magic cookie"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_response_with_wrong_transaction_id() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let request_tx_id = [0xAA; 12];
+        let response_tx_id = [0xBB; 12];
+        // Server replies with a different tx_id — classic forged-response
+        // injection. Parser must reject so attacker cannot inject a
+        // mapping for an unrelated outstanding request.
+        let response = build_response_header(0, STUN_MAGIC_COOKIE, &response_tx_id);
+        let err = client
+            .parse_binding_response(&response, &request_tx_id)
+            .expect_err("tx_id mismatch must be rejected");
+        assert!(err.contains("transaction id"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_response_to_non_binding_request() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0x33; 12];
+        // Build a Binding *Error* Response (0x0111) instead of Success (0x0101).
+        let mut response = Vec::with_capacity(20);
+        response.extend_from_slice(&0x0111u16.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        response.extend_from_slice(&tx_id);
+        let err = client
+            .parse_binding_response(&response, &tx_id)
+            .expect_err("non-success response must be rejected");
+        assert!(err.contains("unexpected response type"), "got: {err}");
+
+        // Also reject a request opcode echoed back as if it were a response.
+        let mut request_echoed = Vec::with_capacity(20);
+        request_echoed.extend_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+        request_echoed.extend_from_slice(&0u16.to_be_bytes());
+        request_echoed.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        request_echoed.extend_from_slice(&tx_id);
+        let err = client
+            .parse_binding_response(&request_echoed, &tx_id)
+            .expect_err("request opcode in response position must be rejected");
+        assert!(err.contains("unexpected response type"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_message_length_past_buffer_end() {
+        // Header claims 100 bytes of attributes but buffer only has 20 bytes.
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0x55; 12];
+        let response = build_response_header(100, STUN_MAGIC_COOKIE, &tx_id);
+        let err = client
+            .parse_binding_response(&response, &tx_id)
+            .expect_err("length past buffer end must be rejected");
+        assert!(err.contains("truncated"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_attribute_length_past_buffer_end() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0x66; 12];
+        // Message length says we have 8 bytes of attributes (one TLV header).
+        // The TLV claims its value is 1024 bytes — far beyond the message.
+        let mut response = build_response_header(8, STUN_MAGIC_COOKIE, &tx_id);
+        response.extend_from_slice(&STUN_ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        response.extend_from_slice(&1024u16.to_be_bytes());
+        response.extend_from_slice(&[0u8; 4]);
+        let err = client
+            .parse_binding_response(&response, &tx_id)
+            .expect_err("attribute length past buffer end must be rejected");
+        assert!(err.contains("message boundary"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_zero_length_attribute_run() {
+        // Crafted malicious response: a long run of zero-length attributes
+        // each with type 0x4242 (unknown comprehension-required).
+        // The parser must NOT spin forever; each iteration must advance
+        // pos by at least 4 (the TLV header itself), so the loop
+        // terminates once we reach `end`.
+        //
+        // We additionally assert no mapped address is found, so the call
+        // returns "no mapped address attribute found".
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0x77; 12];
+        // 8 zero-length attributes = 32 bytes of attribute area.
+        let attr_count = 8u16;
+        let length = attr_count * 4;
+        let mut response = build_response_header(length, STUN_MAGIC_COOKIE, &tx_id);
+        for _ in 0..attr_count {
+            response.extend_from_slice(&0x4242u16.to_be_bytes()); // unknown type
+            response.extend_from_slice(&0u16.to_be_bytes()); // length zero
+        }
+        // If the loop didn't advance on length=0, this call would hang or panic.
+        let err = client
+            .parse_binding_response(&response, &tx_id)
+            .expect_err("response with no mapped address must err");
+        assert!(err.contains("no mapped address"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_xor_mapped_address_with_short_ipv4_payload() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        // IPv4 family but only 6 bytes (header + family + port, no IP).
+        let val = [0x00u8, 0x01, 0x12, 0x34, 0xAA, 0xBB];
+        let err = client
+            .parse_xor_mapped_address(&val, &[0u8; 12])
+            .expect_err("short IPv4 XOR-MAPPED-ADDRESS must be rejected");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_xor_mapped_address_with_short_ipv6_payload() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        // IPv6 family declared but only 12 bytes provided (need 20).
+        let mut val = vec![0x00u8, 0x02, 0x12, 0x34];
+        val.extend_from_slice(&[0u8; 8]);
+        assert_eq!(val.len(), 12);
+        let err = client
+            .parse_xor_mapped_address(&val, &[0u8; 12])
+            .expect_err("short IPv6 XOR-MAPPED-ADDRESS must be rejected");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_xor_mapped_address_with_unknown_family() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        // Family 0x07 — neither IPv4 (0x01) nor IPv6 (0x02).
+        let val = [0x00u8, 0x07, 0x12, 0x34, 0xAA, 0xBB, 0xCC, 0xDD];
+        let err = client
+            .parse_xor_mapped_address(&val, &[0u8; 12])
+            .expect_err("unknown family must be rejected");
+        assert!(err.contains("unknown family"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_mapped_address_with_short_ipv4_payload() {
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        // 7 bytes — header + family + port + 3 of 4 IP octets.
+        let val = [0x00u8, 0x01, 0x27, 0x0F, 1, 2, 3];
+        let err = client
+            .parse_mapped_address(&val)
+            .expect_err("short IPv4 MAPPED-ADDRESS must be rejected");
+        assert!(err.contains("too short"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_ignores_unknown_attribute_in_success_response() {
+        // RFC 5389 §7.3.1: unknown comprehension-required attributes in a
+        // Success Response MUST be ignored (not rejected). A real
+        // XOR-MAPPED-ADDRESS following an unknown attribute must still
+        // parse successfully.
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0x88; 12];
+        let endpoint: SocketAddr = "192.0.2.42:7777".parse().unwrap();
+
+        // Build XOR-MAPPED-ADDRESS attribute (TLV header + 8 byte value = 12 bytes).
+        let mut xor_attr = Vec::with_capacity(12);
+        xor_attr.extend_from_slice(&STUN_ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        xor_attr.extend_from_slice(&8u16.to_be_bytes());
+        xor_attr.push(0);
+        xor_attr.push(0x01);
+        let xored_port = endpoint.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        xor_attr.extend_from_slice(&xored_port.to_be_bytes());
+        let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        match endpoint.ip() {
+            IpAddr::V4(addr) => {
+                for (index, byte) in addr.octets().iter().enumerate() {
+                    xor_attr.push(byte ^ cookie[index]);
+                }
+            }
+            IpAddr::V6(_) => unreachable!(),
+        }
+
+        // Build an unknown comprehension-required attribute (type 0x002A,
+        // 4-byte payload, total 8 bytes). 0x002A is in the 0x0000-0x7FFF
+        // comprehension-required range but is not one we know.
+        let mut unknown_attr = Vec::with_capacity(8);
+        unknown_attr.extend_from_slice(&0x002Au16.to_be_bytes());
+        unknown_attr.extend_from_slice(&4u16.to_be_bytes());
+        unknown_attr.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let total_attr_len = (unknown_attr.len() + xor_attr.len()) as u16;
+        let mut response = build_response_header(total_attr_len, STUN_MAGIC_COOKIE, &tx_id);
+        response.extend_from_slice(&unknown_attr);
+        response.extend_from_slice(&xor_attr);
+
+        let parsed = client
+            .parse_binding_response(&response, &tx_id)
+            .expect("XOR-MAPPED-ADDRESS after unknown attr must still parse");
+        assert_eq!(parsed, endpoint);
+    }
+
+    #[test]
+    fn stun_parser_handles_padding_at_end_of_buffer() {
+        // Positive boundary: an attribute whose length is not a multiple
+        // of 4 must be 4-byte padded by the sender. Parser must accept
+        // proper trailing padding without reading past the message end.
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0x99; 12];
+
+        // Use an unknown 1-byte attribute (3 bytes of padding to align)
+        // followed by a valid XOR-MAPPED-ADDRESS.
+        let mut unknown = Vec::with_capacity(8);
+        unknown.extend_from_slice(&0x002Bu16.to_be_bytes()); // unknown, comp-required
+        unknown.extend_from_slice(&1u16.to_be_bytes());
+        unknown.push(0xAB);
+        unknown.extend_from_slice(&[0u8; 3]); // padding to 4-byte boundary
+
+        let endpoint: SocketAddr = "203.0.113.7:1234".parse().unwrap();
+        let mut xor_attr = Vec::with_capacity(12);
+        xor_attr.extend_from_slice(&STUN_ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        xor_attr.extend_from_slice(&8u16.to_be_bytes());
+        xor_attr.push(0);
+        xor_attr.push(0x01);
+        let xored_port = endpoint.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        xor_attr.extend_from_slice(&xored_port.to_be_bytes());
+        let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        if let IpAddr::V4(addr) = endpoint.ip() {
+            for (index, byte) in addr.octets().iter().enumerate() {
+                xor_attr.push(byte ^ cookie[index]);
+            }
+        }
+
+        let total_len = (unknown.len() + xor_attr.len()) as u16;
+        let mut response = build_response_header(total_len, STUN_MAGIC_COOKIE, &tx_id);
+        response.extend_from_slice(&unknown);
+        response.extend_from_slice(&xor_attr);
+
+        let parsed = client
+            .parse_binding_response(&response, &tx_id)
+            .expect("padded attribute followed by XOR-MAPPED-ADDRESS must parse");
+        assert_eq!(parsed, endpoint);
+    }
+
+    #[test]
+    fn stun_parser_handles_max_attribute_length_without_overflow() {
+        // Attempt to provoke arithmetic overflow / panic via attr_len = u16::MAX
+        // when the message length is much smaller. Must reject cleanly,
+        // not panic with attempt-to-add-with-overflow or out-of-bounds index.
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0xCC; 12];
+        let mut response = build_response_header(8, STUN_MAGIC_COOKIE, &tx_id);
+        response.extend_from_slice(&STUN_ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        response.extend_from_slice(&u16::MAX.to_be_bytes());
+        response.extend_from_slice(&[0u8; 4]);
+        let err = client
+            .parse_binding_response(&response, &tx_id)
+            .expect_err("u16::MAX attribute length must be rejected, not panic");
+        assert!(err.contains("message boundary"), "got: {err}");
+    }
+
+    #[test]
+    fn stun_parser_rejects_short_message_with_only_partial_attribute_header() {
+        // Message length declared 3 bytes (less than a 4-byte TLV header).
+        // The buffer holds those 3 bytes, but the loop guard `pos + 4 <= end`
+        // rejects the iteration, and the parser falls through to "no mapped
+        // address" rather than reading past the message.
+        let client = StunClient::new(vec![], Duration::from_secs(1));
+        let tx_id = [0xDD; 12];
+        let mut response = build_response_header(3, STUN_MAGIC_COOKIE, &tx_id);
+        response.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let err = client
+            .parse_binding_response(&response, &tx_id)
+            .expect_err("partial attribute header must not produce a mapping");
+        assert!(err.contains("no mapped address"), "got: {err}");
+    }
 }
