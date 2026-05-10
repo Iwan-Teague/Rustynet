@@ -50,6 +50,14 @@ const MAX_PACKET_SIZE_BYTES: usize = 65_536;
 /// How long we retain nonces in the replay-prevention store (must cover the
 /// full TTL window so a nonce cannot be recycled within its validity period).
 const NONCE_RETENTION_SECS: u64 = MAX_RELAY_TTL_SECS * 2;
+/// Hard ceiling on `clock_skew_tolerance_secs` accepted by `RelayTransport`
+/// constructors. The replay store retains nonces for `NONCE_RETENTION_SECS`
+/// (two TTL windows). If a caller supplied a larger skew, a token could
+/// remain non-expired (per `is_expired`) after its nonce was already pruned,
+/// re-opening the replay window. We clamp at construction time to keep the
+/// invariant `MAX_RELAY_TTL_SECS + skew <= NONCE_RETENTION_SECS`. Equivalently,
+/// `skew <= MAX_RELAY_TTL_SECS`.
+const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = MAX_RELAY_TTL_SECS;
 /// Maximum `handle_hello` calls accepted per node within a one-second window
 /// before the hello itself is rejected (separate from packet rate limiting).
 const MAX_HELLOS_PER_NODE_PER_SEC: u32 = 5;
@@ -140,6 +148,14 @@ impl RelayTransport {
         max_sessions_per_node: usize,
         clock_skew_tolerance_secs: u64,
     ) -> Self {
+        // Clamp skew so the replay-store retention window always strictly
+        // dominates the maximum acceptable token validity. Without this, an
+        // operator that supplies an unreasonably large skew (>120 s) could
+        // open a replay window between the time a nonce is pruned and the
+        // time `is_expired` would finally reject the token. Clamping is
+        // fail-closed (stricter expiry) and preserves the existing API.
+        let clock_skew_tolerance_secs =
+            clock_skew_tolerance_secs.min(MAX_CLOCK_SKEW_TOLERANCE_SECS);
         Self {
             relay_id,
             sessions: HashMap::new(),
@@ -2313,6 +2329,512 @@ mod tests {
         assert!(
             transport.touch_session(unknown_session).is_err(),
             "touch_session must reject unknown session"
+        );
+    }
+
+    // ── Replay-store / boundary regression tests ─────────────────────────────
+    //
+    // Pin the security contracts that prior tests left implicit:
+    //   * skew is clamped at construction so retention always dominates TTL
+    //   * the replay window is closed at every point inside the skew tolerance
+    //   * forward/touch reject at exact-second expiry boundary
+    //   * advisory `validate_hello_from_tuple` does not consume the nonce
+    //   * `cleanup_idle_sessions` evicts at the retention boundary
+    //   * persisted store survives whitespace and dedupes against memory
+    //   * persisted store fails closed on malformed timestamp / extra fields
+    //   * persisted store rejects symlinked targets
+    //   * empty / max-size store reload semantics
+
+    #[test]
+    fn skew_tolerance_is_clamped_to_max_ttl() {
+        // Operator misconfigured a 600-second skew. Without clamping, a token
+        // that expired at t+120 would remain accepted until t+720 while the
+        // nonce store prunes at t+240, leaving a 480-second replay window.
+        // The constructor clamps so `is_expired` rejects no later than
+        // expires_at + MAX_CLOCK_SKEW_TOLERANCE_SECS, which never exceeds
+        // NONCE_RETENTION_SECS.
+        let (sk, _) = make_test_keypair();
+        let transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 600);
+        assert_eq!(
+            transport.clock_skew_tolerance_secs, MAX_CLOCK_SKEW_TOLERANCE_SECS,
+            "clock skew larger than MAX_CLOCK_SKEW_TOLERANCE_SECS must be clamped"
+        );
+
+        let inside = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 30);
+        assert_eq!(
+            inside.clock_skew_tolerance_secs, 30,
+            "clock skew within bounds must be preserved verbatim"
+        );
+
+        let exact = RelayTransport::new(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            MAX_CLOCK_SKEW_TOLERANCE_SECS,
+        );
+        assert_eq!(
+            exact.clock_skew_tolerance_secs, MAX_CLOCK_SKEW_TOLERANCE_SECS,
+            "boundary value must be preserved (not over-clamped)"
+        );
+    }
+
+    #[test]
+    fn skew_clamp_invariant_holds_for_replay_retention() {
+        // Compile-time-style invariant test: the clamp must always be small
+        // enough that even at exact expiry + skew, the nonce is still inside
+        // the retention window. This protects against future constant tweaks
+        // that would silently re-open the replay window.
+        const _: () = assert!(
+            MAX_RELAY_TTL_SECS + MAX_CLOCK_SKEW_TOLERANCE_SECS <= NONCE_RETENTION_SECS,
+            "skew + ttl must never exceed nonce retention or replay window reopens"
+        );
+    }
+
+    #[test]
+    fn forward_packet_rejects_at_exact_expiry_second() {
+        // `forward_packet` uses `<=` against expiry, so a session whose token
+        // expires at exactly `now_unix` must be rejected (fail-closed at the
+        // boundary).
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        let from = observed_addr([198, 51, 100, 90], 40_900);
+        let sid = accept_hello_from(&mut transport, &sk, "node-a", "node-b", from);
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        transport
+            .sessions
+            .get_mut(&sid)
+            .expect("session should exist")
+            .expires_at_unix = now_unix;
+
+        let err = transport
+            .forward_packet(sid, b"boundary", from)
+            .expect_err("forward must reject at exact expiry second");
+        assert_eq!(err, RelayForwardError::SessionExpired);
+        assert!(
+            !transport.has_session(sid),
+            "expired session must be cleaned up by forward_packet"
+        );
+    }
+
+    #[test]
+    fn touch_session_from_tuple_rejects_at_exact_expiry_second() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        let hello_addr = observed_addr([198, 51, 100, 91], 40_910);
+        let data_addr = observed_addr([198, 51, 100, 91], 51_910);
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_addr);
+        let sid_b = accept_hello_from(
+            &mut transport,
+            &sk,
+            "node-b",
+            "node-a",
+            observed_addr([203, 0, 113, 91], 41_910),
+        );
+        let _ = transport.forward_packet(sid_a, b"bind-a", data_addr);
+        let _ =
+            transport.forward_packet(sid_b, b"bind-b", observed_addr([203, 0, 113, 91], 51_911));
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        transport
+            .sessions
+            .get_mut(&sid_a)
+            .expect("session should exist")
+            .expires_at_unix = now_unix;
+
+        let err = transport
+            .touch_session_from_tuple(sid_a, data_addr)
+            .expect_err("touch must reject at exact expiry second");
+        assert_eq!(err, RelayForwardError::SessionExpired);
+        assert!(
+            !transport.has_session(sid_a),
+            "expired session must be cleaned up by touch_session_from_tuple"
+        );
+    }
+
+    #[test]
+    fn validate_hello_from_tuple_does_not_consume_nonce() {
+        // The advisory pre-flight `validate_hello_from_tuple` is documented
+        // as fail-closed-before-I/O: it rejects forged/stale/flooded hellos
+        // before the daemon binds an allocated UDP port, but it must NOT
+        // burn the nonce. Otherwise a benign caller that allocates a port
+        // and then commits would see its own committed hello rejected as a
+        // replay.
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let from = observed_addr([198, 51, 100, 92], 40_920);
+
+        transport
+            .validate_hello_from_tuple(&hello, from)
+            .expect("advisory validation must succeed");
+        assert!(
+            transport.nonce_store.nonces.is_empty(),
+            "advisory pre-check must not consume the nonce"
+        );
+        assert!(
+            !transport.nonce_store.contains(&hello.session_token.nonce),
+            "advisory pre-check must not register the nonce"
+        );
+
+        match transport.handle_hello_from_tuple_with_allocated_port(hello.clone(), from, 50_010) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("commit must succeed after advisory validation: {other:?}"),
+        }
+        assert!(
+            transport.nonce_store.contains(&hello.session_token.nonce),
+            "commit path must register the nonce"
+        );
+    }
+
+    #[test]
+    fn commit_path_does_not_double_count_hello_rate() {
+        // Contract: `validate_hello_from_tuple` is the daemon's first contact
+        // point and is the call that consumes one hello-rate budget unit. The
+        // subsequent commit (`handle_hello_from_tuple_with_allocated_port`)
+        // re-runs all stateful security predicates, but it must NOT charge a
+        // second hello against the rate budget — otherwise the effective
+        // budget is halved and an honest peer can rate-limit itself with two
+        // legitimate sequential calls in the daemon's pre-check + commit flow.
+        let (sk, _) = make_test_keypair();
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        transport.hello_limiter.max_per_sec = 1;
+        let from = observed_addr([198, 51, 100, 93], 40_930);
+
+        // First advisory call uses the single budget unit.
+        let hello1 = make_hello(&sk, "node-a", "node-b");
+        transport
+            .validate_hello_from_tuple(&hello1, from)
+            .expect("first advisory pre-check must succeed");
+        // Commit must succeed even though the rate budget was already drained
+        // by the advisory call — the commit path itself must not count again.
+        match transport.handle_hello_from_tuple_with_allocated_port(hello1, from, 50_020) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("commit must not double-count hello rate: {other:?}"),
+        }
+
+        // A second independent advisory call must now be rate-limited because
+        // the budget was already consumed by the first advisory call (not by
+        // the commit). This proves the counter is charged exactly once per
+        // (advisory, commit) pair.
+        let hello2 = make_hello(&sk, "node-a", "node-b");
+        assert_eq!(
+            transport.validate_hello_from_tuple(&hello2, from),
+            Err(RejectReason::RateLimitExceeded),
+            "second advisory call must trip the rate limit"
+        );
+    }
+
+    #[test]
+    fn replay_rejected_inside_full_skew_window() {
+        // Even at the latest instant where `is_expired` would still accept
+        // the token (expires_at + skew - 1), a replay must remain rejected.
+        // This protects against a subtle bug where the in-memory nonce
+        // store could be pruned while the token is still valid.
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let nonce = hello.session_token.nonce;
+        match transport.handle_hello(hello.clone()) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("first hello must be accepted: {other:?}"),
+        }
+
+        // Back-date the recorded nonce to (now - retention + 1) — the latest
+        // moment it can still be in the store. A replay here must be rejected.
+        let almost_pruned = now_unix().saturating_sub(NONCE_RETENTION_SECS - 1);
+        transport.nonce_store.nonces.insert(nonce, almost_pruned);
+
+        assert_eq!(
+            transport.handle_hello(hello),
+            RelayHelloResponse::Rejected(RejectReason::ReplayedNonce),
+            "nonce must remain in store throughout retention - 1 boundary"
+        );
+    }
+
+    #[test]
+    fn nonce_at_exact_retention_age_is_pruned_by_cleanup() {
+        // `prune` keeps entries with `now - inserted_at < retention`. At
+        // exactly `retention_secs`, the entry must be evicted. This pins the
+        // boundary so a future loosening would be caught by tests.
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        // Seed one nonce
+        transport.handle_hello(make_hello(&sk, "node-a", "node-b"));
+        assert_eq!(transport.nonce_store.nonces.len(), 1);
+        for inserted_at in transport.nonce_store.nonces.values_mut() {
+            *inserted_at = now_unix().saturating_sub(NONCE_RETENTION_SECS);
+        }
+        transport.cleanup_idle_sessions();
+        assert_eq!(
+            transport.nonce_store.nonces.len(),
+            0,
+            "entries at exactly retention age must be pruned (boundary is exclusive)"
+        );
+
+        // And one second younger must survive.
+        transport.handle_hello(make_hello(&sk, "node-c", "node-d"));
+        for inserted_at in transport.nonce_store.nonces.values_mut() {
+            *inserted_at = now_unix().saturating_sub(NONCE_RETENTION_SECS - 1);
+        }
+        transport.cleanup_idle_sessions();
+        assert_eq!(
+            transport.nonce_store.nonces.len(),
+            1,
+            "entries one second below retention must survive"
+        );
+    }
+
+    #[test]
+    fn empty_replay_store_loads_cleanly_and_persists_zero_entries() {
+        let (sk, _) = make_test_keypair();
+        let path = temp_replay_store_path("empty-replay");
+        // First open creates the file
+        let _ = RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        )
+        .expect("empty replay store must initialize cleanly");
+        let content = fs::read_to_string(&path).expect("replay store file should exist");
+        assert!(
+            content.is_empty(),
+            "fresh replay store must be persisted empty, not contain stub data"
+        );
+
+        // Second open of an empty file must also succeed (covers reload path)
+        let transport = RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        )
+        .expect("empty replay store must reload cleanly");
+        assert_eq!(transport.nonce_store.nonces.len(), 0);
+
+        let _ = fs::remove_dir_all(path.parent().expect("path should have parent"));
+    }
+
+    #[test]
+    fn replay_store_tolerates_blank_lines_but_rejects_extra_fields() {
+        let (sk, _) = make_test_keypair();
+        let path = temp_replay_store_path("blank-vs-extra");
+
+        // Whitespace-only lines must be ignored. Use a fresh timestamp so
+        // load + prune (`new_with_replay_store_path`) does not silently drop
+        // the valid entry as past-retention.
+        let nonce_hex: String = (0u8..16).map(|b| format!("{b:02x}")).collect();
+        let fresh_ts = now_unix();
+        let valid_with_blanks = format!("\n   \n{nonce_hex} {fresh_ts}\n\n");
+        fs::write(&path, valid_with_blanks)
+            .expect("valid-with-blanks replay store should be written");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("test fixture must have 0600 permissions");
+        let transport = RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        )
+        .expect("blank lines must be tolerated");
+        assert_eq!(
+            transport.nonce_store.nonces.len(),
+            1,
+            "blank lines must be skipped without dropping valid entries"
+        );
+
+        // Extra trailing field must fail closed
+        let extra = format!("{nonce_hex} 1700000000 extra-junk\n");
+        fs::write(&path, extra).expect("extra-field replay store should be written");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("test fixture must have 0600 permissions");
+        let err = match RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        ) {
+            Ok(_) => panic!("extra fields in replay store must fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.contains("unexpected fields"));
+
+        let _ = fs::remove_dir_all(path.parent().expect("path should have parent"));
+    }
+
+    #[test]
+    fn replay_store_rejects_short_nonce_hex() {
+        // 30 hex chars (15 bytes) instead of the required 32 must fail closed.
+        let (sk, _) = make_test_keypair();
+        let path = temp_replay_store_path("short-nonce");
+        fs::write(&path, "deadbeefdeadbeefdeadbeefdeadbe 1700000000\n")
+            .expect("short-nonce replay store should be written");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("test fixture must have 0600 permissions");
+
+        let err = match RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        ) {
+            Ok(_) => panic!("short nonce must fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.contains("32 hex characters"));
+        let _ = fs::remove_dir_all(path.parent().expect("path should have parent"));
+    }
+
+    #[test]
+    fn replay_store_rejects_non_numeric_timestamp() {
+        let (sk, _) = make_test_keypair();
+        let path = temp_replay_store_path("bad-ts");
+        let nonce_hex: String = (0u8..16).map(|b| format!("{b:02x}")).collect();
+        fs::write(&path, format!("{nonce_hex} not-a-number\n"))
+            .expect("bad-timestamp replay store should be written");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("test fixture must have 0600 permissions");
+
+        let err = match RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        ) {
+            Ok(_) => panic!("non-numeric timestamp must fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.contains("invalid timestamp"));
+        let _ = fs::remove_dir_all(path.parent().expect("path should have parent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_store_rejects_symlinked_path() {
+        // The replay store path itself must not be a symlink — otherwise a
+        // local attacker with write access to the parent could redirect
+        // writes elsewhere. The validator must reject symlinked file paths.
+        let (sk, _) = make_test_keypair();
+        let real = temp_replay_store_path("symlink-real");
+        let parent = real
+            .parent()
+            .expect("path should have parent")
+            .to_path_buf();
+        // Create a real target with valid (empty) content
+        fs::write(&real, "").expect("real replay store target should be created");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600))
+            .expect("real replay store target must be 0600");
+
+        let symlink = parent.join("replay.symlink");
+        std::os::unix::fs::symlink(&real, &symlink)
+            .expect("symlink for negative test should be created");
+
+        let err = match RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            symlink.clone(),
+        ) {
+            Ok(_) => panic!("symlinked replay store path must fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.contains("regular file"));
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_store_rejects_broad_file_permissions() {
+        // The replay store file itself (not just the parent) must enforce
+        // strict permissions on load. Pin the contract so we catch any
+        // future regressions in `validate_replay_store_path`.
+        let (sk, _) = make_test_keypair();
+        let path = temp_replay_store_path("broad-file");
+        fs::write(&path, "").expect("broad-perm replay store should be written");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("test fixture must use widened permissions");
+
+        let err = match RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        ) {
+            Ok(_) => panic!("broad replay store file permissions must fail closed"),
+            Err(err) => err,
+        };
+        assert!(err.contains("permissions too broad"));
+        let _ = fs::remove_dir_all(path.parent().expect("path should have parent"));
+    }
+
+    #[test]
+    fn nonce_store_failed_persist_keeps_in_memory_state_consistent() {
+        // If `persist_map` were to fail, `insert` must NOT update the
+        // in-memory `nonces` map: otherwise the durable store drifts from
+        // memory and a relay restart would forget the nonce. Simulate this
+        // by pointing the store at a path whose parent disappears.
+        let path_dir = std::env::temp_dir().join(format!(
+            "rustynet-relay-vanish-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::create_dir_all(&path_dir).expect("temp dir must be created");
+        #[cfg(unix)]
+        fs::set_permissions(&path_dir, fs::Permissions::from_mode(0o700))
+            .expect("temp dir permissions must be tight");
+        let path = path_dir.join("replay.store");
+        let (sk, _) = make_test_keypair();
+        let mut transport = RelayTransport::new_with_replay_store_path(
+            TEST_RELAY_ID,
+            sk.verifying_key(),
+            8,
+            90,
+            path.clone(),
+        )
+        .expect("replay store should initialize");
+        // Remove the parent directory so subsequent writes fail
+        fs::remove_dir_all(&path_dir).expect("parent directory removal should succeed");
+
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let response = transport.handle_hello_from_tuple_with_allocated_port(
+            hello.clone(),
+            observed_addr([198, 51, 100, 95], 40_950),
+            50_030,
+        );
+        assert_eq!(
+            response,
+            RelayHelloResponse::Rejected(RejectReason::ReplayStoreUnavailable),
+            "persist failure must surface as ReplayStoreUnavailable"
+        );
+        assert!(
+            !transport.nonce_store.contains(&hello.session_token.nonce),
+            "failed persist must not leave a phantom nonce in memory"
+        );
+        assert_eq!(
+            transport.session_count(),
+            0,
+            "no session may be allocated when nonce persistence fails"
         );
     }
 
