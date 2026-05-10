@@ -20114,6 +20114,781 @@ mod tests {
     }
 
     #[test]
+    fn load_dns_zone_bundle_rejects_strictly_older_generated_at_unix() {
+        // Anti-replay: a dns-zone bundle whose `generated_at_unix` is
+        // strictly older than the persisted watermark must fail closed.
+        // Without this guard an attacker who captured an earlier signed
+        // zone could revert the resolver to the stale answer set.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-watermark-older-generated-at");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            10,
+            false,
+        );
+        let envelope = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("first load should succeed");
+
+        // Persist a watermark whose generated_at_unix is STRICTLY NEWER
+        // than the bundle's own — the bundle must now be rejected as a
+        // replay regardless of any other field.
+        let synthetic_newer = rustynet_dns_zone::DnsZoneWatermark {
+            version: 2,
+            generated_at_unix: envelope.watermark.generated_at_unix.saturating_add(60),
+            nonce: 1,
+            payload_digest: [0u8; 32],
+        };
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: Some(synthetic_newer),
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("strictly older bundle must be rejected as replay");
+        assert!(matches!(err, DnsZoneBootstrapError::ReplayDetected));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_same_generated_at_smaller_nonce() {
+        // (generated_at_unix, nonce) is the lexicographic ordering used
+        // by `dns_zone_watermark_ordering`; same timestamp with a smaller
+        // nonce is strictly older and must be rejected as replay.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-watermark-smaller-nonce");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            5, // bundle nonce
+            false,
+        );
+        let envelope = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("first load should succeed");
+
+        // Persist a watermark with the SAME generated_at_unix but a
+        // LARGER nonce — the bundle's (ts, nonce) pair is then strictly
+        // older and must be rejected.
+        let synthetic_newer_by_nonce = rustynet_dns_zone::DnsZoneWatermark {
+            version: 2,
+            generated_at_unix: envelope.watermark.generated_at_unix,
+            nonce: envelope.watermark.nonce.saturating_add(5),
+            payload_digest: [0u8; 32],
+        };
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: Some(synthetic_newer_by_nonce),
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("same generated_at with smaller nonce must be rejected as replay");
+        assert!(matches!(err, DnsZoneBootstrapError::ReplayDetected));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_accepts_strictly_newer_generated_at_unix() {
+        // Complement of the older-generated-at test: a bundle whose
+        // `generated_at_unix` is strictly newer than the persisted
+        // watermark must be accepted regardless of digest mismatch —
+        // a different timestamp means a different signed zone event.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-watermark-newer-generated-at");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            20,
+            false,
+        );
+        let envelope = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("baseline load should succeed");
+
+        let strictly_older = rustynet_dns_zone::DnsZoneWatermark {
+            version: 2,
+            generated_at_unix: envelope.watermark.generated_at_unix.saturating_sub(60),
+            nonce: 99_999,
+            payload_digest: [0xAAu8; 32],
+        };
+        let envelope2 = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: Some(strictly_older),
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("strictly newer generated_at_unix must be accepted");
+        assert_eq!(envelope2.watermark, envelope.watermark);
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_accepts_same_generated_at_with_larger_nonce() {
+        // Equal `generated_at_unix` with a larger nonce is strictly
+        // newer in the lexicographic ordering and must be accepted
+        // regardless of any digest mismatch on the older watermark.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-watermark-larger-nonce");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            500, // bundle nonce
+            false,
+        );
+        let envelope = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("baseline load should succeed");
+
+        let smaller_nonce = rustynet_dns_zone::DnsZoneWatermark {
+            version: 2,
+            generated_at_unix: envelope.watermark.generated_at_unix,
+            nonce: envelope.watermark.nonce.saturating_sub(50),
+            payload_digest: [0xBBu8; 32],
+        };
+        let envelope2 = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: Some(smaller_nonce),
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("same generated_at with larger nonce must be accepted");
+        assert_eq!(envelope2.watermark.nonce, envelope.watermark.nonce);
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_accepts_equal_watermark_when_payload_digest_matches() {
+        // Idempotent re-load: the same signed dns-zone bundle re-presented
+        // against its own watermark must be accepted (Equal ordering with
+        // matching payload digest is the legitimate steady-state path).
+        let test_dir = secure_test_dir("rustynetd-dns-zone-watermark-digest-match");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            7,
+            false,
+        );
+        let envelope = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("first load should succeed");
+
+        let envelope2 = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: Some(envelope.watermark),
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect("equal watermark with matching digest must be accepted");
+        assert_eq!(envelope2.watermark, envelope.watermark);
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_future_dated_beyond_clock_skew() {
+        // Future-dated guard: a bundle whose `generated_at_unix` is more
+        // than `max_clock_skew_secs` ahead of `now` must be rejected.
+        // This pins the boundary check at line 9728 of `load_dns_zone_bundle`.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-future-dated");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        let policy = TrustPolicy::default();
+        // generated_at_unix one second beyond the configured skew window.
+        let future_at = unix_now()
+            .saturating_add(policy.max_clock_skew_secs)
+            .saturating_add(1);
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            3,
+            DnsZoneFixtureTiming {
+                generated_at_unix: future_at,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: policy,
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("future-dated bundle must be rejected");
+        assert!(matches!(err, DnsZoneBootstrapError::FutureDated));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_stale_beyond_max_age() {
+        // Stale guard: a bundle whose `generated_at_unix` is more than
+        // `max_age_secs` behind `now` must be rejected with `Stale`.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-stale");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        // generated_at_unix one second past the max_age window.
+        // Use a 1-day buffer and a 1-day max_age so the bundle is
+        // unambiguously stale by `now - generated_at > max_age_secs`
+        // without crossing the bundle's own ttl-derived expires_at_unix
+        // (the bundle uses ttl_secs=60).
+        let now = unix_now();
+        let max_age_secs: u64 = 60;
+        let stale_at = now.saturating_sub(max_age_secs).saturating_sub(1);
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            4,
+            DnsZoneFixtureTiming {
+                generated_at_unix: stale_at,
+                ttl_secs: 300,
+                tamper_after_sign: false,
+            },
+        );
+
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("bundle older than max_age must be rejected as stale");
+        assert!(matches!(err, DnsZoneBootstrapError::Stale));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_expired_beyond_expires_at_unix() {
+        // The bundle carries its own `expires_at_unix`; once `now`
+        // crosses it the bundle must be rejected as Stale even if the
+        // ambient `max_age_secs` would have allowed it.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-expired");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        // ttl_secs=60 and generated_at 90s ago → expires_at is 30s in
+        // the past while max_age_secs is well above 90s. Only the
+        // `now > expires_at_unix` arm of the stale check can fire.
+        let now = unix_now();
+        let generated_at = now.saturating_sub(90);
+        write_dns_zone_file_with_timing(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            6,
+            DnsZoneFixtureTiming {
+                generated_at_unix: generated_at,
+                ttl_secs: 60,
+                tamper_after_sign: false,
+            },
+        );
+
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: 86_400,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("bundle past expires_at_unix must be rejected as stale");
+        assert!(matches!(err, DnsZoneBootstrapError::Stale));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_tampered_payload() {
+        // Tamper-after-sign: any modification to the wire payload after
+        // signing must cause signature verification to fail closed.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-tampered");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            8,
+            true, // tamper_after_sign flips record.0.ttl_secs from 60 to 61
+        );
+
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("tampered bundle must fail signature verification");
+        assert!(matches!(err, DnsZoneBootstrapError::SignatureInvalid));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_wrong_signing_key() {
+        // Attacker-controlled signing key: a bundle signed by a
+        // different key but presented against the legitimate verifier
+        // must fail signature verification and never load.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-wrong-key");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        // Write the legitimate verifier (matching key bytes [31u8; 32]
+        // used by `write_dns_zone_file`).
+        let legitimate_signing = SigningKey::from_bytes(&[31u8; 32]);
+        std::fs::write(
+            &dns_zone_verifier_path,
+            format!(
+                "{}\n",
+                hex_encode(legitimate_signing.verifying_key().as_bytes())
+            ),
+        )
+        .expect("legitimate verifier key should be written");
+
+        // Sign the bundle with a DIFFERENT key — verification must fail.
+        let attacker_signing = SigningKey::from_bytes(&[19u8; 32]);
+        let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
+            &attacker_signing,
+            "rustynet",
+            "daemon-local",
+            unix_now(),
+            60,
+            9,
+            &[rustynet_dns_zone::DnsZoneRecordInput {
+                label: "app".to_string(),
+                target_node_id: "node-exit".to_string(),
+                rr_type: rustynet_dns_zone::DnsRecordType::A,
+                target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.64.0.2".to_string(),
+                ttl_secs: 60,
+                aliases: Vec::new(),
+            }],
+        )
+        .expect("attacker-signed bundle should still build");
+        let body = rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle);
+        std::fs::write(&dns_zone_path, body).expect("dns zone file should be written");
+
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("bundle signed with a non-trusted key must be rejected");
+        assert!(matches!(err, DnsZoneBootstrapError::SignatureInvalid));
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_corrupt_signature_hex() {
+        // Corrupt signature hex: even before crypto verification the
+        // bundle must fail closed when the signature field is unparseable.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-corrupt-sig");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        let assignment = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("signed assignment should load");
+
+        write_dns_zone_file(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "daemon-local",
+            ("node-exit", "100.64.0.2", &[]),
+            11,
+            false,
+        );
+        // Replace the signature hex line with a corrupt non-hex value.
+        let original = std::fs::read_to_string(&dns_zone_path).expect("zone file should be read");
+        let mut corrupted = String::new();
+        for line in original.lines() {
+            if let Some(rest) = line.strip_prefix("signature=") {
+                let _ = rest;
+                corrupted.push_str("signature=not-a-valid-hex-signature\n");
+            } else {
+                corrupted.push_str(line);
+                corrupted.push('\n');
+            }
+        }
+        std::fs::write(&dns_zone_path, corrupted).expect("corrupted zone file should be written");
+
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "rustynet",
+            local_node_id: "daemon-local",
+            auto_tunnel: &assignment.bundle,
+        })
+        .expect_err("corrupt signature hex must fail");
+        assert!(
+            matches!(
+                err,
+                DnsZoneBootstrapError::InvalidFormat(_) | DnsZoneBootstrapError::SignatureInvalid
+            ),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn daemon_runtime_dns_inspect_reports_signed_zone_state() {
         let test_dir = secure_test_dir("rustynetd-dns-inspect");
         let assignment_path = test_dir.join("assignment.bundle");
