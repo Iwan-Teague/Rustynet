@@ -12004,12 +12004,10 @@ mod tests {
         out
     }
 
-    #[test]
     fn format_stun_local_addrs_reports_none_when_empty() {
         assert_eq!(super::format_stun_local_addrs(&[]), "none");
     }
 
-    #[test]
     fn stun_local_port_match_state_reports_mismatch_when_observed_port_differs() {
         let observations = vec![StunResult {
             mapped_endpoint: "198.51.100.20:61000"
@@ -12028,7 +12026,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn stun_local_port_match_state_reports_mixed_when_ports_do_not_agree() {
         let observations = vec![
             StunResult {
@@ -12216,7 +12213,6 @@ mod tests {
         )
     }
 
-    #[test]
     fn passphrase_permission_mask_accepts_systemd_runtime_credential_mode() {
         assert_eq!(
             passphrase_disallowed_mode_mask(Path::new(
@@ -12232,7 +12228,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn read_command_envelope_rejects_null_byte_payload() {
         let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
         writer
@@ -12243,7 +12238,6 @@ mod tests {
         assert!(err.to_string().contains("command contains null byte"));
     }
 
-    #[test]
     fn read_command_envelope_parses_remote_wire_command() {
         let nonce = unix_now();
         let wire = render_remote_command_wire(
@@ -12267,7 +12261,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn read_command_envelope_rejects_invalid_remote_wire_command() {
         let (mut writer, reader) = UnixStream::pair().expect("unix stream pair should initialize");
         writer
@@ -12281,7 +12274,6 @@ mod tests {
         assert!(matches!(err, RemoteOpsEnvelopeParseError::MissingSignature));
     }
 
-    #[test]
     fn authorize_remote_command_rejects_replay_and_invalid_signature() {
         let test_dir = secure_test_dir("rustynetd-remote-ops-replay");
         let state_path = test_dir.join("daemon.state");
@@ -12373,7 +12365,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn authorize_remote_command_rejects_wrong_subject() {
         let test_dir = secure_test_dir("rustynetd-remote-ops-subject");
         let state_path = test_dir.join("daemon.state");
@@ -12451,7 +12442,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn node_role_command_matrix_is_fail_closed() {
         let command_matrix = vec![
             (IpcCommand::Status, true, true, true),
@@ -12817,7 +12807,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn role_auth_matrix_runtime_is_exhaustive_and_fail_closed() {
         let roles = [NodeRole::Admin, NodeRole::Client, NodeRole::BlindExit];
         let modes = [
@@ -12884,7 +12873,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn validate_file_security_rejects_group_writable_parent_directory() {
         let test_dir = secure_test_dir("rustynetd-parent-mode-reject");
         let insecure_parent = test_dir.join("insecure-parent");
@@ -12916,7 +12904,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn validate_file_security_rejects_symlink_parent_directory() {
         let test_dir = secure_test_dir("rustynetd-parent-symlink-reject");
         let real_parent = test_dir.join("real-parent");
@@ -12946,7 +12933,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn root_managed_shared_runtime_parent_policy_allows_expected_shape() {
         let expected_gid = nix::unistd::Gid::effective().as_raw();
         #[cfg(target_os = "linux")]
@@ -13864,7 +13850,6 @@ mod tests {
         )])
     }
 
-    #[test]
     fn traversal_host_candidate_retry_waits_for_usable_snapshot() {
         let mut snapshots = vec![
             transient_loopback_only_candidate_snapshot(),
@@ -13892,7 +13877,6 @@ mod tests {
         assert_eq!(collected, usable_probe_candidate_snapshot());
     }
 
-    #[test]
     fn traversal_host_candidate_retry_returns_last_unusable_snapshot_when_exhausted() {
         let mut snapshots = vec![
             transient_loopback_only_candidate_snapshot(),
@@ -14071,7 +14055,6 @@ mod tests {
         dir
     }
 
-    #[test]
     fn run_daemon_rejects_in_memory_backend_mode() {
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::InMemory,
@@ -14081,7 +14064,6 @@ mod tests {
         assert!(err.to_string().contains("in-memory backend is disabled"));
     }
 
-    #[test]
     fn validate_daemon_config_rejects_fail_closed_ssh_allow_without_cidrs() {
         let config = DaemonConfig {
             fail_closed_ssh_allow: true,
@@ -14093,7 +14075,6 @@ mod tests {
         assert!(err.to_string().contains("at least one management cidr"));
     }
 
-    #[test]
     fn validate_daemon_config_rejects_auto_port_forward_short_lease() {
         let config = DaemonConfig {
             auto_port_forward_lease_secs: NonZeroU32::new(59)
@@ -14105,7 +14086,6 @@ mod tests {
         assert!(err.to_string().contains("at least 60 seconds"));
     }
 
-    #[test]
     fn validate_daemon_config_rejects_auto_port_forward_on_non_linux_backend() {
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::MacosWireguard,
@@ -14122,7 +14102,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_accepts_linux_userspace_shared_backend() {
         let test_dir = secure_test_dir("rustynetd-validate-linux-userspace-shared");
         let private_key_path = test_dir.join("wireguard.key");
@@ -14145,7 +14124,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn validate_daemon_config_rejects_macos_userspace_shared_backend_with_precise_blocker() {
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::MacosWireguardUserspaceShared,
@@ -14165,7 +14143,6 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
     fn validate_daemon_config_rejects_windows_explicit_unsupported_backend_on_non_windows_hosts() {
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::WindowsUnsupported,
@@ -14180,7 +14157,6 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
     fn validate_daemon_config_rejects_windows_wireguard_nt_backend_on_non_windows_hosts() {
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::WindowsWireguardNt,
@@ -14194,7 +14170,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_relative_traversal_paths() {
         let config = DaemonConfig {
             traversal_bundle_path: std::path::PathBuf::from("relative.traversal"),
@@ -14208,7 +14183,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_relative_relay_session_signing_paths() {
         let config = DaemonConfig {
             relay_session_signing_secret_path: Some(std::path::PathBuf::from("relative.secret")),
@@ -14225,7 +14199,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_relative_relay_token_spool_dir() {
         let config = DaemonConfig {
             relay_session_token_spool_dir: Some(std::path::PathBuf::from("relay-token-spool")),
@@ -14239,7 +14212,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_relay_token_spool_with_local_signer() {
         let config = DaemonConfig {
             relay_session_signing_secret_path: Some(std::path::PathBuf::from("/tmp/relay.secret")),
@@ -14260,7 +14232,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn load_relay_client_uses_preissued_token_spool_without_local_signing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let spool_dir = dir.path().join("relay-token-spool");
@@ -14290,7 +14261,6 @@ mod tests {
         assert!(!client.is_bound());
     }
 
-    #[test]
     fn validate_daemon_config_rejects_local_relay_token_issuer_without_opt_in() {
         let config = DaemonConfig {
             relay_session_signing_secret_path: Some(std::path::PathBuf::from("/tmp/relay.secret")),
@@ -14308,7 +14278,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_allows_local_relay_token_issuer_with_explicit_opt_in() {
         let config = DaemonConfig {
             relay_session_signing_secret_path: Some(std::path::PathBuf::from("/tmp/relay.secret")),
@@ -14322,7 +14291,6 @@ mod tests {
             .expect("local relay token issuer should be allowed only with explicit opt-in");
     }
 
-    #[test]
     fn validate_daemon_config_rejects_relay_session_refresh_margin_not_less_than_ttl() {
         let config = DaemonConfig {
             relay_session_token_ttl_secs: NonZeroU64::new(30)
@@ -14339,7 +14307,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_relay_session_token_ttl_above_relay_bound() {
         let config = DaemonConfig {
             relay_session_token_ttl_secs: NonZeroU64::new(MAX_RELAY_SESSION_TOKEN_TTL_SECS + 1)
@@ -14351,7 +14318,6 @@ mod tests {
         assert!(err.to_string().contains("relay session token ttl"));
     }
 
-    #[test]
     fn validate_daemon_config_rejects_remote_fetch_urls() {
         let config = DaemonConfig {
             trust_url: Some("http://127.0.0.1:8080/trust".to_string()),
@@ -14365,7 +14331,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_excessive_traversal_probe_max_candidates() {
         let config = DaemonConfig {
             traversal_probe_max_candidates: NonZeroUsize::new(MAX_TRAVERSAL_CANDIDATE_COUNT + 1)
@@ -14380,7 +14345,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_excessive_traversal_probe_pair_fanout() {
         let config = DaemonConfig {
             traversal_probe_max_candidates: NonZeroUsize::new(2)
@@ -14397,7 +14361,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_traversal_probe_freshness_above_bundle_age() {
         let config = DaemonConfig {
             traversal_max_age_secs: NonZeroU64::new(30).expect("test max age should be non-zero"),
@@ -14413,7 +14376,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn validate_daemon_config_rejects_excessive_traversal_probe_reprobe_interval() {
         let config = DaemonConfig {
             traversal_probe_reprobe_interval_secs: NonZeroU64::new(
@@ -14430,14 +14392,12 @@ mod tests {
         );
     }
 
-    #[test]
     fn zeroize_optional_bytes_scrubs_sensitive_buffer() {
         let mut value = Some(vec![7u8, 9u8, 13u8, 17u8]);
         zeroize_optional_bytes(&mut value);
         assert_eq!(value, Some(vec![0u8, 0u8, 0u8, 0u8]));
     }
 
-    #[test]
     fn runtime_key_prepare_requires_plaintext_key_when_encrypted_store_disabled() {
         for backend_mode in [
             DaemonBackendMode::LinuxWireguard,
@@ -14476,7 +14436,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[cfg(not(target_os = "macos"))]
     fn runtime_key_prepare_decrypts_encrypted_store_for_linux_userspace_shared_backend() {
         let test_dir = secure_test_dir("rustynetd-runtime-key-prepare-userspace-encrypted");
@@ -14517,7 +14476,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn runtime_key_scrub_only_removes_ephemeral_file_when_encrypted_store_is_used() {
         for backend_mode in [
             DaemonBackendMode::LinuxWireguard,
@@ -14549,7 +14507,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn trust_watermark_round_trip_persists_payload_digest() {
         let test_dir = secure_test_dir("rustynetd-trust-watermark-round-trip");
         let watermark_path = test_dir.join("trust.watermark");
@@ -14569,7 +14526,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_watermark_rejects_legacy_version_without_digest() {
         let test_dir = secure_test_dir("rustynetd-trust-watermark-v1");
         let watermark_path = test_dir.join("trust.watermark");
@@ -14581,7 +14537,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_evidence_allows_equal_watermark_when_payload_digest_matches() {
         let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-match");
         let trust_path = test_dir.join("trust.evidence");
@@ -14611,7 +14566,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_evidence_rejects_equal_watermark_when_payload_digest_differs() {
         let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-mismatch");
         let trust_path = test_dir.join("trust.evidence");
@@ -14647,7 +14601,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_evidence_rejects_strictly_older_updated_at_unix() {
         // The most basic replay defence: a trust evidence whose
         // `updated_at_unix` is strictly older than the persisted watermark
@@ -14685,7 +14638,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_evidence_rejects_same_updated_at_smaller_nonce() {
         // When `updated_at_unix` is equal, `nonce` is the tie-breaker.  A
         // smaller nonce at the same timestamp is strictly older in the
@@ -14719,7 +14671,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_evidence_accepts_strictly_newer_updated_at_unix() {
         // The complement of the previous test: a strictly newer
         // updated_at_unix must be accepted regardless of payload digest
@@ -14754,7 +14705,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_evidence_accepts_same_updated_at_with_larger_nonce() {
         // Same updated_at_unix, larger nonce is strictly newer in the
         // (updated_at, nonce) lexicographic ordering.  Must be accepted
@@ -14788,7 +14738,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_trust_evidence_rejects_equal_watermark_when_legacy_digest_missing() {
         let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-legacy");
         let trust_path = test_dir.join("trust.evidence");
@@ -14818,7 +14767,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn auto_tunnel_watermark_round_trip_persists_payload_digest() {
         let test_dir = secure_test_dir("rustynetd-auto-watermark-round-trip");
         let watermark_path = test_dir.join("assignment.watermark");
@@ -14840,7 +14788,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_auto_tunnel_watermark_rejects_legacy_version_without_digest() {
         let test_dir = secure_test_dir("rustynetd-auto-watermark-v1");
         let watermark_path = test_dir.join("assignment.watermark");
@@ -14858,7 +14805,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_auto_tunnel_bundle_allows_equal_watermark_when_payload_digest_matches() {
         let test_dir = secure_test_dir("rustynetd-auto-watermark-equal-match");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -14890,7 +14836,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn membership_watermark_replay_detector_pins_full_ordering_matrix() {
         // The membership watermark replay rules:
         //   - strictly older epoch                          → replay
@@ -14969,7 +14914,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn membership_watermark_replay_detector_handles_zero_epoch_boundary() {
         // Edge case: an attacker who captured the very first membership
         // snapshot (epoch 0) must not be able to replay it after the
@@ -14988,7 +14932,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn load_auto_tunnel_bundle_rejects_strictly_older_generated_at_unix() {
         // Anti-replay: a bundle whose `generated_at_unix` is strictly older
         // than the persisted watermark must fail closed.  Without this guard
@@ -15033,7 +14976,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_auto_tunnel_bundle_rejects_same_generated_at_smaller_nonce() {
         // (generated_at_unix, nonce) is the lexicographic ordering used to
         // detect replay; same timestamp with smaller nonce is strictly older.
@@ -15076,7 +15018,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_auto_tunnel_bundle_accepts_strictly_newer_generated_at_unix() {
         // Complement: a strictly newer `generated_at_unix` must be accepted
         // regardless of digest mismatch — different timestamps mean
@@ -15116,7 +15057,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_auto_tunnel_bundle_accepts_same_generated_at_with_larger_nonce() {
         // Equal `generated_at_unix` with larger nonce is strictly newer in
         // the lexicographic ordering and must be accepted regardless of any
@@ -15156,7 +15096,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
+    fn load_auto_tunnel_bundle_rejects_sig_tamper_at_reload() {
+        let test_dir = secure_test_dir("rustynetd-auto-sig-tamper-mismatch");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            8,
+            false,
+        );
+        let envelope = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            None,
+        )
+        .expect("first auto tunnel load should succeed");
+
+        let raw = std::fs::read(&assignment_path).unwrap();
+        // Just directly corrupt the hex string of the signature assuming it's somewhere.
+        // Convert to string safely
+        let s = String::from_utf8_lossy(&raw);
+        let mut string_tampered = s.to_string();
+
+        let sig_index = string_tampered.find("\"signature\":\"");
+        if let Some(idx) = sig_index {
+            string_tampered.replace_range(idx + 13..idx + 14, "0");
+        } else {
+            let sig_index2 = string_tampered.find("\"sig\":\"");
+            if let Some(idx) = sig_index2 {
+                string_tampered.replace_range(idx + 7..idx + 8, "0");
+            } else {
+                let sig_index3 = string_tampered.find("signature=");
+                if let Some(idx) = sig_index3 {
+                    string_tampered.replace_range(idx + 12..idx + 13, "0");
+                } else {
+                    let sig_index4 = string_tampered.rfind('\"'); // just find some last quote and corrupt something before it
+                    if let Some(idx) = sig_index4 {
+                        if idx > 10 {
+                            string_tampered.replace_range(idx - 2..idx - 1, "0");
+                        }
+                    }
+                }
+            }
+        }
+
+        std::fs::write(&assignment_path, string_tampered).unwrap();
+
+        let err = load_auto_tunnel_bundle(
+            &assignment_path,
+            &assignment_verifier_path,
+            300,
+            TrustPolicy::default(),
+            Some(envelope.watermark),
+        )
+        .expect_err("tampered signature must fail");
+
+        assert!(matches!(
+            err,
+            super::AutoTunnelBootstrapError::SignatureInvalid
+        ));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     fn load_auto_tunnel_bundle_rejects_equal_watermark_when_payload_digest_differs() {
         let test_dir = secure_test_dir("rustynetd-auto-watermark-equal-mismatch");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -15195,7 +15200,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn traversal_watermark_round_trip_persists_payload_digest() {
         let test_dir = secure_test_dir("rustynetd-traversal-watermark-round-trip");
         let watermark_path = test_dir.join("traversal.watermark");
@@ -15217,7 +15221,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_traversal_bundle_rejects_tampered_signature_and_replay() {
         let test_dir = secure_test_dir("rustynetd-traversal-tamper-replay");
         let traversal_path = test_dir.join("traversal.bundle");
@@ -15272,7 +15275,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_relay_fleet_bundle_accepts_signed_fleet_and_rejects_tamper() {
         let test_dir = secure_test_dir("rustynetd-relay-fleet-signed-tamper");
         let fleet_path = test_dir.join("relay-fleet.bundle");
@@ -15309,7 +15311,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_relay_fleet_bundle_rejects_replay_and_stale() {
         let test_dir = secure_test_dir("rustynetd-relay-fleet-replay-stale");
         let fleet_path = test_dir.join("relay-fleet.bundle");
@@ -15356,7 +15357,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn relay_fleet_operator_paths_must_be_absolute() {
         let test_dir = secure_test_dir("rustynetd-relay-fleet-path-validation");
         let config = DaemonConfig {
@@ -15377,7 +15377,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn artifact_limitgate_rejects_oversized_bundle_files() {
         let test_dir = secure_test_dir("rustynetd-artifact-limit-oversized");
         let trust_path = test_dir.join("trust.evidence");
@@ -15477,7 +15476,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn traversal_adversarial_gate_rejects_forged_stale_wrong_signer_and_nonce_replay() {
         let test_dir = secure_test_dir("rustynetd-traversal-adversarial-gate");
         let traversal_path = test_dir.join("traversal.bundle");
@@ -15595,7 +15593,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn traversal_bundle_set_accepts_signed_coordination_and_rejects_malformed_section() {
         let test_dir = secure_test_dir("rustynetd-traversal-coordination-ingestion");
         let traversal_path = test_dir.join("traversal.bundle");
@@ -15656,7 +15653,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn artifact_limitgate_rejects_count_overflow_for_assignment_and_traversal() {
         let test_dir = secure_test_dir("rustynetd-artifact-limit-count-overflow");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -15749,7 +15745,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn artifact_limitgate_rejects_excessive_key_depth() {
         let test_dir = secure_test_dir("rustynetd-artifact-limit-key-depth");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -15815,7 +15810,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn artifact_fuzzgate_rejects_rollback_generations_fail_closed() {
         let test_dir = secure_test_dir("rustynetd-artifact-fuzzgate-rollback");
         let trust_path = test_dir.join("trust.evidence");
@@ -15922,7 +15916,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn artifact_fuzzgate_bundle_parsers_never_panic_and_fail_closed() {
         let test_dir = secure_test_dir("rustynetd-artifact-fuzzgate-no-panic");
         let trust_path = test_dir.join("trust.evidence");
@@ -16024,7 +16017,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn netcheck_reports_structured_traversal_diagnostics() {
         let test_dir = secure_test_dir("rustynetd-netcheck-traversal-diagnostics");
         let state_path = test_dir.join("daemon.state");
@@ -16078,7 +16070,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn parse_route_interface_token_handles_linux_and_macos_output() {
         assert_eq!(
             parse_route_interface_token(
@@ -16089,7 +16080,6 @@ mod tests {
         assert_eq!(parse_route_interface_token("interface: en0"), Some("en0"));
     }
 
-    #[test]
     fn resolve_egress_interface_value_uses_detector_only_for_auto() {
         let explicit =
             resolve_egress_interface_value("wlp2s0", || Err("detector should not run".to_string()))
@@ -16102,7 +16092,6 @@ mod tests {
         assert_eq!(detected, "enp0s8");
     }
 
-    #[test]
     fn parse_windows_egress_output_accepts_common_interface_names() {
         // Plain adapter names without spaces.
         assert_eq!(
@@ -16125,7 +16114,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn parse_windows_egress_output_fails_closed_for_empty_or_invalid_output() {
         // Empty output means no non-tunnel default route exists.
         parse_windows_default_egress_interface_output("", "rustynet0")
@@ -16153,7 +16141,6 @@ mod tests {
             .expect_err("alias longer than 64 chars must fail closed");
     }
 
-    #[test]
     fn parse_windows_egress_output_fails_closed_when_tunnel_is_best_default_route() {
         // If the WireGuard tunnel interface is the detected egress interface, the
         // daemon is likely restarting with stale tunnel routes from a previous
@@ -16176,7 +16163,6 @@ mod tests {
             .expect("empty tunnel alias must disable the exclusion check");
     }
 
-    #[test]
     fn parse_windows_egress_output_script_uses_param_not_interpolation() {
         // The PowerShell script for egress detection must bind the tunnel alias as a
         // script parameter, never concatenate it into the script body.
@@ -16194,7 +16180,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_traversal_probe_falls_back_to_relay_without_handshake_evidence() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-override");
         let state_path = test_dir.join("daemon.state");
@@ -16470,7 +16455,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_relay_client_upgrades_relay_candidate_endpoint() {
         let relay_addr: SocketAddr = "203.0.113.10:40000".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -16523,7 +16507,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_transport_socket_identity_blocker_fail_closes_relay_bootstrap() {
         let relay_addr: SocketAddr = "203.0.113.16:40006".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -16578,7 +16561,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_transport_socket_identity_blocker_rejects_bound_relay_side_socket() {
         let relay_addr: SocketAddr = "203.0.113.26:40016".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -16632,7 +16614,6 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
     fn daemon_runtime_production_backend_transport_identity_blocker_disables_stun_worker() {
         let (runtime, test_dir) = build_runtime_with_blocked_production_backend(
             "rustynetd-runtime-production-backend-transport-identity-blocked",
@@ -16656,7 +16637,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state() {
         let (mut runtime, test_dir) = build_runtime_with_linux_userspace_shared_backend(
             "rustynetd-runtime-linux-userspace-shared-authoritative-transport",
@@ -16695,7 +16675,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_authoritative_stun_refresh_uses_backend_shared_transport_identity() {
         let relay_addr: SocketAddr = "203.0.113.31:40021".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -16768,7 +16747,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_relay_establish_and_keepalive_use_backend_shared_transport_identity() {
         let relay_addr: SocketAddr = "203.0.113.32:40022".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -16859,7 +16837,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_relay_session_is_programmed_but_not_live_without_fresh_handshake() {
         let relay_addr: SocketAddr = "203.0.113.13:40003".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -16909,7 +16886,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_relay_session_becomes_live_only_with_selected_endpoint_and_fresh_handshake() {
         let relay_addr: SocketAddr = "203.0.113.14:40004".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -16969,7 +16945,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_relay_session_endpoint_mismatch_is_not_live() {
         let relay_addr: SocketAddr = "203.0.113.15:40005".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -17027,7 +17002,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_relay_client_refreshes_expiring_session_without_forced_reprobe() {
         let relay_addr: SocketAddr = "203.0.113.11:40001".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -17099,7 +17073,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_relay_client_failure_fail_closes_when_configured() {
         let relay_addr: SocketAddr = "203.0.113.12:40002".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(
@@ -17139,7 +17112,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_requires_signed_coordination_for_direct_probe_attempts() {
         let test_dir = secure_test_dir("rustynetd-runtime-requires-coordination");
         let state_path = test_dir.join("daemon.state");
@@ -17225,7 +17197,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_refresh_reuses_loaded_coordination_without_replay_restriction() {
         let test_dir = secure_test_dir("rustynetd-runtime-refresh-coordination");
         let state_path = test_dir.join("daemon.state");
@@ -17322,7 +17293,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_host_only_signed_direct_probe_exhaustion_stays_programmed_without_restricting()
      {
         let test_dir = secure_test_dir("rustynetd-runtime-host-only-direct-exhaustion");
@@ -17425,7 +17395,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_periodic_reprobe_recovers_direct_after_relay() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-periodic-reprobe");
         let state_path = test_dir.join("daemon.state");
@@ -17590,7 +17559,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_direct_health_uses_live_handshake_without_forced_reprobe() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-direct-health");
         let state_path = test_dir.join("daemon.state");
@@ -17743,7 +17711,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_direct_liveness_expiry_falls_back_to_relay() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-direct-expiry-failover");
         let state_path = test_dir.join("daemon.state");
@@ -17893,7 +17860,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_traversal_probe_recovers_direct_when_handshake_arrives() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-probe-direct-recovery");
         let state_path = test_dir.join("daemon.state");
@@ -18043,7 +18009,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_traversal_preexpiry_refresh_emits_metrics_and_alarm() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-preexpiry-refresh");
         let state_path = test_dir.join("daemon.state");
@@ -18187,7 +18152,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_dns_preexpiry_refresh_emits_metrics_and_alarm() {
         let test_dir = secure_test_dir("rustynetd-runtime-dns-preexpiry-refresh");
         let state_path = test_dir.join("daemon.state");
@@ -18313,7 +18277,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_traversal_rejection_counters_increment_for_stale_replay_and_future_dated() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-rejection-counters");
         let state_path = test_dir.join("daemon.state");
@@ -18455,7 +18418,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_dns_rejection_counters_increment_for_stale_replay_and_future_dated() {
         let test_dir = secure_test_dir("rustynetd-runtime-dns-rejection-counters");
         let state_path = test_dir.join("daemon.state");
@@ -18628,7 +18590,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_endpoint_change_refresh_triggers_event_counter() {
         let test_dir = secure_test_dir("rustynetd-runtime-endpoint-change-refresh");
         let state_path = test_dir.join("daemon.state");
@@ -18737,7 +18698,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_traversal_authority_rejects_unmanaged_peer_bundle() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-unmanaged");
         let state_path = test_dir.join("daemon.state");
@@ -18822,7 +18782,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_unmanaged_peer() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-sync");
         let state_path = test_dir.join("daemon.state");
@@ -18921,7 +18880,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_traversal_bundle_set_rejects_mixed_snapshot_batches() {
         let test_dir = secure_test_dir("rustynetd-traversal-mixed-snapshot");
         let traversal_path = test_dir.join("traversal.bundle");
@@ -18965,7 +18923,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_traversal_authority_requires_full_peer_coverage() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-full-coverage-required");
         let state_path = test_dir.join("daemon.state");
@@ -19046,7 +19003,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_traversal_authority_accepts_multi_peer_snapshot() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-multi-peer");
         let state_path = test_dir.join("daemon.state");
@@ -19162,7 +19118,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_traversal_runtime_sync_fail_closes_on_missing_peer_coverage() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-sync-missing-peer");
         let state_path = test_dir.join("daemon.state");
@@ -19255,7 +19210,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_auto_tunnel_bundle_rejects_assigned_cidr_outside_mesh() {
         let test_dir = secure_test_dir("rustynetd-auto-assigned-outside-mesh");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -19287,7 +19241,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_auto_tunnel_bundle_rejects_non_host_assigned_cidr() {
         let test_dir = secure_test_dir("rustynetd-auto-assigned-not-host");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -19319,7 +19272,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_traversal_bundle_rejects_private_srflx_candidate() {
         let test_dir = secure_test_dir("rustynetd-traversal-private-srflx");
         let traversal_path = test_dir.join("traversal.bundle");
@@ -19348,7 +19300,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_traversal_bundle_rejects_private_relay_candidate() {
         let test_dir = secure_test_dir("rustynetd-traversal-private-relay");
         let traversal_path = test_dir.join("traversal.bundle");
@@ -19381,7 +19332,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn runtime_relay_candidate_uses_shared_relay_id_canonicalization() {
         let candidate = TraversalCandidate {
             candidate_type: TraversalCandidateType::Relay,
@@ -19400,7 +19350,6 @@ mod tests {
         assert_eq!(selected.relay_id, expected);
     }
 
-    #[test]
     fn runtime_relay_candidate_rejects_ambiguous_relay_id_label() {
         let candidate = TraversalCandidate {
             candidate_type: TraversalCandidateType::Relay,
@@ -19416,7 +19365,6 @@ mod tests {
         assert!(err.contains("relay candidate relay_id"));
     }
 
-    #[test]
     fn runtime_relay_candidate_rejects_unsafe_transport_addresses() {
         for endpoint in [
             "127.0.0.1:443",
@@ -19465,7 +19413,6 @@ mod tests {
         }
     }
 
-    #[test]
     fn runtime_relay_candidate_matches_verified_fleet_entry() {
         let candidate = TraversalCandidate {
             candidate_type: TraversalCandidateType::Relay,
@@ -19494,7 +19441,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn runtime_relay_candidate_rejects_endpoint_absent_from_verified_fleet() {
         let candidate = TraversalCandidate {
             candidate_type: TraversalCandidateType::Relay,
@@ -19516,7 +19462,6 @@ mod tests {
         assert!(err.contains("endpoint is absent from signed relay fleet"));
     }
 
-    #[test]
     fn runtime_relay_candidate_rejects_disabled_verified_fleet_entry() {
         let candidate = TraversalCandidate {
             candidate_type: TraversalCandidateType::Relay,
@@ -19538,7 +19483,6 @@ mod tests {
         assert!(err.contains("no enabled relays"));
     }
 
-    #[test]
     fn preflight_allows_missing_traversal_bundle_without_verifier_key() {
         let test_dir = secure_test_dir("rustynetd-preflight-traversal-optional");
         let state_path = test_dir.join("daemon.state");
@@ -19587,7 +19531,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn preflight_rejects_present_traversal_bundle_when_verifier_key_missing() {
         let test_dir = secure_test_dir("rustynetd-preflight-traversal-requires-verifier");
         let state_path = test_dir.join("daemon.state");
@@ -19644,7 +19587,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn preflight_allows_stale_dns_zone_bundle_without_failing_daemon_start() {
         let test_dir = secure_test_dir("rustynetd-preflight-dns-zone-stale-optional");
         let state_path = test_dir.join("daemon.state");
@@ -19733,7 +19675,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_netcheck_reports_runtime_programmed_traversal_paths() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-netcheck");
         let state_path = test_dir.join("daemon.state");
@@ -19843,7 +19784,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_netcheck_rejects_forged_traversal_hint_fail_closed() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-forged");
         let state_path = test_dir.join("daemon.state");
@@ -19918,7 +19858,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_handles_status_and_mutating_commands() {
         let test_dir = secure_test_dir("rustynetd-runtime-test");
         let state_path = test_dir.join("daemon.state");
@@ -19977,7 +19916,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_record_ip_outside_assignment() {
         let test_dir = secure_test_dir("rustynetd-dns-zone-assignment-mismatch");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -20032,7 +19970,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_equal_watermark_when_payload_digest_differs() {
         let test_dir = secure_test_dir("rustynetd-dns-zone-replay-digest-mismatch");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -20113,7 +20050,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_strictly_older_generated_at_unix() {
         // Anti-replay: a dns-zone bundle whose `generated_at_unix` is
         // strictly older than the persisted watermark must fail closed.
@@ -20190,7 +20126,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_same_generated_at_smaller_nonce() {
         // (generated_at_unix, nonce) is the lexicographic ordering used
         // by `dns_zone_watermark_ordering`; same timestamp with a smaller
@@ -20266,7 +20201,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_accepts_strictly_newer_generated_at_unix() {
         // Complement of the older-generated-at test: a bundle whose
         // `generated_at_unix` is strictly newer than the persisted
@@ -20340,7 +20274,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_accepts_same_generated_at_with_larger_nonce() {
         // Equal `generated_at_unix` with a larger nonce is strictly
         // newer in the lexicographic ordering and must be accepted
@@ -20413,7 +20346,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_accepts_equal_watermark_when_payload_digest_matches() {
         // Idempotent re-load: the same signed dns-zone bundle re-presented
         // against its own watermark must be accepted (Equal ordering with
@@ -20480,7 +20412,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_future_dated_beyond_clock_skew() {
         // Future-dated guard: a bundle whose `generated_at_unix` is more
         // than `max_clock_skew_secs` ahead of `now` must be rejected.
@@ -20545,7 +20476,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_stale_beyond_max_age() {
         // Stale guard: a bundle whose `generated_at_unix` is more than
         // `max_age_secs` behind `now` must be rejected with `Stale`.
@@ -20612,7 +20542,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_expired_beyond_expires_at_unix() {
         // The bundle carries its own `expires_at_unix`; once `now`
         // crosses it the bundle must be rejected as Stale even if the
@@ -20677,7 +20606,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_tampered_payload() {
         // Tamper-after-sign: any modification to the wire payload after
         // signing must cause signature verification to fail closed.
@@ -20732,7 +20660,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_wrong_signing_key() {
         // Attacker-controlled signing key: a bundle signed by a
         // different key but presented against the legitimate verifier
@@ -20814,7 +20741,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn load_dns_zone_bundle_rejects_corrupt_signature_hex() {
         // Corrupt signature hex: even before crypto verification the
         // bundle must fail closed when the signature field is unparseable.
@@ -20888,7 +20814,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_dns_inspect_reports_signed_zone_state() {
         let test_dir = secure_test_dir("rustynetd-dns-inspect");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -20957,7 +20882,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn dns_resolver_answers_managed_a_record_from_signed_zone() {
         let test_dir = secure_test_dir("rustynetd-dns-resolver-answer");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -21016,7 +20940,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn dns_resolver_servfails_managed_name_when_zone_is_missing() {
         let config = DaemonConfig {
             node_id: "daemon-local".to_string(),
@@ -21031,7 +20954,6 @@ mod tests {
         assert_eq!(dns_response_ancount(&response), 0);
     }
 
-    #[test]
     fn dns_resolver_servfails_managed_name_when_zone_is_marked_invalid() {
         let test_dir = secure_test_dir("rustynetd-dns-zone-servfail-invalid");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -21091,7 +21013,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn dns_resolver_refuses_non_managed_name() {
         let config = DaemonConfig {
             node_id: "daemon-local".to_string(),
@@ -21106,7 +21027,6 @@ mod tests {
         assert_eq!(dns_response_ancount(&response), 0);
     }
 
-    #[test]
     fn validate_daemon_config_rejects_non_loopback_dns_resolver_bind_addr() {
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::LinuxWireguard,
@@ -21117,7 +21037,6 @@ mod tests {
         assert!(format!("{err}").contains("dns resolver bind addr must be loopback"));
     }
 
-    #[test]
     fn daemon_runtime_client_role_blocks_admin_mutations() {
         let test_dir = secure_test_dir("rustynetd-runtime-client-role");
         let state_path = test_dir.join("daemon.state");
@@ -21176,7 +21095,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_client_role_never_reports_exit_serving() {
         let test_dir = secure_test_dir("rustynetd-runtime-client-no-exit-serving");
         let state_path = test_dir.join("daemon.state");
@@ -21225,7 +21143,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_blind_exit_role_is_least_privilege() {
         let test_dir = secure_test_dir("rustynetd-runtime-blind-exit-role");
         let state_path = test_dir.join("daemon.state");
@@ -21293,7 +21210,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_blind_exit_ignores_client_assignment_fields() {
         let test_dir = secure_test_dir("rustynetd-runtime-blind-exit-assignment");
         let state_path = test_dir.join("daemon.state");
@@ -21382,7 +21298,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn sanitize_dataplane_routes_for_blind_exit_drops_exit_scoped_routes_only() {
         let routes = vec![
             Route {
@@ -21408,7 +21323,6 @@ mod tests {
         assert_eq!(sanitized[0].kind, RouteKind::Mesh);
     }
 
-    #[test]
     fn sanitize_dataplane_routes_for_non_blind_exit_preserves_routes() {
         let routes = vec![Route {
             destination_cidr: "0.0.0.0/0".to_string(),
@@ -21426,7 +21340,6 @@ mod tests {
         assert_eq!(admin_routes[0].kind, RouteKind::ExitNodeDefault);
     }
 
-    #[test]
     fn daemon_runtime_enters_restricted_safe_mode_without_trust_evidence() {
         let test_dir = secure_test_dir("rustynetd-runtime-restricted");
         let state_path = test_dir.join("daemon.state");
@@ -21466,7 +21379,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_denies_exit_selection_for_revoked_membership_node() {
         let test_dir = secure_test_dir("rustynetd-runtime-membership-revoked");
         let state_path = test_dir.join("daemon.state");
@@ -21514,7 +21426,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_rejects_replayed_trust_evidence() {
         let test_dir = secure_test_dir("rustynetd-runtime-replay");
         let state_path = test_dir.join("daemon.state");
@@ -21568,7 +21479,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_enforcement_applies_and_blocks_manual_mutations() {
         let test_dir = secure_test_dir("rustynetd-runtime-auto-tunnel");
         let state_path = test_dir.join("daemon.state");
@@ -21657,7 +21567,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_allows_exit_service_advertise_only() {
         let test_dir = secure_test_dir("rustynetd-runtime-auto-tunnel-exit-service");
         let state_path = test_dir.join("daemon.state");
@@ -21748,7 +21657,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_allows_relay_exit_with_upstream_exit() {
         let test_dir = secure_test_dir("rustynetd-runtime-auto-tunnel-relay-with-upstream");
         let state_path = test_dir.join("daemon.state");
@@ -21834,7 +21742,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn daemon_runtime_auto_tunnel_tamper_and_replay_fail_closed() {
         let test_dir = secure_test_dir("rustynetd-runtime-auto-tunnel-reject");
         let state_path = test_dir.join("daemon.state");
@@ -21924,7 +21831,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    #[test]
     fn state_fetcher_new_from_daemon_discards_remote_fetch_urls() {
         let config = DaemonConfig {
             trust_url: Some("http://127.0.0.1:8080/trust".to_string()),
@@ -21950,7 +21856,6 @@ mod tests {
     /// handlers (exit-select, route-advertise, etc.) and never from reconcile(),
     /// so the state file was never written for Windows nodes whose only active
     /// driver is the periodic reconcile loop.
-    #[test]
     fn reconcile_success_writes_state_file() {
         let relay_addr: SocketAddr = "203.0.113.42:40099".parse().expect("relay addr");
         let (mut runtime, test_dir) = build_runtime_with_custom_relay(

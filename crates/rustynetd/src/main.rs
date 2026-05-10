@@ -126,6 +126,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "windows-dns-failclosed-check" => {
                 run_windows_dns_failclosed_check_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "windows-killswitch-assert" => {
+                run_windows_killswitch_assert_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "windows-backend-readiness-check" => {
                 run_windows_backend_readiness_check_command(rest)
             }
@@ -962,6 +965,54 @@ fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), Strin
         );
     }
     Ok(())
+}
+
+fn run_windows_killswitch_assert_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut config_args = Vec::new();
+
+    for arg in args {
+        if arg == "--no-fail-on-drift" {
+            fail_on_drift = false;
+        } else {
+            config_args.push(arg.clone());
+        }
+    }
+
+    let config = parse_daemon_config(&config_args)?;
+    use rustynetd::phase10::DataplaneSystem;
+
+    let mut system = rustynetd::phase10::WindowsCommandSystem::new(
+        config.wg_interface,
+        config.egress_interface,
+        config.dns_resolver_bind_addr,
+    )
+    .map_err(|e| format!("failed to initialize WindowsCommandSystem: {:?}", e))?;
+
+    match system.assert_killswitch() {
+        Ok(()) => {
+            println!("{{\"overall_ok\":true}}");
+            Ok(())
+        }
+        Err(rustynetd::phase10::SystemError::KillSwitchAssertionFailed(reason)) => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "overall_ok": false,
+                    "reason": reason
+                }))
+                .unwrap()
+            );
+            if fail_on_drift {
+                return Err(format!("windows-killswitch-assert failed: {}", reason));
+            }
+            Ok(())
+        }
+        Err(other) => Err(format!(
+            "windows-killswitch-assert unexpected error: {:?}",
+            other
+        )),
+    }
 }
 
 fn run_windows_backend_readiness_check_command(args: &[String]) -> Result<(), String> {
