@@ -942,7 +942,13 @@ fn is_interface_name(value: &str) -> bool {
 }
 
 fn is_path_token(value: &str) -> bool {
-    value.starts_with('/') && is_safe_token(value)
+    if !value.starts_with('/') || !is_safe_token(value) {
+        return false;
+    }
+    // Reject parent-directory traversal in any segment so that an attacker who
+    // can speak the IPC cannot redirect a privileged binary (wg, pfctl, etc.)
+    // at a file outside the path the daemon expected.
+    !value.split('/').any(|segment| segment == "..")
 }
 
 fn is_u16_token(value: &str) -> bool {
@@ -1000,10 +1006,18 @@ fn is_allowed_ips_token(value: &str) -> bool {
 }
 
 fn is_anchor_name_token(value: &str) -> bool {
-    value.starts_with("com.apple/rustynet_g")
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.'))
+    if !value.starts_with("com.apple/rustynet_g") {
+        return false;
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.'))
+    {
+        return false;
+    }
+    // Reject parent-directory traversal segments so the anchor name cannot
+    // redirect pfctl outside the rustynet anchor namespace.
+    !value.split('/').any(|segment| segment == "..")
 }
 
 fn is_owned_nft_table_token(value: &str) -> bool {
@@ -1624,11 +1638,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        HELPER_FRAME_MAGIC, HELPER_FRAME_TYPE_REQUEST, HELPER_FRAME_VERSION, HelperRequest,
-        HelperResponse, MAX_ARG_BYTES, MAX_ARGS, MAX_MESSAGE_BYTES, PrivilegedCommandProgram,
-        encode_helper_request, handle_request, is_nft_token, is_safe_token, read_request,
-        read_response_frame, run_privileged_subprocess, validate_privileged_helper_socket_security,
-        validate_privileged_program_binary, validate_request, write_request_frame, write_response,
+        HELPER_FRAME_MAGIC, HELPER_FRAME_TYPE_REQUEST, HELPER_FRAME_TYPE_RESPONSE,
+        HELPER_FRAME_VERSION, HelperRequest, HelperResponse, MAX_ARG_BYTES, MAX_ARGS,
+        MAX_MESSAGE_BYTES, PrivilegedCommandProgram, decode_helper_request, encode_helper_request,
+        handle_request, is_anchor_name_token, is_nft_token, is_path_token, is_safe_token,
+        read_request, read_response_frame, run_privileged_subprocess,
+        validate_privileged_helper_socket_security, validate_privileged_program_binary,
+        validate_request, write_request_frame, write_response,
     };
 
     fn helper_request_frame_bytes(payload: &[u8], version: u8) -> Vec<u8> {
@@ -2310,5 +2326,243 @@ mod tests {
         assert!(err.contains("must not be a symlink"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn helper_frame_rejects_zero_length_payload() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&HELPER_FRAME_MAGIC);
+        frame.push(HELPER_FRAME_VERSION);
+        frame.push(HELPER_FRAME_TYPE_REQUEST);
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        write_frame_and_close(&mut client_stream, &frame);
+
+        let err = read_request(&mut server_stream)
+            .expect_err("zero-length privileged helper frame must be rejected");
+        assert!(err.contains("frame payload must not be empty"));
+    }
+
+    #[test]
+    fn helper_frame_rejects_unknown_frame_type_failclosed() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        // Build a well-formed payload but tag the frame as a RESPONSE so the
+        // server-side request reader (which expects REQUEST) rejects it.
+        let payload = encode_helper_request(&HelperRequest {
+            program: "ip".to_string(),
+            args: vec!["--version".to_string()],
+        })
+        .expect("request payload should encode");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&HELPER_FRAME_MAGIC);
+        frame.push(HELPER_FRAME_VERSION);
+        frame.push(HELPER_FRAME_TYPE_RESPONSE);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        write_frame_and_close(&mut client_stream, &frame);
+
+        let err = read_request(&mut server_stream)
+            .expect_err("mismatched frame type must be rejected fail-closed");
+        assert!(err.contains("unexpected frame type"));
+    }
+
+    #[test]
+    fn helper_frame_rejects_unknown_arbitrary_frame_type() {
+        let (mut server_stream, mut client_stream) =
+            UnixStream::pair().expect("unix stream pair should be created");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout should be set");
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&HELPER_FRAME_MAGIC);
+        frame.push(HELPER_FRAME_VERSION);
+        frame.push(0xAB); // unknown discriminant
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.push(0x00);
+        write_frame_and_close(&mut client_stream, &frame);
+
+        let err = read_request(&mut server_stream)
+            .expect_err("arbitrary frame discriminant must be rejected");
+        assert!(err.contains("unexpected frame type"));
+    }
+
+    #[test]
+    fn helper_request_decoder_rejects_non_utf8_program_field() {
+        // Build a payload with a length-prefixed program field whose bytes
+        // are not valid UTF-8. The decoder must reject this rather than
+        // treating it as a string.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u16.to_be_bytes());
+        payload.extend_from_slice(&[0xFF, 0xFE]); // not valid utf-8
+        payload.extend_from_slice(&0u16.to_be_bytes()); // 0 args
+        let err =
+            decode_helper_request(&payload).expect_err("non-utf-8 program field must be rejected");
+        assert!(err.contains("not valid utf-8"));
+    }
+
+    #[test]
+    fn helper_request_decoder_rejects_non_utf8_arg_field() {
+        let mut payload = Vec::new();
+        // program = "ip"
+        payload.extend_from_slice(&2u16.to_be_bytes());
+        payload.extend_from_slice(b"ip");
+        // 1 arg
+        payload.extend_from_slice(&1u16.to_be_bytes());
+        // arg with invalid utf-8 continuation
+        payload.extend_from_slice(&3u16.to_be_bytes());
+        payload.extend_from_slice(&[0x80, 0x80, 0x80]);
+        let err =
+            decode_helper_request(&payload).expect_err("non-utf-8 arg field must be rejected");
+        assert!(err.contains("not valid utf-8"));
+    }
+
+    #[test]
+    fn validate_request_rejects_cidr_field_with_shell_metacharacters() {
+        // Inject classic shell metacharacters into the CIDR slot of the most
+        // common variable schema. The strict validator must reject every form
+        // before the request can reach exec.
+        let injection_attempts = [
+            "; rm -rf /",
+            "$(ls)",
+            "`id`",
+            "10.0.0.0/24; reboot",
+            "10.0.0.0/24$(echo pwn)",
+        ];
+        for attempt in injection_attempts {
+            let err = validate_request(
+                PrivilegedCommandProgram::Ip,
+                &["route", "replace", attempt, "dev", "rustynet0"],
+            )
+            .expect_err("shell-metachar CIDR must be rejected");
+            assert!(err.contains("unsupported ip argument schema"));
+        }
+    }
+
+    #[test]
+    fn validate_request_rejects_interface_field_with_newline() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Ip,
+            &["link", "set", "up", "dev", "wg0\nrm -rf /"],
+        )
+        .expect_err("newline in interface name must be rejected");
+        assert!(err.contains("unsupported ip argument schema"));
+
+        // also via the wg endpoint variant
+        let err = validate_request(
+            PrivilegedCommandProgram::Wg,
+            &["show", "wg0\nls", "latest-handshakes"],
+        )
+        .expect_err("newline in wg interface name must be rejected");
+        assert!(err.contains("unsupported wg argument schema"));
+    }
+
+    #[test]
+    fn validate_request_rejects_path_traversal_in_private_key_path() {
+        // Direct token-level check: parent-directory traversal must not pass
+        // is_path_token even though the dot character is otherwise allowed.
+        assert!(!is_path_token("/etc/wg/../shadow"));
+        assert!(!is_path_token("/etc/wg/.."));
+        assert!(!is_path_token("/.."));
+        assert!(is_path_token("/etc/wg/private.key"));
+        // The valid case must still validate end-to-end.
+        validate_request(
+            PrivilegedCommandProgram::Wg,
+            &[
+                "set",
+                "rustynet0",
+                "private-key",
+                "/etc/rustynet/private.key",
+            ],
+        )
+        .expect("clean private-key path must validate");
+        // And the traversal case must be rejected by the schema.
+        let err = validate_request(
+            PrivilegedCommandProgram::Wg,
+            &[
+                "set",
+                "rustynet0",
+                "private-key",
+                "/etc/rustynet/../../etc/shadow",
+            ],
+        )
+        .expect_err("private-key path traversal must be rejected");
+        assert!(err.contains("unsupported wg argument schema"));
+    }
+
+    #[test]
+    fn validate_request_rejects_path_traversal_in_pfctl_anchor_load() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Pfctl,
+            &[
+                "-a",
+                "com.apple/rustynet_g1",
+                "-f",
+                "/etc/rustynet/../../etc/shadow",
+            ],
+        )
+        .expect_err("pfctl load-from path traversal must be rejected");
+        assert!(err.contains("unsupported pfctl argument schema"));
+    }
+
+    #[test]
+    fn validate_request_rejects_path_traversal_in_pfctl_anchor_name() {
+        assert!(!is_anchor_name_token("com.apple/rustynet_g1/../foo"));
+        assert!(!is_anchor_name_token("com.apple/rustynet_g1/.."));
+        assert!(is_anchor_name_token("com.apple/rustynet_g1"));
+        let err = validate_request(
+            PrivilegedCommandProgram::Pfctl,
+            &[
+                "-a",
+                "com.apple/rustynet_g1/../escape",
+                "-f",
+                "/etc/rustynet/anchor.conf",
+            ],
+        )
+        .expect_err("pfctl anchor traversal must be rejected");
+        assert!(err.contains("unsupported pfctl argument schema"));
+    }
+
+    #[test]
+    fn validate_request_rejects_unknown_program_failclosed() {
+        // Unknown opcode/program names must never quietly fall through to a
+        // default. handle_request takes the request directly so the error
+        // surface is exercised end-to-end.
+        let response = handle_request(HelperRequest {
+            program: "totally-unknown-program".to_string(),
+            args: vec!["--version".to_string()],
+        });
+        assert!(!response.ok);
+        assert!(response.status.is_none());
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported privileged command program")
+        );
+    }
+
+    #[test]
+    fn helper_request_decoder_rejects_oversized_program_field() {
+        // Length prefix declares a program field longer than MAX_PROGRAM_BYTES.
+        let mut payload = Vec::new();
+        let oversized_len: u16 = (super::MAX_PROGRAM_BYTES as u16) + 1;
+        payload.extend_from_slice(&oversized_len.to_be_bytes());
+        payload.extend(std::iter::repeat_n(b'a', oversized_len as usize));
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        let err =
+            decode_helper_request(&payload).expect_err("oversized program field must be rejected");
+        assert!(err.contains("exceeds maximum size"));
     }
 }
