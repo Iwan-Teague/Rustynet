@@ -58,6 +58,8 @@ impl TunnelBackend for ContractBackend {
         BackendCapabilities {
             supports_roaming: true,
             supports_exit_nodes: true,
+            supports_exit_client: true,
+            supports_exit_serving: true,
             supports_lan_routes: true,
             supports_ipv6: false,
         }

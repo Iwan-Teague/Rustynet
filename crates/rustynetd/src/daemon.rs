@@ -5731,12 +5731,11 @@ impl DaemonRuntime {
                     traversal_probe_direct_peers,
                     traversal_probe_relay_peers,
                 ) = self.traversal_probe_summary();
-                let serving_exit_node =
-                    if self.is_serving_exit_node(self.selected_exit_node.as_deref()) {
-                        "true"
-                    } else {
-                        "false"
-                    };
+                let serving_exit_node = if self.controller.serving_exit_node_active() {
+                    "true"
+                } else {
+                    "false"
+                };
                 let traversal_peer_count = self
                     .traversal_hints
                     .as_ref()
@@ -6025,6 +6024,9 @@ impl DaemonRuntime {
                 }
                 if !validate_cidr(&cidr) {
                     return IpcResponse::err("invalid cidr format");
+                }
+                if self.route_advertise_requires_exit_serving_activation(&cidr) {
+                    return self.handle_exit_service_route_advertise(cidr);
                 }
                 if let Some(exit_node) = &self.selected_exit_node {
                     if let Ok(node_id) = NodeId::new(exit_node.clone()) {
@@ -6766,6 +6768,38 @@ impl DaemonRuntime {
 
     fn allow_auto_tunnel_exit_advertisement(&self, cidr: &str) -> bool {
         self.node_role.is_admin() && cidr == BLIND_EXIT_DEFAULT_ROUTE_CIDR
+    }
+
+    fn route_advertise_requires_exit_serving_activation(&self, cidr: &str) -> bool {
+        self.node_role.is_admin() && cidr == BLIND_EXIT_DEFAULT_ROUTE_CIDR
+    }
+
+    fn handle_exit_service_route_advertise(&mut self, cidr: String) -> IpcResponse {
+        self.advertised_routes.insert(cidr.clone());
+        self.local_route_reconcile_pending = true;
+
+        self.reconcile();
+
+        if self.controller.serving_exit_node_active() {
+            self.local_route_reconcile_pending = false;
+            if let Err(err) = self.persist_state() {
+                return IpcResponse::err(format!("persist failed: {err}"));
+            }
+            return IpcResponse::ok(format!("route advertised: {cidr}"));
+        }
+
+        self.advertised_routes.remove(&cidr);
+        self.local_route_reconcile_pending = true;
+        if let Err(err) = self.persist_state() {
+            return IpcResponse::err(format!(
+                "exit route advertise failed and rollback persist failed: {err}"
+            ));
+        }
+        let reason = self
+            .last_reconcile_error
+            .as_deref()
+            .unwrap_or("exit-serving dataplane did not become active");
+        IpcResponse::err(format!("route advertise denied: {reason}"))
     }
 
     fn is_restricted(&self) -> bool {
@@ -11993,7 +12027,9 @@ mod tests {
         snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
         validate_daemon_config, validate_file_security, zeroize_optional_bytes,
     };
-    use crate::phase10::{DataplaneState, PathMode, TraversalProbeDecision, TraversalProbeReason};
+    use crate::phase10::{
+        DataplaneState, PathMode, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason,
+    };
     use crate::stun_client::StunResult;
 
     fn hex_encode(bytes: &[u8]) -> String {
@@ -21640,6 +21676,106 @@ mod tests {
                 .message
                 .contains("disabled while auto-tunnel is enforced")
         );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_exit_service_advertise_rolls_back_when_nat_forwarding_fails() {
+        let test_dir = secure_test_dir("rustynetd-runtime-exit-service-advertise-failclosed");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.verifier.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file_exitless(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            node_role: NodeRole::Admin,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+        match runtime.controller.system_mut_for_test() {
+            RuntimeSystem::DryRun(system) => {
+                *system = crate::phase10::DryRunSystem::default().fail_on("apply_nat_forwarding");
+            }
+            _ => panic!("in-memory daemon tests must use DryRunSystem"),
+        }
+
+        let denied = runtime.handle_command(IpcCommand::RouteAdvertise(
+            super::BLIND_EXIT_DEFAULT_ROUTE_CIDR.to_string(),
+        ));
+        assert!(!denied.ok);
+        assert!(denied.message.contains("route advertise denied"));
+        assert!(
+            !runtime
+                .advertised_routes
+                .contains(super::BLIND_EXIT_DEFAULT_ROUTE_CIDR),
+            "default route must not stay advertised after exit-serving activation fails"
+        );
+        assert!(!runtime.controller.serving_exit_node_active());
+        assert_eq!(runtime.controller.state(), DataplaneState::FailClosed);
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains("serving_exit_node=false"));
 
         let _ = std::fs::remove_file(state_path);
         let _ = std::fs::remove_file(trust_path);

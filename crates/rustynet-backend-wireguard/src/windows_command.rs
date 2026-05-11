@@ -323,6 +323,8 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
         BackendCapabilities {
             supports_roaming: true,
             supports_exit_nodes: true,
+            supports_exit_client: true,
+            supports_exit_serving: true,
             supports_lan_routes: true,
             supports_ipv6: true,
         }
@@ -953,6 +955,35 @@ mod tests {
                 "/installtunnelservice".to_string(),
                 config_path.display().to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn windows_backend_capabilities_distinguish_exit_client_and_serving_roles() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let backend = WindowsWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+
+        let capabilities = backend.capabilities();
+        assert!(capabilities.supports_exit_nodes);
+        assert!(
+            capabilities.supports_exit_client,
+            "Windows WireGuardNT can consume an exit node through AllowedIPs/default routes"
+        );
+        assert!(
+            capabilities.supports_exit_serving,
+            "Windows exit serving is allowed only with Phase10 system NAT/forwarding preflight"
         );
     }
 

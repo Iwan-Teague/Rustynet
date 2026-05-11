@@ -99,6 +99,8 @@ impl TunnelBackend for UserspaceBackend {
         BackendCapabilities {
             supports_roaming: false,
             supports_exit_nodes: false,
+            supports_exit_client: false,
+            supports_exit_serving: false,
             supports_lan_routes: false,
             supports_ipv6: false,
         }
