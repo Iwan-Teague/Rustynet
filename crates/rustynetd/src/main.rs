@@ -2200,6 +2200,7 @@ fn help_text() -> String {
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
         "  rustynetd windows-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift]",
+        "  rustynetd windows-killswitch-assert [daemon options] [--no-fail-on-drift]",
         "  rustynetd windows-backend-readiness-check [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
         "",
@@ -2282,8 +2283,9 @@ mod tests {
     use super::{
         help_text, parse_daemon_config, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
-        run_windows_key_custody_check_command, run_windows_mesh_status_check_command,
-        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
+        run_windows_key_custody_check_command, run_windows_killswitch_assert_command,
+        run_windows_mesh_status_check_command, run_windows_runtime_acls_check_command,
+        run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -2574,6 +2576,45 @@ mod tests {
             err.contains("requires a Windows runtime host"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn help_text_advertises_windows_killswitch_assert_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-killswitch-assert"),
+            "help text must advertise windows-killswitch-assert subcommand"
+        );
+    }
+
+    #[test]
+    fn run_windows_killswitch_assert_command_rejects_unknown_flags() {
+        let err = run_windows_killswitch_assert_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown daemon argument") || err.contains("unknown argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_killswitch_assert_command_fails_closed_when_unapplied() {
+        let err = run_windows_killswitch_assert_command(&[])
+            .expect_err("unapplied killswitch state must fail closed");
+        assert!(
+            err.contains("windows-killswitch-assert failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("killswitch is not applied"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_killswitch_assert_command_no_fail_on_drift_reports_unapplied_state() {
+        run_windows_killswitch_assert_command(&["--no-fail-on-drift".to_string()])
+            .expect("--no-fail-on-drift must allow report-only killswitch drift checks");
     }
 
     #[test]
