@@ -2871,7 +2871,7 @@ const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActi
 /// global default outbound policy is still `Block`.  Each rule name and the
 /// expected attributes are passed as PowerShell parameters so no value is
 /// interpolated into the script body.  Throws on the first drift detected.
-const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $TunnelName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($name in @($LoopbackName, $TunnelName, $EgressName)) { $rule = Get-NetFirewallRule -Name $name -ErrorAction Stop; if ($rule.Action -ne 'Allow') { throw \"rule $name action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $name direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $name is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
+const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $TunnelName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($LoopbackName, $TunnelName, $EgressName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Allow') { throw \"rule $displayName action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -7079,8 +7079,8 @@ mod tests {
         );
         assert!(
             WINDOWS_PS_ASSERT_KILLSWITCH
-                .contains("Get-NetFirewallRule -Name $name -ErrorAction Stop"),
-            "Get-NetFirewallRule must use -ErrorAction Stop on the per-rule lookup"
+                .contains("Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop"),
+            "Get-NetFirewallRule must use -DisplayName and -ErrorAction Stop on the per-rule lookup"
         );
         assert!(
             WINDOWS_PS_ASSERT_KILLSWITCH.contains("Get-NetFirewallProfile -ErrorAction Stop"),
@@ -7112,6 +7112,26 @@ mod tests {
         assert!(
             WINDOWS_PS_ASSERT_KILLSWITCH.contains("'Block'"),
             "assert_killswitch script must check the default action is 'Block'"
+        );
+    }
+
+    #[test]
+    fn windows_assert_killswitch_script_rejects_missing_or_duplicate_display_names() {
+        // netsh's `name=` field maps to the firewall rule display name, not
+        // the internal PowerShell `Name`/InstanceID.  The verifier must query
+        // that display name and reject anything other than exactly one match,
+        // so missing rules and duplicate/spoofed rules both fail closed.
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $displayName"),
+            "assert_killswitch must verify the netsh-created display name"
+        );
+        assert!(
+            !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $displayName"),
+            "assert_killswitch must not query the internal PowerShell rule Name"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("$rules.Count -ne 1"),
+            "assert_killswitch must reject missing or duplicate firewall rules"
         );
     }
 
