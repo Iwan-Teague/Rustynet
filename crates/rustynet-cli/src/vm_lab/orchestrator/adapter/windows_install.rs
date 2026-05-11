@@ -354,6 +354,27 @@ fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, Ad
     ))
 }
 
+fn windows_bootstrap_acl_repair_fragment() -> Result<String, AdapterError> {
+    let state_root_q = ps_quote(WINDOWS_STATE_ROOT)?;
+    Ok(format!(
+        "$buser = (whoami.exe).Trim(); \
+         $bootstrapAclDirs = @( \
+             (Join-Path {state_root_q} 'trust'), \
+             (Join-Path {state_root_q} 'keys'), \
+             (Join-Path {state_root_q} 'membership'), \
+             (Join-Path {state_root_q} 'secrets'), \
+             (Join-Path {state_root_q} 'secrets\\key-custody') \
+         ); \
+         foreach ($bootstrapAclDir in $bootstrapAclDirs) {{ \
+             New-Item -ItemType Directory -Force -Path $bootstrapAclDir | Out-Null; \
+             takeown.exe /f $bootstrapAclDir /r /d y; \
+             if ($LASTEXITCODE -ne 0) {{ throw ('takeown bootstrap dir failed for ' + $bootstrapAclDir + ' exit ' + $LASTEXITCODE) }}; \
+             icacls.exe $bootstrapAclDir /grant:r \"${{buser}}:(OI)(CI)(F)\" /T; \
+             if ($LASTEXITCODE -ne 0) {{ throw ('icacls bootstrap dir grant failed for ' + $bootstrapAclDir + ' exit ' + $LASTEXITCODE) }} \
+         }}",
+    ))
+}
+
 // ── Windows e2e bootstrap ─────────────────────────────────────────────────────
 
 fn windows_lab_node_id(alias: &str, ctx: &OrchestrationContext) -> String {
@@ -430,6 +451,7 @@ fn run_windows_e2e_bootstrap(
     let membership_watermark_q = ps_quote(WINDOWS_MEMBERSHIP_WATERMARK_PATH)?;
     let membership_snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?;
     let service_probe = windows_service_start_probe_fragment(WINDOWS_SERVICE_NAME)?;
+    let bootstrap_acl_repair = windows_bootstrap_acl_repair_fragment()?;
 
     let bootstrap_script = format!(
         "$ErrorActionPreference = 'Stop'; \
@@ -439,13 +461,7 @@ fn run_windows_e2e_bootstrap(
          $bytes = New-Object byte[] 48; \
          $rng.GetBytes($bytes); \
          $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
-         $buser = (whoami.exe).Trim(); \
-         takeown.exe /f 'C:\\ProgramData\\RustyNet' /r /d y; \
-         if ($LASTEXITCODE -ne 0) {{ throw \"takeown state-root failed (exit $LASTEXITCODE)\" }}; \
-         icacls.exe 'C:\\ProgramData\\RustyNet' /grant:r \"${{buser}}:(OI)(CI)(F)\" /T; \
-         if ($LASTEXITCODE -ne 0) {{ throw \"icacls state-root grant failed (exit $LASTEXITCODE)\" }}; \
-         icacls.exe 'C:\\ProgramData\\RustyNet' /setowner 'BUILTIN\\Administrators' /T; \
-         if ($LASTEXITCODE -ne 0) {{ Write-Warning \"icacls setowner failed (exit $LASTEXITCODE) - continuing\" }}; \
+         {bootstrap_acl_repair}; \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
          $keyInitOut = (& {rustynetd_q} key init --passphrase-file {passphrase_q} --force 2>&1) -join ' '; \
@@ -730,6 +746,37 @@ mod tests {
         assert!(
             !script.contains("Start-Service"),
             "service smoke path must not block on Start-Service"
+        );
+    }
+
+    #[test]
+    fn windows_bootstrap_acl_repair_scopes_to_runtime_dirs() {
+        let script =
+            windows_bootstrap_acl_repair_fragment().expect("ACL repair fragment should render");
+
+        for required_dir in [
+            "trust",
+            "keys",
+            "membership",
+            "secrets",
+            "secrets\\key-custody",
+        ] {
+            assert!(
+                script.contains(required_dir),
+                "bootstrap ACL repair must cover {required_dir}"
+            );
+        }
+        assert!(
+            !script.contains("takeown.exe /f 'C:\\ProgramData\\RustyNet'"),
+            "bootstrap must not recursively take ownership of the whole state root"
+        );
+        assert!(
+            !script.contains("icacls.exe 'C:\\ProgramData\\RustyNet'"),
+            "bootstrap must not recursively grant over stale lab debris in the whole state root"
+        );
+        assert!(
+            script.contains("$bootstrapAclDir"),
+            "bootstrap ACL repair should operate per reviewed runtime directory"
         );
     }
 
