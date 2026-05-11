@@ -1025,6 +1025,7 @@ landed, where the artifact lives.
 | `0c3d78e` | Windows backend tunnel-name validator + 10 tests | Code only |
 | `8d5de44` | Auto-tunnel sig-tamper reload + dormant daemon security tests restored | Code only |
 | `dc614ce` | windows-killswitch-assert CLI help + fail-closed regression tests | Code only |
+| `9394053` | Windows DPAPI self-test cached at startup instead of live-passphrase roundtrip on every key load | Code only |
 
 §A.1 (live SCM-context NAT lifecycle) — TBD
 §A.2 (live DNS leak proof) — TBD
@@ -1041,6 +1042,7 @@ landed, where the artifact lives.
 §C.2 (heterogeneous live-lab evidence) — TBD
 §C.3 (CI gate scripts add Windows) — TBD
 §D.1–§D.4 (posture promotion + doc updates) — TBD
+§E.4 (DPAPI roundtrip moved from per-load to startup) — `9394053` code-only custody hardening
 
 ---
 
