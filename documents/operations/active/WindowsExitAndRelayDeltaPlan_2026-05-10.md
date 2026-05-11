@@ -1029,12 +1029,13 @@ landed, where the artifact lives.
 | `38525a1` | Privileged-helper request decoder adversarial-byte no-panic regression | Code only |
 | `d9823b9` | Windows Exit lab assignment unblocked without support-posture promotion | Code only |
 | `dff6fcf` | Optional Windows Exit NAT/DNS/killswitch artifact validators added to vm-lab | Code only |
+| `0a699e2` | Windows Exit evidence pull stage allowlists and copies vm-lab artifacts | Code only |
 
 §A.1 (live SCM-context NAT lifecycle) — TBD
 §A.2 (live DNS leak proof) — TBD
 §A.3 (live killswitch precedence) — TBD
 §A.4 (windows-killswitch-assert subcommand) — `dc614ce` code-only CLI/test coverage; live §A.3 proof still blocked on Windows lab access
-§A.5 (three orchestrator stages) — `dff6fcf` code-only optional artifact validators wired into Windows security report; live artifact generation/pull still pending
+§A.5 (three orchestrator stages) — `dff6fcf` + `0a699e2` code-only optional artifact validators and allowlisted evidence pull wired into Windows security report; live artifact generation still pending
 §A.6 (cross-network exit proof) — TBD
 §B.1 (wire daemon to real relay) — TBD
 §B.2 (relay traffic proof) — TBD
