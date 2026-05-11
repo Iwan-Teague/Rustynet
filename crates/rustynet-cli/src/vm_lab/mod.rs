@@ -7550,6 +7550,9 @@ fn run_windows_orchestration_stages_with_options(
     let custody_log_path = logs_dir.join("validate_windows_key_custody.log");
     let authenticode_log_path = logs_dir.join("validate_windows_authenticode.log");
     let dns_failclosed_log_path = logs_dir.join("validate_windows_dns_failclosed.log");
+    let exit_nat_lifecycle_log_path = logs_dir.join("validate_windows_exit_nat_lifecycle.log");
+    let exit_dns_leak_log_path = logs_dir.join("validate_windows_exit_dns_failclosed.log");
+    let exit_killswitch_log_path = logs_dir.join("validate_windows_exit_killswitch_precedence.log");
 
     // Stage 1: bootstrap_windows_host
     let bootstrap_outcome = if dry_run {
@@ -8165,6 +8168,184 @@ fn run_windows_orchestration_stages_with_options(
 
     let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
 
+    // Optional pre-live Windows-as-exit evidence validators. These consume
+    // artifacts staged under report_dir/windows_exit when a live run has
+    // captured them. Missing artifacts remain Skipped so ordinary Windows
+    // client validation does not claim or require exit-node posture.
+    let windows_exit_artifact_root = report_dir.join("windows_exit");
+    let exit_nat_lifecycle_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_exit_nat_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would validate Windows Exit NAT lifecycle artifact for {windows_alias}"
+            ),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "validate_windows_exit_nat_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_path = windows_exit_artifact_root.join("scm_context_nat_lifecycle.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_windows_exit_nat_lifecycle",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Windows Exit NAT lifecycle artifact not present at {}",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_windows_exit_nat_lifecycle_artifact(windows_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_nat_lifecycle_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_windows_exit_nat_lifecycle",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_nat_lifecycle_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_windows_exit_nat_lifecycle",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Windows Exit NAT lifecycle artifact validation failed for {windows_alias}: {reason}"
+                        ),
+                        vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
+    let exit_dns_leak_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_exit_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Windows Exit DNS leak artifacts for {windows_alias}"),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "validate_windows_exit_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_dir = windows_exit_artifact_root.join("dns_leak_proof");
+        if !artifact_dir.exists() {
+            stage_outcome(
+                "validate_windows_exit_dns_failclosed",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Windows Exit DNS leak artifact directory not present at {}",
+                    artifact_dir.display()
+                ),
+                vec![],
+            )
+        } else {
+            match evaluate_windows_exit_dns_leak_artifact_dir(windows_alias, &artifact_dir) {
+                Ok(summary) => {
+                    let _ = fs::write(&exit_dns_leak_log_path, summary.as_str());
+                    stage_outcome(
+                        "validate_windows_exit_dns_failclosed",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_dns_leak_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_dns_leak_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_windows_exit_dns_failclosed",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Windows Exit DNS leak artifact validation failed for {windows_alias}: {reason}"
+                        ),
+                        vec![exit_dns_leak_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
+    let exit_killswitch_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_exit_killswitch_precedence",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would validate Windows Exit killswitch precedence artifact for {windows_alias}"
+            ),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "validate_windows_exit_killswitch_precedence",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_path = windows_exit_artifact_root.join("killswitch_precedence.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_windows_exit_killswitch_precedence",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Windows Exit killswitch precedence artifact not present at {}",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_windows_exit_killswitch_precedence_artifact(
+                        windows_alias,
+                        raw.as_str(),
+                    )
+                    .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_killswitch_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_windows_exit_killswitch_precedence",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_killswitch_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_killswitch_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_windows_exit_killswitch_precedence",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Windows Exit killswitch precedence artifact validation failed for {windows_alias}: {reason}"
+                        ),
+                        vec![exit_killswitch_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
     // Stage 7a: amend_membership_for_windows (W4.2 prerequisite)
     //
     // When `linux_exit_alias` is configured the orchestrator adds the Windows
@@ -8589,6 +8770,9 @@ fn run_windows_orchestration_stages_with_options(
         custody_outcome,
         authenticode_outcome,
         dns_failclosed_outcome,
+        exit_nat_lifecycle_outcome,
+        exit_dns_leak_outcome,
+        exit_killswitch_outcome,
         amend_membership_outcome,
         issue_windows_assignment_outcome,
         distribute_membership_outcome,
@@ -9138,6 +9322,242 @@ fn evaluate_windows_dns_failclosed_report(
         "Windows DNS fail-closed verified on {windows_alias} ({} interfaces, {} NRPT rules)",
         report.snapshot.interfaces.len(),
         report.snapshot.nrpt_rules.len()
+    ))
+}
+
+fn evaluate_windows_exit_nat_lifecycle_artifact(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse windows exit NAT lifecycle artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "windows exit NAT lifecycle artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let mesh_cidr = require_json_str(&report, "mesh_cidr")?;
+    validate_cidr_like("mesh_cidr", mesh_cidr)?;
+    let nat_name = require_json_str(&report, "nat_name")?;
+    if nat_name.trim().is_empty() {
+        return Err("windows exit NAT lifecycle artifact has empty nat_name".to_string());
+    }
+    let during = require_json_value(&report, "during_run")?;
+    if !require_json_bool(during, "netnat_present")? {
+        return Err(
+            "windows exit NAT lifecycle artifact did not prove NetNat present during run"
+                .to_string(),
+        );
+    }
+    let internal_prefix = require_json_str(during, "internal_prefix")?;
+    if internal_prefix != mesh_cidr {
+        return Err(format!(
+            "windows exit NAT lifecycle artifact internal_prefix {internal_prefix:?} did not match mesh_cidr {mesh_cidr:?}"
+        ));
+    }
+    require_forwarding_enabled(during, "tunnel_forwarding")?;
+    require_forwarding_enabled(during, "egress_forwarding")?;
+
+    let after = require_json_value(&report, "after_stop")?;
+    if require_json_bool(after, "netnat_present")? {
+        return Err(
+            "windows exit NAT lifecycle artifact left NetNat present after daemon stop".to_string(),
+        );
+    }
+    if !require_json_bool(after, "forwarding_restored")? {
+        return Err(
+            "windows exit NAT lifecycle artifact did not prove forwarding was restored after stop"
+                .to_string(),
+        );
+    }
+    Ok(format!(
+        "Windows exit NAT lifecycle verified on {windows_alias} (nat={nat_name}, mesh_cidr={mesh_cidr})"
+    ))
+}
+
+fn evaluate_windows_exit_dns_leak_artifact_dir(
+    windows_alias: &str,
+    artifact_dir: &Path,
+) -> Result<String, String> {
+    let firewall_rules = fs::read_to_string(artifact_dir.join("firewall_block_rules.json"))
+        .map_err(|err| format!("read firewall_block_rules.json failed: {err}"))?;
+    let firewall_report: Value = serde_json::from_str(&firewall_rules)
+        .map_err(|err| format!("parse firewall_block_rules.json failed: {err}"))?;
+    require_json_u64(&firewall_report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            "firewall_block_rules.json returned unsupported schema_version".to_string()
+        })?;
+    if !require_json_bool(&firewall_report, "overall_ok")? {
+        return Err("firewall_block_rules.json did not report overall_ok=true".to_string());
+    }
+    let rules = require_json_array(&firewall_report, "rules")?;
+    require_dns_block_rule(rules, "RustyNetDNS-BlockLanUdp")?;
+    require_dns_block_rule(rules, "RustyNetDNS-BlockLanTcp")?;
+
+    let udp_pcap = fs::read_to_string(artifact_dir.join("udp_block_pcap.txt"))
+        .map_err(|err| format!("read udp_block_pcap.txt failed: {err}"))?;
+    require_empty_dns_pcap("udp_block_pcap.txt", udp_pcap.as_str())?;
+    let tcp_pcap = fs::read_to_string(artifact_dir.join("tcp_block_pcap.txt"))
+        .map_err(|err| format!("read tcp_block_pcap.txt failed: {err}"))?;
+    require_empty_dns_pcap("tcp_block_pcap.txt", tcp_pcap.as_str())?;
+
+    let positive_control = fs::read_to_string(artifact_dir.join("tunnel_path_resolves.json"))
+        .map_err(|err| format!("read tunnel_path_resolves.json failed: {err}"))?;
+    let positive_report: Value = serde_json::from_str(&positive_control)
+        .map_err(|err| format!("parse tunnel_path_resolves.json failed: {err}"))?;
+    if !require_json_bool(&positive_report, "overall_ok")?
+        || !require_json_bool(&positive_report, "resolved")?
+    {
+        return Err(
+            "tunnel_path_resolves.json did not prove tunnel DNS positive control".to_string(),
+        );
+    }
+
+    let dns_check = fs::read_to_string(artifact_dir.join("windows_dns_failclosed_check.json"))
+        .map_err(|err| format!("read windows_dns_failclosed_check.json failed: {err}"))?;
+    evaluate_windows_dns_failclosed_report(windows_alias, dns_check.as_str())?;
+
+    Ok(format!(
+        "Windows exit DNS leak proof verified on {windows_alias}: UDP/TCP egress pcaps empty and tunnel positive control passed"
+    ))
+}
+
+fn evaluate_windows_exit_killswitch_precedence_artifact(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json).map_err(|err| {
+        format!("parse windows exit killswitch precedence artifact failed: {err}")
+    })?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            "windows exit killswitch precedence artifact returned unsupported schema_version"
+                .to_string()
+        })?;
+    let baseline = require_json_value(&report, "baseline_assert")?;
+    if !require_json_bool(baseline, "overall_ok")? {
+        return Err("baseline killswitch assertion did not pass before tamper".to_string());
+    }
+    let tampered = require_json_value(&report, "tampered_assert")?;
+    if require_json_bool(tampered, "overall_ok")? {
+        return Err("tampered killswitch assertion reported overall_ok=true".to_string());
+    }
+    let exit_code = require_json_i64(tampered, "exit_code")?;
+    if exit_code == 0 {
+        return Err("tampered killswitch assertion exited zero".to_string());
+    }
+    let reason = require_json_str(tampered, "reason")?;
+    if reason.trim().is_empty() {
+        return Err("tampered killswitch assertion did not record a reason".to_string());
+    }
+    Ok(format!(
+        "Windows exit killswitch precedence verified on {windows_alias}: tamper rejected with exit_code={exit_code}"
+    ))
+}
+
+fn require_json_value<'a>(value: &'a Value, field: &str) -> Result<&'a Value, String> {
+    value
+        .get(field)
+        .ok_or_else(|| format!("JSON field {field:?} is missing"))
+}
+
+fn require_json_array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], String> {
+    require_json_value(value, field)?
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("JSON field {field:?} must be an array"))
+}
+
+fn require_json_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
+    require_json_value(value, field)?
+        .as_str()
+        .ok_or_else(|| format!("JSON field {field:?} must be a string"))
+}
+
+fn require_json_bool(value: &Value, field: &str) -> Result<bool, String> {
+    require_json_value(value, field)?
+        .as_bool()
+        .ok_or_else(|| format!("JSON field {field:?} must be a boolean"))
+}
+
+fn require_json_u64(value: &Value, field: &str) -> Result<u64, String> {
+    require_json_value(value, field)?
+        .as_u64()
+        .ok_or_else(|| format!("JSON field {field:?} must be an unsigned integer"))
+}
+
+fn require_json_i64(value: &Value, field: &str) -> Result<i64, String> {
+    require_json_value(value, field)?
+        .as_i64()
+        .ok_or_else(|| format!("JSON field {field:?} must be an integer"))
+}
+
+fn validate_cidr_like(label: &str, cidr: &str) -> Result<(), String> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| format!("{label} must be CIDR-shaped"))?;
+    if addr.parse::<IpAddr>().is_err() {
+        return Err(format!("{label} has invalid IP address: {addr:?}"));
+    }
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("{label} has invalid prefix length"))?;
+    if prefix > 128 {
+        return Err(format!("{label} prefix length out of range"));
+    }
+    Ok(())
+}
+
+fn require_forwarding_enabled(value: &Value, field: &str) -> Result<(), String> {
+    let status = require_json_str(value, field)?;
+    if status.eq_ignore_ascii_case("enabled") {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows exit forwarding field {field} was {status:?}, expected Enabled"
+        ))
+    }
+}
+
+fn require_dns_block_rule(rules: &[Value], expected_name: &str) -> Result<(), String> {
+    let rule = rules
+        .iter()
+        .find(|rule| {
+            rule.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == expected_name)
+        })
+        .ok_or_else(|| format!("firewall_block_rules.json missing {expected_name}"))?;
+    for (field, expected) in [
+        ("action", "Block"),
+        ("direction", "Outbound"),
+        ("enabled", "True"),
+    ] {
+        let actual = require_json_str(rule, field)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "firewall rule {expected_name} field {field} was {actual:?}, expected {expected}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_empty_dns_pcap(label: &str, content: &str) -> Result<(), String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.contains("0 packets captured") {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} contains DNS egress evidence; expected an empty blocked-path capture"
     ))
 }
 
@@ -26704,6 +27124,170 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         );
     }
 
+    fn reviewed_windows_exit_nat_lifecycle_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "nat_name": "RustyNetExit-rustynet0",
+            "mesh_cidr": "100.64.0.0/10",
+            "during_run": {
+                "netnat_present": true,
+                "internal_prefix": "100.64.0.0/10",
+                "tunnel_forwarding": "Enabled",
+                "egress_forwarding": "Enabled"
+            },
+            "after_stop": {
+                "netnat_present": false,
+                "forwarding_restored": true
+            }
+        })
+    }
+
+    #[test]
+    fn evaluate_windows_exit_nat_lifecycle_artifact_accepts_reviewed_payload() {
+        let summary = super::evaluate_windows_exit_nat_lifecycle_artifact(
+            "windows-utm-1",
+            reviewed_windows_exit_nat_lifecycle_artifact()
+                .to_string()
+                .as_str(),
+        )
+        .expect("reviewed NAT lifecycle artifact must validate");
+        assert!(
+            summary.contains("RustyNetExit-rustynet0") && summary.contains("100.64.0.0/10"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_exit_nat_lifecycle_artifact_rejects_leftover_nat_after_stop() {
+        let mut payload = reviewed_windows_exit_nat_lifecycle_artifact();
+        payload["after_stop"]["netnat_present"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_windows_exit_nat_lifecycle_artifact(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("leftover NetNat after stop must fail closed");
+        assert!(
+            err.contains("left NetNat present after daemon stop"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn write_reviewed_windows_exit_dns_artifacts(dir: &Path) {
+        fs::write(
+            dir.join("firewall_block_rules.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "overall_ok": true,
+                "rules": [
+                    {
+                        "name": "RustyNetDNS-BlockLanUdp",
+                        "action": "Block",
+                        "direction": "Outbound",
+                        "enabled": "True"
+                    },
+                    {
+                        "name": "RustyNetDNS-BlockLanTcp",
+                        "action": "Block",
+                        "direction": "Outbound",
+                        "enabled": "True"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write firewall rules");
+        fs::write(dir.join("udp_block_pcap.txt"), "0 packets captured\n").expect("write udp pcap");
+        fs::write(dir.join("tcp_block_pcap.txt"), "").expect("write tcp pcap");
+        fs::write(
+            dir.join("tunnel_path_resolves.json"),
+            serde_json::json!({
+                "overall_ok": true,
+                "resolved": true
+            })
+            .to_string(),
+        )
+        .expect("write positive control");
+        fs::write(
+            dir.join("windows_dns_failclosed_check.json"),
+            reviewed_dns_failclosed_payload().to_string(),
+        )
+        .expect("write dns failclosed check");
+    }
+
+    #[test]
+    fn evaluate_windows_exit_dns_leak_artifact_dir_accepts_reviewed_payloads() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        write_reviewed_windows_exit_dns_artifacts(temp.path());
+        let summary =
+            super::evaluate_windows_exit_dns_leak_artifact_dir("windows-utm-1", temp.path())
+                .expect("reviewed DNS leak proof artifacts must validate");
+        assert!(
+            summary.contains("UDP/TCP egress pcaps empty"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_exit_dns_leak_artifact_dir_rejects_nonempty_block_pcap() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        write_reviewed_windows_exit_dns_artifacts(temp.path());
+        fs::write(
+            temp.path().join("udp_block_pcap.txt"),
+            "12:00:00 IP 192.0.2.10.53000 > 1.1.1.1.53: UDP, length 32\n",
+        )
+        .expect("write leak pcap");
+        let err = super::evaluate_windows_exit_dns_leak_artifact_dir("windows-utm-1", temp.path())
+            .expect_err("non-empty DNS block pcap must fail closed");
+        assert!(
+            err.contains("contains DNS egress evidence"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn reviewed_windows_exit_killswitch_precedence_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "baseline_assert": {
+                "overall_ok": true
+            },
+            "tampered_assert": {
+                "overall_ok": false,
+                "exit_code": 1,
+                "reason": "Windows advfirewall killswitch verification failed: default outbound action was Allow"
+            }
+        })
+    }
+
+    #[test]
+    fn evaluate_windows_exit_killswitch_precedence_artifact_accepts_reviewed_payload() {
+        let summary = super::evaluate_windows_exit_killswitch_precedence_artifact(
+            "windows-utm-1",
+            reviewed_windows_exit_killswitch_precedence_artifact()
+                .to_string()
+                .as_str(),
+        )
+        .expect("reviewed killswitch precedence artifact must validate");
+        assert!(
+            summary.contains("tamper rejected"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_exit_killswitch_precedence_artifact_rejects_tampered_success() {
+        let mut payload = reviewed_windows_exit_killswitch_precedence_artifact();
+        payload["tampered_assert"]["overall_ok"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_windows_exit_killswitch_precedence_artifact(
+            "windows-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("tampered killswitch success must fail closed");
+        assert!(
+            err.contains("reported overall_ok=true"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ---------------------------------------------------------------
     // W4.2 Windows mesh-join evaluator tests
     // ---------------------------------------------------------------
@@ -28118,6 +28702,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(stage_names.contains(&"validate_windows_key_custody"));
         assert!(stage_names.contains(&"validate_windows_authenticode"));
         assert!(stage_names.contains(&"validate_windows_dns_failclosed"));
+        assert!(stage_names.contains(&"validate_windows_exit_nat_lifecycle"));
+        assert!(stage_names.contains(&"validate_windows_exit_dns_failclosed"));
+        assert!(stage_names.contains(&"validate_windows_exit_killswitch_precedence"));
         assert!(stage_names.contains(&"distribute_windows_membership"));
         assert!(stage_names.contains(&"distribute_windows_assignment"));
         assert!(stage_names.contains(&"distribute_windows_traversal"));
