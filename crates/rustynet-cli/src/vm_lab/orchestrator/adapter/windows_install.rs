@@ -685,6 +685,10 @@ mod tests {
             INSTALL_SERVICE_SCRIPT.contains("'--node-id', $NodeId"),
             "Windows install helper must not hardcode a stale service node id"
         );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("(Join-Path $StateRoot 'rustynetd.state')"),
+            "fresh Windows installs must purge stale daemon state before service start"
+        );
     }
 
     #[test]

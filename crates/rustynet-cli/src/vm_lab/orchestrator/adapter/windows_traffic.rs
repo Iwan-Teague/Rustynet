@@ -175,6 +175,7 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
              (Join-Path $stateRoot 'membership\\membership.snapshot'), \
              (Join-Path $stateRoot 'membership\\membership.log'), \
              (Join-Path $stateRoot 'membership\\membership.watermark'), \
+             (Join-Path $stateRoot 'rustynetd.state'), \
              (Join-Path $stateRoot 'trust\\rustynetd.assignment'), \
              (Join-Path $stateRoot 'trust\\rustynetd.assignment.watermark'), \
              (Join-Path $stateRoot 'trust\\rustynetd.traversal'), \

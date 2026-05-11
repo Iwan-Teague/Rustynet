@@ -985,6 +985,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
             (Join-Path $trustDir 'rustynetd.dns-zone'),
             (Join-Path $trustDir 'rustynetd.dns-zone.watermark'),
             (Join-Path $trustDir 'dns-zone.pub'),
+            (Join-Path $StateRoot 'rustynetd.state'),
             (Join-Path $membershipDir 'membership.snapshot'),
             (Join-Path $membershipDir 'membership.log'),
             (Join-Path $membershipDir 'membership.watermark')
