@@ -57,6 +57,7 @@ const WINDOWS_SERVICE_UNINSTALL_HELPER_FILE: &str = "Uninstall-RustyNetWindowsSe
 const WINDOWS_RELAY_SERVICE_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindowsRelayService.ps1";
 const WINDOWS_RELAY_SERVICE_UNINSTALL_HELPER_FILE: &str =
     "Uninstall-RustyNetWindowsRelayService.ps1";
+const WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT: &str = r"C:\ProgramData\RustyNet\vm-lab\windows_exit";
 const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
@@ -7550,6 +7551,7 @@ fn run_windows_orchestration_stages_with_options(
     let custody_log_path = logs_dir.join("validate_windows_key_custody.log");
     let authenticode_log_path = logs_dir.join("validate_windows_authenticode.log");
     let dns_failclosed_log_path = logs_dir.join("validate_windows_dns_failclosed.log");
+    let pull_exit_evidence_log_path = logs_dir.join("pull_windows_exit_evidence_artifacts.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_windows_exit_nat_lifecycle.log");
     let exit_dns_leak_log_path = logs_dir.join("validate_windows_exit_dns_failclosed.log");
     let exit_killswitch_log_path = logs_dir.join("validate_windows_exit_killswitch_precedence.log");
@@ -8168,11 +8170,71 @@ fn run_windows_orchestration_stages_with_options(
 
     let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
 
-    // Optional pre-live Windows-as-exit evidence validators. These consume
-    // artifacts staged under report_dir/windows_exit when a live run has
-    // captured them. Missing artifacts remain Skipped so ordinary Windows
-    // client validation does not claim or require exit-node posture.
+    // Optional pre-live Windows-as-exit evidence pull + validators. Evidence
+    // is copied from a reviewed guest root through an allowlist, not recursive
+    // directory copy, so live proof can land without risking key exfiltration.
     let windows_exit_artifact_root = report_dir.join("windows_exit");
+    let pull_exit_evidence_outcome = if dry_run {
+        stage_outcome(
+            "pull_windows_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would pull Windows Exit evidence artifacts for {windows_alias}"),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "pull_windows_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        match pull_windows_exit_evidence_artifacts(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+            windows_exit_artifact_root.as_path(),
+        ) {
+            Ok((summary, raw_report, copied_paths)) if copied_paths.is_empty() => {
+                let _ = fs::write(&pull_exit_evidence_log_path, raw_report.as_str());
+                stage_outcome(
+                    "pull_windows_exit_evidence_artifacts",
+                    VmLabStageStatus::Skipped,
+                    summary,
+                    vec![pull_exit_evidence_log_path.clone()],
+                )
+            }
+            Ok((summary, raw_report, copied_paths)) => {
+                let _ = fs::write(&pull_exit_evidence_log_path, raw_report.as_str());
+                let mut artifacts = vec![pull_exit_evidence_log_path.clone()];
+                artifacts.extend(copied_paths);
+                stage_outcome(
+                    "pull_windows_exit_evidence_artifacts",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    artifacts,
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = fs::write(&pull_exit_evidence_log_path, log_body.as_str());
+                stage_outcome(
+                    "pull_windows_exit_evidence_artifacts",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "Windows Exit evidence artifact pull failed for {windows_alias}: {reason}"
+                    ),
+                    vec![pull_exit_evidence_log_path.clone()],
+                )
+            }
+        }
+    };
+
     let exit_nat_lifecycle_outcome = if dry_run {
         stage_outcome(
             "validate_windows_exit_nat_lifecycle",
@@ -8770,6 +8832,7 @@ fn run_windows_orchestration_stages_with_options(
         custody_outcome,
         authenticode_outcome,
         dns_failclosed_outcome,
+        pull_exit_evidence_outcome,
         exit_nat_lifecycle_outcome,
         exit_dns_leak_outcome,
         exit_killswitch_outcome,
@@ -8789,6 +8852,53 @@ fn run_windows_orchestration_stages_with_options(
 /// Path of the installed `rustynetd.exe` on Windows guests, mirroring
 /// `crate::windows_paths::DEFAULT_WINDOWS_INSTALL_ROOT` from the daemon.
 const WINDOWS_RUSTYNETD_EXE_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsExitEvidenceArtifactSpec {
+    label: &'static str,
+    remote_relative_path: &'static str,
+    local_relative_path: &'static str,
+}
+
+fn windows_exit_evidence_artifact_specs() -> &'static [WindowsExitEvidenceArtifactSpec] {
+    &[
+        WindowsExitEvidenceArtifactSpec {
+            label: "scm_context_nat_lifecycle",
+            remote_relative_path: r"scm_context_nat_lifecycle.json",
+            local_relative_path: "scm_context_nat_lifecycle.json",
+        },
+        WindowsExitEvidenceArtifactSpec {
+            label: "dns_firewall_block_rules",
+            remote_relative_path: r"dns_leak_proof\firewall_block_rules.json",
+            local_relative_path: "dns_leak_proof/firewall_block_rules.json",
+        },
+        WindowsExitEvidenceArtifactSpec {
+            label: "dns_udp_block_pcap",
+            remote_relative_path: r"dns_leak_proof\udp_block_pcap.txt",
+            local_relative_path: "dns_leak_proof/udp_block_pcap.txt",
+        },
+        WindowsExitEvidenceArtifactSpec {
+            label: "dns_tcp_block_pcap",
+            remote_relative_path: r"dns_leak_proof\tcp_block_pcap.txt",
+            local_relative_path: "dns_leak_proof/tcp_block_pcap.txt",
+        },
+        WindowsExitEvidenceArtifactSpec {
+            label: "dns_tunnel_positive_control",
+            remote_relative_path: r"dns_leak_proof\tunnel_path_resolves.json",
+            local_relative_path: "dns_leak_proof/tunnel_path_resolves.json",
+        },
+        WindowsExitEvidenceArtifactSpec {
+            label: "dns_failclosed_check",
+            remote_relative_path: r"dns_leak_proof\windows_dns_failclosed_check.json",
+            local_relative_path: "dns_leak_proof/windows_dns_failclosed_check.json",
+        },
+        WindowsExitEvidenceArtifactSpec {
+            label: "killswitch_precedence",
+            remote_relative_path: r"killswitch_precedence.json",
+            local_relative_path: "killswitch_precedence.json",
+        },
+    ]
+}
 
 /// Build the PowerShell script body that invokes one of the security-check
 /// subcommands on the live Windows guest. Centralizes argv-only discipline so
@@ -8831,6 +8941,180 @@ fn build_windows_security_check_invocation(
         }
     }
     Ok(script)
+}
+
+fn build_windows_exit_evidence_inventory_script() -> Result<String, String> {
+    let mut entries = Vec::new();
+    for spec in windows_exit_evidence_artifact_specs() {
+        let remote_path =
+            windows_guest_path_join(WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT, spec.remote_relative_path)?;
+        entries.push(format!(
+            "[pscustomobject]@{{ label = {}; exists = (Test-Path -LiteralPath {} -PathType Leaf) }}",
+            powershell_quote(spec.label)?,
+            powershell_quote(remote_path.as_str())?
+        ));
+    }
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         @({}) | ConvertTo-Json -Depth 4",
+        entries.join("; ")
+    ))
+}
+
+fn parse_windows_exit_evidence_inventory(raw_json: &str) -> Result<HashSet<String>, String> {
+    let parsed: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse Windows Exit evidence inventory failed: {err}"))?;
+    let entries = parsed
+        .as_array()
+        .ok_or_else(|| "Windows Exit evidence inventory must be a JSON array".to_string())?;
+    let allowed_labels = windows_exit_evidence_artifact_specs()
+        .iter()
+        .map(|spec| spec.label)
+        .collect::<HashSet<_>>();
+    let mut found = HashSet::new();
+    for entry in entries {
+        let label = require_json_str(entry, "label")?;
+        if !allowed_labels.contains(label) {
+            return Err(format!(
+                "Windows Exit evidence inventory returned unexpected label {label:?}"
+            ));
+        }
+        if require_json_bool(entry, "exists")? {
+            found.insert(label.to_string());
+        }
+    }
+    Ok(found)
+}
+
+fn pull_windows_exit_evidence_artifacts(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_artifact_root: &Path,
+) -> Result<(String, String, Vec<PathBuf>), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+
+    fs::create_dir_all(local_artifact_root).map_err(|err| {
+        (
+            format!(
+                "create Windows Exit local artifact root failed ({}): {err}",
+                local_artifact_root.display()
+            ),
+            String::new(),
+        )
+    })?;
+
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script =
+        build_windows_exit_evidence_inventory_script().map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_inventory = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote Windows Exit evidence inventory failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_inventory = raw_inventory.trim().to_string();
+    let available = parse_windows_exit_evidence_inventory(raw_inventory.as_str())
+        .map_err(|err| (err, raw_inventory.clone()))?;
+    if available.is_empty() {
+        return Ok((
+            format!(
+                "skipped: no Windows Exit evidence artifacts found under {WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT} on {windows_alias}"
+            ),
+            raw_inventory,
+            Vec::new(),
+        ));
+    }
+
+    let mut copied_paths = Vec::new();
+    for spec in windows_exit_evidence_artifact_specs() {
+        if !available.contains(spec.label) {
+            continue;
+        }
+        let remote_path =
+            windows_guest_path_join(WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT, spec.remote_relative_path)
+                .map_err(|err| (err, raw_inventory.clone()))?;
+        let local_path = local_artifact_root.join(Path::new(spec.local_relative_path));
+        let status = scp_from_remote(
+            &target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            remote_path.as_str(),
+            local_path.as_path(),
+            timeout,
+        )
+        .map_err(|err| {
+            (
+                format!(
+                    "copy Windows Exit evidence artifact {} from {} failed: {err}",
+                    spec.label, remote_path
+                ),
+                raw_inventory.clone(),
+            )
+        })?;
+        if !status.success() {
+            return Err((
+                format!(
+                    "copy Windows Exit evidence artifact {} from {} exited non-zero: {}",
+                    spec.label,
+                    remote_path,
+                    status_code(status)
+                ),
+                raw_inventory,
+            ));
+        }
+        if !local_path.is_file() {
+            return Err((
+                format!(
+                    "copy Windows Exit evidence artifact {} reported success but local file is missing: {}",
+                    spec.label,
+                    local_path.display()
+                ),
+                raw_inventory,
+            ));
+        }
+        copied_paths.push(local_path);
+    }
+
+    Ok((
+        format!(
+            "pulled {} Windows Exit evidence artifact(s) from {windows_alias} into {}",
+            copied_paths.len(),
+            local_artifact_root.display()
+        ),
+        raw_inventory,
+        copied_paths,
+    ))
 }
 
 fn run_validate_windows_runtime_acls_stage(
@@ -28702,6 +28986,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(stage_names.contains(&"validate_windows_key_custody"));
         assert!(stage_names.contains(&"validate_windows_authenticode"));
         assert!(stage_names.contains(&"validate_windows_dns_failclosed"));
+        assert!(stage_names.contains(&"pull_windows_exit_evidence_artifacts"));
         assert!(stage_names.contains(&"validate_windows_exit_nat_lifecycle"));
         assert!(stage_names.contains(&"validate_windows_exit_dns_failclosed"));
         assert!(stage_names.contains(&"validate_windows_exit_killswitch_precedence"));
@@ -29490,6 +29775,71 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             script.contains("'positional-value'"),
             "non-flag arg must be wrapped in PowerShell quotes: {script:?}"
         );
+    }
+
+    #[test]
+    fn windows_exit_evidence_artifact_specs_are_exact_allowlist() {
+        let specs = super::windows_exit_evidence_artifact_specs();
+        let labels: Vec<&str> = specs.iter().map(|spec| spec.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "scm_context_nat_lifecycle",
+                "dns_firewall_block_rules",
+                "dns_udp_block_pcap",
+                "dns_tcp_block_pcap",
+                "dns_tunnel_positive_control",
+                "dns_failclosed_check",
+                "killswitch_precedence",
+            ]
+        );
+        for spec in specs {
+            let joined = format!(
+                "{}\\{}",
+                super::WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT,
+                spec.remote_relative_path
+            )
+            .to_ascii_lowercase();
+            assert!(
+                !joined.contains("\\keys\\") && !joined.contains(".priv"),
+                "Windows Exit evidence pull allowlist must not include key material paths: {joined}"
+            );
+            assert!(
+                spec.local_relative_path == "scm_context_nat_lifecycle.json"
+                    || spec.local_relative_path == "killswitch_precedence.json"
+                    || spec.local_relative_path.starts_with("dns_leak_proof/"),
+                "unexpected local Windows Exit evidence path: {}",
+                spec.local_relative_path
+            );
+        }
+    }
+
+    #[test]
+    fn build_windows_exit_evidence_inventory_script_uses_literal_allowlist_paths() {
+        let script = super::build_windows_exit_evidence_inventory_script()
+            .expect("inventory script should build");
+        assert!(script.contains("Set-StrictMode -Version Latest"));
+        assert!(script.contains("Test-Path -LiteralPath"));
+        assert!(script.contains(r"C:\ProgramData\RustyNet\vm-lab\windows_exit"));
+        assert!(script.contains("scm_context_nat_lifecycle.json"));
+        assert!(script.contains("dns_leak_proof\\firewall_block_rules.json"));
+        assert!(script.contains("killswitch_precedence.json"));
+        assert!(
+            !script.contains("Get-ChildItem") && !script.contains("-Recurse"),
+            "inventory script must not recursively enumerate guest files: {script}"
+        );
+    }
+
+    #[test]
+    fn parse_windows_exit_evidence_inventory_rejects_unknown_labels() {
+        let raw = serde_json::json!([
+            {"label": "scm_context_nat_lifecycle", "exists": true},
+            {"label": "keys_private_dump", "exists": true}
+        ])
+        .to_string();
+        let err = super::parse_windows_exit_evidence_inventory(raw.as_str())
+            .expect_err("unknown inventory labels must fail closed");
+        assert!(err.contains("unexpected label"), "unexpected error: {err}");
     }
 
     // ── W5.6 CLI surface tests ────────────────────────────────────────
