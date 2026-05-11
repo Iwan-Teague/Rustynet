@@ -375,6 +375,23 @@ fn windows_bootstrap_acl_repair_fragment() -> Result<String, AdapterError> {
     ))
 }
 
+fn windows_bootstrap_native_helper_fragment() -> String {
+    "function Invoke-RustyNetBootstrapNative { \
+         param([Parameter(Mandatory = $true)][scriptblock]$Command); \
+         $oldErrorActionPreference = $ErrorActionPreference; \
+         $ErrorActionPreference = 'Continue'; \
+         try { \
+             $output = (& $Command 2>&1) -join ' '; \
+             $exitCode = $LASTEXITCODE \
+         } finally { \
+             $ErrorActionPreference = $oldErrorActionPreference \
+         }; \
+         if ($null -eq $exitCode) { $exitCode = 0 }; \
+         [pscustomobject]@{ ExitCode = $exitCode; Output = $output } \
+     }"
+    .to_string()
+}
+
 // ── Windows e2e bootstrap ─────────────────────────────────────────────────────
 
 fn windows_lab_node_id(alias: &str, ctx: &OrchestrationContext) -> String {
@@ -452,10 +469,12 @@ fn run_windows_e2e_bootstrap(
     let membership_snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?;
     let service_probe = windows_service_start_probe_fragment(WINDOWS_SERVICE_NAME)?;
     let bootstrap_acl_repair = windows_bootstrap_acl_repair_fragment()?;
+    let native_helper = windows_bootstrap_native_helper_fragment();
 
     let bootstrap_script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
+         {native_helper}; \
          $env:RUSTYNET_WG_BINARY_PATH = {wg_binary_q}; \
          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create(); \
          $bytes = New-Object byte[] 48; \
@@ -464,9 +483,9 @@ fn run_windows_e2e_bootstrap(
          {bootstrap_acl_repair}; \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
-         $keyInitOut = (& {rustynetd_q} key init --passphrase-file {passphrase_q} --force 2>&1) -join ' '; \
-         if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key init failed: $keyInitOut\" }}; \
-         $mbInitOut = (& {rustynetd_q} membership init \
+         $keyInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key init --passphrase-file {passphrase_q} --force }}; \
+         if ($keyInit.ExitCode -ne 0) {{ throw ('rustynetd key init failed: ' + $keyInit.Output) }}; \
+         $mbInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} membership init \
              --snapshot {membership_snapshot_q} \
              --log {membership_log_q} \
              --watermark {membership_watermark_q} \
@@ -474,12 +493,12 @@ fn run_windows_e2e_bootstrap(
              --owner-signing-key-passphrase-file {passphrase_q} \
              --node-id {node_id_q} \
              --network-id {network_id_q} \
-             --force 2>&1) -join ' '; \
-         if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd membership init failed: $mbInitOut\" }}; \
-         $kspOut = (& {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q} 2>&1) -join ' '; \
-         if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key store-passphrase failed: $kspOut\" }}; \
-         $aclOut = (& {rustynetd_q} windows-runtime-acls-check 2>&1) -join ' '; \
-         if ($LASTEXITCODE -ne 0) {{ throw \"runtime ACL check failed (startup would fail): $aclOut\" }}; \
+             --force }}; \
+         if ($mbInit.ExitCode -ne 0) {{ throw ('rustynetd membership init failed: ' + $mbInit.Output) }}; \
+         $ksp = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q} }}; \
+         if ($ksp.ExitCode -ne 0) {{ throw ('rustynetd key store-passphrase failed: ' + $ksp.Output) }}; \
+         $acl = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} windows-runtime-acls-check }}; \
+         if ($acl.ExitCode -ne 0) {{ throw ('runtime ACL check failed (startup would fail): ' + $acl.Output) }}; \
          {service_probe}",
     );
     run_remote_ps(conn, &bootstrap_script, WINDOWS_E2E_BOOTSTRAP_TIMEOUT)?;
@@ -777,6 +796,25 @@ mod tests {
         assert!(
             script.contains("$bootstrapAclDir"),
             "bootstrap ACL repair should operate per reviewed runtime directory"
+        );
+    }
+
+    #[test]
+    fn windows_bootstrap_native_helper_captures_stderr_without_native_command_error() {
+        let script = windows_bootstrap_native_helper_fragment();
+
+        assert!(script.contains("Invoke-RustyNetBootstrapNative"));
+        assert!(
+            script.contains("$ErrorActionPreference = 'Continue'"),
+            "native stderr must be captured instead of converted into NativeCommandError"
+        );
+        assert!(
+            script.contains("$exitCode = $LASTEXITCODE"),
+            "native command failure must be decided by LASTEXITCODE"
+        );
+        assert!(
+            script.contains("finally"),
+            "helper must restore the prior ErrorActionPreference"
         );
     }
 
