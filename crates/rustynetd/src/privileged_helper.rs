@@ -1640,9 +1640,9 @@ mod tests {
     use super::{
         HELPER_FRAME_MAGIC, HELPER_FRAME_TYPE_REQUEST, HELPER_FRAME_TYPE_RESPONSE,
         HELPER_FRAME_VERSION, HelperRequest, HelperResponse, MAX_ARG_BYTES, MAX_ARGS,
-        MAX_MESSAGE_BYTES, PrivilegedCommandProgram, decode_helper_request, encode_helper_request,
-        handle_request, is_anchor_name_token, is_nft_token, is_path_token, is_safe_token,
-        read_request, read_response_frame, run_privileged_subprocess,
+        MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandProgram, decode_helper_request,
+        encode_helper_request, handle_request, is_anchor_name_token, is_nft_token, is_path_token,
+        is_safe_token, read_request, read_response_frame, run_privileged_subprocess,
         validate_privileged_helper_socket_security, validate_privileged_program_binary,
         validate_request, write_request_frame, write_response,
     };
@@ -2425,6 +2425,35 @@ mod tests {
         let err =
             decode_helper_request(&payload).expect_err("non-utf-8 arg field must be rejected");
         assert!(err.contains("not valid utf-8"));
+    }
+
+    #[test]
+    fn helper_request_decoder_handles_adversarial_bytes_without_panic() {
+        let mut seed = 0x726e_6866_5f64_6563u64;
+        for len in 0..=512usize {
+            let mut payload = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                payload.push((seed >> 32) as u8);
+            }
+            let decoded = std::panic::catch_unwind(|| decode_helper_request(payload.as_slice()));
+            let result = decoded.expect("decode_helper_request must not panic");
+            if let Ok(request) = result {
+                assert!(
+                    request.program.len() <= MAX_PROGRAM_BYTES,
+                    "decoded program exceeded max bytes"
+                );
+                assert!(
+                    request.args.len() <= MAX_ARGS,
+                    "decoded arg count exceeded max args"
+                );
+                for arg in request.args {
+                    assert!(arg.len() <= MAX_ARG_BYTES, "decoded arg exceeded max bytes");
+                }
+            }
+        }
     }
 
     #[test]
