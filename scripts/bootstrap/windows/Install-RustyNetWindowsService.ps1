@@ -381,6 +381,40 @@ function Repair-RustyNetRuntimeAcl {
     }
 }
 
+function Repair-RustyNetPreServiceAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AdministratorsName,
+        [Parameter(Mandatory = $true)][string]$LocalSystemName,
+        [switch]$Directory
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    & icacls "$Path" /setowner $AdministratorsName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /setowner failed for $Path"
+    }
+    & icacls "$Path" /inheritance:r | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /inheritance:r failed for $Path"
+    }
+
+    if ($Directory) {
+        $adminGrant = "$AdministratorsName`:(OI)(CI)(F)"
+        $systemGrant = "$LocalSystemName`:(OI)(CI)(F)"
+    } else {
+        $adminGrant = "$AdministratorsName`:F"
+        $systemGrant = "$LocalSystemName`:F"
+    }
+    & icacls "$Path" /grant:r $adminGrant $systemGrant | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls /grant:r failed for $Path"
+    }
+}
+
 # Binary install-root files inherit Builtin Users (BU) read+execute from
 # `C:\Program Files`. The W2.2 service-hardening verifier rejects any binary
 # ACL that exposes a broader-than-reviewed Windows principal (WD/AU/BU). Lock
@@ -831,6 +865,18 @@ $wgPassphraseDir = Split-Path -Parent $wgPassphrasePath
 if (-not (Test-Path -LiteralPath $wgPassphraseDir)) {
     New-Item -ItemType Directory -Force -Path $wgPassphraseDir | Out-Null
 }
+$script:InstallFailureStep = 'repair-key-custody-acls-before-rekey'
+$preServiceAdministratorsName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-32-544'
+$preServiceLocalSystemName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-18'
+foreach ($preServiceDirectory in @(
+        (Join-Path $StateRoot 'keys'),
+        (Join-Path $StateRoot 'secrets'),
+        (Join-Path $StateRoot 'secrets\key-custody')
+    )) {
+    Ensure-Directory -Path $preServiceDirectory
+    Repair-RustyNetPreServiceAcl -Path $preServiceDirectory -AdministratorsName $preServiceAdministratorsName -LocalSystemName $preServiceLocalSystemName -Directory
+}
+$script:InstallFailureStep = 'rekey-wireguard-under-runtime-identity'
 $rekeyPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
 [System.IO.File]::WriteAllText($wgPassphrasePath, $rekeyPlaintext)
 $keyInit = Invoke-RustyNetNativeCommand -Path $daemonDest -Arguments @('key', 'init', '--passphrase-file', $wgPassphrasePath, '--force')
