@@ -9320,14 +9320,12 @@ fn capture_windows_exit_evidence_artifacts(
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
     let script =
         build_windows_exit_evidence_capture_script().map_err(|err| (err, String::new()))?;
-    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
-        .map_err(|err| (err, String::new()))?;
     let raw_output = capture_remote_shell_command_for_target(
         &target,
         None,
         Some(ssh_identity_file),
         known_hosts_path,
-        invocation.as_str(),
+        script.as_str(),
         timeout,
     )
     .map_err(|err| {
@@ -9391,14 +9389,12 @@ fn pull_windows_exit_evidence_artifacts(
     let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
     let script =
         build_windows_exit_evidence_inventory_script().map_err(|err| (err, String::new()))?;
-    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
-        .map_err(|err| (err, String::new()))?;
     let raw_inventory = capture_remote_shell_command_for_target(
         &target,
         None,
         Some(ssh_identity_file),
         known_hosts_path,
-        invocation.as_str(),
+        script.as_str(),
         timeout,
     )
     .map_err(|err| {
