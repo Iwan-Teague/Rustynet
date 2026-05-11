@@ -652,9 +652,9 @@ impl LiveLabContext {
             "-o",
             "ConnectTimeout=15",
             "-o",
-            "ServerAliveInterval=20",
+            "ServerAliveInterval=60",
             "-o",
-            "ServerAliveCountMax=3",
+            "ServerAliveCountMax=10",
             "-o",
             "IdentitiesOnly=yes",
             "-i",
@@ -742,7 +742,17 @@ impl LiveLabContext {
                 "UserKnownHostsFile={}",
                 self.known_hosts_file.display()
             ))
-            .args(["-o", "ConnectTimeout=15", "-o", "IdentitiesOnly=yes", "-i"])
+            .args([
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=60",
+                "-o",
+                "ServerAliveCountMax=10",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-i",
+            ])
             .arg(&self.ssh_identity_file)
             .arg("--")
             .arg(src)
