@@ -58,6 +58,8 @@ const WINDOWS_RELAY_SERVICE_INSTALL_HELPER_FILE: &str = "Install-RustyNetWindows
 const WINDOWS_RELAY_SERVICE_UNINSTALL_HELPER_FILE: &str =
     "Uninstall-RustyNetWindowsRelayService.ps1";
 const WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT: &str = r"C:\ProgramData\RustyNet\vm-lab\windows_exit";
+const WINDOWS_EXIT_KILLSWITCH_PROBE_MARKER: &str =
+    r"C:\ProgramData\RustyNet\vm-lab\windows_exit\enable_killswitch_precedence_probe";
 const WINDOWS_VERIFY_HELPER_FILE: &str = "Verify-RustyNetWindowsBootstrap.ps1";
 const WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE: &str = "Collect-RustyNetWindowsDiagnostics.ps1";
 const WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE: &str = "Smoke-RustyNetWindowsServiceHost.ps1";
@@ -7551,6 +7553,8 @@ fn run_windows_orchestration_stages_with_options(
     let custody_log_path = logs_dir.join("validate_windows_key_custody.log");
     let authenticode_log_path = logs_dir.join("validate_windows_authenticode.log");
     let dns_failclosed_log_path = logs_dir.join("validate_windows_dns_failclosed.log");
+    let capture_exit_evidence_log_path =
+        logs_dir.join("capture_windows_exit_evidence_artifacts.log");
     let pull_exit_evidence_log_path = logs_dir.join("pull_windows_exit_evidence_artifacts.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_windows_exit_nat_lifecycle.log");
     let exit_dns_leak_log_path = logs_dir.join("validate_windows_exit_dns_failclosed.log");
@@ -8174,6 +8178,59 @@ fn run_windows_orchestration_stages_with_options(
     // is copied from a reviewed guest root through an allowlist, not recursive
     // directory copy, so live proof can land without risking key exfiltration.
     let windows_exit_artifact_root = report_dir.join("windows_exit");
+    let capture_exit_evidence_outcome = if dry_run {
+        stage_outcome(
+            "capture_windows_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would capture Windows Exit evidence artifacts on {windows_alias}"),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "capture_windows_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        match capture_windows_exit_evidence_artifacts(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok((summary, raw_report, wrote_any)) => {
+                let _ = fs::write(&capture_exit_evidence_log_path, raw_report.as_str());
+                stage_outcome(
+                    "capture_windows_exit_evidence_artifacts",
+                    if wrote_any {
+                        VmLabStageStatus::Pass
+                    } else {
+                        VmLabStageStatus::Skipped
+                    },
+                    summary,
+                    vec![capture_exit_evidence_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = fs::write(&capture_exit_evidence_log_path, log_body.as_str());
+                stage_outcome(
+                    "capture_windows_exit_evidence_artifacts",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "Windows Exit evidence artifact capture failed for {windows_alias}: {reason}"
+                    ),
+                    vec![capture_exit_evidence_log_path.clone()],
+                )
+            }
+        }
+    };
+
     let pull_exit_evidence_outcome = if dry_run {
         stage_outcome(
             "pull_windows_exit_evidence_artifacts",
@@ -8316,6 +8373,16 @@ fn run_windows_orchestration_stages_with_options(
                 VmLabStageStatus::Skipped,
                 format!(
                     "skipped: Windows Exit DNS leak artifact directory not present at {}",
+                    artifact_dir.display()
+                ),
+                vec![],
+            )
+        } else if let Err(reason) = windows_exit_dns_leak_artifact_set_complete(&artifact_dir) {
+            stage_outcome(
+                "validate_windows_exit_dns_failclosed",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Windows Exit DNS leak artifact set incomplete at {}: {reason}",
                     artifact_dir.display()
                 ),
                 vec![],
@@ -8832,6 +8899,7 @@ fn run_windows_orchestration_stages_with_options(
         custody_outcome,
         authenticode_outcome,
         dns_failclosed_outcome,
+        capture_exit_evidence_outcome,
         pull_exit_evidence_outcome,
         exit_nat_lifecycle_outcome,
         exit_dns_leak_outcome,
@@ -8986,6 +9054,303 @@ fn parse_windows_exit_evidence_inventory(raw_json: &str) -> Result<HashSet<Strin
         }
     }
     Ok(found)
+}
+
+fn build_windows_exit_evidence_capture_script() -> Result<String, String> {
+    let root = powershell_quote(WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT)?;
+    let marker = powershell_quote(WINDOWS_EXIT_KILLSWITCH_PROBE_MARKER)?;
+    let daemon = powershell_quote(WINDOWS_RUSTYNETD_EXE_PATH)?;
+    let template = r#"
+Set-StrictMode -Version Latest;
+$ErrorActionPreference = 'Stop';
+$ProgressPreference = 'SilentlyContinue';
+$ArtifactRoot = __ROOT__;
+$DnsDir = Join-Path -Path $ArtifactRoot -ChildPath 'dns_leak_proof';
+$DaemonPath = __DAEMON__;
+$KillswitchProbeMarker = __MARKER__;
+$TunnelAlias = 'rustynet0';
+$MeshCidr = '100.64.0.0/10';
+$NatName = 'RustyNetExit-rustynet0';
+$ServiceName = 'RustyNet';
+$script:WrittenLabels = @();
+$script:SkippedReasons = @();
+function Add-WrittenLabel {
+    param([string]$Label)
+    $script:WrittenLabels += $Label
+}
+function Add-SkippedReason {
+    param([string]$Reason)
+    $script:SkippedReasons += $Reason
+}
+function Write-JsonFile {
+    param([string]$Path, [object]$Value)
+    $parent = Split-Path -Parent $Path;
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null;
+    $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Path -Encoding UTF8;
+}
+function Get-ForwardingState {
+    param([string]$Alias)
+    try {
+        return [string]((Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding)
+    } catch {
+        return ('Error: ' + $_.Exception.Message)
+    }
+}
+function Get-DefaultEgressAlias {
+    try {
+        return [string](Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+            Where-Object { $_.InterfaceAlias -ne $TunnelAlias } |
+            Sort-Object -Property RouteMetric,InterfaceMetric |
+            Select-Object -First 1 -ExpandProperty InterfaceAlias)
+    } catch {
+        return ''
+    }
+}
+
+New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null;
+
+$egressAlias = Get-DefaultEgressAlias;
+$nat = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue;
+if ($null -eq $nat) {
+    Add-SkippedReason 'NAT lifecycle proof skipped: reviewed NetNat was not present; Windows host is not currently serving exit traffic';
+} elseif ([string]::IsNullOrWhiteSpace($egressAlias)) {
+    Add-SkippedReason 'NAT lifecycle proof skipped: no non-tunnel default egress interface was detected';
+} else {
+    $duringTunnelForwarding = Get-ForwardingState -Alias $TunnelAlias;
+    $duringEgressForwarding = Get-ForwardingState -Alias $egressAlias;
+    $stopError = '';
+    try {
+        Stop-Service -Name $ServiceName -Force -ErrorAction Stop;
+        Start-Sleep -Seconds 4;
+    } catch {
+        $stopError = $_.Exception.Message;
+    }
+    $afterNat = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue;
+    $afterTunnelForwarding = Get-ForwardingState -Alias $TunnelAlias;
+    $afterEgressForwarding = Get-ForwardingState -Alias $egressAlias;
+    $forwardingRestored = ($null -eq $afterNat) -and
+        ($afterTunnelForwarding -ne 'Enabled') -and
+        ($afterEgressForwarding -ne 'Enabled');
+    if ([string]::IsNullOrWhiteSpace($stopError) -and $forwardingRestored) {
+        Write-JsonFile -Path (Join-Path -Path $ArtifactRoot -ChildPath 'scm_context_nat_lifecycle.json') -Value ([pscustomobject]@{
+            schema_version = 1;
+            nat_name = $NatName;
+            mesh_cidr = $MeshCidr;
+            during_run = [pscustomobject]@{
+                netnat_present = $true;
+                internal_prefix = [string]$nat.InternalIPInterfaceAddressPrefix;
+                tunnel_forwarding = $duringTunnelForwarding;
+                egress_forwarding = $duringEgressForwarding;
+                egress_alias = $egressAlias;
+            };
+            after_stop = [pscustomobject]@{
+                netnat_present = ($null -ne $afterNat);
+                forwarding_restored = $forwardingRestored;
+                tunnel_forwarding = $afterTunnelForwarding;
+                egress_forwarding = $afterEgressForwarding;
+            };
+        });
+        Add-WrittenLabel 'scm_context_nat_lifecycle';
+    } else {
+        Add-SkippedReason ('NAT lifecycle proof skipped: service stop/cleanup did not prove restoration; stop_error=' + $stopError + '; after_tunnel=' + $afterTunnelForwarding + '; after_egress=' + $afterEgressForwarding);
+    }
+    try {
+        Start-Service -Name $ServiceName -ErrorAction Stop;
+        Start-Sleep -Seconds 8;
+    } catch {
+        Add-SkippedReason ('service restart after NAT lifecycle probe failed: ' + $_.Exception.Message);
+    }
+}
+
+$dnsRuleNames = @('RustyNetDNS-BlockLanUdp', 'RustyNetDNS-BlockLanTcp');
+$dnsRules = @();
+foreach ($ruleName in $dnsRuleNames) {
+    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue;
+    if ($null -ne $rule) {
+        $dnsRules += [pscustomobject]@{
+            name = [string]$rule.Name;
+            action = [string]$rule.Action;
+            direction = [string]$rule.Direction;
+            enabled = [string]$rule.Enabled;
+            profile = [string]$rule.Profile;
+        };
+    }
+}
+$dnsRulesOk = ($dnsRules.Count -eq 2) -and
+    (($dnsRules | Where-Object { $_.action -eq 'Block' -and $_.direction -eq 'Outbound' -and $_.enabled -eq 'True' }).Count -eq 2);
+if ($dnsRulesOk) {
+    New-Item -ItemType Directory -Force -Path $DnsDir | Out-Null;
+    Write-JsonFile -Path (Join-Path -Path $DnsDir -ChildPath 'firewall_block_rules.json') -Value ([pscustomobject]@{
+        schema_version = 1;
+        overall_ok = $true;
+        rules = $dnsRules;
+    });
+    Add-WrittenLabel 'dns_firewall_block_rules';
+    $dnsCheckRaw = (& $DaemonPath windows-dns-failclosed-check --no-fail-on-drift 2>&1) -join [Environment]::NewLine;
+    if ($LASTEXITCODE -eq 0) {
+        Set-Content -LiteralPath (Join-Path -Path $DnsDir -ChildPath 'windows_dns_failclosed_check.json') -Value $dnsCheckRaw -Encoding UTF8;
+        Add-WrittenLabel 'dns_failclosed_check';
+    } else {
+        Add-SkippedReason ('windows-dns-failclosed-check did not exit cleanly: ' + $dnsCheckRaw);
+    }
+} else {
+    Add-SkippedReason 'DNS packet proof precheck skipped: reviewed RustyNet DNS block firewall rules were not both present/enforced';
+}
+
+if (Test-Path -LiteralPath $KillswitchProbeMarker -PathType Leaf) {
+    $baselineRaw = (& $DaemonPath windows-killswitch-assert --no-fail-on-drift 2>&1) -join [Environment]::NewLine;
+    $baselineCode = [int]$LASTEXITCODE;
+    $baselineOk = $false;
+    try {
+        $baselineJson = $baselineRaw | ConvertFrom-Json -ErrorAction Stop;
+        $baselineOk = [bool]$baselineJson.overall_ok;
+    } catch {
+        Add-SkippedReason ('killswitch precedence proof skipped: baseline JSON parse failed: ' + $_.Exception.Message);
+    }
+    if ($baselineCode -eq 0 -and $baselineOk) {
+        $tamperedRaw = '';
+        $tamperedCode = 0;
+        try {
+            Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow -ErrorAction Stop;
+            $tamperedRaw = (& $DaemonPath windows-killswitch-assert 2>&1) -join [Environment]::NewLine;
+            $tamperedCode = [int]$LASTEXITCODE;
+        } finally {
+            try {
+                Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block -ErrorAction SilentlyContinue;
+            } catch {
+            }
+            try {
+                Start-Service -Name $ServiceName -ErrorAction SilentlyContinue;
+                Start-Sleep -Seconds 8;
+            } catch {
+            }
+        }
+        if ($tamperedCode -ne 0) {
+            Write-JsonFile -Path (Join-Path -Path $ArtifactRoot -ChildPath 'killswitch_precedence.json') -Value ([pscustomobject]@{
+                schema_version = 1;
+                baseline_assert = [pscustomobject]@{
+                    overall_ok = $true;
+                };
+                tampered_assert = [pscustomobject]@{
+                    overall_ok = $false;
+                    exit_code = $tamperedCode;
+                    reason = $tamperedRaw.Trim();
+                };
+            });
+            Add-WrittenLabel 'killswitch_precedence';
+        } else {
+            Add-SkippedReason 'killswitch precedence proof skipped: tampered assertion exited zero';
+        }
+    } elseif ($baselineCode -ne 0) {
+        Add-SkippedReason ('killswitch precedence proof skipped: baseline assertion failed: ' + $baselineRaw);
+    }
+} else {
+    Add-SkippedReason ('killswitch precedence proof skipped: marker file not present at ' + $KillswitchProbeMarker);
+}
+
+[pscustomobject]@{
+    schema_version = 1;
+    artifact_root = $ArtifactRoot;
+    written_labels = $script:WrittenLabels;
+    skipped_reasons = $script:SkippedReasons;
+} | ConvertTo-Json -Depth 12
+"#;
+    Ok(template
+        .replace("__ROOT__", root.as_str())
+        .replace("__DAEMON__", daemon.as_str())
+        .replace("__MARKER__", marker.as_str()))
+}
+
+fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize, String), String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse Windows Exit evidence capture summary failed: {err}"))?;
+    if require_json_u64(&report, "schema_version")? != 1 {
+        return Err(
+            "Windows Exit evidence capture summary returned unsupported schema_version".to_string(),
+        );
+    }
+    let allowed_labels = windows_exit_evidence_artifact_specs()
+        .iter()
+        .map(|spec| spec.label)
+        .collect::<HashSet<_>>();
+    let written = require_json_array(&report, "written_labels")?;
+    for label in written {
+        let label = label
+            .as_str()
+            .ok_or_else(|| "written_labels entries must be strings".to_string())?;
+        if !allowed_labels.contains(label) {
+            return Err(format!(
+                "Windows Exit evidence capture returned unexpected label {label:?}"
+            ));
+        }
+    }
+    let skipped_count = report
+        .get("skipped_reasons")
+        .and_then(Value::as_array)
+        .map_or(0, |items| items.len());
+    Ok((
+        written.len(),
+        format!("{} skipped reason(s)", skipped_count),
+    ))
+}
+
+fn capture_windows_exit_evidence_artifacts(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String, bool), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script =
+        build_windows_exit_evidence_capture_script().map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote Windows Exit evidence capture failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_string();
+    let (written_count, skipped_summary) =
+        parse_windows_exit_evidence_capture_summary(raw_trimmed.as_str())
+            .map_err(|err| (err, raw_trimmed.clone()))?;
+    let wrote_any = written_count > 0;
+    let summary = if wrote_any {
+        format!(
+            "captured {written_count} Windows Exit evidence artifact(s) on {windows_alias} under {WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT}; {skipped_summary}"
+        )
+    } else {
+        format!(
+            "skipped: no Windows Exit evidence artifacts captured on {windows_alias}; {skipped_summary}"
+        )
+    };
+    Ok((summary, raw_trimmed, wrote_any))
 }
 
 fn pull_windows_exit_evidence_artifacts(
@@ -9667,6 +10032,7 @@ fn evaluate_windows_exit_dns_leak_artifact_dir(
     windows_alias: &str,
     artifact_dir: &Path,
 ) -> Result<String, String> {
+    windows_exit_dns_leak_artifact_set_complete(artifact_dir)?;
     let firewall_rules = fs::read_to_string(artifact_dir.join("firewall_block_rules.json"))
         .map_err(|err| format!("read firewall_block_rules.json failed: {err}"))?;
     let firewall_report: Value = serde_json::from_str(&firewall_rules)
@@ -9710,6 +10076,29 @@ fn evaluate_windows_exit_dns_leak_artifact_dir(
     Ok(format!(
         "Windows exit DNS leak proof verified on {windows_alias}: UDP/TCP egress pcaps empty and tunnel positive control passed"
     ))
+}
+
+fn windows_exit_dns_leak_artifact_set_complete(artifact_dir: &Path) -> Result<(), String> {
+    let required = [
+        "firewall_block_rules.json",
+        "udp_block_pcap.txt",
+        "tcp_block_pcap.txt",
+        "tunnel_path_resolves.json",
+        "windows_dns_failclosed_check.json",
+    ];
+    let missing = required
+        .iter()
+        .filter(|relative| !artifact_dir.join(relative).is_file())
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing required artifact(s): {}",
+            missing.join(", ")
+        ))
+    }
 }
 
 fn evaluate_windows_exit_killswitch_precedence_artifact(
@@ -27528,6 +27917,25 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         );
     }
 
+    #[test]
+    fn windows_exit_dns_leak_artifact_set_complete_rejects_partial_capture() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("firewall_block_rules.json"),
+            serde_json::json!({"schema_version": 1, "overall_ok": true, "rules": []}).to_string(),
+        )
+        .expect("write firewall rules");
+        let err = super::windows_exit_dns_leak_artifact_set_complete(temp.path())
+            .expect_err("partial DNS proof must remain skipped");
+        assert!(
+            err.contains("udp_block_pcap.txt")
+                && err.contains("tcp_block_pcap.txt")
+                && err.contains("tunnel_path_resolves.json")
+                && err.contains("windows_dns_failclosed_check.json"),
+            "unexpected error: {err}"
+        );
+    }
+
     fn reviewed_windows_exit_killswitch_precedence_artifact() -> serde_json::Value {
         serde_json::json!({
             "schema_version": 1,
@@ -28986,6 +29394,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(stage_names.contains(&"validate_windows_key_custody"));
         assert!(stage_names.contains(&"validate_windows_authenticode"));
         assert!(stage_names.contains(&"validate_windows_dns_failclosed"));
+        assert!(stage_names.contains(&"capture_windows_exit_evidence_artifacts"));
         assert!(stage_names.contains(&"pull_windows_exit_evidence_artifacts"));
         assert!(stage_names.contains(&"validate_windows_exit_nat_lifecycle"));
         assert!(stage_names.contains(&"validate_windows_exit_dns_failclosed"));
@@ -29839,6 +30248,53 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         .to_string();
         let err = super::parse_windows_exit_evidence_inventory(raw.as_str())
             .expect_err("unknown inventory labels must fail closed");
+        assert!(err.contains("unexpected label"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn build_windows_exit_evidence_capture_script_is_allowlisted_and_marker_gated() {
+        let script =
+            super::build_windows_exit_evidence_capture_script().expect("capture script builds");
+        assert!(script.contains("Set-StrictMode -Version Latest"));
+        assert!(script.contains(r"C:\ProgramData\RustyNet\vm-lab\windows_exit"));
+        assert!(script.contains("scm_context_nat_lifecycle.json"));
+        assert!(script.contains("firewall_block_rules.json"));
+        assert!(script.contains("windows_dns_failclosed_check.json"));
+        assert!(script.contains("killswitch_precedence.json"));
+        assert!(script.contains("enable_killswitch_precedence_probe"));
+        assert!(script.contains("Test-Path -LiteralPath $KillswitchProbeMarker"));
+        assert!(script.contains(
+            "Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow"
+        ));
+        assert!(script.contains(
+            "Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block"
+        ));
+        assert!(script.contains("finally"));
+        assert!(
+            !script.contains("Get-ChildItem") && !script.contains("-Recurse"),
+            "capture script must not recursively enumerate guest files: {script}"
+        );
+        assert!(
+            !script.contains("\\keys\\") && !script.contains(".priv"),
+            "capture script must not read key material paths: {script}"
+        );
+        assert!(
+            !script.contains("netsh advfirewall reset"),
+            "automated capture must avoid broad netsh reset over the active transport"
+        );
+    }
+
+    #[test]
+    fn parse_windows_exit_evidence_capture_summary_rejects_unknown_labels() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "artifact_root": "C:\\ProgramData\\RustyNet\\vm-lab\\windows_exit",
+            "written_labels": ["scm_context_nat_lifecycle", "keys_private_dump"],
+            "skipped_reasons": []
+        })
+        .to_string();
+        let err = super::parse_windows_exit_evidence_capture_summary(raw.as_str())
+            .expect_err("unknown capture labels must fail closed");
         assert!(err.contains("unexpected label"), "unexpected error: {err}");
     }
 
