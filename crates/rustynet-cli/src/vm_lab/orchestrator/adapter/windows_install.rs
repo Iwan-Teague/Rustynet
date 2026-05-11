@@ -693,6 +693,32 @@ mod tests {
     }
 
     #[test]
+    fn install_service_script_wraps_native_stderr_with_exit_code_checks() {
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("function Invoke-RustyNetNativeCommand"),
+            "install helper must wrap native commands that may write stderr on success"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("$ErrorActionPreference = 'Continue'"),
+            "native wrapper must prevent benign native stderr from becoming NativeCommandError"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("$exitCode = $LASTEXITCODE"),
+            "native wrapper must still fail closed based on native exit code"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains(
+                "Invoke-RustyNetNativeCommand -Path $daemonDest -Arguments @('key', 'store-passphrase'"
+            ),
+            "install helper must use the native wrapper for key store-passphrase"
+        );
+        assert!(
+            !INSTALL_SERVICE_SCRIPT.contains("(& $daemonDest key store-passphrase"),
+            "install helper must not run key store-passphrase through raw 2>&1 under ErrorActionPreference=Stop"
+        );
+    }
+
+    #[test]
     fn build_windows_release_script_always_requests_guest_manifest() {
         let script = build_windows_release_script(
             r"C:\Rustynet",
