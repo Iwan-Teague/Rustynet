@@ -44,6 +44,10 @@ pub const DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\dns-zone.pub";
 pub const DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\rustynetd.dns-zone.watermark";
+pub const DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\rustynetd.relay-fleet";
+pub const DEFAULT_WINDOWS_RELAY_FLEET_WATERMARK_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\rustynetd.relay-fleet.watermark";
 pub const DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH: &str =
     r"C:\ProgramData\RustyNet\keys\wireguard.key";
 pub const DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str =
@@ -750,5 +754,45 @@ mod tests {
         assert_eq!(json["schema_version"], 1);
         assert_eq!(json["overall_ok"], true);
         assert!(json["roots"].is_array());
+    }
+
+    #[test]
+    fn validate_windows_runtime_file_path_accepts_relay_fleet_bundle_path() {
+        let result = validate_windows_runtime_file_path(
+            Path::new(DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH),
+            "relay fleet bundle",
+        );
+        assert!(
+            result.is_ok(),
+            "relay fleet bundle path must validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_windows_runtime_file_path_accepts_relay_fleet_watermark_path() {
+        let result = validate_windows_runtime_file_path(
+            Path::new(DEFAULT_WINDOWS_RELAY_FLEET_WATERMARK_PATH),
+            "relay fleet watermark",
+        );
+        assert!(
+            result.is_ok(),
+            "relay fleet watermark path must validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relay_fleet_paths_live_under_trust_root() {
+        let bundle = DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH.to_ascii_lowercase();
+        let watermark = DEFAULT_WINDOWS_RELAY_FLEET_WATERMARK_PATH.to_ascii_lowercase();
+        let trust_root = DEFAULT_WINDOWS_TRUST_ROOT.to_ascii_lowercase();
+        let prefix = format!("{trust_root}\\");
+        assert!(
+            bundle.starts_with(&prefix),
+            "relay fleet bundle must be under trust root: {bundle}"
+        );
+        assert!(
+            watermark.starts_with(&prefix),
+            "relay fleet watermark must be under trust root: {watermark}"
+        );
     }
 }
