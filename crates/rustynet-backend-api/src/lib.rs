@@ -87,7 +87,16 @@ pub struct RuntimeContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackendCapabilities {
     pub supports_roaming: bool,
+    /// Legacy broad exit-node workflow flag. New code should inspect
+    /// `supports_exit_client` and `supports_exit_serving` for fail-closed role
+    /// decisions.
     pub supports_exit_nodes: bool,
+    /// This backend can consume a selected exit node by routing local default
+    /// traffic through the tunnel.
+    pub supports_exit_client: bool,
+    /// This backend can safely serve as an exit gateway when the platform
+    /// system preflight and NAT/forwarding controls also pass.
+    pub supports_exit_serving: bool,
     pub supports_lan_routes: bool,
     pub supports_ipv6: bool,
 }

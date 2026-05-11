@@ -405,6 +405,9 @@ pub trait DataplaneSystem {
         Ok(())
     }
     fn check_prerequisites(&mut self) -> Result<(), SystemError>;
+    fn preflight_exit_serving(&mut self, _mesh_cidr: &str) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn apply_peer_endpoint_bypass_routes(
         &mut self,
         _peers: &[PeerConfig],
@@ -430,6 +433,9 @@ pub trait DataplaneSystem {
     }
     fn assert_killswitch(&mut self) -> Result<(), SystemError>;
     fn assert_exit_policy(&mut self, _exit_mode: ExitMode) -> Result<(), SystemError> {
+        self.assert_killswitch()
+    }
+    fn assert_exit_serving(&mut self, _mesh_cidr: &str) -> Result<(), SystemError> {
         self.assert_killswitch()
     }
     fn block_all_egress(&mut self) -> Result<(), SystemError>;
@@ -495,6 +501,12 @@ impl DataplaneSystem for DryRunSystem {
 
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         self.step("check_prerequisites")
+    }
+
+    fn preflight_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        self.operations
+            .push(format!("preflight_exit_serving:mesh_cidr={mesh_cidr}"));
+        self.step("preflight_exit_serving")
     }
 
     fn apply_peer_endpoint_bypass_routes(
@@ -566,6 +578,12 @@ impl DataplaneSystem for DryRunSystem {
             ExitMode::FullTunnel => self.step("assert_exit_policy:full_tunnel")?,
         }
         self.assert_killswitch()
+    }
+
+    fn assert_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        self.operations
+            .push(format!("assert_exit_serving:mesh_cidr={mesh_cidr}"));
+        self.step("assert_exit_serving")
     }
 
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
@@ -2054,6 +2072,11 @@ impl DataplaneSystem for LinuxCommandSystem {
         Ok(())
     }
 
+    fn assert_exit_serving(&mut self, _mesh_cidr: &str) -> Result<(), SystemError> {
+        self.assert_killswitch()?;
+        self.assert_nat_forwarding()
+    }
+
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
         let table = self.ensure_failclosed_table()?;
         if self.has_fail_closed_drop_rule(table.as_str())? {
@@ -2837,6 +2860,7 @@ const WINDOWS_DNS_RULE_BLOCK_LAN_UDP: &str = "RustyNetDNS-BlockLanUdp";
 /// rule above; without it, an app that opted into TCP DNS could still leak.
 const WINDOWS_DNS_RULE_BLOCK_LAN_TCP: &str = "RustyNetDNS-BlockLanTcp";
 const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null }";
+const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { param($TunnelAlias, $EgressAlias) $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; if ($TunnelAlias -eq $EgressAlias) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $TunnelAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $EgressAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $EgressAlias -ErrorAction Stop | Out-Null }";
 const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
 const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
 const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
@@ -2856,8 +2880,21 @@ impl DataplaneSystem for WindowsCommandSystem {
 
     fn check_prerequisites(&mut self) -> Result<(), SystemError> {
         let _ = Self::resolve_netsh_binary()?;
-        let _ = &self.egress_interface;
+        let _ = Self::resolve_powershell_binary()?;
         Ok(())
+    }
+
+    fn preflight_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        validate_windows_nat_prefix(mesh_cidr)?;
+        self.run_powershell_success(
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING,
+            &[self.interface_name.clone(), self.egress_interface.clone()],
+        )
+        .map_err(|err| {
+            SystemError::PrerequisiteCheckFailed(format!(
+                "Windows exit-serving preflight failed: {err}"
+            ))
+        })
     }
 
     fn apply_peer_endpoint_bypass_routes(
@@ -3150,6 +3187,37 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.assert_killswitch()
     }
 
+    fn assert_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        if !self.nat_applied {
+            return Err(SystemError::KillSwitchAssertionFailed(
+                "Windows exit-serving NAT has not been applied".to_string(),
+            ));
+        }
+        let mesh_cidr = validate_windows_nat_prefix(mesh_cidr)?;
+        self.assert_killswitch()?;
+        self.run_powershell_success(
+            WINDOWS_PS_ASSERT_NAT,
+            &[self.nat_name.clone(), mesh_cidr.to_string()],
+        )
+        .map_err(|err| {
+            SystemError::KillSwitchAssertionFailed(format!(
+                "Windows NetNat verification failed for exit serving: {err}"
+            ))
+        })?;
+        for interface_alias in [&self.interface_name, &self.egress_interface] {
+            self.run_powershell_success(
+                WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
+                std::slice::from_ref(interface_alias),
+            )
+            .map_err(|err| {
+                SystemError::KillSwitchAssertionFailed(format!(
+                    "Windows IP forwarding verification failed for {interface_alias}: {err}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
         // Apply killswitch first to set the block-all default policy.
         self.apply_firewall_killswitch()?;
@@ -3215,6 +3283,15 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::Linux(system) => system.check_prerequisites(),
             RuntimeSystem::Macos(system) => system.check_prerequisites(),
             RuntimeSystem::Windows(system) => system.check_prerequisites(),
+        }
+    }
+
+    fn preflight_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.preflight_exit_serving(mesh_cidr),
+            RuntimeSystem::Linux(system) => system.preflight_exit_serving(mesh_cidr),
+            RuntimeSystem::Macos(system) => system.preflight_exit_serving(mesh_cidr),
+            RuntimeSystem::Windows(system) => system.preflight_exit_serving(mesh_cidr),
         }
     }
 
@@ -3351,6 +3428,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn assert_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.assert_exit_serving(mesh_cidr),
+            RuntimeSystem::Linux(system) => system.assert_exit_serving(mesh_cidr),
+            RuntimeSystem::Macos(system) => system.assert_exit_serving(mesh_cidr),
+            RuntimeSystem::Windows(system) => system.assert_exit_serving(mesh_cidr),
+        }
+    }
+
     fn block_all_egress(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.block_all_egress(),
@@ -3403,6 +3489,7 @@ pub struct Phase10Controller<B: TunnelBackend, S: DataplaneSystem> {
     active_stages: Vec<StageMarker>,
     current_routes: Vec<Route>,
     current_exit_mode: ExitMode,
+    current_serve_exit_node: bool,
     /// How long a Direct candidate must be continuously observed before committing (ms).
     pub direct_stability_window_ms: u64,
     /// How long a Relay candidate must be continuously observed before committing (ms).
@@ -3435,6 +3522,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             active_stages: Vec::new(),
             current_routes: Vec::new(),
             current_exit_mode: ExitMode::Off,
+            current_serve_exit_node: false,
             direct_stability_window_ms: 3_000,
             relay_stability_window_ms: 5_000,
             membership: MembershipDirectory::default(),
@@ -3470,6 +3558,10 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.current_exit_mode
     }
 
+    pub fn serving_exit_node_active(&self) -> bool {
+        self.current_serve_exit_node
+    }
+
     pub fn lan_access_enabled(&self) -> bool {
         self.lan_access_enabled
     }
@@ -3491,6 +3583,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     ) -> Result<(), Phase10Error> {
         validate_trust(&self.trust_policy, evidence)?;
         let target_generation = self.generation.saturating_add(1);
+        let mesh_cidr = context.mesh_cidr.clone();
         self.system.set_generation(target_generation);
 
         if self.state == DataplaneState::Init {
@@ -3508,13 +3601,11 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             ));
         }
 
-        self.system.prune_owned_tables()?;
-        if let Err(err) = self.rollback_obsolete_controls(options) {
-            self.force_fail_closed("obsolete_control_rollback_failed")?;
+        if let Err(err) = self.validate_backend_exit_capabilities(options) {
+            self.force_fail_closed("backend_exit_capability_rejected")?;
             return Err(err);
         }
 
-        let mesh_cidr = context.mesh_cidr.clone();
         let mut applied_stages = Vec::new();
         match self.backend.start(context) {
             Ok(()) => applied_stages.push(StageMarker::BackendStarted),
@@ -3523,6 +3614,40 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 self.force_fail_closed("backend_start_failed")?;
                 return Err(err.into());
             }
+        }
+
+        if options.serve_exit_node
+            && let Err(err) = self.system.preflight_exit_serving(mesh_cidr.as_str())
+        {
+            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let fail_closed_result = self.force_fail_closed("exit_serving_preflight_failed");
+            if let Err(rollback_err) = rollback_result {
+                let _ = fail_closed_result;
+                return Err(rollback_err);
+            }
+            fail_closed_result?;
+            return Err(err.into());
+        }
+
+        if let Err(err) = self.system.prune_owned_tables() {
+            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let fail_closed_result = self.force_fail_closed("owned_table_prune_failed");
+            if let Err(rollback_err) = rollback_result {
+                let _ = fail_closed_result;
+                return Err(rollback_err);
+            }
+            fail_closed_result?;
+            return Err(err.into());
+        }
+        if let Err(err) = self.rollback_obsolete_controls(options) {
+            let rollback_result = self.rollback_generation_best_effort(applied_stages);
+            let fail_closed_result = self.force_fail_closed("obsolete_control_rollback_failed");
+            if let Err(rollback_err) = rollback_result {
+                let _ = fail_closed_result;
+                return Err(rollback_err);
+            }
+            fail_closed_result?;
+            return Err(err);
         }
 
         let result = self.apply_generation_stages(
@@ -3534,6 +3659,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         );
 
         if let Err(err) = result {
+            self.current_serve_exit_node = false;
             let rollback_result = self.rollback_generation_best_effort(applied_stages);
             let fail_closed_result = self.force_fail_closed("apply_failed");
             if let Err(rollback_err) = rollback_result {
@@ -3547,6 +3673,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.active_stages = applied_stages;
         self.generation = self.generation.saturating_add(1);
         self.last_safe_generation = self.generation;
+        self.current_serve_exit_node = options.serve_exit_node;
 
         if options.exit_mode == ExitMode::FullTunnel || options.serve_exit_node {
             self.transition_to(
@@ -3557,6 +3684,32 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             self.transition_to(DataplaneState::DataplaneApplied, "dataplane_apply_commit");
         }
 
+        Ok(())
+    }
+
+    fn validate_backend_exit_capabilities(
+        &self,
+        options: ApplyOptions,
+    ) -> Result<(), Phase10Error> {
+        let capabilities = self.backend.capabilities();
+        if matches!(options.exit_mode, ExitMode::FullTunnel)
+            && !(capabilities.supports_exit_nodes && capabilities.supports_exit_client)
+        {
+            return Err(BackendError::invalid_input(format!(
+                "backend {} does not support consuming an exit node",
+                self.backend.name()
+            ))
+            .into());
+        }
+        if options.serve_exit_node
+            && !(capabilities.supports_exit_nodes && capabilities.supports_exit_serving)
+        {
+            return Err(BackendError::invalid_input(format!(
+                "backend {} does not support serving as an exit node",
+                self.backend.name()
+            ))
+            .into());
+        }
         Ok(())
     }
 
@@ -3625,6 +3778,9 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         applied_stages.push(StageMarker::ExitModeApplied);
 
         self.system.assert_exit_policy(options.exit_mode)?;
+        if options.serve_exit_node {
+            self.system.assert_exit_serving(mesh_cidr)?;
+        }
         self.current_exit_mode = options.exit_mode;
 
         Ok(())
@@ -3667,6 +3823,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                         rollback_errors.push(format!("set exit mode off: {err}"));
                     }
                     self.current_exit_mode = ExitMode::Off;
+                    self.current_serve_exit_node = false;
                 }
                 StageMarker::Ipv6Blocked => {
                     if let Err(err) = self.system.rollback_ipv6_egress() {
@@ -3734,6 +3891,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     }
 
     pub fn force_fail_closed(&mut self, reason: &str) -> Result<(), Phase10Error> {
+        self.current_serve_exit_node = false;
         self.system.block_all_egress()?;
         self.current_exit_mode = ExitMode::Off;
         self.transition_to(DataplaneState::FailClosed, reason);
@@ -4287,6 +4445,11 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         &mut self.backend
     }
 
+    #[cfg(test)]
+    pub fn system_mut_for_test(&mut self) -> &mut S {
+        &mut self.system
+    }
+
     pub fn shutdown(&mut self) -> Result<(), Phase10Error> {
         let active_stages = std::mem::take(&mut self.active_stages);
         let rollback_stopped_backend = active_stages.contains(&StageMarker::BackendStarted);
@@ -4301,6 +4464,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.managed_peers.clear();
         self.current_routes.clear();
         self.current_exit_mode = ExitMode::Off;
+        self.current_serve_exit_node = false;
         if let Err(err) = rollback_result {
             self.transition_to(DataplaneState::FailClosed, "shutdown_cleanup_failed");
             return Err(err);
@@ -5332,6 +5496,8 @@ mod tests {
         probe_trigger_count_by_node: BTreeMap<NodeId, usize>,
         routes: Vec<Route>,
         exit_mode: ExitMode,
+        supports_exit_client: bool,
+        supports_exit_serving: bool,
     }
 
     impl Default for RecordingBackend {
@@ -5344,6 +5510,8 @@ mod tests {
                 probe_trigger_count_by_node: BTreeMap::new(),
                 routes: Vec::new(),
                 exit_mode: ExitMode::Off,
+                supports_exit_client: true,
+                supports_exit_serving: true,
             }
         }
     }
@@ -5388,6 +5556,8 @@ mod tests {
             BackendCapabilities {
                 supports_roaming: true,
                 supports_exit_nodes: true,
+                supports_exit_client: self.supports_exit_client,
+                supports_exit_serving: self.supports_exit_serving,
                 supports_lan_routes: true,
                 supports_ipv6: true,
             }
@@ -5528,6 +5698,8 @@ mod tests {
             BackendCapabilities {
                 supports_roaming: true,
                 supports_exit_nodes: true,
+                supports_exit_client: true,
+                supports_exit_serving: true,
                 supports_lan_routes: true,
                 supports_ipv6: true,
             }
@@ -6038,6 +6210,153 @@ mod tests {
     }
 
     #[test]
+    fn full_tunnel_apply_rejects_backend_without_exit_client_capability() {
+        let policy = allow_shared_exit_policy();
+        let backend = RecordingBackend {
+            supports_exit_client: false,
+            ..RecordingBackend::default()
+        };
+        let mut controller = Phase10Controller::new(
+            backend,
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let err = controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("exit-client apply must reject unsupported backend");
+
+        assert!(matches!(err, Phase10Error::Backend(_)));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "prune_owned_tables"),
+            "capability rejection must happen before OS mutation"
+        );
+    }
+
+    #[test]
+    fn exit_serving_apply_rejects_backend_without_exit_serving_capability() {
+        let policy = allow_shared_exit_policy();
+        let backend = RecordingBackend {
+            supports_exit_serving: false,
+            ..RecordingBackend::default()
+        };
+        let mut controller = Phase10Controller::new(
+            backend,
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let err = controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("exit-serving apply must reject unsupported backend");
+
+        assert!(matches!(err, Phase10Error::Backend(_)));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op.starts_with("preflight_exit_serving")),
+            "backend capability rejection must happen before system exit preflight"
+        );
+        assert!(
+            !controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op == "prune_owned_tables"),
+            "capability rejection must happen before OS mutation"
+        );
+    }
+
+    #[test]
+    fn exit_serving_apply_runs_preflight_before_owned_os_mutation() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+
+        let preflight_index = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "preflight_exit_serving")
+            .expect("exit-serving apply must run explicit preflight");
+        let prune_index = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "prune_owned_tables")
+            .expect("apply should prune owned tables after preflight");
+        let nat_index = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "apply_nat_forwarding")
+            .expect("exit-serving apply should eventually apply NAT");
+
+        assert!(
+            preflight_index < prune_index && prune_index < nat_index,
+            "preflight must happen before owned OS mutation and NAT apply; ops={:?}",
+            controller.system.operations
+        );
+    }
+
+    #[test]
     fn apply_generation_flushes_routes_before_endpoint_bypass_rebuild() {
         let policy = allow_shared_exit_policy();
         let mut controller = Phase10Controller::new(
@@ -6471,6 +6790,54 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            !controller.serving_exit_node_active(),
+            "exit serving must not be reported active when NAT/forwarding failed"
+        );
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
+        assert_eq!(controller.last_safe_generation(), 0);
+    }
+
+    #[test]
+    fn apply_exit_serving_requires_post_apply_assertion_before_active() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default().fail_on("assert_exit_serving"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let result = controller.apply_dataplane_generation(
+            trust_ok(),
+            test_runtime_context(),
+            vec![sample_peer("node-b")],
+            vec![Route {
+                destination_cidr: "100.100.20.0/24".to_string(),
+                via_node: NodeId::new("node-b").expect("node should parse"),
+                kind: RouteKind::Mesh,
+            }],
+            ApplyOptions {
+                serve_exit_node: true,
+                ..ApplyOptions::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert!(
+            !controller.serving_exit_node_active(),
+            "exit serving must not become active until post-apply assertions pass"
+        );
+        assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        assert!(
+            controller
+                .system
+                .operations
+                .iter()
+                .any(|op| op.starts_with("assert_exit_serving:mesh_cidr=")),
+            "exit-serving apply must prove NAT/forwarding before committing active state"
+        );
     }
 
     #[test]
@@ -6540,6 +6907,41 @@ mod tests {
     }
 
     #[test]
+    fn windows_exit_serving_preflight_checks_identity_interfaces_nat_and_egress() {
+        // The exit-serving preflight is intentionally broader than the NAT apply
+        // helper: it proves the process is elevated, the NAT/forwarding cmdlets exist,
+        // both reviewed interface aliases resolve as IPv4 interfaces, and the chosen
+        // egress alias actually owns an IPv4 default route before Rustynet mutates
+        // forwarding/NAT/firewall state.
+        for required in [
+            "WindowsPrincipal",
+            "Administrator",
+            "Get-Command $cmd",
+            "Set-NetIPInterface",
+            "Get-NetIPInterface",
+            "New-NetNat",
+            "Get-NetNat",
+            "Remove-NetNat",
+            "Get-NetRoute",
+            "DestinationPrefix '0.0.0.0/0'",
+            "$TunnelAlias -eq $EgressAlias",
+        ] {
+            assert!(
+                WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains(required),
+                "Windows exit-serving preflight must include {required}"
+            );
+        }
+        assert!(
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("param($TunnelAlias, $EgressAlias)"),
+            "preflight must bind interface aliases as PowerShell parameters"
+        );
+        assert!(
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$ErrorActionPreference = 'Stop'"),
+            "preflight must fail closed on PowerShell errors"
+        );
+    }
+
+    #[test]
     fn windows_exit_powershell_scripts_use_stop_error_action_and_param_binding() {
         // Every PowerShell helper that touches NAT / forwarding state must:
         //  - run with `$ErrorActionPreference = 'Stop'` so failures propagate (no silent skip);
@@ -6547,6 +6949,10 @@ mod tests {
         //  - explicitly use `-ErrorAction Stop` on cmdlets so missing/incorrect
         //    state does not silently no-op.
         for (label, script) in [
+            (
+                "WINDOWS_PS_PREFLIGHT_EXIT_SERVING",
+                WINDOWS_PS_PREFLIGHT_EXIT_SERVING,
+            ),
             ("WINDOWS_PS_GET_FORWARDING", WINDOWS_PS_GET_FORWARDING),
             ("WINDOWS_PS_SET_FORWARDING", WINDOWS_PS_SET_FORWARDING),
             ("WINDOWS_PS_REMOVE_NAT", WINDOWS_PS_REMOVE_NAT),
@@ -6609,6 +7015,11 @@ mod tests {
             (
                 "WINDOWS_PS_GET_FORWARDING",
                 WINDOWS_PS_GET_FORWARDING,
+                "Ethernet",
+            ),
+            (
+                "WINDOWS_PS_PREFLIGHT_EXIT_SERVING",
+                WINDOWS_PS_PREFLIGHT_EXIT_SERVING,
                 "Ethernet",
             ),
             (
@@ -6764,6 +7175,21 @@ mod tests {
             .expect_err("assert_killswitch must reject when firewall_applied=false (fast path)");
         assert!(matches!(err, SystemError::KillSwitchAssertionFailed(_)));
         assert!(err.to_string().contains("not applied"));
+    }
+
+    #[test]
+    fn windows_command_system_assert_exit_serving_rejects_unapplied_nat_fast_path() {
+        let mut system = WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("windows command system should initialize");
+
+        let err = DataplaneSystem::assert_exit_serving(&mut system, "100.64.0.0/10")
+            .expect_err("exit-serving assertion must reject before NAT is applied");
+        assert!(matches!(err, SystemError::KillSwitchAssertionFailed(_)));
+        assert!(err.to_string().contains("NAT has not been applied"));
     }
 
     #[test]
