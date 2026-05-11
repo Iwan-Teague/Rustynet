@@ -6416,9 +6416,9 @@ fn execute_rust_native_orchestration(
             .to_string();
 
         let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
-        if !assignment.role.is_supported_for_platform(&platform) {
+        if !assignment.role.is_lab_assignable_for_platform(&platform) {
             return Err(format!(
-                "role '{}' is not supported on platform {platform:?}; W5.4 Windows/macOS Exit remains fail-closed until live evidence is recorded",
+                "role '{}' is not lab-assignable on platform {platform:?}; Windows Exit is lab-assignable for evidence generation only, but unsupported platforms remain fail-closed",
                 assignment.role
             ));
         }

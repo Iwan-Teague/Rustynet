@@ -48,6 +48,18 @@ impl NodeRole {
         }
     }
 
+    /// Role-platform matrix for lab evidence generation. This is intentionally
+    /// wider than `is_supported_for_platform`: Windows Exit must be assignable
+    /// so the lab can produce the evidence required before posture promotion.
+    /// Product support remains conservative until those artifacts pass.
+    pub fn is_lab_assignable_for_platform(&self, platform: &VmGuestPlatform) -> bool {
+        match platform {
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
+            VmGuestPlatform::Linux | VmGuestPlatform::Windows => true,
+            VmGuestPlatform::Macos => !self.is_membership_owner(),
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             NodeRole::Exit => "exit",
@@ -188,5 +200,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn is_lab_assignable_for_platform_allows_windows_exit_evidence_without_support_promotion() {
+        assert!(
+            !NodeRole::Exit.is_supported_for_platform(&VmGuestPlatform::Windows),
+            "Windows Exit must remain unsupported until live evidence promotes posture"
+        );
+        assert!(
+            NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Windows),
+            "Windows Exit must be lab-assignable so live evidence can be generated"
+        );
+        assert!(
+            !NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Macos),
+            "macOS Exit remains blocked until a separate exit-node plan exists"
+        );
     }
 }
