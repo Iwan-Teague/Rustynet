@@ -47,6 +47,12 @@ static UNINSTALL_SERVICE_SCRIPT: &str = include_str!(
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(3600); // cold release build on Windows VM can take 30-60 min
+const WINDOWS_SERVICE_STOP_POLL_SECS: u64 = 30;
+const WINDOWS_SERVICE_START_POLL_ATTEMPTS: u64 = 60;
+const WINDOWS_SERVICE_START_POLL_INTERVAL_SECS: u64 = 2;
+const WINDOWS_SERVICE_START_PROBE_MAX_SECS: u64 = WINDOWS_SERVICE_STOP_POLL_SECS
+    + (WINDOWS_SERVICE_START_POLL_ATTEMPTS * WINDOWS_SERVICE_START_POLL_INTERVAL_SECS);
+const WINDOWS_E2E_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(300);
 const WINDOWS_BUILD_RELEASE_REPORT_PATH: &str =
     r"C:\Windows\Temp\rustynet-stage\build-release\manifest.json";
 
@@ -323,7 +329,7 @@ fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, Ad
     Ok(format!(
         "$stopOut = (& sc.exe stop {svc_q} 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) {{ Write-Warning ('sc.exe stop returned ' + $LASTEXITCODE + ': ' + $stopOut) }}; \
-         for ($i = 0; $i -lt 30; $i++) {{ \
+         for ($i = 0; $i -lt {stop_poll_secs}; $i++) {{ \
              $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
              if ($null -eq $svc -or $svc.Status -ne 'StopPending') {{ break }}; \
              Start-Sleep -Seconds 1 \
@@ -331,16 +337,20 @@ fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, Ad
          $startOut = (& sc.exe start {svc_q} 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1056) {{ throw ('sc.exe start failed (exit ' + $LASTEXITCODE + '): ' + $startOut) }}; \
          $svcStatus = $null; \
-         for ($i = 0; $i -lt 60; $i++) {{ \
+         for ($i = 0; $i -lt {start_attempts}; $i++) {{ \
              $svc = Get-Service -Name {svc_q} -ErrorAction Stop; \
              $svcStatus = $svc.Status; \
              if ($svcStatus -eq 'Running') {{ break }}; \
-             Start-Sleep -Seconds 2 \
+             Start-Sleep -Seconds {start_interval_secs} \
          }}; \
          if ($svcStatus -ne 'Running') {{ \
              $scQuery = (& sc.exe queryex {svc_q} 2>&1) -join ' | '; \
-             throw \"Service failed to reach Running after 120s (status=$svcStatus sc=[$scQuery])\" \
+             throw \"Service failed to reach Running after {start_probe_secs}s (status=$svcStatus sc=[$scQuery])\" \
          }}",
+        stop_poll_secs = WINDOWS_SERVICE_STOP_POLL_SECS,
+        start_attempts = WINDOWS_SERVICE_START_POLL_ATTEMPTS,
+        start_interval_secs = WINDOWS_SERVICE_START_POLL_INTERVAL_SECS,
+        start_probe_secs = WINDOWS_SERVICE_START_PROBE_MAX_SECS,
     ))
 }
 
@@ -456,7 +466,7 @@ fn run_windows_e2e_bootstrap(
          if ($LASTEXITCODE -ne 0) {{ throw \"runtime ACL check failed (startup would fail): $aclOut\" }}; \
          {service_probe}",
     );
-    run_remote_ps(conn, &bootstrap_script, Duration::from_secs(120))?;
+    run_remote_ps(conn, &bootstrap_script, WINDOWS_E2E_BOOTSTRAP_TIMEOUT)?;
     Ok(())
 }
 
@@ -720,6 +730,14 @@ mod tests {
         assert!(
             !script.contains("Start-Service"),
             "service smoke path must not block on Start-Service"
+        );
+    }
+
+    #[test]
+    fn windows_e2e_bootstrap_timeout_covers_service_probe_budget() {
+        assert!(
+            WINDOWS_E2E_BOOTSTRAP_TIMEOUT.as_secs() > WINDOWS_SERVICE_START_PROBE_MAX_SECS + 60,
+            "bootstrap timeout must leave budget for key init, ACL checks, and SCM service probe"
         );
     }
 }
