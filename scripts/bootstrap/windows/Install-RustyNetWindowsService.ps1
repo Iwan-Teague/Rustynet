@@ -3,6 +3,7 @@ param(
     [string]$InstallRoot = 'C:\Program Files\RustyNet',
     [string]$StateRoot = 'C:\ProgramData\RustyNet',
     [string]$ServiceName = 'RustyNet',
+    [string]$NodeId = 'windows-client-1',
     [string]$OutputPath = '',
     # Operator override: pin the daemon to the explicit fail-closed
     # `windows-unsupported` backend even when WireGuard for Windows
@@ -48,6 +49,19 @@ function Test-RustyNetServiceName {
     }
 }
 
+function Test-RustyNetNodeId {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ([string]::IsNullOrEmpty($Name)) {
+        throw 'node id must not be empty'
+    }
+    if ($Name.Length -gt 128) {
+        throw ('node id exceeds 128 chars: {0} chars' -f $Name.Length)
+    }
+    if ($Name -notmatch '^[A-Za-z0-9_.-]+$') {
+        throw ('node id must be ASCII alphanumeric + `_` + `.` + `-`; rejected: {0}' -f $Name)
+    }
+}
+
 function Test-RustyNetReviewedInstallRoot {
     param([Parameter(Mandatory = $true)][string]$Path)
     $expected = 'C:\Program Files\RustyNet'
@@ -68,6 +82,7 @@ function Test-RustyNetReviewedStateRoot {
 # parameter fails loudly with the precise reason rather than collapsing
 # to a generic 'install-init-exception'.
 Test-RustyNetServiceName -Name $ServiceName
+Test-RustyNetNodeId -Name $NodeId
 Test-RustyNetReviewedInstallRoot -Path $InstallRoot
 Test-RustyNetReviewedStateRoot -Path $StateRoot
 
@@ -420,7 +435,10 @@ function Resolve-ReviewedBackendLabel {
 }
 
 function Build-ReviewedDaemonArgsJson {
-    param([Parameter(Mandatory = $true)][string]$BackendLabel)
+    param(
+        [Parameter(Mandatory = $true)][string]$BackendLabel,
+        [Parameter(Mandatory = $true)][string]$NodeId
+    )
     if ($BackendLabel -ne 'windows-unsupported' -and
         $BackendLabel -ne 'windows-wireguard-nt') {
         # Defense-in-depth: the only two labels the daemon's
@@ -469,7 +487,7 @@ function Build-ReviewedDaemonArgsJson {
         '--auto-tunnel-enforce', 'false',
         '--trust-max-age-secs', '86400',
         '--traversal-max-age-secs', '86400',
-        '--node-id', 'windows-client-1'
+        '--node-id', $NodeId
     ) | ConvertTo-Json -Compress)
 }
 # (--trust-max-age-secs and --traversal-max-age-secs are parsed by
@@ -488,7 +506,7 @@ function Write-ReviewedEnvFile {
     }
     @(
         $banner
-        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel))
+        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel -NodeId $NodeId))
     ) | Out-File -Encoding ascii $Path
 }
 

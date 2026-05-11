@@ -194,20 +194,13 @@ pub fn install_daemon(
     run_remote_ps(conn, &build_script, BUILD_TIMEOUT)?;
 
     // Install the service.
-    let install_script = format!(
-        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
-         $ProgressPreference = 'SilentlyContinue'; \
-         & {install_q} \
-           -RustyNetRoot {workdir_q} \
-           -InstallRoot {install_root_q} \
-           -StateRoot {state_root_q} \
-           -ServiceName {svc_q}",
-        install_q = ps_quote(&remote_install_svc)?,
-        workdir_q = ps_quote(workdir)?,
-        install_root_q = ps_quote(WINDOWS_INSTALL_ROOT)?,
-        state_root_q = ps_quote(WINDOWS_STATE_ROOT)?,
-        svc_q = ps_quote(WINDOWS_SERVICE_NAME)?,
-    );
+    let node_id = windows_lab_node_id(alias, ctx);
+    let install_script = build_windows_service_install_script(
+        workdir,
+        &remote_install_svc,
+        WINDOWS_SERVICE_NAME,
+        &node_id,
+    )?;
     run_remote_ps(conn, &install_script, Duration::from_secs(120))?;
 
     // Verify the daemon binary is present before running e2e bootstrap.
@@ -301,6 +294,30 @@ fn build_windows_release_script(
     ))
 }
 
+fn build_windows_service_install_script(
+    workdir: &str,
+    remote_install_svc: &str,
+    service_name: &str,
+    node_id: &str,
+) -> Result<String, AdapterError> {
+    Ok(format!(
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         & {install_q} \
+           -RustyNetRoot {workdir_q} \
+           -InstallRoot {install_root_q} \
+           -StateRoot {state_root_q} \
+           -ServiceName {svc_q} \
+           -NodeId {node_id_q}",
+        install_q = ps_quote(remote_install_svc)?,
+        workdir_q = ps_quote(workdir)?,
+        install_root_q = ps_quote(WINDOWS_INSTALL_ROOT)?,
+        state_root_q = ps_quote(WINDOWS_STATE_ROOT)?,
+        svc_q = ps_quote(service_name)?,
+        node_id_q = ps_quote(node_id)?,
+    ))
+}
+
 fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, AdapterError> {
     let svc_q = ps_quote(service_name)?;
     Ok(format!(
@@ -329,6 +346,13 @@ fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, Ad
 
 // ── Windows e2e bootstrap ─────────────────────────────────────────────────────
 
+fn windows_lab_node_id(alias: &str, ctx: &OrchestrationContext) -> String {
+    ctx.node_ids
+        .get(alias)
+        .cloned()
+        .unwrap_or_else(|| format!("{alias}-bootstrap"))
+}
+
 /// Generate WireGuard keys, membership state, and trust evidence for a Windows host.
 /// Trust keys are generated locally on the orchestrator (rustynet-cli cannot compile
 /// on Windows due to std::os::unix::* imports) and SCP'd to the remote host.
@@ -338,11 +362,7 @@ fn run_windows_e2e_bootstrap(
     alias: &str,
     ctx: &OrchestrationContext,
 ) -> Result<(), AdapterError> {
-    let node_id = ctx
-        .node_ids
-        .get(alias)
-        .cloned()
-        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+    let node_id = windows_lab_node_id(alias, ctx);
     let network_id = &ctx.network_id;
     let role_str = match ctx
         .assignments
@@ -642,6 +662,28 @@ mod tests {
         assert!(
             !script.contains("-AllowInteractiveTaskFallback"),
             "Rust-native live lab must not silently fall back to interactive scheduled-task builds"
+        );
+    }
+
+    #[test]
+    fn build_windows_service_install_script_threads_lab_node_id() {
+        let script = build_windows_service_install_script(
+            r"C:\Rustynet",
+            r"C:\Windows\Temp\rustynet-stage\Install-RustyNetWindowsService.ps1",
+            "RustyNet",
+            "windows-utm-1",
+        )
+        .expect("install script should render");
+
+        assert!(script.contains("-ServiceName 'RustyNet'"));
+        assert!(script.contains("-NodeId 'windows-utm-1'"));
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("[string]$NodeId"),
+            "Windows install helper must accept the node id passed by the orchestrator"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("'--node-id', $NodeId"),
+            "Windows install helper must not hardcode a stale service node id"
         );
     }
 
