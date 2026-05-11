@@ -305,14 +305,14 @@ fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, Ad
     let svc_q = ps_quote(service_name)?;
     Ok(format!(
         "$stopOut = (& sc.exe stop {svc_q} 2>&1) -join ' '; \
-         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) {{ Write-Warning \"sc.exe stop returned $LASTEXITCODE: $stopOut\" }}; \
+         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) {{ Write-Warning ('sc.exe stop returned ' + $LASTEXITCODE + ': ' + $stopOut) }}; \
          for ($i = 0; $i -lt 30; $i++) {{ \
              $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
              if ($null -eq $svc -or $svc.Status -ne 'StopPending') {{ break }}; \
              Start-Sleep -Seconds 1 \
          }}; \
          $startOut = (& sc.exe start {svc_q} 2>&1) -join ' '; \
-         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1056) {{ throw \"sc.exe start failed (exit $LASTEXITCODE): $startOut\" }}; \
+         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1056) {{ throw ('sc.exe start failed (exit ' + $LASTEXITCODE + '): ' + $startOut) }}; \
          $svcStatus = $null; \
          for ($i = 0; $i -lt 60; $i++) {{ \
              $svc = Get-Service -Name {svc_q} -ErrorAction Stop; \
@@ -655,6 +655,14 @@ mod tests {
         assert!(script.contains("sc.exe queryex 'RustyNet'"));
         assert!(script.contains("$i -lt 60"));
         assert!(script.contains("$svcStatus -eq 'Running'"));
+        assert!(
+            !script.contains("$stopOut:"),
+            "PowerShell parses $stopOut: as an invalid scoped variable"
+        );
+        assert!(
+            !script.contains("$startOut:"),
+            "PowerShell parses $startOut: as an invalid scoped variable"
+        );
         assert!(
             !script.contains("Get-EventLog"),
             "service smoke path must not block on slow EventLog queries"
