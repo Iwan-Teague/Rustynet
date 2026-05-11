@@ -1033,8 +1033,9 @@ landed, where the artifact lives.
 | `32fa4fa` | Windows Exit remote evidence capture stage writes reviewed vm-lab proof files | Code only |
 | `f43ef30` | Fix relay fleet default paths (trust/ root) + SSH keepalive; service was crash-looping on startup due to path validation rejection | Code + live lab: service now runs stably (verified RUNNING 30 s+) |
 | `0574a4d` | Fix SSH double-encoding in exit evidence capture/inventory; ~60K-char double-encoded cmd exceeded Windows 32,767-char CreateProcess limit → SSH exit 255; now passes raw script, single-encoded ~22,700 chars | Code + live lab: capture stage now executes (status=skipped, not fail); script ran and returned JSON; all three probes skipped — no active exit traffic on client-only host |
+| `0d321ad` | Rust-native Windows build-release now passes `-ResultPath` so SYSTEM-context topology runs activate the guest manifest and fail-fast toolchain guard instead of silently falling into interactive bootstrap paths | Code + live-lab blocker proof: first 2-node Windows-exit attempt reached Windows build-release and hung before this fix; rerun pending |
 
-§A.1 (live SCM-context NAT lifecycle) — TBD (requires active mesh client + Windows exit-node with NAT)
+§A.1 (live SCM-context NAT lifecycle) — TBD (requires active mesh client + Windows exit-node with NAT; first 2-node attempt exposed missing Windows build-release `-ResultPath`, fixed in `0d321ad`; rerun pending)
 §A.2 (live DNS leak proof) — TBD (DNS block firewall rules not yet configured; requires daemon in exit-node mode)
 §A.3 (live killswitch precedence) — TBD (killswitch probe marker not created; requires exit-node mode)
 §A.4 (windows-killswitch-assert subcommand) — `dc614ce` code-only CLI/test coverage; live §A.3 proof still blocked on Windows lab access
