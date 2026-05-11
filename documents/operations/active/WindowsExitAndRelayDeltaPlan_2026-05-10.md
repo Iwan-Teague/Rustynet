@@ -1026,6 +1026,7 @@ landed, where the artifact lives.
 | `8d5de44` | Auto-tunnel sig-tamper reload + dormant daemon security tests restored | Code only |
 | `dc614ce` | windows-killswitch-assert CLI help + fail-closed regression tests | Code only |
 | `9394053` | Windows DPAPI self-test cached at startup instead of live-passphrase roundtrip on every key load | Code only |
+| `38525a1` | Privileged-helper request decoder adversarial-byte no-panic regression | Code only |
 
 §A.1 (live SCM-context NAT lifecycle) — TBD
 §A.2 (live DNS leak proof) — TBD
