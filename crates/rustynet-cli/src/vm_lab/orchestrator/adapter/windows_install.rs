@@ -395,6 +395,33 @@ fn windows_bootstrap_native_helper_fragment() -> String {
     .to_string()
 }
 
+fn windows_daemon_status_readiness_fragment(service_name: &str) -> Result<String, AdapterError> {
+    let svc_q = ps_quote(service_name)?;
+    let rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?;
+    let pipe_q = ps_quote(r"\\.\pipe\rustynet-rustynetd")?;
+    Ok(format!(
+        "$statusReady = $false; \
+         $lastStatusOutput = ''; \
+         $env:RUSTYNET_DAEMON_SOCKET = {pipe_q}; \
+         for ($i = 0; $i -lt 30; $i++) {{ \
+             $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
+             if ($null -ne $svc -and $svc.Status -eq 'Running') {{ \
+                 $statusProbe = Invoke-RustyNetBootstrapNative {{ & {rustynet_q} status }}; \
+                 $lastStatusOutput = $statusProbe.Output; \
+                 if ($statusProbe.ExitCode -eq 0 -and $statusProbe.Output -match '(^|\\s)node_id=') {{ \
+                     $statusReady = $true; \
+                     break \
+                 }} \
+             }}; \
+             Start-Sleep -Seconds 2 \
+         }}; \
+         if (-not $statusReady) {{ \
+             $scQuery = (& sc.exe queryex {svc_q} 2>&1) -join ' | '; \
+             throw ('RustyNet daemon status did not become ready after 60s; sc=[' + $scQuery + '] status=[' + $lastStatusOutput + ']') \
+         }}",
+    ))
+}
+
 // ── Windows e2e bootstrap ─────────────────────────────────────────────────────
 
 fn windows_lab_node_id(alias: &str, ctx: &OrchestrationContext) -> String {
@@ -471,6 +498,7 @@ fn run_windows_e2e_bootstrap(
     let membership_watermark_q = ps_quote(WINDOWS_MEMBERSHIP_WATERMARK_PATH)?;
     let membership_snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?;
     let service_probe = windows_service_start_probe_fragment(WINDOWS_SERVICE_NAME)?;
+    let daemon_status_probe = windows_daemon_status_readiness_fragment(WINDOWS_SERVICE_NAME)?;
     let bootstrap_acl_repair = windows_bootstrap_acl_repair_fragment()?;
     let native_helper = windows_bootstrap_native_helper_fragment();
 
@@ -502,7 +530,8 @@ fn run_windows_e2e_bootstrap(
          if ($ksp.ExitCode -ne 0) {{ throw ('rustynetd key store-passphrase failed: ' + $ksp.Output) }}; \
          $acl = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} windows-runtime-acls-check }}; \
          if ($acl.ExitCode -ne 0) {{ throw ('runtime ACL check failed (startup would fail): ' + $acl.Output) }}; \
-         {service_probe}",
+         {service_probe}; \
+         {daemon_status_probe}",
     );
     run_remote_ps(conn, &bootstrap_script, WINDOWS_E2E_BOOTSTRAP_TIMEOUT)?;
     Ok(())
@@ -868,6 +897,27 @@ mod tests {
         assert!(
             script.contains("finally"),
             "helper must restore the prior ErrorActionPreference"
+        );
+    }
+
+    #[test]
+    fn windows_daemon_status_readiness_requires_node_id_before_bootstrap_passes() {
+        let script = windows_daemon_status_readiness_fragment("RustyNet")
+            .expect("daemon readiness fragment should render");
+
+        assert!(script.contains("RUSTYNET_DAEMON_SOCKET"));
+        assert!(script.contains("rustynet.exe"));
+        assert!(
+            script.contains("node_id="),
+            "bootstrap readiness must require rustynet status node_id proof"
+        );
+        assert!(
+            script.contains("Invoke-RustyNetBootstrapNative"),
+            "status readiness must use the native wrapper"
+        );
+        assert!(
+            script.contains("sc.exe queryex 'RustyNet'"),
+            "readiness failure must include SCM state"
         );
     }
 
