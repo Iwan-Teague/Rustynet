@@ -91,6 +91,7 @@ The active-work folder contains the current implementation and hardening plans.
 - [UdpHolePunchingImplementationBlueprint_2026-03-07.md](./operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
 - [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./operations/active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 - [WindowsWorkingNodePlan_2026-04-17.md](./operations/active/WindowsWorkingNodePlan_2026-04-17.md)
+- [WindowsExitAndRelayDeltaPlan_2026-05-10.md](./operations/active/WindowsExitAndRelayDeltaPlan_2026-05-10.md)
 
 Related active machine-readable lab asset:
 - `documents/operations/active/vm_lab_inventory.json`

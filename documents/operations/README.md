@@ -50,6 +50,10 @@ Supporting active implementation plan for taking Windows from
 `runtime-host-capable only` to a real working node:
 - [active/WindowsWorkingNodePlan_2026-04-17.md](./active/WindowsWorkingNodePlan_2026-04-17.md)
 
+Supporting active execution ledger for Windows 11 exit-node and relay-node
+hardening:
+- [active/WindowsExitAndRelayDeltaPlan_2026-05-10.md](./active/WindowsExitAndRelayDeltaPlan_2026-05-10.md)
+
 Current phase-local hardening checklist:
 - [active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
 - [active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)

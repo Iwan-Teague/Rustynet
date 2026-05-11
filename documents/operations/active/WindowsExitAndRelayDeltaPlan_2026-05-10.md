@@ -18,8 +18,9 @@ document — almost everything has already been decided.
 
 1. Read **§1 (Mission and ground rules)** before writing any code.
 2. Read **§2 (Repository state right now)** to confirm you are on
-   commit `0c3d78e` or later. If you are on an older commit, fast-forward
-   `main` first: `git fetch origin && git reset --hard origin/main`.
+   commit `0cabab0` or later for current Windows exit/relay work. If you
+   are on an older commit, stop and report the drift; do not reset to
+   `origin/main`, which may lag local Windows work.
 3. Pick the lowest-numbered open subtask in **§5 / §6 / §7 / §8 / §9** that
    does not have an explicit blocker. Do not skip.
 4. After every task, update **§11 (Progress ledger)** with the commit
@@ -84,13 +85,20 @@ All twelve must be true before any posture-promotion claim:
 
 ---
 
-## 2) Repository state right now (2026-05-10, commit `0c3d78e`)
+## 2) Repository state right now
 
-Run these to confirm before you start. If any answer is different, stop and
-re-investigate; do not proceed against a drifted tree.
+Baseline when this playbook was opened: 2026-05-10, commit `0c3d78e`.
+Current local execution has advanced through commit `0cabab0` on `main`
+as of 2026-05-11. `origin/main` remains at `a3f6285`; local `main` is
+the more advanced branch for Windows exit/relay work.
+
+Run these to confirm before you start. The test-count lines below are the
+baseline from `0c3d78e`; the current Windows exit/relay branch should be
+`main` at `0cabab0` or later. If the local branch is older than `0cabab0`,
+stop and re-investigate instead of resetting to `origin/main`.
 
 ```
-git rev-parse HEAD                    # → 0c3d78eb073ca915334f7a3dd360868a6796cbe5
+git rev-parse HEAD                    # → 0cabab04b05d8f324f39bab3a73fb6945ec0aed4 or later
 git rev-parse --abbrev-ref HEAD       # → main
 cargo test -p rustynetd --all-features 2>&1 | grep '^test result'
 # → 683 lib + 60 bin + 3 integration, all passing
@@ -161,15 +169,36 @@ cargo test -p rustynet-backend-wireguard --all-features 2>&1 | grep '^test resul
 
 ### 2.2 What is NOT finished
 
-- **Live Windows lab access is broken** (`WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`).
-  This is the hard blocker — see §3.
-- **No live SCM-context proof** of Windows-as-exit (`OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md`
-  Phase W5 §2505): NetNat enable/disable, forwarding restore, leak proof, DNS
-  fail-closed under load.
+- **Windows lab transport is no longer the main blocker.** SSH/PowerShell
+  execution from the orchestrator works well enough to run Windows exit
+  topology iterations and remote evidence scripts. The old evidence-capture
+  failure was a double-encoded SSH PowerShell payload that exceeded the
+  Windows `CreateProcess` command-line limit; fixed in `0574a4d`.
+- **Current hard blocker: Windows service readiness / node-id collection.**
+  The Windows topology path still calls
+  `C:\Program Files\RustyNet\rustynet.exe status` in readiness and node-id
+  collection. On Windows that binary is the trust CLI, so it prints
+  `usage: rustynet trust <keygen|export-verifier-key|issue> [options]`.
+  Replace this with parsing `--node-id` from
+  `C:\ProgramData\RustyNet\config\rustynetd.env` and proving readiness via
+  SCM service state plus reviewed config/runtime evidence.
+- **Possible second blocker after readiness is fixed:** the latest Windows
+  service failure showed SCM exit code `1`, and the WireGuard tunnel service
+  logged that it could not find
+  `C:\ProgramData\RustyNet\config\rustynet0.conf.dpapi`. If service startup
+  still fails after the status-CLI path is removed, inspect
+  `crates/rustynet-backend-wireguard/src/windows_command.rs` for tunnel
+  config write/register lifecycle under LocalSystem.
+- **No live SCM-context proof** of Windows-as-exit
+  (`OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md` Phase W5
+  §2505): NetNat enable/disable, forwarding restore, leak proof, DNS
+  fail-closed under load. Evidence collectors now run and skip correctly
+  when the host is client-only; they have not yet passed against an active
+  Windows exit.
 - **No live relay traffic proof** (`PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md`
   Phase C §939–944): wire daemon relay client to real relay infrastructure,
   prove relay-active with traffic.
-- **No mixed-node, restart, or reinstall proof** for Windows.
+- **No mixed-node, restart, or reinstall proof** for Windows exit/relay roles.
 - **No cross-network proof** (real ISP NAT, real public internet through
   Windows exit).
 - **Posture promotion** — Windows is still tagged `runtime-host-capable only`
@@ -196,10 +225,14 @@ Memorise these — most of the work happens here.
 
 ---
 
-## 3) The hard blocker: live Windows lab access
+## 3) The current blocker: Windows service readiness and node-id proof
 
-You cannot run any of §5 or §6's live-proof items until lab access is
-unstuck. Owning ledger:
+The original lab-access blocker is partially resolved. Do not treat this as
+release evidence: it only means the orchestrator can now run meaningful
+Windows exit topology iterations over SSH/PowerShell and capture remote
+proof files.
+
+Owning historical recovery ledger:
 [`WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
 
 ### 3.1 What works today
@@ -207,33 +240,43 @@ unstuck. Owning ledger:
 - Local source sync to the Windows guest works.
 - Guest-side PowerShell execution works.
 - Real Rust code compiled successfully inside the Windows guest.
+- SSH fallback transport works for Windows evidence capture when raw
+  scripts are passed to `capture_remote_shell_command_for_target`; do not
+  pre-encode them.
+- A 2-node Windows-exit topology can reach Windows bootstrap/install stages.
+- Windows exit evidence capture returns structured JSON and reports
+  `skipped` rather than failing when the host is client-only.
 
 ### 3.2 What is broken
 
-- Headless `utmctl` cannot drive the guest reliably (the macOS host running
-  UTM cannot script guest power/network from a non-interactive shell).
-- The guest's POST-back readiness probe times out before the host orchestrator
-  proceeds.
-- SSH listener state on the guest after install is intermittent
-  (`sshd_service_count=0`, `sshd_registry_present=False` in the
-  `artifacts/windows_phase4/20260417T174942Z/phase4_evidence_summary.md` run).
+- Windows readiness and node-id collection still use
+  `rustynet.exe status`, but the Windows `rustynet.exe` installed in
+  `C:\Program Files\RustyNet\` is the trust CLI, not the full daemon-control
+  CLI. This causes collect/readiness failures before exit proof can run.
+- Latest topology evidence also showed the RustyNet service stopping with
+  SCM exit code `1`. The next debug step is to remove the invalid status-CLI
+  check, then re-run. If service still stops, investigate the missing
+  `rustynet0.conf.dpapi` tunnel config noted in §2.2.
+- The host has not yet been proven in active exit-serving mode, so NetNat,
+  DNS block, and killswitch artifacts remain unproven.
 
 ### 3.3 Order of operations
 
-You should NOT start exit/relay live-proof until the access path is one of:
-1. Reliably driven by `utmctl` from a headless shell, OR
-2. Driven via a different transport (SSH-over-VPN, QEMU monitor, OpenSSH-on-VM-with-known-host-key) such that the orchestrator can get a deterministic
-   exit-code from the guest.
-
-The Windows VM-lab access plan (`WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`)
-owns the recovery work. Do NOT modify that plan from this document. Do
-modify orchestrator code in `crates/rustynet-cli/src/vm_lab/` if and only if
-the access plan asks you to.
-
-If you are asked to work on §5 or §6 before §3 is unstuck, push back and
-explain that no live-proof artifact can be generated until then. The unit
-tests in §5/§6 can still be added without lab access — they exercise the
-parser/structural layer, not the OS layer.
+1. Patch `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_traffic.rs`
+   so `collect_node_id` reads `--node-id` from
+   `C:\ProgramData\RustyNet\config\rustynetd.env`
+   (`RUSTYNETD_DAEMON_ARGS_JSON`) instead of invoking `rustynet.exe status`.
+2. Patch `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs`
+   so daemon readiness uses SCM `Running` state plus reviewed env/config
+   evidence. It must not invoke the Windows trust CLI as a status CLI.
+3. Re-run the 2-node topology
+   (`windows-utm-1:exit`, `debian-headless-2:client`) and require
+   `bootstrap_hosts` + `collect_pubkeys` to pass before §A.1 proof.
+4. If the service still exits, inspect/fix the WireGuard Windows tunnel
+   config lifecycle around `.conf.dpapi` before attempting NAT/DNS/killswitch
+   proof.
+5. Only after service readiness and node-id collection pass, continue §A.1
+   through §A.3 live proof.
 
 ---
 
@@ -307,7 +350,8 @@ returned success.
 
 ### A.1 Live SCM-context proof of NetNat lifecycle
 
-**Blocked on §3.** Do not start until lab access works.
+**Blocked on §3.** Do not start until Windows bootstrap/readiness and
+node-id collection pass under SCM service context.
 
 **Goal:** prove that the daemon's exit-serving NAT path actually works on
 a real Windows host under the SCM-launched service context (the exec
@@ -1034,22 +1078,34 @@ landed, where the artifact lives.
 | `f43ef30` | Fix relay fleet default paths (trust/ root) + SSH keepalive; service was crash-looping on startup due to path validation rejection | Code + live lab: service now runs stably (verified RUNNING 30 s+) |
 | `0574a4d` | Fix SSH double-encoding in exit evidence capture/inventory; ~60K-char double-encoded cmd exceeded Windows 32,767-char CreateProcess limit → SSH exit 255; now passes raw script, single-encoded ~22,700 chars | Code + live lab: capture stage now executes (status=skipped, not fail); script ran and returned JSON; all three probes skipped — no active exit traffic on client-only host |
 | `0d321ad` | Rust-native Windows build-release now passes `-ResultPath` so SYSTEM-context topology runs activate the guest manifest and fail-fast toolchain guard instead of silently falling into interactive bootstrap paths | Code + live-lab blocker proof: first 2-node Windows-exit attempt reached Windows build-release and hung before this fix; rerun pending |
+| `bbd7d1a` | Record Windows build-release manifest blocker fix in active ledger | Docs only |
+| `e4c3653` | Make Windows service smoke deterministic in vm-lab bootstrap | Code + live-lab blocker reduction |
+| `cb3b99f` | Quote Windows service smoke diagnostics safely | Code + live-lab blocker reduction |
+| `1f7eb02` | Thread lab node id into Windows service env | Code + live-lab blocker reduction |
+| `6339c64` | Purge stale daemon state during Windows lab install | Code + live-lab blocker reduction |
+| `1860106` | Verify Windows killswitch rules by display name, matching `netsh name=` behavior | Code + test; removes false-negative OS-state verifier |
+| `a92d4ff` | Budget Windows bootstrap service probe inside SSH timeout | Code + live-lab blocker reduction |
+| `cb00565` | Scope Windows bootstrap ACL repair to reviewed RustyNet roots | Code + security hardening; avoids broad recursive ACL rewrite |
+| `65b867e` | Capture Windows bootstrap native stderr without PowerShell 5 `NativeCommandError` truncation | Code + diagnostics hardening |
+| `c61f4a4` | Capture install helper native stderr for key/trust commands | Code + diagnostics hardening |
+| `2530ed7` | Restore custody ACL owner before rekey | Code + security hardening; fixes DPAPI/key-custody owner rejection after ACL repair |
+| `0cabab0` | Add Windows daemon readiness polling after service start | Code + live-lab blocker proof; revealed invalid `rustynet.exe status` assumption because Windows `rustynet.exe` is trust CLI |
 
-§A.1 (live SCM-context NAT lifecycle) — TBD (requires active mesh client + Windows exit-node with NAT; first 2-node attempt exposed missing Windows build-release `-ResultPath`, fixed in `0d321ad`; rerun pending)
-§A.2 (live DNS leak proof) — TBD (DNS block firewall rules not yet configured; requires daemon in exit-node mode)
-§A.3 (live killswitch precedence) — TBD (killswitch probe marker not created; requires exit-node mode)
-§A.4 (windows-killswitch-assert subcommand) — `dc614ce` code-only CLI/test coverage; live §A.3 proof still blocked on Windows lab access
-§A.5 (three orchestrator stages) — `dff6fcf` + `0a699e2` + `32fa4fa` code-only optional artifact validators, remote evidence capture, and allowlisted pull wired into Windows security report; live packet-capture artifacts still pending
+§A.1 (live SCM-context NAT lifecycle) — blocked on §3 readiness/node-id fix and stable Windows service. Evidence capture path works but skips on client-only host. Active exit NetNat/forwarding lifecycle not proven.
+§A.2 (live DNS leak proof) — blocked on §3 and §A.1. DNS block rules are code-present, but exit-context live proof is pending because daemon has not yet reached active exit-serving mode.
+§A.3 (live killswitch precedence) — blocked on §3 and §A.1. `windows-killswitch-assert` exists, but live drift/tamper proof needs active exit-serving mode.
+§A.4 (windows-killswitch-assert subcommand) — `dc614ce` code-only CLI/test coverage; live §A.3 proof still blocked on §3/§A.1.
+§A.5 (three orchestrator stages) — `dff6fcf` + `0a699e2` + `32fa4fa` code-only optional artifact validators, remote evidence capture, and allowlisted pull wired into Windows security report; live packet-capture artifacts still pending. SSH evidence transport bug fixed in `0574a4d`.
 §A.6 (cross-network exit proof) — TBD
 §B.1 (wire daemon to real relay) — TBD
 §B.2 (relay traffic proof) — TBD
 §B.3 (failover/failback/roaming) — TBD
 §B.4 (signed relay-fleet end-to-end) — TBD
-§B.5 (live Windows relay execution) — TBD
-§C.1 (Linux-only gate cleanup) — `d9823b9` code-only Rust-native Windows Exit lab assignment unblocked; live run still pending
-§C.2 (heterogeneous live-lab evidence) — TBD
+§B.5 (live Windows relay execution) — partially code-backed by relay SCM host/install/hardening paths; live Windows relay lifecycle and traffic proof still TBD.
+§C.1 (Linux-only gate cleanup) — `d9823b9` code-only Rust-native Windows Exit lab assignment unblocked; 2-node topology now reaches Windows bootstrap/install, but readiness/node-id blocker remains.
+§C.2 (heterogeneous live-lab evidence) — in progress for 2-node Windows-exit topology only; 4×Linux + 1×Windows-as-exit completion still TBD.
 §C.3 (CI gate scripts add Windows) — TBD
-§D.1–§D.4 (posture promotion + doc updates) — TBD
+§D.1–§D.4 (posture promotion + doc updates) — TBD; do not promote Windows support until §A, §B, and §C live artifacts validate.
 §E.4 (DPAPI roundtrip moved from per-load to startup) — `9394053` code-only custody hardening
 
 ---
