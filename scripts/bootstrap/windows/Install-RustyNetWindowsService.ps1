@@ -168,6 +168,32 @@ function Get-NativeCommandText {
     }
 }
 
+function Invoke-RustyNetNativeCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string[]]$Arguments = @()
+    )
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $Path @Arguments 2>&1 | Out-String)
+        $exitCode = $LASTEXITCODE
+        if ($null -eq $output) {
+            $output = ''
+        }
+        if ($null -eq $exitCode) {
+            $exitCode = 0
+        }
+        return [ordered]@{
+            exit_code = $exitCode
+            output = ([string]$output).Trim()
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 function Test-RustyNetWindowsRuntimeSupport {
     param([Parameter(Mandatory = $true)][string]$DaemonPath)
     $helpText = Get-NativeCommandText -Path $DaemonPath -Arguments @('--help')
@@ -807,14 +833,14 @@ if (-not (Test-Path -LiteralPath $wgPassphraseDir)) {
 }
 $rekeyPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
 [System.IO.File]::WriteAllText($wgPassphrasePath, $rekeyPlaintext)
-$keyInitOutput = (& $daemonDest key init --passphrase-file $wgPassphrasePath --force 2>&1) -join "`n"
-if ($LASTEXITCODE -ne 0) {
-    throw "rustynetd key init --force failed (exit $LASTEXITCODE): $keyInitOutput"
+$keyInit = Invoke-RustyNetNativeCommand -Path $daemonDest -Arguments @('key', 'init', '--passphrase-file', $wgPassphrasePath, '--force')
+if ($keyInit.exit_code -ne 0) {
+    throw "rustynetd key init --force failed (exit $($keyInit.exit_code)): $($keyInit.output)"
 }
 Write-Host "[install-helper] rekey: rustynetd key init complete"
-$keyStoreOutput = (& $daemonDest key store-passphrase --passphrase-file $wgPassphrasePath 2>&1) -join "`n"
-if ($LASTEXITCODE -ne 0) {
-    throw "rustynetd key store-passphrase failed (exit $LASTEXITCODE): $keyStoreOutput"
+$keyStore = Invoke-RustyNetNativeCommand -Path $daemonDest -Arguments @('key', 'store-passphrase', '--passphrase-file', $wgPassphrasePath)
+if ($keyStore.exit_code -ne 0) {
+    throw "rustynetd key store-passphrase failed (exit $($keyStore.exit_code)): $($keyStore.output)"
 }
 Write-Host "[install-helper] rekey: passphrase blob written under SYSTEM DPAPI scope"
 
@@ -847,21 +873,25 @@ if (-not (Test-Path -LiteralPath $cliPath)) {
 $trustPlaintext = -join ((1..48 | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }))
 [System.IO.File]::WriteAllText($trustPassphrasePath, $trustPlaintext)
 try {
-    $keygenOutput = (& $cliPath trust keygen `
-            --signing-key-output $trustSigningKeyPath `
-            --signing-key-passphrase-file $trustPassphrasePath `
-            --verifier-key-output $trustVerifierKeyPath `
-            --force 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        throw "rustynet trust keygen failed (exit $LASTEXITCODE): $keygenOutput"
+    $keygen = Invoke-RustyNetNativeCommand -Path $cliPath -Arguments @(
+        'trust', 'keygen',
+        '--signing-key-output', $trustSigningKeyPath,
+        '--signing-key-passphrase-file', $trustPassphrasePath,
+        '--verifier-key-output', $trustVerifierKeyPath,
+        '--force'
+    )
+    if ($keygen.exit_code -ne 0) {
+        throw "rustynet trust keygen failed (exit $($keygen.exit_code)): $($keygen.output)"
     }
     Write-Host "[install-helper] trust: keygen complete (signing + verifier keys rotated)"
-    $issueOutput = (& $cliPath trust issue `
-            --signing-key $trustSigningKeyPath `
-            --signing-key-passphrase-file $trustPassphrasePath `
-            --output $trustEvidencePath 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        throw "rustynet trust issue failed (exit $LASTEXITCODE): $issueOutput"
+    $issue = Invoke-RustyNetNativeCommand -Path $cliPath -Arguments @(
+        'trust', 'issue',
+        '--signing-key', $trustSigningKeyPath,
+        '--signing-key-passphrase-file', $trustPassphrasePath,
+        '--output', $trustEvidencePath
+    )
+    if ($issue.exit_code -ne 0) {
+        throw "rustynet trust issue failed (exit $($issue.exit_code)): $($issue.output)"
     }
     Write-Host "[install-helper] trust: evidence issued at $trustEvidencePath"
     # Drop any stale watermark so the daemon's WatermarkStore re-ingests the
