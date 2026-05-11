@@ -1024,11 +1024,12 @@ landed, where the artifact lives.
 | `ceeda2a` | Privileged-helper path traversal rejection + 12 tests | Code only |
 | `0c3d78e` | Windows backend tunnel-name validator + 10 tests | Code only |
 | `8d5de44` | Auto-tunnel sig-tamper reload + dormant daemon security tests restored | Code only |
+| `dc614ce` | windows-killswitch-assert CLI help + fail-closed regression tests | Code only |
 
 §A.1 (live SCM-context NAT lifecycle) — TBD
 §A.2 (live DNS leak proof) — TBD
 §A.3 (live killswitch precedence) — TBD
-§A.4 (windows-killswitch-assert subcommand) — TBD
+§A.4 (windows-killswitch-assert subcommand) — `dc614ce` code-only CLI/test coverage; live §A.3 proof still blocked on Windows lab access
 §A.5 (three orchestrator stages) — TBD
 §A.6 (cross-network exit proof) — TBD
 §B.1 (wire daemon to real relay) — TBD
