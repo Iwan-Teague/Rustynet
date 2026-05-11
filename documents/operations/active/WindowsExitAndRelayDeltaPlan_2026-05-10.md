@@ -1023,6 +1023,7 @@ landed, where the artifact lives.
 | `3f5432f` | Version=1 gates on all signed-bundle verifiers + 5 tests | Code only |
 | `ceeda2a` | Privileged-helper path traversal rejection + 12 tests | Code only |
 | `0c3d78e` | Windows backend tunnel-name validator + 10 tests | Code only |
+| `8d5de44` | Auto-tunnel sig-tamper reload + dormant daemon security tests restored | Code only |
 
 §A.1 (live SCM-context NAT lifecycle) — TBD
 §A.2 (live DNS leak proof) — TBD
