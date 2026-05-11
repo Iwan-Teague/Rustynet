@@ -1031,10 +1031,12 @@ landed, where the artifact lives.
 | `dff6fcf` | Optional Windows Exit NAT/DNS/killswitch artifact validators added to vm-lab | Code only |
 | `0a699e2` | Windows Exit evidence pull stage allowlists and copies vm-lab artifacts | Code only |
 | `32fa4fa` | Windows Exit remote evidence capture stage writes reviewed vm-lab proof files | Code only |
+| `f43ef30` | Fix relay fleet default paths (trust/ root) + SSH keepalive; service was crash-looping on startup due to path validation rejection | Code + live lab: service now runs stably (verified RUNNING 30 s+) |
+| `0574a4d` | Fix SSH double-encoding in exit evidence capture/inventory; ~60K-char double-encoded cmd exceeded Windows 32,767-char CreateProcess limit → SSH exit 255; now passes raw script, single-encoded ~22,700 chars | Code + live lab: capture stage now executes (status=skipped, not fail); script ran and returned JSON; all three probes skipped — no active exit traffic on client-only host |
 
-§A.1 (live SCM-context NAT lifecycle) — TBD
-§A.2 (live DNS leak proof) — TBD
-§A.3 (live killswitch precedence) — TBD
+§A.1 (live SCM-context NAT lifecycle) — TBD (requires active mesh client + Windows exit-node with NAT)
+§A.2 (live DNS leak proof) — TBD (DNS block firewall rules not yet configured; requires daemon in exit-node mode)
+§A.3 (live killswitch precedence) — TBD (killswitch probe marker not created; requires exit-node mode)
 §A.4 (windows-killswitch-assert subcommand) — `dc614ce` code-only CLI/test coverage; live §A.3 proof still blocked on Windows lab access
 §A.5 (three orchestrator stages) — `dff6fcf` + `0a699e2` + `32fa4fa` code-only optional artifact validators, remote evidence capture, and allowlisted pull wired into Windows security report; live packet-capture artifacts still pending
 §A.6 (cross-network exit proof) — TBD
