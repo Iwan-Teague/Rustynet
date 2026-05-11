@@ -301,6 +301,32 @@ fn build_windows_release_script(
     ))
 }
 
+fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, AdapterError> {
+    let svc_q = ps_quote(service_name)?;
+    Ok(format!(
+        "$stopOut = (& sc.exe stop {svc_q} 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) {{ Write-Warning \"sc.exe stop returned $LASTEXITCODE: $stopOut\" }}; \
+         for ($i = 0; $i -lt 30; $i++) {{ \
+             $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
+             if ($null -eq $svc -or $svc.Status -ne 'StopPending') {{ break }}; \
+             Start-Sleep -Seconds 1 \
+         }}; \
+         $startOut = (& sc.exe start {svc_q} 2>&1) -join ' '; \
+         if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1056) {{ throw \"sc.exe start failed (exit $LASTEXITCODE): $startOut\" }}; \
+         $svcStatus = $null; \
+         for ($i = 0; $i -lt 60; $i++) {{ \
+             $svc = Get-Service -Name {svc_q} -ErrorAction Stop; \
+             $svcStatus = $svc.Status; \
+             if ($svcStatus -eq 'Running') {{ break }}; \
+             Start-Sleep -Seconds 2 \
+         }}; \
+         if ($svcStatus -ne 'Running') {{ \
+             $scQuery = (& sc.exe queryex {svc_q} 2>&1) -join ' | '; \
+             throw \"Service failed to reach Running after 120s (status=$svcStatus sc=[$scQuery])\" \
+         }}",
+    ))
+}
+
 // ── Windows e2e bootstrap ─────────────────────────────────────────────────────
 
 /// Generate WireGuard keys, membership state, and trust evidence for a Windows host.
@@ -373,7 +399,7 @@ fn run_windows_e2e_bootstrap(
     let membership_log_q = ps_quote(WINDOWS_MEMBERSHIP_LOG_PATH)?;
     let membership_watermark_q = ps_quote(WINDOWS_MEMBERSHIP_WATERMARK_PATH)?;
     let membership_snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?;
-    let svc_q = ps_quote(WINDOWS_SERVICE_NAME)?;
+    let service_probe = windows_service_start_probe_fragment(WINDOWS_SERVICE_NAME)?;
 
     let bootstrap_script = format!(
         "$ErrorActionPreference = 'Stop'; \
@@ -408,16 +434,7 @@ fn run_windows_e2e_bootstrap(
          if ($LASTEXITCODE -ne 0) {{ throw \"rustynetd key store-passphrase failed: $kspOut\" }}; \
          $aclOut = (& {rustynetd_q} windows-runtime-acls-check 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0) {{ throw \"runtime ACL check failed (startup would fail): $aclOut\" }}; \
-         Stop-Service -Name {svc_q} -Force -ErrorAction SilentlyContinue; \
-         Start-Service -Name {svc_q}; \
-         Start-Sleep -Seconds 8; \
-         $svcStatus = (Get-Service -Name {svc_q} -ErrorAction SilentlyContinue).Status; \
-         if ($svcStatus -ne 'Running') {{ \
-             $scmEvt = try {{ (Get-EventLog -LogName System -Source 'Service Control Manager' -Newest 5 -ErrorAction SilentlyContinue | Where-Object {{ $_.Message -like '*RustyNet*' }} | Select-Object -ExpandProperty Message) -join ' | ' }} catch {{ '' }}; \
-             $appEvt = try {{ (Get-EventLog -LogName Application -Newest 15 -ErrorAction SilentlyContinue | Where-Object {{ $_.Message -like '*rustynet*' -or $_.Source -like '*rustynet*' }} | Select-Object -ExpandProperty Message) -join ' | ' }} catch {{ '' }}; \
-             $svcExitCode = try {{ (Get-WmiObject win32_service -Filter \"Name={svc_q}\" -ErrorAction SilentlyContinue).ExitCode }} catch {{ 'unknown' }}; \
-             throw \"Service failed (status=$svcStatus exitCode=$svcExitCode) scm=[$scmEvt] app=[$appEvt]\" \
-         }}",
+         {service_probe}",
     );
     run_remote_ps(conn, &bootstrap_script, Duration::from_secs(120))?;
     Ok(())
@@ -625,6 +642,30 @@ mod tests {
         assert!(
             !script.contains("-AllowInteractiveTaskFallback"),
             "Rust-native live lab must not silently fall back to interactive scheduled-task builds"
+        );
+    }
+
+    #[test]
+    fn windows_service_start_probe_polls_scm_without_slow_eventlog_diagnostics() {
+        let script =
+            windows_service_start_probe_fragment("RustyNet").expect("service probe should render");
+
+        assert!(script.contains("sc.exe stop 'RustyNet'"));
+        assert!(script.contains("sc.exe start 'RustyNet'"));
+        assert!(script.contains("sc.exe queryex 'RustyNet'"));
+        assert!(script.contains("$i -lt 60"));
+        assert!(script.contains("$svcStatus -eq 'Running'"));
+        assert!(
+            !script.contains("Get-EventLog"),
+            "service smoke path must not block on slow EventLog queries"
+        );
+        assert!(
+            !script.contains("Get-WmiObject"),
+            "service smoke path must not block on slow WMI queries"
+        );
+        assert!(
+            !script.contains("Start-Service"),
+            "service smoke path must not block on Start-Service"
         );
     }
 }
