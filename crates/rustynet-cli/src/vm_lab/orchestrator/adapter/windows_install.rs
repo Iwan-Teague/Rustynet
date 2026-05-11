@@ -47,6 +47,8 @@ static UNINSTALL_SERVICE_SCRIPT: &str = include_str!(
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(3600); // cold release build on Windows VM can take 30-60 min
+const WINDOWS_BUILD_RELEASE_REPORT_PATH: &str =
+    r"C:\Windows\Temp\rustynet-stage\build-release\manifest.json";
 
 // ── PowerShell encoding helpers ───────────────────────────────────────────────
 
@@ -188,14 +190,7 @@ pub fn install_daemon(
     run_remote_ps(conn, &extract_script, Duration::from_secs(120))?;
 
     // Build release from synced workdir.
-    let build_script = format!(
-        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
-         $ProgressPreference = 'SilentlyContinue'; \
-         Set-Location -LiteralPath {workdir_q}; \
-         & {bootstrap_q} -Phase build-release -RustyNetRoot {workdir_q}",
-        workdir_q = ps_quote(workdir)?,
-        bootstrap_q = ps_quote(&remote_bootstrap)?,
-    );
+    let build_script = build_windows_release_script(workdir, &remote_bootstrap)?;
     run_remote_ps(conn, &build_script, BUILD_TIMEOUT)?;
 
     // Install the service.
@@ -289,6 +284,21 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     );
     run_remote_ps(conn, &script, Duration::from_secs(60))?;
     Ok(())
+}
+
+fn build_windows_release_script(
+    workdir: &str,
+    remote_bootstrap: &str,
+) -> Result<String, AdapterError> {
+    Ok(format!(
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         Set-Location -LiteralPath {workdir_q}; \
+         & {bootstrap_q} -Phase build-release -RustyNetRoot {workdir_q} -ResultPath {result_q}",
+        workdir_q = ps_quote(workdir)?,
+        bootstrap_q = ps_quote(remote_bootstrap)?,
+        result_q = ps_quote(WINDOWS_BUILD_RELEASE_REPORT_PATH)?,
+    ))
 }
 
 // ── Windows e2e bootstrap ─────────────────────────────────────────────────────
@@ -597,6 +607,24 @@ mod tests {
         assert!(
             !UNINSTALL_SERVICE_SCRIPT.is_empty(),
             "Uninstall-RustyNetWindowsService.ps1 must not be empty"
+        );
+    }
+
+    #[test]
+    fn build_windows_release_script_always_requests_guest_manifest() {
+        let script = build_windows_release_script(
+            r"C:\Rustynet",
+            r"C:\Windows\Temp\rustynet-stage\Bootstrap-RustyNetWindows.ps1",
+        )
+        .expect("build script should render");
+        assert!(script.contains("Set-StrictMode -Version Latest"));
+        assert!(script.contains("-Phase build-release"));
+        assert!(script.contains("-RustyNetRoot 'C:\\Rustynet'"));
+        assert!(script.contains("-ResultPath "));
+        assert!(script.contains(WINDOWS_BUILD_RELEASE_REPORT_PATH));
+        assert!(
+            !script.contains("-AllowInteractiveTaskFallback"),
+            "Rust-native live lab must not silently fall back to interactive scheduled-task builds"
         );
     }
 }
