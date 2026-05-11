@@ -1027,6 +1027,7 @@ landed, where the artifact lives.
 | `dc614ce` | windows-killswitch-assert CLI help + fail-closed regression tests | Code only |
 | `9394053` | Windows DPAPI self-test cached at startup instead of live-passphrase roundtrip on every key load | Code only |
 | `38525a1` | Privileged-helper request decoder adversarial-byte no-panic regression | Code only |
+| `d9823b9` | Windows Exit lab assignment unblocked without support-posture promotion | Code only |
 
 §A.1 (live SCM-context NAT lifecycle) — TBD
 §A.2 (live DNS leak proof) — TBD
@@ -1039,7 +1040,7 @@ landed, where the artifact lives.
 §B.3 (failover/failback/roaming) — TBD
 §B.4 (signed relay-fleet end-to-end) — TBD
 §B.5 (live Windows relay execution) — TBD
-§C.1 (Linux-only gate cleanup) — TBD
+§C.1 (Linux-only gate cleanup) — `d9823b9` code-only Rust-native Windows Exit lab assignment unblocked; live run still pending
 §C.2 (heterogeneous live-lab evidence) — TBD
 §C.3 (CI gate scripts add Windows) — TBD
 §D.1–§D.4 (posture promotion + doc updates) — TBD
