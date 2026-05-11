@@ -358,6 +358,7 @@ fn windows_bootstrap_acl_repair_fragment() -> Result<String, AdapterError> {
     let state_root_q = ps_quote(WINDOWS_STATE_ROOT)?;
     Ok(format!(
         "$buser = (whoami.exe).Trim(); \
+         $bootstrapAdministrators = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([System.Security.Principal.NTAccount]).Value; \
          $bootstrapAclDirs = @( \
              (Join-Path {state_root_q} 'trust'), \
              (Join-Path {state_root_q} 'keys'), \
@@ -370,7 +371,9 @@ fn windows_bootstrap_acl_repair_fragment() -> Result<String, AdapterError> {
              takeown.exe /f $bootstrapAclDir /r /d y; \
              if ($LASTEXITCODE -ne 0) {{ throw ('takeown bootstrap dir failed for ' + $bootstrapAclDir + ' exit ' + $LASTEXITCODE) }}; \
              icacls.exe $bootstrapAclDir /grant:r \"${{buser}}:(OI)(CI)(F)\" /T; \
-             if ($LASTEXITCODE -ne 0) {{ throw ('icacls bootstrap dir grant failed for ' + $bootstrapAclDir + ' exit ' + $LASTEXITCODE) }} \
+             if ($LASTEXITCODE -ne 0) {{ throw ('icacls bootstrap dir grant failed for ' + $bootstrapAclDir + ' exit ' + $LASTEXITCODE) }}; \
+             icacls.exe $bootstrapAclDir /setowner $bootstrapAdministrators /T; \
+             if ($LASTEXITCODE -ne 0) {{ throw ('icacls bootstrap dir owner restore failed for ' + $bootstrapAclDir + ' exit ' + $LASTEXITCODE) }} \
          }}",
     ))
 }
@@ -719,6 +722,26 @@ mod tests {
     }
 
     #[test]
+    fn install_service_script_repairs_key_custody_acls_before_rekey() {
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("function Repair-RustyNetPreServiceAcl"),
+            "install helper must be able to restore reviewed custody ownership before service SID repair"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("repair-key-custody-acls-before-rekey"),
+            "install helper must repair key custody ACLs before DPAPI passphrase storage"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("(Join-Path $StateRoot 'secrets')"),
+            "pre-service ACL repair must cover the passphrase parent directory"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("(Join-Path $StateRoot 'secrets\\key-custody')"),
+            "pre-service ACL repair must cover key custody blobs"
+        );
+    }
+
+    #[test]
     fn build_windows_release_script_always_requests_guest_manifest() {
         let script = build_windows_release_script(
             r"C:\Rustynet",
@@ -822,6 +845,10 @@ mod tests {
         assert!(
             script.contains("$bootstrapAclDir"),
             "bootstrap ACL repair should operate per reviewed runtime directory"
+        );
+        assert!(
+            script.contains("/setowner $bootstrapAdministrators"),
+            "bootstrap must restore reviewed ownership after temporary bootstrap-user access"
         );
     }
 
