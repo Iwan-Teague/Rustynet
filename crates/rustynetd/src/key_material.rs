@@ -4,6 +4,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
@@ -59,6 +61,10 @@ const WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC: &[u8; 8] = b"RNYDPAPI";
 const WINDOWS_DPAPI_PASSPHRASE_BLOB_VERSION: u8 = 1;
 #[cfg(windows)]
 const WINDOWS_DPAPI_PASSPHRASE_DESCRIPTION: &str = "RustyNet WireGuard passphrase";
+#[cfg(windows)]
+const WINDOWS_DPAPI_STARTUP_SELF_TEST_PLAINTEXT: &[u8] = b"RustyNet DPAPI startup self-test v1";
+#[cfg(windows)]
+static WINDOWS_DPAPI_STARTUP_SELF_TEST: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>, String> {
     #[cfg(target_os = "macos")]
@@ -349,36 +355,35 @@ fn looks_like_windows_dpapi_passphrase_blob(blob: &[u8]) -> bool {
     blob.len() >= header_len && blob.starts_with(WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC)
 }
 
-// W2.4-followup: In-memory DPAPI round-trip self-test on the live passphrase bytes.
-// Proves that the machine DPAPI key can protect and recover before the passphrase
-// is committed to key-decryption. Fail-closed on any mismatch or DPAPI error.
-// On non-Windows this is a no-op; the platform uses a different custody mechanism.
 #[cfg(windows)]
-fn verify_dpapi_passphrase_roundtrip(plaintext: &[u8]) -> Result<(), String> {
+fn verify_dpapi_startup_self_test() -> Result<(), String> {
+    WINDOWS_DPAPI_STARTUP_SELF_TEST
+        .get_or_init(run_dpapi_startup_self_test)
+        .clone()
+}
+
+#[cfg(windows)]
+fn run_dpapi_startup_self_test() -> Result<(), String> {
     let mut protected = dpapi_protect(
-        plaintext,
+        WINDOWS_DPAPI_STARTUP_SELF_TEST_PLAINTEXT,
         WindowsDpapiScope::LocalMachine,
-        "RustyNet DPAPI passphrase round-trip self-test",
+        "RustyNet DPAPI startup self-test",
     )
-    .map_err(|err| format!("DPAPI passphrase self-test protect failed: {err}"))?;
-    // Wrap the unprotected plaintext in a Zeroizing buffer so the decrypted copy
-    // is scrubbed on every return path (success, mismatch, drop). Without this,
-    // dpapi_unprotect's bare Vec<u8> would leak the round-trip plaintext into
-    // the allocator pool when the local goes out of scope. Fail-closed on any
-    // DPAPI error or mismatch.
+    .map_err(|err| format!("DPAPI startup self-test protect failed: {err}"))?;
+    // Keep the decrypted self-test copy in a Zeroizing buffer so even the
+    // non-secret probe bytes follow the same cleanup discipline as secret
+    // material. Fail closed on any DPAPI error or mismatch.
     let roundtrip = match dpapi_unprotect(protected.as_slice()) {
         Ok(bytes) => Zeroizing::new(bytes),
         Err(err) => {
             protected.zeroize();
-            return Err(format!(
-                "DPAPI passphrase self-test unprotect failed: {err}"
-            ));
+            return Err(format!("DPAPI startup self-test unprotect failed: {err}"));
         }
     };
     protected.zeroize();
-    if roundtrip.as_slice() != plaintext {
+    if roundtrip.as_slice() != WINDOWS_DPAPI_STARTUP_SELF_TEST_PLAINTEXT {
         return Err(
-            "DPAPI passphrase self-test: round-trip bytes do not match original — fail closed"
+            "DPAPI startup self-test: round-trip bytes do not match original - fail closed"
                 .to_string(),
         );
     }
@@ -386,7 +391,7 @@ fn verify_dpapi_passphrase_roundtrip(plaintext: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn verify_dpapi_passphrase_roundtrip(_plaintext: &[u8]) -> Result<(), String> {
+fn verify_dpapi_startup_self_test() -> Result<(), String> {
     Ok(())
 }
 
@@ -444,8 +449,10 @@ pub fn decrypt_private_key(
     passphrase_path: &Path,
 ) -> Result<Vec<u8>, String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
-    // W2.4-followup: fail-closed if the live DPAPI round-trip cannot be proven.
-    verify_dpapi_passphrase_roundtrip(passphrase.as_bytes())?;
+    // Fail closed on Windows if process startup cannot prove LocalMachine DPAPI
+    // protect/unprotect works. The check is cached so repeated key loads do not
+    // repeatedly round-trip live passphrase bytes.
+    verify_dpapi_startup_self_test()?;
     let manager = key_custody_manager(encrypted_key_path, passphrase)?;
     let key_id = key_custody_key_id(encrypted_key_path);
     let mut key = manager
@@ -1301,38 +1308,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    // W2.4-followup: DPAPI round-trip self-test unit coverage.
+    // W2.4-followup: DPAPI startup self-test unit coverage.
     //
-    // On non-Windows: the function is a no-op and must return Ok for any input,
+    // On non-Windows: the function is a no-op and must return Ok,
     // confirming the cfg gate keeps DPAPI logic off non-Windows production paths.
-    // On Windows: the real DPAPI is used and the round-trip must succeed.
+    // On Windows: the real DPAPI is used once per process and must succeed.
 
     #[test]
-    fn dpapi_passphrase_roundtrip_returns_ok_for_valid_input() {
-        // Positive test: the self-test must succeed for a well-formed passphrase.
+    fn dpapi_startup_self_test_returns_ok() {
+        // Positive test: startup self-test must succeed.
         // On non-Windows this exercises the no-op path; on Windows it uses real DPAPI.
-        let result = super::verify_dpapi_passphrase_roundtrip(b"correct-horse-battery-staple-0A");
+        let result = super::verify_dpapi_startup_self_test();
         assert!(
             result.is_ok(),
-            "DPAPI passphrase round-trip self-test should succeed: {result:?}"
+            "DPAPI startup self-test should succeed: {result:?}"
         );
     }
 
     #[test]
     #[cfg(not(windows))]
-    fn dpapi_passphrase_roundtrip_noop_on_non_windows_never_errors() {
-        // On non-Windows the function must be a no-op regardless of input, confirming
+    fn dpapi_startup_self_test_noop_on_non_windows_never_errors() {
+        // On non-Windows the function must be a no-op, confirming
         // it does not call into the Windows DPAPI stubs (which always return Err).
-        for input in &[
-            b"" as &[u8],
-            b"short",
-            b"a-long-passphrase-exceeding-sixteen-chars",
-        ] {
-            let result = super::verify_dpapi_passphrase_roundtrip(input);
+        for _ in 0..3 {
+            let result = super::verify_dpapi_startup_self_test();
             assert!(
                 result.is_ok(),
-                "non-Windows no-op must not return Err for input {:?}: {result:?}",
-                input
+                "non-Windows no-op must not return Err: {result:?}",
             );
         }
     }
@@ -1490,15 +1492,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn dpapi_passphrase_roundtrip_rejects_mismatch_via_zeroizing_buffer() {
-        // Pins the fail-closed contract: the round-trip self-test
-        // wraps the unprotected plaintext in a Zeroizing buffer so
-        // mismatches are scrubbed before returning.  Today the
-        // contract is "real DPAPI must round-trip a 16+ byte
-        // passphrase".  Regression target: a refactor that drops the
-        // Zeroizing wrapper would leak round-trip plaintext into the
-        // allocator pool.
-        super::verify_dpapi_passphrase_roundtrip(b"correct-horse-battery-staple-0A")
-            .expect("DPAPI must round-trip on a Windows host");
+    fn dpapi_startup_self_test_uses_once_lock() {
+        // Pins the E.4 contract: key decrypts call the startup verifier, but
+        // the actual DPAPI protect/unprotect self-test runs once per process.
+        super::verify_dpapi_startup_self_test().expect("DPAPI must round-trip on a Windows host");
+        assert!(
+            super::WINDOWS_DPAPI_STARTUP_SELF_TEST.get().is_some(),
+            "startup self-test result must be cached"
+        );
+        super::verify_dpapi_startup_self_test()
+            .expect("cached DPAPI startup self-test must remain usable");
     }
 }
