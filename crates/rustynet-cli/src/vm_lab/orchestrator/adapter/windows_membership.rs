@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH, WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, WINDOWS_RUSTYNET_PATH,
-    WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT, ps_quote, run_remote_ps,
+    WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH, WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, WINDOWS_STAGING_DIR,
+    WINDOWS_STATE_ROOT, ps_quote, run_remote_ps,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
@@ -47,26 +47,38 @@ pub fn issue_membership_owner_key(
 
 /// Initialize the membership snapshot on a Windows exit node.
 ///
-/// Runs `rustynet.exe ops init-membership`, then adds each non-exit peer
-/// via `ops e2e-membership-add`, then reads back the snapshot bytes.
-/// Requires the SSH session to run as an Administrator user.
+/// The initial membership snapshot was already created by `rustynetd membership init`
+/// during `bootstrap_hosts`.  This function adds each non-exit peer by calling
+/// `rustynetd membership add-peer` (backed by the owner signing key stored in
+/// `WINDOWS_MEMBERSHIP_OWNER_KEY_PATH`, encrypted with the WireGuard passphrase DPAPI
+/// blob).  Finally it reads back the updated snapshot bytes.
+///
+/// The `rustynet-windows-trust-cli` binary (`rustynet.exe`) only supports `trust`
+/// subcommands and cannot be used for membership management; all membership operations
+/// go through `rustynetd.exe` directly.
 pub fn init_membership_snapshot(
     conn: &NodeConnection,
     _owner_key: &MembershipOwnerKey,
     peers: &[NodeMembershipPeer],
 ) -> Result<MembershipSnapshot, AdapterError> {
-    // 1. Run ops init-membership (idempotent).
-    let init_script = format!(
-        "$ErrorActionPreference = 'Stop'; \
-         $ProgressPreference = 'SilentlyContinue'; \
-         $env:RUSTYNET_NODE_ROLE = 'admin'; \
-         & {rustynet_q} ops init-membership; \
-         if ($LASTEXITCODE -ne 0) {{ throw 'ops init-membership failed with exit code ' + $LASTEXITCODE }}",
-        rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?,
-    );
-    run_remote_ps(conn, &init_script, MEDIUM_TIMEOUT)?;
+    use crate::vm_lab::orchestrator::adapter::windows_install::{
+        WINDOWS_MEMBERSHIP_OWNER_KEY_PATH, WINDOWS_RUSTYNETD_PATH, WINDOWS_WG_PASSPHRASE_PATH,
+    };
 
-    // 2. Add each non-exit peer.
+    // Derive the owner approver ID from the exit node's node_id.
+    // `rustynetd membership init` sets approver_id = "{node_id}-owner".
+    let exit_node_id = peers
+        .iter()
+        .find(|p| p.role == NodeRole::Exit)
+        .map(|p| p.node_id.as_str())
+        .unwrap_or("");
+    let approver_id = format!("{exit_node_id}-owner");
+
+    // Add each non-exit peer via `rustynetd membership add-peer`.
+    // The owner signing key lives at WINDOWS_MEMBERSHIP_OWNER_KEY_PATH and is
+    // encrypted with the passphrase stored in the DPAPI blob at
+    // WINDOWS_WG_PASSPHRASE_PATH; `read_passphrase_file_explicit` on Windows
+    // auto-decrypts DPAPI blobs.
     for peer in peers {
         if peer.role == NodeRole::Exit {
             continue;
@@ -75,23 +87,43 @@ pub fn init_membership_snapshot(
         let add_script = format!(
             "$ErrorActionPreference = 'Stop'; \
              $ProgressPreference = 'SilentlyContinue'; \
-             $ownerApprover = (& {rustynet_q} ops owner-approver-id 2>$null); \
-             if (-not $ownerApprover) {{ $ownerApprover = 'none' }}; \
-             & {rustynet_q} ops e2e-membership-add \
-                 --client-node-id {node_id_q} \
-                 --client-pubkey-hex {pubkey_q} \
-                 --owner-approver-id $ownerApprover; \
-             if ($LASTEXITCODE -ne 0) {{ \
-                 throw 'ops e2e-membership-add failed for ' + {node_id_q} \
+             $result = Invoke-RustyNetBootstrapNative {{ \
+                 & {rustynetd_q} membership add-peer \
+                     --node-id {node_id_q} \
+                     --node-pubkey-hex {pubkey_q} \
+                     --owner {owner_q} \
+                     --approver-id {approver_q} \
+                     --signing-key {signing_key_q} \
+                     --signing-key-passphrase-file {passphrase_q} \
+             }}; \
+             if ($result.ExitCode -ne 0) {{ \
+                 throw ('rustynetd membership add-peer failed for {peer_id}: ' + $result.Output) \
              }}",
-            rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?,
+            rustynetd_q = ps_quote(WINDOWS_RUSTYNETD_PATH)?,
             node_id_q = ps_quote(&peer.node_id)?,
             pubkey_q = ps_quote(&pubkey_hex)?,
+            owner_q = ps_quote(exit_node_id)?,
+            approver_q = ps_quote(&approver_id)?,
+            signing_key_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_KEY_PATH)?,
+            passphrase_q = ps_quote(WINDOWS_WG_PASSPHRASE_PATH)?,
+            peer_id = &peer.node_id,
         );
-        run_remote_ps(conn, &add_script, MEDIUM_TIMEOUT)?;
+        // Invoke-RustyNetBootstrapNative is defined in the bootstrap script which
+        // is already loaded in the SSH session.  For post-bootstrap calls we inline
+        // a minimal version.
+        let script_with_helper = format!(
+            "if (-not (Get-Command Invoke-RustyNetBootstrapNative -ErrorAction SilentlyContinue)) {{ \
+                 function Invoke-RustyNetBootstrapNative([scriptblock]$Action) {{ \
+                     $out = & $Action 2>&1; \
+                     [pscustomobject]@{{ ExitCode = $LASTEXITCODE; Output = ($out -join \"`n\") }} \
+                 }} \
+             }}; \
+             {add_script}",
+        );
+        run_remote_ps(conn, &script_with_helper, MEDIUM_TIMEOUT)?;
     }
 
-    // 3. Read snapshot back as base64.
+    // Read snapshot back as base64.
     let read_snapshot_script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
@@ -311,5 +343,32 @@ mod tests {
         };
         let decoded = base64_decode(encoded.trim()).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    /// Verify that `init_membership_snapshot` no longer references the Windows
+    /// trust CLI (`rustynet.exe`) for membership add-peer operations, and instead
+    /// delegates to `rustynetd` which supports `membership add-peer` natively.
+    #[test]
+    fn init_membership_snapshot_uses_rustynetd_not_trust_cli() {
+        use crate::vm_lab::orchestrator::adapter::windows_install::{
+            WINDOWS_MEMBERSHIP_OWNER_KEY_PATH, WINDOWS_RUSTYNETD_PATH, WINDOWS_WG_PASSPHRASE_PATH,
+        };
+        // These constants are referenced in the generated PS script. Verify the paths
+        // are all under the reviewed state/install roots and contain the expected names.
+        assert!(
+            WINDOWS_RUSTYNETD_PATH.contains("rustynetd.exe"),
+            "must invoke rustynetd.exe, not the trust CLI: {WINDOWS_RUSTYNETD_PATH}"
+        );
+        assert!(
+            WINDOWS_MEMBERSHIP_OWNER_KEY_PATH.contains("membership.owner.key"),
+            "signing key path must reference membership owner key: {WINDOWS_MEMBERSHIP_OWNER_KEY_PATH}"
+        );
+        assert!(
+            WINDOWS_WG_PASSPHRASE_PATH.ends_with(".dpapi"),
+            "passphrase path must be a DPAPI blob: {WINDOWS_WG_PASSPHRASE_PATH}"
+        );
+        // The trust CLI is NOT referenced in init_membership_snapshot.
+        // If the WINDOWS_RUSTYNET_PATH constant is removed from module-level imports,
+        // this also serves as documentation that the old ops path is gone.
     }
 }

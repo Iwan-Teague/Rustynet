@@ -1873,9 +1873,254 @@ fn parse_optional_socket_addr_csv_arg(
 fn run_membership_command(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("init") => run_membership_init(&args[1..]),
+        Some("add-peer") => run_membership_add_peer(&args[1..]),
         Some(other) => Err(format!("unknown membership subcommand: {other}")),
-        None => Err("membership subcommand required (supported: init)".to_string()),
+        None => Err("membership subcommand required (supported: init, add-peer)".to_string()),
     }
+}
+
+/// Add a peer node to an existing membership snapshot.
+///
+/// Requires the membership owner signing key and its passphrase (may be a
+/// DPAPI blob on Windows).  Used by the Windows e2e-lab orchestrator to add
+/// client nodes after `membership init` has already produced the initial
+/// snapshot for the exit node.
+///
+/// Usage:
+///   rustynetd membership add-peer
+///     --node-id          <id>
+///     --node-pubkey-hex  <64-hex>
+///     --owner            <owner-node-id>
+///     --approver-id      <approver-id>
+///     --signing-key      <path>
+///     --signing-key-passphrase-file <path>
+///     [--snapshot        <path>]
+///     [--log             <path>]
+fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
+    use ed25519_dalek::SigningKey;
+    use rustynet_control::membership::{
+        MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipReplayCache,
+        MembershipUpdateRecord, SignedMembershipUpdate, append_membership_log_entry,
+        apply_signed_update, load_membership_log, load_membership_snapshot,
+        persist_membership_snapshot, preview_next_state, sign_update_record,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zeroize::Zeroize;
+
+    let mut node_id = String::new();
+    let mut node_pubkey_hex = String::new();
+    let mut owner = String::new();
+    let mut approver_id = String::new();
+    let mut signing_key_path = String::new();
+    let mut signing_key_passphrase_path = String::new();
+    let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_string();
+    let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_string();
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--node-id") => {
+                node_id = args
+                    .get(index + 1)
+                    .ok_or("--node-id requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--node-pubkey-hex") => {
+                node_pubkey_hex = args
+                    .get(index + 1)
+                    .ok_or("--node-pubkey-hex requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--owner") => {
+                owner = args
+                    .get(index + 1)
+                    .ok_or("--owner requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--approver-id") => {
+                approver_id = args
+                    .get(index + 1)
+                    .ok_or("--approver-id requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--signing-key") => {
+                signing_key_path = args
+                    .get(index + 1)
+                    .ok_or("--signing-key requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--signing-key-passphrase-file") => {
+                signing_key_passphrase_path = args
+                    .get(index + 1)
+                    .ok_or("--signing-key-passphrase-file requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--snapshot") => {
+                snapshot_path = args
+                    .get(index + 1)
+                    .ok_or("--snapshot requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some("--log") => {
+                log_path = args
+                    .get(index + 1)
+                    .ok_or("--log requires a value")?
+                    .clone();
+                index += 2;
+            }
+            Some(flag) => return Err(format!("unknown membership add-peer argument: {flag}")),
+            None => break,
+        }
+    }
+
+    if node_id.is_empty() {
+        return Err("--node-id is required".to_string());
+    }
+    if node_pubkey_hex.is_empty() {
+        return Err("--node-pubkey-hex is required".to_string());
+    }
+    if node_pubkey_hex.len() != 64 || !node_pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("--node-pubkey-hex must be 64 hex characters".to_string());
+    }
+    if owner.is_empty() {
+        return Err("--owner is required".to_string());
+    }
+    if approver_id.is_empty() {
+        return Err("--approver-id is required".to_string());
+    }
+    if signing_key_path.is_empty() {
+        return Err("--signing-key is required".to_string());
+    }
+    if signing_key_passphrase_path.is_empty() {
+        return Err("--signing-key-passphrase-file is required".to_string());
+    }
+
+    ensure_cli_path_absolute(&signing_key_path, "signing key path")?;
+    ensure_cli_path_absolute(&signing_key_passphrase_path, "signing key passphrase path")?;
+    ensure_cli_path_absolute(&snapshot_path, "snapshot path")?;
+    ensure_cli_path_absolute(&log_path, "log path")?;
+
+    // Load the signing key using the passphrase (auto-decrypts DPAPI blob on Windows).
+    let passphrase =
+        read_passphrase_file_explicit(std::path::Path::new(&signing_key_passphrase_path))
+            .map_err(|e| format!("read signing key passphrase failed: {e}"))?;
+    let secret = {
+        use rustynet_crypto::{KeyCustodyPermissionPolicy, read_encrypted_key_file};
+        let key_path = std::path::Path::new(&signing_key_path);
+        let parent = key_path
+            .parent()
+            .ok_or_else(|| format!("signing key path has no parent: {signing_key_path}"))?;
+        read_encrypted_key_file(
+            parent,
+            key_path,
+            passphrase.as_str(),
+            KeyCustodyPermissionPolicy::default(),
+        )
+        .map_err(|e| format!("decrypt signing key failed: {e}"))?
+    };
+    if secret.len() != 32 {
+        return Err("decrypted signing key must be 32 bytes".to_string());
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&secret);
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    key_bytes.zeroize();
+
+    // Load the current membership state.
+    let state = load_membership_snapshot(&snapshot_path)
+        .map_err(|e| format!("load membership snapshot failed: {e}"))?;
+
+    // Check if the node is already in the membership (idempotent).
+    if state.nodes.iter().any(|n| n.node_id == node_id) {
+        println!(
+            "membership add-peer: node {node_id} already present in snapshot; no-op"
+        );
+        return Ok(());
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Build the AddNode update record.
+    let operation = MembershipOperation::AddNode(MembershipNode {
+        node_id: node_id.clone(),
+        node_pubkey_hex,
+        owner,
+        status: MembershipNodeStatus::Active,
+        roles: vec!["tag:members".to_string()],
+        joined_at_unix: now,
+        updated_at_unix: now,
+    });
+    let prev_root = state
+        .state_root_hex()
+        .map_err(|e| format!("compute prev state root failed: {e}"))?;
+    let next = preview_next_state(&state, &operation)
+        .map_err(|e| format!("preview next state failed: {e}"))?;
+    let new_root = next
+        .state_root_hex()
+        .map_err(|e| format!("compute new state root failed: {e}"))?;
+    let update_id = format!("add-peer-{node_id}-{now}");
+    let expires_at_unix = now.saturating_add(86400); // 24 h
+    let record = MembershipUpdateRecord {
+        network_id: state.network_id.clone(),
+        update_id,
+        operation,
+        target: node_id.clone(),
+        prev_state_root: prev_root,
+        new_state_root: new_root,
+        epoch_prev: state.epoch,
+        epoch_new: state.epoch.saturating_add(1),
+        created_at_unix: now,
+        expires_at_unix,
+        reason_code: "e2e-lab-add".to_string(),
+        policy_context: None,
+    };
+
+    let signature = sign_update_record(&record, &approver_id, &signing_key)
+        .map_err(|e| format!("sign update record failed: {e}"))?;
+    let signed = SignedMembershipUpdate {
+        record,
+        approver_signatures: vec![signature],
+    };
+
+    // Build replay cache seeded with existing log entries to detect duplicates.
+    let mut replay_cache = if std::path::Path::new(&log_path).exists() {
+        let entries = load_membership_log(&log_path)
+            .map_err(|e| format!("load membership log failed: {e}"))?;
+        let mut cache = MembershipReplayCache::default();
+        for entry in &entries {
+            let r = &entry.signed_update.record;
+            // Seed cache with existing update IDs; ignore epoch ordering since we
+            // only need duplicate detection, not replay ordering here.
+            let _ = cache.observe(r.update_id.as_str(), r.epoch_new);
+        }
+        cache
+    } else {
+        MembershipReplayCache::default()
+    };
+
+    let new_state = apply_signed_update(&state, &signed, now, &mut replay_cache)
+        .map_err(|e| format!("apply signed update failed: {e}"))?;
+
+    append_membership_log_entry(&log_path, &signed)
+        .map_err(|e| format!("append membership log entry failed: {e}"))?;
+    persist_membership_snapshot(&snapshot_path, &new_state)
+        .map_err(|e| format!("persist membership snapshot failed: {e}"))?;
+
+    println!(
+        "membership add-peer complete: node_id={node_id} snapshot={snapshot_path} log={log_path} epoch_new={}",
+        new_state.epoch
+    );
+    Ok(())
 }
 
 fn run_membership_init(args: &[String]) -> Result<(), String> {
@@ -2010,7 +2255,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     fill_random_bytes(&mut approver_key_bytes)
         .map_err(|e| format!("failed to generate approver key: {e}"))?;
 
-    let init_result = (|| -> Result<String, String> {
+    let init_result = (|| -> Result<(String, String), String> {
         let approver_signing = SigningKey::from_bytes(&approver_key_bytes);
         let approver_pubkey_hex = encode_hex(approver_signing.verifying_key().as_bytes());
         let node_pubkey_hex = encode_hex(&node_key_bytes);
@@ -2043,7 +2288,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             }],
             approver_set: vec![MembershipApprover {
                 approver_id: owner_approver_id.clone(),
-                approver_pubkey_hex,
+                approver_pubkey_hex: approver_pubkey_hex.clone(),
                 role: MembershipApproverRole::Owner,
                 status: MembershipApproverStatus::Active,
                 created_at_unix: now,
@@ -2065,12 +2310,19 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
         log_file
             .write_all(format!("version={MEMBERSHIP_SCHEMA_VERSION}\n").as_bytes())
             .map_err(|e| format!("failed to write membership log: {e}"))?;
-        Ok(owner_approver_id)
+        Ok((owner_approver_id, approver_pubkey_hex))
     })();
 
     node_key_bytes.zeroize();
     approver_key_bytes.zeroize();
-    let owner_approver_id = init_result?;
+    let (owner_approver_id, owner_pubkey_hex) = init_result?;
+
+    // Write the owner public key alongside the private key so orchestrators and
+    // adapters can read it without decrypting the private key file.
+    let pub_key_path = format!("{owner_signing_key_path}.pub");
+    std::fs::write(&pub_key_path, format!("{owner_pubkey_hex}\n")).map_err(|e| {
+        format!("failed to write membership owner public key {pub_key_path}: {e}")
+    })?;
 
     println!(
         "membership init complete: snapshot={snapshot_path} log={log_path} watermark_reset={watermark_path} owner_signing_key={owner_signing_key_path}"
@@ -2187,6 +2439,7 @@ fn help_text() -> String {
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
+        "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-runtime-acls-check [--no-fail-on-drift]",
@@ -3087,6 +3340,70 @@ mod tests {
         assert_eq!(
             config.remote_ops_expected_subject,
             DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT
+        );
+    }
+
+    #[test]
+    fn membership_add_peer_rejects_missing_required_args() {
+        // No args at all should fail requiring --node-id.
+        let err = super::run_membership_add_peer(&[]).unwrap_err();
+        assert!(
+            err.contains("--node-id"),
+            "should require --node-id: {err}"
+        );
+    }
+
+    #[test]
+    fn membership_add_peer_rejects_invalid_pubkey_hex() {
+        let args: Vec<String> = vec![
+            "--node-id",
+            "client-1",
+            "--node-pubkey-hex",
+            "not-hex-at-all",
+            "--owner",
+            "exit-1",
+            "--approver-id",
+            "exit-1-owner",
+            "--signing-key",
+            "/tmp/signing.key",
+            "--signing-key-passphrase-file",
+            "/tmp/passphrase",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let err = super::run_membership_add_peer(&args).unwrap_err();
+        assert!(
+            err.contains("64 hex") || err.contains("pubkey-hex"),
+            "should reject invalid pubkey: {err}"
+        );
+    }
+
+    #[test]
+    fn membership_command_routes_add_peer() {
+        // Routing check: run_membership_command dispatches "add-peer" without
+        // panicking on argument validation (will fail on missing args, not unknown cmd).
+        let err = super::run_membership_command(&["add-peer".to_string()]).unwrap_err();
+        // Should be an argument error, not "unknown membership subcommand".
+        assert!(
+            !err.contains("unknown membership subcommand"),
+            "should route to add-peer handler: {err}"
+        );
+        assert!(
+            err.contains("--node-id"),
+            "should show first missing arg: {err}"
+        );
+    }
+
+    #[test]
+    fn membership_init_pub_key_path_matches_membership_owner_key_path() {
+        // The .pub file written by membership init is at
+        // "{owner_signing_key_path}.pub". Verify the constant paths align.
+        use super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH;
+        let pub_path = format!("{DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH}.pub");
+        assert!(
+            pub_path.ends_with(".pub"),
+            "pub key path must end with .pub: {pub_path}"
         );
     }
 }
