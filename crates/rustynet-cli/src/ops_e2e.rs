@@ -1660,6 +1660,178 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
     ))
 }
 
+// ── Local bundle issuance (vm_lab Windows exit adapter) ───────────────────────
+
+/// Parse a `KEY=VALUE` env content string without touching the filesystem.
+fn parse_simple_env_content(
+    content: &str,
+    label: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for (index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_value)) = trimmed.split_once('=') else {
+            return Err(format!(
+                "{label} line {} is missing '=': {trimmed}",
+                index + 1
+            ));
+        };
+        if !validate_env_key_like(key) {
+            return Err(format!("{label} line {} has invalid key: {key}", index + 1));
+        }
+        let value = crate::env_file::parse_env_value(raw_value).map_err(|err| {
+            format!(
+                "{label} line {} has invalid value for {key}: {err}",
+                index + 1
+            )
+        })?;
+        if values.insert(key.to_string(), value).is_some() {
+            return Err(format!("{label} contains duplicate key: {key}"));
+        }
+    }
+    Ok(values)
+}
+
+/// Generate a 32-byte ephemeral signing secret from the OS CSPRNG.
+fn generate_ephemeral_signing_secret() -> Result<Vec<u8>, String> {
+    let mut secret = vec![0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut secret)
+        .map_err(|err| format!("generate ephemeral signing secret failed: {err}"))?;
+    Ok(secret)
+}
+
+/// Issue assignment bundles locally on the orchestrator process.
+///
+/// Used by the vm_lab Windows exit adapter in place of SSH-ing to the remote
+/// node and invoking `rustynet.exe ops e2e-issue-assignment-bundles-from-env`,
+/// which fails because the Windows trust CLI does not support `ops` subcommands.
+/// An ephemeral signing key is generated for each invocation.
+pub(crate) fn issue_assignment_bundles_locally(
+    env_content: &str,
+    issue_dir: &Path,
+) -> Result<(), String> {
+    let env_values = parse_simple_env_content(env_content, "assignment env")?;
+    let nodes_spec = env_required_value(&env_values, "NODES_SPEC", "assignment env")?;
+    let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "assignment env")?;
+    let assignments_spec = env_required_value(&env_values, "ASSIGNMENTS_SPEC", "assignment env")?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    ensure_safe_spec("assignments-spec", assignments_spec.as_str())?;
+    let nodes = parse_generic_nodes(nodes_spec.as_str())?;
+    let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
+    let assignment_specs = parse_generic_assignment_specs(assignments_spec.as_str())?;
+    let mut signing_secret = generate_ephemeral_signing_secret()?;
+    let result = (|| -> Result<(), String> {
+        let (_, bundles) = issue_assignment_bundle_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignment_specs.as_slice(),
+            300,
+        )?;
+        for bundle in &bundles {
+            let output_path = issue_dir.join(format!(
+                "rn-assignment-{}.assignment",
+                bundle.target_node_id
+            ));
+            fs::write(&output_path, bundle.wire.as_bytes()).map_err(|err| {
+                format!("write assignment bundle ({}): {err}", output_path.display())
+            })?;
+        }
+        Ok(())
+    })();
+    signing_secret.zeroize();
+    result
+}
+
+/// Issue traversal bundles locally on the orchestrator process.
+///
+/// Writes one aggregate `rn-traversal-{node_id}.traversal` file per node to
+/// `issue_dir`; these are the files the distribute stage looks for.
+pub(crate) fn issue_traversal_bundles_locally(
+    env_content: &str,
+    issue_dir: &Path,
+) -> Result<(), String> {
+    let env_values = parse_simple_env_content(env_content, "traversal env")?;
+    let nodes_spec = env_required_value(&env_values, "NODES_SPEC", "traversal env")?;
+    let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "traversal env")?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    let nodes = parse_generic_nodes(nodes_spec.as_str())?;
+    let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
+    let mut signing_secret = generate_ephemeral_signing_secret()?;
+    let result = (|| -> Result<(), String> {
+        let artifacts = issue_traversal_bundle_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            120,
+        )?;
+        for node in &nodes {
+            let aggregate = artifacts
+                .aggregate_bundles
+                .get(node.node_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let output_path = issue_dir.join(format!("rn-traversal-{}.traversal", node.node_id));
+            fs::write(&output_path, aggregate.as_bytes()).map_err(|err| {
+                format!(
+                    "write traversal aggregate bundle ({}): {err}",
+                    output_path.display()
+                )
+            })?;
+        }
+        Ok(())
+    })();
+    signing_secret.zeroize();
+    result
+}
+
+/// Issue DNS-zone bundles locally on the orchestrator process.
+///
+/// Writes one `rn-dns-zone-{node_id}.dns-zone` file per node to `issue_dir`.
+pub(crate) fn issue_dns_zone_bundles_locally(
+    env_content: &str,
+    issue_dir: &Path,
+) -> Result<(), String> {
+    let env_values = parse_simple_env_content(env_content, "dns-zone env")?;
+    let nodes_spec = env_required_value(&env_values, "NODES_SPEC", "dns-zone env")?;
+    let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "dns-zone env")?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    let zone_name = env_values
+        .get("DNS_ZONE_NAME")
+        .cloned()
+        .unwrap_or_else(|| "rustynet".to_string());
+    ensure_safe_token("dns-zone-name", zone_name.as_str())?;
+    let nodes = parse_generic_nodes(nodes_spec.as_str())?;
+    let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
+    let mut signing_secret = generate_ephemeral_signing_secret()?;
+    let result = (|| -> Result<(), String> {
+        let (_, bundles) = issue_dns_zone_bundle_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            zone_name.as_str(),
+            300,
+        )?;
+        for bundle in &bundles {
+            let output_path =
+                issue_dir.join(format!("rn-dns-zone-{}.dns-zone", bundle.subject_node_id));
+            fs::write(&output_path, bundle.wire.as_bytes()).map_err(|err| {
+                format!("write dns zone bundle ({}): {err}", output_path.display())
+            })?;
+        }
+        Ok(())
+    })();
+    signing_secret.zeroize();
+    result
+}
+
 struct TwoNodeTraversalArtifacts {
     verifier_key_hex: String,
     exit_bundle_wire: String,

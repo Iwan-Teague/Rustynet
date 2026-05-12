@@ -1969,10 +1969,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
                 index += 2;
             }
             Some("--log") => {
-                log_path = args
-                    .get(index + 1)
-                    .ok_or("--log requires a value")?
-                    .clone();
+                log_path = args.get(index + 1).ok_or("--log requires a value")?.clone();
                 index += 2;
             }
             Some(flag) => return Err(format!("unknown membership add-peer argument: {flag}")),
@@ -2039,9 +2036,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
 
     // Check if the node is already in the membership (idempotent).
     if state.nodes.iter().any(|n| n.node_id == node_id) {
-        println!(
-            "membership add-peer: node {node_id} already present in snapshot; no-op"
-        );
+        println!("membership add-peer: node {node_id} already present in snapshot; no-op");
         return Ok(());
     }
 
@@ -2320,9 +2315,8 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     // Write the owner public key alongside the private key so orchestrators and
     // adapters can read it without decrypting the private key file.
     let pub_key_path = format!("{owner_signing_key_path}.pub");
-    std::fs::write(&pub_key_path, format!("{owner_pubkey_hex}\n")).map_err(|e| {
-        format!("failed to write membership owner public key {pub_key_path}: {e}")
-    })?;
+    std::fs::write(&pub_key_path, format!("{owner_pubkey_hex}\n"))
+        .map_err(|e| format!("failed to write membership owner public key {pub_key_path}: {e}"))?;
 
     println!(
         "membership init complete: snapshot={snapshot_path} log={log_path} watermark_reset={watermark_path} owner_signing_key={owner_signing_key_path}"
@@ -3347,10 +3341,7 @@ mod tests {
     fn membership_add_peer_rejects_missing_required_args() {
         // No args at all should fail requiring --node-id.
         let err = super::run_membership_add_peer(&[]).unwrap_err();
-        assert!(
-            err.contains("--node-id"),
-            "should require --node-id: {err}"
-        );
+        assert!(err.contains("--node-id"), "should require --node-id: {err}");
     }
 
     #[test]
