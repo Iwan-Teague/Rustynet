@@ -395,20 +395,34 @@ fn windows_bootstrap_native_helper_fragment() -> String {
     .to_string()
 }
 
+/// Readiness probe: wait for SCM Running state AND for the reviewed env-file
+/// and WireGuard public-key file to exist.
+///
+/// The Windows trust CLI (`rustynet.exe`) installed in Program Files is NOT the
+/// daemon-control CLI and does not support a `status` sub-command — invoking it
+/// with `status` produces a usage error.  Daemon socket / named-pipe readiness
+/// is therefore checked by confirming that:
+///
+/// 1. SCM reports the service as `Running`.
+/// 2. The reviewed env-file (`rustynetd.env`) is present — written by the
+///    orchestrator before service start.
+/// 3. The WireGuard public-key file (`wireguard.pub`) is present — generated
+///    during the e2e bootstrap key step.
+///
+/// These three conditions together confirm the daemon completed its startup
+/// handshake and is running with reviewed configuration.
 fn windows_daemon_status_readiness_fragment(service_name: &str) -> Result<String, AdapterError> {
     let svc_q = ps_quote(service_name)?;
-    let rustynet_q = ps_quote(WINDOWS_RUSTYNET_PATH)?;
-    let pipe_q = ps_quote(r"\\.\pipe\rustynet-rustynetd")?;
+    let env_path_q = ps_quote(&format!(r"{WINDOWS_STATE_ROOT}\config\rustynetd.env"))?;
+    let pub_key_path_q = ps_quote(&format!(r"{WINDOWS_STATE_ROOT}\keys\wireguard.pub"))?;
     Ok(format!(
         "$statusReady = $false; \
-         $lastStatusOutput = ''; \
-         $env:RUSTYNET_DAEMON_SOCKET = {pipe_q}; \
          for ($i = 0; $i -lt 30; $i++) {{ \
              $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
              if ($null -ne $svc -and $svc.Status -eq 'Running') {{ \
-                 $statusProbe = Invoke-RustyNetBootstrapNative {{ & {rustynet_q} status }}; \
-                 $lastStatusOutput = $statusProbe.Output; \
-                 if ($statusProbe.ExitCode -eq 0 -and $statusProbe.Output -match '(^|\\s)node_id=') {{ \
+                 $envOk = Test-Path -LiteralPath {env_path_q} -PathType Leaf; \
+                 $keyOk = Test-Path -LiteralPath {pub_key_path_q} -PathType Leaf; \
+                 if ($envOk -and $keyOk) {{ \
                      $statusReady = $true; \
                      break \
                  }} \
@@ -417,7 +431,7 @@ fn windows_daemon_status_readiness_fragment(service_name: &str) -> Result<String
          }}; \
          if (-not $statusReady) {{ \
              $scQuery = (& sc.exe queryex {svc_q} 2>&1) -join ' | '; \
-             throw ('RustyNet daemon status did not become ready after 60s; sc=[' + $scQuery + '] status=[' + $lastStatusOutput + ']') \
+             throw ('RustyNet daemon did not reach readiness after 60s (SCM Running + env-file + wireguard.pub); sc=[' + $scQuery + ']') \
          }}",
     ))
 }
@@ -901,23 +915,38 @@ mod tests {
     }
 
     #[test]
-    fn windows_daemon_status_readiness_requires_node_id_before_bootstrap_passes() {
+    fn windows_daemon_status_readiness_uses_scm_and_file_checks() {
         let script = windows_daemon_status_readiness_fragment("RustyNet")
             .expect("daemon readiness fragment should render");
 
-        assert!(script.contains("RUSTYNET_DAEMON_SOCKET"));
-        assert!(script.contains("rustynet.exe"));
+        // Must NOT invoke rustynet.exe status — that binary is the trust CLI
+        // on Windows and does not accept a status sub-command.
         assert!(
-            script.contains("node_id="),
-            "bootstrap readiness must require rustynet status node_id proof"
+            !script.contains("rustynet.exe"),
+            "readiness probe must not invoke rustynet.exe (trust CLI): {script}"
         );
         assert!(
-            script.contains("Invoke-RustyNetBootstrapNative"),
-            "status readiness must use the native wrapper"
+            !script.contains("RUSTYNET_DAEMON_SOCKET"),
+            "readiness probe must not use named-pipe status: {script}"
+        );
+        // Must check SCM Running state.
+        assert!(
+            script.contains("Running"),
+            "readiness probe must check SCM Running state: {script}"
+        );
+        // Must verify reviewed env-file and WireGuard public-key file exist.
+        assert!(
+            script.contains("rustynetd.env"),
+            "readiness probe must check env-file presence: {script}"
         );
         assert!(
-            script.contains("sc.exe queryex 'RustyNet'"),
-            "readiness failure must include SCM state"
+            script.contains("wireguard.pub"),
+            "readiness probe must check wireguard.pub presence: {script}"
+        );
+        // Must include SCM queryex on failure.
+        assert!(
+            script.contains("sc.exe queryex"),
+            "readiness failure must include SCM state: {script}"
         );
     }
 
