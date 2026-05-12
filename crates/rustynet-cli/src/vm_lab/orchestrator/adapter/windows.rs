@@ -191,13 +191,30 @@ impl NodeAdapter for WindowsNodeAdapter {
         env_content: &str,
         local_out_dir: &std::path::Path,
     ) -> Result<(), AdapterError> {
-        windows_traffic::issue_bundles_to_dir(
-            &self.conn,
-            windows_install::WINDOWS_RUSTYNET_PATH,
-            &kind,
-            env_content,
-            local_out_dir,
-        )
+        // Bundle issuance runs locally on the orchestrator process.  The Windows
+        // trust CLI (`rustynet.exe`) only supports `trust` subcommands and cannot
+        // run `ops e2e-issue-*`; the full ops CLI is Linux-only.  Generate an
+        // ephemeral signing key here and produce the bundle files locally.
+        std::fs::create_dir_all(local_out_dir).map_err(|e| AdapterError::Io {
+            message: format!("create bundle output dir: {e}"),
+        })?;
+        match kind {
+            BundleKind::Assignment => {
+                crate::ops_e2e::issue_assignment_bundles_locally(env_content, local_out_dir)
+                    .map_err(|message| AdapterError::Protocol { message })
+            }
+            BundleKind::Traversal => {
+                crate::ops_e2e::issue_traversal_bundles_locally(env_content, local_out_dir)
+                    .map_err(|message| AdapterError::Protocol { message })
+            }
+            BundleKind::DnsZone => {
+                crate::ops_e2e::issue_dns_zone_bundles_locally(env_content, local_out_dir)
+                    .map_err(|message| AdapterError::Protocol { message })
+            }
+            BundleKind::Membership => Err(AdapterError::Protocol {
+                message: "Membership bundles are issued via init_membership_snapshot".to_string(),
+            }),
+        }
     }
 }
 
