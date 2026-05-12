@@ -25,12 +25,12 @@ pub const WINDOWS_MEMBERSHIP_SNAPSHOT_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.snapshot";
 
 // Paths written by the e2e bootstrap sequence.
-const WINDOWS_WG_PASSPHRASE_PATH: &str =
+pub const WINDOWS_WG_PASSPHRASE_PATH: &str =
     r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi";
 const WINDOWS_MEMBERSHIP_LOG_PATH: &str = r"C:\ProgramData\RustyNet\membership\membership.log";
 const WINDOWS_MEMBERSHIP_WATERMARK_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.watermark";
-const WINDOWS_MEMBERSHIP_OWNER_KEY_PATH: &str =
+pub const WINDOWS_MEMBERSHIP_OWNER_KEY_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.owner.key";
 const WINDOWS_TRUST_SIGNING_KEY_PATH: &str = r"C:\ProgramData\RustyNet\trust\trust-evidence.key";
 const WINDOWS_TRUST_VERIFIER_KEY_PATH: &str = r"C:\ProgramData\RustyNet\trust\trust-evidence.pub";
