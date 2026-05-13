@@ -83,8 +83,13 @@ pub fn init_membership_snapshot(
 }
 
 /// Distribute a signed bundle to this (non-exit) node.
-/// The bundle is scp'd to a temp path, then installed atomically via
-/// `install -m 0640 -o root -g rustynetd`.
+/// The bundle is scp'd to a temp path, then installed atomically.
+///
+/// Membership snapshots require mode 0600 owned by the daemon user because
+/// `load_membership_snapshot` uses a strict `mode & 0o077 != 0` check.
+/// Other bundles (assignment, traversal, dns-zone) are installed as
+/// root:rustynetd 0640; the daemon's trust-evidence loader accepts group-read
+/// for root-owned files (`mode & 0o037`).
 pub fn distribute_signed_bundle(
     conn: &NodeConnection,
     kind: BundleKind,
@@ -98,13 +103,20 @@ pub fn distribute_signed_bundle(
         .rsplit_once('/')
         .map(|(dir, _)| dir)
         .unwrap_or("/var/lib/rustynet");
-    // install with -o root and into root-owned directories needs sudo;
-    // the bash orchestrator path also runs these via run_root.
+    // Membership snapshot: mode 0600 owned by the daemon user so the strict
+    // `mode & 0o077 == 0` check in load_membership_snapshot passes.
+    // Other bundles: mode 0640 root:rustynetd (daemon accepts group-read for
+    // root-owned trust evidence).
+    let (mode, owner) = if matches!(kind, BundleKind::Membership) {
+        ("0600", "rustynetd")
+    } else {
+        ("0640", "root")
+    };
     ssh::run_remote(
         conn,
         &format!(
             "sudo -n install -d -m 0700 -o rustynetd -g rustynetd {install_dir} && \
-             sudo -n install -m 0640 -o root -g rustynetd '{remote_tmp}' '{install_dst}' && \
+             sudo -n install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
              sudo -n rm -f '{remote_tmp}'"
         ),
         SHORT_TIMEOUT,
