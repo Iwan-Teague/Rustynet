@@ -93,6 +93,9 @@ impl NodeAdapter for AndroidNodeAdapter {
     fn distribute_signed_bundle(&self, _: BundleKind, _: &Path) -> Result<(), AdapterError> {
         Err(android_unsupported())
     }
+    fn distribute_verifier_key(&self, _: BundleKind, _: &Path) -> Result<(), AdapterError> {
+        Err(android_unsupported())
+    }
     fn run_validator(&self, _: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
         Err(android_unsupported())
     }

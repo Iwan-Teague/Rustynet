@@ -1726,7 +1726,7 @@ pub(crate) fn issue_assignment_bundles_locally(
     let assignment_specs = parse_generic_assignment_specs(assignments_spec.as_str())?;
     let mut signing_secret = generate_ephemeral_signing_secret()?;
     let result = (|| -> Result<(), String> {
-        let (_, bundles) = issue_assignment_bundle_artifacts(
+        let (verifier_hex, bundles) = issue_assignment_bundle_artifacts(
             signing_secret.as_slice(),
             nodes.as_slice(),
             allow_pairs.as_slice(),
@@ -1742,6 +1742,11 @@ pub(crate) fn issue_assignment_bundles_locally(
                 format!("write assignment bundle ({}): {err}", output_path.display())
             })?;
         }
+        // Write verifier public key so distribute stage can deliver it to all nodes.
+        let pub_path = issue_dir.join("rn-assignment.pub");
+        fs::write(&pub_path, format!("{verifier_hex}\n").as_bytes()).map_err(|err| {
+            format!("write assignment verifier key ({}): {err}", pub_path.display())
+        })?;
         Ok(())
     })();
     signing_secret.zeroize();
@@ -1785,6 +1790,11 @@ pub(crate) fn issue_traversal_bundles_locally(
                 )
             })?;
         }
+        // Write verifier public key so distribute stage can deliver it to all nodes.
+        let pub_path = issue_dir.join("rn-traversal.pub");
+        fs::write(&pub_path, format!("{}\n", artifacts.verifier_key_hex).as_bytes()).map_err(
+            |err| format!("write traversal verifier key ({}): {err}", pub_path.display()),
+        )?;
         Ok(())
     })();
     signing_secret.zeroize();
@@ -1812,7 +1822,7 @@ pub(crate) fn issue_dns_zone_bundles_locally(
     let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
     let mut signing_secret = generate_ephemeral_signing_secret()?;
     let result = (|| -> Result<(), String> {
-        let (_, bundles) = issue_dns_zone_bundle_artifacts(
+        let (verifier_hex, bundles) = issue_dns_zone_bundle_artifacts(
             signing_secret.as_slice(),
             nodes.as_slice(),
             allow_pairs.as_slice(),
@@ -1826,6 +1836,11 @@ pub(crate) fn issue_dns_zone_bundles_locally(
                 format!("write dns zone bundle ({}): {err}", output_path.display())
             })?;
         }
+        // Write verifier public key so distribute stage can deliver it to all nodes.
+        let pub_path = issue_dir.join("rn-dns-zone.pub");
+        fs::write(&pub_path, format!("{verifier_hex}\n").as_bytes()).map_err(|err| {
+            format!("write dns-zone verifier key ({}): {err}", pub_path.display())
+        })?;
         Ok(())
     })();
     signing_secret.zeroize();
