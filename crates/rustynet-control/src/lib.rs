@@ -2623,7 +2623,7 @@ impl ControlPlaneCore {
                 "endpoint hint ttl must be greater than zero".to_string(),
             ));
         }
-        if request.ttl_secs > 300 {
+        if request.ttl_secs > 86400 {
             return Err(ControlPlaneError::Traversal(
                 "endpoint hint ttl exceeds max supported value".to_string(),
             ));
@@ -2888,7 +2888,7 @@ impl ControlPlaneCore {
                 "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
             ));
         }
-        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 300 {
+        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 86400 {
             return Err(ControlPlaneError::Traversal(
                 "coordination ttl exceeds max supported value".to_string(),
             ));
@@ -2962,7 +2962,7 @@ impl ControlPlaneCore {
         if bundle
             .expires_at_unix
             .saturating_sub(bundle.generated_at_unix)
-            > 300
+            > 86400
         {
             return false;
         }
@@ -3038,7 +3038,7 @@ impl ControlPlaneCore {
         if record.issued_at_unix >= record.expires_at_unix {
             return false;
         }
-        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 300 {
+        if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 86400 {
             return false;
         }
         if record.probe_start_unix > record.expires_at_unix {
@@ -3977,7 +3977,7 @@ fn serialize_traversal_coordination_payload(
             "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
         ));
     }
-    if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 300 {
+    if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 86400 {
         return Err(ControlPlaneError::Traversal(
             "coordination ttl exceeds max supported value".to_string(),
         ));
@@ -5582,10 +5582,10 @@ mod tests {
     fn endpoint_hint_signer_rejects_ttl_above_max() {
         let core = endpoint_hint_test_core();
         let mut request = endpoint_hint_request();
-        request.ttl_secs = 301;
+        request.ttl_secs = 86401;
         assert!(
             core.signed_endpoint_hint_bundle(request)
-                .expect_err("ttl=301 must fail")
+                .expect_err("ttl=86401 must fail")
                 .to_string()
                 .contains("ttl exceeds max supported value")
         );
@@ -5595,12 +5595,12 @@ mod tests {
     fn endpoint_hint_signer_accepts_ttl_at_max_boundary() {
         let core = endpoint_hint_test_core();
         let mut request = endpoint_hint_request();
-        request.ttl_secs = 300;
+        request.ttl_secs = 86400;
         let bundle = core
             .signed_endpoint_hint_bundle(request)
-            .expect("ttl=300 (boundary) must succeed");
+            .expect("ttl=86400 (boundary) must succeed");
         assert!(core.verify_signed_endpoint_hint_bundle(&bundle));
-        assert_eq!(bundle.expires_at_unix - bundle.generated_at_unix, 300);
+        assert_eq!(bundle.expires_at_unix - bundle.generated_at_unix, 86400);
     }
 
     #[test]
@@ -5828,7 +5828,7 @@ mod tests {
 
     #[test]
     fn endpoint_hint_verifier_rejects_ttl_window_above_max() {
-        // The signer caps TTL at 300s.  The verifier MUST also enforce
+        // The signer caps TTL at 86400s.  The verifier MUST also enforce
         // this bound — otherwise an attacker who reuses a leaked signing
         // key could mint arbitrarily long-lived bundles.
         let core = endpoint_hint_test_core();
@@ -5836,10 +5836,10 @@ mod tests {
             .signed_endpoint_hint_bundle(endpoint_hint_request())
             .expect("bundle must succeed");
         let mut tampered = bundle.clone();
-        tampered.expires_at_unix = tampered.generated_at_unix + 301;
+        tampered.expires_at_unix = tampered.generated_at_unix + 86401;
         assert!(
             !core.verify_signed_endpoint_hint_bundle(&tampered),
-            "verifier must reject TTL window > 300s"
+            "verifier must reject TTL window > 86400s"
         );
     }
 
@@ -6372,10 +6372,10 @@ mod tests {
                 node_a: "coord-node-a".to_string(),
                 node_b: "coord-node-b".to_string(),
                 issued_at_unix: 200,
-                expires_at_unix: 501,
+                expires_at_unix: 200 + 86401,
                 nonce: [0x44; 16],
             })
-            .expect_err("ttl > 300s must be rejected");
+            .expect_err("ttl > 86400s must be rejected");
         assert!(ttl_error.to_string().contains("ttl exceeds"));
 
         let node_error = core
