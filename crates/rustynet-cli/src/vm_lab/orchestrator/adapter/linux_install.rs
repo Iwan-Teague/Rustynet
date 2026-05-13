@@ -127,13 +127,13 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     // Stop service (best-effort — it may not be running).
     let _ = ssh::run_remote(
         conn,
-        "if systemctl is-active rustynetd >/dev/null 2>&1; then systemctl stop rustynetd; fi",
+        "if sudo systemctl is-active rustynetd >/dev/null 2>&1; then sudo systemctl stop rustynetd; fi",
         timeout,
     );
     ssh::run_remote(
         conn,
         &format!(
-            "rm -f {rustynetd} {rustynet} /etc/systemd/system/rustynetd.service && systemctl daemon-reload 2>/dev/null || true && rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet",
+            "sudo rm -f {rustynetd} {rustynet} /etc/systemd/system/rustynetd.service && sudo systemctl daemon-reload 2>/dev/null || true && sudo rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet",
             rustynetd = LINUX_RUSTYNETD_PATH,
             rustynet = LINUX_RUSTYNET_PATH,
         ),
@@ -146,7 +146,7 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
 
 fn run_systemctl(conn: &NodeConnection, action: &str) -> Result<(), AdapterError> {
     let timeout = Duration::from_secs(60);
-    ssh::run_remote(conn, &format!("systemctl {action} rustynetd"), timeout)?;
+    ssh::run_remote(conn, &format!("sudo systemctl {action} rustynetd"), timeout)?;
     Ok(())
 }
 
