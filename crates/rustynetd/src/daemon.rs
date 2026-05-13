@@ -7400,11 +7400,16 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
         loop {
             if crate::windows_service::windows_service_stop_requested() {
-                runtime.controller.shutdown().map_err(|err| {
-                    DaemonError::State(format!(
-                        "windows service stop-triggered shutdown failed: {err}"
-                    ))
-                })?;
+                if let Err(err) = runtime.controller.shutdown() {
+                    // Shutdown errors are best-effort: rollback may legitimately
+                    // fail if the backend is already gone or never fully started
+                    // (e.g. bootstrap daemon with auto_tunnel_enforce=false).
+                    // Log but do not exit with code 1 — the service must stop
+                    // cleanly so the SCM does not block a subsequent start.
+                    log::error!(
+                        "windows service stop-triggered shutdown encountered errors (best-effort): {err}"
+                    );
+                }
                 break;
             }
 
