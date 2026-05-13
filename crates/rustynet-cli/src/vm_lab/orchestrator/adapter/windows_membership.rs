@@ -179,7 +179,68 @@ pub fn distribute_signed_bundle(
     Ok(())
 }
 
+/// Distribute the verifier public-key for `kind` to this Windows node.
+///
+/// SCPs the local pub-key file to a staging path, then atomically
+/// `Move-Item`s it into the daemon-canonical trust directory.
+pub fn distribute_verifier_key(
+    conn: &NodeConnection,
+    kind: BundleKind,
+    pub_key_path: &Path,
+) -> Result<(), AdapterError> {
+    let (remote_staging, remote_dst) = windows_verifier_key_paths(&kind);
+    let dst_parent = remote_dst
+        .rsplit_once('\\')
+        .map(|(d, _)| d.to_string())
+        .unwrap_or_else(|| WINDOWS_STATE_ROOT.to_string());
+    let ensure_dir_script = format!(
+        "if (-not (Test-Path -LiteralPath {dst_q})) {{ \
+             New-Item -ItemType Directory -Force -Path {dst_q} | Out-Null \
+         }}",
+        dst_q = ps_quote(&dst_parent)?,
+    );
+    run_remote_ps(conn, &ensure_dir_script, SHORT_TIMEOUT)?;
+    ssh::scp_to(
+        conn,
+        pub_key_path,
+        &remote_staging.replace('\\', "/"),
+        MEDIUM_TIMEOUT,
+    )?;
+    let install_script = format!(
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force",
+        src_q = ps_quote(&remote_staging)?,
+        dst_q = ps_quote(&remote_dst)?,
+    );
+    run_remote_ps(conn, &install_script, SHORT_TIMEOUT)?;
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn windows_verifier_key_paths(kind: &BundleKind) -> (String, String) {
+    let staging = WINDOWS_STAGING_DIR;
+    let state = WINDOWS_STATE_ROOT;
+    match kind {
+        BundleKind::Assignment => (
+            format!(r"{staging}\rn-assignment.pub"),
+            format!(r"{state}\trust\assignment.pub"),
+        ),
+        BundleKind::Traversal => (
+            format!(r"{staging}\rn-traversal.pub"),
+            format!(r"{state}\trust\traversal.pub"),
+        ),
+        BundleKind::DnsZone => (
+            format!(r"{staging}\rn-dns-zone.pub"),
+            format!(r"{state}\trust\dns-zone.pub"),
+        ),
+        BundleKind::Membership => (
+            format!(r"{staging}\rn-membership.pub"),
+            format!(r"{state}\trust\membership.pub"),
+        ),
+    }
+}
 
 fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     let staging = WINDOWS_STAGING_DIR;

@@ -183,14 +183,43 @@ pub(crate) fn distribute_bundle_kind(
         })
         .collect();
 
+    // Distribute verifier public key to all nodes (enables daemon to verify
+    // freshly-distributed bundles).  The issuance step writes `rn-{kind}.pub`
+    // to tmp_dir alongside the per-node bundle files.
+    let pub_key_path = tmp_dir.join(format!("rn-{kind}.pub"));
+    let verifier_results: Vec<(String, Result<(), String>)> = if pub_key_path.exists() {
+        aliases
+            .iter()
+            .map(|(alias, _)| {
+                let r = match ctx.adapters.get(alias.as_str()) {
+                    Some(adapter) => adapter
+                        .distribute_verifier_key(kind.clone(), &pub_key_path)
+                        .map_err(|e| e.to_string()),
+                    None => Err(format!("no adapter for '{alias}'")),
+                };
+                (alias.clone(), r)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
-    let errors: Vec<String> = results
+    let mut errors: Vec<String> = results
         .into_iter()
         .filter_map(|(alias, r): (String, Result<(), String>)| {
             r.err().map(|e| format!("{alias}: {e}"))
         })
         .collect();
+    errors.extend(
+        verifier_results
+            .into_iter()
+            .filter_map(|(alias, r): (String, Result<(), String>)| {
+                r.err()
+                    .map(|e| format!("{alias}: distribute verifier key: {e}"))
+            }),
+    );
     if errors.is_empty() {
         StageOutcome::Passed
     } else {

@@ -91,6 +91,9 @@ impl NodeAdapter for IosNodeAdapter {
     fn distribute_signed_bundle(&self, _: BundleKind, _: &Path) -> Result<(), AdapterError> {
         Err(ios_unsupported())
     }
+    fn distribute_verifier_key(&self, _: BundleKind, _: &Path) -> Result<(), AdapterError> {
+        Err(ios_unsupported())
+    }
     fn run_validator(&self, _: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
         Err(ios_unsupported())
     }

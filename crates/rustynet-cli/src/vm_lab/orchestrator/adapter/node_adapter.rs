@@ -55,6 +55,19 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         bundle_path: &Path,
     ) -> Result<(), AdapterError>;
 
+    /// Distribute the verifier public-key for `kind` to this node.
+    ///
+    /// `pub_key_path` is a local file containing the hex-encoded verifier key
+    /// (newline-terminated).  The adapter installs it at the platform-canonical
+    /// path used by the daemon's `--{assignment,traversal,dns-zone}-verifier-key`
+    /// flag.  Must be called after `issue_bundles_to_dir` and before the daemon
+    /// starts, so the daemon can verify the freshly-distributed bundles.
+    fn distribute_verifier_key(
+        &self,
+        kind: BundleKind,
+        pub_key_path: &Path,
+    ) -> Result<(), AdapterError>;
+
     // ── Validators ────────────────────────────────────────────────
 
     fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError>;

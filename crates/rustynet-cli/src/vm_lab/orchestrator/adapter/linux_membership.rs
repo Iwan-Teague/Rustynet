@@ -112,7 +112,44 @@ pub fn distribute_signed_bundle(
     Ok(())
 }
 
+/// Distribute the verifier public-key for `kind` to this Linux node.
+///
+/// SCPs the local pub-key file to a temp path, then installs it with
+/// `sudo install -m 0644 -o root -g root` at the daemon-canonical path.
+pub fn distribute_verifier_key(
+    conn: &NodeConnection,
+    kind: BundleKind,
+    pub_key_path: &Path,
+) -> Result<(), AdapterError> {
+    let dst = linux_verifier_key_path(&kind);
+    let remote_tmp = "/tmp/rn-verifier-key.pub";
+    ssh::scp_to(conn, pub_key_path, remote_tmp, MEDIUM_TIMEOUT)?;
+    let dst_dir = dst
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or("/etc/rustynet");
+    ssh::run_remote(
+        conn,
+        &format!(
+            "sudo -n install -d -m 0755 -o root -g root '{dst_dir}' && \
+             sudo -n install -m 0644 -o root -g root '{remote_tmp}' '{dst}' && \
+             sudo -n rm -f '{remote_tmp}'"
+        ),
+        SHORT_TIMEOUT,
+    )?;
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn linux_verifier_key_path(kind: &BundleKind) -> String {
+    match kind {
+        BundleKind::Assignment => "/etc/rustynet/assignment.pub".to_string(),
+        BundleKind::Traversal => "/etc/rustynet/traversal.pub".to_string(),
+        BundleKind::DnsZone => "/etc/rustynet/dns-zone.pub".to_string(),
+        BundleKind::Membership => "/etc/rustynet/membership.pub".to_string(),
+    }
+}
 
 fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     match kind {

@@ -56,13 +56,17 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 }
 
 /// Ping `peer_mesh_ip` 3 times via `Test-Connection`. Returns `Reachable` on success.
+///
+/// Uses explicit `exit 0`/`exit 1` because `Test-Connection -Quiet` always
+/// exits with code 0 regardless of result; the shell exit code is what
+/// `run_remote_ps_check` inspects.
 pub fn ping_mesh_peer(
     conn: &NodeConnection,
     peer_mesh_ip: &str,
 ) -> Result<TrafficTestResult, AdapterError> {
     validate_ip_arg(peer_mesh_ip)?;
     let script = format!(
-        "Test-Connection -ComputerName {ip_q} -Count 3 -Quiet",
+        "if (Test-Connection -ComputerName {ip_q} -Count 3 -Quiet -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
         ip_q = ps_quote(peer_mesh_ip)?
     );
     match run_remote_ps_check(conn, &script, Duration::from_secs(30))? {
@@ -75,13 +79,18 @@ pub fn ping_mesh_peer(
 
 /// Negative ACL test: confirm `denied_ip` is blocked. Expects connection failure.
 /// Returns `Blocked` when ping fails (as expected), `Reachable` on security failure.
+///
+/// Uses explicit `exit 0`/`exit 1` — see `ping_mesh_peer` for rationale.
 pub fn probe_denied_peer(
     conn: &NodeConnection,
     denied_ip: &str,
 ) -> Result<TrafficTestResult, AdapterError> {
     validate_ip_arg(denied_ip)?;
+    // Exit 0 when the target IS reachable (security violation) so
+    // run_remote_ps_check returns true → Reachable.
+    // Exit 1 when blocked (expected) → false → Blocked.
     let script = format!(
-        "Test-Connection -ComputerName {ip_q} -Count 1 -Quiet",
+        "if (Test-Connection -ComputerName {ip_q} -Count 1 -Quiet -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
         ip_q = ps_quote(denied_ip)?
     );
     match run_remote_ps_check(conn, &script, Duration::from_secs(10))? {

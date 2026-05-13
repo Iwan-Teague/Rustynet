@@ -124,7 +124,42 @@ pub fn distribute_signed_bundle(
     Ok(())
 }
 
+/// Distribute the verifier public-key for `kind` to this macOS node.
+pub fn distribute_verifier_key(
+    conn: &NodeConnection,
+    kind: BundleKind,
+    pub_key_path: &Path,
+) -> Result<(), AdapterError> {
+    let dst = macos_verifier_key_path(&kind);
+    let remote_tmp = format!("{MACOS_STAGING_DIR}/rn-verifier-key.pub");
+    ssh::scp_to(conn, pub_key_path, &remote_tmp, MEDIUM_TIMEOUT)?;
+    let dst_dir = dst
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or(MACOS_STATE_ROOT);
+    ssh::run_remote(
+        conn,
+        &format!(
+            "sudo install -d -m 0755 -o root -g wheel '{dst_dir}' && \
+             sudo install -m 0644 -o root -g wheel '{remote_tmp}' '{dst}' && \
+             sudo rm -f '{remote_tmp}'"
+        ),
+        SHORT_TIMEOUT,
+    )?;
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn macos_verifier_key_path(kind: &BundleKind) -> String {
+    let state = MACOS_STATE_ROOT;
+    match kind {
+        BundleKind::Assignment => format!("{state}/trust/assignment.pub"),
+        BundleKind::Traversal => format!("{state}/trust/traversal.pub"),
+        BundleKind::DnsZone => format!("{state}/trust/dns-zone.pub"),
+        BundleKind::Membership => format!("{state}/trust/membership.pub"),
+    }
+}
 
 fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     let staging = MACOS_STAGING_DIR;

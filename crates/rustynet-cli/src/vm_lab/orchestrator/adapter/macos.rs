@@ -115,6 +115,14 @@ impl NodeAdapter for MacosNodeAdapter {
         macos_membership::distribute_signed_bundle(&self.conn, kind, bundle_path)
     }
 
+    fn distribute_verifier_key(
+        &self,
+        kind: BundleKind,
+        pub_key_path: &Path,
+    ) -> Result<(), AdapterError> {
+        macos_membership::distribute_verifier_key(&self.conn, kind, pub_key_path)
+    }
+
     // ── Validators ────────────────────────────────────────────────────────────
 
     fn run_validator(&self, op: DaemonProbeOp) -> Result<ValidatorReport, AdapterError> {
