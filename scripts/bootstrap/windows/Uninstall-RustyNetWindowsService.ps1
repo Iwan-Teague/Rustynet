@@ -227,7 +227,7 @@ $stopOutcome = Stop-RustyNetServiceIfRunning -ServiceName $ServiceName
 # RustyNetDNS-* rules here so reinstalls start from a clean state.
 $script:UninstallFailureStep = 'remove-killswitch-firewall-rules'
 $null = Get-NetFirewallRule -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -like 'RustyNetKS-*' -or $_.Name -like 'RustyNetDNS-*' } |
+    Where-Object { $_.DisplayName -like 'RustyNetKS-*' -or $_.DisplayName -like 'RustyNetDNS-*' } |
     Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
 # Restore the Windows Firewall outbound policy to allowoutbound.  The daemon

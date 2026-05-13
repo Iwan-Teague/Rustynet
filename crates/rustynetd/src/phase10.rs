@@ -2958,10 +2958,13 @@ impl DataplaneSystem for WindowsCommandSystem {
             SystemError::FirewallApplyFailed(format!("allow loopback rule failed: {err}"))
         })?;
         // Allow outbound through the WireGuard tunnel interface (mesh + exit traffic).
-        // WireGuard NT adapters are classified as RAS (remote access) interface type in Windows.
-        self.run_netsh_success(&windows_firewall_allow_interfacetype_args(
+        // WireGuard adapters using wintun are classified as MediaType=IP/Virtual by Windows,
+        // which does NOT match the `ras` (RemoteAccess) interface-type category.  Scope the
+        // rule to the interface alias so it applies regardless of how Windows classifies the
+        // adapter internally.
+        self.run_netsh_success(&windows_firewall_allow_interface_name_args(
             WINDOWS_KS_RULE_TUNNEL,
-            "ras",
+            &self.interface_name.clone(),
         ))
         .map_err(|err| {
             SystemError::FirewallApplyFailed(format!("allow tunnel interface rule failed: {err}"))
@@ -4892,6 +4895,25 @@ fn windows_firewall_allow_interfacetype_args(rule_name: &str, iface_type: &str) 
     ]
 }
 
+/// Build the netsh argv that adds an outbound allow rule scoped to a specific
+/// network interface by alias.  Used for the WireGuard tunnel interface whose
+/// MediaType is `IP` / Virtual — which does NOT match Windows Firewall's
+/// `RemoteAccess` (ras) interface-type category used for legacy VPN adapters.
+/// By naming the interface explicitly the rule is independent of how Windows
+/// classifies the adapter internally.
+fn windows_firewall_allow_interface_name_args(rule_name: &str, interface: &str) -> Vec<String> {
+    vec![
+        "advfirewall".to_string(),
+        "firewall".to_string(),
+        "add".to_string(),
+        "rule".to_string(),
+        format!("name={rule_name}"),
+        "dir=out".to_string(),
+        "action=allow".to_string(),
+        format!("interface={interface}"),
+    ]
+}
+
 /// Build the netsh argv that adds an outbound block rule for the given protocol
 /// (`udp` or `tcp`) and remote port 53 on `interfacetype=lan`.  The rule blocks
 /// DNS traffic on every non-tunnel interface so all DNS is forced through the
@@ -5291,11 +5313,21 @@ mod tests {
 
     #[test]
     fn windows_firewall_allow_interfacetype_helper_renders_correct_args() {
-        // Tunnel allow: `interfacetype=ras` (RAS = Remote Access Service —
-        // WireGuard NT adapters report as RAS).
-        let tunnel = windows_firewall_allow_interfacetype_args(WINDOWS_KS_RULE_TUNNEL, "ras");
+        // Egress LAN allow: `interfacetype=lan`.
+        let lan = windows_firewall_allow_interfacetype_args(WINDOWS_KS_RULE_EGRESS, "lan");
+        assert_eq!(lan[7], "interfacetype=lan");
+        assert_eq!(lan[4], format!("name={WINDOWS_KS_RULE_EGRESS}"));
+    }
+
+    #[test]
+    fn windows_firewall_allow_interface_name_helper_renders_correct_args() {
+        // Tunnel allow: `interface=rustynet0` — scoped to the specific WireGuard
+        // interface alias.  wintun-based WireGuard adapters (MediaType=IP/Virtual)
+        // do NOT match the `ras` (RemoteAccess) interface-type category, so the
+        // old interfacetype=ras rule would not cover them.
+        let args = windows_firewall_allow_interface_name_args(WINDOWS_KS_RULE_TUNNEL, "rustynet0");
         assert_eq!(
-            tunnel,
+            args,
             vec![
                 "advfirewall".to_string(),
                 "firewall".to_string(),
@@ -5304,14 +5336,11 @@ mod tests {
                 format!("name={WINDOWS_KS_RULE_TUNNEL}"),
                 "dir=out".to_string(),
                 "action=allow".to_string(),
-                "interfacetype=ras".to_string(),
+                "interface=rustynet0".to_string(),
             ]
         );
-
-        // Egress LAN allow: `interfacetype=lan`.
-        let lan = windows_firewall_allow_interfacetype_args(WINDOWS_KS_RULE_EGRESS, "lan");
-        assert_eq!(lan[7], "interfacetype=lan");
-        assert_eq!(lan[4], format!("name={WINDOWS_KS_RULE_EGRESS}"));
+        // Sanity: must NOT use interfacetype — that would revert the wintun fix.
+        assert!(!args.iter().any(|a| a.starts_with("interfacetype=")));
     }
 
     #[test]

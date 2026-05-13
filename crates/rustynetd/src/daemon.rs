@@ -7409,14 +7409,46 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                     Ok((length, peer_addr)) => {
                         if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length])
                         {
-                            dns_socket.send_to(&response, peer_addr).map_err(|err| {
-                                DaemonError::Io(format!("dns resolver send failed: {err}"))
-                            })?;
+                            // On Windows, `send_to` can return WSAECONNRESET (10054)
+                            // when a previous datagram we sent triggered an ICMP
+                            // "port unreachable" reply from the peer. This is a
+                            // spurious Windows-specific UDP socket behaviour — the
+                            // pending error clears after the return and the socket
+                            // remains usable. Treat ConnectionReset as a transient
+                            // skip rather than a fatal daemon exit.
+                            match dns_socket.send_to(&response, peer_addr) {
+                                Ok(_) => {}
+                                Err(err) if err.kind() == ErrorKind::ConnectionReset => {
+                                    eprintln!(
+                                        "rustynetd: dns resolver send connection-reset \
+                                         (transient ICMP port-unreachable echo, continuing): \
+                                         {err}"
+                                    );
+                                }
+                                Err(err) => {
+                                    return Err(DaemonError::Io(format!(
+                                        "dns resolver send failed: {err}"
+                                    )));
+                                }
+                            }
                         }
                         processed = processed.saturating_add(1);
                         processed_io = true;
                     }
                     Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    // On Windows, `recv_from` returns WSAECONNRESET (10054) when
+                    // an ICMP "port unreachable" was received in response to a
+                    // datagram we previously sent to a peer whose port was already
+                    // closed. This is a well-known Windows UDP socket quirk — the
+                    // pending error is cleared on this return and the socket
+                    // continues to work normally. Log it and continue the loop
+                    // rather than treating it as a fatal daemon error.
+                    Err(err) if err.kind() == ErrorKind::ConnectionReset => {
+                        eprintln!(
+                            "rustynetd: dns resolver recv connection-reset \
+                             (transient ICMP port-unreachable echo, continuing): {err}"
+                        );
+                    }
                     Err(err) => {
                         return Err(DaemonError::Io(format!("dns resolver recv failed: {err}")));
                     }
