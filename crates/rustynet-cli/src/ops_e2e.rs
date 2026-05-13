@@ -1320,6 +1320,10 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
     ensure_safe_spec("assignments-spec", assignments_spec.as_str())?;
 
+    let bundle_ttl_secs: u64 = env_values
+        .get("BUNDLE_TTL_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let known_node_ids = nodes
         .iter()
@@ -1376,7 +1380,7 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
             nodes.as_slice(),
             allow_pairs.as_slice(),
             assignment_specs.as_slice(),
-            300,
+            bundle_ttl_secs,
         )?;
         for bundle in &bundles {
             let output_path = config.issue_dir.join(format!(
@@ -1721,6 +1725,10 @@ pub(crate) fn issue_assignment_bundles_locally(
     ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
     ensure_safe_spec("assignments-spec", assignments_spec.as_str())?;
+    let bundle_ttl_secs: u64 = env_values
+        .get("BUNDLE_TTL_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
     let assignment_specs = parse_generic_assignment_specs(assignments_spec.as_str())?;
@@ -1731,7 +1739,7 @@ pub(crate) fn issue_assignment_bundles_locally(
             nodes.as_slice(),
             allow_pairs.as_slice(),
             assignment_specs.as_slice(),
-            300,
+            bundle_ttl_secs,
         )?;
         for bundle in &bundles {
             let output_path = issue_dir.join(format!(

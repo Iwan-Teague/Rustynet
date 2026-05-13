@@ -257,12 +257,19 @@ pub fn enforce_daemon(
          $updated = $lines | ForEach-Object {{ \
              if ($_ -match '^RUSTYNETD_DAEMON_ARGS_JSON=') {{ \
                  $json = $_ -replace '^RUSTYNETD_DAEMON_ARGS_JSON=', ''; \
-                 $arr = ($json | ConvertFrom-Json); \
+                 $arr = [System.Collections.ArrayList]($json | ConvertFrom-Json); \
                  $idx = [array]::IndexOf([string[]]$arr, '--auto-tunnel-enforce'); \
                  if ($idx -ge 0 -and ($idx + 1) -lt $arr.Count) {{ \
                      $arr[$idx + 1] = 'true' \
                  }}; \
-                 'RUSTYNETD_DAEMON_ARGS_JSON=' + ($arr | ConvertTo-Json -Compress) \
+                 $ageIdx = [array]::IndexOf([string[]]$arr, '--auto-tunnel-max-age-secs'); \
+                 if ($ageIdx -lt 0) {{ \
+                     $null = $arr.Add('--auto-tunnel-max-age-secs'); \
+                     $null = $arr.Add('86400') \
+                 }} elseif (($ageIdx + 1) -lt $arr.Count) {{ \
+                     $arr[$ageIdx + 1] = '86400' \
+                 }}; \
+                 'RUSTYNETD_DAEMON_ARGS_JSON=' + ($arr.ToArray() | ConvertTo-Json -Compress) \
              }} else {{ $_ }} \
          }}; \
          $updated | Out-File -Encoding ASCII $envPath",

@@ -79,6 +79,11 @@ pub(crate) fn build_bundle_env(
     ];
 
     if matches!(kind, BundleKind::Assignment) {
+        // Lab pipeline: use a 24-hour TTL so the bundle remains valid through
+        // enforce_baseline_runtime even when the pipeline takes several minutes.
+        // Production nodes refresh assignments via the assignment-refresh timer and
+        // never rely on a single long-lived bundle.
+        lines.push("BUNDLE_TTL_SECS=86400".to_string());
         let exit_node_id = ctx
             .assignments
             .iter()
