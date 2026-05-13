@@ -226,9 +226,25 @@ pub fn install_daemon(
     })
 }
 
-/// Start the RustyNet SCM service.
+/// Start the RustyNet SCM service and wait for it to reach Running state.
+///
+/// Uses `windows_service_start_probe_fragment` which handles the already-running
+/// case (sc.exe exit 1056) and polls for SCM Running state.  This is called from
+/// EnforceBaselineRuntime AFTER verifier keys have been distributed, so the
+/// daemon has all required keys to start successfully.
 pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
-    run_service_action(conn, "Start-Service")
+    let service_probe = windows_service_start_probe_fragment(WINDOWS_SERVICE_NAME)?;
+    let script = format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         {service_probe}",
+    );
+    // Budget: stop-poll (30s) + start-poll (60 × 2s = 120s) + overhead (60s) = 210s
+    const START_DAEMON_TIMEOUT: Duration =
+        Duration::from_secs(WINDOWS_SERVICE_START_PROBE_MAX_SECS + 60);
+    run_remote_ps(conn, &script, START_DAEMON_TIMEOUT)?;
+    Ok(())
 }
 
 /// Stop the RustyNet SCM service.
@@ -511,11 +527,15 @@ fn run_windows_e2e_bootstrap(
     let membership_log_q = ps_quote(WINDOWS_MEMBERSHIP_LOG_PATH)?;
     let membership_watermark_q = ps_quote(WINDOWS_MEMBERSHIP_WATERMARK_PATH)?;
     let membership_snapshot_q = ps_quote(WINDOWS_MEMBERSHIP_SNAPSHOT_PATH)?;
-    let service_probe = windows_service_start_probe_fragment(WINDOWS_SERVICE_NAME)?;
-    let daemon_status_probe = windows_daemon_status_readiness_fragment(WINDOWS_SERVICE_NAME)?;
     let bootstrap_acl_repair = windows_bootstrap_acl_repair_fragment()?;
     let native_helper = windows_bootstrap_native_helper_fragment();
 
+    // NOTE: the service is NOT started here. Verifier keys (assignment.pub,
+    // traversal.pub, dns-zone.pub) are required by the daemon at startup but
+    // are only distributed in the DistributeAssignments / DistributeTraversal /
+    // DistributeDnsZone stages that run AFTER this bootstrap stage.
+    // EnforceBaselineRuntime calls start_daemon after all verifier keys are in
+    // place.
     let bootstrap_script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
@@ -543,9 +563,7 @@ fn run_windows_e2e_bootstrap(
          $ksp = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q} }}; \
          if ($ksp.ExitCode -ne 0) {{ throw ('rustynetd key store-passphrase failed: ' + $ksp.Output) }}; \
          $acl = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} windows-runtime-acls-check }}; \
-         if ($acl.ExitCode -ne 0) {{ throw ('runtime ACL check failed (startup would fail): ' + $acl.Output) }}; \
-         {service_probe}; \
-         {daemon_status_probe}",
+         if ($acl.ExitCode -ne 0) {{ throw ('runtime ACL check failed (startup would fail): ' + $acl.Output) }}",
     );
     run_remote_ps(conn, &bootstrap_script, WINDOWS_E2E_BOOTSTRAP_TIMEOUT)?;
     Ok(())
@@ -951,10 +969,14 @@ mod tests {
     }
 
     #[test]
-    fn windows_e2e_bootstrap_timeout_covers_service_probe_budget() {
+    fn windows_e2e_bootstrap_timeout_covers_key_and_membership_budget() {
+        // Bootstrap does NOT start the service; the service is deferred to
+        // EnforceBaselineRuntime (after verifier keys are distributed).
+        // The timeout only needs to cover: key init, membership init,
+        // key store-passphrase, and runtime-acls-check.
         assert!(
-            WINDOWS_E2E_BOOTSTRAP_TIMEOUT.as_secs() > WINDOWS_SERVICE_START_PROBE_MAX_SECS + 60,
-            "bootstrap timeout must leave budget for key init, ACL checks, and SCM service probe"
+            WINDOWS_E2E_BOOTSTRAP_TIMEOUT.as_secs() > 120,
+            "bootstrap timeout must leave budget for key init, membership init, and ACL checks"
         );
     }
 }
