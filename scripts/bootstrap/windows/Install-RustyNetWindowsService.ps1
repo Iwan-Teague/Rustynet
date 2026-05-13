@@ -553,6 +553,7 @@ function Build-ReviewedDaemonArgsJson {
     return (@(
         '--backend', $BackendLabel,
         '--auto-tunnel-enforce', $autoTunnelValue,
+        '--auto-tunnel-max-age-secs', '86400',
         '--trust-max-age-secs', '86400',
         '--traversal-max-age-secs', '86400',
         '--node-id', $NodeId
