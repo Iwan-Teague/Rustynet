@@ -224,14 +224,12 @@ pub(crate) fn distribute_bundle_kind(
             r.err().map(|e| format!("{alias}: {e}"))
         })
         .collect();
-    errors.extend(
-        verifier_results
-            .into_iter()
-            .filter_map(|(alias, r): (String, Result<(), String>)| {
-                r.err()
-                    .map(|e| format!("{alias}: distribute verifier key: {e}"))
-            }),
-    );
+    errors.extend(verifier_results.into_iter().filter_map(
+        |(alias, r): (String, Result<(), String>)| {
+            r.err()
+                .map(|e| format!("{alias}: distribute verifier key: {e}"))
+        },
+    ));
     if errors.is_empty() {
         StageOutcome::Passed
     } else {

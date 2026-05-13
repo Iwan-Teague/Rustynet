@@ -41,10 +41,7 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     /// implementation falls through to `start_daemon`; platforms that need
     /// a richer enforce step (e.g. Linux, which must re-run
     /// `ops install-systemd`) override this method.
-    fn enforce_runtime(
-        &self,
-        _ctx: &OrchestrationContext,
-    ) -> Result<(), AdapterError> {
+    fn enforce_runtime(&self, _ctx: &OrchestrationContext) -> Result<(), AdapterError> {
         self.start_daemon()
     }
 

@@ -37,14 +37,17 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         // to detect IP collisions (duplicate IPs across nodes indicate the
         // assignment bundle has not yet been applied).
         {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
                 let mut fresh: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
                 let mut any_error = false;
                 for alias in &aliases {
-                    match ctx.adapters.get(alias.as_str()).map(|a| a.collect_mesh_ip()) {
+                    match ctx
+                        .adapters
+                        .get(alias.as_str())
+                        .map(|a| a.collect_mesh_ip())
+                    {
                         Some(Ok(ip)) => {
                             fresh.insert(alias.clone(), ip);
                         }
