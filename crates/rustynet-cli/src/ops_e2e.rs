@@ -1774,6 +1774,10 @@ pub(crate) fn issue_traversal_bundles_locally(
     let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "traversal env")?;
     ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    let bundle_ttl_secs: u64 = env_values
+        .get("TRAVERSAL_TTL_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
     let mut signing_secret = generate_ephemeral_signing_secret()?;
@@ -1782,7 +1786,7 @@ pub(crate) fn issue_traversal_bundles_locally(
             signing_secret.as_slice(),
             nodes.as_slice(),
             allow_pairs.as_slice(),
-            120,
+            bundle_ttl_secs,
         )?;
         for node in &nodes {
             let aggregate = artifacts
