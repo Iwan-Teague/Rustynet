@@ -7325,8 +7325,36 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     {
         use std::sync::mpsc;
 
-        let dns_socket = UdpSocket::bind(config.dns_resolver_bind_addr)
-            .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
+        // Retry the DNS bind with backoff.  When the SCM stops the previous daemon instance and
+        // immediately starts the new one there is a brief race: the SCM marks the service Stopped
+        // before the old process fully terminates, so the old socket may still be bound
+        // (WSAEADDRINUSE / os error 10048).  Retrying for ~10 s covers this window.
+        let dns_socket = {
+            const MAX_BIND_ATTEMPTS: u32 = 10;
+            let mut last_err: Option<std::io::Error> = None;
+            let mut bound: Option<UdpSocket> = None;
+            for attempt in 0..MAX_BIND_ATTEMPTS {
+                match UdpSocket::bind(config.dns_resolver_bind_addr) {
+                    Ok(sock) => {
+                        bound = Some(sock);
+                        break;
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                        // Back-off: 200 ms × (attempt + 1) → 200 ms, 400 ms, … 2 s.
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            200 * u64::from(attempt + 1),
+                        ));
+                    }
+                }
+            }
+            bound.ok_or_else(|| {
+                DaemonError::Io(format!(
+                    "dns resolver bind failed after {MAX_BIND_ATTEMPTS} attempts: {}",
+                    last_err.unwrap()
+                ))
+            })?
+        };
         dns_socket
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
