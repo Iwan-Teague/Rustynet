@@ -9820,9 +9820,12 @@ fn ensure_parent_directory_for_membership_path(
     match host_profile {
         SigningPassphraseHostProfile::Linux => ensure_directory_with_mode_owner(
             parent,
-            0o700,
+            // Must match encrypted_secret_permission_policy (0o750) so the key
+            // custody check passes after init-membership.  Pass None for group so
+            // the rustynetd group set by ops-install is preserved.
+            0o750,
             Some(Uid::from_raw(0)),
-            Some(Gid::from_raw(0)),
+            None,
         ),
         SigningPassphraseHostProfile::Macos => {
             ensure_directory_with_mode_owner(parent, 0o700, None, None)

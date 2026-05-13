@@ -47,14 +47,28 @@ pub fn init_membership_snapshot(
 ) -> Result<MembershipSnapshot, AdapterError> {
     // 1. Run ops init-membership on the exit node (idempotent if already done).
     //    Privileged: needs to write into /var/lib/rustynet/ (root:rustynetd).
+    //    RUSTYNET_NODE_ID is required by init-membership; source it from the exit
+    //    peer entry in the peers list so the caller need not duplicate that lookup.
+    let exit_node_id = peers
+        .iter()
+        .find(|p| p.role == NodeRole::Exit)
+        .map(|p| p.node_id.as_str())
+        .unwrap_or("");
+    let exit_node_id_arg = shell_safe_arg(exit_node_id)?;
     ssh::run_remote(
         conn,
-        "sudo -n env RUSTYNET_NODE_ROLE=admin rustynet ops init-membership",
+        &format!(
+            "sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='{exit_node_id_arg}' \
+             rustynet ops init-membership"
+        ),
         MEDIUM_TIMEOUT,
     )?;
 
     // 2. Add each non-exit peer via e2e-membership-add.
     //    Privileged: writes membership.snapshot, reads owner key.
+    //    owner_approver_id convention: "{exit_node_id}-owner" (matches ops_e2e.rs).
+    //    There is no `rustynet ops owner-approver-id` command; derive from the exit peer.
+    let owner_approver_id_arg = shell_safe_arg(&format!("{exit_node_id}-owner"))?;
     for peer in peers {
         if peer.role == NodeRole::Exit {
             continue;
@@ -64,9 +78,10 @@ pub fn init_membership_snapshot(
         ssh::run_remote(
             conn,
             &format!(
-                "owner_approver_id=\"$(sudo -n rustynet ops owner-approver-id 2>/dev/null || echo none)\"; \
-                 sudo -n rustynet ops e2e-membership-add --client-node-id '{node_id_arg}' \
-                 --client-pubkey-hex '{pubkey_arg}' --owner-approver-id \"$owner_approver_id\""
+                "sudo -n rustynet ops e2e-membership-add \
+                 --client-node-id '{node_id_arg}' \
+                 --client-pubkey-hex '{pubkey_arg}' \
+                 --owner-approver-id '{owner_approver_id_arg}'"
             ),
             MEDIUM_TIMEOUT,
         )?;
