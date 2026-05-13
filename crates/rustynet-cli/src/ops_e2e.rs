@@ -2061,7 +2061,11 @@ fn issue_traversal_bundle_artifacts(
     let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
     let generated_at_unix = unix_now();
     let snapshot_nonce = traversal_nonce(generated_at_unix, 0);
-    let coordination_ttl_secs = ttl_secs.min(300);
+    // Use the same TTL as the traversal bundle so coordination records remain
+    // valid for the same window.  The lab pipeline distributes once; production
+    // nodes receive fresh traversal bundles (and new coordination records) from
+    // the assignment-refresh timer and never need an extended window.
+    let coordination_ttl_secs = ttl_secs;
     let mut aggregate_bundles = BTreeMap::<String, String>::new();
     let mut pair_bundles = Vec::new();
     let mut emitted_coordination_pairs = BTreeSet::new();

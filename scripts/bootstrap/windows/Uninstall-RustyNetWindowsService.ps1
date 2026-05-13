@@ -219,6 +219,17 @@ $serviceBefore = Get-ServiceSnapshot -ServiceName $ServiceName
 $script:UninstallFailureStep = 'stop-service'
 $stopOutcome = Stop-RustyNetServiceIfRunning -ServiceName $ServiceName
 
+# Remove killswitch firewall rules left by the daemon.  The daemon adds
+# RustyNetKS-* rules when it applies the dataplane killswitch; if the
+# service is stopped without a clean shutdown those rules persist.  A
+# subsequent bootstrap would add duplicate rules, causing the daemon's
+# killswitch verification to fail.  Remove all RustyNetKS-* and
+# RustyNetDNS-* rules here so reinstalls start from a clean state.
+$script:UninstallFailureStep = 'remove-killswitch-firewall-rules'
+$null = Get-NetFirewallRule -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like 'RustyNetKS-*' -or $_.Name -like 'RustyNetDNS-*' } |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
 $script:UninstallFailureStep = 'delete-service-registration'
 $serviceDeleted = Remove-RustyNetServiceRegistration -ServiceName $ServiceName
 
