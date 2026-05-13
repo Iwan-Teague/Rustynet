@@ -16,7 +16,14 @@ param(
     # env file selects `--backend windows-unsupported` and the
     # daemon refuses to start until WireGuard for Windows is
     # installed.
-    [switch]$ForceUnsupportedBackend
+    [switch]$ForceUnsupportedBackend,
+    # Enable auto-tunnel enforcement (auto_tunnel_enforce=true).
+    # Bootstrap installs the service with auto_tunnel_enforce=false so the
+    # daemon starts before any mesh assignment bundle exists.
+    # EnforceBaselineRuntime re-runs the script with -EnforceAutoTunnel after
+    # all verifier keys and bundles are in place, so the daemon applies
+    # assignment bundles and brings up WireGuard tunnels.
+    [switch]$EnforceAutoTunnel
 )
 
 Set-StrictMode -Version Latest
@@ -497,7 +504,8 @@ function Resolve-ReviewedBackendLabel {
 function Build-ReviewedDaemonArgsJson {
     param(
         [Parameter(Mandatory = $true)][string]$BackendLabel,
-        [Parameter(Mandatory = $true)][string]$NodeId
+        [Parameter(Mandatory = $true)][string]$NodeId,
+        [bool]$AutoTunnelEnforce = $false
     )
     if ($BackendLabel -ne 'windows-unsupported' -and
         $BackendLabel -ne 'windows-wireguard-nt') {
@@ -508,14 +516,13 @@ function Build-ReviewedDaemonArgsJson {
         # startup with "invalid Windows backend value".
         throw ('Build-ReviewedDaemonArgsJson rejects unknown backend label: {0}' -f $BackendLabel)
     }
-    # --auto-tunnel-enforce false: per-node bootstrap brings the
-    # service host up before any mesh assignment bundle has been
-    # distributed by `vm-lab-orchestrate-live-lab`.  Without this
-    # flag the daemon refuses to start until the assignment file
-    # exists, so install-release / restart-runtime / verify-runtime
-    # cannot complete on a fresh node.  The mesh-join phases later
-    # distribute and validate the assignment; this flag does NOT
-    # bypass that — it only defers the startup gate to runtime.
+    # --auto-tunnel-enforce: bootstrap passes false so the daemon starts before
+    # any mesh assignment bundle exists.  EnforceBaselineRuntime re-runs the
+    # script with -EnforceAutoTunnel ($AutoTunnelEnforce=$true) after all
+    # verifier keys and bundles are in place so the daemon applies the
+    # assignment bundle and brings up WireGuard tunnels.
+    # This flag does NOT bypass security checks — it only defers the startup
+    # gate to runtime.
     #
     # --trust-max-age-secs 86400: install-release issues fresh trust
     # evidence under the runtime identity (see
@@ -542,9 +549,10 @@ function Build-ReviewedDaemonArgsJson {
     # its own traversal bundle as stale. DEFAULT_TRAVERSAL_MAX_AGE_SECS
     # is 120s which is correct for production with an active refresh
     # service but too tight for a single-run lab pipeline.
+    $autoTunnelValue = if ($AutoTunnelEnforce) { 'true' } else { 'false' }
     return (@(
         '--backend', $BackendLabel,
-        '--auto-tunnel-enforce', 'false',
+        '--auto-tunnel-enforce', $autoTunnelValue,
         '--trust-max-age-secs', '86400',
         '--traversal-max-age-secs', '86400',
         '--node-id', $NodeId
@@ -557,7 +565,8 @@ function Build-ReviewedDaemonArgsJson {
 function Write-ReviewedEnvFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$BackendLabel
+        [Parameter(Mandatory = $true)][string]$BackendLabel,
+        [bool]$AutoTunnelEnforce = $false
     )
     $banner = if ($BackendLabel -eq 'windows-wireguard-nt') {
         '# Reviewed RustyNet Windows service host configuration. WireGuard for Windows detected; daemon will bring up tunnels via the wireguard.exe / wg.exe / netsh.exe toolchain.'
@@ -566,7 +575,7 @@ function Write-ReviewedEnvFile {
     }
     @(
         $banner
-        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel -NodeId $NodeId))
+        ('RUSTYNETD_DAEMON_ARGS_JSON=' + (Build-ReviewedDaemonArgsJson -BackendLabel $BackendLabel -NodeId $NodeId -AutoTunnelEnforce $AutoTunnelEnforce))
     ) | Out-File -Encoding ascii $Path
 }
 
@@ -962,7 +971,7 @@ $backendLabel = Resolve-ReviewedBackendLabel `
     -ForceUnsupported ([bool]$ForceUnsupportedBackend)
 Write-Host ("[install-helper] selected backend label: {0} (wireguard.present={1}, force-unsupported={2})" -f
     $backendLabel, [bool]$wireGuardProbe.present, [bool]$ForceUnsupportedBackend)
-Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel
+Write-ReviewedEnvFile -Path $configPath -BackendLabel $backendLabel -AutoTunnelEnforce ([bool]$EnforceAutoTunnel)
 
 $script:InstallFailureStep = 'configure-dns-failclosed'
 $dnsFailClosedPosture = Set-RustyNetDnsFailClosedPosture

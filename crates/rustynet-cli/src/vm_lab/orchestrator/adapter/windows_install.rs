@@ -226,6 +226,52 @@ pub fn install_daemon(
     })
 }
 
+/// Enforce baseline runtime on Windows: update daemon args to enable
+/// `auto_tunnel_enforce=true`, then stop-start the service with a full probe.
+///
+/// Bootstrap configures the daemon with `--auto-tunnel-enforce false` so the
+/// service can start before any mesh assignment bundle exists.  After all
+/// bundles are distributed, `EnforceBaselineRuntime` calls this function to
+/// patch the daemon env file to `--auto-tunnel-enforce true` and restart the
+/// service.  The daemon then applies the assignment bundle and brings up
+/// WireGuard tunnels on the next reconcile tick.
+pub fn enforce_daemon(
+    conn: &NodeConnection,
+    _alias: &str,
+    _ctx: &OrchestrationContext,
+) -> Result<(), AdapterError> {
+    let env_path = format!(r"{WINDOWS_STATE_ROOT}\config\rustynetd.env");
+    // Patch --auto-tunnel-enforce in the RUSTYNETD_DAEMON_ARGS_JSON line.
+    // The env file has the form:
+    //   # comment
+    //   RUSTYNETD_DAEMON_ARGS_JSON=["--backend","...",
+    //       "--auto-tunnel-enforce","false","--node-id","..."]
+    // We parse the JSON array, flip the value, and write it back.
+    let env_path_q = ps_quote(&env_path)?;
+    let patch_script = format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $envPath = {env_path_q}; \
+         $lines = (Get-Content $envPath -Encoding ASCII); \
+         $updated = $lines | ForEach-Object {{ \
+             if ($_ -match '^RUSTYNETD_DAEMON_ARGS_JSON=') {{ \
+                 $json = $_ -replace '^RUSTYNETD_DAEMON_ARGS_JSON=', ''; \
+                 $arr = ($json | ConvertFrom-Json); \
+                 $idx = [array]::IndexOf([string[]]$arr, '--auto-tunnel-enforce'); \
+                 if ($idx -ge 0 -and ($idx + 1) -lt $arr.Count) {{ \
+                     $arr[$idx + 1] = 'true' \
+                 }}; \
+                 'RUSTYNETD_DAEMON_ARGS_JSON=' + ($arr | ConvertTo-Json -Compress) \
+             }} else {{ $_ }} \
+         }}; \
+         $updated | Out-File -Encoding ASCII $envPath",
+    );
+    run_remote_ps(conn, &patch_script, SHORT_TIMEOUT)?;
+    // Restart service with full probe so daemon reads new config.
+    start_daemon(conn)
+}
+
 /// Start the RustyNet SCM service and wait for it to reach Running state.
 ///
 /// Uses `windows_service_start_probe_fragment` which handles the already-running
