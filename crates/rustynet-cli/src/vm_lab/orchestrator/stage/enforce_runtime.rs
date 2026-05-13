@@ -29,7 +29,7 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
             .iter()
             .map(|alias| {
                 let r = match ctx.adapters.get(alias.as_str()) {
-                    Some(adapter) => adapter.start_daemon().map_err(|e| e.to_string()),
+                    Some(adapter) => adapter.enforce_runtime(ctx).map_err(|e| e.to_string()),
                     None => Err(format!("no adapter for '{alias}'")),
                 };
                 (alias.clone(), r)

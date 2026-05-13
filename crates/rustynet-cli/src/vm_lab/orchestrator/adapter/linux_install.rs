@@ -106,7 +106,77 @@ pub fn install_daemon(
     })
 }
 
+/// Enforce baseline runtime: re-run `install-systemd` with
+/// `auto_tunnel_enforce=true` so the daemon applies assignment bundles.
+///
+/// Called by `EnforceBaselineRuntime` after all verifier keys are in place.
+/// This is distinct from `start_daemon` (plain `systemctl start`, a no-op if
+/// the daemon is already running) because:
+///  * Bootstrap starts the daemon with `auto_tunnel_enforce=false`.
+///  * After assignment/traversal/dns-zone bundles are distributed we must
+///    restart the daemon with enforcement enabled and a fresh trust token.
+///  * `rustynet ops e2e-enforce-host` wraps `ops install-systemd` with the
+///    correct env and refreshes trust evidence immediately before restart.
+pub fn enforce_daemon(
+    conn: &NodeConnection,
+    alias: &str,
+    ctx: &OrchestrationContext,
+) -> Result<(), AdapterError> {
+    let role = ctx
+        .assignments
+        .iter()
+        .find(|a| a.alias == alias)
+        .map(|a| &a.role)
+        .cloned()
+        .unwrap_or(NodeRole::Client);
+    let node_id = ctx
+        .node_ids
+        .get(alias)
+        .cloned()
+        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+    let role_str = match role {
+        NodeRole::Exit => "admin",
+        _ => "client",
+    };
+    // SSH_ALLOW_CIDRS may contain commas; quote the whole arg.
+    // Backslash-escape any single quotes in the cidr string (none expected in practice).
+    let ssh_allow_cidrs = ctx.ssh_allow_cidrs.replace('\'', "'\\''");
+
+    // Detect the SSH user's home directory for the source root that the
+    // bootstrap script extracts to (`${HOME}/Rustynet`).
+    let home = ssh::run_remote(conn, "echo $HOME", Duration::from_secs(10))?
+        .trim()
+        .to_string();
+    if home.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "could not determine $HOME on remote for e2e-enforce-host".to_string(),
+        });
+    }
+    let src_dir = format!("{home}/Rustynet");
+
+    // Run e2e-enforce-host as root: re-installs systemd units with
+    // auto_tunnel_enforce=true and refreshes trust evidence before restart.
+    // Budget: install-systemd rebuild is fast (binaries already present);
+    // add 120 s for daemon restart + socket readiness poll.
+    let script = format!(
+        "sudo RUSTYNET_INSTALL_SOURCE_ROOT={src_dir} \
+         rustynet ops e2e-enforce-host \
+         --role {role_str} \
+         --node-id '{node_id}' \
+         --src-dir '{src_dir}' \
+         --ssh-allow-cidrs '{ssh_allow_cidrs}'"
+    );
+    ssh::run_remote(conn, &script, Duration::from_secs(120))?;
+    Ok(())
+}
+
 /// Start the rustynetd systemd service.
+///
+/// In the orchestration pipeline, prefer `enforce_daemon` over this function:
+/// `enforce_daemon` transitions the daemon from its bootstrap
+/// (`auto_tunnel_enforce=false`) to an enforcement-enabled configuration.
+/// `start_daemon` is a plain `systemctl start`, which is a no-op when the
+/// daemon is already running.
 pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     run_systemctl(conn, "start")
 }

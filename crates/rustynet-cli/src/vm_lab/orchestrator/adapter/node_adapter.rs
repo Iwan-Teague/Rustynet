@@ -32,6 +32,22 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     fn restart_daemon(&self) -> Result<(), AdapterError>;
     fn uninstall_daemon(&self) -> Result<(), AdapterError>;
 
+    /// Transition the daemon from its bootstrap state
+    /// (`auto_tunnel_enforce=false`) to a fully-enforcing state
+    /// (`auto_tunnel_enforce=true`).
+    ///
+    /// Called by `EnforceBaselineRuntime` after all verifier keys
+    /// (assignment, traversal, dns-zone) are in place.  Default
+    /// implementation falls through to `start_daemon`; platforms that need
+    /// a richer enforce step (e.g. Linux, which must re-run
+    /// `ops install-systemd`) override this method.
+    fn enforce_runtime(
+        &self,
+        _ctx: &OrchestrationContext,
+    ) -> Result<(), AdapterError> {
+        self.start_daemon()
+    }
+
     // ── Membership owner (exit role only) ─────────────────────────
 
     fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError>;
