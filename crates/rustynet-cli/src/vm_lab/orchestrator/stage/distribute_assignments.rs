@@ -92,7 +92,16 @@ pub(crate) fn build_bundle_env(
             .map(|a| {
                 ctx.node_ids
                     .get(&a.alias)
-                    .map(|nid| format!("{nid}|{exit_node_id}"))
+                    .map(|nid| {
+                        // The exit node itself gets `-` (no exit assignment);
+                        // client nodes get assigned to the exit node.
+                        let exit_part = if a.role == NodeRole::Exit {
+                            "-"
+                        } else {
+                            exit_node_id.as_str()
+                        };
+                        format!("{nid}|{exit_part}")
+                    })
                     .ok_or_else(|| format!("no node_id for '{}'", a.alias))
             })
             .collect::<Result<Vec<_>, _>>()?;
