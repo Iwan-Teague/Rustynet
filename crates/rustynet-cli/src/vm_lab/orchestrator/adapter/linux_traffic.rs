@@ -249,7 +249,7 @@ pub fn issue_bundles_to_dir(
     ssh::run_remote(
         conn,
         &format!(
-            "env RUSTYNET_NODE_ROLE=admin sudo -n \
+            "sudo -n env RUSTYNET_NODE_ROLE=admin \
              '{safe_rustynet}' ops {issue_subcmd} \
              --env-file '{remote_env}' --issue-dir '{remote_issue_dir}'"
         ),
