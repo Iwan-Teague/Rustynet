@@ -78,6 +78,13 @@ pub(crate) fn build_bundle_env(
         format!("ALLOW_SPEC={allow_spec}"),
     ];
 
+    if matches!(kind, BundleKind::Traversal) {
+        // Lab pipeline: use a 24-hour TTL so the traversal bundle remains valid through
+        // the full pipeline and the reconcile loop.  Production nodes receive fresh
+        // traversal bundles from the assignment-refresh timer; the lab distributes once.
+        lines.push("TRAVERSAL_TTL_SECS=86400".to_string());
+    }
+
     if matches!(kind, BundleKind::Assignment) {
         // Lab pipeline: use a 24-hour TTL so the bundle remains valid through
         // enforce_baseline_runtime even when the pipeline takes several minutes.
