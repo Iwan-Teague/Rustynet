@@ -158,8 +158,22 @@ pub fn enforce_daemon(
     // auto_tunnel_enforce=true and refreshes trust evidence before restart.
     // Budget: install-systemd rebuild is fast (binaries already present);
     // add 120 s for daemon restart + socket readiness poll.
+    //
+    // RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400: the assignment bundle is issued
+    // by the exit node during DistributeAssignments and may be several minutes
+    // old by the time enforce_daemon runs.  The production default (300 s) is
+    // correct for nodes with an active assignment-refresh timer, but the lab
+    // pipeline distributes a single bundle and doesn't rotate it.  86400 s
+    // matches the Windows lab setting and lets the daemon start successfully.
+    //
+    // RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400: the traversal bundle is issued
+    // with a 120-s TTL but the lab pipeline does not refresh it, so the same
+    // extended window is needed here.
     let script = format!(
-        "sudo RUSTYNET_INSTALL_SOURCE_ROOT={src_dir} \
+        "sudo \
+         RUSTYNET_INSTALL_SOURCE_ROOT={src_dir} \
+         RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400 \
+         RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 \
          rustynet ops e2e-enforce-host \
          --role {role_str} \
          --node-id '{node_id}' \
@@ -199,6 +213,13 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
         conn,
         "if sudo systemctl is-active rustynetd >/dev/null 2>&1; then sudo systemctl stop rustynetd; fi",
         timeout,
+    );
+    // Remove WireGuard interface if still present (daemon may not have torn it
+    // down, e.g. if the previous run's cleanup stage was skipped).  Best-effort.
+    let _ = ssh::run_remote(
+        conn,
+        "sudo ip link delete rustynet0 2>/dev/null || true",
+        Duration::from_secs(10),
     );
     ssh::run_remote(
         conn,
