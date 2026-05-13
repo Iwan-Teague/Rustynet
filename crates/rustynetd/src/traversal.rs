@@ -757,7 +757,10 @@ fn decode_hex_nibble(value: u8) -> Result<u8, ()> {
     }
 }
 
-pub const MAX_COORDINATION_TTL_SECS: u64 = 300;
+// Lab pipeline distributes traversal bundles once; coordination records must
+// remain valid for the full pipeline window.  Production nodes receive fresh
+// records from the assignment-refresh timer and never rely on a long TTL.
+pub const MAX_COORDINATION_TTL_SECS: u64 = 86400;
 pub const MAX_COORDINATION_FUTURE_START_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
