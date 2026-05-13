@@ -26,9 +26,17 @@ impl OrchestrationStage for TrafficTestMatrixStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
 
-        // Collect mesh IPs from adapters if not already populated
-        if ctx.mesh_ips.is_empty() {
-            let collected: Vec<(String, Option<String>)> = aliases
+        // Collect mesh IPs from adapters for any node not yet in the map.
+        // Always attempt collection rather than skipping when the map is
+        // non-empty: collect_pubkeys may have populated it before daemon
+        // startup, leaving some nodes (e.g. Windows) without an entry.
+        let missing_aliases: Vec<String> = aliases
+            .iter()
+            .filter(|a| !ctx.mesh_ips.contains_key(a.as_str()))
+            .cloned()
+            .collect();
+        if !missing_aliases.is_empty() {
+            let collected: Vec<(String, Option<String>)> = missing_aliases
                 .iter()
                 .map(|alias| {
                     let ip = ctx

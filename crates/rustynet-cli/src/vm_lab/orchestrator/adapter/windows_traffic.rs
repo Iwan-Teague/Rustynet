@@ -219,27 +219,28 @@ pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
 }
 
 /// Collect the WireGuard mesh IP from the running daemon or network interface.
+///
+/// Retries for up to 60 seconds because the WireGuard interface receives its
+/// IP assignment asynchronously after the service starts; the first probe often
+/// races the kernel netdev registration.
 pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
-    let script = "$iface = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*rustynet*' -or $_.Name -like '*rustynet*' } | Select-Object -First 1; \
+    let iface_script = "$iface = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*rustynet*' -or $_.Name -like '*rustynet*' } | Select-Object -First 1; \
          if ($iface) { (Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress } else { '' }";
-    let ip = run_remote_ps(conn, script, SHORT_TIMEOUT)?;
-    let ip = ip.trim().to_string();
-    if !ip.is_empty() {
-        return Ok(ip);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let ip = run_remote_ps(conn, iface_script, SHORT_TIMEOUT)?;
+        let ip = ip.trim().to_string();
+        if !ip.is_empty() {
+            return Ok(ip);
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(3));
     }
-    let daemon_pipe = r"\\.\pipe\rustynet-rustynetd";
-    let status_script = format!(
-        "$env:RUSTYNET_DAEMON_SOCKET = {pipe_q}; \
-         $out = & 'C:\\Program Files\\RustyNet\\rustynet.exe' status 2>&1; \
-         Write-Output $out",
-        pipe_q = crate::vm_lab::orchestrator::adapter::windows_install::ps_quote(daemon_pipe)?
-    );
-    let status = run_remote_ps(conn, &status_script, SHORT_TIMEOUT)?;
-    ssh::parse_status_field(&status, "mesh_ip")
-        .or_else(|| ssh::parse_status_field(&status, "wg_ip"))
-        .ok_or_else(|| AdapterError::Protocol {
-            message: "mesh IP not found via network interface or rustynet status".to_string(),
-        })
+    Err(AdapterError::Protocol {
+        message: "mesh IP not found on rustynet* network interface after 60s".to_string(),
+    })
 }
 
 /// Issue signed bundles on this (Windows) exit node and SCP results to `local_out_dir`.
