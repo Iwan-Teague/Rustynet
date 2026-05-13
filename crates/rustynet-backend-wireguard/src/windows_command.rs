@@ -120,6 +120,44 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         )
     }
 
+    /// Poll `wg show <tunnel>` until the wintun adapter is ready.
+    ///
+    /// `wireguard.exe /installtunnelservice` returns as soon as the SCM
+    /// reports the service as Running, but the wintun adapter (e.g.
+    /// `rustynet0`) may still be initialising at that point.  Subsequent
+    /// apply steps that bind firewall rules to the interface alias (e.g.
+    /// `New-NetFirewallRule -InterfaceAlias rustynet0`) fail immediately if
+    /// the adapter is not yet enumerated by the OS.
+    ///
+    /// Non-empty stdout from `wg show <tunnel>` is the canonical signal that
+    /// the adapter is present and WireGuard has attached to it.
+    fn wait_for_tunnel_ready(&mut self) -> Result<(), BackendError> {
+        const TUNNEL_READY_TIMEOUT_SECS: u64 = 30;
+        const TUNNEL_READY_RETRY_INTERVAL_MS: u64 = 1000;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(TUNNEL_READY_TIMEOUT_SECS);
+        loop {
+            let result = self.runner.run_capture(
+                self.wg_exe_path.to_string_lossy().as_ref(),
+                &["show".to_string(), self.tunnel_name.clone()],
+            );
+            if let Ok(out) = result
+                && !out.stdout.trim().is_empty()
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(BackendError::internal(format!(
+                    "WireGuard tunnel '{}' did not become ready within {} seconds",
+                    self.tunnel_name, TUNNEL_READY_TIMEOUT_SECS
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(
+                TUNNEL_READY_RETRY_INTERVAL_MS,
+            ));
+        }
+    }
+
     fn uninstall_tunnel_service(&mut self) -> Result<(), BackendError> {
         self.runner.run(
             self.wireguard_exe_path.to_string_lossy().as_ref(),
@@ -345,6 +383,14 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
         self.context = Some(context);
         self.sync_persistent_config()?;
         if let Err(err) = self.install_tunnel_service() {
+            self.context = None;
+            return Err(err);
+        }
+        if let Err(err) = self.wait_for_tunnel_ready() {
+            // The tunnel service started but the adapter never came up; tear
+            // the service back down before returning so the system is left in
+            // a clean state for the caller's rollback path.
+            let _ = self.uninstall_tunnel_service();
             self.context = None;
             return Err(err);
         }
@@ -833,12 +879,33 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone)]
     struct RecordingRunner {
         #[allow(clippy::type_complexity)]
         commands: Arc<Mutex<Vec<(String, Vec<String>)>>>,
         handshake_output: Arc<Mutex<String>>,
         transfer_output: Arc<Mutex<String>>,
+        /// Stdout returned for plain `wg show <tunnel>` calls (the
+        /// tunnel-readiness probe in `wait_for_tunnel_ready`).  Defaults to a
+        /// non-empty interface summary so tests that do not exercise a slow-
+        /// start scenario get an immediate pass through the readiness loop.
+        show_interface_output: Arc<Mutex<String>>,
+    }
+
+    impl Default for RecordingRunner {
+        fn default() -> Self {
+            Self {
+                commands: Arc::new(Mutex::new(Vec::new())),
+                handshake_output: Arc::new(Mutex::new(String::new())),
+                transfer_output: Arc::new(Mutex::new(String::new())),
+                // Simulate a ready wintun adapter so `wait_for_tunnel_ready`
+                // exits on the first poll in tests that don't model slow start.
+                show_interface_output: Arc::new(Mutex::new(
+                    "interface: rustynet0\n  public key: AAAA=\n  listening port: 51820\n"
+                        .to_string(),
+                )),
+            }
+        }
     }
 
     impl RecordingRunner {
@@ -869,6 +936,12 @@ mod tests {
                 self.handshake_output.lock().expect("handshake").clone()
             } else if args.iter().any(|arg| arg == "transfer") {
                 self.transfer_output.lock().expect("transfer").clone()
+            } else if args.first().map(|a| a.as_str()) == Some("show") {
+                // Plain `wg show <tunnel>` — the tunnel-readiness probe.
+                self.show_interface_output
+                    .lock()
+                    .expect("show_interface_output")
+                    .clone()
             } else {
                 String::new()
             };
@@ -947,7 +1020,9 @@ mod tests {
         assert!(written.contains("ListenPort = 51820"));
 
         let recorded = runner.recorded();
-        assert_eq!(recorded.len(), 1);
+        // start() emits two commands: install_tunnel_service (via run) then
+        // the first wait_for_tunnel_ready poll (via run_capture).
+        assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].0, wireguard_path.to_string_lossy());
         assert_eq!(
             recorded[0].1,
@@ -955,6 +1030,12 @@ mod tests {
                 "/installtunnelservice".to_string(),
                 config_path.display().to_string()
             ]
+        );
+        // Second call must be the readiness probe: `wg show rustynet0`.
+        assert_eq!(recorded[1].0, wg_path.to_string_lossy());
+        assert_eq!(
+            recorded[1].1,
+            vec!["show".to_string(), "rustynet0".to_string()]
         );
     }
 
