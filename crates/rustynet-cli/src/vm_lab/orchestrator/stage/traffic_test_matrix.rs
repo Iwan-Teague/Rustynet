@@ -36,20 +36,31 @@ impl OrchestrationStage for TrafficTestMatrixStage {
             .cloned()
             .collect();
         if !missing_aliases.is_empty() {
-            let collected: Vec<(String, Option<String>)> = missing_aliases
-                .iter()
-                .map(|alias| {
-                    let ip = ctx
+            // Retry for up to 30 s: the WireGuard interface on a node that was
+            // just started in EnforceBaselineRuntime may take a few seconds to
+            // receive its IP assignment even after the SCM service is Running.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut remaining: Vec<String> = missing_aliases.clone();
+            loop {
+                let mut still_missing = Vec::new();
+                for alias in &remaining {
+                    match ctx
                         .adapters
                         .get(alias.as_str())
-                        .and_then(|a| a.collect_mesh_ip().ok());
-                    (alias.clone(), ip)
-                })
-                .collect();
-            for (alias, ip) in collected {
-                if let Some(ip) = ip {
-                    ctx.mesh_ips.insert(alias, ip);
+                        .map(|a| a.collect_mesh_ip())
+                    {
+                        Some(Ok(ip)) => {
+                            ctx.mesh_ips.insert(alias.clone(), ip);
+                        }
+                        _ => still_missing.push(alias.clone()),
+                    }
                 }
+                remaining = still_missing;
+                if remaining.is_empty() || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3));
             }
         }
 

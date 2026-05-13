@@ -218,29 +218,25 @@ pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Collect the WireGuard mesh IP from the running daemon or network interface.
+/// Collect the WireGuard mesh IP from the running network interface.
 ///
-/// Retries for up to 60 seconds because the WireGuard interface receives its
-/// IP assignment asynchronously after the service starts; the first probe often
-/// races the kernel netdev registration.
+/// Queries `Get-NetAdapter` for an interface named or described as `rustynet*`
+/// and returns its first IPv4 address.  Returns an error if the interface is
+/// absent or has no assigned IP (e.g. service not yet started).
+///
+/// Callers that need retry behaviour (e.g. `traffic_test_matrix` when the
+/// interface may have just come up) should implement the retry loop themselves.
 pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     let iface_script = "$iface = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*rustynet*' -or $_.Name -like '*rustynet*' } | Select-Object -First 1; \
          if ($iface) { (Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress } else { '' }";
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let ip = run_remote_ps(conn, iface_script, SHORT_TIMEOUT)?;
-        let ip = ip.trim().to_string();
-        if !ip.is_empty() {
-            return Ok(ip);
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(3));
+    let ip = run_remote_ps(conn, iface_script, SHORT_TIMEOUT)?;
+    let ip = ip.trim().to_string();
+    if ip.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "mesh IP not found on rustynet* network interface (service not running or WireGuard tunnel not up)".to_string(),
+        });
     }
-    Err(AdapterError::Protocol {
-        message: "mesh IP not found on rustynet* network interface after 60s".to_string(),
-    })
+    Ok(ip)
 }
 
 /// Issue signed bundles on this (Windows) exit node and SCP results to `local_out_dir`.
