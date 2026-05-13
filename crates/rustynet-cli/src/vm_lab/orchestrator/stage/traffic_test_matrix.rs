@@ -87,8 +87,16 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         let mesh_ips = ctx.mesh_ips.clone();
         let mut errors = Vec::new();
 
+        // WireGuard handshakes complete asynchronously after the daemon applies the
+        // assignment bundle.  The IP collection loop above exits as soon as IPs are
+        // stable, which may be before the first handshake completes.  Retry each
+        // positive ping for up to PING_SETTLE_SECS so a slow-starting handshake does
+        // not produce a false failure.
+        const PING_SETTLE_SECS: u64 = 90;
+        const PING_RETRY_INTERVAL_SECS: u64 = 5;
+
         for src_alias in &aliases {
-            // Positive tests: ping each peer
+            // Positive tests: ping each peer (with retry to allow handshake settle)
             for peer_alias in &aliases {
                 if peer_alias == src_alias {
                     continue;
@@ -100,11 +108,26 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                         continue;
                     }
                 };
-                match ctx
-                    .adapters
-                    .get(src_alias.as_str())
-                    .map(|a| a.ping_mesh_peer(&peer_ip))
-                {
+                let ping_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(PING_SETTLE_SECS);
+                let final_result = loop {
+                    let result = ctx
+                        .adapters
+                        .get(src_alias.as_str())
+                        .map(|a| a.ping_mesh_peer(&peer_ip));
+                    match &result {
+                        Some(Ok(TrafficTestResult::Reachable)) => break result,
+                        _ => {
+                            if std::time::Instant::now() >= ping_deadline {
+                                break result;
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(
+                                PING_RETRY_INTERVAL_SECS,
+                            ));
+                        }
+                    }
+                };
+                match final_result {
                     Some(Ok(TrafficTestResult::Reachable)) => {}
                     Some(Ok(TrafficTestResult::Blocked)) => {
                         errors.push(format!(
