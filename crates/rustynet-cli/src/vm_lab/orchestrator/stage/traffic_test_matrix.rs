@@ -26,38 +26,49 @@ impl OrchestrationStage for TrafficTestMatrixStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
 
-        // Collect mesh IPs from adapters for any node not yet in the map.
-        // Always attempt collection rather than skipping when the map is
-        // non-empty: collect_pubkeys may have populated it before daemon
-        // startup, leaving some nodes (e.g. Windows) without an entry.
-        let missing_aliases: Vec<String> = aliases
-            .iter()
-            .filter(|a| !ctx.mesh_ips.contains_key(a.as_str()))
-            .cloned()
-            .collect();
-        if !missing_aliases.is_empty() {
-            // Retry for up to 30 s: the WireGuard interface on a node that was
-            // just started in EnforceBaselineRuntime may take a few seconds to
-            // receive its IP assignment even after the SCM service is Running.
+        // Always re-collect mesh IPs fresh here.  The values cached during
+        // collect_pubkeys were gathered before bundle distribution and
+        // enforce_runtime, so daemons had auto_tunnel_enforce=false and the
+        // WireGuard interface IP was not yet set to the deterministic
+        // assignment.  After enforce_runtime the daemon applies the assignment
+        // bundle and sets the correct unique IP.
+        //
+        // Retry for up to 60 s to allow the WireGuard interface to settle and
+        // to detect IP collisions (duplicate IPs across nodes indicate the
+        // assignment bundle has not yet been applied).
+        {
             let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let mut remaining: Vec<String> = missing_aliases.clone();
+                std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
-                let mut still_missing = Vec::new();
-                for alias in &remaining {
-                    match ctx
-                        .adapters
-                        .get(alias.as_str())
-                        .map(|a| a.collect_mesh_ip())
-                    {
+                let mut fresh: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                let mut any_error = false;
+                for alias in &aliases {
+                    match ctx.adapters.get(alias.as_str()).map(|a| a.collect_mesh_ip()) {
                         Some(Ok(ip)) => {
-                            ctx.mesh_ips.insert(alias.clone(), ip);
+                            fresh.insert(alias.clone(), ip);
                         }
-                        _ => still_missing.push(alias.clone()),
+                        _ => {
+                            any_error = true;
+                        }
                     }
                 }
-                remaining = still_missing;
-                if remaining.is_empty() || std::time::Instant::now() >= deadline {
+                // Collision: two different aliases mapped to the same IP means
+                // the assignment bundle has not yet updated the interface.
+                let unique_count: std::collections::HashSet<String> =
+                    fresh.values().cloned().collect();
+                let has_collision = unique_count.len() < fresh.len();
+                let has_missing = any_error || fresh.len() < aliases.len();
+                // Accept results or keep retrying until deadline.
+                if (!has_collision && !has_missing) || std::time::Instant::now() >= deadline {
+                    // Replace stale cached entries with fresh data.  Stale
+                    // collect_pubkeys entries (pre-enforce IP values) must not
+                    // survive into the traffic test; clear the map first so any
+                    // node that failed collection here does not retain a stale IP.
+                    ctx.mesh_ips.clear();
+                    for (alias, ip) in fresh {
+                        ctx.mesh_ips.insert(alias, ip);
+                    }
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_secs(3));
