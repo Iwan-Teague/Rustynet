@@ -230,6 +230,14 @@ $null = Get-NetFirewallRule -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like 'RustyNetKS-*' -or $_.Name -like 'RustyNetDNS-*' } |
     Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
+# Restore the Windows Firewall outbound policy to allowoutbound.  The daemon
+# sets `blockoutbound` on all profiles when it applies the killswitch; if the
+# daemon is stopped or crashes without a clean rollback the policy stays blocked,
+# making the host unreachable via SSH (outbound TCP responses are blocked).
+# Reset to `allowinbound,allowoutbound` so the next pipeline run can SSH in.
+$script:UninstallFailureStep = 'restore-firewall-outbound-policy'
+$null = netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound 2>&1
+
 $script:UninstallFailureStep = 'delete-service-registration'
 $serviceDeleted = Remove-RustyNetServiceRegistration -ServiceName $ServiceName
 
