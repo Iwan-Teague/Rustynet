@@ -622,6 +622,14 @@ pub fn execute_ops_e2e_enforce_host(
         && Path::new("/etc/rustynet/assignment-refresh.env").is_file();
     let backend_mode = e2e_backend_mode_from_env()?;
 
+    // Forward lab-pipeline TTL overrides if set in the process environment.
+    // The lab orchestrator passes RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400 and
+    // RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 via sudo so that install-systemd
+    // bakes the extended age into the unit file.  Production deployments leave
+    // these unset and install-systemd falls back to its built-in defaults.
+    let auto_tunnel_max_age_secs = std::env::var("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS").ok();
+    let traversal_max_age_secs = std::env::var("RUSTYNET_TRAVERSAL_MAX_AGE_SECS").ok();
+
     let mut install_env = vec![
         ("RUSTYNET_NODE_ID", node_id.as_str()),
         ("RUSTYNET_NODE_ROLE", role.as_str()),
@@ -648,6 +656,12 @@ pub fn execute_ops_e2e_enforce_host(
     ];
     if let Some(value) = backend_mode.as_deref() {
         install_env.push(("RUSTYNET_BACKEND", value));
+    }
+    if let Some(ref value) = auto_tunnel_max_age_secs {
+        install_env.push(("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS", value.as_str()));
+    }
+    if let Some(ref value) = traversal_max_age_secs {
+        install_env.push(("RUSTYNET_TRAVERSAL_MAX_AGE_SECS", value.as_str()));
     }
     run_status(
         "rustynet",

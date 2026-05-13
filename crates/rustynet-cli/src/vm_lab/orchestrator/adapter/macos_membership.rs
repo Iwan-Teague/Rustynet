@@ -100,7 +100,12 @@ pub fn init_membership_snapshot(
 
 /// Distribute a signed bundle to a macOS client node.
 /// Uses the same atomic install pattern as Linux: scp to temp, then
-/// `sudo install -m 0640 -o root -g rustynetd` to the final path.
+/// `sudo install` with permissions appropriate to the bundle kind.
+///
+/// Membership snapshots require mode 0600 owned by the daemon user because
+/// `load_membership_snapshot` uses a strict `mode & 0o077 != 0` check.
+/// Other bundles (assignment, traversal, dns-zone) are installed as
+/// root:rustynetd 0640.
 pub fn distribute_signed_bundle(
     conn: &NodeConnection,
     kind: BundleKind,
@@ -112,11 +117,16 @@ pub fn distribute_signed_bundle(
         .rsplit_once('/')
         .map(|(dir, _)| dir)
         .unwrap_or(MACOS_STATE_ROOT);
+    let (mode, owner) = if matches!(kind, BundleKind::Membership) {
+        ("0600", "rustynetd")
+    } else {
+        ("0640", "root")
+    };
     ssh::run_remote(
         conn,
         &format!(
             "sudo install -d -m 0700 -o rustynetd -g rustynetd '{install_dir}' && \
-             sudo install -m 0640 -o root -g rustynetd '{remote_tmp}' '{install_dst}' && \
+             sudo install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
              sudo rm -f '{remote_tmp}'"
         ),
         SHORT_TIMEOUT,
