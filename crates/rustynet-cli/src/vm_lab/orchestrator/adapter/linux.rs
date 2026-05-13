@@ -59,10 +59,7 @@ impl NodeAdapter for LinuxNodeAdapter {
         linux_install::start_daemon(&self.conn)
     }
 
-    fn enforce_runtime(
-        &self,
-        ctx: &OrchestrationContext,
-    ) -> Result<(), AdapterError> {
+    fn enforce_runtime(&self, ctx: &OrchestrationContext) -> Result<(), AdapterError> {
         linux_install::enforce_daemon(&self.conn, &self.alias, ctx)
     }
 
