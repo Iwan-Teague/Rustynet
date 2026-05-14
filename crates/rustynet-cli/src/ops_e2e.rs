@@ -1456,9 +1456,9 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
         })
         .transpose()?
         .unwrap_or(120);
-    if ttl_secs == 0 || ttl_secs > 300 {
+    if ttl_secs == 0 || ttl_secs > 86400 {
         return Err(format!(
-            "TRAVERSAL_TTL_SECS must be a positive integer <= 300 (got: {ttl_secs})"
+            "TRAVERSAL_TTL_SECS must be a positive integer <= 86400 (got: {ttl_secs})"
         ));
     }
 
@@ -1592,9 +1592,9 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
         })
         .transpose()?
         .unwrap_or(300);
-    if ttl_secs == 0 || ttl_secs > 300 {
+    if ttl_secs == 0 || ttl_secs > 86400 {
         return Err(format!(
-            "DNS_ZONE_TTL_SECS must be a positive integer <= 300 (got: {ttl_secs})"
+            "DNS_ZONE_TTL_SECS must be a positive integer <= 86400 (got: {ttl_secs})"
         ));
     }
 
