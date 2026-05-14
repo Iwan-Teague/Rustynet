@@ -3202,6 +3202,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 )?),
                 None => None,
             };
+            let format = match parser.value("--format") {
+                Some(value) => {
+                    vm_lab::capability::parse_report_capabilities_format_arg(value.as_str())?
+                }
+                None => vm_lab::capability::VmLabReportCapabilitiesFormat::Summary,
+            };
             Ok(OpsCommand::VmLabReportCapabilities {
                 config: vm_lab::capability::VmLabReportCapabilitiesConfig {
                     scope,
@@ -3210,6 +3216,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     bootstrap_phase,
                     mixed_platform_topology: parser.has_flag("--mixed-platform-topology"),
                     output_dir: parser.optional_path("--output-dir"),
+                    format,
                 },
             })
         }
@@ -15144,7 +15151,7 @@ fn help_text() -> String {
         "  ops vm-lab-issue-and-distribute-state [--inventory <path>] --topology <path> --authority-vm <alias> [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-run-suite [--inventory <path>] --suite <direct-remote-exit|relay-remote-exit|failback-roaming|full-live-lab> [--topology <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] --ssh-identity-file <path> [--nat-profile <profile>] [--impairment-profile <profile>] [--report-dir <path>] [--dry-run] [--timeout-secs <secs>]",
         "  ops vm-lab-bootstrap-phase [--inventory <path>] --phase <sync-source|build-release|install-release|restart-runtime|verify-runtime|all> [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] [--repo-url <url> | --local-source-dir <path>] [--dest-dir <absolute-path>] [--branch <name>] [--remote <name>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
-        "  ops vm-lab-report-capabilities --scope <setup-live-lab|run-live-lab|orchestrate-live-lab|bootstrap-phase|baseline-diagnostics|repo-sync|suite> --platform <linux|windows|macos|ios|android> --source-mode <working-tree|local-head|commit-ref|local-source|repo-url> [--bootstrap-phase <sync-source|build-release|install-release|restart-runtime|verify-runtime>] [--mixed-platform-topology] [--output-dir <path>]",
+        "  ops vm-lab-report-capabilities --scope <setup-live-lab|run-live-lab|orchestrate-live-lab|bootstrap-phase|baseline-diagnostics|repo-sync|suite> --platform <linux|windows|macos|ios|android> --source-mode <working-tree|local-head|commit-ref|local-source|repo-url> [--bootstrap-phase <sync-source|build-release|install-release|restart-runtime|verify-runtime>] [--mixed-platform-topology] [--output-dir <path>] [--format <summary|error>]",
         "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
         "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
         "  ops verify-linux-fresh-install-os-matrix-readiness --report-path <path> [--max-age-seconds <secs>] [--profile <cross_platform|linux>] [--expected-git-commit <sha>]",
