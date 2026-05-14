@@ -839,6 +839,14 @@ impl DaemonBackendMode {
                 | DaemonBackendMode::WindowsWireguardNt
         )
     }
+
+    // Userspace-shared backends re-read the key file from disk on every runtime
+    // restart (e.g. boringtun worker recovery). The runtime key must remain on
+    // disk for the daemon's lifetime; scrubbing it after the first apply would
+    // break subsequent recovery attempts.
+    fn retains_runtime_key_at_rest(self) -> bool {
+        matches!(self, DaemonBackendMode::LinuxWireguardUserspaceShared)
+    }
 }
 
 #[cfg(not(windows))]
@@ -7900,6 +7908,9 @@ fn scrub_runtime_wireguard_key_material(
     if !backend_mode.requires_runtime_wireguard_key_material() {
         return Ok(());
     }
+    if backend_mode.retains_runtime_key_at_rest() {
+        return Ok(());
+    }
     if encrypted_private_key_path.is_none() {
         return Ok(());
     }
@@ -14656,18 +14667,16 @@ mod tests {
 
     #[test]
     fn runtime_key_scrub_only_removes_ephemeral_file_when_encrypted_store_is_used() {
-        for backend_mode in [
-            DaemonBackendMode::LinuxWireguard,
-            DaemonBackendMode::LinuxWireguardUserspaceShared,
-        ] {
-            let test_dir = secure_test_dir("rustynetd-runtime-key-scrub");
+        // Kernel-mode backend: key is loaded once into kernel memory, then scrubbed.
+        {
+            let test_dir = secure_test_dir("rustynetd-runtime-key-scrub-kernel");
             let runtime_key_path = test_dir.join("wireguard.key");
             let encrypted_key_path = test_dir.join("wireguard.key.enc");
             std::fs::write(&runtime_key_path, b"private-key\n")
                 .expect("runtime key should be writable");
 
             scrub_runtime_wireguard_key_material(
-                backend_mode,
+                DaemonBackendMode::LinuxWireguard,
                 Some(runtime_key_path.as_path()),
                 None,
             )
@@ -14675,12 +14684,32 @@ mod tests {
             assert!(runtime_key_path.exists());
 
             scrub_runtime_wireguard_key_material(
-                backend_mode,
+                DaemonBackendMode::LinuxWireguard,
                 Some(runtime_key_path.as_path()),
                 Some(encrypted_key_path.as_path()),
             )
-            .expect("encrypted key mode should scrub runtime key");
-            assert!(!runtime_key_path.exists());
+            .expect("encrypted key mode should scrub runtime key for kernel backend");
+            assert!(!runtime_key_path.exists(), "kernel backend must scrub runtime key");
+
+            let _ = std::fs::remove_dir_all(test_dir);
+        }
+
+        // Userspace-shared backend: boringtun re-reads the key on every runtime
+        // restart (including recovery). The key must NOT be scrubbed.
+        {
+            let test_dir = secure_test_dir("rustynetd-runtime-key-scrub-userspace-shared");
+            let runtime_key_path = test_dir.join("wireguard.key");
+            let encrypted_key_path = test_dir.join("wireguard.key.enc");
+            std::fs::write(&runtime_key_path, b"private-key\n")
+                .expect("runtime key should be writable");
+
+            scrub_runtime_wireguard_key_material(
+                DaemonBackendMode::LinuxWireguardUserspaceShared,
+                Some(runtime_key_path.as_path()),
+                Some(encrypted_key_path.as_path()),
+            )
+            .expect("userspace-shared backend scrub must succeed without removing the key");
+            assert!(runtime_key_path.exists(), "userspace-shared backend must retain runtime key at rest");
 
             let _ = std::fs::remove_dir_all(test_dir);
         }
