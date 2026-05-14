@@ -606,6 +606,7 @@ pub struct LinuxCommandSystem {
     prior_ipv6_disabled: Option<bool>,
     allow_tunnel_relay_forward: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
+    wg_listen_port: u16,
     dns_protected: bool,
     expected_management_bypass_routes: BTreeSet<ExpectedBypassRoute>,
     expected_peer_endpoint_bypass_routes: BTreeSet<ExpectedBypassRoute>,
@@ -666,6 +667,7 @@ impl LinuxCommandSystem {
             prior_ipv6_disabled: None,
             allow_tunnel_relay_forward: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
+            wg_listen_port: 0,
             dns_protected: false,
             expected_management_bypass_routes: BTreeSet::new(),
             expected_peer_endpoint_bypass_routes: BTreeSet::new(),
@@ -674,6 +676,11 @@ impl LinuxCommandSystem {
 
     pub fn with_traversal_bootstrap_allow_endpoints(mut self, endpoints: Vec<SocketAddr>) -> Self {
         self.traversal_bootstrap_allow_endpoints = dedupe_socket_addrs(endpoints);
+        self
+    }
+
+    pub fn with_wg_listen_port(mut self, port: u16) -> Self {
+        self.wg_listen_port = port;
         self
     }
 
@@ -1118,6 +1125,21 @@ impl LinuxCommandSystem {
             &["oifname", self.interface_name.as_str(), "accept"],
             "tunnel-interface killswitch allow rule missing",
         )?;
+        if self.wg_listen_port != 0 {
+            let port_str = self.wg_listen_port.to_string();
+            self.assert_chain_contains(
+                &killswitch,
+                &[
+                    "oifname",
+                    self.egress_interface.as_str(),
+                    "udp",
+                    "dport",
+                    port_str.as_str(),
+                    "accept",
+                ],
+                "wireguard listen port killswitch allow rule missing",
+            )?;
+        }
         self.assert_chain_contains(
             &forward,
             &["ct state established,related", "accept"],
@@ -1459,6 +1481,31 @@ impl LinuxCommandSystem {
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         self.apply_fail_closed_management_allow_rules(table.as_str())?;
         self.apply_traversal_bootstrap_allow_rules(table.as_str())?;
+        if self.wg_listen_port != 0 {
+            let port_str = self.wg_listen_port.to_string();
+            self.run(
+                PrivilegedCommandProgram::Nft,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    table.as_str(),
+                    "killswitch",
+                    "oifname",
+                    self.egress_interface.as_str(),
+                    "udp",
+                    "dport",
+                    port_str.as_str(),
+                    "accept",
+                ],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "wireguard listen port {} allow rule failed: {err}",
+                    self.wg_listen_port
+                ))
+            })?;
+        }
         self.firewall_table = Some(table.clone());
         Ok(table)
     }
@@ -8733,10 +8780,18 @@ mod tests {
         include_egress_allow: bool,
         dns_protected: bool,
         allow_tunnel_relay_forward: bool,
+        wg_listen_port: u16,
     ) -> String {
         let mut rules = format!(
-            "table inet rustynet_g1 {{\n  chain killswitch {{\n    type filter hook output priority 0; policy drop;\n    oifname \"lo\" accept\n    ct state established,related accept\n    oifname \"{interface_name}\" accept\n"
+            "table inet rustynet_g1 {{\n  chain killswitch {{\n    type filter hook output priority 0; policy drop;\n    oifname \"lo\" accept\n"
         );
+        if wg_listen_port != 0 {
+            rules.push_str(
+                format!("    oifname \"{egress_interface}\" udp dport {wg_listen_port} accept\n")
+                    .as_str(),
+            );
+        }
+        rules.push_str(format!("    ct state established,related accept\n    oifname \"{interface_name}\" accept\n").as_str());
         if include_egress_allow {
             rules.push_str(format!("    oifname \"{egress_interface}\" accept\n").as_str());
         }
@@ -8782,6 +8837,7 @@ mod tests {
                             false,
                             false,
                             false,
+                            0,
                         ),
                         stderr: String::new(),
                     },
@@ -8878,6 +8934,7 @@ mod tests {
                             false,
                             false,
                             false,
+                            0,
                         ),
                         stderr: String::new(),
                     },
@@ -8959,6 +9016,7 @@ mod tests {
                             false,
                             false,
                             false,
+                            0,
                         ),
                         stderr: String::new(),
                     },
@@ -9045,6 +9103,7 @@ mod tests {
                             false,
                             false,
                             false,
+                            0,
                         ),
                         stderr: String::new(),
                     },
@@ -9119,6 +9178,7 @@ mod tests {
                             false,
                             false,
                             false,
+                            0,
                         ),
                         stderr: String::new(),
                     },
@@ -9197,6 +9257,7 @@ mod tests {
                             false,
                             false,
                             false,
+                            0,
                         ),
                         stderr: String::new(),
                     },

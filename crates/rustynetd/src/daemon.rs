@@ -7223,7 +7223,9 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             config.fail_closed_ssh_allow_cidrs.clone(),
         )
         .map(|system| {
-            system.with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
+            system
+                .with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
+                .with_wg_listen_port(config.wg_listen_port)
         })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         Ok(RuntimeSystem::Linux(system))
