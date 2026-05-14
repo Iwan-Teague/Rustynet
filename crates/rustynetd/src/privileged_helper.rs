@@ -1312,6 +1312,24 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         [
             "add",
             "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "udp",
+            "dport",
+            port,
+            "accept",
+        ] if is_owned_failclosed_table_token(table)
+            && is_interface_name(interface)
+            && is_u16_token(port) =>
+        {
+            Ok(())
+        }
+        [
+            "add",
+            "rule",
             "ip",
             table,
             "postrouting",
@@ -1839,6 +1857,49 @@ mod tests {
             ],
         )
         .expect("traversal bootstrap allow rule schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_accepts_wireguard_listen_port_egress_allow_rule() {
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "oifname",
+                "enp0s1",
+                "udp",
+                "dport",
+                "51820",
+                "accept",
+            ],
+        )
+        .expect("wireguard listen port egress allow rule schema should be accepted");
+    }
+
+    #[test]
+    fn validate_request_rejects_wireguard_listen_port_rule_with_non_port() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "oifname",
+                "enp0s1",
+                "udp",
+                "dport",
+                "notaport",
+                "accept",
+            ],
+        )
+        .expect_err("non-numeric port in wg listen rule must be rejected");
+        assert!(err.contains("unsupported nft add rule argument schema"));
     }
 
     #[test]

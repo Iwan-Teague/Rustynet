@@ -283,7 +283,21 @@ pub fn enforce_daemon(
     );
     run_remote_ps(conn, &patch_script, SHORT_TIMEOUT)?;
     // Restart service with full probe so daemon reads new config.
-    start_daemon(conn)
+    start_daemon(conn)?;
+    // Wait for the WireGuard tunnel adapter to receive its IPv4 mesh address.
+    // The SCM reports Running before the daemon thread begins its first
+    // reconcile, so the IP may not be assigned for several seconds after
+    // start_daemon returns.  Without this wait, traffic_test_matrix's
+    // collect_mesh_ip may timeout before the IP appears.
+    let tunnel_ip_script = format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         {}",
+        windows_tunnel_ip_readiness_fragment()?,
+    );
+    run_remote_ps(conn, &tunnel_ip_script, Duration::from_secs(100))?;
+    Ok(())
 }
 
 /// Start the RustyNet SCM service and wait for it to reach Running state.
@@ -469,6 +483,33 @@ fn windows_bootstrap_native_helper_fragment() -> String {
          [pscustomobject]@{ ExitCode = $exitCode; Output = $output } \
      }"
     .to_string()
+}
+
+/// Wait for the rustynet0 WireGuard adapter to appear with an IPv4 address.
+///
+/// Called from `enforce_daemon` after the SCM confirms Running.  The daemon
+/// sets SCM Running before the daemon thread begins; WireGuard tunnel setup
+/// happens inside the daemon's first reconcile tick (~1 s after thread start).
+/// Without this probe the orchestrator proceeds to `validate_baseline_runtime`
+/// before the IP is assigned, causing `collect_mesh_ip` to fail.
+fn windows_tunnel_ip_readiness_fragment() -> Result<String, AdapterError> {
+    Ok(
+        "$wnRdy = $false; \
+         for ($wnI = 0; $wnI -lt 45; $wnI++) { \
+             $wnIface = Get-NetAdapter -ErrorAction SilentlyContinue | \
+                 Where-Object { $_.Name -like '*rustynet*' -or $_.InterfaceDescription -like '*WireGuard*' } | \
+                 Select-Object -First 1; \
+             if ($wnIface) { \
+                 $wnIp = Get-NetIPAddress -InterfaceIndex $wnIface.ifIndex \
+                     -AddressFamily IPv4 -ErrorAction SilentlyContinue | \
+                     Select-Object -First 1; \
+                 if ($wnIp -and $wnIp.IPAddress) { $wnRdy = $true; break } \
+             }; \
+             Start-Sleep -Seconds 2 \
+         }; \
+         if (-not $wnRdy) { throw 'rustynet WireGuard adapter did not get an IPv4 address within 90s' }"
+        .to_string(),
+    )
 }
 
 /// Readiness probe: wait for SCM Running state AND for the reviewed env-file
