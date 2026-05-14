@@ -711,6 +711,9 @@ enum OpsCommand {
     VmLabBootstrapPhase {
         config: vm_lab::VmLabBootstrapPhaseConfig,
     },
+    VmLabReportCapabilities {
+        config: vm_lab::capability::VmLabReportCapabilitiesConfig,
+    },
     RebindLinuxFreshInstallOsMatrixInputs {
         config: ops_fresh_install_os_matrix::RebindLinuxFreshInstallOsMatrixInputsConfig,
     },
@@ -3186,6 +3189,29 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
+        "vm-lab-report-capabilities" => {
+            let scope_arg = parser.required("--scope")?;
+            let platform_arg = parser.required("--platform")?;
+            let source_mode_arg = parser.required("--source-mode")?;
+            let scope = vm_lab::capability::parse_scope_arg(scope_arg.as_str())?;
+            let platform = vm_lab::capability::parse_platform_arg(platform_arg.as_str())?;
+            let source_mode = vm_lab::capability::parse_source_mode_arg(source_mode_arg.as_str())?;
+            let bootstrap_phase = match parser.value("--bootstrap-phase") {
+                Some(value) => Some(vm_lab::capability::parse_bootstrap_phase_arg(
+                    value.as_str(),
+                )?),
+                None => None,
+            };
+            Ok(OpsCommand::VmLabReportCapabilities {
+                config: vm_lab::capability::VmLabReportCapabilitiesConfig {
+                    scope,
+                    platform,
+                    source_mode,
+                    bootstrap_phase,
+                    mixed_platform_topology: parser.has_flag("--mixed-platform-topology"),
+                },
+            })
+        }
         "rebind-linux-fresh-install-os-matrix-inputs" => {
             Ok(OpsCommand::RebindLinuxFreshInstallOsMatrixInputs {
                 config: ops_fresh_install_os_matrix::RebindLinuxFreshInstallOsMatrixInputsConfig {
@@ -5223,6 +5249,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::VmLabRunSuite { config } => vm_lab::execute_ops_vm_lab_run_suite(config),
         OpsCommand::VmLabBootstrapPhase { config } => {
             vm_lab::execute_ops_vm_lab_bootstrap_phase(config)
+        }
+        OpsCommand::VmLabReportCapabilities { config } => {
+            vm_lab::capability::execute_ops_vm_lab_report_capabilities(config)
         }
         OpsCommand::RebindLinuxFreshInstallOsMatrixInputs { config } => {
             ops_fresh_install_os_matrix::execute_ops_rebind_linux_fresh_install_os_matrix_inputs(
@@ -15114,6 +15143,7 @@ fn help_text() -> String {
         "  ops vm-lab-issue-and-distribute-state [--inventory <path>] --topology <path> --authority-vm <alias> [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
         "  ops vm-lab-run-suite [--inventory <path>] --suite <direct-remote-exit|relay-remote-exit|failback-roaming|full-live-lab> [--topology <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] --ssh-identity-file <path> [--nat-profile <profile>] [--impairment-profile <profile>] [--report-dir <path>] [--dry-run] [--timeout-secs <secs>]",
         "  ops vm-lab-bootstrap-phase [--inventory <path>] --phase <sync-source|build-release|install-release|restart-runtime|verify-runtime|all> [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] [--repo-url <url> | --local-source-dir <path>] [--dest-dir <absolute-path>] [--branch <name>] [--remote <name>] [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--timeout-secs <secs>]",
+        "  ops vm-lab-report-capabilities --scope <setup-live-lab|run-live-lab|orchestrate-live-lab|bootstrap-phase|baseline-diagnostics|repo-sync|suite> --platform <linux|windows|macos|ios|android> --source-mode <working-tree|local-head|commit-ref|local-source|repo-url> [--bootstrap-phase <sync-source|build-release|install-release|restart-runtime|verify-runtime>] [--mixed-platform-topology]",
         "  ops rebind-linux-fresh-install-os-matrix-inputs --dest-dir <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path>",
         "  ops generate-linux-fresh-install-os-matrix-report --output <path> --environment <label> --source-mode <mode> --expected-git-commit-file <path> --git-status-file <path> --bootstrap-log <path> --baseline-log <path> --two-hop-report <path> --role-switch-report <path> --lan-toggle-report <path> --exit-handoff-report <path> --exit-node-id <id> --client-node-id <id> --ubuntu-node-id <id> --fedora-node-id <id> --mint-node-id <id> [--debian-os-version <label>] [--ubuntu-os-version <label>] [--fedora-os-version <label>] [--mint-os-version <label>]",
         "  ops verify-linux-fresh-install-os-matrix-readiness --report-path <path> [--max-age-seconds <secs>] [--profile <cross_platform|linux>] [--expected-git-commit <sha>]",
@@ -19239,6 +19269,45 @@ mod tests {
         ]);
         assert!(format!("{vm_lab_bootstrap_phase:?}").contains("VmLabBootstrapPhase"));
         assert!(format!("{vm_lab_bootstrap_phase:?}").contains("phase: \"all\""));
+
+        let vm_lab_report_capabilities = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-report-capabilities".to_string(),
+            "--scope".to_string(),
+            "setup-live-lab".to_string(),
+            "--platform".to_string(),
+            "linux".to_string(),
+            "--source-mode".to_string(),
+            "local-head".to_string(),
+        ]);
+        assert!(format!("{vm_lab_report_capabilities:?}").contains("VmLabReportCapabilities"));
+        assert!(format!("{vm_lab_report_capabilities:?}").contains("SetupLiveLab"));
+        assert!(format!("{vm_lab_report_capabilities:?}").contains("Linux"));
+        assert!(format!("{vm_lab_report_capabilities:?}").contains("LocalHead"));
+
+        let vm_lab_report_capabilities_bootstrap = parse_command(&[
+            "ops".to_string(),
+            "vm-lab-report-capabilities".to_string(),
+            "--scope".to_string(),
+            "bootstrap-phase".to_string(),
+            "--platform".to_string(),
+            "windows".to_string(),
+            "--source-mode".to_string(),
+            "local-head".to_string(),
+            "--bootstrap-phase".to_string(),
+            "install-release".to_string(),
+            "--mixed-platform-topology".to_string(),
+        ]);
+        assert!(format!("{vm_lab_report_capabilities_bootstrap:?}").contains("BootstrapPhase"));
+        assert!(format!("{vm_lab_report_capabilities_bootstrap:?}").contains("InstallRelease"));
+        assert!(
+            format!("{vm_lab_report_capabilities_bootstrap:?})")
+                .contains("mixed_platform_topology: true)")
+                || format!("{vm_lab_report_capabilities_bootstrap:?}")
+                    .contains("mixed_platform_topology: true,")
+                || format!("{vm_lab_report_capabilities_bootstrap:?}")
+                    .contains("mixed_platform_topology: true ")
+        );
 
         let vm_lab_bootstrap_phase_local = parse_command(&[
             "ops".to_string(),
