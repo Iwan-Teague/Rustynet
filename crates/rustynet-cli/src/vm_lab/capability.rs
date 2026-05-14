@@ -1153,6 +1153,44 @@ pub fn render_vm_lab_capability_failure_block(ctx: &VmLabCapabilityFailureContex
     )
 }
 
+/// Wrapper-side adapter: gather a command name plus the input axes into a
+/// ready-to-use [`VmLabCapabilityFailureContext`] (which carries the
+/// evaluator's verdict, ready for `is_blocker()` checks and the failure-
+/// block renderer).
+///
+/// The command name is mapped to a scope via [`command_scope`]. If the
+/// command is not a known wrapper entry point this function fails closed
+/// — wrapper sites must surface a precise error rather than guessing a
+/// scope.
+///
+/// This is the canonical entry point for Slice-2 wrapper integration: a
+/// wrapper site should hand its command name plus the input axes to this
+/// function and then act on the returned bundle, rather than constructing
+/// `VmLabCapabilityContext` directly. Centralising assembly here means
+/// future capability-evaluator extensions are picked up everywhere
+/// automatically.
+pub fn collect_vm_lab_capability_inputs(
+    command: &str,
+    platform: VmLabPlatform,
+    source_mode: VmLabSourceMode,
+    bootstrap_phase: Option<VmLabBootstrapPhase>,
+    mixed_platform_topology: bool,
+) -> Result<VmLabCapabilityFailureContext, String> {
+    let Some(scope) = command_scope(command) else {
+        return Err(format!(
+            "unknown vm-lab command for capability collection: {command:?}"
+        ));
+    };
+    let context = VmLabCapabilityContext {
+        scope,
+        platform,
+        source_mode,
+        bootstrap_phase,
+        mixed_platform_topology,
+    };
+    Ok(VmLabCapabilityFailureContext::new(command, context))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2686,6 +2724,111 @@ mod tests {
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
+    }
+
+    // ----- collect_vm_lab_capability_inputs -----
+
+    #[test]
+    fn collect_inputs_maps_known_command_to_scope_and_carries_record() {
+        let bundle = collect_vm_lab_capability_inputs(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            false,
+        )
+        .expect("known wrapper command must map to a scope");
+        assert_eq!(bundle.command, "vm-lab-setup-live-lab");
+        assert_eq!(bundle.context.scope, VmLabCapabilityScope::SetupLiveLab);
+        assert_eq!(bundle.record.status, VmLabCapabilityStatus::Supported);
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+        assert!(!bundle.is_blocker());
+    }
+
+    #[test]
+    fn collect_inputs_for_windows_setup_returns_unsupported_blocker_bundle() {
+        let bundle = collect_vm_lab_capability_inputs(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Windows,
+            VmLabSourceMode::LocalHead,
+            None,
+            false,
+        )
+        .expect("known wrapper command must map to a scope");
+        assert!(bundle.is_blocker());
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+    }
+
+    #[test]
+    fn collect_inputs_threads_bootstrap_phase_into_context_and_record() {
+        let bundle = collect_vm_lab_capability_inputs(
+            "vm-lab-bootstrap-phase",
+            VmLabPlatform::Windows,
+            VmLabSourceMode::LocalHead,
+            Some(VmLabBootstrapPhase::InstallRelease),
+            false,
+        )
+        .unwrap();
+        assert_eq!(bundle.context.scope, VmLabCapabilityScope::BootstrapPhase);
+        assert_eq!(
+            bundle.context.bootstrap_phase,
+            Some(VmLabBootstrapPhase::InstallRelease)
+        );
+        assert!(bundle.is_blocker());
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED
+        );
+    }
+
+    #[test]
+    fn collect_inputs_threads_mixed_platform_topology_flag_into_context() {
+        let bundle = collect_vm_lab_capability_inputs(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(bundle.context.mixed_platform_topology);
+        assert!(bundle.is_blocker());
+        assert_eq!(bundle.record.reason_code, reason_code::TOPOLOGY_MISMATCH);
+    }
+
+    #[test]
+    fn collect_inputs_fails_closed_on_unknown_command_name() {
+        let err = collect_vm_lab_capability_inputs(
+            "vm-lab-this-does-not-exist",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            false,
+        )
+        .expect_err("unknown command must fail closed");
+        assert!(err.contains("unknown vm-lab command"));
+        assert!(err.contains("vm-lab-this-does-not-exist"));
+    }
+
+    #[test]
+    fn collect_inputs_render_block_matches_command_identity() {
+        let bundle = collect_vm_lab_capability_inputs(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Windows,
+            VmLabSourceMode::LocalHead,
+            None,
+            false,
+        )
+        .unwrap();
+        let rendered = render_vm_lab_capability_failure_block(&bundle);
+        assert!(rendered.starts_with("rustynet vm-lab failure: vm-lab-setup-live-lab\n"));
+        assert!(rendered.contains("status: Unsupported"));
     }
 
     // ----- VmLabCapabilityFailureContext / render_vm_lab_capability_failure_block -----
