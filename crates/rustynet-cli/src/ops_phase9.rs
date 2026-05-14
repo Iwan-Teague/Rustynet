@@ -1030,6 +1030,58 @@ fn read_ndjson_objects(path: &Path, label: &str) -> Result<Vec<Map<String, Value
     Ok(entries)
 }
 
+/// Generic typed NDJSON reader: one entry per non-blank line, each
+/// deserialized directly into the caller-chosen typed view `T` rather than
+/// a `serde_json::Map<String, Value>`. Pairs with
+/// [`read_ndjson_objects`] for Phase A typed-schema hardening of NDJSON
+/// measured-evidence streams (see
+/// `documents/operations/active/SerializationFormatHardeningPlan_2026-03-25.md`).
+///
+/// Contract:
+///
+/// - Blank lines are skipped.
+/// - A single malformed line aborts the read with a per-line error that
+///   names the file path, the 1-based line number, and the caller-supplied
+///   label. There is no silent skip.
+/// - A line that parses as JSON but does not match the typed view shape
+///   also aborts. Distinguishing this case from "valid JSON, wrong field
+///   types" is left to the typed view (`#[serde(default)]`, optional
+///   fields, etc.); the helper passes the serde error through.
+/// - Empty input (no non-blank lines) is rejected with a stable error
+///   so accidental empty files do not silently produce empty result
+///   vectors.
+///
+/// The helper does NOT enforce `evidence_mode == "measured"`; that check
+/// is the caller's responsibility (typically through a downstream typed
+/// envelope or the existing `phase9_require_measured_mode` helper).
+#[allow(dead_code)]
+fn read_ndjson_typed<T>(path: &Path, label: &str) -> Result<Vec<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read {label} failed ({}): {err}", path.display()))?;
+    let mut entries: Vec<T> = Vec::new();
+    for (line_number, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let entry: T = serde_json::from_str(trimmed).map_err(|err| {
+            format!(
+                "invalid ndjson at {}:{} ({label}): {err}",
+                path.display(),
+                line_number + 1
+            )
+        })?;
+        entries.push(entry);
+    }
+    if entries.is_empty() {
+        return Err(format!("no entries in ndjson source: {}", path.display()));
+    }
+    Ok(entries)
+}
+
 fn open_secure_log_file(path: &Path) -> Result<File, String> {
     OpenOptions::new()
         .create(true)
@@ -5353,5 +5405,167 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         fs::remove_file(source_path.as_path()).expect("remove source");
         fs::remove_dir(out_dir.as_path()).expect("remove operations directory");
         fs::remove_dir(root_dir.as_path()).expect("remove temp root");
+    }
+
+    // ----- NDJSON readers (untyped + typed) -----
+
+    fn ndjson_temp_path(suffix: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rustynet-cli-ndjson-{}-{}-{}.ndjson",
+            std::process::id(),
+            unique,
+            suffix
+        ))
+    }
+
+    #[test]
+    fn read_ndjson_objects_skips_blank_lines_and_returns_each_object() {
+        let path = ndjson_temp_path("ok");
+        fs::write(&path, "{\"a\":1}\n\n   \n{\"a\":2}\n{\"a\":3}\n").expect("write ndjson");
+        let entries = super::read_ndjson_objects(path.as_path(), "test").expect("parse ok");
+        assert_eq!(entries.len(), 3);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_objects_rejects_invalid_json_with_line_number() {
+        let path = ndjson_temp_path("bad-line");
+        fs::write(&path, "{\"a\":1}\nnot json\n{\"a\":3}\n").expect("write ndjson");
+        let err = super::read_ndjson_objects(path.as_path(), "test").expect_err("must fail");
+        assert!(err.contains(":2"), "error must cite line 2: {err}");
+        assert!(err.contains("invalid ndjson"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_objects_rejects_non_object_line() {
+        let path = ndjson_temp_path("non-object");
+        fs::write(&path, "{\"a\":1}\n[1,2,3]\n").expect("write ndjson");
+        let err = super::read_ndjson_objects(path.as_path(), "test").expect_err("must fail");
+        assert!(err.contains("invalid ndjson object"));
+        assert!(err.contains(":2"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_objects_rejects_empty_file() {
+        let path = ndjson_temp_path("empty");
+        fs::write(&path, "\n   \n\n").expect("write ndjson");
+        let err = super::read_ndjson_objects(path.as_path(), "test").expect_err("must fail");
+        assert!(err.contains("no entries in ndjson source"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_objects_rejects_missing_file_with_path() {
+        let path = std::env::temp_dir().join(format!(
+            "rustynet-cli-ndjson-missing-{}.ndjson",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let err = super::read_ndjson_objects(path.as_path(), "test").expect_err("must fail");
+        assert!(err.contains("read test failed"));
+        assert!(err.contains(path.display().to_string().as_str()));
+    }
+
+    // Typed reader
+
+    #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+    struct SloLikeEntry {
+        window_end_utc: String,
+        #[serde(default)]
+        evidence_mode: String,
+    }
+
+    #[test]
+    fn read_ndjson_typed_deserializes_each_line_into_typed_view() {
+        let path = ndjson_temp_path("typed-ok");
+        fs::write(
+            &path,
+            r#"{"window_end_utc":"2026-01-01T00:00:00Z","evidence_mode":"measured"}
+{"window_end_utc":"2026-02-01T00:00:00Z","evidence_mode":"measured"}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<SloLikeEntry> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].window_end_utc, "2026-01-01T00:00:00Z");
+        assert_eq!(entries[1].evidence_mode, "measured");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_typed_skips_blank_lines() {
+        let path = ndjson_temp_path("typed-blanks");
+        fs::write(
+            &path,
+            "{\"window_end_utc\":\"x\"}\n\n   \n{\"window_end_utc\":\"y\"}\n",
+        )
+        .expect("write ndjson");
+        let entries: Vec<SloLikeEntry> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 2);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_typed_rejects_line_that_misses_required_field() {
+        let path = ndjson_temp_path("typed-missing-field");
+        // Missing window_end_utc -> typed parse fails on line 2.
+        fs::write(
+            &path,
+            "{\"window_end_utc\":\"a\"}\n{\"only_other\":\"x\"}\n",
+        )
+        .expect("write ndjson");
+        let err = super::read_ndjson_typed::<SloLikeEntry>(path.as_path(), "test")
+            .expect_err("must fail-closed on missing required field");
+        assert!(err.contains(":2"), "error must cite line 2: {err}");
+        assert!(err.contains("invalid ndjson"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_typed_rejects_line_with_wrong_field_type() {
+        let path = ndjson_temp_path("typed-wrong-type");
+        // window_end_utc must be string; passing a number fails the typed parse.
+        fs::write(&path, "{\"window_end_utc\":42}\n").expect("write ndjson");
+        let err = super::read_ndjson_typed::<SloLikeEntry>(path.as_path(), "test")
+            .expect_err("must fail-closed on wrong type");
+        assert!(err.contains(":1"));
+        assert!(err.contains("invalid ndjson"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_typed_rejects_empty_file() {
+        let path = ndjson_temp_path("typed-empty");
+        fs::write(&path, "\n\n   \n").expect("write ndjson");
+        let err = super::read_ndjson_typed::<SloLikeEntry>(path.as_path(), "test")
+            .expect_err("must fail-closed on empty input");
+        assert!(err.contains("no entries in ndjson source"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ndjson_typed_ignores_unknown_top_level_fields() {
+        let path = ndjson_temp_path("typed-extras");
+        // Extra unknown fields should be ignored (serde default behaviour),
+        // not rejected — keeps NDJSON streams forward-compatible.
+        fs::write(
+            &path,
+            r#"{"window_end_utc":"x","evidence_mode":"measured","extra_field":{"nested":42}}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<SloLikeEntry> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].window_end_utc, "x");
+        let _ = fs::remove_file(&path);
     }
 }
