@@ -196,6 +196,39 @@ Emit the machine-readable artifact.
 - keep the existing report contract stable
 - make the artifact suitable for offline inspection
 
+**Status (2026-05-14): complete.** Implemented as an opt-in extension of the
+Slice 4 read-only inspection CLI. When the operator passes
+`--output-dir <path>` to `ops vm-lab-report-capabilities`, the handler
+additionally writes
+`<output_dir>/state/platform_capabilities.json` (relative path also exported
+as the public constant `PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH`)
+containing the single evaluated record for the requested
+`(scope, platform, source_mode, mixed_platform_topology, bootstrap_phase)`
+tuple. JSON shape:
+
+```text
+{
+  "schema_version": 1,
+  "records": [
+    {"scope": "...", "status": "...", "reason_code": "...", "message": "..."},
+    ...
+  ]
+}
+```
+
+The artifact emitter is exposed as `render_platform_capabilities_artifact_json`
+plus `write_platform_capabilities_artifact` and accepts a slice of records, so
+it can be reused by Slice 2 wrapper integration when that lands. The fail-closed
+contract is preserved: when the handler refuses the request (e.g. missing
+`--bootstrap-phase` on a `--scope=bootstrap-phase` invocation), the artifact is
+never written. Eight additional tests cover schema-version + records-array
+shape, ordered serialization of multiple records, JSON escaping for `"` and
+`\\` in message bodies, idempotent writes against the same input, artifact
+emission when `--output-dir` is set, no artifact when `--output-dir` is
+unset, and no artifact when the handler fails closed. CLI is smoke-tested:
+`ops vm-lab-report-capabilities --scope setup-live-lab --platform linux
+--source-mode local-head --output-dir <dir>` writes the expected JSON.
+
 ### Slice 4
 
 Add the optional inspection CLI.
