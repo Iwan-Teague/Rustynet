@@ -1071,6 +1071,88 @@ pub fn validate_vm_lab_report_dir_fresh(report_dir: &std::path::Path) -> VmLabRe
     }
 }
 
+/// Inputs that led to a particular capability outcome. The struct is
+/// strictly informational; it never claims to express enforcement and never
+/// re-runs the evaluator. It exists so downstream tooling (error logs,
+/// failure artifacts, ops review bundles) can render a deterministic block
+/// that captures both *what was asked for* and *what the evaluator decided*
+/// without depending on the wrapper site's local string-building.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabCapabilityFailureContext {
+    pub command: String,
+    pub context: VmLabCapabilityContext,
+    pub record: VmLabCapabilityRecord,
+}
+
+impl VmLabCapabilityFailureContext {
+    /// Build a failure-context bundle from a command name and the inputs
+    /// that were fed to the evaluator. The capability record is re-derived
+    /// via `evaluate_vm_lab_capability(context)` so the bundle is always
+    /// internally consistent: caller cannot pass a mismatched record.
+    ///
+    /// Slice 2 callers can drop this bundle straight into a log line, an
+    /// audit artifact, or an error response, and downstream consumers will
+    /// always see the same shape.
+    pub fn new(command: impl Into<String>, context: VmLabCapabilityContext) -> Self {
+        let record = evaluate_vm_lab_capability(context);
+        Self {
+            command: command.into(),
+            context,
+            record,
+        }
+    }
+
+    /// True when the carried record is `Unsupported`. Convenience for
+    /// callers that need to fail closed without re-matching on the inner
+    /// status.
+    pub fn is_blocker(&self) -> bool {
+        matches!(self.record.status, VmLabCapabilityStatus::Unsupported)
+    }
+}
+
+/// Render a deterministic operator-facing failure block from a capability
+/// failure context. Pairs with [`render_vm_lab_capability_error`]: the
+/// existing renderer takes just a record; this renderer also includes the
+/// command identity and the input tuple, so the block is reproducible from
+/// the bundle alone.
+///
+/// Shape (exact lines for an Unsupported record):
+///
+/// ```text
+/// rustynet vm-lab failure: <command>
+///   scope: <scope>
+///   status: <status>
+///   reason_code: <reason_code>
+///   details: <message>
+///   inputs:
+///     platform: <platform>
+///     source_mode: <source_mode>
+///     mixed_platform_topology: <true|false>
+///     bootstrap_phase: <phase|none>
+/// ```
+///
+/// For Supported / PartiallySupported records the headline stays the same
+/// (it documents the bundle's origin, not a positive assertion); the
+/// per-status status field communicates the actual outcome.
+pub fn render_vm_lab_capability_failure_block(ctx: &VmLabCapabilityFailureContext) -> String {
+    let bootstrap_phase = match ctx.context.bootstrap_phase {
+        Some(phase) => phase.as_label(),
+        None => "none",
+    };
+    format!(
+        "rustynet vm-lab failure: {command}\n  scope: {scope}\n  status: {status}\n  reason_code: {reason_code}\n  details: {message}\n  inputs:\n    platform: {platform}\n    source_mode: {source_mode}\n    mixed_platform_topology: {mixed}\n    bootstrap_phase: {bootstrap_phase}",
+        command = ctx.command,
+        scope = ctx.record.scope.as_label(),
+        status = ctx.record.status.as_label(),
+        reason_code = ctx.record.reason_code,
+        message = ctx.record.message,
+        platform = ctx.context.platform.as_label(),
+        source_mode = ctx.context.source_mode.as_label(),
+        mixed = ctx.context.mixed_platform_topology,
+        bootstrap_phase = bootstrap_phase,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2604,6 +2686,100 @@ mod tests {
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
+    }
+
+    // ----- VmLabCapabilityFailureContext / render_vm_lab_capability_failure_block -----
+
+    #[test]
+    fn failure_context_rederives_record_from_inputs() {
+        let ctx = ctx_windows(VmLabCapabilityScope::SetupLiveLab);
+        let bundle = VmLabCapabilityFailureContext::new("vm-lab-setup-live-lab", ctx);
+        assert_eq!(bundle.command, "vm-lab-setup-live-lab");
+        assert_eq!(bundle.context, ctx);
+        assert_eq!(bundle.record.status, VmLabCapabilityStatus::Unsupported);
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+    }
+
+    #[test]
+    fn failure_context_is_blocker_true_only_for_unsupported_record() {
+        let unsupported = VmLabCapabilityFailureContext::new(
+            "x",
+            ctx_windows(VmLabCapabilityScope::SetupLiveLab),
+        );
+        assert!(unsupported.is_blocker());
+
+        let supported =
+            VmLabCapabilityFailureContext::new("x", ctx_linux(VmLabCapabilityScope::SetupLiveLab));
+        assert!(!supported.is_blocker());
+
+        let partial = VmLabCapabilityFailureContext::new(
+            "x",
+            VmLabCapabilityContext {
+                scope: VmLabCapabilityScope::BaselineDiagnostics,
+                platform: VmLabPlatform::Windows,
+                source_mode: VmLabSourceMode::LocalHead,
+                bootstrap_phase: None,
+                mixed_platform_topology: false,
+            },
+        );
+        assert!(!partial.is_blocker());
+    }
+
+    #[test]
+    fn render_failure_block_includes_command_scope_status_reason_and_inputs() {
+        let ctx = ctx_windows(VmLabCapabilityScope::SetupLiveLab);
+        let bundle = VmLabCapabilityFailureContext::new("vm-lab-setup-live-lab", ctx);
+        let rendered = render_vm_lab_capability_failure_block(&bundle);
+        assert!(rendered.starts_with("rustynet vm-lab failure: vm-lab-setup-live-lab\n"));
+        assert!(rendered.contains("scope: SetupLiveLab"));
+        assert!(rendered.contains("status: Unsupported"));
+        assert!(rendered.contains("reason_code: linux-shell-orchestrator-only"));
+        assert!(rendered.contains("details: "));
+        assert!(rendered.contains("inputs:"));
+        assert!(rendered.contains("platform: Windows"));
+        assert!(rendered.contains("source_mode: LocalHead"));
+        assert!(rendered.contains("mixed_platform_topology: false"));
+        assert!(rendered.contains("bootstrap_phase: none"));
+    }
+
+    #[test]
+    fn render_failure_block_shows_bootstrap_phase_label_when_set() {
+        let ctx = VmLabCapabilityContext {
+            scope: VmLabCapabilityScope::BootstrapPhase,
+            platform: VmLabPlatform::Windows,
+            source_mode: VmLabSourceMode::LocalHead,
+            bootstrap_phase: Some(VmLabBootstrapPhase::InstallRelease),
+            mixed_platform_topology: false,
+        };
+        let bundle = VmLabCapabilityFailureContext::new("vm-lab-bootstrap-phase", ctx);
+        let rendered = render_vm_lab_capability_failure_block(&bundle);
+        assert!(rendered.contains("bootstrap_phase: InstallRelease"));
+        assert!(rendered.contains("reason_code: runtime-host-not-yet-implemented"));
+    }
+
+    #[test]
+    fn render_failure_block_is_deterministic_for_same_bundle() {
+        let bundle = VmLabCapabilityFailureContext::new(
+            "vm-lab-setup-live-lab",
+            ctx_windows(VmLabCapabilityScope::SetupLiveLab),
+        );
+        let a = render_vm_lab_capability_failure_block(&bundle);
+        let b = render_vm_lab_capability_failure_block(&bundle);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn render_failure_block_mixed_topology_flag_shown_as_true_when_set() {
+        let mut ctx = ctx_linux(VmLabCapabilityScope::SetupLiveLab);
+        ctx.mixed_platform_topology = true;
+        let bundle = VmLabCapabilityFailureContext::new("vm-lab-setup-live-lab", ctx);
+        let rendered = render_vm_lab_capability_failure_block(&bundle);
+        assert!(rendered.contains("mixed_platform_topology: true"));
+        // Mixed topology + Linux scope must surface topology-mismatch.
+        assert!(rendered.contains("reason_code: topology-mismatch"));
     }
 
     // ----- validate_vm_lab_report_dir_fresh -----
