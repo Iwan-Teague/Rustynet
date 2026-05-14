@@ -188,6 +188,22 @@ Use the evaluator in the top-level wrappers.
 - replace coarse error text with capability-derived messages
 - preserve current Linux-only execution boundaries
 
+**Status (2026-05-14): partial.** The most prominent coarse-text reject in
+the wrapper trait surface — `RustOrchestrator::execute_live_lab`'s
+heterogeneous-topology rejection in
+`crates/rustynet-cli/src/vm_lab/mod.rs` — is now derived from the Slice-1
+capability evaluator. The reject message keeps its existing operator-facing
+"heterogeneous live-lab execution" / W4.1 references for continuity, and
+additionally embeds the canonical Slice-1 capability summary
+(`scope=RunLiveLab status=Unsupported reason_code=topology-mismatch
+message=...`), so downstream tooling can grep on the stable capability
+reason code instead of the free-form prose. Enforcement is unchanged: the
+trait boundary still fails closed for any non-Linux target. The
+profile-time gate `ensure_live_lab_profile_capabilities` (W4.1 vocabulary)
+remains untouched and continues to do the per-stage capability gating it
+already does; folding that gate into the Slice-1 vocabulary is left for a
+later pass.
+
 ### Slice 3
 
 Emit the machine-readable artifact.
