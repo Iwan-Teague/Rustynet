@@ -1369,6 +1369,9 @@ Notes:
 ```
 
 ### 18.3 Final Audited Artifact and Gate State
+- Re-audited on 2026-05-14 at `HEAD=425faa411ce7f09327bd1c16b8746a23f210c8bb`. The legacy entry below
+  records the prior audit point against `HEAD=06e3e2ed...` and is retained for traceability; the
+  2026-05-14 entry in §18.2 supersedes it for the current commit.
 - Current `HEAD`: `06e3e2ed745b4439505991bea775246cde8ed653`
 - Canonical cross-network report artifact expectation and current state:
   - `artifacts/phase10/cross_network_direct_remote_exit_report.json`: missing
@@ -4079,6 +4082,96 @@ What this slice completed:
     Windows relay validation.
 What remains blocked:
   - Live cross-network relay evidence remains open.
+```
+
+```text
+Date: 2026-05-14
+Phase / Slice: Track A defect re-audit, full gate sweep, and 3-VM live-lab orchestration on commit 425faa4
+Files reviewed (no changes — verified existing implementation matches plan §8.1–§8.5):
+  - crates/rustynetd/src/stun_client.rs
+    - `StunResult` carries the full mapped public `SocketAddr` (mapped_endpoint + server + local_addr).
+    - `gather_mapped_endpoints_with_round_trip(...)` consumes the backend-owned authoritative round-trip
+      transport so the measured tuple corresponds to the same socket identity that carries peer traffic.
+    - The legacy `gather_public_ips()` remains documented as DEPRECATED and is no longer used to
+      reconstruct srflx candidates from `wg_listen_port`.
+  - crates/rustynetd/src/daemon.rs
+    - `local_stun_candidates: Vec<SocketAddr>` stores the measured mapped endpoint as-is.
+    - srflx publication at the probe candidate generator uses `endpoint.ip()`/`endpoint.port()` from the
+      stored result, not `SocketAddr::new(ip, wg_listen_port)`.
+    - `load_relay_client(...)` no longer binds a daemon-owned ephemeral relay socket; the relay client
+      surface is bound only by the authoritative backend transport contract via `RelayClient::bind`.
+    - Runtime path-summary requires `selected_endpoint_matches && handshake_fresh` before incrementing
+      `live_relay_peers`; `relay_active` is reachable only when `live_relay_peers == programmed_peer_count`,
+      and `relay_session_state` collapses to `live` only under the same proof-bearing condition.
+  - crates/rustynetd/src/relay_client.rs
+    - `RelayClient::bind(socket)` takes a caller-provided `UdpSocket` and refuses an unbound state with
+      `relay socket not bound`; backend authoritative transport contract is the single supply path.
+  - crates/rustynet-relay/src/main.rs and crates/rustynet-relay/src/transport.rs
+    - Real production daemon: control UDP listener, allocated-port dataplane sockets, hello/ack parsing,
+      session table, ciphertext forwarding loop, replay/nonce store, per-node and per-session rate limits,
+      session expiry/cleanup, clean shutdown, and Windows-service mode.
+    - Allocated-port demux contract: source-tuple binding on first packet, strict tuple match thereafter,
+      stale-tuple rejection, replay rejection via `NonceStore`, session attribution by `(node_id, peer_node_id)`
+      index, and pre-reuse attribution clearing.
+Gate sweep run on commit `425faa411ce7f09327bd1c16b8746a23f210c8bb` (HEAD at run time):
+  - `cargo fmt --all -- --check`: pass (no diff).
+  - `cargo check --workspace --all-targets --all-features`: pass.
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+  - `cargo test --workspace --all-targets --all-features`: 2036 passed, 0 failed, 0 ignored.
+  - `cargo audit --deny warnings`: pass (exit 0; 1087 advisories scanned over 166 dependencies).
+  - `cargo deny check bans licenses sources advisories`: pass.
+  - `./scripts/ci/phase10_hp2_gates.sh`: pass (`traversal_path_selection_report` and
+    `traversal_probe_security_report` regenerated under `artifacts/phase10/source/`).
+  - `./scripts/ci/membership_gates.sh`: pass (`artifacts/phase10/membership_report.json` regenerated and
+    schema-validated).
+  - `./scripts/ci/phase10_cross_network_exit_gates.sh`: fails closed on the six canonical missing
+    cross-network reports for commit `425faa4`. Correct behavior: the in-tree 3-VM lab shares one
+    underlay (192.168.64.0/24) and cannot synthesize the distinct-WAN topology required by the canonical
+    cross-network suites.
+Live-lab orchestration:
+  - Command:
+    `./target/release/rustynet-cli ops vm-lab-orchestrate-live-lab
+       --inventory documents/operations/active/vm_lab_inventory.json
+       --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+       --known-hosts-file ~/.ssh/known_hosts
+       --node debian-headless-1:exit
+       --node debian-headless-2:client
+       --windows-vm windows-utm-1
+       --report-dir artifacts/live-lab-run-20260514-091558`
+  - Outcome: `passed=17 failed=0 skipped=0` covering preflight, prepare_source_archive,
+    verify_ssh_reachability, cleanup_hosts, bootstrap_hosts, collect_pubkeys, membership_init,
+    distribute_membership, distribute_assignments, distribute_traversal, distribute_dns_zone,
+    enforce_baseline_runtime, validate_baseline_runtime, traffic_test_matrix, role_switch_matrix,
+    exit_handoff, cleanup.
+  - Parity input: `artifacts/live-lab-run-20260514-091558/parity_input.json`
+    (`run_id=rust-1778746942`, `overall_status=passed`).
+  - Topology: 3 VMs on a single underlay (Linux exit `192.168.64.8`, Linux client `192.168.64.4`,
+    Windows client `192.168.64.14`); this proves single-network direct-active correctness end-to-end on
+    the current commit but does not yet substitute for distinct-WAN cross-network reports.
+Security invariants re-verified by code audit on this run:
+  - srflx candidates are published from measured public tuples only; no `wg_listen_port` substitution path
+    remains in candidate publication.
+  - Relay client cannot reach `establish_session`/`send_keepalive` without a caller-supplied authoritative
+    `UdpSocket`; backend-owned shared transport remains the only supply.
+  - `relay_active` requires both selected-endpoint match against the relay session and fresh handshake
+    proof; `relay_programmed` does not promote to live without that proof.
+  - Allocated-port relay dispatch attributes each datagram to exactly one authenticated session, rejects
+    stale-tuple reuse, rejects replayed nonces, and clears attribution before any port reuse.
+What this slice completed:
+  - Audited the implementation against §8.1–§8.5 of this document and confirmed the fixes are present
+    on `425faa4`.
+  - Ran the full mandatory CI gate sweep and the in-tree 3-VM live-lab orchestrator, recording outcomes
+    above for this commit.
+What remains blocked (unchanged from §18.3 in nature, refreshed for this commit):
+  - The six canonical cross-network reports
+    (`cross_network_direct_remote_exit_report.json`, `cross_network_relay_remote_exit_report.json`,
+    `cross_network_failback_roaming_report.json`, `cross_network_traversal_adversarial_report.json`,
+    `cross_network_remote_exit_dns_report.json`, `cross_network_remote_exit_soak_report.json`)
+    are still absent for commit `425faa4`. They require a true distinct-underlay topology that the
+    current local UTM lab cannot synthesize. `./scripts/ci/phase10_cross_network_exit_gates.sh` continues
+    to fail closed on this gap by design.
+  - `./scripts/ci/phase10_gates.sh` remains blocked by the same stale
+    `artifacts/phase10/fresh_install_os_matrix_report.json` (embedded `git_commit=c86a62a`).
 ```
 
 ## 19. Definition of Done for This Document
