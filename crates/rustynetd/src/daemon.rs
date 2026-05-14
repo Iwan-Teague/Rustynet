@@ -844,8 +844,17 @@ impl DaemonBackendMode {
     // restart (e.g. boringtun worker recovery). The runtime key must remain on
     // disk for the daemon's lifetime; scrubbing it after the first apply would
     // break subsequent recovery attempts.
+    //
+    // The Windows WireGuard-NT backend calls sync_persistent_config() on every
+    // peer/route change (configure_peer, update_peer_endpoint, apply_routes,
+    // set_exit_mode), which reads the private key to re-render the DPAPI-encrypted
+    // config file. Scrubbing the key after the first apply breaks subsequent
+    // sync_persistent_config() calls triggered by traversal probe path changes.
     fn retains_runtime_key_at_rest(self) -> bool {
-        matches!(self, DaemonBackendMode::LinuxWireguardUserspaceShared)
+        matches!(
+            self,
+            DaemonBackendMode::LinuxWireguardUserspaceShared | DaemonBackendMode::WindowsWireguardNt
+        )
     }
 }
 
