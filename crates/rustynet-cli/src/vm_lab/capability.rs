@@ -397,6 +397,27 @@ pub const MERGED_EMPTY_INPUT_REASON_CODE: &str = "merge-empty-record-set";
 /// message enumerates them for operator inspection.
 pub const MERGED_MIXED_REASON_CODE: &str = "merge-mixed-reasons";
 
+/// Evaluate a composite scope (Orchestrate / RepoSync / Suite) by evaluating
+/// each constituent sub-context with the Slice-1 evaluator and folding the
+/// results through [`merge_vm_lab_capability_records`].
+///
+/// The `scope` argument is the composite scope label to attach to the merged
+/// record. Constituent sub-contexts may carry any scope; the merge ignores
+/// their scopes and uses only their status and reason codes. Empty
+/// sub-contexts produce the same fail-closed merged record as
+/// `merge_vm_lab_capability_records` on an empty input.
+pub fn evaluate_composite_scope(
+    scope: VmLabCapabilityScope,
+    sub_contexts: &[VmLabCapabilityContext],
+) -> VmLabCapabilityRecord {
+    let records: Vec<VmLabCapabilityRecord> = sub_contexts
+        .iter()
+        .copied()
+        .map(evaluate_vm_lab_capability)
+        .collect();
+    merge_vm_lab_capability_records(scope, &records)
+}
+
 /// Merge a set of capability records into a single composite record using a
 /// weakest-link rule:
 ///
@@ -1250,6 +1271,110 @@ mod tests {
         ];
         let first = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
         let second = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        assert_eq!(first, second);
+    }
+
+    // ----- evaluate_composite_scope -----
+
+    fn raw_context(scope: VmLabCapabilityScope, platform: VmLabPlatform) -> VmLabCapabilityContext {
+        VmLabCapabilityContext {
+            scope,
+            platform,
+            source_mode: VmLabSourceMode::LocalHead,
+            bootstrap_phase: None,
+            mixed_platform_topology: false,
+        }
+    }
+
+    #[test]
+    fn evaluate_composite_scope_with_empty_sub_contexts_fails_closed() {
+        let merged = evaluate_composite_scope(VmLabCapabilityScope::OrchestrateLiveLab, &[]);
+        assert_eq!(merged.scope, VmLabCapabilityScope::OrchestrateLiveLab);
+        assert_eq!(merged.status, VmLabCapabilityStatus::Unsupported);
+        assert_eq!(merged.reason_code, MERGED_EMPTY_INPUT_REASON_CODE);
+    }
+
+    #[test]
+    fn evaluate_composite_scope_promotes_to_supported_only_when_every_subcontext_is_supported() {
+        let subs = [
+            raw_context(VmLabCapabilityScope::SetupLiveLab, VmLabPlatform::Linux),
+            raw_context(VmLabCapabilityScope::RunLiveLab, VmLabPlatform::Linux),
+        ];
+        let merged = evaluate_composite_scope(VmLabCapabilityScope::OrchestrateLiveLab, &subs);
+        assert_eq!(merged.status, VmLabCapabilityStatus::Supported);
+        assert_eq!(
+            merged.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+    }
+
+    #[test]
+    fn evaluate_composite_scope_demotes_to_unsupported_when_any_subcontext_is_unsupported() {
+        let subs = [
+            raw_context(VmLabCapabilityScope::SetupLiveLab, VmLabPlatform::Linux),
+            raw_context(VmLabCapabilityScope::RunLiveLab, VmLabPlatform::Windows),
+        ];
+        let merged = evaluate_composite_scope(VmLabCapabilityScope::OrchestrateLiveLab, &subs);
+        assert_eq!(merged.status, VmLabCapabilityStatus::Unsupported);
+        // Windows RunLiveLab returns linux-shell-orchestrator-only; Linux
+        // SetupLiveLab returns linux-shell-orchestrator-only too. Uniform
+        // reason code is reused.
+        assert_eq!(
+            merged.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+    }
+
+    #[test]
+    fn evaluate_composite_scope_demotes_to_partial_when_baseline_diagnostics_is_partial_on_windows()
+    {
+        // Linux Setup -> Supported (linux-shell-orchestrator-only)
+        // Windows BaselineDiagnostics -> PartiallySupported (partially-implemented-subcapability)
+        // Composite -> PartiallySupported, mixed reason codes
+        let subs = [
+            raw_context(VmLabCapabilityScope::SetupLiveLab, VmLabPlatform::Linux),
+            raw_context(
+                VmLabCapabilityScope::BaselineDiagnostics,
+                VmLabPlatform::Windows,
+            ),
+        ];
+        let merged = evaluate_composite_scope(VmLabCapabilityScope::Suite, &subs);
+        assert_eq!(merged.status, VmLabCapabilityStatus::PartiallySupported);
+        assert_eq!(merged.reason_code, MERGED_MIXED_REASON_CODE);
+        assert!(merged.message.contains("linux-shell-orchestrator-only"));
+        assert!(
+            merged
+                .message
+                .contains("partially-implemented-subcapability")
+        );
+    }
+
+    #[test]
+    fn evaluate_composite_scope_preserves_caller_provided_scope_label() {
+        let subs = [raw_context(
+            VmLabCapabilityScope::SetupLiveLab,
+            VmLabPlatform::Linux,
+        )];
+        let a = evaluate_composite_scope(VmLabCapabilityScope::OrchestrateLiveLab, &subs);
+        let b = evaluate_composite_scope(VmLabCapabilityScope::RepoSync, &subs);
+        let c = evaluate_composite_scope(VmLabCapabilityScope::Suite, &subs);
+        assert_eq!(a.scope, VmLabCapabilityScope::OrchestrateLiveLab);
+        assert_eq!(b.scope, VmLabCapabilityScope::RepoSync);
+        assert_eq!(c.scope, VmLabCapabilityScope::Suite);
+    }
+
+    #[test]
+    fn evaluate_composite_scope_is_deterministic_for_same_subcontexts() {
+        let subs = [
+            raw_context(VmLabCapabilityScope::SetupLiveLab, VmLabPlatform::Linux),
+            raw_context(VmLabCapabilityScope::RunLiveLab, VmLabPlatform::Windows),
+            raw_context(
+                VmLabCapabilityScope::BaselineDiagnostics,
+                VmLabPlatform::MacOS,
+            ),
+        ];
+        let first = evaluate_composite_scope(VmLabCapabilityScope::Suite, &subs);
+        let second = evaluate_composite_scope(VmLabCapabilityScope::Suite, &subs);
         assert_eq!(first, second);
     }
 
