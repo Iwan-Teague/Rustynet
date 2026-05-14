@@ -161,6 +161,25 @@ Add a pure evaluator and unit tests.
 - no support broadening yet
 - capability output stays internal until the model is stable
 
+**Status (2026-05-14): complete.** Implemented in
+`crates/rustynet-cli/src/vm_lab/capability.rs` as a new internal submodule of
+`vm_lab`. Carries the full taxonomy (`VmLabCapabilityStatus`,
+`VmLabCapabilityScope`, `VmLabPlatform`, `VmLabSourceMode`,
+`VmLabBootstrapPhase`, `VmLabCapabilityContext`, `VmLabCapabilityRecord`), a
+stable `reason_code` namespace, the pure `evaluate_vm_lab_capability`
+classifier, the `evaluate_vm_lab_capabilities_for_profile` profile helper, the
+`command_scope` mapping, and `render_capability_summary` /
+`render_capability_report` rendering helpers. 24 unit tests cover Linux/
+Windows/macOS/iOS/Android setup/run/orchestrate/bootstrap/diagnostics paths,
+mixed-platform topology rejection on Linux setup, Windows helper-backed
+bootstrap phases as `Supported`, Windows runtime-host bootstrap phases as
+`Unsupported` with `runtime-host-not-yet-implemented`, the
+`BootstrapPhase`-scope-without-phase guard, command-name mapping, the
+one-line rendering format, profile-evaluator determinism, idempotent repeat
+invocations, and reason-code ASCII-kebab-case shape. The module is
+`#![allow(dead_code)]` for the duration of Slice 1 because no wrapper calls
+into it yet; Slice 2 wiring will drop that attribute.
+
 ### Slice 2
 
 Use the evaluator in the top-level wrappers.

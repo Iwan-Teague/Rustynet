@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bootstrap;
+pub mod capability;
 pub mod orchestrator;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
