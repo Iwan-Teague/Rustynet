@@ -469,6 +469,106 @@ pub fn sanitize_vm_lab_capability_message(input: &str) -> String {
     out
 }
 
+/// Outcome of [`validate_vm_lab_target_topology`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmLabTopologyValidation {
+    /// Topology is honest for the currently supported wrapper path.
+    Ok,
+    /// Topology is rejected fail-closed. The accompanying capability record
+    /// carries the canonical reason code and operator-facing message; the
+    /// `scope` field reflects whichever scope the caller asked the validator
+    /// to interpret the topology under.
+    Rejected(VmLabCapabilityRecord),
+}
+
+/// Fail-closed validator for the platform mix of a live-lab topology before
+/// any execution begins. The validator is pure and never touches state.
+///
+/// Contract (in evaluation order):
+///
+/// 1. Empty platform set is rejected with `target-platform-unsupported`. A
+///    wrapper that has no targets at all is not the same as a default-Linux
+///    profile — that defaulting belongs in the profile loader, not here.
+/// 2. Any mobile platform (`Ios` or `Android`) in the topology is rejected
+///    with `target-platform-unsupported`. Mobile is not part of the current
+///    wrapper surface.
+/// 3. For composite/run/setup scopes that do not currently accept mixed
+///    platforms (`SetupLiveLab`, `RunLiveLab`, `OrchestrateLiveLab`,
+///    `RepoSync`, `Suite`), a mix that contains any non-Linux target is
+///    rejected with `topology-mismatch` when more than one platform family
+///    is present, or with `linux-shell-orchestrator-only` when the single
+///    family is a non-Linux platform.
+/// 4. Otherwise the topology is `Ok` for the requested scope.
+///
+/// The `scope` argument decides which scope label the rejection record
+/// carries. The validator does not invent a new scope.
+pub fn validate_vm_lab_target_topology(
+    scope: VmLabCapabilityScope,
+    platforms: &[VmLabPlatform],
+) -> VmLabTopologyValidation {
+    if platforms.is_empty() {
+        return VmLabTopologyValidation::Rejected(VmLabCapabilityRecord {
+            scope,
+            status: VmLabCapabilityStatus::Unsupported,
+            reason_code: reason_code::TARGET_PLATFORM_UNSUPPORTED,
+            message: "empty target topology: a live-lab wrapper needs at least one target node"
+                .to_string(),
+        });
+    }
+    if platforms
+        .iter()
+        .any(|p| matches!(p, VmLabPlatform::Ios | VmLabPlatform::Android))
+    {
+        return VmLabTopologyValidation::Rejected(VmLabCapabilityRecord {
+            scope,
+            status: VmLabCapabilityStatus::Unsupported,
+            reason_code: reason_code::TARGET_PLATFORM_UNSUPPORTED,
+            message: "mobile platforms (iOS/Android) are not part of the current wrapper surface"
+                .to_string(),
+        });
+    }
+    // Count distinct desktop platform families.
+    let mut distinct: Vec<VmLabPlatform> = Vec::new();
+    for platform in platforms {
+        if !distinct.contains(platform) {
+            distinct.push(*platform);
+        }
+    }
+    let scope_requires_pure_linux = matches!(
+        scope,
+        VmLabCapabilityScope::SetupLiveLab
+            | VmLabCapabilityScope::RunLiveLab
+            | VmLabCapabilityScope::OrchestrateLiveLab
+            | VmLabCapabilityScope::RepoSync
+            | VmLabCapabilityScope::Suite
+    );
+    if scope_requires_pure_linux {
+        if distinct.len() > 1 {
+            return VmLabTopologyValidation::Rejected(VmLabCapabilityRecord {
+                scope,
+                status: VmLabCapabilityStatus::Unsupported,
+                reason_code: reason_code::TOPOLOGY_MISMATCH,
+                message:
+                    "the current live-lab wrapper path requires a pure-Linux topology; mixed-platform targets are not supported yet"
+                        .to_string(),
+            });
+        }
+        // distinct.len() == 1 here
+        if distinct[0] != VmLabPlatform::Linux {
+            return VmLabTopologyValidation::Rejected(VmLabCapabilityRecord {
+                scope,
+                status: VmLabCapabilityStatus::Unsupported,
+                reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                message: format!(
+                    "the current live-lab wrapper path is Linux-shell based and does not yet execute the top-level flow on {} targets",
+                    distinct[0].as_label(),
+                ),
+            });
+        }
+    }
+    VmLabTopologyValidation::Ok
+}
+
 /// Evaluate a composite scope (Orchestrate / RepoSync / Suite) by evaluating
 /// each constituent sub-context with the Slice-1 evaluator and folding the
 /// results through [`merge_vm_lab_capability_records`].
@@ -1344,6 +1444,130 @@ mod tests {
         let first = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
         let second = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
         assert_eq!(first, second);
+    }
+
+    // ----- validate_vm_lab_target_topology -----
+
+    fn assert_rejected(
+        result: VmLabTopologyValidation,
+        expected_status: VmLabCapabilityStatus,
+        expected_code: &'static str,
+    ) -> VmLabCapabilityRecord {
+        match result {
+            VmLabTopologyValidation::Rejected(rec) => {
+                assert_eq!(rec.status, expected_status);
+                assert_eq!(rec.reason_code, expected_code);
+                rec
+            }
+            VmLabTopologyValidation::Ok => panic!("expected rejection, got Ok"),
+        }
+    }
+
+    #[test]
+    fn validate_topology_pure_linux_setup_is_ok() {
+        let platforms = vec![VmLabPlatform::Linux; 5];
+        assert_eq!(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &platforms),
+            VmLabTopologyValidation::Ok,
+        );
+    }
+
+    #[test]
+    fn validate_topology_empty_platform_set_is_rejected_with_target_platform_unsupported() {
+        assert_rejected(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &[]),
+            VmLabCapabilityStatus::Unsupported,
+            reason_code::TARGET_PLATFORM_UNSUPPORTED,
+        );
+    }
+
+    #[test]
+    fn validate_topology_with_ios_target_is_rejected_with_target_platform_unsupported() {
+        let platforms = vec![VmLabPlatform::Linux, VmLabPlatform::Ios];
+        assert_rejected(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &platforms),
+            VmLabCapabilityStatus::Unsupported,
+            reason_code::TARGET_PLATFORM_UNSUPPORTED,
+        );
+    }
+
+    #[test]
+    fn validate_topology_with_android_target_is_rejected_with_target_platform_unsupported() {
+        let platforms = vec![VmLabPlatform::Android];
+        assert_rejected(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::RunLiveLab, &platforms),
+            VmLabCapabilityStatus::Unsupported,
+            reason_code::TARGET_PLATFORM_UNSUPPORTED,
+        );
+    }
+
+    #[test]
+    fn validate_topology_mixed_linux_and_windows_is_rejected_with_topology_mismatch() {
+        let platforms = vec![
+            VmLabPlatform::Linux,
+            VmLabPlatform::Linux,
+            VmLabPlatform::Windows,
+        ];
+        assert_rejected(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &platforms),
+            VmLabCapabilityStatus::Unsupported,
+            reason_code::TOPOLOGY_MISMATCH,
+        );
+    }
+
+    #[test]
+    fn validate_topology_pure_windows_is_rejected_with_linux_shell_orchestrator_only() {
+        let platforms = vec![VmLabPlatform::Windows; 3];
+        let rec = assert_rejected(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &platforms),
+            VmLabCapabilityStatus::Unsupported,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+        );
+        assert!(rec.message.contains("Windows"));
+    }
+
+    #[test]
+    fn validate_topology_pure_macos_is_rejected_with_linux_shell_orchestrator_only() {
+        let platforms = vec![VmLabPlatform::MacOS];
+        let rec = assert_rejected(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::OrchestrateLiveLab, &platforms),
+            VmLabCapabilityStatus::Unsupported,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+        );
+        assert!(rec.message.contains("MacOS"));
+    }
+
+    #[test]
+    fn validate_topology_attaches_caller_scope_to_rejection_record() {
+        let platforms = vec![VmLabPlatform::Windows];
+        let scopes = [
+            VmLabCapabilityScope::SetupLiveLab,
+            VmLabCapabilityScope::RunLiveLab,
+            VmLabCapabilityScope::OrchestrateLiveLab,
+            VmLabCapabilityScope::RepoSync,
+            VmLabCapabilityScope::Suite,
+        ];
+        for scope in scopes {
+            let rec = assert_rejected(
+                validate_vm_lab_target_topology(scope, &platforms),
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+            );
+            assert_eq!(rec.scope, scope);
+        }
+    }
+
+    #[test]
+    fn validate_topology_bootstrap_phase_scope_accepts_pure_windows_topology() {
+        // BootstrapPhase is one of the scopes that does NOT require a pure-
+        // Linux topology — Windows bootstrap phases are evaluated separately
+        // by the Slice-1 evaluator. The topology validator must not reject
+        // pure-Windows targets when the caller is evaluating bootstrap.
+        let platforms = vec![VmLabPlatform::Windows; 2];
+        assert_eq!(
+            validate_vm_lab_target_topology(VmLabCapabilityScope::BootstrapPhase, &platforms),
+            VmLabTopologyValidation::Ok,
+        );
     }
 
     // ----- sanitize_vm_lab_capability_message -----
