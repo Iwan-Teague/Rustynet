@@ -778,6 +778,42 @@ pub fn merge_vm_lab_capability_records(
 /// parser. The handler is deterministic: given the same config, it always
 /// returns the same summary string and writes the same artifact when
 /// `output_dir` is set.
+/// Output format for `ops vm-lab-report-capabilities`. Defaults to
+/// `Summary` (one-line `scope=... status=... reason_code=... message=...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VmLabReportCapabilitiesFormat {
+    /// One-line `scope=... status=... reason_code=... message=...` form
+    /// produced by [`render_capability_summary`]. Default.
+    #[default]
+    Summary,
+    /// Multi-line operator-facing block produced by
+    /// [`render_vm_lab_capability_error`]. Suitable for surfacing the
+    /// verdict in a user-visible failure block.
+    Error,
+}
+
+impl VmLabReportCapabilitiesFormat {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            VmLabReportCapabilitiesFormat::Summary => "Summary",
+            VmLabReportCapabilitiesFormat::Error => "Error",
+        }
+    }
+}
+
+/// Parse the `--format` argument. Lowercase kebab-case labels only.
+pub fn parse_report_capabilities_format_arg(
+    value: &str,
+) -> Result<VmLabReportCapabilitiesFormat, String> {
+    match value {
+        "summary" => Ok(VmLabReportCapabilitiesFormat::Summary),
+        "error" => Ok(VmLabReportCapabilitiesFormat::Error),
+        other => Err(format!(
+            "invalid --format value {other:?}: expected one of summary, error"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabReportCapabilitiesConfig {
     pub scope: VmLabCapabilityScope,
@@ -791,6 +827,8 @@ pub struct VmLabReportCapabilitiesConfig {
     /// the plan contract; the JSON shape is documented on
     /// [`render_platform_capabilities_artifact_json`].
     pub output_dir: Option<std::path::PathBuf>,
+    /// Stdout rendering format. Defaults to `Summary`.
+    pub format: VmLabReportCapabilitiesFormat,
 }
 
 /// Parse the `--scope` argument. Accepts canonical wrapper command names
@@ -895,7 +933,11 @@ pub fn execute_ops_vm_lab_report_capabilities(
         write_platform_capabilities_artifact(output_dir, std::slice::from_ref(&record))
             .map_err(|err| format!("write platform capabilities artifact failed: {err}"))?;
     }
-    Ok(render_capability_summary(&record))
+    let rendered = match config.format {
+        VmLabReportCapabilitiesFormat::Summary => render_capability_summary(&record),
+        VmLabReportCapabilitiesFormat::Error => render_vm_lab_capability_error(&record),
+    };
+    Ok(rendered)
 }
 
 /// Canonical relative artifact path inside the report dir, per
@@ -2055,7 +2097,82 @@ mod tests {
             bootstrap_phase: None,
             mixed_platform_topology: false,
             output_dir: None,
+            format: VmLabReportCapabilitiesFormat::Summary,
         }
+    }
+
+    #[test]
+    fn parse_format_accepts_summary_and_error_labels() {
+        assert_eq!(
+            parse_report_capabilities_format_arg("summary").unwrap(),
+            VmLabReportCapabilitiesFormat::Summary
+        );
+        assert_eq!(
+            parse_report_capabilities_format_arg("error").unwrap(),
+            VmLabReportCapabilitiesFormat::Error
+        );
+    }
+
+    #[test]
+    fn parse_format_rejects_unknown_and_uppercase_values() {
+        for bad in ["", "Summary", "ERROR", "json", "block"] {
+            assert!(
+                parse_report_capabilities_format_arg(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_capabilities_format_summary_is_default() {
+        // The default-derived format is Summary, matching the previous
+        // single-output behaviour.
+        let default = VmLabReportCapabilitiesFormat::default();
+        assert_eq!(default, VmLabReportCapabilitiesFormat::Summary);
+    }
+
+    #[test]
+    fn report_capabilities_with_summary_format_returns_one_line_summary() {
+        let out = execute_ops_vm_lab_report_capabilities(linux_setup_config()).unwrap();
+        // One-line summary form does not start with the multi-line block
+        // headline.
+        assert!(!out.starts_with("rustynet vm-lab:"));
+        assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
+        assert!(!out.contains('\n'));
+    }
+
+    #[test]
+    fn report_capabilities_with_error_format_returns_multi_line_block() {
+        let mut config = linux_setup_config();
+        config.format = VmLabReportCapabilitiesFormat::Error;
+        let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        assert!(out.starts_with("rustynet vm-lab:"));
+        assert!(out.contains("scope: SetupLiveLab"));
+        assert!(out.contains("status: Supported"));
+        assert!(out.contains("reason_code: linux-shell-orchestrator-only"));
+        assert!(out.contains("details: "));
+        // Multi-line block has exactly 5 lines (no trailing newline).
+        assert_eq!(out.lines().count(), 5);
+    }
+
+    #[test]
+    fn report_capabilities_with_error_format_still_writes_artifact_when_output_dir_set() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-cap-format-error-artifact-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut config = linux_setup_config();
+        config.format = VmLabReportCapabilitiesFormat::Error;
+        config.output_dir = Some(tmp.clone());
+        let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        // Stdout is the multi-line block...
+        assert!(out.starts_with("rustynet vm-lab:"));
+        // ...but the artifact still lands in the canonical location.
+        let body = std::fs::read_to_string(tmp.join(PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH))
+            .expect("artifact must exist after a successful error-format invocation");
+        assert!(body.starts_with("{\"schema_version\":1,"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2238,6 +2355,7 @@ mod tests {
             bootstrap_phase: Some(VmLabBootstrapPhase::InstallRelease),
             mixed_platform_topology: false,
             output_dir: None,
+            format: VmLabReportCapabilitiesFormat::Summary,
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=BootstrapPhase status=Unsupported"));
@@ -2419,6 +2537,7 @@ mod tests {
             bootstrap_phase: Some(VmLabBootstrapPhase::SyncSource),
             mixed_platform_topology: false,
             output_dir: None,
+            format: VmLabReportCapabilitiesFormat::Summary,
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
