@@ -387,6 +387,103 @@ pub fn render_capability_report(records: &[VmLabCapabilityRecord]) -> String {
     out
 }
 
+/// Reason code used by [`merge_vm_lab_capability_records`] when the merge has
+/// no records to fold. Composite scopes always require at least one
+/// constituent record; an empty input is treated as fail-closed.
+pub const MERGED_EMPTY_INPUT_REASON_CODE: &str = "merge-empty-record-set";
+
+/// Reason code used by [`merge_vm_lab_capability_records`] when the merged
+/// record covers records with multiple distinct reason codes. The merged
+/// message enumerates them for operator inspection.
+pub const MERGED_MIXED_REASON_CODE: &str = "merge-mixed-reasons";
+
+/// Merge a set of capability records into a single composite record using a
+/// weakest-link rule:
+///
+/// - If any constituent is `Unsupported`, the merged status is `Unsupported`.
+/// - Else if any constituent is `PartiallySupported`, the merged status is
+///   `PartiallySupported`.
+/// - Else every constituent is `Supported`, and the merged status is
+///   `Supported`.
+///
+/// The `scope` argument is the composite scope label to attach to the merged
+/// record (typically [`VmLabCapabilityScope::OrchestrateLiveLab`],
+/// [`VmLabCapabilityScope::RepoSync`], or [`VmLabCapabilityScope::Suite`]).
+///
+/// Reason code rules:
+///
+/// - Empty input -> [`MERGED_EMPTY_INPUT_REASON_CODE`] and `Unsupported`
+///   status. Composite scopes never declare success without a constituent.
+/// - All constituents share the same `reason_code` -> reuse that
+///   constituent code (so the merged record looks like a normal Slice-1
+///   record to downstream tooling).
+/// - Otherwise -> [`MERGED_MIXED_REASON_CODE`] with the constituent codes
+///   enumerated in the message body.
+pub fn merge_vm_lab_capability_records(
+    scope: VmLabCapabilityScope,
+    records: &[VmLabCapabilityRecord],
+) -> VmLabCapabilityRecord {
+    if records.is_empty() {
+        return VmLabCapabilityRecord {
+            scope,
+            status: VmLabCapabilityStatus::Unsupported,
+            reason_code: MERGED_EMPTY_INPUT_REASON_CODE,
+            message: "composite capability cannot be derived from an empty record set".to_string(),
+        };
+    }
+
+    let mut merged_status = VmLabCapabilityStatus::Supported;
+    for record in records {
+        merged_status = match (merged_status, record.status) {
+            (VmLabCapabilityStatus::Unsupported, _) | (_, VmLabCapabilityStatus::Unsupported) => {
+                VmLabCapabilityStatus::Unsupported
+            }
+            (VmLabCapabilityStatus::PartiallySupported, _)
+            | (_, VmLabCapabilityStatus::PartiallySupported) => {
+                VmLabCapabilityStatus::PartiallySupported
+            }
+            _ => VmLabCapabilityStatus::Supported,
+        };
+    }
+
+    let first_reason = records[0].reason_code;
+    let uniform = records.iter().all(|r| r.reason_code == first_reason);
+    if uniform {
+        return VmLabCapabilityRecord {
+            scope,
+            status: merged_status,
+            reason_code: first_reason,
+            message: format!(
+                "composite {} records all share reason_code={}",
+                records.len(),
+                first_reason,
+            ),
+        };
+    }
+
+    // Stable, deterministic mixed-reason enumeration: first occurrence wins,
+    // duplicates suppressed.
+    let mut seen: Vec<&'static str> = Vec::with_capacity(records.len());
+    for record in records {
+        if !seen.contains(&record.reason_code) {
+            seen.push(record.reason_code);
+        }
+    }
+    let mut message = String::from("composite reason codes: ");
+    for (idx, code) in seen.iter().enumerate() {
+        if idx > 0 {
+            message.push_str(", ");
+        }
+        message.push_str(code);
+    }
+    VmLabCapabilityRecord {
+        scope,
+        status: merged_status,
+        reason_code: MERGED_MIXED_REASON_CODE,
+        message,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slice 4: read-only inspection CLI surface.
 //
@@ -960,6 +1057,200 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----- merge_vm_lab_capability_records -----
+
+    fn record(
+        status: VmLabCapabilityStatus,
+        reason: &'static str,
+        message: &str,
+    ) -> VmLabCapabilityRecord {
+        VmLabCapabilityRecord {
+            scope: VmLabCapabilityScope::SetupLiveLab,
+            status,
+            reason_code: reason,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_empty_record_set_is_unsupported_with_dedicated_reason_code() {
+        let merged = merge_vm_lab_capability_records(VmLabCapabilityScope::OrchestrateLiveLab, &[]);
+        assert_eq!(merged.scope, VmLabCapabilityScope::OrchestrateLiveLab);
+        assert_eq!(merged.status, VmLabCapabilityStatus::Unsupported);
+        assert_eq!(merged.reason_code, MERGED_EMPTY_INPUT_REASON_CODE);
+    }
+
+    #[test]
+    fn merge_all_supported_with_uniform_reason_reuses_constituent_reason_code() {
+        let records = vec![
+            record(
+                VmLabCapabilityStatus::Supported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                "a",
+            ),
+            record(
+                VmLabCapabilityStatus::Supported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                "b",
+            ),
+        ];
+        let merged = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        assert_eq!(merged.status, VmLabCapabilityStatus::Supported);
+        assert_eq!(
+            merged.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+        assert!(merged.message.contains("2 records"));
+    }
+
+    #[test]
+    fn merge_any_partial_demotes_to_partial_when_no_unsupported() {
+        let records = vec![
+            record(
+                VmLabCapabilityStatus::Supported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                "linux ok",
+            ),
+            record(
+                VmLabCapabilityStatus::PartiallySupported,
+                reason_code::PARTIALLY_IMPLEMENTED_SUBCAPABILITY,
+                "partial",
+            ),
+        ];
+        let merged = merge_vm_lab_capability_records(VmLabCapabilityScope::RepoSync, &records);
+        assert_eq!(merged.status, VmLabCapabilityStatus::PartiallySupported);
+        assert_eq!(merged.reason_code, MERGED_MIXED_REASON_CODE);
+        assert!(merged.message.contains("linux-shell-orchestrator-only"));
+        assert!(
+            merged
+                .message
+                .contains("partially-implemented-subcapability")
+        );
+    }
+
+    #[test]
+    fn merge_any_unsupported_demotes_to_unsupported_even_with_supported_present() {
+        let records = vec![
+            record(
+                VmLabCapabilityStatus::Supported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                "ok",
+            ),
+            record(
+                VmLabCapabilityStatus::PartiallySupported,
+                reason_code::PARTIALLY_IMPLEMENTED_SUBCAPABILITY,
+                "partial",
+            ),
+            record(
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED,
+                "blocked",
+            ),
+        ];
+        let merged =
+            merge_vm_lab_capability_records(VmLabCapabilityScope::OrchestrateLiveLab, &records);
+        assert_eq!(merged.status, VmLabCapabilityStatus::Unsupported);
+        assert_eq!(merged.reason_code, MERGED_MIXED_REASON_CODE);
+        assert!(merged.message.starts_with("composite reason codes:"));
+    }
+
+    #[test]
+    fn merge_mixed_reason_codes_deduplicate_in_message() {
+        let records = vec![
+            record(
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                "a",
+            ),
+            record(
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::TARGET_PLATFORM_UNSUPPORTED,
+                "b",
+            ),
+            record(
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                "c",
+            ),
+        ];
+        let merged = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        assert_eq!(merged.reason_code, MERGED_MIXED_REASON_CODE);
+        // Each reason should appear once, in first-seen order.
+        let body = merged.message.as_str();
+        let linux_idx = body.find("linux-shell-orchestrator-only").unwrap();
+        let target_idx = body.find("target-platform-unsupported").unwrap();
+        assert!(linux_idx < target_idx, "first-seen order must be preserved");
+        assert_eq!(
+            body.matches("linux-shell-orchestrator-only").count(),
+            1,
+            "duplicate reason codes must be deduped"
+        );
+    }
+
+    #[test]
+    fn merge_uniform_all_unsupported_reuses_constituent_reason_code() {
+        let records = vec![
+            record(
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED,
+                "a",
+            ),
+            record(
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED,
+                "b",
+            ),
+        ];
+        let merged = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        assert_eq!(merged.status, VmLabCapabilityStatus::Unsupported);
+        assert_eq!(
+            merged.reason_code,
+            reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED
+        );
+    }
+
+    #[test]
+    fn merge_preserves_caller_provided_scope_regardless_of_constituent_scopes() {
+        // Constituents have SetupLiveLab scope (built by `record`), but the
+        // merged record must adopt whatever composite scope the caller passes.
+        let records = vec![record(
+            VmLabCapabilityStatus::Supported,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+            "a",
+        )];
+        let merged_a =
+            merge_vm_lab_capability_records(VmLabCapabilityScope::OrchestrateLiveLab, &records);
+        let merged_b = merge_vm_lab_capability_records(VmLabCapabilityScope::RepoSync, &records);
+        let merged_c = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        assert_eq!(merged_a.scope, VmLabCapabilityScope::OrchestrateLiveLab);
+        assert_eq!(merged_b.scope, VmLabCapabilityScope::RepoSync);
+        assert_eq!(merged_c.scope, VmLabCapabilityScope::Suite);
+    }
+
+    #[test]
+    fn merge_is_deterministic_for_same_inputs() {
+        let records = vec![
+            record(
+                VmLabCapabilityStatus::Supported,
+                reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+                "a",
+            ),
+            record(
+                VmLabCapabilityStatus::PartiallySupported,
+                reason_code::COMPOSITE_CAPABILITY,
+                "b",
+            ),
+            record(
+                VmLabCapabilityStatus::Unsupported,
+                reason_code::TARGET_PLATFORM_UNSUPPORTED,
+                "c",
+            ),
+        ];
+        let first = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        let second = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        assert_eq!(first, second);
     }
 
     // ----- Slice 4: inspection CLI -----
