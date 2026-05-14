@@ -169,11 +169,17 @@ pub fn enforce_daemon(
     // RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400: the traversal bundle is issued
     // with a 120-s TTL but the lab pipeline does not refresh it, so the same
     // extended window is needed here.
+    //
+    // RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400: the dns-zone bundle is distributed
+    // once by DistributeDnsZone and is not refreshed.  The default 300-s window
+    // causes dns_alarm_state=error once the bundle ages past 5 minutes, which
+    // can block traffic validation in longer pipeline runs.
     let script = format!(
         "sudo \
          RUSTYNET_INSTALL_SOURCE_ROOT={src_dir} \
          RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400 \
          RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400 \
+         RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400 \
          rustynet ops e2e-enforce-host \
          --role {role_str} \
          --node-id '{node_id}' \
