@@ -8791,7 +8791,12 @@ mod tests {
                     .as_str(),
             );
         }
-        rules.push_str(format!("    ct state established,related accept\n    oifname \"{interface_name}\" accept\n").as_str());
+        rules.push_str(
+            format!(
+                "    ct state established,related accept\n    oifname \"{interface_name}\" accept\n"
+            )
+            .as_str(),
+        );
         if include_egress_allow {
             rules.push_str(format!("    oifname \"{egress_interface}\" accept\n").as_str());
         }

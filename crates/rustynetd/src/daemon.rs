@@ -853,7 +853,8 @@ impl DaemonBackendMode {
     fn retains_runtime_key_at_rest(self) -> bool {
         matches!(
             self,
-            DaemonBackendMode::LinuxWireguardUserspaceShared | DaemonBackendMode::WindowsWireguardNt
+            DaemonBackendMode::LinuxWireguardUserspaceShared
+                | DaemonBackendMode::WindowsWireguardNt
         )
     }
 }
@@ -14700,7 +14701,10 @@ mod tests {
                 Some(encrypted_key_path.as_path()),
             )
             .expect("encrypted key mode should scrub runtime key for kernel backend");
-            assert!(!runtime_key_path.exists(), "kernel backend must scrub runtime key");
+            assert!(
+                !runtime_key_path.exists(),
+                "kernel backend must scrub runtime key"
+            );
 
             let _ = std::fs::remove_dir_all(test_dir);
         }
@@ -14720,7 +14724,10 @@ mod tests {
                 Some(encrypted_key_path.as_path()),
             )
             .expect("userspace-shared backend scrub must succeed without removing the key");
-            assert!(runtime_key_path.exists(), "userspace-shared backend must retain runtime key at rest");
+            assert!(
+                runtime_key_path.exists(),
+                "userspace-shared backend must retain runtime key at rest"
+            );
 
             let _ = std::fs::remove_dir_all(test_dir);
         }

@@ -269,6 +269,13 @@ pub fn enforce_daemon(
                  }} elseif (($ageIdx + 1) -lt $arr.Count) {{ \
                      $arr[$ageIdx + 1] = '86400' \
                  }}; \
+                 $dnsAgeIdx = [array]::IndexOf([string[]]$arr, '--dns-zone-max-age-secs'); \
+                 if ($dnsAgeIdx -lt 0) {{ \
+                     $null = $arr.Add('--dns-zone-max-age-secs'); \
+                     $null = $arr.Add('86400') \
+                 }} elseif (($dnsAgeIdx + 1) -lt $arr.Count) {{ \
+                     $arr[$dnsAgeIdx + 1] = '86400' \
+                 }}; \
                  'RUSTYNETD_DAEMON_ARGS_JSON=' + ($arr.ToArray() | ConvertTo-Json -Compress) \
              }} else {{ $_ }} \
          }}; \
