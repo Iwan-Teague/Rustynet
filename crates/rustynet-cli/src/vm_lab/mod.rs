@@ -6128,35 +6128,41 @@ impl StageOrchestrator for RustOrchestrator {
         // this branch into the real heterogeneous execution path.
         //
         // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14 wires the
-        // capability evaluator at this boundary. The reject record is now
-        // produced by `validate_vm_lab_target_topology` against the actual
-        // normalized platform mix, so the surfaced `reason_code`
-        // accurately reflects whether this is a mixed-platform topology
+        // capability evaluator at this boundary through the umbrella
+        // `validate_vm_lab_capability_preconditions`. The umbrella chains
+        // normalize_vm_lab_platform_mix + validate_vm_lab_target_topology
+        // + the Slice-1 evaluator into one typed verdict, so the surfaced
+        // `reason_code` reflects whether this is a mixed-platform topology
         // (`topology-mismatch`) or a pure-non-Linux topology
         // (`linux-shell-orchestrator-only`). Enforcement is unchanged:
         // this branch still fails closed for any non-Linux target.
         let blockers = self.non_linux_platforms();
-        let mix = capability::normalize_vm_lab_platform_mix(&self.target_platforms);
-        let capability_record = match capability::validate_vm_lab_target_topology(
-            capability::VmLabCapabilityScope::RunLiveLab,
-            &mix,
-        ) {
-            capability::VmLabTopologyValidation::Rejected(rec) => rec,
-            capability::VmLabTopologyValidation::Ok => {
-                // Unreachable in this branch: we are here precisely
-                // because `is_pure_linux()` is false, which means the
-                // topology validator must also reject. Build a defensive
-                // capability record so the wrapper never returns a
-                // capability-less string if the invariants ever drift.
-                capability::evaluate_vm_lab_capability(capability::VmLabCapabilityContext {
-                    scope: capability::VmLabCapabilityScope::RunLiveLab,
-                    platform: capability::VmLabPlatform::Linux,
-                    source_mode: capability::VmLabSourceMode::LocalHead,
-                    bootstrap_phase: None,
-                    mixed_platform_topology: true,
-                })
-            }
-        };
+        // The umbrella's Err branch is for unknown command names; we hard-
+        // code "vm-lab-run-live-lab" so this is unreachable in practice.
+        // Defensive fallback synthesizes a Blocked verdict so the wrapper
+        // never returns a capability-less string if the mapping drifts.
+        let outcome = capability::validate_vm_lab_capability_preconditions(
+            "vm-lab-run-live-lab",
+            capability::VmLabPlatform::Linux,
+            capability::VmLabSourceMode::LocalHead,
+            None,
+            &self.target_platforms,
+        )
+        .unwrap_or_else(|_| {
+            capability::VmLabCapabilityPrecondition::Blocked(
+                capability::VmLabCapabilityFailureContext::new(
+                    "vm-lab-run-live-lab",
+                    capability::VmLabCapabilityContext {
+                        scope: capability::VmLabCapabilityScope::RunLiveLab,
+                        platform: capability::VmLabPlatform::Linux,
+                        source_mode: capability::VmLabSourceMode::LocalHead,
+                        bootstrap_phase: None,
+                        mixed_platform_topology: true,
+                    },
+                ),
+            )
+        });
+        let capability_record = outcome.failure_context().record.clone();
         Err(format!(
             "RustOrchestrator refuses heterogeneous live-lab execution today: \
              non-Linux platforms in target set [{}]. {}. Until per-stage \
