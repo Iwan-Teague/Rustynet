@@ -585,7 +585,12 @@ fn protect_config_bytes(
 ) -> Result<Vec<u8>, BackendError> {
     #[cfg(windows)]
     {
-        return dpapi_protect(bytes, WindowsDpapiScope::CurrentUser, tunnel_name).map_err(|err| {
+        // LocalMachine scope: any LocalSystem process (including the WireGuard
+        // tunnel service, which runs as LocalSystem) can decrypt this blob.
+        // CurrentUser scope would lock the blob to the daemon's logon session
+        // and the tunnel service — a different security principal — could not
+        // read the config, causing the Wintun adapter to start without an IP.
+        return dpapi_protect(bytes, WindowsDpapiScope::LocalMachine, tunnel_name).map_err(|err| {
             BackendError::internal(format!(
                 "DPAPI protect failed for Windows tunnel config {}: {err}",
                 path.display()
