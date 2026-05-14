@@ -1,6 +1,9 @@
 # VM Lab Capability Reporting Plan
 
-**Status:** Active planning document
+**Status:** Active planning document. Slices 1, 3, and 4 complete; Slice 2 in
+partial-rollout (RustOrchestrator reject site wired through the umbrella
+validator). All 14 cookbook helpers (reusable building blocks + security-first
+set) are landed and tested; see the Slice 2 entry for the full catalog.
 
 ## Purpose
 
@@ -192,17 +195,45 @@ Use the evaluator in the top-level wrappers.
 the wrapper trait surface — `RustOrchestrator::execute_live_lab`'s
 heterogeneous-topology rejection in
 `crates/rustynet-cli/src/vm_lab/mod.rs` — is now derived from the Slice-1
-capability evaluator. The reject message keeps its existing operator-facing
-"heterogeneous live-lab execution" / W4.1 references for continuity, and
-additionally embeds the canonical Slice-1 capability summary
-(`scope=RunLiveLab status=Unsupported reason_code=topology-mismatch
-message=...`), so downstream tooling can grep on the stable capability
-reason code instead of the free-form prose. Enforcement is unchanged: the
-trait boundary still fails closed for any non-Linux target. The
-profile-time gate `ensure_live_lab_profile_capabilities` (W4.1 vocabulary)
-remains untouched and continues to do the per-stage capability gating it
-already does; folding that gate into the Slice-1 vocabulary is left for a
-later pass.
+capability evaluator and routed through the canonical umbrella validator
+`validate_vm_lab_capability_preconditions`. The reject message keeps its
+existing operator-facing "heterogeneous live-lab execution" / W4.1
+references for continuity, and additionally embeds the canonical Slice-1
+capability summary (e.g. `scope=RunLiveLab status=Unsupported
+reason_code=topology-mismatch message=...` for mixed topologies, or
+`reason_code=linux-shell-orchestrator-only` for pure-non-Linux topologies),
+so downstream tooling can grep on the stable capability reason code
+instead of the free-form prose. Enforcement is unchanged: the trait
+boundary still fails closed for any non-Linux target. The profile-time
+gate `ensure_live_lab_profile_capabilities` (W4.1 vocabulary) remains
+untouched and continues to do the per-stage capability gating it already
+does; folding that gate into the Slice-1 vocabulary is left for a later
+pass.
+
+Cookbook helpers landed as part of Slices 1-4 and Slice-2 follow-up
+(`crates/rustynet-cli/src/vm_lab/capability.rs`):
+
+Reusable building blocks:
+- `evaluate_vm_lab_capability`
+- `evaluate_vm_lab_capabilities_for_profile`
+- `evaluate_composite_scope`
+- `merge_vm_lab_capability_records` (weakest-link)
+- `command_scope` (the cookbook's `select_vm_lab_capability_scope`)
+- `collect_vm_lab_capability_inputs`
+- `normalize_vm_lab_platform_mix` + `From<VmGuestPlatform>`
+- `render_capability_summary` / `render_capability_report`
+- `render_vm_lab_capability_error` (multi-line operator block)
+- `render_vm_lab_capability_failure_block` (with command identity)
+- `render_platform_capabilities_artifact_json` /
+  `write_platform_capabilities_artifact`
+- `VmLabCapabilityFailureContext`
+
+Security-first helpers:
+- `sanitize_vm_lab_capability_message`
+- `validate_vm_lab_target_topology`
+- `validate_vm_lab_report_dir_fresh`
+- `validate_vm_lab_capability_preconditions` (umbrella validator,
+  consumed by `RustOrchestrator::execute_live_lab`)
 
 ### Slice 3
 
