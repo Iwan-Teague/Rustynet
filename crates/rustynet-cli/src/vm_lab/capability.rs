@@ -387,6 +387,51 @@ pub fn render_capability_report(records: &[VmLabCapabilityRecord]) -> String {
     out
 }
 
+/// Render a multi-line, operator-facing error string from a capability
+/// record. Pairs with [`render_capability_summary`]: the summary form is
+/// the single-line `scope=... status=... reason_code=... message=...`
+/// telemetry shape; this form is what a wrapper site should surface in a
+/// user-visible failure message.
+///
+/// Shape (exact bytes for a non-Supported record):
+///
+/// ```text
+/// rustynet vm-lab: this combination is not supported by the current wrapper path
+///   scope: <scope>
+///   status: <status>
+///   reason_code: <reason_code>
+///   details: <message>
+/// ```
+///
+/// For a `Supported` record the first line becomes
+/// `"rustynet vm-lab: this combination is supported by the current wrapper path"`,
+/// since `render_vm_lab_capability_error` is also useful as the operator-facing
+/// form of a positive capability assertion (e.g. dry-run preflight).
+///
+/// The renderer never invokes [`sanitize_vm_lab_capability_message`]; callers
+/// that have not already sanitized externally-sourced messages must do so
+/// themselves before passing the record in.
+pub fn render_vm_lab_capability_error(record: &VmLabCapabilityRecord) -> String {
+    let headline = match record.status {
+        VmLabCapabilityStatus::Supported => {
+            "rustynet vm-lab: this combination is supported by the current wrapper path"
+        }
+        VmLabCapabilityStatus::PartiallySupported => {
+            "rustynet vm-lab: this combination is only partially supported by the current wrapper path"
+        }
+        VmLabCapabilityStatus::Unsupported => {
+            "rustynet vm-lab: this combination is not supported by the current wrapper path"
+        }
+    };
+    format!(
+        "{headline}\n  scope: {scope}\n  status: {status}\n  reason_code: {reason_code}\n  details: {message}",
+        scope = record.scope.as_label(),
+        status = record.status.as_label(),
+        reason_code = record.reason_code,
+        message = record.message,
+    )
+}
+
 /// Reason code used by [`merge_vm_lab_capability_records`] when the merge has
 /// no records to fold. Composite scopes always require at least one
 /// constituent record; an empty input is treated as fail-closed.
@@ -1242,6 +1287,76 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("status=Supported"));
         assert!(lines[1].contains("status=Unsupported"));
+    }
+
+    #[test]
+    fn render_error_uses_unsupported_headline_for_unsupported_record() {
+        let record = evaluate_vm_lab_capability(ctx_windows(VmLabCapabilityScope::SetupLiveLab));
+        let out = render_vm_lab_capability_error(&record);
+        let mut lines = out.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "rustynet vm-lab: this combination is not supported by the current wrapper path"
+        );
+        assert_eq!(lines.next().unwrap(), "  scope: SetupLiveLab");
+        assert_eq!(lines.next().unwrap(), "  status: Unsupported");
+        assert_eq!(
+            lines.next().unwrap(),
+            "  reason_code: linux-shell-orchestrator-only"
+        );
+        assert!(lines.next().unwrap().starts_with("  details: "));
+        assert!(
+            lines.next().is_none(),
+            "error block must have exactly five lines"
+        );
+    }
+
+    #[test]
+    fn render_error_uses_supported_headline_for_supported_record() {
+        let record = evaluate_vm_lab_capability(ctx_linux(VmLabCapabilityScope::SetupLiveLab));
+        let out = render_vm_lab_capability_error(&record);
+        assert!(out.starts_with(
+            "rustynet vm-lab: this combination is supported by the current wrapper path\n"
+        ));
+        assert!(out.contains("status: Supported"));
+        assert!(out.contains("reason_code: linux-shell-orchestrator-only"));
+    }
+
+    #[test]
+    fn render_error_uses_partial_headline_for_partial_record() {
+        // Windows BaselineDiagnostics -> PartiallySupported per Slice-1.
+        let mut ctx = ctx_windows(VmLabCapabilityScope::BaselineDiagnostics);
+        ctx.platform = VmLabPlatform::Windows;
+        let record = evaluate_vm_lab_capability(ctx);
+        let out = render_vm_lab_capability_error(&record);
+        assert!(out.starts_with(
+            "rustynet vm-lab: this combination is only partially supported by the current wrapper path\n"
+        ));
+        assert!(out.contains("status: PartiallySupported"));
+    }
+
+    #[test]
+    fn render_error_does_not_invoke_sanitizer_so_the_caller_controls_message_shape() {
+        let record = VmLabCapabilityRecord {
+            scope: VmLabCapabilityScope::SetupLiveLab,
+            status: VmLabCapabilityStatus::Unsupported,
+            reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+            message: "preserved\twith\ttabs".to_string(),
+        };
+        let out = render_vm_lab_capability_error(&record);
+        // The tabs survive untouched — sanitization is the caller's
+        // responsibility, by design.
+        assert!(out.contains("preserved\twith\ttabs"));
+    }
+
+    #[test]
+    fn render_error_is_idempotent_for_same_record() {
+        let record = evaluate_vm_lab_capability(ctx_windows(VmLabCapabilityScope::SetupLiveLab));
+        let a = render_vm_lab_capability_error(&record);
+        let b = render_vm_lab_capability_error(&record);
+        let c = render_vm_lab_capability_error(&record);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
     }
 
     #[test]
