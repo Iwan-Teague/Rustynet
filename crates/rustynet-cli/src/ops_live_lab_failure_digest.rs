@@ -1,11 +1,28 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
+use serde::Deserialize;
 use serde_json::json;
+
+/// Typed view of the relevant subset of
+/// `live_linux_reboot_recovery_report.json` used by the failure-digest
+/// extractor. The schema covers exactly the fields the extractor reads;
+/// unknown fields are ignored (default serde behaviour), but the fields
+/// declared here must hold the documented shape or the parse fails — no
+/// `serde_json::Value` walks remain on this trust-adjacent path.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RebootRecoveryReportView {
+    #[serde(default)]
+    failure_reasons: Vec<String>,
+    #[serde(default)]
+    checks: BTreeMap<String, String>,
+    #[serde(default)]
+    observations: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateLiveLinuxLabFailureDigestConfig {
@@ -236,57 +253,44 @@ fn extract_extended_soak_reason(report_dir: &Path) -> Option<String> {
     if !report_path.exists() {
         return None;
     }
-    let payload: serde_json::Value = serde_json::from_str(
-        fs::read_to_string(&report_path)
-            .ok()
-            .as_deref()
-            .unwrap_or_default(),
-    )
-    .ok()?;
+    let body = fs::read_to_string(&report_path).ok()?;
+    let payload: RebootRecoveryReportView = serde_json::from_str(body.as_str()).ok()?;
 
-    if let Some(failure_reasons) = payload.get("failure_reasons").and_then(|v| v.as_array()) {
-        let cleaned = failure_reasons
-            .iter()
-            .filter_map(|item| item.as_str().map(str::trim))
-            .filter(|item| !item.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        if !cleaned.is_empty() {
-            return Some(shorten(cleaned.join("; ").as_str(), 220));
-        }
+    let cleaned: Vec<String> = payload
+        .failure_reasons
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if !cleaned.is_empty() {
+        return Some(shorten(cleaned.join("; ").as_str(), 220));
     }
 
     let mut reasons = Vec::new();
-    if let Some(checks) = payload.get("checks").and_then(|v| v.as_object()) {
-        for (name, value) in checks {
-            if value.as_str() == Some("fail")
-                && let Some(reason) = reboot_check_reason_text(name.as_str())
-            {
-                reasons.push(reason.to_string());
-            }
+    for (name, value) in &payload.checks {
+        if value == "fail"
+            && let Some(reason) = reboot_check_reason_text(name.as_str())
+        {
+            reasons.push(reason.to_string());
         }
     }
 
-    if let Some(observations) = payload.get("observations").and_then(|v| v.as_str()) {
-        for line in observations
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            match line {
-                "client_reboot_wait=fail" => {
-                    reasons.push("client reboot wait timed out".to_string())
-                }
-                "exit_reboot_wait=fail" => reasons.push("exit reboot wait timed out".to_string()),
-                "exit_post=" => {
-                    reasons.push("exit post-reboot boot_id capture was empty".to_string())
-                }
-                "client_post=" => {
-                    reasons.push("client post-reboot boot_id capture was empty".to_string())
-                }
-                _ if line.starts_with("ssh_port22_hosts=") => reasons.push(line.to_string()),
-                _ => {}
+    for line in payload
+        .observations
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        match line {
+            "client_reboot_wait=fail" => reasons.push("client reboot wait timed out".to_string()),
+            "exit_reboot_wait=fail" => reasons.push("exit reboot wait timed out".to_string()),
+            "exit_post=" => reasons.push("exit post-reboot boot_id capture was empty".to_string()),
+            "client_post=" => {
+                reasons.push("client post-reboot boot_id capture was empty".to_string())
             }
+            _ if line.starts_with("ssh_port22_hosts=") => reasons.push(line.to_string()),
+            _ => {}
         }
     }
 
@@ -627,4 +631,145 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
         output_json.display(),
         output_md.display()
     ))
+}
+
+#[cfg(test)]
+mod typed_parser_tests {
+    use super::*;
+
+    fn write_report(dir: &Path, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("live_linux_reboot_recovery_report.json"), body).unwrap();
+    }
+
+    fn tmp_dir(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-cli-failure-digest-{}-{}",
+            std::process::id(),
+            suffix
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn extract_returns_none_when_report_file_is_absent() {
+        let dir = tmp_dir("absent");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(extract_extended_soak_reason(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_returns_none_when_payload_is_not_valid_json() {
+        let dir = tmp_dir("invalid");
+        write_report(&dir, "not json");
+        // Typed parse fails closed; the extractor returns None.
+        assert!(extract_extended_soak_reason(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_uses_failure_reasons_array_when_present() {
+        let dir = tmp_dir("reasons");
+        write_report(
+            &dir,
+            r#"{"schema_version":1,"failure_reasons":["alpha","  beta  ","",  "gamma"]}"#,
+        );
+        let out =
+            extract_extended_soak_reason(&dir).expect("non-empty failure_reasons must surface");
+        // Empty-after-trim entries are dropped; whitespace is trimmed; order preserved.
+        assert_eq!(out, "alpha; beta; gamma");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_falls_back_to_checks_when_failure_reasons_is_absent() {
+        let dir = tmp_dir("checks");
+        write_report(
+            &dir,
+            r#"{"schema_version":1,"checks":{"exit_reboot_returns":"fail","client_reboot_returns":"pass"}}"#,
+        );
+        let out = extract_extended_soak_reason(&dir)
+            .expect("failed check must yield a reboot_check_reason_text mapping");
+        assert!(!out.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_consumes_observations_when_no_failure_reasons_or_failed_checks() {
+        let dir = tmp_dir("obs");
+        write_report(
+            &dir,
+            r#"{"schema_version":1,"observations":"client_reboot_wait=fail\nexit_post=\nunrelated_line"}"#,
+        );
+        let out = extract_extended_soak_reason(&dir)
+            .expect("matching observation lines must surface a reason");
+        assert!(out.contains("client reboot wait timed out"));
+        assert!(out.contains("exit post-reboot boot_id capture was empty"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_dedupes_repeated_reasons() {
+        let dir = tmp_dir("dedup");
+        write_report(
+            &dir,
+            r#"{"schema_version":1,"observations":"client_reboot_wait=fail\nclient_reboot_wait=fail\nexit_reboot_wait=fail"}"#,
+        );
+        let out = extract_extended_soak_reason(&dir).unwrap();
+        let cnt = out.matches("client reboot wait timed out").count();
+        assert_eq!(
+            cnt, 1,
+            "repeated observation lines must dedupe in output: {out}"
+        );
+    }
+
+    #[test]
+    fn extract_returns_none_when_payload_has_no_signals_at_all() {
+        let dir = tmp_dir("empty-signals");
+        write_report(
+            &dir,
+            r#"{"schema_version":1,"mode":"live_linux_reboot_recovery","status":"pass"}"#,
+        );
+        // No failure_reasons, no failed checks, no matching observations: nothing to report.
+        assert!(extract_extended_soak_reason(&dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_ignores_unknown_fields_under_typed_parse() {
+        let dir = tmp_dir("unknown-fields");
+        // Unknown top-level fields (boot_ids, etc.) must not break parsing —
+        // RebootRecoveryReportView intentionally accepts the documented
+        // subset and ignores everything else.
+        write_report(
+            &dir,
+            r#"{
+              "schema_version": 1,
+              "mode": "live_linux_reboot_recovery",
+              "status": "fail",
+              "boot_ids": {"exit_pre":"a","exit_post":"b","client_pre":"c","client_post":"d"},
+              "failure_reasons": ["fault-from-typed-view"],
+              "checks": {"exit_reboot_returns":"fail"},
+              "observations": "exit_post="
+            }"#,
+        );
+        let out = extract_extended_soak_reason(&dir).unwrap();
+        assert!(out.contains("fault-from-typed-view"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_treats_failure_reasons_with_only_whitespace_entries_as_empty() {
+        let dir = tmp_dir("whitespace-only");
+        write_report(
+            &dir,
+            r#"{"failure_reasons":["", "  ", "\t"], "observations":"exit_post="}"#,
+        );
+        // failure_reasons effectively empty -> falls through to observations.
+        let out = extract_extended_soak_reason(&dir).unwrap();
+        assert!(out.contains("exit post-reboot boot_id capture was empty"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
