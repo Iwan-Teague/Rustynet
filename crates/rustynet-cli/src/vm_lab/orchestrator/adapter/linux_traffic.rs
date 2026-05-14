@@ -245,6 +245,18 @@ pub fn issue_bundles_to_dir(
         SHORT_TIMEOUT,
     )?;
 
+    // Ensure /etc/rustynet/ has the strict mode 0750 root:rustynetd that
+    // validate_key_custody_permissions requires before the signing-secret load.
+    // install-systemd sets this during bootstrap, but some bootstrap paths
+    // leave it at 0755 if install-systemd runs before the rustynetd group GID
+    // is fully resolved.  Re-enforcing here is safe and idempotent.
+    ssh::run_remote(
+        conn,
+        "sudo -n chmod 0750 /etc/rustynet && \
+         sudo -n chown root:rustynetd /etc/rustynet",
+        SHORT_TIMEOUT,
+    )?;
+
     let safe_rustynet = rustynet_path.replace('\'', "'\"'\"'");
     ssh::run_remote(
         conn,
