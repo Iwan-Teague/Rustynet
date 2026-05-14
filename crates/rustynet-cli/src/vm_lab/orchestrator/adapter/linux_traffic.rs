@@ -256,6 +256,17 @@ pub fn issue_bundles_to_dir(
         MEDIUM_TIMEOUT,
     )?;
 
+    // rustynet creates the issue dir as root:root 0700; make it and its
+    // files readable by the SSH user so the listing and scp_from below work.
+    ssh::run_remote(
+        conn,
+        &format!(
+            "sudo -n chmod 755 '{remote_issue_dir}' && \
+             sudo -n chmod 644 '{remote_issue_dir}'/*"
+        ),
+        SHORT_TIMEOUT,
+    )?;
+
     let listing = ssh::run_remote(
         conn,
         &format!("ls -1 '{remote_issue_dir}' 2>/dev/null"),
