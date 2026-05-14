@@ -1579,10 +1579,10 @@ mod tests {
     use super::{
         CandidateSource, CoordinationReplayWindow, CoordinationSchedule, EndpointMonitor,
         NatFilteringBehavior, NatMappingBehavior, NatProfile, PathMode, SimultaneousOpenRuntime,
-        SimultaneousOpenWaiter, TraversalCandidate, TraversalDecision, TraversalDecisionReason,
-        TraversalEngine, TraversalEngineConfig, TraversalError, TraversalSession,
-        collect_gathered_candidates, direct_udp_viable, parse_stun_xor_mapped_address,
-        schedule_proactive_refresh,
+        SimultaneousOpenWaiter, TransitionReason, TraversalCandidate, TraversalDecision,
+        TraversalDecisionReason, TraversalEngine, TraversalEngineConfig, TraversalError,
+        TraversalSession, collect_gathered_candidates, direct_udp_viable,
+        parse_stun_xor_mapped_address, schedule_proactive_refresh,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
     use rustynet_control::{ControlPlaneCore, NodeMetadata, TraversalCoordinationRecord};
@@ -1693,6 +1693,84 @@ mod tests {
         assert_eq!(roam.to, PathMode::Direct);
         assert_eq!(session.path, PathMode::Direct);
         assert_eq!(session.active_endpoint, Some(second_endpoint));
+    }
+
+    #[test]
+    fn endpoint_roam_to_identical_endpoint_is_noop() {
+        let peer = NodeId::new("peer-roam-same").expect("node id should be valid");
+        let mut session = TraversalSession::new(peer, 100);
+        let endpoint = endpoint([198, 51, 100, 5], 55123);
+
+        session.on_direct_probe_success(endpoint, 120);
+        assert_eq!(session.path, PathMode::Direct);
+        assert_eq!(session.active_endpoint, Some(endpoint));
+
+        let previous_transition = session.last_transition;
+        let event = session.on_endpoint_roamed(endpoint, 150);
+        assert!(
+            event.is_none(),
+            "roam to identical endpoint must not emit a transition"
+        );
+        assert_eq!(session.path, PathMode::Direct);
+        assert_eq!(session.active_endpoint, Some(endpoint));
+        assert_eq!(
+            session.last_transition, previous_transition,
+            "no-op roam must not overwrite last_transition"
+        );
+    }
+
+    #[test]
+    fn endpoint_roam_on_relay_path_does_not_promote_to_direct() {
+        let peer = NodeId::new("peer-roam-relay").expect("node id should be valid");
+        let mut session = TraversalSession::new(peer, 100);
+        let relay_endpoint = endpoint([198, 51, 100, 10], 51820);
+
+        assert_eq!(session.path, PathMode::Relay);
+        let event = session.on_endpoint_roamed(relay_endpoint, 130);
+        assert!(
+            event.is_none(),
+            "roaming while on relay path must not emit a direct-mode transition"
+        );
+        assert_eq!(
+            session.path,
+            PathMode::Relay,
+            "path mode must remain Relay across endpoint roam"
+        );
+        assert_eq!(
+            session.active_endpoint,
+            Some(relay_endpoint),
+            "active endpoint should record the observed roam even on relay path"
+        );
+    }
+
+    #[test]
+    fn endpoint_roam_after_multiple_distinct_changes_keeps_direct_session() {
+        let peer = NodeId::new("peer-multi-roam").expect("node id should be valid");
+        let mut session = TraversalSession::new(peer, 100);
+        let endpoints = [
+            endpoint([198, 51, 100, 5], 55101),
+            endpoint([198, 51, 100, 6], 55102),
+            endpoint([198, 51, 100, 7], 55103),
+            endpoint([198, 51, 100, 8], 55104),
+        ];
+
+        session.on_direct_probe_success(endpoints[0], 120);
+        let mut now = 130u64;
+        let mut last_event_ts = 0u64;
+        for next in &endpoints[1..] {
+            let event = session
+                .on_endpoint_roamed(*next, now)
+                .expect("distinct endpoint roam should emit a transition");
+            assert_eq!(event.from, PathMode::Direct);
+            assert_eq!(event.to, PathMode::Direct);
+            assert_eq!(event.reason, TransitionReason::EndpointRoamed);
+            assert_eq!(event.at_unix, now);
+            last_event_ts = now;
+            now = now.saturating_add(15);
+        }
+        assert_eq!(session.path, PathMode::Direct);
+        assert_eq!(session.active_endpoint, Some(*endpoints.last().unwrap()));
+        assert_eq!(session.last_transition.at_unix, last_event_ts);
     }
 
     #[test]

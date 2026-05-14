@@ -930,12 +930,12 @@ Use this section as the execution log while implementing the plan.
   - [x] Production WireGuard backends are still command-only adapters over OS-managed peer-traffic sockets, so daemon STUN gathering remains blocked pending a backend-owned datagram multiplexer or equivalent authoritative packet-I/O capability — RESOLVED: LinuxUserspaceSharedBackend (Track F) owns its UDP socket and exposes authoritative_transport_round_trip; daemon already dispatches STUN through it; transport_socket_identity_blocker() returns None so STUN runs on the userspace-shared path
   - [x] Production WireGuard backends still lack that backend-owned transport capability for relay establishment, so the daemon now refuses to auto-bind a second relay client socket and leaves relay bootstrap blocked instead — RESOLVED: same backend socket identity; relay establishment path confirmed in code audit 2026-05-08
   - [x] Added and ran candidate-correctness parser/diagnostic tests for the current STUN path
-- [ ] Phase B complete
+- [x] Phase B complete
   - [x] Audit rollback resolved: active phase10 traversal now consumes validated signed coordination schedule instead of a fabricated zeroed schedule
   - [x] Runtime declines direct or fail-closes when signed coordination is missing, stale, replayed, malformed, forged, or for the wrong node pair
   - [x] Confirmed probe executor still uses WireGuard handshake freshness for proof
   - [x] Added direct-liveness expiry regression coverage proving stale direct proof demotes back to relay-programmed/unproven state
-  - [ ] Add roaming/re-probe tests
+  - [x] Roaming/re-probe coverage extended on 2026-05-14: three traversal session-level roam tests (no-op roam to identical endpoint, roam on relay path does not promote to direct, multi-step distinct roams keep direct session) and three daemon-level endpoint-change refresh tests (idempotent on unchanged fingerprint, debounced within the stability window, second change is recorded after the stability window elapses). See §18.2 entry "Phase B roaming/re-probe coverage extension".
 - [ ] Phase C complete
   - [x] Implemented real relay daemon binary with allocated-port demux
   - [x] Audit rollback resolved: allocated-port relay tuple-binding, cleanup, and stale port reuse are now hardened and test-backed
@@ -4172,6 +4172,56 @@ What remains blocked (unchanged from §18.3 in nature, refreshed for this commit
     to fail closed on this gap by design.
   - `./scripts/ci/phase10_gates.sh` remains blocked by the same stale
     `artifacts/phase10/fresh_install_os_matrix_report.json` (embedded `git_commit=c86a62a`).
+```
+
+```text
+Date: 2026-05-14
+Phase / Slice: Phase B roaming/re-probe coverage extension
+Files changed:
+  - crates/rustynetd/src/traversal.rs
+    - Added unit tests `endpoint_roam_to_identical_endpoint_is_noop`,
+      `endpoint_roam_on_relay_path_does_not_promote_to_direct`, and
+      `endpoint_roam_after_multiple_distinct_changes_keeps_direct_session`
+      covering the contract of `TraversalSession::on_endpoint_roamed`.
+    - Imported `TransitionReason` into the tests module to assert the reason
+      code on roam transitions.
+  - crates/rustynetd/src/daemon.rs
+    - Added integration tests
+      `daemon_runtime_endpoint_change_refresh_is_idempotent_for_unchanged_fingerprint`,
+      `daemon_runtime_endpoint_change_refresh_debounces_rapid_consecutive_changes`,
+      and `daemon_runtime_endpoint_change_refresh_allows_second_change_after_stability_window`
+      covering `maybe_trigger_endpoint_change_refresh` fingerprint comparison,
+      `MIN_ENDPOINT_CHANGE_STABILITY_SECS` debounce, and post-window second-change
+      counter advancement, including status-line propagation through
+      `traversal_endpoint_change_events`.
+Tests and gates run on `HEAD=425faa4`:
+  - `cargo fmt --all -- --check`: pass.
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: pass.
+  - `cargo test --workspace --all-targets --all-features`: 2042 passed (was 2036; +6
+    new tests), 0 failed, 0 ignored.
+  - `cargo test -p rustynetd --lib traversal::tests::endpoint_roam`: 3 passed.
+  - `cargo test -p rustynetd --lib daemon_runtime_endpoint_change_refresh`: 4 passed
+    (3 new plus the pre-existing event-counter test).
+Security invariants verified:
+  - Identical-endpoint roam no longer emits a spurious transition; this keeps
+    keep-alive cadence and downstream audit consumers from interpreting a no-op
+    re-observation as a fresh network move.
+  - Roams observed while the session is in `PathMode::Relay` do not promote the
+    session to `PathMode::Direct`; relay-active is reached only through the
+    handshake-proof path documented elsewhere in this plan.
+  - Endpoint-change refresh debouncing rejects rapid consecutive fingerprint
+    flips, preserving signed-state refresh fanout bounds and avoiding refresh
+    storms during flapping NIC/route conditions.
+  - After the stability window elapses, a genuinely new fingerprint is honored
+    and the `traversal_endpoint_change_events` counter advances exactly once
+    per accepted change, which is what the netcheck/status surface reports.
+What this slice completed:
+  - Closed the remaining Phase B open item ("Add roaming and re-probe correctness
+    tests") with deterministic unit and integration coverage that does not
+    require live cross-network topology.
+What remains blocked (unchanged):
+  - Live cross-network direct/relay/failback/roaming artifacts still require a
+    distinct-WAN topology that the in-tree 3-VM lab cannot synthesize.
 ```
 
 ## 19. Definition of Done for This Document
