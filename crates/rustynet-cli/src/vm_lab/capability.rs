@@ -469,6 +469,48 @@ pub fn sanitize_vm_lab_capability_message(input: &str) -> String {
     out
 }
 
+impl From<super::VmGuestPlatform> for VmLabPlatform {
+    fn from(value: super::VmGuestPlatform) -> Self {
+        match value {
+            super::VmGuestPlatform::Linux => VmLabPlatform::Linux,
+            super::VmGuestPlatform::Macos => VmLabPlatform::MacOS,
+            super::VmGuestPlatform::Windows => VmLabPlatform::Windows,
+            super::VmGuestPlatform::Ios => VmLabPlatform::Ios,
+            super::VmGuestPlatform::Android => VmLabPlatform::Android,
+        }
+    }
+}
+
+impl From<&super::VmGuestPlatform> for VmLabPlatform {
+    fn from(value: &super::VmGuestPlatform) -> Self {
+        (*value).into()
+    }
+}
+
+/// Normalize a slice of wrapper-side [`super::VmGuestPlatform`] values into
+/// the capability vocabulary as a stable, deduplicated [`VmLabPlatform`]
+/// slice.
+///
+/// "Stable" means: the first occurrence of each platform family in the input
+/// determines its position in the output, mirroring the dedup semantics used
+/// elsewhere in this module (see
+/// [`merge_vm_lab_capability_records`] mixed-reason enumeration).
+///
+/// Mirrors the cookbook helper `normalize_vm_lab_platform_mix` and is the
+/// canonical bridge that Slice-2 wrapper sites should use before feeding a
+/// platform mix into [`validate_vm_lab_target_topology`] or
+/// [`evaluate_vm_lab_capability`].
+pub fn normalize_vm_lab_platform_mix(guests: &[super::VmGuestPlatform]) -> Vec<VmLabPlatform> {
+    let mut out: Vec<VmLabPlatform> = Vec::with_capacity(guests.len());
+    for guest in guests {
+        let mapped: VmLabPlatform = guest.into();
+        if !out.contains(&mapped) {
+            out.push(mapped);
+        }
+    }
+    out
+}
+
 /// Outcome of [`validate_vm_lab_target_topology`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmLabTopologyValidation {
@@ -1444,6 +1486,123 @@ mod tests {
         let first = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
         let second = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
         assert_eq!(first, second);
+    }
+
+    // ----- normalize_vm_lab_platform_mix -----
+
+    #[test]
+    fn from_vm_guest_platform_maps_every_variant_to_vm_lab_platform() {
+        assert_eq!(
+            VmLabPlatform::from(super::super::VmGuestPlatform::Linux),
+            VmLabPlatform::Linux
+        );
+        assert_eq!(
+            VmLabPlatform::from(super::super::VmGuestPlatform::Macos),
+            VmLabPlatform::MacOS
+        );
+        assert_eq!(
+            VmLabPlatform::from(super::super::VmGuestPlatform::Windows),
+            VmLabPlatform::Windows
+        );
+        assert_eq!(
+            VmLabPlatform::from(super::super::VmGuestPlatform::Ios),
+            VmLabPlatform::Ios
+        );
+        assert_eq!(
+            VmLabPlatform::from(super::super::VmGuestPlatform::Android),
+            VmLabPlatform::Android
+        );
+    }
+
+    #[test]
+    fn from_borrowed_vm_guest_platform_matches_owned() {
+        let guest = super::super::VmGuestPlatform::Windows;
+        let owned: VmLabPlatform = guest.into();
+        let borrowed: VmLabPlatform = (&guest).into();
+        assert_eq!(owned, borrowed);
+        assert_eq!(owned, VmLabPlatform::Windows);
+    }
+
+    #[test]
+    fn normalize_empty_input_returns_empty_vec() {
+        assert_eq!(
+            normalize_vm_lab_platform_mix(&[]),
+            Vec::<VmLabPlatform>::new()
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_first_occurrence_order() {
+        let guests = [
+            super::super::VmGuestPlatform::Windows,
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Macos,
+            super::super::VmGuestPlatform::Linux,
+        ];
+        assert_eq!(
+            normalize_vm_lab_platform_mix(&guests),
+            vec![
+                VmLabPlatform::Windows,
+                VmLabPlatform::Linux,
+                VmLabPlatform::MacOS,
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_dedupes_repeated_platform_families() {
+        let guests = [
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Linux,
+        ];
+        assert_eq!(
+            normalize_vm_lab_platform_mix(&guests),
+            vec![VmLabPlatform::Linux]
+        );
+    }
+
+    #[test]
+    fn normalize_output_feeds_validate_topology_without_extra_translation() {
+        let guests = [
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Windows,
+        ];
+        let mix = normalize_vm_lab_platform_mix(&guests);
+        // The mix carries two distinct desktop families on a pure-Linux-
+        // required scope, so the validator should reject with
+        // topology-mismatch.
+        let result = validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &mix);
+        match result {
+            VmLabTopologyValidation::Rejected(rec) => {
+                assert_eq!(rec.reason_code, reason_code::TOPOLOGY_MISMATCH);
+            }
+            VmLabTopologyValidation::Ok => panic!("expected topology-mismatch rejection"),
+        }
+    }
+
+    #[test]
+    fn normalize_output_is_idempotent_under_round_trip_via_validate_topology() {
+        // Two equal guest mixes (one with extra duplicates) must produce
+        // identical normalized output, and therefore identical validator
+        // outcomes.
+        let a = [
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Windows,
+        ];
+        let b = [
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Linux,
+            super::super::VmGuestPlatform::Windows,
+            super::super::VmGuestPlatform::Windows,
+        ];
+        let mix_a = normalize_vm_lab_platform_mix(&a);
+        let mix_b = normalize_vm_lab_platform_mix(&b);
+        assert_eq!(mix_a, mix_b);
+        let result_a = validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &mix_a);
+        let result_b = validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &mix_b);
+        assert_eq!(result_a, result_b);
     }
 
     // ----- validate_vm_lab_target_topology -----
