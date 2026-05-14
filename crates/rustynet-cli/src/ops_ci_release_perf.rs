@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_AUDIT_DB_RELATIVE_PATH: &str = ".cargo-audit-db";
@@ -2037,43 +2038,58 @@ fn read_utf8_file(path: &Path) -> Result<String, String> {
     Ok(contents)
 }
 
+/// Typed view of the four metadata fields every measured-pass phase report
+/// must publish. The struct is deserialized in one pass alongside the
+/// existing `serde_json::Value` (`#[serde(deny_unknown_fields)]` is
+/// intentionally NOT set — reports legitimately carry many additional
+/// fields beyond the metadata header, e.g. `entries`, `checks`,
+/// `validated_by_tests`, etc.). Each declared field has a precise type;
+/// any shape drift now fails the typed parse rather than silently
+/// returning `None` from a `Value::as_str()`-style walk.
+///
+/// `captured_at_unix` and `environment` are populated for their typed
+/// validation side-effect (presence + correct primitive type) and are
+/// not read back here. The `#[allow(dead_code)]` on those fields is
+/// intentional: the deserialize step is the validation step.
+#[derive(Debug, Clone, Deserialize)]
+struct MeasuredPassReportMetadata {
+    evidence_mode: String,
+    #[allow(dead_code)]
+    captured_at_unix: u64,
+    #[allow(dead_code)]
+    environment: String,
+    status: String,
+}
+
 fn require_measured_pass_report(
     path: &Path,
     allow_fail_status_absent: bool,
 ) -> Result<serde_json::Value, String> {
-    let value: serde_json::Value = serde_json::from_str(&read_utf8_file(path)?)
+    let body = read_utf8_file(path)?;
+    let value: serde_json::Value = serde_json::from_str(&body)
         .map_err(|err| format!("failed parsing json {}: {err}", path.display()))?;
-    if value.get("evidence_mode").and_then(|value| value.as_str()) != Some("measured") {
+    // Re-deserialize the same parsed Value into the typed metadata header.
+    // This validates the metadata fields' types and presence in one shot,
+    // while preserving the Value for downstream callers that walk it.
+    let metadata: MeasuredPassReportMetadata =
+        serde_json::from_value(value.clone()).map_err(|err| {
+            format!(
+                "artifact missing or malformed measured-pass metadata header: {} ({err})",
+                path.display()
+            )
+        })?;
+    if metadata.evidence_mode != "measured" {
         return Err(format!(
             "artifact is not measured evidence: {}",
             path.display()
         ));
     }
-    if value
-        .get("captured_at_unix")
-        .and_then(|value| value.as_u64())
-        .is_none()
-    {
-        return Err(format!(
-            "artifact missing captured_at_unix metadata: {}",
-            path.display()
-        ));
-    }
-    if value
-        .get("environment")
-        .and_then(|value| value.as_str())
-        .is_none()
-    {
-        return Err(format!(
-            "artifact missing environment metadata: {}",
-            path.display()
-        ));
-    }
-    let status = value
-        .get("status")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| format!("artifact missing status field: {}", path.display()))?;
-    if status != "pass" {
+    // captured_at_unix and environment presence + type are already enforced
+    // by the typed deserialize above. The original implementation only
+    // required presence and the right primitive type, so we keep that
+    // semantic exactly here — no extra "is zero" or "is empty" rejections
+    // beyond what the typed parse guarantees.
+    if metadata.status != "pass" {
         return Err(format!("artifact is not pass: {}", path.display()));
     }
     if !allow_fail_status_absent && contains_status_field(&value, "fail") {
@@ -2428,5 +2444,188 @@ mod tests {
         fs::write(root.join("support.toml"), "[advisory]\n").unwrap();
         assert!(is_valid_db_layout(&root));
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_report(suffix: &str, body: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "rustynet-cli-measured-pass-{}-{}.json",
+            unique_suffix(),
+            suffix
+        ));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn measured_pass_report_accepts_well_formed_pass_artifact() {
+        let path = write_report(
+            "pass",
+            r#"{
+              "evidence_mode":"measured",
+              "captured_at_unix":1700000000,
+              "environment":"ci",
+              "status":"pass",
+              "entries":42
+            }"#,
+        );
+        let value = require_measured_pass_report(&path, true)
+            .expect("well-formed pass artifact must accept");
+        assert_eq!(
+            value.get("entries").and_then(|value| value.as_u64()),
+            Some(42)
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_rejects_invalid_json() {
+        let path = write_report("badjson", "not json");
+        let err = require_measured_pass_report(&path, true).expect_err("invalid json must fail");
+        assert!(
+            err.contains("failed parsing json"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_rejects_missing_evidence_mode_via_typed_header() {
+        let path = write_report(
+            "no-evidence-mode",
+            r#"{"captured_at_unix":1700000000,"environment":"ci","status":"pass"}"#,
+        );
+        let err = require_measured_pass_report(&path, true)
+            .expect_err("missing evidence_mode must fail via typed header");
+        assert!(
+            err.contains("measured-pass metadata header"),
+            "expected typed-header error: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_rejects_wrong_evidence_mode_value() {
+        let path = write_report(
+            "wrong-evidence-mode",
+            r#"{"evidence_mode":"synthetic","captured_at_unix":1,"environment":"ci","status":"pass"}"#,
+        );
+        let err = require_measured_pass_report(&path, true)
+            .expect_err("non-measured evidence_mode must fail");
+        assert!(
+            err.contains("not measured evidence"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_rejects_captured_at_unix_with_wrong_type() {
+        let path = write_report(
+            "captured-at-string",
+            r#"{"evidence_mode":"measured","captured_at_unix":"2024-01-01","environment":"ci","status":"pass"}"#,
+        );
+        // String where u64 expected — typed header fails.
+        let err = require_measured_pass_report(&path, true)
+            .expect_err("string captured_at_unix must fail typed header");
+        assert!(
+            err.contains("measured-pass metadata header"),
+            "expected typed-header error: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_rejects_environment_with_wrong_type() {
+        let path = write_report(
+            "env-number",
+            r#"{"evidence_mode":"measured","captured_at_unix":1,"environment":42,"status":"pass"}"#,
+        );
+        let err = require_measured_pass_report(&path, true)
+            .expect_err("non-string environment must fail typed header");
+        assert!(
+            err.contains("measured-pass metadata header"),
+            "expected typed-header error: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_rejects_status_not_pass() {
+        let path = write_report(
+            "status-fail",
+            r#"{"evidence_mode":"measured","captured_at_unix":1,"environment":"ci","status":"fail"}"#,
+        );
+        let err = require_measured_pass_report(&path, true)
+            .expect_err("status=fail must fail at the status check");
+        assert!(err.contains("not pass"), "unexpected error: {err}");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_rejects_nested_fail_when_allow_flag_is_false() {
+        let path = write_report(
+            "nested-fail",
+            r#"{
+              "evidence_mode":"measured",
+              "captured_at_unix":1,
+              "environment":"ci",
+              "status":"pass",
+              "subreport":{"status":"fail"}
+            }"#,
+        );
+        let err = require_measured_pass_report(&path, false)
+            .expect_err("nested fail must fail when allow_fail_status_absent=false");
+        assert!(
+            err.contains("contains failure status"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_allows_nested_fail_when_allow_flag_is_true() {
+        let path = write_report(
+            "nested-fail-allowed",
+            r#"{
+              "evidence_mode":"measured",
+              "captured_at_unix":1,
+              "environment":"ci",
+              "status":"pass",
+              "subreport":{"status":"fail"}
+            }"#,
+        );
+        let value = require_measured_pass_report(&path, true)
+            .expect("nested fail must be accepted when allow_fail_status_absent=true");
+        assert_eq!(
+            value
+                .get("subreport")
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("fail")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn measured_pass_report_accepts_extra_top_level_fields() {
+        let path = write_report(
+            "extras",
+            r#"{
+              "evidence_mode":"measured",
+              "captured_at_unix":1700000000,
+              "environment":"ci",
+              "status":"pass",
+              "checks":{"a":"pass","b":"pass"},
+              "validated_by_tests":["t1","t2"],
+              "log_artifacts":["/tmp/x.log"]
+            }"#,
+        );
+        // Typed header does not deny unknown fields — extras are preserved
+        // in the returned Value for downstream callers.
+        let value = require_measured_pass_report(&path, true).unwrap();
+        assert!(value.get("checks").is_some());
+        assert!(value.get("validated_by_tests").is_some());
+        assert!(value.get("log_artifacts").is_some());
+        let _ = fs::remove_file(&path);
     }
 }
