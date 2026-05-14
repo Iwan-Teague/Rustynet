@@ -1191,6 +1191,126 @@ pub fn collect_vm_lab_capability_inputs(
     Ok(VmLabCapabilityFailureContext::new(command, context))
 }
 
+/// Outcome of [`validate_vm_lab_capability_preconditions`]. The umbrella
+/// validator returns a single typed verdict so wrapper sites can match on
+/// `Ok` to proceed or surface the carried failure context directly to the
+/// operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmLabCapabilityPrecondition {
+    /// Inputs cleared every precondition. The carried record reflects the
+    /// evaluator's verdict for the supplied tuple — usually `Supported` or
+    /// `PartiallySupported`. Wrapper sites should still inspect the record
+    /// status if they need to gate composite scopes more aggressively than
+    /// the topology validator does.
+    Ok(VmLabCapabilityFailureContext),
+    /// Inputs failed a precondition. The carried context carries the
+    /// canonical failure record (`Unsupported` plus the precise reason
+    /// code) and the inputs that led to the rejection.
+    Blocked(VmLabCapabilityFailureContext),
+}
+
+impl VmLabCapabilityPrecondition {
+    /// True for the `Blocked` variant.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, VmLabCapabilityPrecondition::Blocked(_))
+    }
+
+    /// Borrow the underlying failure context regardless of variant. Useful
+    /// for callers that always log the bundle (Ok or Blocked) and then
+    /// branch on the variant separately.
+    pub fn failure_context(&self) -> &VmLabCapabilityFailureContext {
+        match self {
+            VmLabCapabilityPrecondition::Ok(ctx) | VmLabCapabilityPrecondition::Blocked(ctx) => ctx,
+        }
+    }
+}
+
+/// Umbrella wrapper-precondition validator. Chains the existing capability
+/// surface — [`command_scope`], [`normalize_vm_lab_platform_mix`],
+/// [`validate_vm_lab_target_topology`], and the Slice-1 evaluator — into a
+/// single fail-closed entry point that wrapper sites can call before any
+/// mutation begins. This is the canonical wrapper-precondition helper
+/// foreseen by VmLabCapabilityReportingPlan's cookbook
+/// (`validate_vm_lab_capability_preconditions`).
+///
+/// Behaviour:
+///
+/// 1. The command name is mapped to a capability scope via
+///    [`command_scope`]. Unknown commands fail closed with `Err(String)`
+///    so the wrapper surfaces a precise parser-level error, not a typed
+///    `Blocked` outcome — that taxonomy is reserved for capability
+///    rejections, not interface misuse.
+/// 2. The wrapper-side platform mix is normalized through
+///    [`normalize_vm_lab_platform_mix`] and validated by
+///    [`validate_vm_lab_target_topology`] against the resolved scope. A
+///    topology rejection is returned as `Blocked` carrying the validator's
+///    record plus the inputs.
+/// 3. If topology validation passes, the validator builds the standard
+///    [`VmLabCapabilityFailureContext`] for the
+///    `(scope, primary_platform, source_mode, bootstrap_phase,
+///      mixed_platform_topology)` tuple. The bundle's record reflects the
+///    Slice-1 evaluator's verdict. If the record's status is
+///    `Unsupported` (e.g. Windows install-release bootstrap), the
+///    validator returns `Blocked`. Otherwise it returns `Ok` with the same
+///    bundle so the wrapper still gets the canonical telemetry surface.
+///
+/// `primary_platform` is the platform attached to the capability context
+/// (e.g. the bootstrap target platform or the wrapper's selected
+/// platform). When topology contains multiple distinct families the
+/// topology validator will already have rejected, so `primary_platform`
+/// only matters in the single-family case.
+pub fn validate_vm_lab_capability_preconditions(
+    command: &str,
+    primary_platform: VmLabPlatform,
+    source_mode: VmLabSourceMode,
+    bootstrap_phase: Option<VmLabBootstrapPhase>,
+    topology: &[super::VmGuestPlatform],
+) -> Result<VmLabCapabilityPrecondition, String> {
+    let Some(scope) = command_scope(command) else {
+        return Err(format!(
+            "unknown vm-lab command for capability preconditions: {command:?}"
+        ));
+    };
+    let mix = normalize_vm_lab_platform_mix(topology);
+    let mixed_platform_topology = mix.len() > 1;
+    if let VmLabTopologyValidation::Rejected(rejection) =
+        validate_vm_lab_target_topology(scope, &mix)
+    {
+        let context = VmLabCapabilityContext {
+            scope,
+            platform: primary_platform,
+            source_mode,
+            bootstrap_phase,
+            mixed_platform_topology,
+        };
+        let bundle = VmLabCapabilityFailureContext {
+            command: command.to_string(),
+            context,
+            // The topology rejection record IS the canonical failure
+            // record for this precondition. Keep it intact (its
+            // reason_code and message describe the topology gap exactly)
+            // rather than re-deriving via the Slice-1 evaluator.
+            record: rejection,
+        };
+        return Ok(VmLabCapabilityPrecondition::Blocked(bundle));
+    }
+    let bundle = VmLabCapabilityFailureContext::new(
+        command,
+        VmLabCapabilityContext {
+            scope,
+            platform: primary_platform,
+            source_mode,
+            bootstrap_phase,
+            mixed_platform_topology,
+        },
+    );
+    if bundle.is_blocker() {
+        Ok(VmLabCapabilityPrecondition::Blocked(bundle))
+    } else {
+        Ok(VmLabCapabilityPrecondition::Ok(bundle))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2724,6 +2844,188 @@ mod tests {
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
+    }
+
+    // ----- validate_vm_lab_capability_preconditions (umbrella validator) -----
+
+    #[test]
+    fn preconditions_unknown_command_returns_parser_error_not_blocked() {
+        let result = validate_vm_lab_capability_preconditions(
+            "vm-lab-not-real",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            &[super::super::VmGuestPlatform::Linux],
+        );
+        let err = result.expect_err("unknown command must fail closed at parser level");
+        assert!(err.contains("unknown vm-lab command for capability preconditions"));
+    }
+
+    #[test]
+    fn preconditions_pure_linux_setup_is_ok_supported_bundle() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            &[super::super::VmGuestPlatform::Linux; 5],
+        )
+        .expect("known command must parse");
+        assert!(!outcome.is_blocked());
+        let bundle = outcome.failure_context();
+        assert_eq!(bundle.context.scope, VmLabCapabilityScope::SetupLiveLab);
+        assert!(!bundle.context.mixed_platform_topology);
+        assert_eq!(bundle.record.status, VmLabCapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn preconditions_mixed_topology_returns_blocked_with_topology_mismatch_record() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            &[
+                super::super::VmGuestPlatform::Linux,
+                super::super::VmGuestPlatform::Linux,
+                super::super::VmGuestPlatform::Windows,
+            ],
+        )
+        .expect("known command must parse");
+        assert!(outcome.is_blocked());
+        let bundle = outcome.failure_context();
+        assert!(bundle.context.mixed_platform_topology);
+        assert_eq!(bundle.record.reason_code, reason_code::TOPOLOGY_MISMATCH);
+    }
+
+    #[test]
+    fn preconditions_pure_windows_topology_returns_blocked_with_linux_shell_only_record() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Windows,
+            VmLabSourceMode::LocalHead,
+            None,
+            &[super::super::VmGuestPlatform::Windows; 2],
+        )
+        .expect("known command must parse");
+        assert!(outcome.is_blocked());
+        let bundle = outcome.failure_context();
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+    }
+
+    #[test]
+    fn preconditions_bootstrap_phase_windows_install_release_returns_blocked_runtime_host() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-bootstrap-phase",
+            VmLabPlatform::Windows,
+            VmLabSourceMode::LocalHead,
+            Some(VmLabBootstrapPhase::InstallRelease),
+            // BootstrapPhase scope accepts pure-Windows topology; the
+            // Slice-1 evaluator then gates per-(platform, phase).
+            &[super::super::VmGuestPlatform::Windows],
+        )
+        .expect("known command must parse");
+        assert!(outcome.is_blocked());
+        let bundle = outcome.failure_context();
+        assert_eq!(bundle.context.scope, VmLabCapabilityScope::BootstrapPhase);
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED
+        );
+    }
+
+    #[test]
+    fn preconditions_bootstrap_phase_windows_sync_source_is_supported() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-bootstrap-phase",
+            VmLabPlatform::Windows,
+            VmLabSourceMode::LocalHead,
+            Some(VmLabBootstrapPhase::SyncSource),
+            &[super::super::VmGuestPlatform::Windows],
+        )
+        .expect("known command must parse");
+        assert!(!outcome.is_blocked());
+        let bundle = outcome.failure_context();
+        assert_eq!(bundle.record.status, VmLabCapabilityStatus::Supported);
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::PLATFORM_SPECIFIC_HELPER_AVAILABLE
+        );
+    }
+
+    #[test]
+    fn preconditions_empty_topology_returns_blocked_with_target_platform_unsupported() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            &[],
+        )
+        .expect("known command must parse");
+        assert!(outcome.is_blocked());
+        let bundle = outcome.failure_context();
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::TARGET_PLATFORM_UNSUPPORTED
+        );
+    }
+
+    #[test]
+    fn preconditions_ios_topology_returns_blocked_with_target_platform_unsupported() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Linux,
+            VmLabSourceMode::LocalHead,
+            None,
+            &[
+                super::super::VmGuestPlatform::Linux,
+                super::super::VmGuestPlatform::Ios,
+            ],
+        )
+        .expect("known command must parse");
+        assert!(outcome.is_blocked());
+        let bundle = outcome.failure_context();
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::TARGET_PLATFORM_UNSUPPORTED
+        );
+    }
+
+    #[test]
+    fn preconditions_failure_context_carries_command_and_inputs() {
+        let outcome = validate_vm_lab_capability_preconditions(
+            "vm-lab-setup-live-lab",
+            VmLabPlatform::Windows,
+            VmLabSourceMode::CommitRef,
+            None,
+            &[super::super::VmGuestPlatform::Windows],
+        )
+        .unwrap();
+        let bundle = outcome.failure_context();
+        assert_eq!(bundle.command, "vm-lab-setup-live-lab");
+        assert_eq!(bundle.context.source_mode, VmLabSourceMode::CommitRef);
+        assert_eq!(bundle.context.platform, VmLabPlatform::Windows);
+    }
+
+    #[test]
+    fn preconditions_is_deterministic_for_same_inputs() {
+        let inputs = || {
+            validate_vm_lab_capability_preconditions(
+                "vm-lab-setup-live-lab",
+                VmLabPlatform::Linux,
+                VmLabSourceMode::LocalHead,
+                None,
+                &[super::super::VmGuestPlatform::Linux],
+            )
+            .unwrap()
+        };
+        let a = inputs();
+        let b = inputs();
+        assert_eq!(a, b);
     }
 
     // ----- collect_vm_lab_capability_inputs -----
