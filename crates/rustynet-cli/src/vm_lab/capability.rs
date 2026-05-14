@@ -397,6 +397,78 @@ pub const MERGED_EMPTY_INPUT_REASON_CODE: &str = "merge-empty-record-set";
 /// message enumerates them for operator inspection.
 pub const MERGED_MIXED_REASON_CODE: &str = "merge-mixed-reasons";
 
+/// Maximum capability message length after sanitization. Capability messages
+/// are operator-facing strings only; very long messages either indicate a
+/// caller mistake or an attempt to leak data through the capability surface,
+/// so the sanitizer truncates beyond this bound with an explicit marker.
+pub const MAX_CAPABILITY_MESSAGE_LEN: usize = 1024;
+
+/// Suffix appended by [`sanitize_vm_lab_capability_message`] when the input
+/// exceeds [`MAX_CAPABILITY_MESSAGE_LEN`]. The suffix is fixed text so
+/// downstream tooling can deterministically detect the truncation case.
+pub const SANITIZED_TRUNCATION_SUFFIX: &str = " [truncated]";
+
+/// Defensive sanitizer for capability message bodies. The Slice-1 evaluator
+/// always produces ASCII-safe message strings, but capability records may
+/// also be constructed externally (e.g. by Slice-2 wrapper-derived merges)
+/// from data that has not been bounded. This helper is the single
+/// fail-closed sanitizer the wrapper layer can call before surfacing a
+/// message in operator output, logs, or the
+/// `state/platform_capabilities.json` artifact.
+///
+/// Rules:
+/// 1. Replace any ASCII control byte (0x00..=0x1F, 0x7F) with a single ASCII
+///    space. CR/LF are control bytes for this contract — capability
+///    messages are one-line strings.
+/// 2. Collapse any run of two or more ASCII whitespace characters into a
+///    single space.
+/// 3. Trim leading and trailing whitespace.
+/// 4. Truncate to [`MAX_CAPABILITY_MESSAGE_LEN`] bytes if longer, appending
+///    [`SANITIZED_TRUNCATION_SUFFIX`] so the cut is explicit.
+///
+/// Non-goals:
+/// - No secret-pattern matching. The sanitizer never tries to detect or
+///   redact secret-shaped substrings; producers must not embed secret
+///   material in capability messages in the first place.
+/// - No HTML/JSON escaping. JSON escaping is handled when the message is
+///   serialized into an artifact (see
+///   [`render_platform_capabilities_artifact_json`]).
+pub fn sanitize_vm_lab_capability_message(input: &str) -> String {
+    let mut out = String::with_capacity(input.len().min(MAX_CAPABILITY_MESSAGE_LEN));
+    let mut last_was_space = true; // start "true" so any leading space is dropped
+    for ch in input.chars() {
+        let normalized = if (ch as u32) <= 0x1F || ch == '\u{7F}' {
+            ' '
+        } else {
+            ch
+        };
+        if normalized.is_ascii_whitespace() {
+            if last_was_space {
+                continue;
+            }
+            out.push(' ');
+            last_was_space = true;
+        } else {
+            out.push(normalized);
+            last_was_space = false;
+        }
+    }
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
+    if out.len() > MAX_CAPABILITY_MESSAGE_LEN {
+        // Truncate at a char boundary to avoid splitting a multi-byte UTF-8
+        // sequence, then append the truncation suffix so the cut is explicit.
+        let cap = MAX_CAPABILITY_MESSAGE_LEN;
+        let mut boundary = cap;
+        while boundary > 0 && !out.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        out.truncate(boundary);
+        out.push_str(SANITIZED_TRUNCATION_SUFFIX);
+    }
+    out
+}
+
 /// Evaluate a composite scope (Orchestrate / RepoSync / Suite) by evaluating
 /// each constituent sub-context with the Slice-1 evaluator and folding the
 /// results through [`merge_vm_lab_capability_records`].
@@ -1271,6 +1343,103 @@ mod tests {
         ];
         let first = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
         let second = merge_vm_lab_capability_records(VmLabCapabilityScope::Suite, &records);
+        assert_eq!(first, second);
+    }
+
+    // ----- sanitize_vm_lab_capability_message -----
+
+    #[test]
+    fn sanitize_preserves_normal_ascii_message_unchanged() {
+        let input = "the current live-lab wrapper path is Linux-shell based";
+        assert_eq!(sanitize_vm_lab_capability_message(input), input);
+    }
+
+    #[test]
+    fn sanitize_replaces_control_characters_with_spaces() {
+        let input = "hello\x01world\x02!";
+        assert_eq!(sanitize_vm_lab_capability_message(input), "hello world !");
+    }
+
+    #[test]
+    fn sanitize_replaces_cr_and_lf_with_spaces_and_collapses_runs() {
+        let input = "line one\nline two\r\nline three\n\nfour";
+        assert_eq!(
+            sanitize_vm_lab_capability_message(input),
+            "line one line two line three four"
+        );
+    }
+
+    #[test]
+    fn sanitize_collapses_multiple_spaces_into_one() {
+        let input = "a   b    c";
+        assert_eq!(sanitize_vm_lab_capability_message(input), "a b c");
+    }
+
+    #[test]
+    fn sanitize_trims_leading_and_trailing_whitespace() {
+        let input = "   middle    ";
+        assert_eq!(sanitize_vm_lab_capability_message(input), "middle");
+    }
+
+    #[test]
+    fn sanitize_handles_tabs_and_form_feeds_as_control_characters() {
+        let input = "a\tb\x0Cc";
+        assert_eq!(sanitize_vm_lab_capability_message(input), "a b c");
+    }
+
+    #[test]
+    fn sanitize_handles_delete_character() {
+        let input = "alpha\x7Fbeta";
+        assert_eq!(sanitize_vm_lab_capability_message(input), "alpha beta");
+    }
+
+    #[test]
+    fn sanitize_empty_input_returns_empty_string() {
+        assert_eq!(sanitize_vm_lab_capability_message(""), "");
+    }
+
+    #[test]
+    fn sanitize_whitespace_only_input_returns_empty_string() {
+        assert_eq!(sanitize_vm_lab_capability_message("   \n\t  "), "");
+    }
+
+    #[test]
+    fn sanitize_truncates_overlong_input_and_marks_truncation() {
+        let big = "a".repeat(MAX_CAPABILITY_MESSAGE_LEN + 100);
+        let out = sanitize_vm_lab_capability_message(big.as_str());
+        assert!(out.ends_with(SANITIZED_TRUNCATION_SUFFIX));
+        let body_len = out.len() - SANITIZED_TRUNCATION_SUFFIX.len();
+        assert!(
+            body_len <= MAX_CAPABILITY_MESSAGE_LEN,
+            "body length {body_len} must respect the cap"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_multibyte_utf8_when_truncating() {
+        // Build a string whose final ASCII char lives near the cap, but
+        // followed by a multi-byte char that would straddle the byte cap.
+        // The sanitizer must back off to the nearest char boundary, not
+        // split the multi-byte sequence.
+        let prefix_len = MAX_CAPABILITY_MESSAGE_LEN - 1;
+        let mut input = "a".repeat(prefix_len);
+        input.push('é'); // 2 bytes
+        input.push_str(&"b".repeat(64));
+        let out = sanitize_vm_lab_capability_message(input.as_str());
+        // The result must still be valid UTF-8 — String guarantees this, so
+        // we just verify the truncation marker is present and the prefix
+        // length is reasonable.
+        assert!(out.ends_with(SANITIZED_TRUNCATION_SUFFIX));
+        // No partial char before the suffix: the body must be valid UTF-8.
+        let body = &out[..out.len() - SANITIZED_TRUNCATION_SUFFIX.len()];
+        assert!(std::str::from_utf8(body.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn sanitize_is_idempotent() {
+        let input = "hello\n\t\x00 world  ";
+        let first = sanitize_vm_lab_capability_message(input);
+        let second = sanitize_vm_lab_capability_message(first.as_str());
         assert_eq!(first, second);
     }
 
