@@ -829,6 +829,13 @@ pub struct VmLabReportCapabilitiesConfig {
     pub output_dir: Option<std::path::PathBuf>,
     /// Stdout rendering format. Defaults to `Summary`.
     pub format: VmLabReportCapabilitiesFormat,
+    /// When `true` and `output_dir` is set, the handler validates that
+    /// `<output_dir>/state/platform_capabilities.json` does not already
+    /// exist before writing. Stale dirs are rejected fail-closed; the
+    /// existing artifact is not touched. Defaults to `false` so the
+    /// inspection CLI keeps its idempotent default for operators who
+    /// repeatedly poke at the same temp directory.
+    pub require_fresh_output_dir: bool,
 }
 
 /// Parse the `--scope` argument. Accepts canonical wrapper command names
@@ -930,6 +937,16 @@ pub fn execute_ops_vm_lab_report_capabilities(
     };
     let record = evaluate_vm_lab_capability(context);
     if let Some(output_dir) = config.output_dir.as_deref() {
+        if config.require_fresh_output_dir
+            && let VmLabReportDirFreshness::Stale(existing) =
+                validate_vm_lab_report_dir_fresh(output_dir)
+        {
+            return Err(format!(
+                "refusing to overwrite existing platform capabilities artifact at {} \
+                 (--require-fresh-output-dir is set; rerun without the flag, or pick a new --output-dir)",
+                existing.display(),
+            ));
+        }
         write_platform_capabilities_artifact(output_dir, std::slice::from_ref(&record))
             .map_err(|err| format!("write platform capabilities artifact failed: {err}"))?;
     }
@@ -1009,6 +1026,49 @@ pub fn write_platform_capabilities_artifact(
     let body = render_platform_capabilities_artifact_json(records);
     std::fs::write(&artifact_path, body)?;
     Ok(artifact_path)
+}
+
+/// Outcome of [`validate_vm_lab_report_dir_fresh`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmLabReportDirFreshness {
+    /// The directory does not exist yet, exists but is empty, or exists but
+    /// contains no canonical capability artifact at the expected relative
+    /// path. Safe to write into.
+    Fresh,
+    /// The canonical capability artifact already exists at the expected
+    /// relative path. Writing would overwrite it. The contained path is the
+    /// existing artifact location for the operator to inspect.
+    Stale(std::path::PathBuf),
+}
+
+/// Pure-but-IO-bound validator that reports whether a candidate report
+/// directory is fresh for writing the
+/// `state/platform_capabilities.json` artifact. The validator never
+/// mutates state — it never creates directories, never removes existing
+/// artifacts, and never writes anything. Callers decide whether to fail
+/// closed on `Stale` based on their own freshness policy.
+///
+/// Specifically:
+///
+/// - If `report_dir` does not exist on disk, the result is `Fresh`. The
+///   subsequent write helper will create it.
+/// - If `report_dir` exists but does not contain
+///   `<report_dir>/state/platform_capabilities.json`, the result is
+///   `Fresh`. Other unrelated artifacts in the directory are not a
+///   freshness violation for the capability surface.
+/// - If `<report_dir>/state/platform_capabilities.json` already exists,
+///   the result is `Stale(path_to_existing_artifact)` so the caller can
+///   surface that path in the rejection message.
+///
+/// `Stale` is the only fail-closed outcome a freshness-strict caller
+/// should reject on; readers and idempotent rewriters should accept it.
+pub fn validate_vm_lab_report_dir_fresh(report_dir: &std::path::Path) -> VmLabReportDirFreshness {
+    let artifact_path = report_dir.join(PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH);
+    if artifact_path.exists() {
+        VmLabReportDirFreshness::Stale(artifact_path)
+    } else {
+        VmLabReportDirFreshness::Fresh
+    }
 }
 
 #[cfg(test)]
@@ -2098,6 +2158,7 @@ mod tests {
             mixed_platform_topology: false,
             output_dir: None,
             format: VmLabReportCapabilitiesFormat::Summary,
+            require_fresh_output_dir: false,
         }
     }
 
@@ -2356,6 +2417,7 @@ mod tests {
             mixed_platform_topology: false,
             output_dir: None,
             format: VmLabReportCapabilitiesFormat::Summary,
+            require_fresh_output_dir: false,
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=BootstrapPhase status=Unsupported"));
@@ -2538,8 +2600,148 @@ mod tests {
             mixed_platform_topology: false,
             output_dir: None,
             format: VmLabReportCapabilitiesFormat::Summary,
+            require_fresh_output_dir: false,
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
+    }
+
+    // ----- validate_vm_lab_report_dir_fresh -----
+
+    #[test]
+    fn validate_report_dir_fresh_for_non_existent_dir_returns_fresh() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-report-dir-fresh-nonexistent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!tmp.exists());
+        assert_eq!(
+            validate_vm_lab_report_dir_fresh(&tmp),
+            VmLabReportDirFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn validate_report_dir_fresh_for_empty_existing_dir_returns_fresh() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-report-dir-fresh-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert_eq!(
+            validate_vm_lab_report_dir_fresh(&tmp),
+            VmLabReportDirFreshness::Fresh
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_report_dir_fresh_for_dir_with_unrelated_files_returns_fresh() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-report-dir-fresh-unrelated-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("other.json"), "{}").unwrap();
+        assert_eq!(
+            validate_vm_lab_report_dir_fresh(&tmp),
+            VmLabReportDirFreshness::Fresh
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_report_dir_fresh_returns_stale_when_canonical_artifact_already_exists() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-report-dir-fresh-stale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let record = evaluate_vm_lab_capability(ctx_linux(VmLabCapabilityScope::SetupLiveLab));
+        let path = write_platform_capabilities_artifact(&tmp, std::slice::from_ref(&record))
+            .expect("first write should succeed");
+        match validate_vm_lab_report_dir_fresh(&tmp) {
+            VmLabReportDirFreshness::Stale(existing) => {
+                assert_eq!(existing, path);
+            }
+            VmLabReportDirFreshness::Fresh => {
+                panic!("expected Stale, got Fresh");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn report_capabilities_require_fresh_output_dir_rejects_existing_artifact() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-cap-fresh-reject-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Plant an existing artifact.
+        let record = evaluate_vm_lab_capability(ctx_linux(VmLabCapabilityScope::SetupLiveLab));
+        let _ = write_platform_capabilities_artifact(&tmp, std::slice::from_ref(&record)).unwrap();
+        // Snapshot the existing artifact body.
+        let existing_body =
+            std::fs::read_to_string(tmp.join(PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH))
+                .unwrap();
+
+        let mut config = linux_setup_config();
+        config.output_dir = Some(tmp.clone());
+        config.require_fresh_output_dir = true;
+        let err = execute_ops_vm_lab_report_capabilities(config)
+            .expect_err("must fail-closed with --require-fresh-output-dir");
+        assert!(
+            err.contains("refusing to overwrite"),
+            "rejection message must mention overwrite refusal: {err}"
+        );
+
+        // The existing artifact body must NOT have been touched.
+        let body_after =
+            std::fs::read_to_string(tmp.join(PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH))
+                .unwrap();
+        assert_eq!(
+            body_after, existing_body,
+            "fail-closed rejection must not overwrite the existing artifact"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn report_capabilities_require_fresh_output_dir_succeeds_when_dir_is_fresh() {
+        let tmp =
+            std::env::temp_dir().join(format!("rustynet-cli-cap-fresh-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut config = linux_setup_config();
+        config.output_dir = Some(tmp.clone());
+        config.require_fresh_output_dir = true;
+        let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        assert!(out.contains("status=Supported"));
+        assert!(
+            tmp.join(PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH)
+                .exists(),
+            "artifact must be written on a fresh require-fresh-output-dir invocation"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn report_capabilities_default_idempotent_rewrite_still_works_when_freshness_not_required() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-cap-idempotent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut config = linux_setup_config();
+        config.output_dir = Some(tmp.clone());
+        // First write
+        let _ = execute_ops_vm_lab_report_capabilities(config.clone()).unwrap();
+        // Second write to the same dir, without --require-fresh-output-dir.
+        // Must succeed (idempotent default behaviour for the inspection CLI).
+        let _ = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
