@@ -6128,21 +6128,35 @@ impl StageOrchestrator for RustOrchestrator {
         // this branch into the real heterogeneous execution path.
         //
         // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14 wires the
-        // capability evaluator at this boundary: the rejection message is
-        // now derived from a Slice-1 capability record so downstream
-        // tooling can grep on the stable `reason_code` instead of the
-        // free-form W4.1 string, while preserving the same operator-facing
-        // explanation. Enforcement is unchanged: this branch still
-        // fails closed for any non-Linux target.
+        // capability evaluator at this boundary. The reject record is now
+        // produced by `validate_vm_lab_target_topology` against the actual
+        // normalized platform mix, so the surfaced `reason_code`
+        // accurately reflects whether this is a mixed-platform topology
+        // (`topology-mismatch`) or a pure-non-Linux topology
+        // (`linux-shell-orchestrator-only`). Enforcement is unchanged:
+        // this branch still fails closed for any non-Linux target.
         let blockers = self.non_linux_platforms();
-        let capability_record =
-            capability::evaluate_vm_lab_capability(capability::VmLabCapabilityContext {
-                scope: capability::VmLabCapabilityScope::RunLiveLab,
-                platform: capability::VmLabPlatform::Linux,
-                source_mode: capability::VmLabSourceMode::LocalHead,
-                bootstrap_phase: None,
-                mixed_platform_topology: true,
-            });
+        let mix = capability::normalize_vm_lab_platform_mix(&self.target_platforms);
+        let capability_record = match capability::validate_vm_lab_target_topology(
+            capability::VmLabCapabilityScope::RunLiveLab,
+            &mix,
+        ) {
+            capability::VmLabTopologyValidation::Rejected(rec) => rec,
+            capability::VmLabTopologyValidation::Ok => {
+                // Unreachable in this branch: we are here precisely
+                // because `is_pure_linux()` is false, which means the
+                // topology validator must also reject. Build a defensive
+                // capability record so the wrapper never returns a
+                // capability-less string if the invariants ever drift.
+                capability::evaluate_vm_lab_capability(capability::VmLabCapabilityContext {
+                    scope: capability::VmLabCapabilityScope::RunLiveLab,
+                    platform: capability::VmLabPlatform::Linux,
+                    source_mode: capability::VmLabSourceMode::LocalHead,
+                    bootstrap_phase: None,
+                    mixed_platform_topology: true,
+                })
+            }
+        };
         Err(format!(
             "RustOrchestrator refuses heterogeneous live-lab execution today: \
              non-Linux platforms in target set [{}]. {}. Until per-stage \
@@ -29352,6 +29366,59 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .execute_live_lab(&rust_orchestrator_inputs())
             .expect_err("macos-only must reject today");
         assert!(err.contains("macos"), "blocker must name macos: {err}");
+    }
+
+    #[test]
+    fn rust_orchestrator_pure_non_linux_reject_uses_linux_shell_orchestrator_only_reason_code() {
+        // Slice 2 wiring through normalize_vm_lab_platform_mix +
+        // validate_vm_lab_target_topology must surface the precise reason
+        // code for a pure-non-Linux topology (linux-shell-orchestrator-only),
+        // not the topology-mismatch code that fits a mixed topology.
+        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let rust = super::RustOrchestrator::new(
+            bash,
+            vec![
+                super::VmGuestPlatform::Windows,
+                super::VmGuestPlatform::Windows,
+            ],
+        );
+        let err = rust
+            .execute_live_lab(&rust_orchestrator_inputs())
+            .expect_err("pure-Windows topology must reject today");
+        assert!(
+            err.contains("status=Unsupported"),
+            "blocker must surface Unsupported status: {err}"
+        );
+        assert!(
+            err.contains("reason_code=linux-shell-orchestrator-only"),
+            "pure-non-Linux topology must surface the Linux-shell-only reason code: {err}"
+        );
+        assert!(
+            !err.contains("reason_code=topology-mismatch"),
+            "pure-Windows must NOT surface topology-mismatch (that is for mixed topologies): {err}"
+        );
+    }
+
+    #[test]
+    fn rust_orchestrator_mixed_topology_reject_uses_topology_mismatch_reason_code() {
+        // Mixed Linux+Windows must surface topology-mismatch, not
+        // linux-shell-orchestrator-only.
+        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let rust = super::RustOrchestrator::new(
+            bash,
+            vec![
+                super::VmGuestPlatform::Linux,
+                super::VmGuestPlatform::Linux,
+                super::VmGuestPlatform::Windows,
+            ],
+        );
+        let err = rust
+            .execute_live_lab(&rust_orchestrator_inputs())
+            .expect_err("mixed topology must reject today");
+        assert!(
+            err.contains("reason_code=topology-mismatch"),
+            "mixed topology must surface topology-mismatch: {err}"
+        );
     }
 
     #[test]
