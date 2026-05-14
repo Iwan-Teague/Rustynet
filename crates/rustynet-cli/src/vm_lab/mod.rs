@@ -6126,15 +6126,32 @@ impl StageOrchestrator for RustOrchestrator {
         // trait directly still fails closed. W4.1 wires per-stage
         // capability gating + per-target adapter dispatch and turns
         // this branch into the real heterogeneous execution path.
+        //
+        // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14 wires the
+        // capability evaluator at this boundary: the rejection message is
+        // now derived from a Slice-1 capability record so downstream
+        // tooling can grep on the stable `reason_code` instead of the
+        // free-form W4.1 string, while preserving the same operator-facing
+        // explanation. Enforcement is unchanged: this branch still
+        // fails closed for any non-Linux target.
         let blockers = self.non_linux_platforms();
+        let capability_record =
+            capability::evaluate_vm_lab_capability(capability::VmLabCapabilityContext {
+                scope: capability::VmLabCapabilityScope::RunLiveLab,
+                platform: capability::VmLabPlatform::Linux,
+                source_mode: capability::VmLabSourceMode::LocalHead,
+                bootstrap_phase: None,
+                mixed_platform_topology: true,
+            });
         Err(format!(
             "RustOrchestrator refuses heterogeneous live-lab execution today: \
-             non-Linux platforms in target set [{}]. The W4.1 capability-gating \
-             slice removes the Linux-only gate and wires per-target adapter \
-             dispatch (see OS-agnostic delta plan §6.2 / §7 W4.1). Until then, \
-             use the LinuxBashOrchestrator path for pure-Linux runs and the \
-             existing Windows sidecar for Windows peers.",
-            blockers.join(", ")
+             non-Linux platforms in target set [{}]. {}. Until per-stage \
+             capability gating (W4.1, see OS-agnostic delta plan §6.2 / §7 W4.1) \
+             wires per-target adapter dispatch, use the LinuxBashOrchestrator \
+             path for pure-Linux runs and the existing Windows sidecar for \
+             Windows peers.",
+            blockers.join(", "),
+            capability::render_capability_summary(&capability_record),
         ))
     }
 }
@@ -29266,6 +29283,38 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(
             err.contains("windows"),
             "blocker must name the offending platform: {err}"
+        );
+    }
+
+    #[test]
+    fn rust_orchestrator_heterogeneous_execution_blocker_includes_capability_record() {
+        // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14: the
+        // heterogeneous reject must carry a stable capability `reason_code`
+        // and `status` so downstream tooling can grep on the capability
+        // vocabulary rather than the free-form W4.1 prose.
+        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+        let rust = super::RustOrchestrator::new(
+            bash,
+            vec![
+                super::VmGuestPlatform::Linux,
+                super::VmGuestPlatform::Windows,
+            ],
+        );
+        let inputs = rust_orchestrator_inputs();
+        let err = rust
+            .execute_live_lab(&inputs)
+            .expect_err("heterogeneous execution must reject today");
+        assert!(
+            err.contains("scope=RunLiveLab"),
+            "blocker must surface the RunLiveLab capability scope: {err}"
+        );
+        assert!(
+            err.contains("status=Unsupported"),
+            "blocker must surface Unsupported status: {err}"
+        );
+        assert!(
+            err.contains("reason_code=topology-mismatch"),
+            "blocker must surface the topology-mismatch reason code: {err}"
         );
     }
 
