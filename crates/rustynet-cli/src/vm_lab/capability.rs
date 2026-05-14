@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
-// Slice 1 is intentionally internal: nothing in the binary calls into this
-// module yet because wrapper integration is reserved for Slice 2 of the
-// VmLabCapabilityReportingPlan. Dead-code is therefore expected for now;
-// the lint will go away on its own once Slice 2 lands.
+// Slice 1 internals (status/scope label helpers, etc.) are still reserved for
+// future wrapper integration (Slice 2). The read-only inspection CLI (Slice 4)
+// now consumes a subset of the public surface, so blanket dead-code is no
+// longer correct; the remaining unused items keep an explicit allow so the
+// linter does not block Slice-2 work.
 #![allow(dead_code)]
 
-//! VM-lab capability evaluator (Slice 1).
+//! VM-lab capability evaluator (Slice 1) and read-only inspection CLI
+//! (Slice 4).
 //!
 //! This module is a pure classification surface for the top-level Rustynet
 //! live-lab wrappers. It answers, for a given command/stage on a given
@@ -385,6 +387,129 @@ pub fn render_capability_report(records: &[VmLabCapabilityRecord]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Slice 4: read-only inspection CLI surface.
+//
+// `ops vm-lab-report-capabilities` is an inspection-only command: it never
+// mutates state, never runs setup, and never gates the wrapper path. It exists
+// so operators can ask the same evaluator that Slice 2/3 will use later, in
+// advance, against a hypothetical (command, platform, source_mode, topology,
+// bootstrap_phase) tuple, and get the exact same answer the wrapper will give.
+// ---------------------------------------------------------------------------
+
+/// Parsed inputs for `ops vm-lab-report-capabilities`. Constructed by the CLI
+/// parser. The handler itself is pure: given the same config, it always
+/// returns the same string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmLabReportCapabilitiesConfig {
+    pub scope: VmLabCapabilityScope,
+    pub platform: VmLabPlatform,
+    pub source_mode: VmLabSourceMode,
+    pub bootstrap_phase: Option<VmLabBootstrapPhase>,
+    pub mixed_platform_topology: bool,
+}
+
+/// Parse the `--scope` argument. Accepts canonical wrapper command names
+/// (e.g. `vm-lab-setup-live-lab`) and the kebab-case label form
+/// (e.g. `setup-live-lab`). Anything else is fail-closed.
+pub fn parse_scope_arg(value: &str) -> Result<VmLabCapabilityScope, String> {
+    if let Some(scope) = command_scope(value) {
+        return Ok(scope);
+    }
+    match value {
+        "setup-live-lab" => Ok(VmLabCapabilityScope::SetupLiveLab),
+        "run-live-lab" => Ok(VmLabCapabilityScope::RunLiveLab),
+        "orchestrate-live-lab" => Ok(VmLabCapabilityScope::OrchestrateLiveLab),
+        "bootstrap-phase" => Ok(VmLabCapabilityScope::BootstrapPhase),
+        "baseline-diagnostics" => Ok(VmLabCapabilityScope::BaselineDiagnostics),
+        "repo-sync" => Ok(VmLabCapabilityScope::RepoSync),
+        "suite" => Ok(VmLabCapabilityScope::Suite),
+        other => Err(format!(
+            "invalid --scope value {other:?}: expected one of setup-live-lab, run-live-lab, \
+             orchestrate-live-lab, bootstrap-phase, baseline-diagnostics, repo-sync, suite, or a \
+             canonical vm-lab-* command name"
+        )),
+    }
+}
+
+/// Parse the `--platform` argument. Lowercase ASCII labels only. Anything else
+/// is fail-closed.
+pub fn parse_platform_arg(value: &str) -> Result<VmLabPlatform, String> {
+    match value {
+        "linux" => Ok(VmLabPlatform::Linux),
+        "windows" => Ok(VmLabPlatform::Windows),
+        "macos" => Ok(VmLabPlatform::MacOS),
+        "ios" => Ok(VmLabPlatform::Ios),
+        "android" => Ok(VmLabPlatform::Android),
+        other => Err(format!(
+            "invalid --platform value {other:?}: expected one of linux, windows, macos, ios, android"
+        )),
+    }
+}
+
+/// Parse the `--source-mode` argument. Kebab-case labels only. Anything else
+/// is fail-closed.
+pub fn parse_source_mode_arg(value: &str) -> Result<VmLabSourceMode, String> {
+    match value {
+        "working-tree" => Ok(VmLabSourceMode::WorkingTree),
+        "local-head" => Ok(VmLabSourceMode::LocalHead),
+        "commit-ref" => Ok(VmLabSourceMode::CommitRef),
+        "local-source" => Ok(VmLabSourceMode::LocalSource),
+        "repo-url" => Ok(VmLabSourceMode::RepoUrl),
+        other => Err(format!(
+            "invalid --source-mode value {other:?}: expected one of working-tree, local-head, \
+             commit-ref, local-source, repo-url"
+        )),
+    }
+}
+
+/// Parse the `--bootstrap-phase` argument. Kebab-case labels only. Anything
+/// else is fail-closed.
+pub fn parse_bootstrap_phase_arg(value: &str) -> Result<VmLabBootstrapPhase, String> {
+    match value {
+        "sync-source" => Ok(VmLabBootstrapPhase::SyncSource),
+        "build-release" => Ok(VmLabBootstrapPhase::BuildRelease),
+        "install-release" => Ok(VmLabBootstrapPhase::InstallRelease),
+        "restart-runtime" => Ok(VmLabBootstrapPhase::RestartRuntime),
+        "verify-runtime" => Ok(VmLabBootstrapPhase::VerifyRuntime),
+        other => Err(format!(
+            "invalid --bootstrap-phase value {other:?}: expected one of sync-source, build-release, \
+             install-release, restart-runtime, verify-runtime"
+        )),
+    }
+}
+
+/// Read-only inspection handler for `ops vm-lab-report-capabilities`.
+/// Returns the rendered one-line capability summary for the requested
+/// `(scope, platform, source_mode, bootstrap_phase, mixed_platform_topology)`
+/// tuple. The handler never mutates filesystem, network, or process state.
+///
+/// Pre-execution validation:
+/// - When `scope == BootstrapPhase` the caller must supply
+///   `bootstrap_phase`. The fail-closed check is wired here so the CLI does
+///   not surface the underlying
+///   `BOOTSTRAP_PHASE_MISSING_FOR_BOOTSTRAP_SCOPE` record from a buggy
+///   parser flow — that record is reserved for the evaluator's internal
+///   contract.
+pub fn execute_ops_vm_lab_report_capabilities(
+    config: VmLabReportCapabilitiesConfig,
+) -> Result<String, String> {
+    if matches!(config.scope, VmLabCapabilityScope::BootstrapPhase)
+        && config.bootstrap_phase.is_none()
+    {
+        return Err("--bootstrap-phase is required when --scope is bootstrap-phase".to_string());
+    }
+    let context = VmLabCapabilityContext {
+        scope: config.scope,
+        platform: config.platform,
+        source_mode: config.source_mode,
+        bootstrap_phase: config.bootstrap_phase,
+        mixed_platform_topology: config.mixed_platform_topology,
+    };
+    let record = evaluate_vm_lab_capability(context);
+    Ok(render_capability_summary(&record))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +878,240 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----- Slice 4: inspection CLI -----
+
+    fn linux_setup_config() -> VmLabReportCapabilitiesConfig {
+        VmLabReportCapabilitiesConfig {
+            scope: VmLabCapabilityScope::SetupLiveLab,
+            platform: VmLabPlatform::Linux,
+            source_mode: VmLabSourceMode::LocalHead,
+            bootstrap_phase: None,
+            mixed_platform_topology: false,
+        }
+    }
+
+    #[test]
+    fn parse_scope_accepts_label_and_canonical_command_name() {
+        assert_eq!(
+            parse_scope_arg("setup-live-lab").unwrap(),
+            VmLabCapabilityScope::SetupLiveLab
+        );
+        assert_eq!(
+            parse_scope_arg("vm-lab-setup-live-lab").unwrap(),
+            VmLabCapabilityScope::SetupLiveLab
+        );
+        assert_eq!(
+            parse_scope_arg("run-live-lab").unwrap(),
+            VmLabCapabilityScope::RunLiveLab
+        );
+        assert_eq!(
+            parse_scope_arg("orchestrate-live-lab").unwrap(),
+            VmLabCapabilityScope::OrchestrateLiveLab
+        );
+        assert_eq!(
+            parse_scope_arg("bootstrap-phase").unwrap(),
+            VmLabCapabilityScope::BootstrapPhase
+        );
+        assert_eq!(
+            parse_scope_arg("baseline-diagnostics").unwrap(),
+            VmLabCapabilityScope::BaselineDiagnostics
+        );
+        assert_eq!(
+            parse_scope_arg("repo-sync").unwrap(),
+            VmLabCapabilityScope::RepoSync
+        );
+        assert_eq!(
+            parse_scope_arg("suite").unwrap(),
+            VmLabCapabilityScope::Suite
+        );
+    }
+
+    #[test]
+    fn parse_scope_rejects_unknown_and_empty_values() {
+        for bad in [
+            "",
+            "Setup-Live-Lab",
+            "linux",
+            "vm-lab-unknown",
+            "setup live lab",
+        ] {
+            assert!(parse_scope_arg(bad).is_err(), "expected error for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_platform_accepts_lowercase_labels() {
+        assert_eq!(parse_platform_arg("linux").unwrap(), VmLabPlatform::Linux);
+        assert_eq!(
+            parse_platform_arg("windows").unwrap(),
+            VmLabPlatform::Windows
+        );
+        assert_eq!(parse_platform_arg("macos").unwrap(), VmLabPlatform::MacOS);
+        assert_eq!(parse_platform_arg("ios").unwrap(), VmLabPlatform::Ios);
+        assert_eq!(
+            parse_platform_arg("android").unwrap(),
+            VmLabPlatform::Android
+        );
+    }
+
+    #[test]
+    fn parse_platform_rejects_uppercase_and_unknown_values() {
+        for bad in ["", "Linux", "WINDOWS", "darwin", "ubuntu"] {
+            assert!(
+                parse_platform_arg(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_source_mode_accepts_kebab_case_labels() {
+        assert_eq!(
+            parse_source_mode_arg("working-tree").unwrap(),
+            VmLabSourceMode::WorkingTree
+        );
+        assert_eq!(
+            parse_source_mode_arg("local-head").unwrap(),
+            VmLabSourceMode::LocalHead
+        );
+        assert_eq!(
+            parse_source_mode_arg("commit-ref").unwrap(),
+            VmLabSourceMode::CommitRef
+        );
+        assert_eq!(
+            parse_source_mode_arg("local-source").unwrap(),
+            VmLabSourceMode::LocalSource
+        );
+        assert_eq!(
+            parse_source_mode_arg("repo-url").unwrap(),
+            VmLabSourceMode::RepoUrl
+        );
+    }
+
+    #[test]
+    fn parse_source_mode_rejects_unknown_and_empty_values() {
+        for bad in ["", "WorkingTree", "main", "git"] {
+            assert!(
+                parse_source_mode_arg(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bootstrap_phase_accepts_kebab_case_labels() {
+        assert_eq!(
+            parse_bootstrap_phase_arg("sync-source").unwrap(),
+            VmLabBootstrapPhase::SyncSource
+        );
+        assert_eq!(
+            parse_bootstrap_phase_arg("build-release").unwrap(),
+            VmLabBootstrapPhase::BuildRelease
+        );
+        assert_eq!(
+            parse_bootstrap_phase_arg("install-release").unwrap(),
+            VmLabBootstrapPhase::InstallRelease
+        );
+        assert_eq!(
+            parse_bootstrap_phase_arg("restart-runtime").unwrap(),
+            VmLabBootstrapPhase::RestartRuntime
+        );
+        assert_eq!(
+            parse_bootstrap_phase_arg("verify-runtime").unwrap(),
+            VmLabBootstrapPhase::VerifyRuntime
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_phase_rejects_unknown_and_empty_values() {
+        for bad in ["", "SyncSource", "all", "verify"] {
+            assert!(
+                parse_bootstrap_phase_arg(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_capabilities_returns_linux_setup_supported_summary() {
+        let out = execute_ops_vm_lab_report_capabilities(linux_setup_config()).unwrap();
+        assert_eq!(
+            out,
+            "scope=SetupLiveLab status=Supported \
+             reason_code=linux-shell-orchestrator-only \
+             message=supported through the current Linux shell orchestrator path"
+        );
+    }
+
+    #[test]
+    fn report_capabilities_is_idempotent() {
+        let first = execute_ops_vm_lab_report_capabilities(linux_setup_config()).unwrap();
+        let second = execute_ops_vm_lab_report_capabilities(linux_setup_config()).unwrap();
+        let third = execute_ops_vm_lab_report_capabilities(linux_setup_config()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+    }
+
+    #[test]
+    fn report_capabilities_returns_windows_setup_unsupported_summary() {
+        let mut config = linux_setup_config();
+        config.platform = VmLabPlatform::Windows;
+        let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        assert!(out.starts_with("scope=SetupLiveLab status=Unsupported"));
+        assert!(out.contains("reason_code=linux-shell-orchestrator-only"));
+    }
+
+    #[test]
+    fn report_capabilities_returns_windows_bootstrap_install_release_blocked_summary() {
+        let config = VmLabReportCapabilitiesConfig {
+            scope: VmLabCapabilityScope::BootstrapPhase,
+            platform: VmLabPlatform::Windows,
+            source_mode: VmLabSourceMode::LocalHead,
+            bootstrap_phase: Some(VmLabBootstrapPhase::InstallRelease),
+            mixed_platform_topology: false,
+        };
+        let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        assert!(out.starts_with("scope=BootstrapPhase status=Unsupported"));
+        assert!(out.contains("reason_code=runtime-host-not-yet-implemented"));
+    }
+
+    #[test]
+    fn report_capabilities_returns_linux_setup_mixed_topology_topology_mismatch() {
+        let mut config = linux_setup_config();
+        config.mixed_platform_topology = true;
+        let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        assert!(out.starts_with("scope=SetupLiveLab status=Unsupported"));
+        assert!(out.contains("reason_code=topology-mismatch"));
+    }
+
+    #[test]
+    fn report_capabilities_requires_bootstrap_phase_for_bootstrap_scope() {
+        let mut config = linux_setup_config();
+        config.scope = VmLabCapabilityScope::BootstrapPhase;
+        config.bootstrap_phase = None;
+        let err = execute_ops_vm_lab_report_capabilities(config)
+            .expect_err("must fail-closed without --bootstrap-phase");
+        assert!(
+            err.contains("--bootstrap-phase is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn report_capabilities_passes_bootstrap_phase_through_for_non_bootstrap_scopes() {
+        // A non-BootstrapPhase scope still accepts a bootstrap_phase value;
+        // the evaluator just ignores it. The handler must not over-reject in
+        // that case.
+        let config = VmLabReportCapabilitiesConfig {
+            scope: VmLabCapabilityScope::SetupLiveLab,
+            platform: VmLabPlatform::Linux,
+            source_mode: VmLabSourceMode::LocalHead,
+            bootstrap_phase: Some(VmLabBootstrapPhase::SyncSource),
+            mixed_platform_topology: false,
+        };
+        let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
     }
 }

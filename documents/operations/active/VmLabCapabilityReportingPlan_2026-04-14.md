@@ -204,6 +204,30 @@ Add the optional inspection CLI.
 - keep it read-only
 - keep it strict and deterministic
 
+**Status (2026-05-14): complete.** Implemented in the existing
+`crates/rustynet-cli/src/vm_lab/capability.rs` module with CLI parser and
+dispatch wiring in `crates/rustynet-cli/src/main.rs`. The new command
+`ops vm-lab-report-capabilities` accepts
+`--scope`, `--platform`, `--source-mode`, optional `--bootstrap-phase`, and
+optional `--mixed-platform-topology` flags, parses them through fail-closed
+helpers (`parse_scope_arg`, `parse_platform_arg`, `parse_source_mode_arg`,
+`parse_bootstrap_phase_arg`), feeds them through the Slice 1 evaluator
+(`evaluate_vm_lab_capability`), and prints the stable one-line
+`render_capability_summary` form. The handler is read-only: it never touches
+filesystem, network, or process state; it fails closed when
+`--scope=bootstrap-phase` is requested without `--bootstrap-phase`. Slice 4
+ordering note: although the cookbook lists Phase 4 after Phase 3 artifact
+emission, the inspection surface only depends on the Slice 1 evaluator and
+can stand on its own; the `state/platform_capabilities.json` artifact
+remains a separate Slice 3 deliverable. 15 unit tests cover label and
+canonical-name scope parsing, lowercase-only platform parsing, kebab-case
+source-mode and bootstrap-phase parsing, the read-only handler's stable
+summary for Linux setup, Windows setup, Windows install-release bootstrap,
+mixed-platform-topology rejection, the `bootstrap-phase` scope guard,
+idempotent repeat invocation, and tolerance of a redundant
+`bootstrap_phase` value on non-`BootstrapPhase` scopes. Parser dispatch is
+exercised through `tests::parse_supports_ops_commands`.
+
 ## Tests And Evidence
 
 The first implementation pass should add coverage for:
