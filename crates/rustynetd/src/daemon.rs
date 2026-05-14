@@ -18987,6 +18987,365 @@ mod tests {
     }
 
     #[test]
+    fn daemon_runtime_endpoint_change_refresh_is_idempotent_for_unchanged_fingerprint() {
+        let test_dir = secure_test_dir("rustynetd-runtime-endpoint-change-idempotent");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            1,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+        let baseline_fingerprint = runtime
+            .traversal_last_endpoint_fingerprint
+            .clone()
+            .expect("fingerprint should be set after first trigger");
+
+        for _ in 0..5 {
+            runtime.maybe_trigger_endpoint_change_refresh();
+        }
+
+        assert_eq!(
+            runtime.traversal_endpoint_change_events, baseline_events,
+            "repeated calls with identical runtime endpoint state must not double-count change events"
+        );
+        assert_eq!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(baseline_fingerprint.as_str()),
+            "fingerprint must be stable across no-op trigger calls"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_endpoint_change_refresh_debounces_rapid_consecutive_changes() {
+        let test_dir = secure_test_dir("rustynetd-runtime-endpoint-change-debounce");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            1,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+
+        let first_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=2\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.2.2\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.77\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-1\ncandidate.1.priority=20\n",
+            unix_now(),
+            unix_now().saturating_add(60)
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [27u8; 32],
+            first_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(false);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let after_first_change = runtime.traversal_endpoint_change_events;
+        assert_eq!(
+            after_first_change,
+            baseline_events.saturating_add(1),
+            "first observed endpoint change must increment the event counter"
+        );
+        let after_first_change_unix = runtime
+            .traversal_last_endpoint_change_unix
+            .expect("first change should record a stability anchor timestamp");
+        let fingerprint_after_first = runtime
+            .traversal_last_endpoint_fingerprint
+            .clone()
+            .expect("fingerprint must be set after first observed change");
+
+        let second_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=3\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.3.3\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.88\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-2\ncandidate.1.priority=20\n",
+            unix_now(),
+            unix_now().saturating_add(60)
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [29u8; 32],
+            second_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(false);
+        runtime.maybe_trigger_endpoint_change_refresh();
+
+        assert_eq!(
+            runtime.traversal_endpoint_change_events, after_first_change,
+            "second endpoint change within the stability window must not increment the event counter"
+        );
+        assert_eq!(
+            runtime.traversal_last_endpoint_change_unix,
+            Some(after_first_change_unix),
+            "stability anchor timestamp must remain pinned to the first observed change"
+        );
+        assert_eq!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(fingerprint_after_first.as_str()),
+            "fingerprint must not advance while the stability window is still active"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_endpoint_change_refresh_allows_second_change_after_stability_window() {
+        let test_dir = secure_test_dir("rustynetd-runtime-endpoint-change-after-window");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+            false,
+        );
+        write_traversal_file(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            1,
+            false,
+        );
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path.clone()),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
+            traversal_bundle_path: traversal_path.clone(),
+            traversal_verifier_key_path: traversal_verifier_path.clone(),
+            traversal_watermark_path: traversal_watermark_path.clone(),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+
+        let first_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=2\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.4.4\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.99\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-eu-3\ncandidate.1.priority=20\n",
+            unix_now(),
+            unix_now().saturating_add(60)
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [31u8; 32],
+            first_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(false);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events.saturating_add(1),
+            "first observed change must increment the event counter"
+        );
+        let stability_window_secs = 10u64;
+        runtime.traversal_last_endpoint_change_unix = runtime
+            .traversal_last_endpoint_change_unix
+            .map(|prev| prev.saturating_sub(stability_window_secs.saturating_add(5)));
+
+        let second_payload = format!(
+            "version=1\npath_policy=direct_preferred_relay_allowed\nsource_node_id=daemon-local\ntarget_node_id=node-exit\ngenerated_at_unix={}\nexpires_at_unix={}\nnonce=3\ncandidate_count=2\ncandidate.0.type=host\ncandidate.0.addr=10.0.5.5\ncandidate.0.port=51820\ncandidate.0.family=ipv4\ncandidate.0.relay_id=\ncandidate.0.priority=10\ncandidate.1.type=relay\ncandidate.1.addr=203.0.113.111\ncandidate.1.port=443\ncandidate.1.family=ipv4\ncandidate.1.relay_id=relay-us-1\ncandidate.1.priority=20\n",
+            unix_now(),
+            unix_now().saturating_add(60)
+        );
+        write_signed_kv_artifact(
+            &traversal_path,
+            &traversal_verifier_path,
+            [33u8; 32],
+            second_payload.as_str(),
+        );
+        runtime.refresh_traversal_hint_state(false);
+        runtime.maybe_trigger_endpoint_change_refresh();
+
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events.saturating_add(2),
+            "second observed change after the stability window must increment the event counter"
+        );
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains(&format!(
+            "traversal_endpoint_change_events={}",
+            baseline_events.saturating_add(2)
+        )));
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_file(assignment_path);
+        let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(assignment_watermark_path);
+        let _ = std::fs::remove_file(traversal_path);
+        let _ = std::fs::remove_file(traversal_verifier_path);
+        let _ = std::fs::remove_file(traversal_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn daemon_runtime_auto_tunnel_traversal_authority_rejects_unmanaged_peer_bundle() {
         let test_dir = secure_test_dir("rustynetd-runtime-traversal-authority-unmanaged");
         let state_path = test_dir.join("daemon.state");
