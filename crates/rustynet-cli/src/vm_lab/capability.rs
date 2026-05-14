@@ -398,8 +398,9 @@ pub fn render_capability_report(records: &[VmLabCapabilityRecord]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parsed inputs for `ops vm-lab-report-capabilities`. Constructed by the CLI
-/// parser. The handler itself is pure: given the same config, it always
-/// returns the same string.
+/// parser. The handler is deterministic: given the same config, it always
+/// returns the same summary string and writes the same artifact when
+/// `output_dir` is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmLabReportCapabilitiesConfig {
     pub scope: VmLabCapabilityScope,
@@ -407,6 +408,12 @@ pub struct VmLabReportCapabilitiesConfig {
     pub source_mode: VmLabSourceMode,
     pub bootstrap_phase: Option<VmLabBootstrapPhase>,
     pub mixed_platform_topology: bool,
+    /// Slice 3 artifact emission. When `Some(dir)`, the handler additionally
+    /// writes `<dir>/state/platform_capabilities.json` containing the single
+    /// evaluated record for this invocation. The artifact path is fixed by
+    /// the plan contract; the JSON shape is documented on
+    /// [`render_platform_capabilities_artifact_json`].
+    pub output_dir: Option<std::path::PathBuf>,
 }
 
 /// Parse the `--scope` argument. Accepts canonical wrapper command names
@@ -507,7 +514,82 @@ pub fn execute_ops_vm_lab_report_capabilities(
         mixed_platform_topology: config.mixed_platform_topology,
     };
     let record = evaluate_vm_lab_capability(context);
+    if let Some(output_dir) = config.output_dir.as_deref() {
+        write_platform_capabilities_artifact(output_dir, std::slice::from_ref(&record))
+            .map_err(|err| format!("write platform capabilities artifact failed: {err}"))?;
+    }
     Ok(render_capability_summary(&record))
+}
+
+/// Canonical relative artifact path inside the report dir, per
+/// VmLabCapabilityReportingPlan Slice 3.
+pub const PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH: &str = "state/platform_capabilities.json";
+
+/// Render the platform capabilities JSON artifact body for a set of records.
+///
+/// JSON shape:
+/// ```text
+/// {
+///   "schema_version": 1,
+///   "records": [
+///     {
+///       "scope": "...",
+///       "status": "...",
+///       "reason_code": "...",
+///       "message": "..."
+///     },
+///     ...
+///   ]
+/// }
+/// ```
+///
+/// The encoder uses only enum-label and reason-code byte sequences that are
+/// already validated as ASCII (lowercase kebab-case for reason codes,
+/// PascalCase for scope/status labels), plus the JSON-escaped `message` field.
+/// `\\` and `"` are the only escapes we need to handle today; control
+/// characters never appear in evaluator-produced messages by construction
+/// (see the `reason_codes_use_kebab_case_lowercase_ascii` and message
+/// literals in the evaluator).
+pub fn render_platform_capabilities_artifact_json(records: &[VmLabCapabilityRecord]) -> String {
+    let mut body = String::new();
+    body.push_str("{\"schema_version\":1,\"records\":[");
+    for (idx, record) in records.iter().enumerate() {
+        if idx > 0 {
+            body.push(',');
+        }
+        body.push_str("{\"scope\":\"");
+        body.push_str(record.scope.as_label());
+        body.push_str("\",\"status\":\"");
+        body.push_str(record.status.as_label());
+        body.push_str("\",\"reason_code\":\"");
+        body.push_str(record.reason_code);
+        body.push_str("\",\"message\":\"");
+        for ch in record.message.chars() {
+            match ch {
+                '"' => body.push_str("\\\""),
+                '\\' => body.push_str("\\\\"),
+                _ => body.push(ch),
+            }
+        }
+        body.push_str("\"}");
+    }
+    body.push_str("]}");
+    body
+}
+
+/// Persist the platform-capabilities artifact at
+/// `<output_dir>/state/platform_capabilities.json`. Creates the `state/`
+/// subdirectory if needed. Writes are deterministic given the input records.
+pub fn write_platform_capabilities_artifact(
+    output_dir: &std::path::Path,
+    records: &[VmLabCapabilityRecord],
+) -> std::io::Result<std::path::PathBuf> {
+    let state_dir = output_dir.join("state");
+    std::fs::create_dir_all(&state_dir)?;
+    let artifact_path = state_dir.join("platform_capabilities.json");
+    let body = render_platform_capabilities_artifact_json(records);
+    std::fs::write(&artifact_path, body)?;
+    Ok(artifact_path)
 }
 
 #[cfg(test)]
@@ -889,6 +971,7 @@ mod tests {
             source_mode: VmLabSourceMode::LocalHead,
             bootstrap_phase: None,
             mixed_platform_topology: false,
+            output_dir: None,
         }
     }
 
@@ -1071,6 +1154,7 @@ mod tests {
             source_mode: VmLabSourceMode::LocalHead,
             bootstrap_phase: Some(VmLabBootstrapPhase::InstallRelease),
             mixed_platform_topology: false,
+            output_dir: None,
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=BootstrapPhase status=Unsupported"));
@@ -1099,6 +1183,147 @@ mod tests {
         );
     }
 
+    // ----- Slice 3: artifact emission -----
+
+    #[test]
+    fn render_artifact_emits_schema_version_and_records_array() {
+        let record = evaluate_vm_lab_capability(ctx_linux(VmLabCapabilityScope::SetupLiveLab));
+        let body = render_platform_capabilities_artifact_json(std::slice::from_ref(&record));
+        assert!(body.starts_with("{\"schema_version\":1,\"records\":["));
+        assert!(body.ends_with("]}"));
+        assert!(body.contains("\"scope\":\"SetupLiveLab\""));
+        assert!(body.contains("\"status\":\"Supported\""));
+        assert!(body.contains("\"reason_code\":\"linux-shell-orchestrator-only\""));
+        assert!(body.contains(
+            "\"message\":\"supported through the current Linux shell orchestrator path\""
+        ));
+    }
+
+    #[test]
+    fn render_artifact_supports_multiple_records_in_order() {
+        let records = vec![
+            evaluate_vm_lab_capability(ctx_linux(VmLabCapabilityScope::SetupLiveLab)),
+            evaluate_vm_lab_capability(ctx_windows(VmLabCapabilityScope::SetupLiveLab)),
+        ];
+        let body = render_platform_capabilities_artifact_json(&records);
+        let first = body.find("\"status\":\"Supported\"").unwrap();
+        let second = body.find("\"status\":\"Unsupported\"").unwrap();
+        assert!(
+            first < second,
+            "records must be serialized in input order: {body}"
+        );
+        assert!(body.contains("},{"));
+    }
+
+    #[test]
+    fn render_artifact_escapes_double_quote_and_backslash_in_message() {
+        let record = VmLabCapabilityRecord {
+            scope: VmLabCapabilityScope::SetupLiveLab,
+            status: VmLabCapabilityStatus::Supported,
+            reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+            message: "needs \"quotes\" and a backslash \\ here".to_string(),
+        };
+        let body = render_platform_capabilities_artifact_json(std::slice::from_ref(&record));
+        assert!(body.contains("\\\"quotes\\\""));
+        assert!(body.contains("backslash \\\\ here"));
+    }
+
+    #[test]
+    fn write_artifact_creates_state_subdir_and_returns_path() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-platform-capabilities-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let record = evaluate_vm_lab_capability(ctx_linux(VmLabCapabilityScope::SetupLiveLab));
+        let path = write_platform_capabilities_artifact(&tmp, std::slice::from_ref(&record))
+            .expect("artifact write should succeed");
+        assert_eq!(path, tmp.join(PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH));
+        let body = std::fs::read_to_string(&path).expect("artifact should be readable");
+        assert!(body.starts_with("{\"schema_version\":1,"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_artifact_is_idempotent_for_same_records() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-platform-capabilities-idem-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let record = evaluate_vm_lab_capability(ctx_linux(VmLabCapabilityScope::SetupLiveLab));
+        let path_a = write_platform_capabilities_artifact(&tmp, std::slice::from_ref(&record))
+            .expect("first write should succeed");
+        let body_a = std::fs::read_to_string(&path_a).unwrap();
+        let path_b = write_platform_capabilities_artifact(&tmp, std::slice::from_ref(&record))
+            .expect("second write should succeed");
+        let body_b = std::fs::read_to_string(&path_b).unwrap();
+        assert_eq!(path_a, path_b);
+        assert_eq!(body_a, body_b);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn report_capabilities_emits_artifact_when_output_dir_is_set() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-platform-capabilities-cli-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut config = linux_setup_config();
+        config.output_dir = Some(tmp.clone());
+        let summary = execute_ops_vm_lab_report_capabilities(config).unwrap();
+        assert!(summary.contains("status=Supported"));
+        let artifact_path = tmp.join(PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH);
+        let body = std::fs::read_to_string(&artifact_path)
+            .expect("artifact must exist after a successful invocation");
+        assert!(body.contains("\"scope\":\"SetupLiveLab\""));
+        assert!(body.contains("\"status\":\"Supported\""));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn report_capabilities_does_not_emit_artifact_when_output_dir_is_unset() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-platform-capabilities-noop-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+        let summary = execute_ops_vm_lab_report_capabilities(linux_setup_config()).unwrap();
+        assert!(summary.contains("status=Supported"));
+        assert!(
+            !tmp.join("state")
+                .join("platform_capabilities.json")
+                .exists(),
+            "artifact must not be created when output_dir is None"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn report_capabilities_does_not_emit_artifact_when_handler_fails_closed() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-cli-platform-capabilities-fail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut config = linux_setup_config();
+        config.scope = VmLabCapabilityScope::BootstrapPhase;
+        config.bootstrap_phase = None;
+        config.output_dir = Some(tmp.clone());
+        let err = execute_ops_vm_lab_report_capabilities(config)
+            .expect_err("must fail-closed when bootstrap-phase missing");
+        assert!(err.contains("--bootstrap-phase is required"));
+        assert!(
+            !tmp.join("state")
+                .join("platform_capabilities.json")
+                .exists(),
+            "fail-closed handler must not leave a partial artifact behind"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn report_capabilities_passes_bootstrap_phase_through_for_non_bootstrap_scopes() {
         // A non-BootstrapPhase scope still accepts a bootstrap_phase value;
@@ -1110,6 +1335,7 @@ mod tests {
             source_mode: VmLabSourceMode::LocalHead,
             bootstrap_phase: Some(VmLabBootstrapPhase::SyncSource),
             mixed_platform_topology: false,
+            output_dir: None,
         };
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
         assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
