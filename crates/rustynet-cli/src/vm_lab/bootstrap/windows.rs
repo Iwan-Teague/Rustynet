@@ -893,6 +893,69 @@ impl WindowsInstallReportView {
     }
 }
 
+/// Typed view of the JSON report written by
+/// `scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1` for the
+/// `prepare-transport` phase. The helper builds the same field set on
+/// both branches via `New-PrepareTransportFailureReport`, mutating
+/// individual fields as the phase progresses; on the success path it
+/// sets `status='pass'`, `reason='ok'`. The top-level trap
+/// (`Write-FailClosedPhaseResultIfRequested`) emits the same field set
+/// with `status='fail'` and a `reason` carrying the failure detail.
+///
+/// All fields are required because the helper writes the full shape on
+/// every code path — there is no "missing on success" case here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WindowsPrepareTransportReportView {
+    pub openssh_installed: bool,
+    pub service_running: bool,
+    pub firewall_rule_enabled: bool,
+    pub authorized_keys_applied: bool,
+    pub host_key_present: bool,
+    pub listener_ready: bool,
+    pub default_shell_configured: bool,
+    pub status: String,
+    pub reason: String,
+    pub host_key: String,
+}
+
+impl WindowsPrepareTransportReportView {
+    /// Parse a Bootstrap-RustyNetWindows prepare-transport report body.
+    /// Fails closed when shape drift is detected:
+    /// - invalid JSON
+    /// - missing/wrong type on any field (every field is required)
+    /// - status not in {pass, fail}
+    /// - status=fail with empty reason
+    /// - status=pass with host_key_present=true but empty host_key
+    ///   (the success contract documented at line 1042-1047 of the
+    ///   helper is: host_key_present implies a non-empty host_key)
+    #[allow(dead_code)]
+    pub(crate) fn parse(body: &str) -> Result<Self, String> {
+        let view: WindowsPrepareTransportReportView = serde_json::from_str(body)
+            .map_err(|err| format!("invalid windows prepare-transport report shape: {err}"))?;
+        match view.status.as_str() {
+            "pass" | "fail" => {}
+            other => {
+                return Err(format!(
+                    "windows prepare-transport status must be 'pass' or 'fail'; got {other:?}"
+                ));
+            }
+        }
+        if view.status == "fail" && view.reason.trim().is_empty() {
+            return Err(
+                "windows prepare-transport status=fail must carry a non-empty reason".to_string(),
+            );
+        }
+        if view.host_key_present && view.host_key.trim().is_empty() {
+            return Err(
+                "windows prepare-transport host_key_present=true requires a non-empty host_key"
+                    .to_string(),
+            );
+        }
+        Ok(view)
+    }
+}
+
 #[cfg(test)]
 fn build_windows_diagnostics_validation_script(
     remote_path: &str,
@@ -2304,6 +2367,191 @@ mod tests {
         }"#;
         let a = WindowsInstallReportView::parse(body).unwrap();
         let b = WindowsInstallReportView::parse(body).unwrap();
+        assert_eq!(a, b);
+    }
+
+    // ----- WindowsPrepareTransportReportView typed parser tests -----
+
+    #[test]
+    fn windows_prepare_transport_report_parses_success_payload() {
+        let body = r#"{
+          "openssh_installed": true,
+          "service_running": true,
+          "firewall_rule_enabled": true,
+          "authorized_keys_applied": true,
+          "host_key_present": true,
+          "listener_ready": true,
+          "default_shell_configured": true,
+          "status": "pass",
+          "reason": "ok",
+          "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExAMPLE host-id"
+        }"#;
+        let view = WindowsPrepareTransportReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "pass");
+        assert_eq!(view.reason, "ok");
+        assert!(view.openssh_installed);
+        assert!(view.host_key.starts_with("ssh-ed25519"));
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_parses_failure_payload_from_trap() {
+        let body = r#"{
+          "openssh_installed": false,
+          "service_running": false,
+          "firewall_rule_enabled": false,
+          "authorized_keys_applied": false,
+          "host_key_present": false,
+          "listener_ready": false,
+          "default_shell_configured": false,
+          "status": "fail",
+          "reason": "prepare-transport-exception: access denied",
+          "host_key": ""
+        }"#;
+        let view = WindowsPrepareTransportReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "fail");
+        assert!(view.reason.contains("access denied"));
+        assert!(view.host_key.is_empty());
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_parses_partial_progress_failure() {
+        // Helper reports failure mid-progress: openssh + default_shell
+        // got installed, but firewall_rule_enabled fell over before
+        // host_key collection. Both success-progress booleans and the
+        // canonical failure reason coexist.
+        let body = r#"{
+          "openssh_installed": true,
+          "service_running": false,
+          "firewall_rule_enabled": false,
+          "authorized_keys_applied": true,
+          "host_key_present": false,
+          "listener_ready": false,
+          "default_shell_configured": true,
+          "status": "fail",
+          "reason": "firewall-rule-not-enabled",
+          "host_key": ""
+        }"#;
+        let view = WindowsPrepareTransportReportView::parse(body).expect("must parse");
+        assert!(view.openssh_installed);
+        assert!(view.default_shell_configured);
+        assert_eq!(view.reason, "firewall-rule-not-enabled");
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_rejects_unknown_status_value() {
+        let body = r#"{
+          "openssh_installed": true,
+          "service_running": true,
+          "firewall_rule_enabled": true,
+          "authorized_keys_applied": true,
+          "host_key_present": true,
+          "listener_ready": true,
+          "default_shell_configured": true,
+          "status": "warn",
+          "reason": "ok",
+          "host_key": "ssh-ed25519 AAA"
+        }"#;
+        let err = WindowsPrepareTransportReportView::parse(body)
+            .expect_err("unknown status must fail closed");
+        assert!(err.contains("'pass' or 'fail'"));
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_rejects_fail_with_empty_reason() {
+        let body = r#"{
+          "openssh_installed": false,
+          "service_running": false,
+          "firewall_rule_enabled": false,
+          "authorized_keys_applied": false,
+          "host_key_present": false,
+          "listener_ready": false,
+          "default_shell_configured": false,
+          "status": "fail",
+          "reason": "   ",
+          "host_key": ""
+        }"#;
+        let err = WindowsPrepareTransportReportView::parse(body)
+            .expect_err("status=fail with empty reason must fail closed");
+        assert!(err.contains("non-empty reason"));
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_rejects_host_key_present_with_empty_host_key() {
+        // Internal invariant: if the helper says host_key_present=true,
+        // the host_key field must also be populated. The typed view
+        // catches drift between the two fields.
+        let body = r#"{
+          "openssh_installed": true,
+          "service_running": true,
+          "firewall_rule_enabled": true,
+          "authorized_keys_applied": true,
+          "host_key_present": true,
+          "listener_ready": true,
+          "default_shell_configured": true,
+          "status": "pass",
+          "reason": "ok",
+          "host_key": "   "
+        }"#;
+        let err = WindowsPrepareTransportReportView::parse(body)
+            .expect_err("host_key_present=true with empty host_key must fail closed");
+        assert!(err.contains("non-empty host_key"));
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_rejects_missing_required_field() {
+        // missing listener_ready
+        let body = r#"{
+          "openssh_installed": true,
+          "service_running": true,
+          "firewall_rule_enabled": true,
+          "authorized_keys_applied": true,
+          "host_key_present": true,
+          "default_shell_configured": true,
+          "status": "pass",
+          "reason": "ok",
+          "host_key": "ssh-ed25519 AAA"
+        }"#;
+        let err = WindowsPrepareTransportReportView::parse(body)
+            .expect_err("missing listener_ready must fail closed");
+        assert!(err.contains("invalid windows prepare-transport report shape"));
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_rejects_wrong_field_type() {
+        // status as number instead of string
+        let body = r#"{
+          "openssh_installed": true,
+          "service_running": true,
+          "firewall_rule_enabled": true,
+          "authorized_keys_applied": true,
+          "host_key_present": true,
+          "listener_ready": true,
+          "default_shell_configured": true,
+          "status": 1,
+          "reason": "ok",
+          "host_key": "ssh-ed25519 AAA"
+        }"#;
+        let err = WindowsPrepareTransportReportView::parse(body)
+            .expect_err("status wrong type must fail closed");
+        assert!(err.contains("invalid windows prepare-transport report shape"));
+    }
+
+    #[test]
+    fn windows_prepare_transport_report_parse_is_idempotent() {
+        let body = r#"{
+          "openssh_installed": true,
+          "service_running": true,
+          "firewall_rule_enabled": true,
+          "authorized_keys_applied": true,
+          "host_key_present": true,
+          "listener_ready": true,
+          "default_shell_configured": true,
+          "status": "pass",
+          "reason": "ok",
+          "host_key": "ssh-ed25519 AAA"
+        }"#;
+        let a = WindowsPrepareTransportReportView::parse(body).unwrap();
+        let b = WindowsPrepareTransportReportView::parse(body).unwrap();
         assert_eq!(a, b);
     }
 
