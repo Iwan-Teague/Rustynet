@@ -349,4 +349,244 @@ domain example.lan
             "off-Linux must surface unreadable resolv.conf"
         );
     }
+
+    // ---- L4: race + edge-case fail-closed coverage --------------------
+
+    /// systemd-resolved's stub listener uses 127.0.0.53 (still loopback).
+    /// The evaluator must accept this as valid — the queries never leave
+    /// the host even though the address isn't the bare 127.0.0.1.
+    #[test]
+    fn evaluator_accepts_systemd_resolved_stub_127_0_0_53() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["127.0.0.53".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.is_empty(),
+            "127.0.0.53 (systemd-resolved stub) must pass: {reasons:?}"
+        );
+    }
+
+    /// IPv4 unspecified 0.0.0.0 must be flagged — a resolver binding to
+    /// the wildcard accepts off-host traffic and is not loopback-only.
+    #[test]
+    fn evaluator_rejects_ipv4_unspecified_nameserver() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["0.0.0.0".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("0.0.0.0") && r.contains("non-loopback")),
+            "0.0.0.0 must surface as drift: {reasons:?}"
+        );
+    }
+
+    /// IPv6 unspecified :: must be flagged for the same reason.
+    #[test]
+    fn evaluator_rejects_ipv6_unspecified_nameserver() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["::".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.iter().any(|r| r.contains("non-loopback")),
+            ":: must surface as drift: {reasons:?}"
+        );
+    }
+
+    /// IPv4 link-local 169.254.0.0/16 — common DHCP / cloud-metadata
+    /// path. Off-loopback, must drift.
+    #[test]
+    fn evaluator_rejects_ipv4_link_local_nameserver() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["169.254.169.254".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("169.254.169.254") && r.contains("non-loopback")),
+            "IPv4 link-local must surface as drift: {reasons:?}"
+        );
+    }
+
+    /// IPv6 link-local fe80::/10 — NetworkManager / RA-installed
+    /// resolver case. Off-loopback, must drift.
+    #[test]
+    fn evaluator_rejects_ipv6_link_local_nameserver() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["fe80::1".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("fe80") && r.contains("non-loopback")),
+            "IPv6 link-local must surface as drift: {reasons:?}"
+        );
+    }
+
+    /// IPv4-mapped IPv6 (::ffff:8.8.8.8) — same wire address as 8.8.8.8
+    /// but written as v6. Must not be treated as loopback.
+    #[test]
+    fn evaluator_rejects_ipv4_mapped_external_nameserver() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["::ffff:8.8.8.8".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.iter().any(|r| r.contains("non-loopback")),
+            "IPv4-mapped external must surface as drift: {reasons:?}"
+        );
+    }
+
+    /// IPv6 loopback expressed in long form must be accepted.
+    #[test]
+    fn evaluator_accepts_ipv6_loopback_long_form() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["0:0:0:0:0:0:0:1".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.is_empty(),
+            "0:0:0:0:0:0:0:1 must pass as loopback: {reasons:?}"
+        );
+    }
+
+    /// Loopback range 127.0.0.0/8: 127.255.255.254 is still loopback by
+    /// Rust's `is_loopback`. Pin the contract so a future refactor that
+    /// narrows to 127.0.0.1 only doesn't silently shift behavior.
+    #[test]
+    fn evaluator_accepts_full_127_slash_8_loopback_range() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec![
+            "127.0.0.1".to_string(),
+            "127.0.0.53".to_string(),
+            "127.255.255.254".to_string(),
+        ];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.is_empty(),
+            "127.0.0.0/8 must all pass as loopback: {reasons:?}"
+        );
+    }
+
+    /// One loopback + one external → external is flagged, loopback is
+    /// not. Race shape: NetworkManager appended a public resolver after
+    /// systemd-resolved's stub line during precedence resolution.
+    #[test]
+    fn evaluator_flags_only_off_loopback_entry_when_mixed() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["127.0.0.53".to_string(), "1.1.1.1".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert_eq!(
+            reasons.len(),
+            1,
+            "exactly one drift expected for one external entry: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("1.1.1.1") && reasons[0].contains("non-loopback"),
+            "drift must name the off-loopback entry: {reasons:?}"
+        );
+    }
+
+    /// IPv6 link-local with zone-id (fe80::1%eth0) is not a parseable
+    /// IpAddr in Rust std — confirm the evaluator surfaces it as a
+    /// parse failure rather than silently accepting.
+    #[test]
+    fn evaluator_rejects_zoneid_suffixed_link_local() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["fe80::1%eth0".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.iter().any(|r| r.contains("not a parseable IP")),
+            "zone-id-suffixed entry must surface as parse failure: {reasons:?}"
+        );
+    }
+
+    /// IPv6 bracketed form `[::1]` is a URL form, not resolv.conf form.
+    /// Confirm we reject it as unparseable rather than silently
+    /// accepting after a brackets-strip.
+    #[test]
+    fn evaluator_rejects_bracketed_ipv6_nameserver() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["[::1]".to_string()];
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.iter().any(|r| r.contains("not a parseable IP")),
+            "bracketed form must surface as parse failure: {reasons:?}"
+        );
+    }
+
+    /// Parser tolerates leading whitespace before `nameserver` — common
+    /// in resolvconf-managed files where /run/resolvconf snippets get
+    /// concatenated with mixed indentation.
+    #[test]
+    fn parser_tolerates_leading_whitespace_before_nameserver() {
+        let body = "    nameserver 127.0.0.1\n\t nameserver ::1\n";
+        let (ns, _sd) = parse_resolv_conf(body);
+        assert_eq!(ns, vec!["127.0.0.1".to_string(), "::1".to_string()]);
+    }
+
+    /// Parser ignores resolv.conf option lines (`options`, `sortlist`,
+    /// `lookup`, `family`) — they are not nameserver-bearing and must
+    /// not appear in the nameserver list.
+    #[test]
+    fn parser_ignores_options_and_sortlist_lines() {
+        let body = "\
+options edns0 timeout:1 attempts:2
+sortlist 192.168.1.0/24
+lookup file bind
+family inet4
+nameserver 127.0.0.1
+";
+        let (ns, sd) = parse_resolv_conf(body);
+        assert_eq!(
+            ns,
+            vec!["127.0.0.1".to_string()],
+            "options/sortlist/lookup/family must not pollute nameservers"
+        );
+        assert!(sd.is_empty(), "search_domains must stay empty: {sd:?}");
+    }
+
+    /// Parser treats a nameserver line with no address as a no-op
+    /// rather than panicking or pushing an empty string. Mirrors what
+    /// glibc does (skips the bad line).
+    #[test]
+    fn parser_drops_bare_nameserver_keyword_with_no_address() {
+        let body = "nameserver\nnameserver 127.0.0.1\n";
+        let (ns, _sd) = parse_resolv_conf(body);
+        assert_eq!(ns, vec!["127.0.0.1".to_string()]);
+    }
+
+    /// Parser does not strip in-line comments after the address — glibc
+    /// also treats the rest of the line as part of the value, so the
+    /// evaluator must surface "127.0.0.1 # comment" as an unparseable
+    /// entry rather than silently keeping only the IP. This pins the
+    /// contract so an over-eager parser refactor doesn't introduce a
+    /// silent-accept path for "127.0.0.1 # add backup 8.8.8.8".
+    #[test]
+    fn parser_keeps_inline_comment_attached_to_address() {
+        let body = "nameserver 127.0.0.1 # via systemd-resolved\n";
+        let (ns, _sd) = parse_resolv_conf(body);
+        assert_eq!(ns.len(), 1);
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&LinuxDnsFailclosedSnapshot {
+            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_string(),
+            resolv_conf_present: true,
+            nameservers: ns,
+            search_domains: Vec::new(),
+            loopback_resolver_advertised: true,
+        });
+        assert!(
+            reasons.iter().any(|r| r.contains("not a parseable IP")),
+            "inline-comment-attached entry must surface as parse failure: {reasons:?}"
+        );
+    }
+
+    /// Snapshot test: pin schema_version on report builds. Bumping it
+    /// must be a deliberate change with a paired migration test, not a
+    /// silent drift.
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        let report = build_linux_dns_failclosed_report(loopback_only_snapshot());
+        assert_eq!(
+            report.schema_version, 1,
+            "schema_version bump must be deliberate"
+        );
+    }
 }
