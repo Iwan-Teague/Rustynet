@@ -1048,15 +1048,105 @@ struct ProposalConfig {
 }
 
 fn main() {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    // Pull --json out of the argv before delegating to parse_command. The
+    // flag is positional-agnostic and only meaningful for the small set of
+    // structured-line output commands (status, netcheck). Other commands
+    // are unaffected.
+    let (args, json_mode) = extract_json_flag(raw_args);
     let command = parse_command(&args);
+    let want_json = json_mode && command_supports_json_render(&command);
     match execute(command) {
-        Ok(output) => println!("{output}"),
+        Ok(output) => {
+            if want_json {
+                match render_key_value_line_as_json(output.as_str()) {
+                    Ok(json) => println!("{json}"),
+                    // If the daemon emitted something the JSON renderer
+                    // doesn't recognise, fall back to the original output
+                    // so the operator still sees the data — but tag the
+                    // fallback in a one-line preamble so any downstream
+                    // JSON consumer fails parse-fast and surfaces the
+                    // upstream shape drift.
+                    Err(_) => println!(
+                        "rustynet --json: upstream shape not key=value; raw output below\n{output}"
+                    ),
+                }
+            } else {
+                println!("{output}");
+            }
+        }
         Err(err) => {
-            println!("error: {err}");
+            if want_json {
+                println!(
+                    "{{\"ok\":false,\"error\":{}}}",
+                    serde_json::Value::String(err)
+                );
+            } else {
+                println!("error: {err}");
+            }
             std::process::exit(1);
         }
     }
+}
+
+/// Strip `--json` from the argument vector, anywhere it appears, returning
+/// the cleaned args plus a boolean indicating whether the flag was seen.
+fn extract_json_flag(args: Vec<String>) -> (Vec<String>, bool) {
+    let mut json_mode = false;
+    let mut cleaned: Vec<String> = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--json" {
+            json_mode = true;
+        } else {
+            cleaned.push(arg);
+        }
+    }
+    (cleaned, json_mode)
+}
+
+/// Which CLI commands honour `--json`. Today only `status` and `netcheck`
+/// emit a structured key=value line that can be losslessly converted; other
+/// commands keep their existing human-readable output regardless of the
+/// flag.
+fn command_supports_json_render(command: &CliCommand) -> bool {
+    matches!(command, CliCommand::Status | CliCommand::Netcheck)
+}
+
+/// Convert a single daemon response line of the form
+/// `prefix: key1=value1 key2=value2 ...` into a compact JSON object whose
+/// top-level fields are `prefix` (the leading label without the colon) and
+/// the parsed key/value pairs as string fields. Returns Err when the input
+/// does not contain a `:` separator or contains a token that is not a
+/// `key=value` pair.
+///
+/// The renderer is intentionally lossless: every key/value pair the daemon
+/// emits surfaces as a string field. Numeric coercion belongs at the
+/// consumer, not here — that keeps the wire shape stable across daemon
+/// schema additions.
+fn render_key_value_line_as_json(line: &str) -> Result<String, String> {
+    let trimmed = line.trim();
+    let (prefix, body) = trimmed
+        .split_once(':')
+        .ok_or_else(|| "missing `:` prefix separator".to_string())?;
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "prefix".to_string(),
+        serde_json::Value::String(prefix.trim().to_string()),
+    );
+    for token in body.split_whitespace() {
+        let (key, value) = token
+            .split_once('=')
+            .ok_or_else(|| format!("token without `=` separator: {token:?}"))?;
+        if key.is_empty() {
+            return Err(format!("empty key in token: {token:?}"));
+        }
+        object.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    serde_json::to_string(&serde_json::Value::Object(object))
+        .map_err(|err| format!("serialise json failed: {err}"))
 }
 
 fn parse_command(args: &[String]) -> CliCommand {
@@ -15001,9 +15091,9 @@ fn resolve_domain(domain: &str) -> Result<Vec<String>, String> {
 fn help_text() -> String {
     [
         "commands:",
-        "  status",
+        "  status [--json]",
         "  login",
-        "  netcheck",
+        "  netcheck [--json]",
         "  version",
         "  info",
         "  doctor",
@@ -16709,14 +16799,15 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, contains_ip_rule_lookup_table,
-        detect_tampered_log, execute, help_text, is_interface_absent_detail, launchd_xml_escape,
-        load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
-        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
-        parse_command, parse_managed_pf_anchors, parse_wireguard_go_pids_from_ps,
-        persist_encrypted_secret_material, phase6_stage_probe_from_source,
-        phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
-        phase6_validate_platform_parity_report, read_json_value, render_launchd_plist,
+        CliCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, command_supports_json_render,
+        contains_ip_rule_lookup_table, detect_tampered_log, execute, extract_json_flag, help_text,
+        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
+        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
+        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
+        phase6_stage_probe_from_source, phase6_sync_platform_probe_from_inbox,
+        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
+        read_json_value, render_key_value_line_as_json, render_launchd_plist,
         required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
         rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
         validate_control_socket_security, write_json_pretty_file,
@@ -20031,5 +20122,158 @@ mod tests {
         assert!(err.contains("must be a Unix socket"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extract_json_flag_strips_flag_when_present() {
+        let (cleaned, json_mode) =
+            extract_json_flag(vec!["netcheck".to_string(), "--json".to_string()]);
+        assert!(json_mode);
+        assert_eq!(cleaned, vec!["netcheck".to_string()]);
+    }
+
+    #[test]
+    fn extract_json_flag_strips_flag_in_any_position() {
+        let (cleaned, json_mode) =
+            extract_json_flag(vec!["--json".to_string(), "status".to_string()]);
+        assert!(json_mode);
+        assert_eq!(cleaned, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn extract_json_flag_absent_returns_false() {
+        let (cleaned, json_mode) = extract_json_flag(vec!["status".to_string()]);
+        assert!(!json_mode);
+        assert_eq!(cleaned, vec!["status".to_string()]);
+    }
+
+    #[test]
+    fn extract_json_flag_does_not_match_partial_or_quoted() {
+        let (cleaned, json_mode) = extract_json_flag(vec![
+            "status".to_string(),
+            "--jsonn".to_string(),
+            "--JSON".to_string(),
+        ]);
+        assert!(!json_mode);
+        assert_eq!(
+            cleaned,
+            vec![
+                "status".to_string(),
+                "--jsonn".to_string(),
+                "--JSON".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_supports_json_render_status_and_netcheck() {
+        assert!(command_supports_json_render(&CliCommand::Status));
+        assert!(command_supports_json_render(&CliCommand::Netcheck));
+    }
+
+    #[test]
+    fn command_supports_json_render_returns_false_for_other_commands() {
+        assert!(!command_supports_json_render(&CliCommand::Version));
+        assert!(!command_supports_json_render(&CliCommand::Login));
+        assert!(!command_supports_json_render(&CliCommand::Doctor));
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_parses_netcheck_shape() {
+        let line = "netcheck: path_mode=direct_active path_reason=fresh_handshake_observed candidate_count=3";
+        let json = render_key_value_line_as_json(line).expect("must parse");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("output must be valid JSON");
+        let obj = parsed.as_object().expect("output is an object");
+        assert_eq!(obj.get("prefix").and_then(|v| v.as_str()), Some("netcheck"));
+        assert_eq!(
+            obj.get("path_mode").and_then(|v| v.as_str()),
+            Some("direct_active")
+        );
+        assert_eq!(
+            obj.get("path_reason").and_then(|v| v.as_str()),
+            Some("fresh_handshake_observed")
+        );
+        assert_eq!(
+            obj.get("candidate_count").and_then(|v| v.as_str()),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_preserves_numeric_values_as_strings() {
+        // Lossless representation: numbers stay as strings so downstream
+        // tooling can decide whether to coerce. This keeps the wire shape
+        // stable across daemon schema additions.
+        let line = "status: epoch=42 active_peers=5";
+        let json = render_key_value_line_as_json(line).unwrap();
+        assert!(json.contains("\"epoch\":\"42\""));
+        assert!(json.contains("\"active_peers\":\"5\""));
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_handles_empty_body() {
+        let line = "status: ";
+        let json = render_key_value_line_as_json(line).expect("must parse");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.get("prefix").and_then(|v| v.as_str()),
+            Some("status")
+        );
+        // No data tokens -> only the prefix field is present.
+        assert_eq!(parsed.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_rejects_missing_colon() {
+        let line = "path_mode=direct_active";
+        let err = render_key_value_line_as_json(line).expect_err("must fail");
+        assert!(err.contains("missing `:` prefix separator"));
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_rejects_token_without_equals() {
+        let line = "netcheck: path_mode=direct_active not-a-pair";
+        let err = render_key_value_line_as_json(line).expect_err("must fail");
+        assert!(err.contains("token without `=` separator"));
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_rejects_empty_key() {
+        let line = "netcheck: =value";
+        let err = render_key_value_line_as_json(line).expect_err("must fail");
+        assert!(err.contains("empty key"));
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_handles_values_with_equals_signs_in_value() {
+        // Values may contain `=` if the daemon ever encodes nested k=v
+        // shapes; split_once preserves anything past the first `=`.
+        let line = "status: hash=abc=def epoch=1";
+        let json = render_key_value_line_as_json(line).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.get("hash").and_then(|v| v.as_str()), Some("abc=def"));
+        assert_eq!(parsed.get("epoch").and_then(|v| v.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_handles_repeated_keys_with_last_wins() {
+        // serde_json::Map preserves insertion order but the JSON object
+        // semantic says duplicates resolve to last value. We exercise that
+        // explicitly so consumers know the contract.
+        let line = "netcheck: status=ok status=fail";
+        let json = render_key_value_line_as_json(line).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("fail"));
+    }
+
+    #[test]
+    fn render_key_value_line_as_json_is_idempotent_for_same_input() {
+        let line = "netcheck: path_mode=relay_active reason_code=topology-mismatch";
+        let a = render_key_value_line_as_json(line).unwrap();
+        let b = render_key_value_line_as_json(line).unwrap();
+        let c = render_key_value_line_as_json(line).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
     }
 }
