@@ -161,9 +161,18 @@ inline. Cross-reference with:
       unknown status, fail without reason, missing/wrong-type field,
       and the `host_key_present=true` with empty host_key drift case.
       9 unit tests. (Commit 74ac13d.)
-    * `[ ]` sync-source / build-release / install-release /
-      restart-runtime / verify-runtime / collect-diagnostics / all
-      phases — separate sub-slices.
+    * `[x]` build-release phase: typed `WindowsBuildReleaseReportView`
+      covers both branches (helper writes the full schema_version=2
+      manifest on every code path via `Write-BuildReleaseReport`).
+      Parser fail-closes on wrong schema_version, wrong phase, unknown
+      status, fail without reason, fail with exit_code=0 (internal
+      invariant), unknown `toolchain_scope`, missing/wrong-type field.
+      12 unit tests. (Commit b2878f1.)
+    * `[ ]` sync-source / install-release / restart-runtime /
+      verify-runtime / collect-diagnostics / all phases — these
+      helpers do not yet emit structured JSON on success, so the
+      next sub-slices need to add the helper-side writers before
+      adding typed views.
 
 ### W2. `windows_service_hardening.rs` SDDL + SidType drift hardening
 
