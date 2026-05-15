@@ -152,8 +152,18 @@ inline. Cross-reference with:
     shape drift (wrong schema_version, blocked status which Install
     never emits, fail without reason, missing required field, wrong
     field type). 9 unit tests cover the parser. (Commit 9d12735.)
-  * `[ ]` Bootstrap helper per-phase shape audit (multiple JSON
-    shapes; largest helper surface).
+  * `[~]` Bootstrap helper per-phase shape audit (multiple JSON
+    shapes; largest helper surface). Sub-slice progress:
+    * `[x]` prepare-transport phase: typed
+      `WindowsPrepareTransportReportView` covers both branches (helper
+      emits the full field set on every code path via
+      `New-PrepareTransportFailureReport`). Parser fail-closes on
+      unknown status, fail without reason, missing/wrong-type field,
+      and the `host_key_present=true` with empty host_key drift case.
+      9 unit tests. (Commit 74ac13d.)
+    * `[ ]` sync-source / build-release / install-release /
+      restart-runtime / verify-runtime / collect-diagnostics / all
+      phases — separate sub-slices.
 
 ### W2. `windows_service_hardening.rs` SDDL + SidType drift hardening
 
