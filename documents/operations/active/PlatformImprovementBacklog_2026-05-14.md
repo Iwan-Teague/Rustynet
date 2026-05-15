@@ -192,12 +192,15 @@ inline. Cross-reference with:
 
 ### X1. `rustynet status` / `rustynet netcheck` `--json` flag
 
-* `[ ]` Add `--json` flag that emits the existing status/netcheck data
-  as machine-readable JSON. Today the daemon emits one structured
-  key=value line; expose the same fields as JSON for operator
-  scripting and CI gates.
-* Acceptance: `--json` output parses against a typed view; default
-  human-readable output unchanged; new tests cover field coverage.
+* `[x]` Add `--json` flag that emits the existing status/netcheck data
+  as machine-readable JSON. (Commit 50a8b80.) The CLI converts the
+  daemon's `prefix: key1=value1 ...` line into a JSON object with
+  `prefix` plus one string field per key/value pair (lossless;
+  consumers do their own numeric coercion). On daemon error or
+  unrecognised shape, the CLI emits a minimal `{"ok":false,"error":...}`
+  or a tagged fallback so downstream `jq` pipelines fail parse-fast on
+  shape drift. 15 unit tests cover the renderer, flag extraction, and
+  the command whitelist.
 
 ### X2. Phase A typed-schema continuation
 
