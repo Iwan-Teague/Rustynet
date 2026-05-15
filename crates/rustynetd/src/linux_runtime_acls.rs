@@ -433,4 +433,191 @@ mod tests {
         let parsed: LinuxRuntimeAclReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, report);
     }
+
+    // ----- L2: extended drift signatures for security-relevant edge cases -----
+
+    #[test]
+    fn evaluator_rejects_setuid_drift_on_state_root() {
+        // Setuid on the state root (0o4700) is a privilege-escalation
+        // hazard: anything spawned inside the directory could inherit
+        // the rustynetd identity. The evaluator catches this via the
+        // mode-bit comparison (0o4700 != 0o0700).
+        let mut snap = good_state_root_snapshot();
+        snap.mode = 0o44700; // file-type bits + setuid + 0700
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("setuid drift must reject");
+        assert!(
+            err.contains("0o4700") && err.contains("0o700"),
+            "rejection must contrast 0o4700 vs 0o700: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_setgid_drift_on_state_root() {
+        // Setgid on the state root (0o2700) is a similar
+        // privilege-escalation hazard. The evaluator catches it via
+        // mode-bit comparison.
+        let mut snap = good_state_root_snapshot();
+        snap.mode = 0o42700; // file-type bits + setgid + 0700
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("setgid drift must reject");
+        assert!(
+            err.contains("0o2700") && err.contains("0o700"),
+            "rejection must contrast 0o2700 vs 0o700: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_world_writable_state_root() {
+        // 0o777 on the state root is the catastrophic case: any local
+        // user can read or write the daemon's session-state snapshot.
+        let mut snap = good_state_root_snapshot();
+        snap.mode = 0o40777;
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("0o777 must reject when 0o700 is reviewed");
+        assert!(
+            err.contains("0o777") && err.contains("0o700"),
+            "rejection must contrast 0o777 vs 0o700: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_state_root_owned_by_root() {
+        // /var/lib/rustynet is reviewed as `rustynetd:rustynetd` (uid
+        // 998). If the directory is owned by root (uid 0), the daemon
+        // can't write its state snapshot under StateDirectoryMode=0700.
+        let mut snap = good_state_root_snapshot();
+        snap.uid = 0;
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("root-owned state root must reject");
+        assert!(
+            err.contains("owner uid is 0,"),
+            "rejection must surface the actual uid=0: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_config_root_owned_by_rustynetd_instead_of_root() {
+        // /etc/rustynet is reviewed as `root:rustynetd` (uid 0, gid
+        // 998). If the directory is owned by rustynetd:rustynetd,
+        // the daemon can mutate its own config root — a posture the
+        // reviewed install explicitly forbids.
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o40750,
+            uid: 998, // rustynetd, NOT root
+            gid: 998,
+            is_dir: true,
+            is_symlink: false,
+        };
+        let err =
+            evaluate_linux_runtime_acl_metadata("config root", config_root_expectation(), snap)
+                .expect_err("rustynetd-owned config root must reject");
+        assert!(
+            err.contains("owner uid is 998") && err.contains("expected 0"),
+            "rejection must surface the actual uid=998 and expected uid=0: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_state_root_under_restrictive_mode() {
+        // 0o000 on the state root would break the daemon at startup;
+        // the evaluator surfaces the wrong-mode reason rather than
+        // silently letting the daemon fail-closed on first write.
+        let mut snap = good_state_root_snapshot();
+        snap.mode = 0o40000;
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("0o000 must reject when 0o700 is reviewed");
+        assert!(
+            err.contains("mode is 0o0,") && err.contains("0o700"),
+            "rejection must contrast 0o0 vs 0o700: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_drift_report_accumulates_mode_then_uid_then_gid_in_order() {
+        // The evaluator returns the FIRST drift reason; this is by
+        // design (cheaper for the orchestrator to surface a single
+        // precise blocker). Pin the order: mode mismatch is checked
+        // before uid mismatch, which is checked before gid mismatch.
+        // A snapshot with all three drifted should surface the mode
+        // reason first.
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o40755,
+            uid: 0,
+            gid: 0,
+            is_dir: true,
+            is_symlink: false,
+        };
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("all three drifts must reject");
+        assert!(
+            err.contains("mode is"),
+            "first reason must be the mode mismatch: {err}"
+        );
+        assert!(
+            !err.contains("owner uid is") && !err.contains("group gid is"),
+            "subsequent drift reasons must not surface in the first-fault message: {err}"
+        );
+    }
+
+    #[test]
+    fn report_overall_ok_is_false_when_any_root_drifted() {
+        // Compose a report with one Ok root and one Drifted root and
+        // confirm overall_ok=false. Pins the AND-of-statuses contract.
+        let report = LinuxRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: false,
+            roots: vec![
+                LinuxRuntimeAclRootEntry {
+                    label: "state root".to_string(),
+                    path: "/var/lib/rustynet".to_string(),
+                    status: LinuxRuntimeAclRootStatus::Ok,
+                },
+                LinuxRuntimeAclRootEntry {
+                    label: "config root".to_string(),
+                    path: "/etc/rustynet".to_string(),
+                    status: LinuxRuntimeAclRootStatus::Drifted {
+                        reason: "config root mode is 0o755, expected 0o750".to_string(),
+                    },
+                },
+            ],
+        };
+        // Re-derive overall_ok the same way the collector does, to
+        // make sure the documented invariant holds.
+        let derived = report
+            .roots
+            .iter()
+            .all(|entry| matches!(entry.status, LinuxRuntimeAclRootStatus::Ok));
+        assert!(
+            !derived,
+            "overall_ok must be false when any root is drifted"
+        );
+        assert_eq!(report.overall_ok, derived);
+    }
+
+    #[test]
+    fn report_overall_ok_is_true_when_all_roots_ok() {
+        let report = LinuxRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: true,
+            roots: vec![
+                LinuxRuntimeAclRootEntry {
+                    label: "state root".to_string(),
+                    path: "/var/lib/rustynet".to_string(),
+                    status: LinuxRuntimeAclRootStatus::Ok,
+                },
+                LinuxRuntimeAclRootEntry {
+                    label: "config root".to_string(),
+                    path: "/etc/rustynet".to_string(),
+                    status: LinuxRuntimeAclRootStatus::Ok,
+                },
+            ],
+        };
+        let derived = report
+            .roots
+            .iter()
+            .all(|entry| matches!(entry.status, LinuxRuntimeAclRootStatus::Ok));
+        assert!(derived, "overall_ok must be true when every root is Ok");
+        assert_eq!(report.overall_ok, derived);
+    }
 }
