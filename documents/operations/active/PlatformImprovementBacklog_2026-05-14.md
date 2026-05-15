@@ -139,10 +139,22 @@ inline. Cross-reference with:
 
 ### L6. `linux_key_custody.rs` passphrase-file pinning
 
-* `[ ]` Tighten passphrase-file mode/owner check (already 0600 + owner
-  match); add cross-boot stability tests (write → reboot fixture → read
-  → match) and assert no plaintext passphrase survives a normal-shutdown
-  daemon restart.
+* `[x]` Commit 8e1e64e. Extended the verifier from 4-entry WG-key-only
+  coverage to 8-entry coverage that pins systemd's encrypted-credential
+  store (the real source of the runtime WG passphrase + the
+  membership-owner signing-key passphrase):
+  - `/etc/rustynet/credentials/` dir (0700 root:root)
+  - `wg_key_passphrase.cred` (0600 root:root)
+  - `signing_key_passphrase.cred` (0600 root:root)
+  - `/var/lib/rustynet/keys/wireguard.passphrase` (must be ABSENT)
+  Plus 7 new tests + canonical 8-entry path snapshot. Before this slice
+  the verifier silently passed when those paths had wrong perms,
+  missing files, or rustynetd-owned credential files — now those drift
+  shapes are named rejections.
+* `[ ]` Remaining scope (separate slice): cross-boot stability test
+  (write → reboot fixture → read → match) + assertion that no plaintext
+  passphrase survives a normal-shutdown daemon restart. Requires
+  fixtures or a live-lab harness rather than pure unit tests.
 
 ### L7. Linux exit ACL IPv6 parity
 
