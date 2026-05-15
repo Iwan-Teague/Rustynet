@@ -39,6 +39,7 @@ Start with these when you need current status, remaining work, or the public imp
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 - [RustyfinExtensionTrustPlan_2026-05-10.md](./RustyfinExtensionTrustPlan_2026-05-10.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)
+- [PlatformImprovementBacklog_2026-05-14.md](./PlatformImprovementBacklog_2026-05-14.md)
 - [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md)
 - [SecurityHardeningBacklog_2026-03-09.md](./SecurityHardeningBacklog_2026-03-09.md)
 - [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
