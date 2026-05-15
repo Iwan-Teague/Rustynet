@@ -32,6 +32,23 @@ pub const LINUX_WG_PUBLIC_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.pub
 /// Legacy plaintext private key path. Must NOT exist at rest after the
 /// Phase E migration to encrypted-at-rest custody.
 pub const LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.key";
+/// Reviewed encrypted credential directory. systemd loads the
+/// passphrase material from inside via `LoadCredentialEncrypted=`; the
+/// directory must be 0700 root:root so only systemd (running as root)
+/// can read the encrypted blobs at unit-start time.
+pub const LINUX_CREDENTIALS_DIR: &str = "/etc/rustynet/credentials";
+/// Encrypted credential file holding the WireGuard runtime passphrase.
+/// Reviewed: 0600 root:root.
+pub const LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH: &str =
+    "/etc/rustynet/credentials/wg_key_passphrase.cred";
+/// Encrypted credential file holding the membership-owner signing-key
+/// passphrase. Reviewed: 0600 root:root.
+pub const LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_PATH: &str =
+    "/etc/rustynet/credentials/signing_key_passphrase.cred";
+/// Legacy plaintext passphrase path inside the keys directory. Must
+/// NOT exist at rest — passphrase material is owned by systemd's
+/// encrypted-credential store, never by the rustynetd-owned keys dir.
+pub const LINUX_WG_PLAINTEXT_PASSPHRASE_PATH: &str = "/var/lib/rustynet/keys/wireguard.passphrase";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -177,6 +194,31 @@ pub fn collect_linux_key_custody_report() -> LinuxKeyCustodyReport {
         probe_forbidden_path(
             "plaintext WireGuard private key (legacy)",
             LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH,
+        ),
+        probe_present_directory(
+            "systemd credentials directory",
+            LINUX_CREDENTIALS_DIR,
+            0o700,
+            "root",
+            "root",
+        ),
+        probe_present_file(
+            "WireGuard passphrase encrypted credential",
+            LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH,
+            0o600,
+            "root",
+            "root",
+        ),
+        probe_present_file(
+            "signing-key passphrase encrypted credential",
+            LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_PATH,
+            0o600,
+            "root",
+            "root",
+        ),
+        probe_forbidden_path(
+            "plaintext WireGuard passphrase (legacy)",
+            LINUX_WG_PLAINTEXT_PASSPHRASE_PATH,
         ),
     ];
     build_linux_key_custody_report(entries)
@@ -451,23 +493,47 @@ mod tests {
         }
     }
 
-    #[test]
-    fn evaluator_accepts_canonical_present_set() {
-        let entries = vec![
+    fn absent_entry(label: &str, path: &str) -> LinuxKeyCustodyEntry {
+        LinuxKeyCustodyEntry {
+            label: label.to_string(),
+            path: path.to_string(),
+            requirement: REQUIREMENT_ABSENT.to_string(),
+            status: LinuxKeyCustodyEntryStatus::AbsentAsExpected,
+        }
+    }
+
+    fn canonical_clean_entries() -> Vec<LinuxKeyCustodyEntry> {
+        vec![
             ok_entry("keys directory", LINUX_WG_KEYS_DIR),
             ok_entry(
                 "encrypted WireGuard private key",
                 LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH,
             ),
             ok_entry("WireGuard public key", LINUX_WG_PUBLIC_KEY_PATH),
-            LinuxKeyCustodyEntry {
-                label: "plaintext WireGuard private key (legacy)".to_string(),
-                path: LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
-                requirement: REQUIREMENT_ABSENT.to_string(),
-                status: LinuxKeyCustodyEntryStatus::AbsentAsExpected,
-            },
-        ];
-        evaluate_linux_key_custody(&entries).expect("clean entries must validate");
+            absent_entry(
+                "plaintext WireGuard private key (legacy)",
+                LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH,
+            ),
+            ok_entry("systemd credentials directory", LINUX_CREDENTIALS_DIR),
+            ok_entry(
+                "WireGuard passphrase encrypted credential",
+                LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH,
+            ),
+            ok_entry(
+                "signing-key passphrase encrypted credential",
+                LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_PATH,
+            ),
+            absent_entry(
+                "plaintext WireGuard passphrase (legacy)",
+                LINUX_WG_PLAINTEXT_PASSPHRASE_PATH,
+            ),
+        ]
+    }
+
+    #[test]
+    fn evaluator_accepts_canonical_present_set() {
+        evaluate_linux_key_custody(&canonical_clean_entries())
+            .expect("clean entries must validate");
     }
 
     #[test]
@@ -536,24 +602,187 @@ mod tests {
 
     #[test]
     fn build_report_marks_overall_ok_for_clean_entries() {
-        let entries = vec![
-            ok_entry("keys directory", LINUX_WG_KEYS_DIR),
-            ok_entry(
-                "encrypted WireGuard private key",
-                LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-            ),
-            ok_entry("WireGuard public key", LINUX_WG_PUBLIC_KEY_PATH),
-            LinuxKeyCustodyEntry {
-                label: "plaintext WireGuard private key (legacy)".to_string(),
-                path: LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
-                requirement: REQUIREMENT_ABSENT.to_string(),
-                status: LinuxKeyCustodyEntryStatus::AbsentAsExpected,
-            },
-        ];
-        let report = build_linux_key_custody_report(entries);
+        let report = build_linux_key_custody_report(canonical_clean_entries());
         assert!(report.overall_ok);
         assert!(report.drift_reasons.is_empty());
-        assert_eq!(report.entries.len(), 4);
+        assert_eq!(report.entries.len(), 8);
+    }
+
+    // ---- L6: passphrase + credential custody pinning ------------------
+
+    /// Missing wg_key_passphrase.cred is a hard fail-closed condition:
+    /// without the encrypted credential, systemd cannot load the
+    /// passphrase and the daemon cannot unwrap the runtime WG private
+    /// key. Pin it as a required Present entry.
+    #[test]
+    fn evaluator_rejects_missing_wg_key_passphrase_credential() {
+        let mut entries = canonical_clean_entries();
+        for entry in entries.iter_mut() {
+            if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Missing {
+                    reason: "ENOENT".to_string(),
+                };
+            }
+        }
+        let reasons = evaluate_linux_key_custody(&entries)
+            .expect_err("missing wg passphrase credential must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("WireGuard passphrase") && r.contains("missing")),
+            "rejection must name passphrase credential: {reasons:?}"
+        );
+    }
+
+    /// Missing signing_key_passphrase.cred is a hard fail: without it,
+    /// the membership-owner cannot issue signed bundles. Pin Present.
+    #[test]
+    fn evaluator_rejects_missing_signing_key_passphrase_credential() {
+        let mut entries = canonical_clean_entries();
+        for entry in entries.iter_mut() {
+            if entry.path == LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Missing {
+                    reason: "ENOENT".to_string(),
+                };
+            }
+        }
+        let reasons = evaluate_linux_key_custody(&entries)
+            .expect_err("missing signing-key passphrase credential must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("signing-key passphrase") && r.contains("missing")),
+            "rejection must name signing-key passphrase credential: {reasons:?}"
+        );
+    }
+
+    /// Credentials directory must be 0700 root:root. A group-read mode
+    /// (0750) on a root-owned dir would expose .cred bytes to any
+    /// process whose primary or supplementary gid includes the
+    /// credential dir's group — must reject.
+    #[test]
+    fn evaluator_rejects_credentials_dir_wrong_mode() {
+        let mut entries = canonical_clean_entries();
+        for entry in entries.iter_mut() {
+            if entry.path == LINUX_CREDENTIALS_DIR {
+                entry.status = LinuxKeyCustodyEntryStatus::Invalid {
+                    reason: "mode is 0o750, expected 0o700".to_string(),
+                    mode: 0o40750,
+                    uid: 0,
+                    gid: 0,
+                };
+            }
+        }
+        let reasons =
+            evaluate_linux_key_custody(&entries).expect_err("0750 credentials dir must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("systemd credentials directory") && r.contains("invalid")),
+            "rejection must name credentials dir: {reasons:?}"
+        );
+    }
+
+    /// .cred files must be 0600. 0640 would let any group-member read
+    /// the encrypted blob and start an offline attack. Reject.
+    #[test]
+    fn evaluator_rejects_wg_passphrase_credential_group_readable_mode() {
+        let mut entries = canonical_clean_entries();
+        for entry in entries.iter_mut() {
+            if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Invalid {
+                    reason: "mode is 0o640, expected 0o600".to_string(),
+                    mode: 0o100640,
+                    uid: 0,
+                    gid: 0,
+                };
+            }
+        }
+        let reasons = evaluate_linux_key_custody(&entries)
+            .expect_err("0640 wg passphrase credential must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("WireGuard passphrase") && r.contains("invalid")),
+            "rejection must name passphrase credential: {reasons:?}"
+        );
+    }
+
+    /// .cred files must be owned by root, NOT rustynetd. systemd loads
+    /// them as root, then drops them into the credential dir for the
+    /// service user. If the file at rest is owned by rustynetd, then
+    /// a rustynetd-context compromise can rewrite the encrypted blob.
+    #[test]
+    fn evaluator_rejects_wg_passphrase_credential_owned_by_rustynetd() {
+        let mut entries = canonical_clean_entries();
+        for entry in entries.iter_mut() {
+            if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Invalid {
+                    reason: "owner uid is 998, expected 0 (root)".to_string(),
+                    mode: 0o100600,
+                    uid: 998,
+                    gid: 998,
+                };
+            }
+        }
+        let reasons = evaluate_linux_key_custody(&entries)
+            .expect_err("rustynetd-owned wg passphrase credential must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("WireGuard passphrase") && r.contains("invalid")),
+            "rejection must surface rustynetd-owned passphrase credential: {reasons:?}"
+        );
+    }
+
+    /// A plaintext passphrase at /var/lib/rustynet/keys/wireguard.passphrase
+    /// must be flagged forbidden. Production must keep passphrase
+    /// material inside systemd's encrypted-credential store; a
+    /// plaintext copy in the rustynetd-owned keys dir is a leak path
+    /// that survives reboot.
+    #[test]
+    fn evaluator_rejects_legacy_plaintext_passphrase_present_at_rest() {
+        let mut entries = canonical_clean_entries();
+        for entry in entries.iter_mut() {
+            if entry.path == LINUX_WG_PLAINTEXT_PASSPHRASE_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Forbidden {
+                    reason: format!(
+                        "must not exist at rest after Phase E migration; found {}",
+                        LINUX_WG_PLAINTEXT_PASSPHRASE_PATH
+                    ),
+                };
+            }
+        }
+        let reasons = evaluate_linux_key_custody(&entries)
+            .expect_err("plaintext passphrase at rest must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("plaintext WireGuard passphrase")
+                    && r.contains("forbidden but present at rest")),
+            "rejection must name plaintext passphrase: {reasons:?}"
+        );
+    }
+
+    /// Snapshot: the canonical entry list shape is exactly 8 entries.
+    /// Pins the contract so a future refactor that silently removes a
+    /// required entry trips a named failure rather than silently
+    /// relaxing the verifier.
+    #[test]
+    fn canonical_entry_list_pinned_at_eight_entries() {
+        let entries = canonical_clean_entries();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        let expected: Vec<&str> = vec![
+            LINUX_WG_KEYS_DIR,
+            LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+            LINUX_WG_PUBLIC_KEY_PATH,
+            LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH,
+            LINUX_CREDENTIALS_DIR,
+            LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH,
+            LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_PATH,
+            LINUX_WG_PLAINTEXT_PASSPHRASE_PATH,
+        ];
+        assert_eq!(paths, expected, "canonical entry list shape drifted");
     }
 
     #[test]
@@ -571,8 +800,8 @@ mod tests {
         let report = collect_linux_key_custody_report();
         assert!(!report.overall_ok);
         // Required (present) entries should report Missing with the
-        // off-Linux blocker reason. The forbidden plaintext-key entry
-        // is correctly absent off-Linux too.
-        assert_eq!(report.entries.len(), 4);
+        // off-Linux blocker reason. The forbidden plaintext-key entries
+        // are correctly absent off-Linux too.
+        assert_eq!(report.entries.len(), 8);
     }
 }
