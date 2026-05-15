@@ -678,6 +678,62 @@ fn build_windows_runtime_report_validation_script(
     ))
 }
 
+/// Typed view of the `manifest.json` written by
+/// `scripts/bootstrap/windows/Collect-RustyNetWindowsDiagnostics.ps1`.
+///
+/// The helper now writes the same key set on both the success and the
+/// top-level-failure code paths (`schema_version`, `captured_at_utc`,
+/// `output_root`, `install_root`, `state_root`, `service_name`,
+/// `status`, `reason`, `files`). Success carries `status = "pass"`,
+/// `reason = ""`, and the actual collected file list; failure carries
+/// `status = "fail"`, `reason = <error message>`, and an empty files
+/// list. Optional success-only fields (`windows_target_facts`,
+/// `runtime_boundary_status`, `omitted_secret_material`) are accepted
+/// via `#[serde(default)]` so this view round-trips both branches.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WindowsDiagnosticsManifestView {
+    pub schema_version: u32,
+    pub captured_at_utc: String,
+    pub output_root: String,
+    pub install_root: String,
+    pub state_root: String,
+    pub service_name: String,
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+impl WindowsDiagnosticsManifestView {
+    /// Parse a `manifest.json` body emitted by the Windows diagnostics
+    /// helper. Returns `Err(String)` with a fail-closed message on any
+    /// shape drift — including missing required fields, wrong primitive
+    /// types, and a `status` value that is neither `"pass"` nor
+    /// `"fail"`.
+    #[allow(dead_code)]
+    pub(crate) fn parse(body: &str) -> Result<Self, String> {
+        let view: WindowsDiagnosticsManifestView = serde_json::from_str(body)
+            .map_err(|err| format!("invalid windows diagnostics manifest shape: {err}"))?;
+        match view.status.as_str() {
+            "pass" | "fail" => {}
+            other => {
+                return Err(format!(
+                    "windows diagnostics manifest status must be 'pass' or 'fail'; got {other:?}"
+                ));
+            }
+        }
+        if view.status == "fail" && view.reason.trim().is_empty() {
+            return Err(
+                "windows diagnostics manifest status=fail must carry a non-empty reason"
+                    .to_string(),
+            );
+        }
+        Ok(view)
+    }
+}
+
 #[cfg(test)]
 fn build_windows_diagnostics_validation_script(
     remote_path: &str,
@@ -1565,6 +1621,157 @@ mod tests {
         assert!(script.contains("manifest.json"));
         assert!(script.contains("ConvertFrom-Json"));
         assert!(script.contains("did not create output root"));
+    }
+
+    // ----- WindowsDiagnosticsManifestView typed parser tests -----
+
+    #[test]
+    fn windows_diagnostics_manifest_parses_success_payload() {
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\ProgramData\\RustyNet\\vm-lab\\diagnostics\\run-1",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "windows_target_facts": {"caption": "Windows 11 Pro"},
+          "runtime_boundary_status": "pass",
+          "omitted_secret_material": ["C:\\ProgramData\\ssh\\ssh_host_ed25519_key"],
+          "files": ["manifest.json", "services.txt", "hashes.json"],
+          "status": "pass",
+          "reason": ""
+        }"#;
+        let view = WindowsDiagnosticsManifestView::parse(body).expect("must parse");
+        assert_eq!(view.schema_version, 2);
+        assert_eq!(view.service_name, "RustyNet");
+        assert_eq!(view.status, "pass");
+        assert_eq!(view.reason, "");
+        assert!(view.files.iter().any(|name| name == "manifest.json"));
+    }
+
+    #[test]
+    fn windows_diagnostics_manifest_parses_failure_payload_with_reason() {
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\ProgramData\\RustyNet\\vm-lab\\diagnostics\\run-2",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "fail",
+          "reason": "diagnostics-collection-exception: access denied",
+          "files": []
+        }"#;
+        let view = WindowsDiagnosticsManifestView::parse(body).expect("must parse");
+        assert_eq!(view.status, "fail");
+        assert!(view.reason.contains("access denied"));
+        assert!(view.files.is_empty());
+    }
+
+    #[test]
+    fn windows_diagnostics_manifest_rejects_unknown_status_value() {
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\out",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "maybe",
+          "files": []
+        }"#;
+        let err = WindowsDiagnosticsManifestView::parse(body)
+            .expect_err("unknown status value must fail closed");
+        assert!(err.contains("must be 'pass' or 'fail'"));
+    }
+
+    #[test]
+    fn windows_diagnostics_manifest_rejects_fail_status_without_reason() {
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\out",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "fail",
+          "reason": "   ",
+          "files": []
+        }"#;
+        let err = WindowsDiagnosticsManifestView::parse(body)
+            .expect_err("status=fail with empty reason must fail closed");
+        assert!(err.contains("non-empty reason"));
+    }
+
+    #[test]
+    fn windows_diagnostics_manifest_rejects_missing_required_field() {
+        // missing service_name
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\out",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "status": "pass",
+          "files": []
+        }"#;
+        let err = WindowsDiagnosticsManifestView::parse(body)
+            .expect_err("missing service_name must fail closed");
+        assert!(err.contains("invalid windows diagnostics manifest shape"));
+    }
+
+    #[test]
+    fn windows_diagnostics_manifest_rejects_wrong_field_type() {
+        // schema_version as string instead of number
+        let body = r#"{
+          "schema_version": "two",
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\out",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass",
+          "files": []
+        }"#;
+        let err = WindowsDiagnosticsManifestView::parse(body)
+            .expect_err("schema_version wrong type must fail closed");
+        assert!(err.contains("invalid windows diagnostics manifest shape"));
+    }
+
+    #[test]
+    fn windows_diagnostics_manifest_accepts_unknown_extra_fields() {
+        // Forward-compatible: extras (e.g. windows_target_facts, custom
+        // operator annotations) MUST NOT break the typed view.
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\out",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass",
+          "files": [],
+          "future_field_added_by_a_later_helper_version": {"some": "value"}
+        }"#;
+        let view = WindowsDiagnosticsManifestView::parse(body).expect("must parse");
+        assert_eq!(view.status, "pass");
+    }
+
+    #[test]
+    fn windows_diagnostics_manifest_parse_is_idempotent() {
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T11:00:00.000Z",
+          "output_root": "C:\\out",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass",
+          "files": ["manifest.json"]
+        }"#;
+        let a = WindowsDiagnosticsManifestView::parse(body).unwrap();
+        let b = WindowsDiagnosticsManifestView::parse(body).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
