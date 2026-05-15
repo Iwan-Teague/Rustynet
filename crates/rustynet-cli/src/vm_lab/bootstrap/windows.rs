@@ -734,6 +734,84 @@ impl WindowsDiagnosticsManifestView {
     }
 }
 
+/// Typed view of the report written by
+/// `scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1`. The
+/// helper emits the same `schema_version=3` on both the success path
+/// (full runtime check report at the tail of the script) and the
+/// top-level-failure trap (compact failure report from
+/// `New-FailClosedVerifyReport`).
+///
+/// Both branches share the documented required fields below.
+/// Success-only fields are accepted via `#[serde(default)]` so a typed
+/// consumer can deserialize either branch through this view. The
+/// `status` field must be `"pass"`, `"fail"`, or `"blocked"`; the latter
+/// is used when the runtime is intentionally not supported on the
+/// target (e.g. `windows-runtime-backend-explicitly-unsupported`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WindowsVerifyReportView {
+    pub schema_version: u32,
+    pub captured_at_utc: String,
+    pub platform: String,
+    pub rustynet_root: String,
+    pub install_root: String,
+    pub state_root: String,
+    pub service_name: String,
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub backend_label: String,
+    #[serde(default)]
+    pub runtime_supported: bool,
+    #[serde(default)]
+    pub service_verified: bool,
+    #[serde(default)]
+    pub service_present: bool,
+    #[serde(default)]
+    pub service_status: String,
+    #[serde(default)]
+    pub failure_step: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl WindowsVerifyReportView {
+    /// Parse a Verify-RustyNetWindowsBootstrap report body. Fails closed
+    /// when shape drift is detected:
+    /// - invalid JSON
+    /// - missing/wrong type on any required field
+    /// - schema_version other than 3 (the contract the helper emits today)
+    /// - status not in {pass, fail, blocked}
+    /// - status=fail or status=blocked with empty reason
+    #[allow(dead_code)]
+    pub(crate) fn parse(body: &str) -> Result<Self, String> {
+        let view: WindowsVerifyReportView = serde_json::from_str(body)
+            .map_err(|err| format!("invalid windows verify report shape: {err}"))?;
+        if view.schema_version != 3 {
+            return Err(format!(
+                "windows verify report schema_version must be 3; got {}",
+                view.schema_version
+            ));
+        }
+        match view.status.as_str() {
+            "pass" | "fail" | "blocked" => {}
+            other => {
+                return Err(format!(
+                    "windows verify report status must be 'pass', 'fail', or 'blocked'; got {other:?}"
+                ));
+            }
+        }
+        if (view.status == "fail" || view.status == "blocked") && view.reason.trim().is_empty() {
+            return Err(format!(
+                "windows verify report status='{}' must carry a non-empty reason",
+                view.status
+            ));
+        }
+        Ok(view)
+    }
+}
+
 #[cfg(test)]
 fn build_windows_diagnostics_validation_script(
     remote_path: &str,
@@ -1772,6 +1850,187 @@ mod tests {
         let a = WindowsDiagnosticsManifestView::parse(body).unwrap();
         let b = WindowsDiagnosticsManifestView::parse(body).unwrap();
         assert_eq!(a, b);
+    }
+
+    // ----- WindowsVerifyReportView typed parser tests -----
+
+    #[test]
+    fn windows_verify_report_parses_success_payload() {
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass",
+          "reason": "",
+          "backend_label": "windows-wireguard-nt",
+          "runtime_supported": true,
+          "service_verified": true,
+          "service_present": true,
+          "service_status": "Running",
+          "failure_step": "",
+          "notes": []
+        }"#;
+        let view = WindowsVerifyReportView::parse(body).expect("must parse");
+        assert_eq!(view.schema_version, 3);
+        assert_eq!(view.status, "pass");
+        assert!(view.runtime_supported);
+        assert!(view.service_verified);
+    }
+
+    #[test]
+    fn windows_verify_report_parses_failure_payload_from_trap() {
+        // Failure manifest emitted by New-FailClosedVerifyReport, after
+        // the schema_version bump that brought it to parity with success.
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "fail",
+          "reason": "verify-helper-init-exception: access denied",
+          "backend_label": "",
+          "runtime_supported": false,
+          "service_verified": false,
+          "service_present": false,
+          "service_status": "missing",
+          "failure_step": "init",
+          "runtime_signals": null,
+          "notes": ["verify-helper-trap"]
+        }"#;
+        let view = WindowsVerifyReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "fail");
+        assert!(view.reason.contains("access denied"));
+        assert_eq!(view.notes, vec!["verify-helper-trap".to_string()]);
+    }
+
+    #[test]
+    fn windows_verify_report_parses_blocked_payload_for_unsupported_runtime() {
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "blocked",
+          "reason": "windows-runtime-backend-explicitly-unsupported"
+        }"#;
+        let view = WindowsVerifyReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "blocked");
+        assert!(view.reason.contains("explicitly-unsupported"));
+    }
+
+    #[test]
+    fn windows_verify_report_rejects_wrong_schema_version() {
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass"
+        }"#;
+        let err = WindowsVerifyReportView::parse(body)
+            .expect_err("schema_version=1 must fail closed (helper emits 3)");
+        assert!(err.contains("schema_version must be 3"));
+    }
+
+    #[test]
+    fn windows_verify_report_rejects_unknown_status_value() {
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "warn"
+        }"#;
+        let err =
+            WindowsVerifyReportView::parse(body).expect_err("unknown status must fail closed");
+        assert!(err.contains("'pass', 'fail', or 'blocked'"));
+    }
+
+    #[test]
+    fn windows_verify_report_rejects_fail_without_reason() {
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "fail",
+          "reason": "   "
+        }"#;
+        let err = WindowsVerifyReportView::parse(body)
+            .expect_err("status=fail with empty reason must fail closed");
+        assert!(err.contains("non-empty reason"));
+    }
+
+    #[test]
+    fn windows_verify_report_rejects_blocked_without_reason() {
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "blocked",
+          "reason": ""
+        }"#;
+        let err = WindowsVerifyReportView::parse(body)
+            .expect_err("status=blocked with empty reason must fail closed");
+        assert!(err.contains("non-empty reason"));
+    }
+
+    #[test]
+    fn windows_verify_report_rejects_missing_required_field() {
+        // missing rustynet_root
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass"
+        }"#;
+        let err = WindowsVerifyReportView::parse(body)
+            .expect_err("missing rustynet_root must fail closed");
+        assert!(err.contains("invalid windows verify report shape"));
+    }
+
+    #[test]
+    fn windows_verify_report_accepts_forward_compatible_extra_fields() {
+        let body = r#"{
+          "schema_version": 3,
+          "captured_at_utc": "2026-05-15T12:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass",
+          "future_field_added_by_a_later_helper_version": {"some": "value"},
+          "runtime_boundary": {"status": "pass"}
+        }"#;
+        let view = WindowsVerifyReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "pass");
     }
 
     #[test]

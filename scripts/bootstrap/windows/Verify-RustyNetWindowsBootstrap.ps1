@@ -39,8 +39,12 @@ if ($StateRoot -ne 'C:\ProgramData\RustyNet') {
 
 function New-FailClosedVerifyReport {
     param([Parameter(Mandatory = $true)][string]$FailureReason)
+    # schema_version must match the success report at the tail of the
+    # script (currently 3) so a single typed view on the Rust side can
+    # deserialize either branch. When bumping the success schema, bump
+    # this constant in the same commit.
     return [ordered]@{
-        schema_version = 1
+        schema_version = 3
         captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
         platform = 'windows'
         rustynet_root = $RustyNetRoot
