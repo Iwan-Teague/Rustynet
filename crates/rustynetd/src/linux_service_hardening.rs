@@ -355,4 +355,286 @@ mod tests {
             report.probe_reason
         );
     }
+
+    // ----- L3: per-directive drift coverage -----
+    //
+    // The evaluator walks REVIEWED_HARDENING_DIRECTIVES and surfaces a
+    // drift reason for any directive that's missing or doesn't match
+    // the expected value. Tests below pin each security-critical
+    // directive individually so a future refactor that accidentally
+    // drops a directive from the table cannot silently relax the
+    // hardening contract.
+
+    #[test]
+    fn evaluator_rejects_memory_deny_write_execute_drift_to_no() {
+        // W^X bypass: a process that can mprotect a region to RWX can
+        // load attacker-controlled code. The reviewed posture requires
+        // MemoryDenyWriteExecute=yes so the kernel blocks the
+        // PROT_WRITE|PROT_EXEC combination.
+        let mut map = reviewed_property_map();
+        map.insert("MemoryDenyWriteExecute".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("MemoryDenyWriteExecute drifted")),
+            "MemoryDenyWriteExecute=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_ambient_capabilities_drift_to_non_empty() {
+        // Cap-inheritance attack: AmbientCapabilities= bypasses
+        // CapabilityBoundingSet= for child processes. The reviewed
+        // posture requires AmbientCapabilities= empty.
+        let mut map = reviewed_property_map();
+        map.insert(
+            "AmbientCapabilities".to_string(),
+            "CAP_NET_ADMIN CAP_NET_BIND_SERVICE".to_string(),
+        );
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("AmbientCapabilities drifted")),
+            "non-empty AmbientCapabilities must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_umask_drift_to_looser_value() {
+        // UMask=0022 makes new files world-readable by default — a
+        // posture regression if the daemon ever writes secrets through
+        // a path that doesn't pin its own mode.
+        let mut map = reviewed_property_map();
+        map.insert("UMask".to_string(), "0022".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons.iter().any(|r| r.contains("UMask drifted")),
+            "UMask=0022 must surface drift when 0077 is reviewed: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_user_drift_to_root() {
+        // The daemon must NOT run as root. The reviewed User=rustynetd.
+        let mut map = reviewed_property_map();
+        map.insert("User".to_string(), "root".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons.iter().any(|r| r.contains("User drifted")),
+            "User=root must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_group_drift_to_root() {
+        let mut map = reviewed_property_map();
+        map.insert("Group".to_string(), "root".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons.iter().any(|r| r.contains("Group drifted")),
+            "Group=root must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_protect_home_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("ProtectHome".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons.iter().any(|r| r.contains("ProtectHome drifted")),
+            "ProtectHome=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_protect_kernel_tunables_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("ProtectKernelTunables".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("ProtectKernelTunables drifted")),
+            "ProtectKernelTunables=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_protect_kernel_modules_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("ProtectKernelModules".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("ProtectKernelModules drifted")),
+            "ProtectKernelModules=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_private_tmp_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("PrivateTmp".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons.iter().any(|r| r.contains("PrivateTmp drifted")),
+            "PrivateTmp=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_private_devices_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("PrivateDevices".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons.iter().any(|r| r.contains("PrivateDevices drifted")),
+            "PrivateDevices=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_lock_personality_drift_to_no() {
+        // LockPersonality=no allows changes to the personality(2)
+        // syscall, which can be used to emulate old kernel quirks
+        // (READ_IMPLIES_EXEC etc.) and bypass mitigations.
+        let mut map = reviewed_property_map();
+        map.insert("LockPersonality".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("LockPersonality drifted")),
+            "LockPersonality=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_restrict_suidsgid_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("RestrictSUIDSGID".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("RestrictSUIDSGID drifted")),
+            "RestrictSUIDSGID=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_restrict_realtime_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("RestrictRealtime".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("RestrictRealtime drifted")),
+            "RestrictRealtime=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_syscall_architectures_drift_to_compat() {
+        // SystemCallArchitectures=native blocks 32-bit syscalls on
+        // a 64-bit kernel, closing a class of mitigation-bypass paths.
+        let mut map = reviewed_property_map();
+        map.insert(
+            "SystemCallArchitectures".to_string(),
+            "native x86".to_string(),
+        );
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("SystemCallArchitectures drifted")),
+            "SystemCallArchitectures with compat arch must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_protect_system_drift_to_full() {
+        // ProtectSystem=strict (the reviewed value) is stricter than
+        // =full. Drift to =full means /etc/ becomes writable inside
+        // the service's mount namespace, which the reviewed posture
+        // explicitly forbids.
+        let mut map = reviewed_property_map();
+        map.insert("ProtectSystem".to_string(), "full".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons.iter().any(|r| r.contains("ProtectSystem drifted")),
+            "ProtectSystem=full must surface drift when =strict is reviewed: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("\"strict\"")),
+            "drift must cite expected value 'strict': {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_protect_control_groups_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("ProtectControlGroups".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("ProtectControlGroups drifted")),
+            "ProtectControlGroups=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_no_new_privileges_drift_to_no() {
+        let mut map = reviewed_property_map();
+        map.insert("NoNewPrivileges".to_string(), "no".to_string());
+        let reasons = evaluate_linux_service_hardening(&map);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("NoNewPrivileges drifted")),
+            "NoNewPrivileges=no must surface drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_reviewed_directives_cover_complete_hardening_envelope() {
+        // Snapshot test: pins exactly which keys the reviewed
+        // hardening table currently inspects, so a future commit that
+        // drops a directive forces a corresponding test update.
+        let keys: Vec<&str> = REVIEWED_HARDENING_DIRECTIVES
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        let expected = [
+            "User",
+            "Group",
+            "NoNewPrivileges",
+            "PrivateTmp",
+            "PrivateDevices",
+            "ProtectSystem",
+            "ProtectHome",
+            "ProtectControlGroups",
+            "ProtectKernelTunables",
+            "ProtectKernelModules",
+            "ProtectKernelLogs",
+            "MemoryDenyWriteExecute",
+            "LockPersonality",
+            "RestrictSUIDSGID",
+            "RestrictRealtime",
+            "SystemCallArchitectures",
+            "CapabilityBoundingSet",
+            "AmbientCapabilities",
+            "UMask",
+        ];
+        assert_eq!(
+            keys, expected,
+            "REVIEWED_HARDENING_DIRECTIVES changed shape; update this snapshot test in the same commit"
+        );
+    }
 }
