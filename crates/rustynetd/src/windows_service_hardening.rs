@@ -567,6 +567,150 @@ mod tests {
     }
 
     #[test]
+    fn evaluator_rejects_binary_acl_granting_everyone_principal_wd() {
+        // WD = SDDL alias for "Everyone" — never permitted on the service
+        // binary; would expose `rustynetd.exe` to any local user.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.binary_path_acl_sddl =
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_string();
+        let reasons = evaluate_windows_service_hardening(&snapshot)
+            .expect_err("WD principal in binary ACL must fail");
+        assert!(
+            reasons.iter().any(|r| r.contains("(WD)")),
+            "expected the rejection to name the WD principal: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_binary_acl_granting_authenticated_users_principal_au() {
+        // AU = SDDL alias for "Authenticated Users" — broader than the
+        // reviewed SY+BA principal set on the service binary.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.binary_path_acl_sddl =
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)".to_string();
+        let reasons = evaluate_windows_service_hardening(&snapshot)
+            .expect_err("AU principal in binary ACL must fail");
+        assert!(
+            reasons.iter().any(|r| r.contains("(AU)")),
+            "expected the rejection to name the AU principal: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_binary_acl_granting_builtin_users_principal_bu() {
+        // BU = SDDL alias for "Builtin\\Users" — broader than the reviewed
+        // SY+BA principal set on the service binary.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.binary_path_acl_sddl =
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_string();
+        let reasons = evaluate_windows_service_hardening(&snapshot)
+            .expect_err("BU principal in binary ACL must fail");
+        assert!(
+            reasons.iter().any(|r| r.contains("(BU)")),
+            "expected the rejection to name the BU principal: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_binary_acl_missing_localsystem_principal_sy() {
+        // The reviewed profile requires LocalSystem (SY) access so the SCM
+        // can launch the daemon under the service SID. An ACL that grants
+        // only Builtin Administrators is rejected with a precise reason.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.binary_path_acl_sddl = "O:BAG:BAD:P(A;;FA;;;BA)".to_string();
+        let reasons = evaluate_windows_service_hardening(&snapshot)
+            .expect_err("binary ACL missing SY principal must fail");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("must grant LocalSystem access")),
+            "expected the rejection to require LocalSystem (SY): {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_binary_acl_missing_builtin_administrators_principal_ba() {
+        // The reviewed profile requires Builtin Administrators (BA) access
+        // so operators can audit and update the binary under
+        // C:\Program Files\RustyNet during normal break-glass procedures.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.binary_path_acl_sddl = "O:BAG:BAD:P(A;;FA;;;SY)".to_string();
+        let reasons = evaluate_windows_service_hardening(&snapshot)
+            .expect_err("binary ACL missing BA principal must fail");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("must grant Builtin Administrators access")),
+            "expected the rejection to require Builtin Administrators (BA): {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_binary_acl_with_unreviewed_owner() {
+        // Owner must be LocalSystem (SY), Builtin Administrators (BA), or
+        // a service SID (S-1-5-80-*). Anything else (e.g. a regular user
+        // SID or Everyone) is rejected.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.binary_path_acl_sddl =
+            "O:S-1-5-21-1234567890-1234567890-1234567890-1001G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                .to_string();
+        let reasons =
+            evaluate_windows_service_hardening(&snapshot).expect_err("unreviewed owner must fail");
+        assert!(
+            reasons.iter().any(|r| r.contains(
+                "ACL owner must be LocalSystem, Builtin Administrators, or a service SID"
+            )),
+            "expected the rejection to require a reviewed owner: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_accepts_binary_acl_with_service_sid_owner() {
+        // S-1-5-80-* owner is acceptable: this is the service SID for the
+        // RustyNet virtual account, which appears when the service was
+        // configured with SidType=Restricted or SidType=Unrestricted and
+        // the lab-image install pinned the owner to that SID.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.binary_path_acl_sddl =
+            "O:S-1-5-80-1234567890-1234567890G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string();
+        evaluate_windows_service_hardening(&snapshot).expect("service-SID owner must be accepted");
+    }
+
+    #[test]
+    fn evaluator_rejects_interactive_localsystem_combination_specifically() {
+        // The "interactive + LocalSystem" combination is the historical
+        // Windows footgun (interactive SYSTEM session). The evaluator
+        // already rejects interactive_process=true regardless of the
+        // start_name, but this test pins the specific combination so a
+        // future refactor cannot accidentally drop the
+        // interactive_process check.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interactive_process = true;
+        assert_eq!(snapshot.start_name, "LocalSystem");
+        let reasons = evaluate_windows_service_hardening(&snapshot)
+            .expect_err("interactive + LocalSystem must fail closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("SERVICE_INTERACTIVE_PROCESS")),
+            "expected the rejection to name SERVICE_INTERACTIVE_PROCESS: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_accepts_protected_dacl_with_no_inheritance_flag_p() {
+        // The protected-DACL invariant (D:P) is enforced upstream by
+        // evaluate_windows_protected_dacl_sddl. This test pins that the
+        // reviewed_snapshot uses D:P (no inheritance from parent ACL).
+        let snapshot = reviewed_snapshot();
+        assert!(
+            snapshot.binary_path_acl_sddl.contains("D:P"),
+            "reviewed binary ACL must use a protected DACL (D:P)"
+        );
+        evaluate_windows_service_hardening(&snapshot).expect("D:P protected DACL must be accepted");
+    }
+
+    #[test]
     fn evaluator_rejects_empty_binary_acl() {
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_path_acl_sddl = String::new();
