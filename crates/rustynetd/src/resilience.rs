@@ -391,6 +391,168 @@ mod tests {
         let _ = std::fs::remove_file(lock_path);
     }
 
+    // ----- fail-closed schema-drift coverage -----
+    //
+    // The session-snapshot parser is the trust-adjacent path the Linux
+    // mesh-status verifier and Windows verifier both read through. Its
+    // fail-closed contract is:
+    //   - unknown line             -> ResilienceError::InvalidFormat
+    //   - malformed numeric field  -> ResilienceError::InvalidFormat
+    //   - missing required field   -> ResilienceError::InvalidFormat
+    //   - missing digest line      -> ResilienceError::InvalidFormat
+    //   - digest mismatch          -> ResilienceError::IntegrityMismatch
+    //   - oversize input (>128KiB) -> ResilienceError::InvalidFormat
+    //
+    // The tests below pin every leg of that contract so a future refactor
+    // cannot silently relax fail-closed behaviour.
+
+    fn snapshot_test_path(suffix: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rustynet-session-snapshot-{}-{}-{}.state",
+            std::process::id(),
+            unique,
+            suffix
+        ))
+    }
+
+    #[test]
+    fn load_rejects_unknown_top_level_line() {
+        let path = snapshot_test_path("unknown-line");
+        std::fs::write(
+            &path,
+            "timestamp_unix=1\npeer_ids=\nselected_exit_node=none\nlan_access_enabled=true\nfuture_field=value\ndigest=ignored\n",
+        )
+        .unwrap();
+        let err = load_session_snapshot(&path).expect_err("unknown line must fail closed");
+        assert_eq!(err, ResilienceError::InvalidFormat);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_missing_digest_line() {
+        let path = snapshot_test_path("missing-digest");
+        std::fs::write(
+            &path,
+            "timestamp_unix=1\npeer_ids=\nselected_exit_node=none\nlan_access_enabled=true\n",
+        )
+        .unwrap();
+        let err = load_session_snapshot(&path).expect_err("missing digest must fail closed");
+        assert_eq!(err, ResilienceError::InvalidFormat);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_missing_required_field() {
+        // Missing timestamp_unix line. Digest will be present so we
+        // exercise the InvalidFormat path on field-completeness, not on
+        // digest absence.
+        let path = snapshot_test_path("missing-timestamp");
+        let body = "peer_ids=\nselected_exit_node=none\nlan_access_enabled=true\n";
+        let digest = super::sha256_hex(body.as_bytes());
+        std::fs::write(&path, format!("{body}digest={digest}\n")).unwrap();
+        let err =
+            load_session_snapshot(&path).expect_err("missing timestamp_unix must fail closed");
+        assert_eq!(err, ResilienceError::InvalidFormat);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_malformed_timestamp_unix() {
+        let path = snapshot_test_path("bad-timestamp");
+        let body = "timestamp_unix=not_a_number\npeer_ids=\nselected_exit_node=none\nlan_access_enabled=true\n";
+        let digest = super::sha256_hex(body.as_bytes());
+        std::fs::write(&path, format!("{body}digest={digest}\n")).unwrap();
+        // Parse error sets timestamp = None, then ok_or yields InvalidFormat.
+        let err = load_session_snapshot(&path).expect_err("non-numeric timestamp must fail closed");
+        assert_eq!(err, ResilienceError::InvalidFormat);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_malformed_lan_access_enabled() {
+        let path = snapshot_test_path("bad-lan-access");
+        std::fs::write(
+            &path,
+            "timestamp_unix=1\npeer_ids=\nselected_exit_node=none\nlan_access_enabled=maybe\ndigest=ignored\n",
+        )
+        .unwrap();
+        let err =
+            load_session_snapshot(&path).expect_err("non-bool lan_access_enabled must fail closed");
+        assert_eq!(err, ResilienceError::InvalidFormat);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_oversize_payload() {
+        let path = snapshot_test_path("oversize");
+        // 129 KiB of dummy content; the parser short-circuits before
+        // looking at the shape.
+        let body = "x".repeat(129 * 1024);
+        std::fs::write(&path, body).unwrap();
+        let err = load_session_snapshot(&path).expect_err("oversize must fail closed");
+        assert_eq!(err, ResilienceError::InvalidFormat);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_accepts_empty_peer_ids_list() {
+        // Empty peer_ids is a legitimate state (e.g. a node that hasn't
+        // received its first traversal bundle yet) and must NOT fail.
+        let snapshot = SessionStateSnapshot {
+            timestamp_unix: 100,
+            peer_ids: Vec::new(),
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let path = snapshot_test_path("empty-peers");
+        persist_session_snapshot(&snapshot, &path).expect("persist must succeed");
+        let restored = load_session_snapshot(&path).expect("load must succeed");
+        assert_eq!(restored.peer_ids, Vec::<String>::new());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_accepts_none_selected_exit_node() {
+        // selected_exit_node=none must round-trip to Option::None, not to
+        // Some("none"). This protects against the regression where the
+        // sentinel string is accidentally treated as a literal node id.
+        let snapshot = SessionStateSnapshot {
+            timestamp_unix: 100,
+            peer_ids: vec!["peer-a".to_string()],
+            selected_exit_node: None,
+            lan_access_enabled: true,
+        };
+        let path = snapshot_test_path("none-exit");
+        persist_session_snapshot(&snapshot, &path).expect("persist must succeed");
+        let restored = load_session_snapshot(&path).expect("load must succeed");
+        assert!(restored.selected_exit_node.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_missing_state_file_with_io_error() {
+        let path = snapshot_test_path("missing-file");
+        // Make sure the path is genuinely absent.
+        let _ = std::fs::remove_file(&path);
+        let err = load_session_snapshot(&path).expect_err("missing file must fail closed");
+        assert_eq!(err, ResilienceError::Io);
+    }
+
+    #[test]
+    fn load_rejects_empty_state_file() {
+        let path = snapshot_test_path("empty-file");
+        std::fs::write(&path, b"").unwrap();
+        let err = load_session_snapshot(&path).expect_err("empty state file must fail closed");
+        // Empty content has no required fields and no digest line, so the
+        // parser short-circuits at the digest absence check.
+        assert_eq!(err, ResilienceError::InvalidFormat);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn persist_waits_for_brief_lock_contention() {
         let unique = format!(
