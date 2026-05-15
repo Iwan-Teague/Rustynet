@@ -76,11 +76,26 @@ inline. Cross-reference with:
 
 ### L3. `linux_service_hardening.rs` systemd sandbox-flag pinning
 
-* `[ ]` Extend the systemd-unit drift signature to assert pinned values
-  for `MemoryDenyWriteExecute=yes`, `RestrictNamespaces=`,
-  `SystemCallFilter=`, `CapabilityBoundingSet=`, `NoNewPrivileges=yes`.
-* Acceptance: new unit tests cover present + drifted + missing cases;
-  fixture covers a representative Debian 12 service file.
+* `[x]` Audit-only slice landed in commit 818f494. 18 new per-directive
+  drift tests pin `MemoryDenyWriteExecute=yes`,
+  `CapabilityBoundingSet=""`, `AmbientCapabilities=""`, `UMask=0077`,
+  `User=rustynetd`, `Group=rustynetd`, `ProtectHome=yes`,
+  `ProtectKernelTunables=yes`, `ProtectKernelModules=yes`,
+  `PrivateTmp=yes`, `PrivateDevices=yes`, `LockPersonality=yes`,
+  `RestrictSUIDSGID=yes`, `RestrictRealtime=yes`,
+  `SystemCallArchitectures=native`, `ProtectSystem=strict`,
+  `ProtectControlGroups=yes`, `NoNewPrivileges=yes`. Each drift case
+  flips the directive to a representative weak value and asserts the
+  evaluator marks the unit drifted. Snapshot test
+  `evaluator_reviewed_directives_cover_complete_hardening_envelope`
+  pins the exact 19-key shape of `REVIEWED_HARDENING_DIRECTIVES` so
+  silent removal of a reviewed directive trips a named failure.
+* Note: production `scripts/systemd/rustynetd.service` does NOT
+  currently set `MemoryDenyWriteExecute=` — the evaluator already
+  flags this, but the orchestrator standard flow does not invoke
+  `linux-service-hardening-check`, so the lab pipeline does not catch
+  the drift today. Unit-file alignment + check wiring tracked as a
+  follow-up slice rather than rolled into the audit-only commit.
 
 ### L4. `linux_dns_failclosed.rs` race + edge cases
 
