@@ -146,9 +146,12 @@ inline. Cross-reference with:
     9 unit tests cover the parser including the
     `windows-runtime-backend-explicitly-unsupported` blocked-status
     path. (Commit 5b27a53.)
-  * `[ ]` Install helper: success-path shape parity audit + typed view
-    (next slice; shape already consistent at schema_version=1, just
-    needs typed view + tests).
+  * `[x]` Install helper: shape already consistent at
+    schema_version=1 on both branches; this slice adds typed
+    `WindowsInstallReportView` parsing both branches and rejecting
+    shape drift (wrong schema_version, blocked status which Install
+    never emits, fail without reason, missing required field, wrong
+    field type). 9 unit tests cover the parser. (Commit 9d12735.)
   * `[ ]` Bootstrap helper per-phase shape audit (multiple JSON
     shapes; largest helper surface).
 
