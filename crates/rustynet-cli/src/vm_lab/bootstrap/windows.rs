@@ -956,6 +956,103 @@ impl WindowsPrepareTransportReportView {
     }
 }
 
+/// Typed view of the JSON report written by
+/// `scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1` for the
+/// `build-release` phase. The helper writes `schema_version=2` on
+/// both branches via `Write-BuildReleaseReport`. Success and failure
+/// share an identical field set — only `status` and `reason` (and
+/// the `exit_code` + `stderr_tail` informational fields) differ.
+///
+/// The `toolchain_scope` field is critical for the lab-image
+/// short-circuit invariant documented at lines 195-218 of the helper:
+/// it classifies the resolved cargo/rustc path as `machine` (lab-image
+/// install), `user` (per-user toolchain), or `unknown`/empty. Operator
+/// confirmation that the SYSTEM short-circuit actually ran (not the
+/// fallback interactive scheduled task) hinges on this field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WindowsBuildReleaseReportView {
+    pub schema_version: u32,
+    pub phase: String,
+    pub captured_at_utc: String,
+    pub status: String,
+    pub reason: String,
+    pub rustynet_root: String,
+    pub report_root: String,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub exit_code_path: String,
+    pub toolchain_path: String,
+    pub toolchain_scope: String,
+    pub manifest_path: String,
+    pub complete_marker_path: String,
+    pub exit_code: i32,
+    #[serde(default)]
+    pub stderr_tail: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl WindowsBuildReleaseReportView {
+    /// Parse a Bootstrap-RustyNetWindows build-release manifest body.
+    /// Fails closed on shape drift:
+    /// - invalid JSON
+    /// - missing/wrong type on any required field
+    /// - schema_version other than 2 (helper contract today)
+    /// - phase != "build-release"
+    /// - status not in {pass, fail}
+    /// - status=fail with empty/whitespace reason
+    /// - toolchain_scope not in {"", machine, user, unknown}
+    /// - exit_code=0 with status=fail (the helper invariant: a zero
+    ///   exit cannot coexist with a failure)
+    #[allow(dead_code)]
+    pub(crate) fn parse(body: &str) -> Result<Self, String> {
+        let view: WindowsBuildReleaseReportView = serde_json::from_str(body)
+            .map_err(|err| format!("invalid windows build-release report shape: {err}"))?;
+        if view.schema_version != 2 {
+            return Err(format!(
+                "windows build-release report schema_version must be 2; got {}",
+                view.schema_version
+            ));
+        }
+        if view.phase != "build-release" {
+            return Err(format!(
+                "windows build-release report phase must be 'build-release'; got {:?}",
+                view.phase
+            ));
+        }
+        match view.status.as_str() {
+            "pass" | "fail" => {}
+            other => {
+                return Err(format!(
+                    "windows build-release report status must be 'pass' or 'fail'; got {other:?}"
+                ));
+            }
+        }
+        if view.status == "fail" && view.reason.trim().is_empty() {
+            return Err(
+                "windows build-release report status=fail must carry a non-empty reason"
+                    .to_string(),
+            );
+        }
+        match view.toolchain_scope.as_str() {
+            "" | "machine" | "user" | "unknown" => {}
+            other => {
+                return Err(format!(
+                    "windows build-release report toolchain_scope must be one of '', 'machine', 'user', 'unknown'; got {other:?}"
+                ));
+            }
+        }
+        if view.status == "fail" && view.exit_code == 0 {
+            return Err(
+                "windows build-release report status=fail with exit_code=0 is internally inconsistent"
+                    .to_string(),
+            );
+        }
+        Ok(view)
+    }
+}
+
 #[cfg(test)]
 fn build_windows_diagnostics_validation_script(
     remote_path: &str,
@@ -2552,6 +2649,188 @@ mod tests {
         }"#;
         let a = WindowsPrepareTransportReportView::parse(body).unwrap();
         let b = WindowsPrepareTransportReportView::parse(body).unwrap();
+        assert_eq!(a, b);
+    }
+
+    // ----- WindowsBuildReleaseReportView typed parser tests -----
+
+    fn build_release_success_payload() -> &'static str {
+        r#"{
+          "schema_version": 2,
+          "phase": "build-release",
+          "captured_at_utc": "2026-05-15T14:00:00.000Z",
+          "status": "pass",
+          "reason": "ok",
+          "rustynet_root": "C:\\Rustynet",
+          "report_root": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release",
+          "stdout_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\stdout.txt",
+          "stderr_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\stderr.txt",
+          "exit_code_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\exit_code.txt",
+          "toolchain_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\toolchain.txt",
+          "toolchain_scope": "machine",
+          "manifest_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\manifest.json",
+          "complete_marker_path": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release\\complete.marker",
+          "exit_code": 0,
+          "stderr_tail": "",
+          "notes": ["guest-authored-build-report"]
+        }"#
+    }
+
+    #[test]
+    fn windows_build_release_report_parses_success_payload() {
+        let view = WindowsBuildReleaseReportView::parse(build_release_success_payload())
+            .expect("must parse");
+        assert_eq!(view.schema_version, 2);
+        assert_eq!(view.phase, "build-release");
+        assert_eq!(view.status, "pass");
+        assert_eq!(view.toolchain_scope, "machine");
+        assert_eq!(view.exit_code, 0);
+    }
+
+    #[test]
+    fn windows_build_release_report_parses_failure_payload_with_stderr_tail() {
+        let body = r#"{
+          "schema_version": 2,
+          "phase": "build-release",
+          "captured_at_utc": "2026-05-15T14:00:00.000Z",
+          "status": "fail",
+          "reason": "cargo build exited with 101",
+          "rustynet_root": "C:\\Rustynet",
+          "report_root": "C:\\ProgramData\\RustyNet\\vm-lab\\build-release",
+          "stdout_path": "C:\\out\\stdout.txt",
+          "stderr_path": "C:\\out\\stderr.txt",
+          "exit_code_path": "C:\\out\\exit_code.txt",
+          "toolchain_path": "C:\\out\\toolchain.txt",
+          "toolchain_scope": "unknown",
+          "manifest_path": "C:\\out\\manifest.json",
+          "complete_marker_path": "C:\\out\\complete.marker",
+          "exit_code": 101,
+          "stderr_tail": "error: linking with `link.exe` failed",
+          "notes": ["guest-authored-build-report"]
+        }"#;
+        let view = WindowsBuildReleaseReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "fail");
+        assert_eq!(view.exit_code, 101);
+        assert!(view.stderr_tail.contains("link.exe"));
+    }
+
+    #[test]
+    fn windows_build_release_report_accepts_all_toolchain_scopes() {
+        for scope in ["", "machine", "user", "unknown"] {
+            let body = build_release_success_payload().replace(
+                "\"toolchain_scope\": \"machine\"",
+                &format!("\"toolchain_scope\": \"{scope}\""),
+            );
+            WindowsBuildReleaseReportView::parse(body.as_str())
+                .unwrap_or_else(|err| panic!("scope {scope:?} should parse: {err}"));
+        }
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_unknown_toolchain_scope() {
+        let body = build_release_success_payload().replace(
+            "\"toolchain_scope\": \"machine\"",
+            "\"toolchain_scope\": \"system-wide\"",
+        );
+        let err = WindowsBuildReleaseReportView::parse(body.as_str())
+            .expect_err("unknown toolchain_scope must fail closed");
+        assert!(err.contains("toolchain_scope"));
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_wrong_schema_version() {
+        let body = build_release_success_payload()
+            .replace("\"schema_version\": 2", "\"schema_version\": 1");
+        let err = WindowsBuildReleaseReportView::parse(body.as_str())
+            .expect_err("schema_version=1 must fail closed");
+        assert!(err.contains("schema_version must be 2"));
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_wrong_phase_value() {
+        let body = build_release_success_payload().replace(
+            "\"phase\": \"build-release\"",
+            "\"phase\": \"install-release\"",
+        );
+        let err = WindowsBuildReleaseReportView::parse(body.as_str())
+            .expect_err("phase mismatch must fail closed");
+        assert!(err.contains("phase must be 'build-release'"));
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_unknown_status_value() {
+        let body =
+            build_release_success_payload().replace("\"status\": \"pass\"", "\"status\": \"warn\"");
+        let err = WindowsBuildReleaseReportView::parse(body.as_str())
+            .expect_err("unknown status must fail closed");
+        assert!(err.contains("'pass' or 'fail'"));
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_fail_with_empty_reason() {
+        let body = build_release_success_payload()
+            .replace("\"status\": \"pass\"", "\"status\": \"fail\"")
+            .replace("\"reason\": \"ok\"", "\"reason\": \"   \"")
+            .replace("\"exit_code\": 0", "\"exit_code\": 1");
+        let err = WindowsBuildReleaseReportView::parse(body.as_str())
+            .expect_err("status=fail with empty reason must fail closed");
+        assert!(err.contains("non-empty reason"));
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_fail_with_zero_exit_code() {
+        // Internal invariant: a fail status with exit_code=0 indicates
+        // the helper's status decision is internally inconsistent with
+        // what cargo actually returned.
+        let body = build_release_success_payload()
+            .replace("\"status\": \"pass\"", "\"status\": \"fail\"")
+            .replace(
+                "\"reason\": \"ok\"",
+                "\"reason\": \"unexpected fail with zero exit\"",
+            );
+        let err = WindowsBuildReleaseReportView::parse(body.as_str())
+            .expect_err("status=fail with exit_code=0 must fail closed");
+        assert!(err.contains("internally inconsistent"));
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_missing_required_field() {
+        // missing complete_marker_path
+        let body = r#"{
+          "schema_version": 2,
+          "phase": "build-release",
+          "captured_at_utc": "2026-05-15T14:00:00.000Z",
+          "status": "pass",
+          "reason": "ok",
+          "rustynet_root": "C:\\Rustynet",
+          "report_root": "C:\\out",
+          "stdout_path": "C:\\out\\stdout.txt",
+          "stderr_path": "C:\\out\\stderr.txt",
+          "exit_code_path": "C:\\out\\exit_code.txt",
+          "toolchain_path": "C:\\out\\toolchain.txt",
+          "toolchain_scope": "machine",
+          "manifest_path": "C:\\out\\manifest.json",
+          "exit_code": 0
+        }"#;
+        let err = WindowsBuildReleaseReportView::parse(body)
+            .expect_err("missing complete_marker_path must fail closed");
+        assert!(err.contains("invalid windows build-release report shape"));
+    }
+
+    #[test]
+    fn windows_build_release_report_rejects_wrong_field_type() {
+        // exit_code as string instead of int
+        let body =
+            build_release_success_payload().replace("\"exit_code\": 0", "\"exit_code\": \"zero\"");
+        let err = WindowsBuildReleaseReportView::parse(body.as_str())
+            .expect_err("exit_code wrong type must fail closed");
+        assert!(err.contains("invalid windows build-release report shape"));
+    }
+
+    #[test]
+    fn windows_build_release_report_parse_is_idempotent() {
+        let a = WindowsBuildReleaseReportView::parse(build_release_success_payload()).unwrap();
+        let b = WindowsBuildReleaseReportView::parse(build_release_success_payload()).unwrap();
         assert_eq!(a, b);
     }
 
