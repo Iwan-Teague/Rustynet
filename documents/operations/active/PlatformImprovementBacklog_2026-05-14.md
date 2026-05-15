@@ -122,17 +122,26 @@ inline. Cross-reference with:
 
 ### W1. PowerShell helper machine-readable JSON outputs
 
-* `[ ]` `Bootstrap-RustyNetWindows.ps1`, `Install-RustyNetWindowsService.ps1`,
+* `[~]` In progress. (Slice 1 = commit 09df8f4 — Collect helper.) Goal:
+  `Bootstrap-RustyNetWindows.ps1`, `Install-RustyNetWindowsService.ps1`,
   `Verify-RustyNetWindowsBootstrap.ps1`,
   `Collect-RustyNetWindowsDiagnostics.ps1` each write a fail-closed JSON
-  result through `-ResultPath` on **both** success and top-level failure.
-  Eliminates "did the helper actually finish" ambiguity in VM-lab
-  orchestration.
+  result on **both** success and top-level failure with shape parity so
+  consumers deserialize either branch through a single typed view.
 * Source: Phase 1 of
   [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md).
-* Acceptance: each helper writes JSON in both code paths; the Rust-side
-  consumer parses it through a typed envelope; existing CLI commands
-  surface a precise error when the JSON is missing or malformed.
+* Slice progress:
+  * `[x]` Collect helper: success manifest now emits `status='pass'` +
+    `reason=''` alongside the existing fields; failure manifest
+    unchanged. Typed `WindowsDiagnosticsManifestView` in
+    `crates/rustynet-cli/src/vm_lab/bootstrap/windows.rs` parses both
+    branches and rejects shape drift (unknown status value,
+    `status='fail'` with empty reason, missing required field, wrong
+    field type). 8 unit tests cover the parser. (Commit 09df8f4.)
+  * `[ ]` Bootstrap helper per-phase shape audit (multiple JSON
+    shapes; largest helper surface).
+  * `[ ]` Install / Verify helpers: success-path shape parity audit
+    + typed view.
 
 ### W2. `windows_service_hardening.rs` SDDL + SidType drift hardening
 
