@@ -176,14 +176,25 @@ inline. Cross-reference with:
 
 ### W2. `windows_service_hardening.rs` SDDL + SidType drift hardening
 
-* `[ ]` Extend the SCM-side drift signature to pin:
-  - `ServiceSidType=restricted` (or the strictest tier the platform
-    permits — re-check B.8.1 status in SecurityHardeningAudit)
-  - SDDL deny-list for the dangerous principals already named in the
-    constant set (WD, AU, BU)
-  - non-interactive `LocalSystem` (today usually so, but assert)
-* Acceptance: existing tests pass; new tests cover drifted SDDL, missing
-  SidType, interactive flag set.
+* `[x]` (Commit 88325dc.) On audit, the existing evaluator already
+  enforces every check the W2 acceptance criterion called for:
+  REVIEWED_SERVICE_SID_TYPES rejects `none`; the
+  FORBIDDEN_WELL_KNOWN_SDDL_PRINCIPALS deny-list in
+  `crates/rustynetd/src/windows_paths.rs` covers WD/AU/BU;
+  `interactive_process=true` is rejected regardless of `start_name`;
+  `failure_action_count=0` is rejected; the binary ACL is delegated to
+  `evaluate_windows_runtime_acl_sddl` which enforces `D:P` + SY + BA +
+  reviewed-owner-only. The gap was per-principal, per-invariant test
+  coverage in this module's own test suite. 9 new tests now pin: WD /
+  AU / BU principals each rejected with the principal named in the
+  reason; missing SY / BA principals rejected with the precise required
+  reason; unreviewed owner rejected; S-1-5-80-* service-SID owner
+  accepted; `interactive_process=true` + `start_name=LocalSystem`
+  rejected (pins the historical SYSTEM-interactive-session footgun);
+  D:P protected DACL is pinned as the contract. B.8.1
+  SidType=restricted feasibility was closed as "not feasible" in
+  SecurityHardeningAudit on 2026-05-05, so the evaluator continues to
+  accept either `unrestricted` or `restricted`.
 
 ### W3. `windows_dns_failclosed.rs` IPv6 NRPT + RA suppression
 
