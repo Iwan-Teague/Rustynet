@@ -812,6 +812,87 @@ impl WindowsVerifyReportView {
     }
 }
 
+/// Typed view of the report written by
+/// `scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1`. The
+/// helper emits `schema_version=1` on both the success branch (full
+/// install report at the tail of the script) and the top-level-failure
+/// trap (compact failure report from `New-FailClosedInstallReport`).
+///
+/// Both branches share the documented required fields below.
+/// Success-only fields (cli_optional, start_attempted, start_error,
+/// daemon_present, cli_present, config_present, log_root_present,
+/// trust_root_present, secrets_root_present, service_sid_configured,
+/// runtime_acl_applied, service_state, service_start_mode,
+/// service_exit_code, service_process_id, service_image_path*,
+/// runtime_flags_present, wireguard_driver*, dns_failclosed_posture)
+/// are accepted via `#[serde(default)]` so a typed consumer can
+/// deserialize either branch through this view. Unlike the Verify
+/// helper, Install never emits the `blocked` status — the runtime
+/// install path is always either `pass` or `fail`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WindowsInstallReportView {
+    pub schema_version: u32,
+    pub captured_at_utc: String,
+    pub platform: String,
+    pub rustynet_root: String,
+    pub install_root: String,
+    pub state_root: String,
+    pub service_name: String,
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub backend_label: String,
+    #[serde(default)]
+    pub runtime_supported: bool,
+    #[serde(default)]
+    pub service_verified: bool,
+    #[serde(default)]
+    pub service_present: bool,
+    #[serde(default)]
+    pub service_status: String,
+    #[serde(default)]
+    pub failure_step: String,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl WindowsInstallReportView {
+    /// Parse an Install-RustyNetWindowsService report body. Fails closed
+    /// when shape drift is detected:
+    /// - invalid JSON
+    /// - missing/wrong type on any required field
+    /// - schema_version other than 1 (the contract the helper emits today)
+    /// - status not in {pass, fail}
+    /// - status=fail with empty reason
+    #[allow(dead_code)]
+    pub(crate) fn parse(body: &str) -> Result<Self, String> {
+        let view: WindowsInstallReportView = serde_json::from_str(body)
+            .map_err(|err| format!("invalid windows install report shape: {err}"))?;
+        if view.schema_version != 1 {
+            return Err(format!(
+                "windows install report schema_version must be 1; got {}",
+                view.schema_version
+            ));
+        }
+        match view.status.as_str() {
+            "pass" | "fail" => {}
+            other => {
+                return Err(format!(
+                    "windows install report status must be 'pass' or 'fail'; got {other:?}"
+                ));
+            }
+        }
+        if view.status == "fail" && view.reason.trim().is_empty() {
+            return Err(
+                "windows install report status=fail must carry a non-empty reason".to_string(),
+            );
+        }
+        Ok(view)
+    }
+}
+
 #[cfg(test)]
 fn build_windows_diagnostics_validation_script(
     remote_path: &str,
@@ -2031,6 +2112,199 @@ mod tests {
         }"#;
         let view = WindowsVerifyReportView::parse(body).expect("must parse");
         assert_eq!(view.status, "pass");
+    }
+
+    // ----- WindowsInstallReportView typed parser tests -----
+
+    #[test]
+    fn windows_install_report_parses_success_payload() {
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass",
+          "reason": "",
+          "backend_label": "windows-wireguard-nt",
+          "runtime_supported": false,
+          "service_verified": true,
+          "cli_optional": true,
+          "start_attempted": true,
+          "start_error": "",
+          "daemon_present": true,
+          "cli_present": true,
+          "config_present": true,
+          "service_present": true,
+          "service_status": "Running",
+          "service_state": "Running",
+          "service_start_mode": "Auto",
+          "service_exit_code": 0,
+          "service_process_id": 1234,
+          "service_image_path": "C:\\Program Files\\RustyNet\\rustynetd.exe --windows-service ...",
+          "notes": []
+        }"#;
+        let view = WindowsInstallReportView::parse(body).expect("must parse");
+        assert_eq!(view.schema_version, 1);
+        assert_eq!(view.status, "pass");
+        assert!(view.service_verified);
+        assert_eq!(view.service_status, "Running");
+    }
+
+    #[test]
+    fn windows_install_report_parses_failure_payload_from_trap() {
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "fail",
+          "reason": "install-helper-init-exception: invalid service name",
+          "backend_label": "",
+          "runtime_supported": false,
+          "service_verified": false,
+          "service_present": false,
+          "service_status": "missing",
+          "failure_step": "init",
+          "runtime_signals": null,
+          "notes": ["install-helper-trap"]
+        }"#;
+        let view = WindowsInstallReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "fail");
+        assert!(view.reason.contains("invalid service name"));
+        assert_eq!(view.notes, vec!["install-helper-trap".to_string()]);
+    }
+
+    #[test]
+    fn windows_install_report_rejects_wrong_schema_version() {
+        let body = r#"{
+          "schema_version": 2,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass"
+        }"#;
+        let err = WindowsInstallReportView::parse(body)
+            .expect_err("schema_version=2 must fail closed (helper emits 1)");
+        assert!(err.contains("schema_version must be 1"));
+    }
+
+    #[test]
+    fn windows_install_report_rejects_blocked_status_value() {
+        // Install never emits blocked — only pass or fail. Unlike Verify
+        // which has a backend-explicitly-unsupported case, Install treats
+        // any unsupported-runtime case as a regular failure.
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "blocked",
+          "reason": "anything"
+        }"#;
+        let err = WindowsInstallReportView::parse(body)
+            .expect_err("blocked status must fail closed for Install");
+        assert!(err.contains("'pass' or 'fail'"));
+    }
+
+    #[test]
+    fn windows_install_report_rejects_fail_without_reason() {
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "fail",
+          "reason": "   "
+        }"#;
+        let err = WindowsInstallReportView::parse(body)
+            .expect_err("status=fail with empty reason must fail closed");
+        assert!(err.contains("non-empty reason"));
+    }
+
+    #[test]
+    fn windows_install_report_rejects_missing_required_field() {
+        // missing install_root
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass"
+        }"#;
+        let err = WindowsInstallReportView::parse(body)
+            .expect_err("missing install_root must fail closed");
+        assert!(err.contains("invalid windows install report shape"));
+    }
+
+    #[test]
+    fn windows_install_report_rejects_wrong_field_type() {
+        // service_name as bool instead of string
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": true,
+          "status": "pass"
+        }"#;
+        let err = WindowsInstallReportView::parse(body)
+            .expect_err("service_name wrong type must fail closed");
+        assert!(err.contains("invalid windows install report shape"));
+    }
+
+    #[test]
+    fn windows_install_report_accepts_forward_compatible_extra_fields() {
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass",
+          "future_install_field": {"nested": [1, 2, 3]},
+          "wireguard_driver_probe": {"present": false},
+          "dns_failclosed_posture": {"status": "pass"}
+        }"#;
+        let view = WindowsInstallReportView::parse(body).expect("must parse");
+        assert_eq!(view.status, "pass");
+    }
+
+    #[test]
+    fn windows_install_report_parse_is_idempotent() {
+        let body = r#"{
+          "schema_version": 1,
+          "captured_at_utc": "2026-05-15T13:00:00.000Z",
+          "platform": "windows",
+          "rustynet_root": "C:\\Rustynet",
+          "install_root": "C:\\Program Files\\RustyNet",
+          "state_root": "C:\\ProgramData\\RustyNet",
+          "service_name": "RustyNet",
+          "status": "pass"
+        }"#;
+        let a = WindowsInstallReportView::parse(body).unwrap();
+        let b = WindowsInstallReportView::parse(body).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
