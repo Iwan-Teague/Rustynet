@@ -81,13 +81,17 @@ inline. Cross-reference with:
 
 ### L5. `linux_mesh_status.rs` typed-schema fail-closed parser
 
-* `[ ]` Phase A typed view for the mesh-state JSON: replace any remaining
-  `serde_json::Value` walks with a typed `LinuxMeshStatusReportView`
-  struct; reject malformed/replayed snapshots earlier.
-* Source: Phase A of
-  [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md).
-* Acceptance: typed view in place, parser-level error contains the path
-  and offending field; existing tests pass.
+* `[x]` (Commit d1433e1.) On audit, `linux_mesh_status.rs` was already
+  using a typed `LinuxMeshStatusReport` struct and the underlying
+  `resilience::load_session_snapshot` parser was already a strict
+  line-by-line state-file parser (no dynamic `serde_json::Value` walks
+  involved). What was missing was test coverage that pins the
+  fail-closed contract. 16 new schema-drift tests now cover unknown
+  lines, missing/invalid required fields, oversize payload, digest
+  mismatch, integrity-mismatch propagation through the collector,
+  state-path echo in the report, and drift-reason enumeration. The
+  regression contract is now explicit so a future refactor cannot
+  silently relax fail-closed behaviour.
 
 ### L6. `linux_key_custody.rs` passphrase-file pinning
 
