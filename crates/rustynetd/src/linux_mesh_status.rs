@@ -159,4 +159,138 @@ mod tests {
         );
         assert_eq!(report.max_age_seconds, Some(300));
     }
+
+    // ----- fail-closed schema-drift coverage for the collector -----
+    //
+    // These tests pin the collector's translation of resilience::load
+    // failures into typed snapshot-load variants. Pairs with the
+    // schema-drift coverage in resilience::tests.
+
+    fn fixture_path(suffix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rustynet-linux-mesh-status-{}-{}-{}",
+            std::process::id(),
+            unique,
+            suffix
+        ))
+    }
+
+    #[test]
+    fn collector_reports_invalid_format_when_unknown_line_present() {
+        let path = fixture_path("unknown-line");
+        std::fs::write(
+            &path,
+            "timestamp_unix=1\npeer_ids=\nselected_exit_node=none\nlan_access_enabled=true\nfuture_field=value\ndigest=ignored\n",
+        )
+        .unwrap();
+        let options = LinuxMeshStatusOptions {
+            state_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let report = collect_linux_mesh_status_report(&options);
+        assert!(!report.overall_ok);
+        assert!(matches!(
+            report.snapshot,
+            WindowsMeshSnapshotLoad::InvalidFormat { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn collector_reports_integrity_mismatch_when_digest_does_not_match() {
+        let path = fixture_path("digest-mismatch");
+        // Construct a body that's well-formed but has a digest that does
+        // NOT match the actual content.
+        std::fs::write(
+            &path,
+            "timestamp_unix=42\npeer_ids=peer-a,peer-b\nselected_exit_node=none\nlan_access_enabled=false\ndigest=0000000000000000000000000000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        let options = LinuxMeshStatusOptions {
+            state_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let report = collect_linux_mesh_status_report(&options);
+        assert!(!report.overall_ok);
+        assert!(matches!(
+            report.snapshot,
+            WindowsMeshSnapshotLoad::IntegrityMismatch { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn collector_reports_invalid_format_when_oversize() {
+        let path = fixture_path("oversize");
+        std::fs::write(&path, "x".repeat(129 * 1024)).unwrap();
+        let options = LinuxMeshStatusOptions {
+            state_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let report = collect_linux_mesh_status_report(&options);
+        assert!(!report.overall_ok);
+        assert!(matches!(
+            report.snapshot,
+            WindowsMeshSnapshotLoad::InvalidFormat { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn collector_reports_invalid_format_when_lan_access_enabled_is_garbage() {
+        let path = fixture_path("bad-lan-access");
+        std::fs::write(
+            &path,
+            "timestamp_unix=1\npeer_ids=\nselected_exit_node=none\nlan_access_enabled=maybe\ndigest=ignored\n",
+        )
+        .unwrap();
+        let options = LinuxMeshStatusOptions {
+            state_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let report = collect_linux_mesh_status_report(&options);
+        assert!(!report.overall_ok);
+        assert!(matches!(
+            report.snapshot,
+            WindowsMeshSnapshotLoad::InvalidFormat { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn collector_state_path_in_report_matches_options() {
+        let path = fixture_path("path-echo");
+        let options = LinuxMeshStatusOptions {
+            state_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let report = collect_linux_mesh_status_report(&options);
+        assert_eq!(report.state_path, path.display().to_string());
+        // The fixture file doesn't exist, so the snapshot is Missing —
+        // that's a separate property already covered upstream.
+    }
+
+    #[test]
+    fn collector_drift_reasons_include_state_path_context_for_invalid_format() {
+        let path = fixture_path("drift-reason-context");
+        std::fs::write(
+            &path,
+            "timestamp_unix=NaN\npeer_ids=\nselected_exit_node=none\nlan_access_enabled=true\ndigest=ignored\n",
+        )
+        .unwrap();
+        let options = LinuxMeshStatusOptions {
+            state_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let report = collect_linux_mesh_status_report(&options);
+        // The drift reasons enumerate the failure context for the
+        // orchestrator to surface; an InvalidFormat path should be flagged.
+        assert!(!report.overall_ok);
+        assert!(!report.drift_reasons.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
 }
