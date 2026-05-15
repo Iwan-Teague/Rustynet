@@ -99,10 +99,29 @@ inline. Cross-reference with:
 
 ### L4. `linux_dns_failclosed.rs` race + edge cases
 
-* `[ ]` Race-on-startup hardening: detect `systemd-resolved` listening
-  before the rustynet resolver claims its socket; reject NetworkManager
-  precedence overrides; add link-local resolver bypass scenario.
-* Acceptance: new unit tests with fixture snapshots for each race shape.
+* `[~]` Audit-only slice landed in commit d082221. 16 new tests pin the
+  loopback-only evaluator against off-loopback shapes the production
+  `/etc/resolv.conf` path can produce:
+  - `127.0.0.53` systemd-resolved stub accepted (loopback)
+  - long-form IPv6 loopback `0:0:0:0:0:0:0:1` accepted
+  - full `127.0.0.0/8` range accepted (pins `is_loopback` contract)
+  - `0.0.0.0` / `::` unspecified rejected
+  - IPv4 link-local `169.254.169.254` (cloud-metadata) rejected
+  - IPv6 link-local `fe80::1` (RA-installed resolver) rejected
+  - `::ffff:8.8.8.8` IPv4-mapped IPv6 rejected
+  - mixed loopback+external: exactly one drift naming the external
+  - zone-id-suffixed `fe80::1%eth0` surfaces as parse failure
+  - bracketed `[::1]` surfaces as parse failure
+  - parser tolerates leading whitespace before keyword
+  - parser ignores `options` / `sortlist` / `lookup` / `family` lines
+  - parser drops bare `nameserver` with no address
+  - inline comment attached to nameserver value caught as parse failure
+  - `schema_version` pinned at 1 (deliberate-bump guard)
+* `[ ]` Remaining scope (separate slice): systemd-resolved socket-race
+  detection + NetworkManager precedence override check. Both require
+  expanding the snapshot collector beyond `/etc/resolv.conf` (probe
+  listening socket; query `resolvectl status` / NM state) and a paired
+  update to the `LinuxDaemonProbe` adapter.
 
 ### L5. `linux_mesh_status.rs` typed-schema fail-closed parser
 
