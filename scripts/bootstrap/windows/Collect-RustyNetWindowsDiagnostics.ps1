@@ -23,6 +23,10 @@ trap {
             if (-not (Test-Path -LiteralPath $OutputRoot)) {
                 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
             }
+            # Shape parity with the success manifest below: same
+            # schema_version, same key names, same value types. Only
+            # status/reason and the empty files list differ. Machine
+            # consumers can deserialize this with one typed view.
             $failureManifest = [ordered]@{
                 schema_version = 2
                 captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
@@ -339,6 +343,15 @@ $sshAccessState = [ordered]@{
 }
 $sshAccessState | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $OutputRoot 'ssh_access_state.json')
 
+# The success manifest carries the same `status` field as the failure
+# manifest at line 33 (`status = 'fail'`), so machine-readable consumers
+# can branch on a single field — including operators who inspect the
+# helper output directly without going through the orchestrator-side
+# wrapper script. The orchestrator-side validator
+# (`build_windows_diagnostics_result_file_script` in
+# crates/rustynet-cli/src/vm_lab/bootstrap/windows.rs) wraps this output
+# with its own `status` field for the resultPath shape; the helper's
+# own manifest now carries the same taxonomy for direct inspection.
 $manifest = [ordered]@{
     schema_version = 2
     captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
@@ -353,6 +366,8 @@ $manifest = [ordered]@{
         'C:\ProgramData\ssh\ssh_host_ed25519_key'
     )
     files = (Get-ChildItem -LiteralPath $OutputRoot -File | Sort-Object Name | Select-Object -ExpandProperty Name)
+    status = 'pass'
+    reason = ''
 }
 $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 -LiteralPath (Join-Path $OutputRoot 'manifest.json')
 Write-Output $OutputRoot
