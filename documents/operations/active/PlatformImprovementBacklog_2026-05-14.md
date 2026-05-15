@@ -138,10 +138,19 @@ inline. Cross-reference with:
     branches and rejects shape drift (unknown status value,
     `status='fail'` with empty reason, missing required field, wrong
     field type). 8 unit tests cover the parser. (Commit 09df8f4.)
+  * `[x]` Verify helper: failure manifest schema_version bumped
+    1 → 3 for parity with the success report at the tail of the
+    script. Typed `WindowsVerifyReportView` parses both branches and
+    rejects shape drift (wrong schema_version, unknown status, fail/
+    blocked without reason, missing required field, wrong field type).
+    9 unit tests cover the parser including the
+    `windows-runtime-backend-explicitly-unsupported` blocked-status
+    path. (Commit 5b27a53.)
+  * `[ ]` Install helper: success-path shape parity audit + typed view
+    (next slice; shape already consistent at schema_version=1, just
+    needs typed view + tests).
   * `[ ]` Bootstrap helper per-phase shape audit (multiple JSON
     shapes; largest helper surface).
-  * `[ ]` Install / Verify helpers: success-path shape parity audit
-    + typed view.
 
 ### W2. `windows_service_hardening.rs` SDDL + SidType drift hardening
 
