@@ -53,16 +53,26 @@ inline. Cross-reference with:
   changes in operator-visible behaviour; net file count grows but no
   single file owns >40% of the prior surface.
 
-### L2. `linux_runtime_acls.rs` IPv6 + named-chain integrity hardening
+### L2. `linux_runtime_acls.rs` security-relevant drift coverage
 
-* `[ ]` Extend the runtime-ACL drift detector to assert:
-  - IPv6 parity for the v4 rules already covered (drop-all default-deny,
-    tunnel-only egress)
-  - named-chain integrity (every chain that should exist is present and
-    in the expected `rustynet-*` hook)
-  - socket-activation rule presence on systemd-managed deployments
-* Acceptance: new unit tests, snapshot-fixture coverage, no behaviour
-  change for currently-passing systems.
+* `[x]` (Commit a924229.) Scope adjustment: the original L2 entry
+  conflated nftables runtime-ACL drift (which lives in `phase10.rs` and
+  `privileged_helper.rs`) with the filesystem-ACL `linux_runtime_acls`
+  module (which verifies `/var/lib/rustynet` and `/etc/rustynet`
+  ownership / mode bits). This slice covers the filesystem-ACL surface;
+  nftables IPv6 parity + named-chain integrity is a separate slice that
+  requires touching the path controller's bring-up logic.
+* 9 new tests pin: setuid/setgid drift on the state root (privilege-
+  escalation hazard); world-writable state root (catastrophic local-
+  user read/write); state root owned by root instead of rustynetd
+  (daemon can't write StateDirectoryMode=0700); config root owned by
+  rustynetd instead of root (daemon must not own its own config
+  directory); 0o000 mode (would break daemon startup); first-fault
+  ordering (mode > uid > gid); and the AND-of-statuses
+  `overall_ok` invariant. (Commit a924229.)
+* nftables IPv6 parity + named-chain integrity work is now tracked
+  separately — promoting to its own backlog entry below or leaving
+  for `phase10.rs` future work.
 
 ### L3. `linux_service_hardening.rs` systemd sandbox-flag pinning
 
