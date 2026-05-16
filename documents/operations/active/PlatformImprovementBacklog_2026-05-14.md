@@ -254,12 +254,26 @@ inline. Cross-reference with:
 
 ### W3. `windows_dns_failclosed.rs` IPv6 NRPT + RA suppression
 
-* `[ ]` Extend the NRPT validator to require an IPv6 sibling rule for
-  every IPv4 NRPT entry that maps the rustynet zone; add on-link Router
-  Advertisement suppression check (no native IPv6 default route during
-  protected mode); reject newer NRPT rule shapes that bypass the
-  loopback resolver.
-* Acceptance: new unit tests + fixture snapshots.
+* `[~]` Audit-only slice landed in commit 966546c. 11 new NRPT-side
+  IPv6 tests pin the loopback-only contract against IPv6 name-server
+  shapes Get-DnsClientNrptRule can return:
+  - `::1` single-server root rule accepted
+  - `0:0:0:0:0:0:0:1` long-form loopback accepted
+  - dual-stack rule (127.0.0.1 + ::1) accepted
+  - `fe80::1` link-local NRPT rejected (+ root coverage drift)
+  - `::` IPv6 unspecified rejected
+  - `2606:4700:4700::1111` IPv6 external rejected
+  - `ff02::1` IPv6 multicast rejected
+  - `::ffff:8.8.8.8` IPv4-mapped external rejected
+  - mixed loopback+external IPv6 rule rejected (+ root drift)
+  - secondary IPv6 external rule isolated drift (root stays clean)
+  - root rule covered by `::1`-only accepted
+* `[ ]` Remaining scope (separate slice): IPv6 sibling-rule
+  requirement (every IPv4 mesh-zone rule must have an IPv6 sibling) +
+  Router Advertisement suppression check (no native IPv6 default
+  route during protected mode). Requires expanding the snapshot
+  collector to surface RA / default-route state and adding a
+  pairing-check pass to the evaluator.
 
 ### W4. `windows_runtime_acls.rs` registry + service ACL drift extension
 
