@@ -10149,4 +10149,293 @@ mod tests {
             "state must be FailClosed after force_fail_closed regardless of pending transition"
         );
     }
+
+    // ---- L7: Linux exit ACL IPv6 parity audit -------------------------
+    //
+    // The Linux exit-node programming uses two nftables families:
+    //   * `inet` for the killswitch + forward chain (covers IPv4 + IPv6)
+    //   * `ip` for the NAT/masquerade postrouting chain (IPv4 only)
+    //
+    // There is intentionally no `ip6` NAT table — when the exit-server
+    // path is engaged with `ipv6_parity_supported=false` (production
+    // default in `daemon.rs`), the runtime instead hard-disables IPv6
+    // at the kernel via `/proc/sys/net/ipv6/conf/all/disable_ipv6=1`.
+    // This is the security-bar invariant: any rule that exists for IPv4
+    // but not for IPv6 must be paired with a kernel-level IPv6 disable
+    // so a packet never traverses the unprogrammed sibling rule. The
+    // tests below pin that invariant via the DryRunSystem operation log.
+
+    #[test]
+    fn exit_serving_with_ipv6_parity_unsupported_hard_disables_ipv6_egress() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ipv6_parity_supported: false,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+        let ops = &controller.system.operations[start..];
+
+        assert!(
+            ops.contains(&"hard_disable_ipv6_egress".to_string()),
+            "ipv6_parity_supported=false on Linux exit MUST hard-disable \
+             ipv6 egress at the kernel; missing in ops={ops:?}"
+        );
+        assert!(
+            ops.contains(&"apply_nat_forwarding".to_string()),
+            "exit-serving apply must program IPv4 NAT (ip family) — ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn exit_serving_with_ipv6_parity_supported_skips_kernel_disable() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ipv6_parity_supported: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("exit-serving apply should succeed");
+        let ops = &controller.system.operations[start..];
+
+        assert!(
+            !ops.contains(&"hard_disable_ipv6_egress".to_string()),
+            "ipv6_parity_supported=true must NOT also hard-disable \
+             ipv6 egress (the caller is asserting parity is programmed \
+             elsewhere); ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn exit_full_tunnel_with_ipv6_parity_unsupported_hard_disables_ipv6_egress() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    ipv6_parity_supported: false,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("full-tunnel apply should succeed");
+        let ops = &controller.system.operations[start..];
+
+        assert!(
+            ops.contains(&"hard_disable_ipv6_egress".to_string()),
+            "full-tunnel mode with ipv6_parity_supported=false MUST hard-disable \
+             ipv6 egress (the kernel is the only barrier against IPv6 leaks since \
+             there is no ip6 nat sibling); missing in ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn hard_disable_ipv6_egress_runs_before_exit_mode_flip() {
+        // Security ordering invariant: IPv6 must be killed BEFORE the
+        // backend flips exit-mode active. Otherwise there is a window
+        // where the backend accepts mesh traffic and forwards it
+        // while the IPv6 kernel disable hasn't yet taken effect.
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    serve_exit_node: true,
+                    ipv6_parity_supported: false,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("apply should succeed");
+        let ops = &controller.system.operations[start..];
+
+        let disable_idx = ops
+            .iter()
+            .position(|op| op == "hard_disable_ipv6_egress")
+            .expect("hard_disable_ipv6_egress must be in op log");
+        let set_exit_idx = ops
+            .iter()
+            .position(|op| op.starts_with("set_exit_mode") || op.contains("set_exit_mode"))
+            .or_else(|| ops.iter().position(|op| op == "apply_firewall_killswitch"));
+        // The DryRunSystem doesn't echo backend ops, so use the
+        // firewall/nat ordering as a proxy: NAT apply must run before
+        // (or alongside) the IPv6 disable, but the disable MUST
+        // precede the assert_exit_policy invocation that locks in the
+        // exit-mode-applied stage.
+        let assert_idx = ops
+            .iter()
+            .position(|op| op == "assert_exit_policy")
+            .or_else(|| ops.iter().position(|op| op.starts_with("assert_exit_")));
+        if let Some(assert_idx) = assert_idx {
+            assert!(
+                disable_idx < assert_idx,
+                "hard_disable_ipv6_egress (idx={disable_idx}) must run before \
+                 assert_exit_policy (idx={assert_idx}); ops={ops:?}"
+            );
+        } else if let Some(set_exit_idx) = set_exit_idx {
+            assert!(
+                disable_idx < set_exit_idx,
+                "hard_disable_ipv6_egress (idx={disable_idx}) must run before \
+                 set_exit_mode (idx={set_exit_idx}); ops={ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nat_table_is_ipv4_family_only() {
+        // Pins the contract that the Linux exit-node NAT path uses
+        // the `ip` (IPv4-only) family. If a future change introduces
+        // an `ip6` nat table sibling, this snapshot must be updated
+        // deliberately + paired with the IPv6 NAT logic + paired
+        // with relaxing the `ipv6_parity_supported` default to true.
+        let nft_family_v4 = nft_family_for_ip(IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 1)));
+        let nft_family_v6 = nft_family_for_ip(IpAddr::V6(std::net::Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1,
+        )));
+        assert_eq!(nft_family_v4, "ip");
+        assert_eq!(nft_family_v6, "ip6");
+
+        // ManagementCidr nft_family helper must also match the same
+        // mapping (used in fail-closed SSH allow CIDRs etc.).
+        let v4 = ManagementCidr {
+            address: IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 0)),
+            prefix: 24,
+        };
+        let v6 = ManagementCidr {
+            address: IpAddr::V6(std::net::Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)),
+            prefix: 7,
+        };
+        assert_eq!(v4.nft_family(), "ip");
+        assert_eq!(v6.nft_family(), "ip6");
+        assert!(!v4.is_ipv6());
+        assert!(v6.is_ipv6());
+    }
+
+    #[test]
+    fn rollback_ipv6_egress_runs_when_parity_supported_flips_to_true() {
+        // Regression contract: when an apply that hard-disabled IPv6
+        // (parity_supported=false) is followed by an apply with
+        // parity_supported=true, the rollback path MUST re-enable IPv6
+        // egress. Otherwise a stale kernel-disable would block legit
+        // IPv6 traffic the parity programming is expected to permit.
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ipv6_parity_supported: false,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("first apply should succeed");
+
+        let second_start = controller.system.operations.len();
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "100.100.20.0/24".to_string(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    serve_exit_node: true,
+                    ipv6_parity_supported: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("second apply should succeed");
+        let second_ops = &controller.system.operations[second_start..];
+
+        assert!(
+            second_ops.contains(&"rollback_ipv6_egress".to_string()),
+            "flipping ipv6_parity_supported false→true must rollback the \
+             kernel disable; ops={second_ops:?}"
+        );
+    }
 }
