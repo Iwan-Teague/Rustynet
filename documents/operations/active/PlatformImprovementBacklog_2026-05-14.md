@@ -277,9 +277,27 @@ inline. Cross-reference with:
 
 ### W4. `windows_runtime_acls.rs` registry + service ACL drift extension
 
-* `[ ]` Match Linux runtime-ACL coverage: registry keys under
-  `HKLM\\SYSTEM\\CurrentControlSet\\Services\\RustyNet*` ACL drift,
-  service config-store DACL drift.
+* `[~]` Commit f31b9f2. Split the SDDL principal matcher into
+  `sddl_grants_principal` (allow ACEs only) + `sddl_denies_principal`
+  (deny ACEs only); the underlying matcher now exact-matches the ACE
+  type token (`A` ≠ `AU` audit, `D` ≠ `XD` callback-deny). Previously
+  the substring scan treated allow and deny ACEs as identical, so an
+  inserted deny ACE for LocalSystem or Builtin Administrators would
+  silently pass evaluation. The runtime-ACL evaluator now rejects:
+  - deny ACE for SY (LocalSystem)
+  - deny ACE for BA (Builtin Administrators)
+  …while still permitting explicit deny ACEs for World (`(D;;FA;;;WD)`)
+  because they strengthen the protection rather than weakening it.
+  13 new tests including deny-ACE coverage, PAI inheritance form,
+  SACL audit isolation from DACL drift, anonymous + user-SID owner
+  rejection, DPAPI blob WD rejection, an 8-entry reviewed-root path
+  snapshot, and a `schema_version=1` deliberate-bump guard.
+* `[ ]` Remaining scope (separate slice): registry-key ACL drift
+  detection under `HKLM\SYSTEM\CurrentControlSet\Services\RustyNet*`
+  + service config-store DACL drift. Requires a new
+  `rustynet-windows-native` helper to inspect registry SDDL +
+  service-config ACL via the Win32 API; not landable as a pure-Rust
+  audit extension.
 
 ### W5. `windows_authenticode.rs` thumbprint pinning + revocation deny-list
 
