@@ -348,11 +348,51 @@ inline. Cross-reference with:
 
 ### W5. `windows_authenticode.rs` thumbprint pinning + revocation deny-list
 
-* `[ ]` Today the validator only reports a "trusted" boolean. Pin by
-  Authenticode cert thumbprint; add deny-list of revoked thumbprints; on
-  unknown thumbprint, fail closed with a precise reason code.
-* Acceptance: positive (matched thumbprint) + negative (revoked,
-  unknown) + drift tests.
+* `[~]` Policy + evaluator + report-schema slice landed (commit
+  pending). New components:
+  - `WindowsAuthenticodeThumbprintPolicy { allowlist_sha256,
+    denylist_sha256 }` with `Default` + `Serialize`/`Deserialize` and
+    a `normalise_thumbprint` helper that strips whitespace / colons /
+    dashes and lowercases, rejecting anything that isn't a 64-char
+    hex SHA-256 thumbprint.
+  - `evaluate_thumbprint_policy(observed, &policy) -> Vec<reason>`
+    pure evaluator with explicit fail-closed shapes:
+    - `None` observation → fail closed (thumbprint extraction failed
+      but a pinned policy is in effect)
+    - malformed observation → fail closed
+    - denylist hit → fail closed (denylist takes precedence over
+      allowlist; revocation always wins)
+    - allowlist enabled and observed thumbprint not on list → fail
+      closed
+    - malformed allowlist / denylist entries surface as drift so
+      operators see typos in their reviewed lists
+  - `WindowsAuthenticodeReport` extended with
+    `signer_thumbprint_sha256: Option<String>` and
+    `thumbprint_policy_applied: Option<WindowsAuthenticodeThumbprintPolicy>`,
+    both `#[serde(default)]` for forward-compat.
+  - New `inspect_authenticode_signature_with_thumbprint_policy(path,
+    policy)` API that threads the policy through; legacy
+    `inspect_authenticode_signature(path)` delegates with `None`
+    policy for back-compat. When a policy is supplied, `overall_ok`
+    requires presence + chain-verified + policy-satisfied.
+  17 new tests: 5 normalisation (clean / uppercase / Microsoft
+  separator style / short input / non-hex) + 12 policy evaluator
+  (empty-allowlist clean / off-allowlist reject / on-allowlist
+  accept / denylist-takes-precedence / case+separator normalised
+  denylist match / None-observation fail-closed / malformed
+  observation fail-closed / malformed allowlist drift / malformed
+  denylist drift / allowlist-disabled+clean-denylist passes /
+  default empty-state snapshot / policy serde round-trip).
+* `[ ]` Remaining scope (separate slice): native thumbprint EXTRACTOR
+  in `rustynet_windows_native`. The Windows extractor needs to call
+  `CryptQueryObject` on the PE → `CryptMsgGetParam` for the SignerInfo
+  → derive the signer cert from the SignedData → compute
+  `CertGetCertificateContextProperty(CERT_SHA256_HASH_PROP_ID)` and
+  surface the lowercase hex via a new
+  `extract_signer_thumbprint_sha256(path) -> Result<String, String>`
+  function. Until that lands, every observation is `None` and any
+  caller that supplies a policy gets a fail-closed result — which is
+  the correct security posture for rollout.
 
 ### W6. `windows_key_custody.rs` DPAPI LocalMachine rotation tests
 
