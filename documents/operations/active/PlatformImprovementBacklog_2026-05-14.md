@@ -117,11 +117,16 @@ inline. Cross-reference with:
   - parser drops bare `nameserver` with no address
   - inline comment attached to nameserver value caught as parse failure
   - `schema_version` pinned at 1 (deliberate-bump guard)
-* `[ ]` Remaining scope (separate slice): systemd-resolved socket-race
-  detection + NetworkManager precedence override check. Both require
-  expanding the snapshot collector beyond `/etc/resolv.conf` (probe
-  listening socket; query `resolvectl status` / NM state) and a paired
-  update to the `LinuxDaemonProbe` adapter.
+* `[x]` Commit 255cff4. Remaining scope landed: snapshot expanded
+  with `systemd_resolved_stub_present` (read from
+  `/run/systemd/resolve/stub-resolv.conf`) and
+  `network_manager_dns_mode` (parsed from `[main] dns=` in
+  `/etc/NetworkManager/NetworkManager.conf`). Both `#[serde(default)]`
+  for forward-compat; schema_version stays at 1. New evaluator flags
+  stub-race on 127.0.0.53 conflict and NM precedence drift on
+  `dns=default` / empty / unknown backends. `dns=none` /
+  `systemd-resolved` / `dnsmasq` accepted. 17 new tests (3 race + 7
+  precedence + 7 INI-parser shapes).
 
 ### L5. `linux_mesh_status.rs` typed-schema fail-closed parser
 
@@ -329,9 +334,12 @@ inline. Cross-reference with:
 
 ### W6. `windows_key_custody.rs` DPAPI LocalMachine rotation tests
 
-* `[ ]` DPAPI LocalMachine scope was just landed in `425faa4`. Add tests
-  that exercise DPAPI blob rotation + cross-restart re-decryption + the
-  fail-closed path when the LocalMachine key is unavailable.
+* `[x]` Commit 255cff4. 7 new tests pin post-rotation custody
+  invariants: success with reviewed ACL; world-writable principal on
+  rotated blob; unreviewed owner; partial rotation (encrypted-key
+  mid-rename, briefly missing); rotation that left plaintext-key file
+  present; temp-suffix extension drift (`.dpapi.tmp` instead of
+  `.dpapi`); DACL widened to Authenticated Users.
 
 ### W7. Windows install-release real runtime path (substantial)
 
@@ -345,9 +353,19 @@ inline. Cross-reference with:
 
 ### W8. Windows mesh status hardening
 
-* `[ ]` Typed-schema parse for the mesh-state file the Windows side
-  emits; reject malformed/replayed snapshots; mirror L5 on the Windows
-  side.
+* `[x]` Commit 255cff4. On audit, the parser side was already using
+  the typed `WindowsMeshSnapshotLoad` enum shared with Linux via
+  `resilience::load_session_snapshot` — the L5 fail-closed tests
+  already cover the underlying state-file parser. What was missing
+  was reviewed-root enforcement on the collector itself. The
+  `ensure_state_path_under_reviewed_root` helper existed but was
+  `#[allow(dead_code)]` and never invoked, so the collector accepted
+  any state path the orchestrator passed (including %TEMP%, UNC
+  shares, world-writable locations). Now the collector calls the
+  validator as the first action; out-of-root paths surface as
+  `InvalidFormat` snapshots before any filesystem read. 3 new tests
+  pin the contract: arbitrary `/tmp/...` path, user-writable
+  `%TEMP%` path, UNC `\\fileserver\…` path.
 
 ---
 
