@@ -2,7 +2,9 @@
 
 pub mod daemon;
 pub mod dataplane;
+pub mod exit_codes;
 pub mod fetcher;
+
 pub mod ipc;
 pub mod key_material;
 pub mod linux_authenticode;

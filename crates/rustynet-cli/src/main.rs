@@ -1076,16 +1076,71 @@ fn main() {
             }
         }
         Err(err) => {
+            let exit_code = classify_cli_error(err.as_str());
             if want_json {
                 println!(
-                    "{{\"ok\":false,\"error\":{}}}",
+                    "{{\"ok\":false,\"exit_code\":{},\"exit_label\":\"{}\",\"error\":{}}}",
+                    exit_code.as_i32(),
+                    exit_code.label(),
                     serde_json::Value::String(err)
                 );
             } else {
-                println!("error: {err}");
+                let hint = exit_code.operator_hint();
+                if hint.is_empty() {
+                    println!("error [{exit_code}]: {err}");
+                } else {
+                    println!("error [{exit_code}]: {err}\n  hint: {hint}");
+                }
             }
-            std::process::exit(1);
+            std::process::exit(exit_code.as_i32());
         }
+    }
+}
+
+/// Classify a CLI error string into the reviewed exit-code taxonomy
+/// (X6). The CLI's `execute` returns `Result<String, String>`; this
+/// helper maps the error message to the right bucket so shells and CI
+/// can branch on the failure kind.
+fn classify_cli_error(message: &str) -> rustynetd::exit_codes::ExitCode {
+    use rustynetd::exit_codes::ExitCode;
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unknown command")
+        || lower.contains("unknown subcommand")
+        || lower.contains("missing required")
+        || lower.contains("requires --")
+        || lower.contains("requires argument")
+        || lower.starts_with("usage:")
+        || lower.contains("invalid value for")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("fail-closed")
+        || lower.contains("fail closed")
+        || lower.contains("policy reject")
+        || lower.contains("policy rejected")
+        || lower.contains("signature verification")
+        || lower.contains("reviewed root")
+        || lower.contains("not reviewed")
+        || lower.contains("drift detected")
+        || lower.contains("forbidden")
+    {
+        ExitCode::PolicyReject
+    } else if lower.contains("config")
+        || lower.contains("invalid path")
+        || lower.contains("schema")
+        || lower.contains("malformed")
+        || lower.contains("parse error")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("connection refused")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("retry")
+        || lower.contains("transient")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
     }
 }
 
@@ -16799,18 +16854,19 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, command_supports_json_render,
-        contains_ip_rule_lookup_table, detect_tampered_log, execute, extract_json_flag, help_text,
-        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
-        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
-        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
-        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
-        phase6_stage_probe_from_source, phase6_sync_platform_probe_from_inbox,
-        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
-        read_json_value, render_key_value_line_as_json, render_launchd_plist,
-        required_macos_tunnel_keychain_account, rewrite_assignment_refresh_exit_node,
-        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        validate_control_socket_security, write_json_pretty_file,
+        CliCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, classify_cli_error,
+        command_supports_json_render, contains_ip_rule_lookup_table, detect_tampered_log, execute,
+        extract_json_flag, help_text, is_interface_absent_detail, launchd_xml_escape,
+        load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
+        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
+        parse_command, parse_managed_pf_anchors, parse_wireguard_go_pids_from_ps,
+        persist_encrypted_secret_material, phase6_stage_probe_from_source,
+        phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
+        phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
+        render_launchd_plist, required_macos_tunnel_keychain_account,
+        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
+        rewrite_env_key_value, to_ipc_command, unix_now, validate_control_socket_security,
+        write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -20275,5 +20331,111 @@ mod tests {
         let c = render_key_value_line_as_json(line).unwrap();
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    // ---- X6: classify_cli_error coverage --------------------------------
+
+    #[test]
+    fn classify_cli_error_maps_unknown_command_to_bad_args() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_cli_error("unknown command: 'frobnicate'"),
+            ExitCode::BadArgs
+        );
+        assert_eq!(
+            classify_cli_error("missing required argument --inventory"),
+            ExitCode::BadArgs
+        );
+        assert_eq!(
+            classify_cli_error("usage: rustynet status [--json]"),
+            ExitCode::BadArgs
+        );
+    }
+
+    #[test]
+    fn classify_cli_error_maps_fail_closed_drift_to_policy_reject() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_cli_error("signature verification rejected the bundle"),
+            ExitCode::PolicyReject
+        );
+        assert_eq!(
+            classify_cli_error("fail-closed gate refused the operation"),
+            ExitCode::PolicyReject
+        );
+        assert_eq!(
+            classify_cli_error("drift detected in linux runtime acls"),
+            ExitCode::PolicyReject
+        );
+        assert_eq!(
+            classify_cli_error("forbidden plaintext key present at rest"),
+            ExitCode::PolicyReject
+        );
+    }
+
+    #[test]
+    fn classify_cli_error_maps_schema_errors_to_config_error() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_cli_error("config file at /etc/rustynet/daemon.env is unreadable"),
+            ExitCode::ConfigError
+        );
+        assert_eq!(
+            classify_cli_error("schema mismatch: missing field `node_id`"),
+            ExitCode::ConfigError
+        );
+        assert_eq!(
+            classify_cli_error("malformed assignment bundle: invalid JSON"),
+            ExitCode::ConfigError
+        );
+    }
+
+    #[test]
+    fn classify_cli_error_maps_io_failures_to_transient() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_cli_error("connection refused (os error 111)"),
+            ExitCode::TransientFailure
+        );
+        assert_eq!(
+            classify_cli_error("operation timed out after 5s"),
+            ExitCode::TransientFailure
+        );
+        assert_eq!(
+            classify_cli_error("temporarily unavailable; retry in 30s"),
+            ExitCode::TransientFailure
+        );
+    }
+
+    #[test]
+    fn classify_cli_error_falls_back_to_generic_failure_when_no_pattern_matches() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_cli_error("something went wrong"),
+            ExitCode::GenericFailure
+        );
+        assert_eq!(classify_cli_error(""), ExitCode::GenericFailure);
+    }
+
+    /// Precedence test: a string that matches multiple buckets must
+    /// classify to the highest-priority match. The reviewed precedence
+    /// order is: `BadArgs > PolicyReject > ConfigError >
+    /// TransientFailure > GenericFailure`. Pin so a future refactor
+    /// that reorders the if-chain doesn't silently change
+    /// classification.
+    #[test]
+    fn classify_cli_error_precedence_bad_args_beats_other_matches() {
+        use rustynetd::exit_codes::ExitCode;
+        // Contains both "missing required" (BadArgs) and "fail-closed"
+        // (PolicyReject). The earlier branch wins.
+        let msg = "missing required arg; fail-closed gate would refuse";
+        assert_eq!(classify_cli_error(msg), ExitCode::BadArgs);
+    }
+
+    #[test]
+    fn classify_cli_error_precedence_policy_reject_beats_config_and_transient() {
+        use rustynetd::exit_codes::ExitCode;
+        let msg = "signature verification failed; schema-side malformed; retry impossible";
+        assert_eq!(classify_cli_error(msg), ExitCode::PolicyReject);
     }
 }
