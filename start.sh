@@ -91,25 +91,33 @@ export PATH="${HOME}/.cargo/bin:/opt/homebrew/opt/rustup/bin:/usr/local/opt/rust
 
 mkdir -p "${CONFIG_DIR}"
 
-print_info() {
-  printf '[info] %s\n' "$*"
-}
+# L1 — modularization (GAP-10). Load the shared helpers from a
+# dedicated common-layer module. Sourced files use ${ROOT_DIR} so an
+# attacker cannot path-substitute the modules; a missing file is a
+# hard fail rather than a silent fallback (an inline-helper fallback
+# would defeat the security audit boundary).
+RUSTYNET_START_MODULE_DIR="${ROOT_DIR}/scripts/start"
+if [[ ! -f "${RUSTYNET_START_MODULE_DIR}/common.sh" ]]; then
+  printf '[error] %s\n' \
+    "missing required start.sh module: ${RUSTYNET_START_MODULE_DIR}/common.sh" >&2
+  exit 1
+fi
+# shellcheck source=scripts/start/common.sh
+. "${RUSTYNET_START_MODULE_DIR}/common.sh"
 
-print_warn() {
-  printf '[warn] %s\n' "$*" >&2
-}
-
-print_err() {
-  printf '[error] %s\n' "$*" >&2
-}
-
-is_linux_host() {
-  [[ "${HOST_OS}" == "Linux" ]]
-}
-
-is_macos_host() {
-  [[ "${HOST_OS}" == "Darwin" ]]
-}
+# Source the per-platform modules. Each module is internally guarded
+# and is safe to source on the other platform — the inline `is_*_host`
+# checks turn function bodies into no-ops. We still source both so
+# the helpers are available if a future code path triggers them on a
+# host we did not expect.
+if [[ -f "${RUSTYNET_START_MODULE_DIR}/linux.sh" ]]; then
+  # shellcheck source=scripts/start/linux.sh
+  . "${RUSTYNET_START_MODULE_DIR}/linux.sh"
+fi
+if [[ -f "${RUSTYNET_START_MODULE_DIR}/macos.sh" ]]; then
+  # shellcheck source=scripts/start/macos.sh
+  . "${RUSTYNET_START_MODULE_DIR}/macos.sh"
+fi
 
 apply_host_profile_defaults() {
   if is_linux_host; then
@@ -155,14 +163,6 @@ apply_host_profile_defaults() {
   HOST_PROFILE="unsupported"
 }
 
-path_in_linux_runtime_roots() {
-  local value="$1"
-  [[ "${value}" == /etc/rustynet* ]] \
-    || [[ "${value}" == /var/lib/rustynet* ]] \
-    || [[ "${value}" == /run/rustynet* ]] \
-    || [[ "${value}" == /var/log/rustynet* ]]
-}
-
 require_macos_path_var_exact() {
   local var_name="$1"
   local expected="$2"
@@ -176,17 +176,6 @@ require_macos_path_var_exact() {
     print_info "Update ${CONFIG_FILE} to canonical macOS paths before continuing."
     exit 1
   fi
-}
-
-sanitize_macos_keychain_account() {
-  local value="$1"
-  value="${value//[^A-Za-z0-9._-]/-}"
-  value="${value#-}"
-  value="${value%-}"
-  if [[ -z "${value}" ]]; then
-    value="rustynet-passphrase"
-  fi
-  printf '%s' "${value}"
 }
 
 ensure_macos_keychain_passphrase_account() {
