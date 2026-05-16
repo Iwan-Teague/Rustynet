@@ -158,10 +158,30 @@ inline. Cross-reference with:
 
 ### L7. Linux exit ACL IPv6 parity
 
-* `[ ]` Audit exit-node ACL/firewall programming for IPv6 gaps (any rule
-  that's IPv4-only must have an IPv6 sibling unless explicitly scoped).
-* Acceptance: new gate test enumerates `ip` vs `ip6` rule counts and
-  fails closed when a security-bar rule is v4-only.
+* `[~]` Audit-only slice landed in commit dbf0565. On audit, the Linux
+  exit-node programming uses two nftables families intentionally:
+  - `inet` for killswitch + forward (covers IPv4 + IPv6)
+  - `ip` for NAT/masquerade postrouting (IPv4 only)
+  There is no `ip6` NAT sibling — the fail-closed posture is the
+  kernel disable `/proc/sys/net/ipv6/conf/all/disable_ipv6=1`, gated
+  by `ApplyOptions.ipv6_parity_supported`. Production default in
+  `daemon.rs` is `ipv6_parity_supported=false`, which forces the
+  kernel disable.
+  6 new tests pin the security-bar invariant against the DryRunSystem
+  operation log:
+  - parity=false serve-exit-node logs `hard_disable_ipv6_egress` +
+    `apply_nat_forwarding`
+  - parity=true serve-exit-node omits `hard_disable_ipv6_egress`
+  - parity=false full-tunnel logs `hard_disable_ipv6_egress`
+  - ordering: kernel disable runs before `assert_exit_policy` /
+    `set_exit_mode`
+  - `nft_family_for_ip` + `ManagementCidr::nft_family` v4→"ip",
+    v6→"ip6" snapshot
+  - parity false→true flip rolls back the kernel disable
+* `[ ]` Remaining scope (separate slice): introduce an `ip6` NAT
+  sibling table + raise the default to `ipv6_parity_supported=true`.
+  Needs live-lab validation since the IPv6 NAT programming changes
+  what packets actually traverse the exit node.
 
 ### L8. Linux killswitch boot-time enforcement
 
