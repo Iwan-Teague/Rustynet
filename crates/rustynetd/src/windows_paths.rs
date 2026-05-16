@@ -263,12 +263,25 @@ pub(crate) fn evaluate_windows_runtime_acl_sddl(
     is_dir: bool,
 ) -> Result<(), String> {
     evaluate_windows_protected_dacl_sddl(label, sddl, is_dir)?;
-    if !sddl_contains_principal(sddl, "SY") {
+    if !sddl_grants_principal(sddl, "SY") {
         return Err(format!("{label} ACL must grant LocalSystem access"));
     }
-    if !sddl_contains_principal(sddl, "BA") {
+    if !sddl_grants_principal(sddl, "BA") {
         return Err(format!(
             "{label} ACL must grant Builtin Administrators access"
+        ));
+    }
+    // A deny ACE for an allowed principal short-circuits the allow
+    // ACE (Windows evaluates ACEs in order; an inserted deny would
+    // halt the service). Treat such ACEs as drift.
+    if sddl_denies_principal(sddl, "SY") {
+        return Err(format!(
+            "{label} ACL denies LocalSystem (deny ACE present); the daemon cannot start without LocalSystem access"
+        ));
+    }
+    if sddl_denies_principal(sddl, "BA") {
+        return Err(format!(
+            "{label} ACL denies Builtin Administrators (deny ACE present); operators lose remediation access"
         ));
     }
     let owner = extract_sddl_owner(sddl)
@@ -309,7 +322,7 @@ fn evaluate_windows_protected_dacl_sddl(
         ));
     }
     for principal in FORBIDDEN_WELL_KNOWN_SDDL_PRINCIPALS {
-        if sddl_contains_principal(sddl, principal) {
+        if sddl_grants_principal(sddl, principal) {
             return Err(format!(
                 "{label} ACL grants a broader-than-reviewed Windows principal ({principal})"
             ));
@@ -407,9 +420,54 @@ fn extract_sddl_owner(sddl: &str) -> Option<&str> {
     Some(&owner_start[..owner_len])
 }
 
-fn sddl_contains_principal(sddl: &str, principal: &str) -> bool {
+/// True iff the SDDL contains an allow-type ACE for `principal`. A
+/// SDDL ACE has the form `(ace_type;ace_flags;rights;...;sid)`. We
+/// scan for the trailing `;;;principal)` segment that anchors the
+/// ACE end, then walk back to the opening parenthesis to confirm the
+/// ACE type is `A` (allow). Deny ACEs (`D;...`) intentionally do NOT
+/// match — see `sddl_denies_principal`.
+fn sddl_grants_principal(sddl: &str, principal: &str) -> bool {
+    sddl_ace_matches(sddl, principal, 'A')
+}
+
+/// True iff the SDDL contains a deny-type ACE for `principal`. A deny
+/// ACE for an allowed principal (e.g. `(D;;FA;;;SY)`) would override
+/// any allow ACE that follows it in evaluation order, which means an
+/// attacker who can append a deny ACE silently disables access for
+/// the daemon's own service identity.
+fn sddl_denies_principal(sddl: &str, principal: &str) -> bool {
+    sddl_ace_matches(sddl, principal, 'D')
+}
+
+fn sddl_ace_matches(sddl: &str, principal: &str, expected_type: char) -> bool {
     let marker = format!(";;;{principal})");
-    sddl.contains(&marker)
+    let expected_token: &str = match expected_type {
+        'A' => "A",
+        'D' => "D",
+        other => {
+            debug_assert!(false, "unsupported ACE type {other}");
+            return false;
+        }
+    };
+    let mut search_from = 0usize;
+    while let Some(local) = sddl[search_from..].find(&marker) {
+        let absolute = search_from + local;
+        // Walk back from the marker's start to the opening '(' of
+        // this ACE. The ACE type token is the substring between '('
+        // and the first ';' — needs to match EXACTLY (so `A` !=
+        // `AU` audit, `D` != `XD` callback-deny, etc.).
+        if let Some(paren) = sddl[..absolute].rfind('(') {
+            let ace_body_start = paren + 1;
+            if let Some(semi) = sddl[ace_body_start..absolute].find(';') {
+                let token = &sddl[ace_body_start..ace_body_start + semi];
+                if token == expected_token {
+                    return true;
+                }
+            }
+        }
+        search_from = absolute + marker.len();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -511,8 +569,38 @@ mod tests {
 
     #[test]
     fn sddl_principal_match_is_ace_scoped() {
-        assert!(sddl_contains_principal("D:P(A;;FA;;;SY)(A;;FA;;;BA)", "SY"));
-        assert!(!sddl_contains_principal("O:SYG:SYD:P", "SY"));
+        assert!(sddl_grants_principal("D:P(A;;FA;;;SY)(A;;FA;;;BA)", "SY"));
+        assert!(!sddl_grants_principal("O:SYG:SYD:P", "SY"));
+    }
+
+    #[test]
+    fn sddl_grants_principal_distinguishes_allow_from_deny() {
+        assert!(sddl_grants_principal("D:P(A;;FA;;;SY)", "SY"));
+        assert!(
+            !sddl_grants_principal("D:P(D;;FA;;;SY)", "SY"),
+            "deny ACE must not register as a grant"
+        );
+    }
+
+    #[test]
+    fn sddl_denies_principal_detects_deny_aces() {
+        assert!(sddl_denies_principal("D:P(D;;FA;;;SY)", "SY"));
+        assert!(
+            !sddl_denies_principal("D:P(A;;FA;;;SY)", "SY"),
+            "allow ACE must not register as a deny"
+        );
+    }
+
+    #[test]
+    fn sddl_grants_principal_handles_mixed_allow_and_deny_aces() {
+        // Daemon DACL with both an allow grant and a deny ACE for the
+        // same principal: deny wins at Windows evaluation time but
+        // both flags must register correctly in our helpers.
+        let sddl = "D:P(A;;FA;;;SY)(D;;FA;;;SY)(A;;FA;;;BA)";
+        assert!(sddl_grants_principal(sddl, "SY"));
+        assert!(sddl_denies_principal(sddl, "SY"));
+        assert!(sddl_grants_principal(sddl, "BA"));
+        assert!(!sddl_denies_principal(sddl, "BA"));
     }
 
     const REVIEWED_DIRECTORY_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
@@ -793,6 +881,179 @@ mod tests {
         assert!(
             watermark.starts_with(&prefix),
             "relay fleet watermark must be under trust root: {watermark}"
+        );
+    }
+
+    // ---- W4: runtime-ACL drift extension -----------------------------
+
+    /// Deny ACE for LocalSystem must reject: even with a paired allow
+    /// ACE, the deny halts service start because Windows evaluates
+    /// ACEs in order and short-circuits on the first match. Before
+    /// this slice the verifier silently passed.
+    #[test]
+    fn evaluate_runtime_acl_rejects_deny_ace_for_localsystem() {
+        let sddl = "O:BAG:BAD:P(D;;FA;;;SY)(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("deny ACE for LocalSystem must fail");
+        assert!(
+            err.contains("denies LocalSystem"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Deny ACE for Builtin Administrators must reject for the same
+    /// reason — even though SY still has access, admins lose
+    /// remediation paths (Restart-Service, registry cleanup, etc).
+    #[test]
+    fn evaluate_runtime_acl_rejects_deny_ace_for_builtin_admins() {
+        let sddl = "O:BAG:BAD:P(A;;FA;;;SY)(D;;FA;;;BA)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("deny ACE for Builtin Administrators must fail");
+        assert!(
+            err.contains("denies Builtin Administrators"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Explicit deny ACE for `WD` (World) is acceptable — it
+    /// strengthens the protection rather than weakening it. Confirms
+    /// the WD-forbidden check is allow-only and does not over-trigger.
+    #[test]
+    fn evaluate_runtime_acl_accepts_explicit_deny_ace_for_world() {
+        let sddl = "O:BAG:BAD:P(D;;FA;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)";
+        evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect("explicit Deny for World must validate");
+    }
+
+    /// `D:PAI` (protected + auto-inherit) is acceptable: the `D:P`
+    /// substring is still present so the protection bit check passes.
+    /// Pin this so a future tightening to exact-match `D:P` doesn't
+    /// silently break common SDDL forms.
+    #[test]
+    fn evaluate_runtime_acl_accepts_pai_inheritance_flag() {
+        let sddl = "O:BAG:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)";
+        evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect("D:PAI form must validate");
+    }
+
+    /// Empty SDDL string fails on the DACL-marker check first.
+    #[test]
+    fn evaluate_runtime_acl_rejects_empty_sddl() {
+        let err = evaluate_windows_runtime_acl_sddl("state root", "", true)
+            .expect_err("empty SDDL must fail");
+        assert!(
+            err.contains("must expose a Windows DACL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// SDDL that is only the owner field (no DACL) must fail.
+    #[test]
+    fn evaluate_runtime_acl_rejects_owner_only_sddl() {
+        let err = evaluate_windows_runtime_acl_sddl("state root", "O:SY", true)
+            .expect_err("owner-only SDDL must fail");
+        assert!(
+            err.contains("must expose a Windows DACL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// SACL present + a clean DACL: SACL audit ACEs must NOT interfere
+    /// with the DACL evaluation. A WD principal inside the SACL audit
+    /// path is benign — auditing world access is fine.
+    #[test]
+    fn evaluate_runtime_acl_accepts_sacl_audit_for_world() {
+        let sddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)S:(AU;;FA;;;WD)";
+        evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect("SACL audit for WD must not trip the DACL drift check");
+    }
+
+    /// Inverse case: SACL omitted entirely is also acceptable — we do
+    /// not require auditing as part of the runtime contract.
+    #[test]
+    fn evaluate_runtime_acl_accepts_sddl_without_sacl_section() {
+        let sddl = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect("SDDL without SACL must validate");
+    }
+
+    /// Anonymous-owner SID (S-1-5-7) must reject. Only LocalSystem,
+    /// Builtin Administrators, or a service SID (S-1-5-80-*) are
+    /// reviewed owners. Anonymous would allow ownership transfer.
+    #[test]
+    fn evaluate_runtime_acl_rejects_anonymous_owner() {
+        let sddl = "O:S-1-5-7G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("anonymous owner must fail");
+        assert!(
+            err.contains("ACL owner must be LocalSystem"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Generic user SID (S-1-5-21-*) as owner must reject — only
+    /// administrative or service identities are reviewed.
+    #[test]
+    fn evaluate_runtime_acl_rejects_user_sid_owner() {
+        let sddl = "O:S-1-5-21-1111-2222-3333-1001G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("local user SID owner must fail");
+        assert!(
+            err.contains("ACL owner must be LocalSystem"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Local secret ACL evaluator must reject the same deny-ACE
+    /// shape — DPAPI blobs need uniform deny-ACE handling.
+    #[test]
+    fn evaluate_local_secret_acl_passes_through_protected_dacl_checks() {
+        // Local secret evaluator only invokes the protected-DACL
+        // helper + owner-present check; the DACL helper still uses
+        // the allow-only grants matcher under the hood. Confirm a
+        // WD allow ACE on a DPAPI blob still trips drift.
+        let sddl = "O:S-1-5-80-9999D:P(A;;FA;;;SY)(A;;FA;;;WD)";
+        let err = evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect_err("WD allow ACE on dpapi blob must fail");
+        assert!(
+            err.contains("broader-than-reviewed Windows principal"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Snapshot test: pin the exact 8-entry reviewed-root list so
+    /// silent removal of a root (e.g. dropping `key-custody root` by
+    /// accident) trips a named failure.
+    #[test]
+    fn windows_runtime_startup_acl_roots_snapshot_pinned_at_eight_entries() {
+        let paths: Vec<&str> = WINDOWS_RUNTIME_STARTUP_ACL_ROOTS
+            .iter()
+            .map(|(p, _)| *p)
+            .collect();
+        let expected: Vec<&str> = vec![
+            DEFAULT_WINDOWS_STATE_ROOT,
+            DEFAULT_WINDOWS_CONFIG_ROOT,
+            DEFAULT_WINDOWS_LOG_ROOT,
+            DEFAULT_WINDOWS_TRUST_ROOT,
+            DEFAULT_WINDOWS_MEMBERSHIP_ROOT,
+            DEFAULT_WINDOWS_KEYS_ROOT,
+            DEFAULT_WINDOWS_SECRET_ROOT,
+            DEFAULT_WINDOWS_KEY_CUSTODY_ROOT,
+        ];
+        assert_eq!(
+            paths, expected,
+            "reviewed runtime-root list shape drifted (W4 snapshot)"
+        );
+    }
+
+    /// schema_version on the diagnostic report must stay at 1.
+    /// Bumping it must be a deliberate change with a paired migration.
+    #[test]
+    fn windows_runtime_acl_report_schema_version_pinned_at_one() {
+        let report = collect_windows_runtime_acl_report();
+        assert_eq!(
+            report.schema_version, 1,
+            "schema_version bump must be deliberate"
         );
     }
 }
