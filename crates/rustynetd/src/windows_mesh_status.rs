@@ -77,6 +77,30 @@ pub fn collect_windows_mesh_status_report(
         .unwrap_or_else(|| PathBuf::from(DEFAULT_WINDOWS_STATE_PATH));
     let state_path_str = state_path.display().to_string();
     let now_unix = current_unix_seconds();
+    // W8 fail-closed: reject state paths outside the reviewed Windows
+    // runtime roots BEFORE touching the filesystem. An operator (or
+    // attacker with orchestrator credentials) cannot point the mesh
+    // status verifier at a planted state file in a writable location
+    // such as %TEMP% or a network share — the path must live under the
+    // reviewed `C:\ProgramData\RustyNet\…` tree.
+    if let Err(reason) = ensure_state_path_under_reviewed_root(state_path.as_path()) {
+        let snapshot = WindowsMeshSnapshotLoad::InvalidFormat {
+            reason: reason.clone(),
+        };
+        let mut drift_reasons = Vec::new();
+        drift_reasons.push(format!(
+            "state path rejected by reviewed-root check: {reason}"
+        ));
+        return WindowsMeshStatusReport {
+            schema_version: 1,
+            state_path: state_path_str,
+            overall_ok: false,
+            snapshot,
+            expected_peer_ids: options.expected_peer_ids.clone(),
+            max_age_seconds: options.max_age_seconds,
+            drift_reasons,
+        };
+    }
     let snapshot = match load_session_snapshot(state_path.as_path()) {
         Ok(snap) => {
             let age = now_unix.saturating_sub(snap.timestamp_unix as i64);
@@ -171,7 +195,6 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
 fn ensure_state_path_under_reviewed_root(path: &Path) -> Result<(), String> {
     crate::windows_paths::validate_windows_runtime_file_path(path, "mesh status state path")
 }
@@ -324,7 +347,9 @@ mod tests {
     }
 
     #[test]
-    fn collect_report_returns_missing_for_nonexistent_path() {
+    fn collect_report_returns_invalid_for_path_outside_reviewed_root() {
+        // /tmp/... is NOT a reviewed Windows runtime root. The collector
+        // must reject the path before any filesystem access.
         let bogus = PathBuf::from("/tmp/rustynet-mesh-status-test-nonexistent");
         let _ = fs::remove_file(bogus.as_path());
         let options = WindowsMeshStatusOptions {
@@ -337,14 +362,64 @@ mod tests {
         assert!(!report.overall_ok);
         assert!(matches!(
             report.snapshot,
-            WindowsMeshSnapshotLoad::Missing { .. }
+            WindowsMeshSnapshotLoad::InvalidFormat { .. }
         ));
         assert!(
             report
                 .drift_reasons
                 .iter()
-                .any(|r| r.contains("state snapshot missing")),
-            "missing-state reason must propagate: {:?}",
+                .any(|r| r.contains("reviewed-root check")),
+            "reviewed-root rejection must surface: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn collect_report_rejects_user_writable_temp_state_path() {
+        // %TEMP% is writable by the runtime service account and a low-
+        // privilege attacker. The mesh-status check must refuse to read
+        // a planted state file from there.
+        let temp_path = PathBuf::from(r"C:\Users\Public\AppData\Local\Temp\rustynetd.state");
+        let options = WindowsMeshStatusOptions {
+            state_path: Some(temp_path),
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+        };
+        let report = collect_windows_mesh_status_report(&options);
+        assert!(!report.overall_ok);
+        assert!(matches!(
+            report.snapshot,
+            WindowsMeshSnapshotLoad::InvalidFormat { .. }
+        ));
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("reviewed-root check")),
+            "user-temp state path must be rejected: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn collect_report_rejects_unc_state_path() {
+        // UNC / network shares are not reviewed roots — an attacker who
+        // controls the SMB endpoint could feed a forged state file. The
+        // collector must reject the path shape.
+        let unc_path = PathBuf::from(r"\\fileserver\rustynet$\rustynetd.state");
+        let options = WindowsMeshStatusOptions {
+            state_path: Some(unc_path),
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+        };
+        let report = collect_windows_mesh_status_report(&options);
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("reviewed-root check")),
+            "UNC state path must be rejected: {:?}",
             report.drift_reasons
         );
     }
