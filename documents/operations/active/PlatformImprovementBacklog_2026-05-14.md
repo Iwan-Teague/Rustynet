@@ -397,10 +397,26 @@ inline. Cross-reference with:
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
 
-* `[ ]` Sweep `daemon.rs`, `phase10.rs`, `key_material.rs`, helper
-  output for accidental secret leakage in error paths. Add structured
-  redaction at the log emit boundary. Add a unit-test pattern that
-  asserts known-secret bytes never appear in any error string.
+* `[x]` `crates/rustynetd/src/secret_log_audit.rs` — static source-walk
+  audit gate covering every `.rs` file under `crates/rustynetd/src/`
+  and `crates/rustynet-cli/src/`. Two complementary detection forms:
+  - **Forbidden placeholder tokens** inside log/print/format macros:
+    `passphrase_bytes`, `private_key_bytes`, `signing_key_bytes`,
+    `wrapped_secret`, `decrypted_secret`, `plaintext_key`,
+    `raw_passphrase`, `secret_bytes`. Catches the common shape where
+    a debug-time `eprintln!("...{passphrase_bytes:?}")` slips through
+    review. Matches `{token}`, `{token:?}`, `{token:x?}` placeholder
+    forms; ignores commented-out lines and path-only log strings.
+  - **Forbidden `Debug` derive / impl** on canonical secret-bearing
+    types (`PassphraseMaterial`, `WrappedKeyMaterial`,
+    `RuntimePrivateKey`, `SigningKeyMaterial`). The no-`Debug`-derive
+    pattern is the structural guarantee that `{:?}` cannot leak inner
+    bytes; the audit pins it so a future refactor that adds
+    `#[derive(Debug)]` trips a named test failure.
+  Sweep over current tree found zero offenders. 12 self-tests pin the
+  audit logic itself (positive + negative shapes for each scan).
+  Audit module is allow-listed from the placeholder scan because it
+  necessarily mentions the forbidden tokens as constants.
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 

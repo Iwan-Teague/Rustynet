@@ -23,6 +23,7 @@ pub mod platform;
 pub mod privileged_helper;
 pub mod relay_client;
 pub mod resilience;
+pub mod secret_log_audit;
 pub mod stun_client;
 pub mod traversal;
 pub mod windows_authenticode;
