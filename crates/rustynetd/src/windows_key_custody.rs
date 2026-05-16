@@ -534,6 +534,237 @@ mod tests {
         ));
     }
 
+    // ---- W6: DPAPI LocalMachine rotation tests ----------------------
+
+    /// Helper: produce a reviewed DPAPI blob ACL — service-SID owner,
+    /// LocalSystem and BUILTIN\Administrators granted, protected DACL.
+    fn reviewed_dpapi_sddl() -> &'static str {
+        "O:S-1-5-80-1234567890D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+    }
+
+    /// Helper: produce an entry as if a rotation just replaced the
+    /// passphrase blob — same path, same ACL shape, fresh DPAPI bytes
+    /// (the verifier only checks shape, not content).
+    fn rotated_passphrase_entry() -> WindowsKeyCustodyEntry {
+        WindowsKeyCustodyEntry {
+            label: "wg key passphrase blob".to_string(),
+            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
+            requirement: REQUIREMENT_PRESENT.to_string(),
+            status: WindowsKeyCustodyEntryStatus::Ok {
+                acl_sddl: reviewed_dpapi_sddl().to_string(),
+            },
+        }
+    }
+
+    /// Rotation success path: post-rotation snapshot with all three
+    /// secret blobs present + reviewed ACLs and the plaintext-key path
+    /// still absent. Must validate.
+    #[test]
+    fn evaluator_accepts_post_rotation_snapshot_with_reviewed_acls() {
+        let entries = vec![
+            rotated_passphrase_entry(),
+            ok_entry("wg encrypted private key"),
+            ok_entry("wg public key"),
+            absent_forbidden_entry("wg plaintext runtime private key"),
+        ];
+        evaluate_windows_key_custody(&entries)
+            .expect("rotated blob with reviewed ACL must validate");
+    }
+
+    /// Rotation that lost the protected-DACL bit: the new file landed
+    /// with a non-protected DACL ("D:" without "D:P"). For a regular
+    /// secret-blob *file* the helper does NOT require D:P (file-level
+    /// non-protected DACLs are tolerated as long as no forbidden
+    /// principal is granted), but any forbidden well-known principal
+    /// on the rotated file must still fail. Pin both cases.
+    #[test]
+    fn evaluator_rejects_rotation_with_world_writable_principal() {
+        let entries = vec![
+            WindowsKeyCustodyEntry {
+                label: "wg key passphrase blob".to_string(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
+                requirement: REQUIREMENT_PRESENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Invalid {
+                    reason: "ACL drift: world-writable principal (Everyone) on rotated blob"
+                        .to_string(),
+                    acl_sddl: "O:S-1-5-80-1234567890D:(A;;FA;;;WD)".to_string(),
+                },
+            },
+            ok_entry("wg encrypted private key"),
+            ok_entry("wg public key"),
+            absent_forbidden_entry("wg plaintext runtime private key"),
+        ];
+        let reasons = evaluate_windows_key_custody(&entries)
+            .expect_err("world-writable post-rotation must fail");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("wg key passphrase blob invalid")
+                    && r.contains("world-writable")),
+            "post-rotation world-writable must surface: {reasons:?}"
+        );
+    }
+
+    /// Rotation that broke ownership: the rotator process ran as a
+    /// user other than the service SID, so the new file's owner is
+    /// wrong. Even with a clean DACL this is drift — the service-SID
+    /// principal is part of the reviewed contract.
+    #[test]
+    fn evaluator_rejects_rotation_with_unreviewed_owner() {
+        let entries = vec![
+            WindowsKeyCustodyEntry {
+                label: "wg key passphrase blob".to_string(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
+                requirement: REQUIREMENT_PRESENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Invalid {
+                    reason: "owner drift: rotation completed as wrong principal".to_string(),
+                    acl_sddl: "O:S-1-5-21-1111-2222-3333-1001D:P(A;;FA;;;SY)".to_string(),
+                },
+            },
+            ok_entry("wg encrypted private key"),
+            ok_entry("wg public key"),
+            absent_forbidden_entry("wg plaintext runtime private key"),
+        ];
+        let reasons = evaluate_windows_key_custody(&entries)
+            .expect_err("wrong owner post-rotation must fail");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("wg key passphrase blob invalid") && r.contains("owner drift")),
+            "owner-drift must surface: {reasons:?}"
+        );
+    }
+
+    /// Partial rotation: passphrase blob rotated successfully but the
+    /// encrypted-key path is mid-rotation and reported `Missing`. Even
+    /// though one entry is fresh, the partial state must fail-closed —
+    /// a half-rotated key set cannot unwrap the runtime key.
+    #[test]
+    fn evaluator_rejects_partial_rotation_with_missing_encrypted_key() {
+        let entries = vec![
+            rotated_passphrase_entry(),
+            WindowsKeyCustodyEntry {
+                label: "wg encrypted private key".to_string(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.key.enc".to_string(),
+                requirement: REQUIREMENT_PRESENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Missing {
+                    reason: "atomic rename mid-rotation; file briefly missing".to_string(),
+                },
+            },
+            ok_entry("wg public key"),
+            absent_forbidden_entry("wg plaintext runtime private key"),
+        ];
+        let reasons =
+            evaluate_windows_key_custody(&entries).expect_err("partial rotation must fail-closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("wg encrypted private key missing")),
+            "missing post-rotation must surface: {reasons:?}"
+        );
+    }
+
+    /// Rotation that left the plaintext-key path populated (e.g. the
+    /// rotation tool wrote the unwrapped key to disk by mistake). The
+    /// forbidden-artifact-present case is a Phase-E migration violator
+    /// at any moment, but is especially likely as a transient artifact
+    /// during a buggy rotation.
+    #[test]
+    fn evaluator_rejects_rotation_that_left_plaintext_key_present() {
+        let entries = vec![
+            rotated_passphrase_entry(),
+            ok_entry("wg encrypted private key"),
+            ok_entry("wg public key"),
+            WindowsKeyCustodyEntry {
+                label: "wg plaintext runtime private key".to_string(),
+                path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_string(),
+                requirement: REQUIREMENT_ABSENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Forbidden {
+                    reason: "rotation tool dropped a plaintext key by mistake".to_string(),
+                },
+            },
+        ];
+        let reasons =
+            evaluate_windows_key_custody(&entries).expect_err("plaintext at rest must fail-closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("wg plaintext runtime private key")
+                    && r.contains("present but must be absent")),
+            "post-rotation plaintext-at-rest must surface: {reasons:?}"
+        );
+    }
+
+    /// Rotation atomicity: simulate a multi-stage rotation that flips
+    /// only the passphrase blob to a fresh DPAPI ciphertext but leaves
+    /// the encrypted-key blob still under the OLD passphrase. The
+    /// custody verifier cannot detect crypto-content mismatch (that
+    /// would require attempting an unwrap), but it CAN catch the
+    /// mode/ACL drift that often accompanies a partial rotation, e.g.
+    /// the passphrase blob ending with a non-reviewed extension after
+    /// the rotation tool wrote a `.dpapi.tmp` and forgot to rename.
+    #[test]
+    fn evaluator_rejects_rotation_with_temp_suffix_extension_drift() {
+        let entries = vec![
+            WindowsKeyCustodyEntry {
+                label: "wg key passphrase blob".to_string(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi.tmp".to_string(),
+                requirement: REQUIREMENT_PRESENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Invalid {
+                    reason: "extension drift: post-rotation file ends with .dpapi.tmp not .dpapi"
+                        .to_string(),
+                    acl_sddl: reviewed_dpapi_sddl().to_string(),
+                },
+            },
+            ok_entry("wg encrypted private key"),
+            ok_entry("wg public key"),
+            absent_forbidden_entry("wg plaintext runtime private key"),
+        ];
+        let reasons = evaluate_windows_key_custody(&entries)
+            .expect_err("post-rotation temp-suffix must fail-closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("wg key passphrase blob invalid")
+                    && r.contains("extension drift")),
+            "rotation temp-suffix must surface: {reasons:?}"
+        );
+    }
+
+    /// LocalMachine scope marker: a reviewed DPAPI-protected blob's
+    /// SDDL exposes ONLY service-SID + SY + BA principals. If a future
+    /// refactor accidentally widens the DACL to include
+    /// Authenticated Users (AU), the verifier must catch it — that
+    /// shape grants any logged-on user read access to the encrypted
+    /// blob and breaks the LocalMachine-scope assumption.
+    #[test]
+    fn evaluator_rejects_rotation_that_widened_dacl_to_authenticated_users() {
+        let entries = vec![
+            WindowsKeyCustodyEntry {
+                label: "wg key passphrase blob".to_string(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
+                requirement: REQUIREMENT_PRESENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Invalid {
+                    reason: "ACL drift: rotation tool added Authenticated Users (AU) to DACL"
+                        .to_string(),
+                    acl_sddl: "O:S-1-5-80-1234567890D:P(A;;FA;;;SY)(A;;FR;;;AU)".to_string(),
+                },
+            },
+            ok_entry("wg encrypted private key"),
+            ok_entry("wg public key"),
+            absent_forbidden_entry("wg plaintext runtime private key"),
+        ];
+        let reasons =
+            evaluate_windows_key_custody(&entries).expect_err("AU-widened DACL must fail-closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("wg key passphrase blob invalid")
+                    && r.contains("Authenticated Users")),
+            "AU-widened DACL must surface: {reasons:?}"
+        );
+    }
+
     #[test]
     fn snapshot_serializes_with_status_tag_and_round_trips() {
         let report = WindowsKeyCustodyReport {

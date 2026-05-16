@@ -29,6 +29,16 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 pub const REVIEWED_RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+/// Marker file written by systemd-resolved when its loopback stub
+/// (127.0.0.53:53) is active. Reading the file does not require
+/// systemctl / dbus and is cheap to probe.
+pub const SYSTEMD_RESOLVED_STUB_FILE: &str = "/run/systemd/resolve/stub-resolv.conf";
+/// NetworkManager configuration file. The `[main] dns=` key selects
+/// whether NM writes `/etc/resolv.conf` directly (`default`), defers
+/// to dnsmasq on loopback (`dnsmasq`), defers to systemd-resolved
+/// (`systemd-resolved`), or stays out of resolver management
+/// (`none`).
+pub const NETWORK_MANAGER_CONF_PATH: &str = "/etc/NetworkManager/NetworkManager.conf";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinuxDnsFailclosedSnapshot {
@@ -44,6 +54,20 @@ pub struct LinuxDnsFailclosedSnapshot {
     /// env-var contract; this snapshot field is a placeholder for a
     /// future probe of the actual listening socket.
     pub loopback_resolver_advertised: bool,
+    /// L4 race-shape coverage: presence of the systemd-resolved stub
+    /// marker file. When the stub is active, the rustynet resolver
+    /// cannot bind 127.0.0.53:53; the evaluator surfaces this as a
+    /// fail-closed advisory so the operator sees the race shape
+    /// before the daemon's bind attempt fails.
+    #[serde(default)]
+    pub systemd_resolved_stub_present: bool,
+    /// L4 race-shape coverage: NetworkManager `[main] dns=` value, or
+    /// `None` if NetworkManager isn't configured on this host. The
+    /// evaluator flags `default` (NM writes resolv.conf directly) as
+    /// precedence drift because NM can overwrite /etc/resolv.conf at
+    /// any link change and reintroduce off-loopback nameservers.
+    #[serde(default)]
+    pub network_manager_dns_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +115,72 @@ pub fn evaluate_linux_dns_failclosed_snapshot(
             }
         }
     }
+    evaluate_systemd_resolved_race(snapshot, &mut reasons);
+    evaluate_network_manager_precedence(snapshot, &mut reasons);
     reasons
+}
+
+/// L4 race coverage: surface the systemd-resolved socket-race shape.
+/// When the systemd-resolved stub marker is present and any reviewed
+/// nameserver entry is `127.0.0.53` (the stub), the rustynet resolver
+/// will not be able to bind that address — the operator needs to know
+/// the daemon's resolver socket claim will race against systemd-
+/// resolved at startup.
+fn evaluate_systemd_resolved_race(
+    snapshot: &LinuxDnsFailclosedSnapshot,
+    reasons: &mut Vec<String>,
+) {
+    if !snapshot.systemd_resolved_stub_present {
+        return;
+    }
+    let stub_nameserver_present = snapshot
+        .nameservers
+        .iter()
+        .any(|n| n.trim() == "127.0.0.53");
+    if stub_nameserver_present {
+        reasons.push(format!(
+            "systemd-resolved stub is active (marker file {} present) and 127.0.0.53 \
+             appears in {}; the rustynet resolver cannot bind 127.0.0.53:53 while \
+             systemd-resolved holds it — stop systemd-resolved.service or bind the \
+             rustynet resolver to a distinct loopback address",
+            SYSTEMD_RESOLVED_STUB_FILE, snapshot.resolv_conf_path
+        ));
+    }
+}
+
+/// L4 race coverage: surface NetworkManager precedence drift. The
+/// only modes that are fail-closed compatible are `none` (NM stays
+/// out of resolver state) and `systemd-resolved` / `dnsmasq` (both
+/// keep the resolver on loopback). `default` means NM writes
+/// `/etc/resolv.conf` directly and can reintroduce off-loopback
+/// nameservers on any link change, so it must be flagged.
+fn evaluate_network_manager_precedence(
+    snapshot: &LinuxDnsFailclosedSnapshot,
+    reasons: &mut Vec<String>,
+) {
+    let Some(mode) = snapshot.network_manager_dns_mode.as_deref() else {
+        return;
+    };
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "none" | "systemd-resolved" | "dnsmasq" => {}
+        "default" | "" => {
+            reasons.push(format!(
+                "NetworkManager [main] dns={mode:?} mode at {} writes /etc/resolv.conf \
+                 directly and can reintroduce off-loopback nameservers on any link \
+                 change; set dns=none (or dns=systemd-resolved / dns=dnsmasq) to keep \
+                 the resolver loopback-only",
+                NETWORK_MANAGER_CONF_PATH
+            ));
+        }
+        other => {
+            reasons.push(format!(
+                "NetworkManager [main] dns={other:?} mode at {} is not on the reviewed \
+                 fail-closed list (none|systemd-resolved|dnsmasq); cannot confirm \
+                 resolver stays loopback-only",
+                NETWORK_MANAGER_CONF_PATH
+            ));
+        }
+    }
 }
 
 fn is_loopback_address(addr: &IpAddr) -> bool {
@@ -174,6 +263,8 @@ fn collect_linux_dns_failclosed_snapshot_inner() -> LinuxDnsFailclosedSnapshot {
                 // 127.0.0.1; the snapshot field stays a contract
                 // marker until a future slice probes the live socket.
                 loopback_resolver_advertised: true,
+                systemd_resolved_stub_present: probe_systemd_resolved_stub_present(),
+                network_manager_dns_mode: probe_network_manager_dns_mode(),
             };
         }
     };
@@ -184,6 +275,8 @@ fn collect_linux_dns_failclosed_snapshot_inner() -> LinuxDnsFailclosedSnapshot {
         nameservers,
         search_domains,
         loopback_resolver_advertised: true,
+        systemd_resolved_stub_present: probe_systemd_resolved_stub_present(),
+        network_manager_dns_mode: probe_network_manager_dns_mode(),
     }
 }
 
@@ -195,7 +288,67 @@ fn collect_linux_dns_failclosed_snapshot_inner() -> LinuxDnsFailclosedSnapshot {
         nameservers: Vec::new(),
         search_domains: Vec::new(),
         loopback_resolver_advertised: false,
+        systemd_resolved_stub_present: false,
+        network_manager_dns_mode: None,
     }
+}
+
+/// Cheap race-probe: presence of systemd-resolved's stub marker file.
+/// File-read only, no shell-out, no privileged syscall.
+#[cfg(target_os = "linux")]
+fn probe_systemd_resolved_stub_present() -> bool {
+    std::path::Path::new(SYSTEMD_RESOLVED_STUB_FILE).exists()
+}
+
+/// Parse NetworkManager.conf's `[main] dns=` value. Returns `None`
+/// when the file is absent or the key is not set. The parser is
+/// minimal: it walks lines, tracks the current `[section]`, and
+/// extracts `dns=<value>` inside `[main]`.
+#[cfg(target_os = "linux")]
+fn probe_network_manager_dns_mode() -> Option<String> {
+    let body = std::fs::read_to_string(NETWORK_MANAGER_CONF_PATH).ok()?;
+    parse_network_manager_dns_mode(body.as_str())
+}
+
+/// Pure parser for NetworkManager.conf `[main] dns=` value. Exposed
+/// (crate-visible) so tests can pin the parser shape without touching
+/// the filesystem.
+#[allow(dead_code)]
+pub(crate) fn parse_network_manager_dns_mode(body: &str) -> Option<String> {
+    let mut section: Option<String> = None;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            if let Some(name) = rest.strip_suffix(']') {
+                section = Some(name.trim().to_ascii_lowercase());
+            }
+            continue;
+        }
+        if section.as_deref() != Some("main") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("dns") {
+            let after_key = rest.trim_start();
+            if let Some(after_eq) = after_key.strip_prefix('=') {
+                let value = after_eq.trim();
+                // Strip trailing inline comments.
+                let value = match value.find(['#', ';']) {
+                    Some(idx) => value[..idx].trim(),
+                    None => value,
+                };
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -209,6 +362,8 @@ mod tests {
             nameservers: vec!["127.0.0.1".to_string(), "::1".to_string()],
             search_domains: vec!["rustynet".to_string()],
             loopback_resolver_advertised: true,
+            systemd_resolved_stub_present: false,
+            network_manager_dns_mode: None,
         }
     }
 
@@ -287,6 +442,8 @@ domain example.lan
             nameservers: Vec::new(),
             search_domains: Vec::new(),
             loopback_resolver_advertised: true,
+            systemd_resolved_stub_present: false,
+            network_manager_dns_mode: None,
         };
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
@@ -571,6 +728,8 @@ nameserver 127.0.0.1
             nameservers: ns,
             search_domains: Vec::new(),
             loopback_resolver_advertised: true,
+            systemd_resolved_stub_present: false,
+            network_manager_dns_mode: None,
         });
         assert!(
             reasons.iter().any(|r| r.contains("not a parseable IP")),
@@ -587,6 +746,216 @@ nameserver 127.0.0.1
         assert_eq!(
             report.schema_version, 1,
             "schema_version bump must be deliberate"
+        );
+    }
+
+    // ---- L4 race coverage: systemd-resolved socket race --------------
+
+    /// Stub-active + 127.0.0.53 in resolv.conf → race shape: rustynet
+    /// cannot claim 127.0.0.53:53 while systemd-resolved holds it.
+    #[test]
+    fn evaluator_flags_systemd_resolved_stub_race_when_127_0_0_53_present() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["127.0.0.53".to_string()];
+        snap.systemd_resolved_stub_present = true;
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("systemd-resolved stub is active") && r.contains("127.0.0.53")),
+            "systemd-resolved race must surface: {reasons:?}"
+        );
+    }
+
+    /// Stub-active but resolv.conf points to a different loopback
+    /// address (e.g. 127.0.0.1, the rustynet resolver) → no race.
+    /// The stub is running but rustynet is binding a different
+    /// loopback IP, so the daemon can coexist with systemd-resolved.
+    #[test]
+    fn evaluator_accepts_stub_active_when_resolver_uses_distinct_loopback() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["127.0.0.1".to_string()];
+        snap.systemd_resolved_stub_present = true;
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.is_empty(),
+            "distinct-loopback case must pass: {reasons:?}"
+        );
+    }
+
+    /// Stub-not-active + 127.0.0.53 in resolv.conf → still flagged as
+    /// stale config (the stub address is in resolv.conf without an
+    /// active stub), BUT only by the loopback evaluator's existing
+    /// path. The race-detection logic itself stays quiet because the
+    /// race condition (concurrent bind) does not exist when the stub
+    /// is not running. Pin this so the race detector does not produce
+    /// a false positive when systemd-resolved has been disabled.
+    #[test]
+    fn evaluator_silent_on_race_when_stub_marker_file_absent() {
+        let mut snap = loopback_only_snapshot();
+        snap.nameservers = vec!["127.0.0.53".to_string()];
+        snap.systemd_resolved_stub_present = false;
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.contains("systemd-resolved stub is active")),
+            "race detector must stay quiet when stub absent: {reasons:?}"
+        );
+    }
+
+    // ---- L4 race coverage: NetworkManager precedence -----------------
+
+    /// `dns=none` is fail-closed-compatible: NetworkManager stays out
+    /// of resolver state, so rustynet's loopback resolver is safe.
+    #[test]
+    fn evaluator_accepts_network_manager_dns_none() {
+        let mut snap = loopback_only_snapshot();
+        snap.network_manager_dns_mode = Some("none".to_string());
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(reasons.is_empty(), "dns=none must pass: {reasons:?}");
+    }
+
+    /// `dns=systemd-resolved` is fail-closed-compatible: NM delegates
+    /// to the stub on loopback.
+    #[test]
+    fn evaluator_accepts_network_manager_dns_systemd_resolved() {
+        let mut snap = loopback_only_snapshot();
+        snap.network_manager_dns_mode = Some("systemd-resolved".to_string());
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.is_empty(),
+            "dns=systemd-resolved must pass: {reasons:?}"
+        );
+    }
+
+    /// `dns=dnsmasq` is fail-closed-compatible: NM runs dnsmasq on
+    /// loopback as the resolver. Pin so a future tightening doesn't
+    /// accidentally reject it.
+    #[test]
+    fn evaluator_accepts_network_manager_dns_dnsmasq() {
+        let mut snap = loopback_only_snapshot();
+        snap.network_manager_dns_mode = Some("dnsmasq".to_string());
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(reasons.is_empty(), "dns=dnsmasq must pass: {reasons:?}");
+    }
+
+    /// `dns=default` lets NetworkManager rewrite `/etc/resolv.conf`
+    /// directly on every link change — that can reintroduce
+    /// off-loopback nameservers at runtime. Flag as drift.
+    #[test]
+    fn evaluator_flags_network_manager_dns_default_precedence_drift() {
+        let mut snap = loopback_only_snapshot();
+        snap.network_manager_dns_mode = Some("default".to_string());
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("NetworkManager") && r.contains("default")),
+            "dns=default must surface as drift: {reasons:?}"
+        );
+    }
+
+    /// Empty `dns=` value (operator forgot to set it) is equivalent to
+    /// `default` — NM falls back to direct resolv.conf rewrites. Flag.
+    #[test]
+    fn evaluator_flags_network_manager_dns_empty_value_as_default() {
+        let mut snap = loopback_only_snapshot();
+        snap.network_manager_dns_mode = Some(String::new());
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons.iter().any(|r| r.contains("NetworkManager")),
+            "empty dns= must surface: {reasons:?}"
+        );
+    }
+
+    /// Unknown `dns=` value (operator typo, new NM backend) must
+    /// fail-closed: the verifier cannot confirm loopback safety for
+    /// an unrecognized backend.
+    #[test]
+    fn evaluator_flags_unknown_network_manager_dns_value() {
+        let mut snap = loopback_only_snapshot();
+        snap.network_manager_dns_mode = Some("unbound".to_string());
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("not on the reviewed fail-closed list")),
+            "unknown dns= mode must surface: {reasons:?}"
+        );
+    }
+
+    /// `None` (NetworkManager.conf absent or `[main] dns=` not set)
+    /// must stay quiet — many hosts don't run NM at all and the
+    /// verifier shouldn't penalize that case.
+    #[test]
+    fn evaluator_silent_on_network_manager_when_mode_unset() {
+        let mut snap = loopback_only_snapshot();
+        snap.network_manager_dns_mode = None;
+        let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
+        assert!(
+            !reasons.iter().any(|r| r.contains("NetworkManager")),
+            "absent NM config must not surface: {reasons:?}"
+        );
+    }
+
+    // ---- L4 parser coverage for NetworkManager.conf ------------------
+
+    #[test]
+    fn nm_parser_returns_none_when_dns_key_absent() {
+        let body = "[main]\nplugins=keyfile\n";
+        assert_eq!(parse_network_manager_dns_mode(body), None);
+    }
+
+    #[test]
+    fn nm_parser_extracts_value_from_main_section() {
+        let body = "[main]\nplugins=keyfile\ndns=systemd-resolved\n";
+        assert_eq!(
+            parse_network_manager_dns_mode(body),
+            Some("systemd-resolved".to_string())
+        );
+    }
+
+    #[test]
+    fn nm_parser_ignores_dns_outside_main_section() {
+        // dns= under [logging] is not the resolver mode; ignore.
+        let body = "[logging]\ndns=trace\n[main]\nplugins=keyfile\n";
+        assert_eq!(parse_network_manager_dns_mode(body), None);
+    }
+
+    #[test]
+    fn nm_parser_strips_inline_comment_after_value() {
+        let body = "[main]\ndns=none # explicit fail-closed\n";
+        assert_eq!(
+            parse_network_manager_dns_mode(body),
+            Some("none".to_string())
+        );
+    }
+
+    #[test]
+    fn nm_parser_tolerates_whitespace_around_equals() {
+        let body = "[main]\ndns =  dnsmasq\n";
+        assert_eq!(
+            parse_network_manager_dns_mode(body),
+            Some("dnsmasq".to_string())
+        );
+    }
+
+    #[test]
+    fn nm_parser_ignores_hash_and_semicolon_comments() {
+        let body = "# comment\n; comment\n[main]\ndns=none\n";
+        assert_eq!(
+            parse_network_manager_dns_mode(body),
+            Some("none".to_string())
+        );
+    }
+
+    #[test]
+    fn nm_parser_handles_section_case_insensitively() {
+        let body = "[Main]\ndns=none\n";
+        assert_eq!(
+            parse_network_manager_dns_mode(body),
+            Some("none".to_string())
         );
     }
 }
