@@ -427,10 +427,17 @@ inline. Cross-reference with:
 
 ### X7. CI gate enhancements
 
-* `[ ]` Add per-platform regression-coverage gates: a script that for
-  each of {linux, windows} runs the platform-specific `*_drift_*`
-  tests and fails closed on missing fixtures or test counts below a
-  pinned floor.
+* `[x]` Commit 255cff4 follow-up: `scripts/ci/regression_coverage_gates.sh`
+  runs each platform-specific verifier module's tests and asserts the
+  passing-test count is at least the pinned floor. 11 modules pinned
+  today: 6 Linux (`linux_runtime_acls`, `linux_service_hardening`,
+  `linux_dns_failclosed`, `linux_mesh_status`, `linux_key_custody`,
+  `linux_authenticode`) + 5 Windows (`windows_service_hardening`,
+  `windows_dns_failclosed`, `windows_mesh_status`, `windows_key_custody`,
+  `windows_authenticode`). Floors set to current pass counts so any
+  refactor that silently removes a drift-test group trips a named
+  failure. `--platform linux|windows|all` flag scopes to one group.
+  Exit code taxonomy: 0 ok / 1 floor breach / 64 bad args.
 
 ---
 
