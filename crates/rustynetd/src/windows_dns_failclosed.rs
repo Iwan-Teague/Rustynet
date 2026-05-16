@@ -635,4 +635,190 @@ mod tests {
         let parsed: WindowsDnsFailclosedReport = serde_json::from_str(&json).expect("parse report");
         assert_eq!(parsed, report);
     }
+
+    // ---- W3: IPv6 NRPT coverage --------------------------------------
+
+    /// IPv6 loopback `::1` is a valid NRPT name-server target. A
+    /// Windows host whose mesh resolver listens on `::1` should be
+    /// allowed to declare a root NRPT rule with `::1` only.
+    #[test]
+    fn evaluator_accepts_ipv6_loopback_only_root_nrpt_rule() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["::1".to_string()];
+        evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect("IPv6 loopback ::1 must be acceptable as a root NRPT name server");
+    }
+
+    /// Long-form `0:0:0:0:0:0:0:1` is the same loopback address as
+    /// `::1`. Pin acceptance so a parser refactor that narrows to the
+    /// short form doesn't silently relax behavior.
+    #[test]
+    fn evaluator_accepts_ipv6_loopback_long_form_in_nrpt_rule() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["0:0:0:0:0:0:0:1".to_string()];
+        evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect("long-form IPv6 loopback must be acceptable in NRPT");
+    }
+
+    /// Mixed loopback set — IPv4 + IPv6 — both qualify as loopback so
+    /// a dual-stack rule must be accepted. Mirrors the dual-listener
+    /// case where the daemon binds both `127.0.0.1` and `::1`.
+    #[test]
+    fn evaluator_accepts_dual_stack_loopback_nrpt_rule() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["127.0.0.1".to_string(), "::1".to_string()];
+        evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect("dual-stack loopback NRPT must be acceptable");
+    }
+
+    /// IPv6 link-local `fe80::1` is NOT loopback — any NRPT rule that
+    /// forwards to a link-local resolver leaks queries to whatever is
+    /// listening on the link. Reject.
+    #[test]
+    fn evaluator_rejects_ipv6_link_local_nrpt_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["fe80::1".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv6 link-local NRPT name server must fail closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("non-loopback name server fe80::1")),
+            "rejection must name link-local entry: {reasons:?}"
+        );
+        // Missing-root-coverage drift must also surface because the
+        // root rule is no longer covered by loopback-only servers.
+        assert!(
+            reasons.iter().any(|r| r.contains("root namespace")),
+            "missing-root coverage must surface: {reasons:?}"
+        );
+    }
+
+    /// IPv6 unspecified `::` would mean "any source" — not loopback.
+    /// Reject as a non-loopback resolver address.
+    #[test]
+    fn evaluator_rejects_ipv6_unspecified_nrpt_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["::".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv6 unspecified :: must fail closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("non-loopback name server ::")),
+            "rejection must name unspecified entry: {reasons:?}"
+        );
+    }
+
+    /// IPv6 external `2606:4700:4700::1111` (Cloudflare's quad-1
+    /// equivalent) is a public resolver. Reject.
+    #[test]
+    fn evaluator_rejects_ipv6_external_nrpt_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["2606:4700:4700::1111".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv6 external NRPT name server must fail closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("non-loopback name server 2606:4700:4700::1111")),
+            "rejection must name external entry: {reasons:?}"
+        );
+    }
+
+    /// IPv6 multicast `ff02::1` is "all-nodes" on the local link — a
+    /// resolver pointed there spits queries at every neighbor. Reject.
+    #[test]
+    fn evaluator_rejects_ipv6_multicast_nrpt_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["ff02::1".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv6 multicast NRPT name server must fail closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("non-loopback name server ff02::1")),
+            "rejection must name multicast entry: {reasons:?}"
+        );
+    }
+
+    /// IPv4-mapped IPv6 `::ffff:8.8.8.8` is the v6 representation of
+    /// a v4 external resolver — must reject like the v4 form.
+    #[test]
+    fn evaluator_rejects_ipv4_mapped_external_nrpt_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["::ffff:8.8.8.8".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv4-mapped external NRPT name server must fail closed");
+        assert!(
+            reasons.iter().any(|r| r.contains("non-loopback")),
+            "rejection must surface IPv4-mapped external: {reasons:?}"
+        );
+    }
+
+    /// Mixed loopback + external in the same NRPT rule: every entry
+    /// must be loopback. A single off-loopback entry breaks the
+    /// uniformity guarantee — even if the rule has a 127.0.0.1 server
+    /// first, the second non-loopback entry leaks any query that
+    /// Windows happens to forward to the second server.
+    #[test]
+    fn evaluator_rejects_mixed_loopback_plus_external_ipv6_in_nrpt_rule() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers =
+            vec!["::1".to_string(), "2606:4700:4700::1111".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("mixed loopback+external IPv6 NRPT must fail closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("non-loopback name server 2606:4700:4700::1111")),
+            "rejection must name the off-loopback entry: {reasons:?}"
+        );
+        // Root-coverage must also fail because not all servers are
+        // loopback.
+        assert!(
+            reasons.iter().any(|r| r.contains("root namespace")),
+            "root-namespace coverage must fail when any entry is off-loopback: {reasons:?}"
+        );
+    }
+
+    /// Non-root NRPT rule with IPv6 external name server: the rule's
+    /// drift surfaces, AND the missing-root drift does NOT surface
+    /// because the root rule is still clean.
+    #[test]
+    fn evaluator_rejects_secondary_ipv6_external_nrpt_rule_only_for_that_rule() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules.push(WindowsNrptRule {
+            name: "{rustynet-mesh-rule}".to_string(),
+            namespace: vec![".mesh.local".to_string()],
+            name_servers: vec!["2606:4700:4700::1111".to_string()],
+        });
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("secondary IPv6 external rule must fail closed");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("non-loopback name server 2606:4700:4700::1111")),
+            "rejection must name the off-loopback entry: {reasons:?}"
+        );
+        // Root coverage must NOT trip because the original root rule
+        // is still loopback-only.
+        assert!(
+            !reasons.iter().any(|r| r.contains("root namespace")),
+            "root-namespace must not regress when only a secondary rule drifts: {reasons:?}"
+        );
+    }
+
+    /// Root NRPT rule covers root via IPv6 loopback only — explicitly
+    /// pin that the root-coverage check accepts an `::1`-only root.
+    #[test]
+    fn evaluator_accepts_root_covered_by_ipv6_loopback_only() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules[0].name_servers = vec!["::1".to_string()];
+        // Root-coverage helper is exercised indirectly via the public
+        // evaluator: a clean evaluation proves the rule still covers
+        // the `.` namespace.
+        evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect("root rule with ::1-only must qualify as covered");
+    }
 }
