@@ -76,8 +76,52 @@ const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("rustynetd startup failed: {err}");
-        std::process::exit(1);
+        // Map the error to a reviewed exit-code bucket per the X6
+        // taxonomy. Today the daemon's top-level run() returns a
+        // String for every failure shape, so we classify by content;
+        // a future refactor that returns a typed error can switch
+        // this to a direct enum match.
+        let code = classify_top_level_error(&err);
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("rustynetd startup failed: {err}");
+        } else {
+            eprintln!("rustynetd startup failed [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
+    }
+}
+
+/// Classify a top-level startup error into the reviewed exit-code
+/// taxonomy. Used by `main` to translate the daemon's stringly-typed
+/// error to a numeric exit code shells can branch on.
+fn classify_top_level_error(message: &str) -> rustynetd::exit_codes::ExitCode {
+    use rustynetd::exit_codes::ExitCode;
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("rustynetd usage")
+        || lower.contains("unknown subcommand")
+        || lower.contains("missing required")
+        || lower.starts_with("usage:")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("fail-closed")
+        || lower.contains("policy reject")
+        || lower.contains("signature verification")
+        || lower.contains("reviewed root")
+        || lower.contains("not reviewed")
+    {
+        ExitCode::PolicyReject
+    } else if lower.contains("config") || lower.contains("invalid path") || lower.contains("schema")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("connection refused")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("timed out")
+        || lower.contains("retry")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
     }
 }
 
@@ -2528,11 +2572,11 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        help_text, parse_daemon_config, run_windows_authenticode_check_command,
-        run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
-        run_windows_key_custody_check_command, run_windows_killswitch_assert_command,
-        run_windows_mesh_status_check_command, run_windows_runtime_acls_check_command,
-        run_windows_service_hardening_check_command,
+        classify_top_level_error, help_text, parse_daemon_config,
+        run_windows_authenticode_check_command, run_windows_backend_readiness_check_command,
+        run_windows_dns_failclosed_check_command, run_windows_key_custody_check_command,
+        run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
+        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -3396,5 +3440,85 @@ mod tests {
             pub_path.ends_with(".pub"),
             "pub key path must end with .pub: {pub_path}"
         );
+    }
+
+    // ---- X6: classify_top_level_error coverage --------------------------
+
+    #[test]
+    fn classify_top_level_error_maps_usage_text_to_bad_args() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_top_level_error("rustynetd usage:\n  rustynetd daemon …"),
+            ExitCode::BadArgs
+        );
+        assert_eq!(
+            classify_top_level_error("unknown subcommand 'foo'"),
+            ExitCode::BadArgs
+        );
+        assert_eq!(
+            classify_top_level_error("missing required value for --node-id"),
+            ExitCode::BadArgs
+        );
+    }
+
+    #[test]
+    fn classify_top_level_error_maps_signature_verification_to_policy_reject() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_top_level_error("signature verification failed for trust-evidence bundle"),
+            ExitCode::PolicyReject
+        );
+        assert_eq!(
+            classify_top_level_error("reviewed root check rejected /tmp/state"),
+            ExitCode::PolicyReject
+        );
+        assert_eq!(
+            classify_top_level_error("fail-closed gate refused operation"),
+            ExitCode::PolicyReject
+        );
+    }
+
+    #[test]
+    fn classify_top_level_error_maps_schema_to_config_error() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_top_level_error("config file at /etc/rustynet/daemon.env malformed"),
+            ExitCode::ConfigError
+        );
+        assert_eq!(
+            classify_top_level_error("invalid path /tmp/state for state file"),
+            ExitCode::ConfigError
+        );
+        assert_eq!(
+            classify_top_level_error("schema mismatch in assignment bundle"),
+            ExitCode::ConfigError
+        );
+    }
+
+    #[test]
+    fn classify_top_level_error_maps_io_failures_to_transient() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_top_level_error("connection refused on privileged helper socket"),
+            ExitCode::TransientFailure
+        );
+        assert_eq!(
+            classify_top_level_error("temporarily unavailable; retry after 30s"),
+            ExitCode::TransientFailure
+        );
+        assert_eq!(
+            classify_top_level_error("operation timed out after 5s"),
+            ExitCode::TransientFailure
+        );
+    }
+
+    #[test]
+    fn classify_top_level_error_falls_back_to_generic_failure() {
+        use rustynetd::exit_codes::ExitCode;
+        assert_eq!(
+            classify_top_level_error("some unknown failure"),
+            ExitCode::GenericFailure
+        );
+        assert_eq!(classify_top_level_error(""), ExitCode::GenericFailure);
     }
 }

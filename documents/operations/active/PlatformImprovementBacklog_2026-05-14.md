@@ -432,14 +432,35 @@ inline. Cross-reference with:
 
 ### X6. CLI ergonomics + exit-code taxonomy
 
-* `[ ]` Standardize exit codes across all `rustynet` / `rustynet-cli`
-  surfaces:
-  - `0` success
-  - `64` invalid input / bad CLI args
-  - `65` configuration error
-  - `70` transient / retry-safe failure
-  - `78` policy / fail-closed reject
-  Document the taxonomy in a runbook; thread through every entry point.
+* `[~]` Shared `rustynetd::exit_codes::ExitCode` enum landed
+  (commit pending). Six-variant taxonomy aligned with
+  `sysexits.h`: 0/`success`, 1/`generic_failure`, 64/`bad_args`,
+  65/`config_error`, 70/`transient_failure`, 78/`policy_reject`.
+  Each variant carries `as_i32()` + `label()` + `operator_hint()`
+  helpers plus a `Display` impl. Two top-level entry points use
+  the taxonomy today:
+  - `crates/rustynetd/src/main.rs` →
+    `classify_top_level_error` maps the startup-error string to a
+    taxonomy bucket and exits with the matching numeric code.
+  - `crates/rustynet-cli/src/main.rs` →
+    `classify_cli_error` maps `execute()` failures + adds an
+    operator-facing hint and a JSON `exit_code` / `exit_label`
+    pair when `--json` is in scope.
+  21 tests pin the contract: numeric values, label stability,
+  pairwise distinctness, sysexits.h alignment, operator-hint
+  retry-safety wording, plus per-classifier test coverage for both
+  entry points (bad args / policy reject / config / transient /
+  generic fallback / precedence ordering).
+* `[ ]` Runbook: `documents/operations/CliExitCodeTaxonomy.md`
+  documents the operator decision rules, the CI retry contract
+  (retry only on 70), and the systemd integration guidance
+  (`RestartPreventExitStatus=64 65 78`).
+* `[ ]` Remaining scope (separate slice): thread the taxonomy
+  through the ~60 individual bin/ binaries under
+  `crates/rustynet-cli/src/bin/`. Today they use legacy
+  `exit(1)`/`exit(0)` patterns — they still classify as
+  `generic_failure`, but a future slice should map each binary's
+  specific error shapes to the right bucket.
 
 ### X7. CI gate enhancements
 
