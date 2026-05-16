@@ -42,16 +42,50 @@ inline. Cross-reference with:
 
 ### L1. `start.sh` modularization (GAP-10)
 
-* `[ ]` Split `start.sh` into `scripts/start/common.sh`,
-  `scripts/start/linux.sh`, `scripts/start/macos.sh`. Keep shared policy
-  validation in the common layer.
-* Source: GAP-10 in
-  [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md).
-* Why: reduces blast radius when macOS-only patches accidentally break
-  Linux paths.
-* Acceptance: every existing start.sh integration test passes; nothing
-  changes in operator-visible behaviour; net file count grows but no
-  single file owns >40% of the prior surface.
+* `[~]` Scaffolding slice landed (commit pending). New
+  `scripts/start/` directory holds:
+  - `common.sh` — platform-agnostic helpers: `print_info`,
+    `print_warn`, `print_err`, `is_linux_host`, `is_macos_host`,
+    `path_in_linux_runtime_roots` (loop-based against a pinned
+    reviewed-roots list — replaces the inline four-prefix test),
+    `sanitize_macos_keychain_account`, plus crate-internal
+    `__rustynet_is_bool_token` / `__rustynet_canonical_bool` for
+    future env-rewriter calls.
+  - `linux.sh` — Linux-runtime scaffolds: reviewed systemd unit
+    constants pinned and `rustynet_linux_killswitch_programmed`
+    helper that wraps the new `linux-killswitch-boot-check`
+    subcommand from L8. Sourcing requires `common.sh` first; fails
+    fast if missing.
+  - `macos.sh` — macOS scaffolds: reviewed Keychain service
+    constants and `rustynet_macos_keychain_entry_exists` argv-only
+    helper for the `security` binary. Sourcing requires `common.sh`
+    first; fails fast if missing.
+  - `start.sh` sources all three modules with hard-fail on missing
+    `common.sh` (no inline-fallback that would defeat the audit
+    boundary). The duplicated inline helpers (`print_info` /
+    `print_warn` / `print_err` / `is_linux_host` / `is_macos_host` /
+    `path_in_linux_runtime_roots` / `sanitize_macos_keychain_account`)
+    are removed from start.sh and now live only in `common.sh`.
+  Operator-visible behaviour is unchanged: `./start.sh --help`
+  produces the same output, and the smoke gate
+  `scripts/ci/start_modularization_smoke.sh` runs `bash -n` on each
+  module, sources all three under both `HOST_OS=Linux` and
+  `HOST_OS=Darwin`, and pins the behaviour of
+  `path_in_linux_runtime_roots` (8 input shapes including
+  `/etc/rustynet-other/foo` boundary case and empty input) and
+  `sanitize_macos_keychain_account` (6 shapes including degenerate
+  all-bad-chars input). All checks pass today.
+* `[ ]` Remaining scope (separate slice): incrementally migrate the
+  larger platform-specific blocks from start.sh into the
+  per-platform modules:
+  - systemd-unit install / `run_root` calls → `linux.sh`
+  - launchd plist install / `pfctl` programming / Keychain
+    secret-store wiring → `macos.sh`
+  - `apply_host_profile_defaults` (currently a 40-line cond block in
+    start.sh) → split into `__linux_apply_profile_defaults` and
+    `__macos_apply_profile_defaults` in the respective modules
+  Each future migration adds another smoke-test check that pins
+  the migrated function's reviewed behaviour.
 
 ### L2. `linux_runtime_acls.rs` security-relevant drift coverage
 
