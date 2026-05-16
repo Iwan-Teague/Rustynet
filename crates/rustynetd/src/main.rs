@@ -185,6 +185,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "linux-key-custody-check" => {
                 run_linux_key_custody_check_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "linux-killswitch-boot-check" => {
+                run_linux_killswitch_boot_check_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "linux-authenticode-check" => {
                 run_linux_authenticode_check_command(rest)
             }
@@ -627,6 +630,48 @@ fn run_linux_authenticode_check_command(args: &[String]) -> Result<(), String> {
         serde_json::to_string_pretty(&report)
             .map_err(|err| format!("serialize linux authenticode report failed: {err}"))?
     );
+    Ok(())
+}
+
+fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String> {
+    use rustynetd::linux_killswitch_boot::collect_linux_killswitch_boot_report;
+    let mut fail_on_drift = true;
+    let mut iface_name: String = "rustynet0".to_string();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--iface") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--iface requires a value (e.g. --iface rustynet0)".to_string()
+                })?;
+                iface_name = value.clone();
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown linux-killswitch-boot-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_linux_killswitch_boot_report(iface_name.as_str());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize linux killswitch-boot report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "linux-killswitch-boot-check reported drift; the killswitch is not in a \
+             pre-up boot-time-safe state"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -2483,6 +2528,7 @@ fn help_text() -> String {
         "  rustynetd linux-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd linux-key-custody-check [--no-fail-on-drift]",
+        "  rustynetd linux-killswitch-boot-check [--iface <name>] [--no-fail-on-drift]",
         "  rustynetd linux-authenticode-check [--no-fail-on-drift]",
         "  rustynetd linux-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",

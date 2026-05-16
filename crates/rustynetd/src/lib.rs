@@ -10,6 +10,7 @@ pub mod key_material;
 pub mod linux_authenticode;
 pub mod linux_dns_failclosed;
 pub mod linux_key_custody;
+pub mod linux_killswitch_boot;
 pub mod linux_mesh_status;
 pub mod linux_runtime_acls;
 pub mod linux_service_hardening;

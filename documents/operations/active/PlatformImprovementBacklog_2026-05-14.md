@@ -190,12 +190,34 @@ inline. Cross-reference with:
 
 ### L8. Linux killswitch boot-time enforcement
 
-* `[ ]` Make sure the killswitch nftables rules apply *before* the
-  WireGuard interface comes up at boot; today the systemd-unit ordering
-  is mostly correct, but there's a small window where traffic could leak
-  if the unit is restarted.
-* Acceptance: integration test reboots a netns lab node and asserts no
-  unprotected egress packets observed in the bring-up window.
+* `[~]` Audit-only slice landed (commit pending). New
+  `rustynetd::linux_killswitch_boot` module + `rustynetd
+  linux-killswitch-boot-check` subcommand verify the boot-time
+  invariant: *if* the WireGuard tunnel interface is present in
+  `/sys/class/net`, the reviewed `inet rustynet` killswitch table
+  with chains `killswitch` and `forward` plus loopback + est/rel
+  rule fragments MUST be in place. The reverse case (table present,
+  iface absent) and the cold-boot pre-up window (both absent) pass.
+  Off-Linux the verifier sets `host_observable=false` and surfaces a
+  clear blocker rather than claiming overall_ok.
+  - Pure `evaluate_linux_killswitch_boot_snapshot` evaluator
+  - `parse_nft_ruleset_for_killswitch` text parser for `nft list
+    ruleset` output (no shelling out at test time)
+  - Off-host collector returns the unobservable-host snapshot
+  - 21 tests: clean / pre-boot / leak-window / missing chain x2 /
+    missing rule fragment x2 / chain-missing suppresses fragment
+    noise / aggregation / build-report / schema_version pin /
+    parser shapes including unrelated-table isolation / off-Linux
+    collector blocker / reviewed-list snapshot tests
+  - CLI: `rustynetd linux-killswitch-boot-check [--iface <name>]
+    [--no-fail-on-drift]`. Designed to be wired as `ExecStartPre=` on
+    the rustynetd unit and (future) on a `network-online.target`-
+    ordered service so the daemon refuses to bring the WG iface up
+    when the killswitch isn't programmed yet.
+* `[ ]` Remaining scope (separate slice): wire the new subcommand
+  into `scripts/systemd/rustynetd.service` as `ExecStartPre=` and
+  add an integration test that reboots a netns lab node + asserts
+  no unprotected egress packets observed in the bring-up window.
 
 ---
 
