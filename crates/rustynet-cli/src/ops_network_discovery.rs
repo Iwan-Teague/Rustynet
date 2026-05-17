@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 const PUBLIC_KEY_KEYS: [&str; 4] = [
     "assignment_verifier_key_b64",
@@ -173,33 +173,102 @@ fn validate_no_secrets(payload: &Value, problems: &mut Vec<String>, path: &str) 
     }
 }
 
+/// X2: Phase A typed view for the top-level shape of a network
+/// discovery bundle. The reviewed contract pins three fields with
+/// serde required-field semantics:
+///
+/// - `schema_version: u64` — must deserialize as an unsigned integer;
+///   the downstream check still enforces the value (`== 1`).
+/// - `purpose: String` — must deserialize as a string; the downstream
+///   check still enforces the value
+///   (`"cross_network_discovery_bundle"`).
+/// - `collected_at_unix: u64` — must deserialize as an unsigned
+///   integer; the downstream check still enforces positivity and
+///   freshness against `config.max_age_seconds`.
+///
+/// Everything else flows through `#[serde(flatten)] extra:
+/// Map<String, Value>` so the downstream Map-walking validation logic
+/// (NAT profile, wireguard, endpoint candidates, etc.) keeps working
+/// unchanged. `into_value_map` re-injects the typed fields so the
+/// caller sees the full bundle shape.
+///
+/// `validate_no_secrets` STAYS a generic `Value` walk — it must be
+/// generic to catch arbitrary nested forbidden keys/strings.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct NetworkDiscoveryBundleView {
+    schema_version: u64,
+    purpose: String,
+    collected_at_unix: u64,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl NetworkDiscoveryBundleView {
+    /// Bridge the typed view back to a `Map<String, Value>` for
+    /// downstream code that still walks the bundle generically. Adds
+    /// the typed fields back into the map so callers see the full
+    /// bundle shape.
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert(
+            "schema_version".to_string(),
+            Value::Number(self.schema_version.into()),
+        );
+        m.insert("purpose".to_string(), Value::String(self.purpose));
+        m.insert(
+            "collected_at_unix".to_string(),
+            Value::Number(self.collected_at_unix.into()),
+        );
+        m
+    }
+}
+
 fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> Vec<String> {
     let mut problems = Vec::new();
-    let Some(object) = payload.as_object() else {
-        return vec![format!("{}: payload must be a JSON object", path.display())];
-    };
 
+    // Recursive secret-leak scan STAYS a generic Value walk — it must
+    // be generic to catch arbitrary nested forbidden keys and strings.
     validate_no_secrets(payload, &mut problems, "$");
 
-    if object.get("schema_version").and_then(Value::as_i64) != Some(1) {
+    // X2: Phase A typed view migration. The top-level shape now goes
+    // through `NetworkDiscoveryBundleView`, which pins `schema_version`,
+    // `purpose`, and `collected_at_unix` with serde required-field
+    // semantics. A missing or wrong-type required field fails at
+    // deserialize with a precise error rather than falling through to
+    // `as_i64`/`as_str`/`as_u64` returning `None`.
+    let typed: NetworkDiscoveryBundleView = match serde_json::from_value(payload.clone()) {
+        Ok(view) => view,
+        Err(err) => {
+            problems.push(format!("bundle top-level shape invalid: {err}"));
+            return problems
+                .into_iter()
+                .map(|problem| format!("{}: {problem}", path.display()))
+                .collect();
+        }
+    };
+
+    if typed.schema_version != 1 {
         problems.push("schema_version must equal 1".to_string());
     }
-    if object.get("purpose").and_then(Value::as_str) != Some("cross_network_discovery_bundle") {
+    if typed.purpose != "cross_network_discovery_bundle" {
         problems.push("purpose must equal 'cross_network_discovery_bundle'".to_string());
     }
 
     let now_unix = unix_now();
-    match object.get("collected_at_unix").and_then(Value::as_u64) {
-        Some(collected_at_unix) if collected_at_unix > 0 => {
-            if collected_at_unix > now_unix.saturating_add(300) {
-                problems.push("collected_at_unix is too far in the future".to_string());
-            }
-            if now_unix.saturating_sub(collected_at_unix) > config.max_age_seconds {
-                problems.push("collected_at_unix is stale".to_string());
-            }
+    let collected_at_unix = typed.collected_at_unix;
+    if collected_at_unix == 0 {
+        problems.push("collected_at_unix must be a positive integer".to_string());
+    } else {
+        if collected_at_unix > now_unix.saturating_add(300) {
+            problems.push("collected_at_unix is too far in the future".to_string());
         }
-        _ => problems.push("collected_at_unix must be a positive integer".to_string()),
+        if now_unix.saturating_sub(collected_at_unix) > config.max_age_seconds {
+            problems.push("collected_at_unix is stale".to_string());
+        }
     }
+
+    let object = typed.into_value_map();
+    let object = &object;
 
     match object.get("node_identity").and_then(Value::as_object) {
         Some(node_identity) => {
@@ -604,5 +673,112 @@ pub fn execute_ops_validate_network_discovery_bundle(
         Ok("network discovery bundle validation passed".to_string())
     } else {
         Err(overall_errors.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NetworkDiscoveryBundleView;
+    use serde_json::{Value, json};
+
+    /// Clean fixture: a well-formed top-level shape deserializes into
+    /// the typed view, the typed fields land in their slots, and the
+    /// remaining keys ride through `#[serde(flatten)] extra`.
+    #[test]
+    fn network_discovery_bundle_view_accepts_clean_top_level() {
+        let payload = json!({
+            "schema_version": 1,
+            "purpose": "cross_network_discovery_bundle",
+            "collected_at_unix": 1_700_000_000u64,
+            "node_identity": { "node_id": "node-a" },
+            "extra_field": "ride-through",
+        });
+        let view: NetworkDiscoveryBundleView =
+            serde_json::from_value(payload).expect("typed view accepts clean top-level shape");
+        assert_eq!(view.schema_version, 1);
+        assert_eq!(view.purpose, "cross_network_discovery_bundle");
+        assert_eq!(view.collected_at_unix, 1_700_000_000);
+        assert!(view.extra.contains_key("node_identity"));
+        assert_eq!(
+            view.extra.get("extra_field").and_then(Value::as_str),
+            Some("ride-through")
+        );
+    }
+
+    /// Missing required field rejected with a precise error naming the
+    /// field. The serde error message must mention `purpose` so the
+    /// failure points to the source field.
+    #[test]
+    fn network_discovery_bundle_view_rejects_missing_required_field() {
+        let payload = json!({
+            "schema_version": 1,
+            "collected_at_unix": 1_700_000_000u64,
+        });
+        let err = serde_json::from_value::<NetworkDiscoveryBundleView>(payload)
+            .expect_err("missing purpose must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("purpose"),
+            "error must name the missing required field: {message}"
+        );
+    }
+
+    /// Wrong-type required field rejected at deserialize.
+    /// `schema_version` is typed `u64`; supplying a string must fail
+    /// at parse, not later via `as_u64()` returning `None`.
+    #[test]
+    fn network_discovery_bundle_view_rejects_wrong_type_required_field() {
+        let payload = json!({
+            "schema_version": "one",
+            "purpose": "cross_network_discovery_bundle",
+            "collected_at_unix": 1_700_000_000u64,
+        });
+        let err = serde_json::from_value::<NetworkDiscoveryBundleView>(payload)
+            .expect_err("string schema_version must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("schema_version") || message.contains("u64"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// `into_value_map` round-trips: typed fields are re-injected and
+    /// flattened extras are preserved verbatim.
+    #[test]
+    fn network_discovery_bundle_view_into_value_map_round_trips() {
+        let payload = json!({
+            "schema_version": 1,
+            "purpose": "cross_network_discovery_bundle",
+            "collected_at_unix": 1_700_000_000u64,
+            "node_identity": { "node_id": "node-a" },
+            "extra_field": "ride-through",
+        });
+        let view: NetworkDiscoveryBundleView =
+            serde_json::from_value(payload).expect("typed view parses");
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("schema_version").and_then(Value::as_u64),
+            Some(1),
+            "schema_version must round-trip"
+        );
+        assert_eq!(
+            map.get("purpose").and_then(Value::as_str),
+            Some("cross_network_discovery_bundle"),
+            "purpose must round-trip"
+        );
+        assert_eq!(
+            map.get("collected_at_unix").and_then(Value::as_u64),
+            Some(1_700_000_000),
+            "collected_at_unix must round-trip"
+        );
+        assert!(
+            map.contains_key("node_identity"),
+            "flattened extras must be preserved"
+        );
+        assert_eq!(
+            map.get("extra_field").and_then(Value::as_str),
+            Some("ride-through"),
+            "scalar extras must be preserved"
+        );
     }
 }
