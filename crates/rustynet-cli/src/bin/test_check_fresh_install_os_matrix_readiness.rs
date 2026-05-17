@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -97,12 +98,17 @@ fn status_code(status: ExitStatus) -> i32 {
 
 fn run_command(command: &mut Command) -> Result<(), i32> {
     let status = command.status().map_err(|err| {
-        eprintln!("failed to run command: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to run command: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess code so the inner CLI taxonomy
+        // (PolicyReject for a readiness fail-closed verdict) survives.
         Err(status_code(status))
     }
 }
@@ -110,12 +116,12 @@ fn run_command(command: &mut Command) -> Result<(), i32> {
 fn run() -> Result<(), i32> {
     let _ignored_args = env::args_os().skip(1).count();
     let repo_root = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let temp_dir = TempDirGuard::create().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     let head_commit = Command::new("git")
@@ -123,23 +129,29 @@ fn run() -> Result<(), i32> {
         .args(["rev-parse", "HEAD"])
         .output()
         .map_err(|err| {
-            eprintln!("failed to run git rev-parse HEAD: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run git rev-parse HEAD: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if !head_commit.status.success() {
         return Err(status_code(head_commit.status));
     }
     let head_commit = String::from_utf8(head_commit.stdout)
         .map_err(|err| {
-            eprintln!("git rev-parse HEAD produced invalid utf-8: {err}");
-            1
+            eprintln!(
+                "error [{}]: git rev-parse HEAD produced invalid utf-8: {err}",
+                ExitCode::ConfigError
+            );
+            ExitCode::ConfigError.as_i32()
         })?
         .trim()
         .to_ascii_lowercase();
     let stale_commit = "1111111111111111111111111111111111111111";
     let now_unix = now_unix().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     let mut write_fixtures = Command::new("cargo");
@@ -215,13 +227,22 @@ fn run() -> Result<(), i32> {
     if stale_child_check
         .status()
         .map_err(|err| {
-            eprintln!("failed to run command: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run command: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?
         .success()
     {
-        eprintln!("expected stale child commit replay fixture to fail readiness validation");
-        return Err(1);
+        // Inverted-success self-test: the stale-child fixture MUST
+        // be rejected by the readiness gate. A pass here is a fail-
+        // closed contract violation, not a transient error.
+        eprintln!(
+            "error [{}]: expected stale child commit replay fixture to fail readiness validation",
+            ExitCode::PolicyReject
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
     }
 
     let mut wrapper_success_check = Command::new("cargo");
@@ -273,15 +294,19 @@ fn run() -> Result<(), i32> {
     if wrapper_stale_child_check
         .status()
         .map_err(|err| {
-            eprintln!("failed to run command: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run command: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?
         .success()
     {
         eprintln!(
-            "expected wrapper gate to fail when fresh-install report references stale child evidence"
+            "error [{}]: expected wrapper gate to fail when fresh-install report references stale child evidence",
+            ExitCode::PolicyReject
         );
-        return Err(1);
+        return Err(ExitCode::PolicyReject.as_i32());
     }
 
     println!("fresh install OS matrix readiness self-test: PASS");

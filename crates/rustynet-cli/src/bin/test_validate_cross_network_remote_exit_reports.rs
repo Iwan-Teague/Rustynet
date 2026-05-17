@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -10,21 +11,50 @@ const DEFAULT_PHASE10_MAX_EVIDENCE_AGE_SECONDS: &str = "2678400";
 const DEFAULT_SCHEMA_OUTPUT_BASENAME: &str = "cross_network_remote_exit_schema_validation.md";
 
 fn main() {
-    let code = match run() {
-        Ok(()) => 0,
-        Err(code) => code,
-    };
-    std::process::exit(code);
+    if let Err(err) = run() {
+        let code = classify_local_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
+    }
 }
 
-fn run() -> Result<(), i32> {
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("does not accept options") {
+        ExitCode::BadArgs
+    } else if lower.contains("missing required command")
+        || lower.contains("failed to resolve repository root")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("failed to run ops") || lower.contains("failed to run git") {
+        ExitCode::TransientFailure
+    } else if (lower.contains("ops ") && lower.contains("failed with status"))
+        || lower.contains("git rev-parse head failed")
+        || lower.contains("git rev-parse head returned empty output")
+    {
+        // Subprocess validation failure: surface as PolicyReject so
+        // retry-only-on-70 CI loops do not retry a real fail-closed
+        // verdict from the inner cross-network-remote-exit validator.
+        ExitCode::PolicyReject
+    } else {
+        ExitCode::GenericFailure
+    }
+}
+
+fn run() -> Result<(), String> {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     if !args.is_empty() {
-        eprintln!("test_validate_cross_network_remote_exit_reports does not accept options");
-        return Err(2);
+        return Err(
+            "test_validate_cross_network_remote_exit_reports does not accept options".to_string(),
+        );
     }
 
-    let root_dir = repo_root().map_err(report_err)?;
+    let root_dir = repo_root()?;
     require_command("cargo")?;
     require_command("git")?;
 
@@ -46,7 +76,7 @@ fn run() -> Result<(), i32> {
         });
     let expected_commit = env::var_os("RUSTYNET_PHASE10_CROSS_NETWORK_EXIT_EXPECTED_GIT_COMMIT")
         .filter(|value| !value.is_empty())
-        .unwrap_or(get_head_commit(&root_dir).map_err(report_err)?);
+        .unwrap_or(get_head_commit(&root_dir)?);
 
     run_ops(
         &root_dir,
@@ -68,12 +98,11 @@ fn run() -> Result<(), i32> {
     Ok(())
 }
 
-fn require_command(command: &str) -> Result<(), i32> {
+fn require_command(command: &str) -> Result<(), String> {
     if command_exists(command) {
         Ok(())
     } else {
-        eprintln!("missing required command: {command}");
-        Err(1)
+        Err(format!("missing required command: {command}"))
     }
 }
 
@@ -104,7 +133,7 @@ fn get_head_commit(root_dir: &Path) -> Result<OsString, String> {
     Ok(OsString::from(trimmed))
 }
 
-fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[OsString]) -> Result<(), i32> {
+fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[OsString]) -> Result<(), String> {
     let mut command = Command::new("cargo");
     command.current_dir(root_dir).args([
         "run",
@@ -116,14 +145,16 @@ fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[OsString]) -> Result<(
         ops_subcommand,
     ]);
     command.args(args.iter().map(OsString::as_os_str));
-    let status = command.status().map_err(|err| {
-        eprintln!("failed to run ops {ops_subcommand}: {err}");
-        1
-    })?;
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to run ops {ops_subcommand}: {err}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(status_code(status))
+        Err(format!(
+            "ops {ops_subcommand} failed with status {}",
+            status_code(status)
+        ))
     }
 }
 
@@ -139,11 +170,6 @@ fn repo_root() -> Result<PathBuf, String> {
                 manifest_dir.display()
             )
         })
-}
-
-fn report_err(err: String) -> i32 {
-    eprintln!("{err}");
-    1
 }
 
 fn status_code(status: ExitStatus) -> i32 {
