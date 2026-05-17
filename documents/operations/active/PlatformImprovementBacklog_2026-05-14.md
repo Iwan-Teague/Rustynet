@@ -100,15 +100,19 @@ inline. Cross-reference with:
   sole caller. start.sh retains a 3-branch dispatcher (linux /
   macos / unsupported). Smoke gate now has 32 checks (+7 dispatch
   assertions). Operator-visible behaviour unchanged.
-* `[ ]` Remaining scope (separate slices): incrementally migrate
-  the larger platform-specific blocks from start.sh. systemd-unit
-  install + launchd plist install paths already dispatch to Rust
+* `[x]` pfctl extraction audit: NO-OP confirmed. start.sh contains
+  only `doctor_require_cmd pfctl` (line 1593) and the `pfctl_bin`
+  path-resolver (lines 2227-2269); both already sit inside
+  macOS-guarded blocks and there are NO standalone
+  `apply_managed_dns_routing` / `clear_managed_dns_routing`
+  wrappers in start.sh today. The original backlog entry was based
+  on a wrong assumption — no migration is needed. Removed from
+  remaining scope.
+* `[ ]` Remaining scope (separate slices): systemd-unit install +
+  launchd plist install paths already dispatch to Rust
   (`rustynet ops write-daemon-env` etc.) so those big blocks are
-  NOT actually shell-to-Rust migrations. Remaining shell-only
-  blocks:
-  - `pfctl` programming wrappers (`apply_managed_dns_routing` /
-    `clear_managed_dns_routing` on macOS path) → `macos.sh`
-  Each future migration adds another smoke-test check.
+  NOT actually shell-to-Rust migrations. No further shell-only
+  blocks identified at this time.
 
 ### L2. `linux_runtime_acls.rs` security-relevant drift coverage
 
@@ -696,14 +700,31 @@ inline. Cross-reference with:
     + nodes/stages arrays)
   16 new tests (clean parse / missing-required / wrong-type /
   into_value_map round-trip per view).
+* `[~]` Third X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 185b213). Migrated
+  `execute_ops_validate_cross_network_forensics_bundle` (lines
+  1090-1275, the prime next target) to THREE typed views:
+  - `CrossNetworkForensicsManifestView` (4 typed fields with
+    serde-default to preserve missing-field-tolerant legacy
+    semantics)
+  - `CrossNetworkForensicsNodeReportView` (7 required typed
+    fields)
+  - `CrossNetworkForensicsBundleValidationView` (16 required
+    typed fields)
+  15 new tests; target fn now has ZERO Value walks.
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (~17 production walks; future slices):
-  - `execute_ops_validate_cross_network_forensics_bundle` (lines
-    1090-1275; nested forensics-manifest walker — largest cluster
-    left, prime next target)
-  - bundle-status / manifest reader at 2246-2294
-  - misc 1-call `.get("status")` pull-backs from `json!({...})`
-    report writers (low-value, leave for cleanup pass)
+  (9 production walks across 7 unrelated report-writer fns +
+  1 intentional generic JSON-pointer reader):
+  - `write_live_linux_server_ip_bypass_report`,
+    `write_live_linux_control_surface_report`,
+    `write_live_linux_endpoint_hijack_report` (report writers)
+  - `write_real_wireguard_exitnode_e2e_report`,
+    `write_real_wireguard_no_leak_under_load_report`,
+    `write_active_network_signed_state_tamper_report`,
+    `write_active_network_rogue_path_hijack_report` (e2e writers)
+  - `e2e_dns_query` (helper)
+  - `execute_ops_read_json_field` (intentional generic shape-agnostic
+    JSON-pointer reader — must stay Value-walk)
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
@@ -743,6 +764,18 @@ inline. Cross-reference with:
     canonical secret-bearing types.
   3 new workspace sweeps + 13 new self-tests. Sweep over the
   current tree found 0 offenders; no allowlist extensions needed.
+* `[~]` X3 extension #2 landed (commit 8bc02ce). Converts the
+  grep-based static analysis in
+  `scripts/ci/security_regression_gates.sh` into a typed Rust
+  scanner: `scan_source_for_secret_material_equality` flags
+  `==`/`!=` against forbidden tokens (token / csrf / session_key /
+  nonce / mac / hmac / session_id / signature) unless `ct_eq`
+  appears on the line OR the (file,line) is in a structured
+  `REVIEWED_SECRET_EQUALITY_EXCEPTIONS` allowlist with per-entry
+  justification. Removes fragile `// EXCEPTION:` magic-comment
+  allowlist. Workspace sweep finds 0 unallowed hits today. Shell
+  script shrunk from 56 lines to ~10. 6+ self-tests pin the
+  scanner positive/negative shapes.
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 
@@ -918,6 +951,16 @@ inline. Cross-reference with:
     failure, secrets-hygiene leak, trust-CLI decrypt failure → PolicyReject
   In every batch, subprocess exit codes pass through unchanged so
   inner taxonomy bubbles survive the wrapper.
+* `[~]` Shell→Rust gate conversion: `scripts/ci/membership_gates.sh`
+  JSON-validation (commit 18521df). Replaces grep/jq-style shell
+  assertions on the Phase 10 membership report with a typed Rust
+  subcommand `rustynet ops verify-membership-phase10-report
+  [--report-path <path>]`. New `MembershipPhase10ReportView`
+  serde view pins two required fields (status, evidence_mode);
+  missing file → ConfigError(65); malformed JSON → ConfigError(65);
+  missing required field → ConfigError(65); `status=fail` →
+  PolicyReject(78). 5 new tests pin the verdict shapes. Shell
+  script shrunk 37→25 lines, now a thin dispatcher.
 * W3 wire-up: `--enforce-ra-suppression` flag (commit 527d14f)
   threads the W3 Router Advertisement evaluator into the
   `windows-dns-failclosed-check` subcommand alongside
