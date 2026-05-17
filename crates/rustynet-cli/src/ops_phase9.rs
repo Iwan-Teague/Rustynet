@@ -1030,6 +1030,48 @@ fn read_ndjson_objects(path: &Path, label: &str) -> Result<Vec<Map<String, Value
     Ok(entries)
 }
 
+/// X2: Phase A typed view for one line of `dr_drills.ndjson`. The
+/// reviewed contract is:
+///   - every entry MUST carry a string `executed_at_utc` field
+///   - `evidence_mode` is optional; when present it must be a string
+///   - all other fields are passed through to the downstream
+///     Map-based consumer via `extra` so the existing helpers
+///     (`phase9_value_or_null`, `phase9_entry_numeric`) keep working
+///     during the migration. Bridging back to a `Map<String, Value>`
+///     is handled by `into_value_map`.
+///
+/// `executed_at_utc` is the typed boundary that makes the migration
+/// useful: a missing or non-string value now fails at serde
+/// deserialization with a precise per-line error rather than
+/// surfacing later as an `ok_or_else` on a stale `Value::as_str()`
+/// result.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Phase9DrDrillView {
+    executed_at_utc: String,
+    #[serde(default)]
+    evidence_mode: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl Phase9DrDrillView {
+    /// Bridge the typed view back to a `Map<String, Value>` for
+    /// downstream code that still walks the entry generically. Adds
+    /// the typed fields back into the map so callers see the full
+    /// entry shape.
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert(
+            "executed_at_utc".to_string(),
+            Value::String(self.executed_at_utc),
+        );
+        if let Some(mode) = self.evidence_mode {
+            m.insert("evidence_mode".to_string(), Value::String(mode));
+        }
+        m
+    }
+}
+
 /// Generic typed NDJSON reader: one entry per non-blank line, each
 /// deserialized directly into the caller-chosen typed view `T` rather than
 /// a `serde_json::Map<String, Value>`. Pairs with
@@ -1054,7 +1096,6 @@ fn read_ndjson_objects(path: &Path, label: &str) -> Result<Vec<Map<String, Value
 /// The helper does NOT enforce `evidence_mode == "measured"`; that check
 /// is the caller's responsibility (typically through a downstream typed
 /// envelope or the existing `phase9_require_measured_mode` helper).
-#[allow(dead_code)]
 fn read_ndjson_typed<T>(path: &Path, label: &str) -> Result<Vec<T>, String>
 where
     T: serde::de::DeserializeOwned,
@@ -1552,14 +1593,26 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         now_unix,
     )?;
 
-    let dr_entries = read_ndjson_objects(
+    // X2: Phase A typed-schema migration of the dr_drills.ndjson
+    // consumer. `read_ndjson_typed::<Phase9DrDrillView>` now enforces
+    // that every line has a string `executed_at_utc` field as a
+    // serde-required-field check; previously a missing or non-string
+    // value would surface as `Value::as_str()` returning `None` and
+    // hit a manual `ok_or_else`. The typed view's `into_value_map`
+    // bridges back to the existing Map-based downstream code without
+    // changing operator-visible behaviour.
+    let dr_typed_entries = read_ndjson_typed::<Phase9DrDrillView>(
         source_dir.join("dr_drills.ndjson").as_path(),
         "dr_drills.ndjson",
     )?;
     let mut latest_dr: Option<(i64, Map<String, Value>)> = None;
-    for (index, entry) in dr_entries.iter().enumerate() {
-        phase9_require_measured_mode(entry, format!("dr_drills.ndjson entry {index}").as_str())?;
-        let executed_at = entry
+    for (index, entry) in dr_typed_entries.into_iter().enumerate() {
+        let entry_map = entry.into_value_map();
+        phase9_require_measured_mode(
+            &entry_map,
+            format!("dr_drills.ndjson entry {index}").as_str(),
+        )?;
+        let executed_at = entry_map
             .get("executed_at_utc")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing or invalid UTC field: dr latest executed_at_utc".to_string())?;
@@ -1569,7 +1622,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
             .map(|(latest, _)| timestamp > *latest)
             .unwrap_or(true)
         {
-            latest_dr = Some((timestamp, entry.clone()));
+            latest_dr = Some((timestamp, entry_map));
         }
     }
     let (dr_latest_timestamp, dr_latest) =
@@ -5567,5 +5620,168 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].window_end_utc, "x");
         let _ = fs::remove_file(&path);
+    }
+
+    // ---- X2: Phase9DrDrillView typed-view migration coverage ------------
+
+    /// A clean dr_drills.ndjson line deserializes into the typed view
+    /// with executed_at_utc + extra fields preserved.
+    #[test]
+    fn phase9_dr_drill_view_accepts_clean_line() {
+        let path = ndjson_temp_path("dr-typed-clean");
+        fs::write(
+            &path,
+            r#"{"executed_at_utc":"2026-05-01T00:00:00Z","evidence_mode":"measured","drill_id":"dr-1","region_count":3}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<super::Phase9DrDrillView> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.executed_at_utc, "2026-05-01T00:00:00Z");
+        assert_eq!(entry.evidence_mode.as_deref(), Some("measured"));
+        // extra carries the non-typed fields.
+        assert!(entry.extra.contains_key("drill_id"));
+        assert!(entry.extra.contains_key("region_count"));
+        // extra MUST NOT contain the typed-out fields — those moved
+        // onto the struct.
+        assert!(!entry.extra.contains_key("executed_at_utc"));
+        assert!(!entry.extra.contains_key("evidence_mode"));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Missing executed_at_utc must fail-closed at deserialization
+    /// time with a precise per-line error — the typed boundary is
+    /// the whole point of the migration.
+    #[test]
+    fn phase9_dr_drill_view_rejects_missing_executed_at_utc() {
+        let path = ndjson_temp_path("dr-typed-missing-utc");
+        fs::write(
+            &path,
+            r#"{"evidence_mode":"measured","drill_id":"dr-1"}
+"#,
+        )
+        .expect("write ndjson");
+        let err = super::read_ndjson_typed::<super::Phase9DrDrillView>(
+            path.as_path(),
+            "dr_drills.ndjson",
+        )
+        .expect_err("missing executed_at_utc must fail-closed");
+        assert!(
+            err.contains("executed_at_utc"),
+            "error must name the missing field: {err}"
+        );
+        assert!(
+            err.contains("dr_drills.ndjson"),
+            "error must name the source label: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// executed_at_utc that is present but not a string must
+    /// fail-closed (e.g. someone wrote a unix timestamp number by
+    /// mistake).
+    #[test]
+    fn phase9_dr_drill_view_rejects_executed_at_utc_with_wrong_type() {
+        let path = ndjson_temp_path("dr-typed-wrong-type");
+        fs::write(
+            &path,
+            r#"{"executed_at_utc":1700000000,"evidence_mode":"measured"}
+"#,
+        )
+        .expect("write ndjson");
+        let err = super::read_ndjson_typed::<super::Phase9DrDrillView>(
+            path.as_path(),
+            "dr_drills.ndjson",
+        )
+        .expect_err("wrong-type executed_at_utc must fail-closed");
+        // Serde's per-field error doesn't always include the field
+        // name (only the line/column), but the per-line wrapper does
+        // include the file label + line number — pin both so a
+        // future serde upgrade that DOES include the field name
+        // still passes.
+        assert!(
+            err.contains("expected a string") || err.contains("executed_at_utc"),
+            "error must name the type mismatch or the bad-type field: {err}"
+        );
+        assert!(
+            err.contains("dr_drills.ndjson"),
+            "error must name the source label: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// evidence_mode is optional — its absence must be silently ok.
+    /// Pin this so a future tightening of the typed view that flips
+    /// `Option<String>` to `String` is a deliberate breaking change.
+    #[test]
+    fn phase9_dr_drill_view_accepts_missing_evidence_mode_as_none() {
+        let path = ndjson_temp_path("dr-typed-no-mode");
+        fs::write(
+            &path,
+            r#"{"executed_at_utc":"2026-05-01T00:00:00Z","drill_id":"dr-1"}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<super::Phase9DrDrillView> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].evidence_mode.is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// into_value_map round-trips the entry plus the typed fields
+    /// back into the legacy `Map<String, Value>` shape that
+    /// downstream helpers walk. The bridge must be lossless across
+    /// the typed boundary.
+    #[test]
+    fn phase9_dr_drill_view_into_value_map_round_trips_all_fields() {
+        let view = super::Phase9DrDrillView {
+            executed_at_utc: "2026-05-01T00:00:00Z".to_string(),
+            evidence_mode: Some("measured".to_string()),
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "drill_id".to_string(),
+                    serde_json::Value::String("dr-1".to_string()),
+                );
+                m.insert("region_count".to_string(), serde_json::Value::from(3));
+                m
+            },
+        };
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("executed_at_utc").and_then(|v| v.as_str()),
+            Some("2026-05-01T00:00:00Z")
+        );
+        assert_eq!(
+            map.get("evidence_mode").and_then(|v| v.as_str()),
+            Some("measured")
+        );
+        assert_eq!(map.get("drill_id").and_then(|v| v.as_str()), Some("dr-1"));
+        assert_eq!(map.get("region_count").and_then(|v| v.as_i64()), Some(3));
+    }
+
+    /// into_value_map omits evidence_mode when the typed view's
+    /// `evidence_mode` is `None`. Pin so downstream `as_str()`
+    /// readers see the same shape as the legacy
+    /// `read_ndjson_objects` path.
+    #[test]
+    fn phase9_dr_drill_view_into_value_map_omits_none_evidence_mode() {
+        let view = super::Phase9DrDrillView {
+            executed_at_utc: "2026-05-01T00:00:00Z".to_string(),
+            evidence_mode: None,
+            extra: serde_json::Map::new(),
+        };
+        let map = view.into_value_map();
+        assert!(
+            !map.contains_key("evidence_mode"),
+            "evidence_mode must NOT appear when the typed view had None"
+        );
+        assert_eq!(
+            map.get("executed_at_utc").and_then(|v| v.as_str()),
+            Some("2026-05-01T00:00:00Z")
+        );
     }
 }
