@@ -8,18 +8,57 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use live_lab_support::{LiveLabContext, Logger, read_text, repo_root, run_cargo_ops};
 
 fn main() {
-    let code = match run() {
-        Ok(()) => 0,
-        Err(code) => code,
-    };
-    std::process::exit(code);
+    if let Err(err) = run() {
+        let code = classify_live_lab_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
+    }
 }
 
-fn run() -> Result<(), i32> {
-    let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+/// X6 taxonomy classifier for live-lab test binaries. Mirrors the
+/// classifier in `live_linux_exit_handoff_test.rs`.
+fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
+    use rustynetd::exit_codes::ExitCode;
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("missing required")
+        || lower.contains("unknown command")
+        || lower.contains("missing required argument")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("drift")
+        || lower.contains("fail-closed")
+        || lower.contains("signature verification")
+        || lower.contains("policy reject")
+        || lower.contains("forbidden")
+    {
+        ExitCode::PolicyReject
+    } else if lower.contains("missing required command")
+        || lower.contains("identity file")
+        || lower.contains("invalid path")
+        || lower.contains("config")
+        || lower.contains("schema")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("ssh")
+        || lower.contains("scp")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("transient")
+        || lower.contains("retry")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
+    }
+}
+
+fn run() -> Result<(), String> {
+    let root_dir = repo_root()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
 
     let mut exit_host = String::new();
@@ -83,9 +122,8 @@ fn run() -> Result<(), i32> {
                 return Ok(());
             }
             other => {
-                eprintln!("unknown argument: {other}");
                 print_usage();
-                return Err(2);
+                return Err(format!("unknown command: {other}"));
             }
         }
         idx += 1;
@@ -93,32 +131,21 @@ fn run() -> Result<(), i32> {
 
     if ssh_identity_file.is_empty() || client_host.is_empty() {
         print_usage();
-        return Err(2);
+        return Err("missing required argument: --ssh-identity-file, --client-host".to_string());
     }
 
     if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            eprintln!("failed to create {}: {err}", parent.display());
-            1
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            eprintln!("failed to create {}: {err}", parent.display());
-            1
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     }
 
-    let logger = Logger::new(&log_path).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    let logger = Logger::new(&log_path)?;
     let ssh_identity_path = PathBuf::from(&ssh_identity_file);
-    let mut ctx = LiveLabContext::new("rustynet-control-surface", ssh_identity_path.as_path())
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    let mut ctx = LiveLabContext::new("rustynet-control-surface", ssh_identity_path.as_path())?;
 
     if probe_host.is_empty() {
         if !exit_host.is_empty() && exit_host != client_host {
@@ -141,99 +168,50 @@ fn run() -> Result<(), i32> {
     append_host(&mut host_labels, &mut host_targets, "extra", &extra_host);
 
     if host_targets.is_empty() {
-        eprintln!("at least one target host is required");
-        return Err(2);
+        return Err("missing required argument: at least one target host is required".to_string());
     }
 
     for target in &host_targets {
-        ctx.push_sudo_password(target).map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-        ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
+        ctx.push_sudo_password(target)?;
+        ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
     }
 
     for (label, target) in host_labels.iter().zip(host_targets.iter()) {
-        logger
-            .line(format!("Inspecting control surfaces on {label} {target}"))
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
-        let daemon_socket_meta = ctx
-            .capture_root(
-                target,
-                &["stat", "-Lc", "%F|%a|%U|%G", "/run/rustynet/rustynetd.sock"],
-            )
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
-        let helper_socket_meta = ctx
-            .capture_root(
-                target,
-                &[
-                    "stat",
-                    "-Lc",
-                    "%F|%a|%U|%G",
-                    "/run/rustynet/rustynetd-privileged.sock",
-                ],
-            )
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
-        let inet_listeners = ctx
-            .capture_root_allow_failure(target, &["ss", "-H", "-ltnup"])
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
-        let dns_service_state = ctx
-            .capture_root_allow_failure(
-                target,
-                &["systemctl", "is-active", "rustynetd-managed-dns.service"],
-            )
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
+        logger.line(format!("Inspecting control surfaces on {label} {target}"))?;
+        let daemon_socket_meta = ctx.capture_root(
+            target,
+            &["stat", "-Lc", "%F|%a|%U|%G", "/run/rustynet/rustynetd.sock"],
+        )?;
+        let helper_socket_meta = ctx.capture_root(
+            target,
+            &[
+                "stat",
+                "-Lc",
+                "%F|%a|%U|%G",
+                "/run/rustynet/rustynetd-privileged.sock",
+            ],
+        )?;
+        let inet_listeners = ctx.capture_root_allow_failure(target, &["ss", "-H", "-ltnup"])?;
+        let dns_service_state = ctx.capture_root_allow_failure(
+            target,
+            &["systemctl", "is-active", "rustynetd-managed-dns.service"],
+        )?;
         write_block(
             &ctx.work_dir.join(format!("{label}.daemon_socket.txt")),
             &daemon_socket_meta,
-        )
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        )?;
         write_block(
             &ctx.work_dir.join(format!("{label}.helper_socket.txt")),
             &helper_socket_meta,
-        )
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        )?;
         write_block(
             &ctx.work_dir.join(format!("{label}.inet_listeners.txt")),
             &inet_listeners,
-        )
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        )?;
         write_block(
             &ctx.work_dir.join(format!("{label}.managed_dns_state.txt")),
             &dns_service_state,
-        )
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        )?;
     }
 
     let mut remote_dns_probe_status = "skipped".to_string();
@@ -246,35 +224,27 @@ fn run() -> Result<(), i32> {
             .map(|text| text.trim() == "active")
             .unwrap_or(false)
     {
-        let client_addr = LiveLabContext::resolved_target_address(&client_host).map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        let client_addr = LiveLabContext::resolved_target_address(&client_host)?;
         let dns_port = dns_bind_addr
             .rsplit_once(':')
             .map(|(_, port)| port.to_string())
             .unwrap_or_else(|| "53535".to_string());
-        remote_dns_probe_output = ctx
-            .capture_root_allow_failure(
-                &probe_host,
-                &[
-                    "rustynet",
-                    "ops",
-                    "e2e-dns-query",
-                    "--server",
-                    &client_addr,
-                    "--port",
-                    &dns_port,
-                    "--qname",
-                    "blocked-probe.rustynet",
-                    "--timeout-ms",
-                    "1000",
-                ],
-            )
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
+        remote_dns_probe_output = ctx.capture_root_allow_failure(
+            &probe_host,
+            &[
+                "rustynet",
+                "ops",
+                "e2e-dns-query",
+                "--server",
+                &client_addr,
+                "--port",
+                &dns_port,
+                "--qname",
+                "blocked-probe.rustynet",
+                "--timeout-ms",
+                "1000",
+            ],
+        )?;
         let blocked_probe = ctx
             .run_root(
                 &probe_host,
@@ -332,29 +302,19 @@ fn run() -> Result<(), i32> {
         &ctx.root_dir,
         "write-live-linux-control-surface-report",
         &cargo_refs,
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
 
     if report_status != "pass" {
-        eprintln!(
+        return Err(format!(
             "control-surface exposure test failed; see {}",
             report_path.display()
-        );
-        return Err(1);
+        ));
     }
 
-    logger
-        .line(format!(
-            "Control-surface exposure report written: {}",
-            report_path.display()
-        ))
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    logger.line(format!(
+        "Control-surface exposure report written: {}",
+        report_path.display()
+    ))?;
     Ok(())
 }
 
@@ -365,10 +325,9 @@ fn append_host(labels: &mut Vec<String>, targets: &mut Vec<String>, label: &str,
     }
 }
 
-fn required_value(args: &[String], idx: usize, flag: &str) -> Result<String, i32> {
+fn required_value(args: &[String], idx: usize, flag: &str) -> Result<String, String> {
     if idx >= args.len() {
-        eprintln!("missing value for {flag}");
-        return Err(2);
+        return Err(format!("missing required argument value for {flag}"));
     }
     Ok(args[idx].clone())
 }
