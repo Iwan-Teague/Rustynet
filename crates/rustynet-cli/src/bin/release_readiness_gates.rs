@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::OsString;
@@ -41,8 +42,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let bundle_path = env::var_os("RUSTYNET_RELEASE_READINESS_BUNDLE_PATH")
         .filter(|value| !value.is_empty())
@@ -88,8 +89,11 @@ where
     F: FnOnce() -> Result<(), StepExecutionError>,
 {
     let step = bundle.step_mut(step_id).ok_or_else(|| {
-        eprintln!("release readiness bundle is missing step definition: {step_id}");
-        1
+        eprintln!(
+            "error [{}]: release readiness bundle is missing step definition: {step_id}",
+            ExitCode::ConfigError
+        );
+        ExitCode::ConfigError.as_i32()
     })?;
     match action() {
         Ok(()) => {
@@ -116,12 +120,17 @@ fn run_script(root_dir: &Path, script: &str, args: &[&str]) -> Result<(), StepEx
         .args(args)
         .status()
         .map_err(|err| StepExecutionError {
-            exit_code: 1,
+            // Spawning the script process itself failed (PATH, ENOENT,
+            // permission). Classify as TransientFailure so retry-only-
+            // on-70 CI loops can re-attempt without operator review.
+            exit_code: ExitCode::TransientFailure.as_i32(),
             detail: format!("failed to execute script {}: {err}", script_path.display()),
         })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through the script's own exit code so an inner X6
+        // verdict (e.g. PolicyReject from phase5_gates.sh) survives.
         Err(StepExecutionError {
             exit_code: status_code(status),
             detail: format!("script failed: {}", script_path.display()),
@@ -132,8 +141,10 @@ fn run_script(root_dir: &Path, script: &str, args: &[&str]) -> Result<(), StepEx
 fn validate_phase5_gate_report(report_path: &Path) -> Result<(), StepExecutionError> {
     let report = read_phase5_gate_report(report_path)?;
     if report.gate != "phase5_ci_gates" {
+        // Wrong gate name in the on-disk report = release evidence
+        // does not match this release. Fail-closed: PolicyReject.
         return Err(StepExecutionError {
-            exit_code: 1,
+            exit_code: ExitCode::PolicyReject.as_i32(),
             detail: format!(
                 "phase5 gate report at {} has unexpected gate name {}",
                 report_path.display(),
@@ -142,8 +153,11 @@ fn validate_phase5_gate_report(report_path: &Path) -> Result<(), StepExecutionEr
         });
     }
     if report.overall_status != GateRunStatus::ExecutedPassed {
+        // Release evidence on disk explicitly records a non-pass
+        // overall verdict. PolicyReject so retry-only-on-70 loops do
+        // not accidentally retry a real release failure.
         return Err(StepExecutionError {
-            exit_code: 1,
+            exit_code: ExitCode::PolicyReject.as_i32(),
             detail: format!(
                 "phase5 gate report at {} does not record executed_passed status",
                 report_path.display()
@@ -156,8 +170,10 @@ fn validate_phase5_gate_report(report_path: &Path) -> Result<(), StepExecutionEr
             .iter()
             .any(|step| step == required_step)
         {
+            // Required-step set drifted from this binary's pinned list
+            // → release evidence is incomplete. PolicyReject.
             return Err(StepExecutionError {
-                exit_code: 1,
+                exit_code: ExitCode::PolicyReject.as_i32(),
                 detail: format!(
                     "phase5 gate report at {} is missing required step id {}",
                     report_path.display(),
@@ -170,7 +186,7 @@ fn validate_phase5_gate_report(report_path: &Path) -> Result<(), StepExecutionEr
             .iter()
             .find(|step| step.id == *required_step)
             .ok_or_else(|| StepExecutionError {
-                exit_code: 1,
+                exit_code: ExitCode::PolicyReject.as_i32(),
                 detail: format!(
                     "phase5 gate report at {} is missing required step {}",
                     report_path.display(),
@@ -178,8 +194,10 @@ fn validate_phase5_gate_report(report_path: &Path) -> Result<(), StepExecutionEr
                 ),
             })?;
         if step.status != GateStepStatus::ExecutedPassed {
+            // A required release-evidence step recorded a non-pass
+            // status. This is the canonical fail-closed verdict.
             return Err(StepExecutionError {
-                exit_code: 1,
+                exit_code: ExitCode::PolicyReject.as_i32(),
                 detail: format!(
                     "phase5 gate report at {} records {} as {:?}, expected executed_passed",
                     report_path.display(),
@@ -194,14 +212,19 @@ fn validate_phase5_gate_report(report_path: &Path) -> Result<(), StepExecutionEr
 
 fn read_phase5_gate_report(report_path: &Path) -> Result<Phase5GateReport, StepExecutionError> {
     let raw = fs::read_to_string(report_path).map_err(|err| StepExecutionError {
-        exit_code: 1,
+        // Report on disk could not be read (missing / unreadable).
+        // Classify as ConfigError: the release input is malformed or
+        // not where it's expected, operator must fix the path/schema.
+        exit_code: ExitCode::ConfigError.as_i32(),
         detail: format!(
             "failed to read phase5 gate report {}: {err}",
             report_path.display()
         ),
     })?;
     serde_json::from_str(&raw).map_err(|err| StepExecutionError {
-        exit_code: 1,
+        // Bad JSON in the release evidence file = ConfigError, same
+        // reasoning as the read failure above.
+        exit_code: ExitCode::ConfigError.as_i32(),
         detail: format!(
             "failed to parse phase5 gate report {}: {err}",
             report_path.display()
@@ -219,8 +242,11 @@ fn require_files(root_dir: &Path, paths: &[&str], label: &str) -> Result<(), Ste
     if missing.is_empty() {
         Ok(())
     } else {
+        // Missing required release-readiness docs = release sign-off
+        // evidence is incomplete. Fail-closed: PolicyReject so CI
+        // retry loops do not retry a real release-gate verdict.
         Err(StepExecutionError {
-            exit_code: 1,
+            exit_code: ExitCode::PolicyReject.as_i32(),
             detail: format!("missing {label}: {}", missing.join(", ")),
         })
     }
@@ -230,26 +256,34 @@ fn write_bundle(path: &Path, bundle: &mut ReleaseReadinessBundle) -> Result<(), 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             eprintln!(
-                "failed to create bundle directory {}: {err}",
+                "error [{}]: failed to create bundle directory {}: {err}",
+                ExitCode::TransientFailure,
                 parent.display()
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
     }
     bundle.generated_at_unix = now_unix().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::TransientFailure);
+        ExitCode::TransientFailure.as_i32()
     })?;
     let json = serde_json::to_vec_pretty(bundle).map_err(|err| {
-        eprintln!("failed to serialize release readiness bundle: {err}");
-        1
+        // Internal serialization error against a strongly typed
+        // schema: there is no operator fix beyond a code change, so
+        // surface as GenericFailure rather than ConfigError.
+        eprintln!(
+            "error [{}]: failed to serialize release readiness bundle: {err}",
+            ExitCode::GenericFailure
+        );
+        ExitCode::GenericFailure.as_i32()
     })?;
     fs::write(path, json).map_err(|err| {
         eprintln!(
-            "failed to write release readiness bundle {}: {err}",
+            "error [{}]: failed to write release readiness bundle {}: {err}",
+            ExitCode::TransientFailure,
             path.display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })
 }
 
