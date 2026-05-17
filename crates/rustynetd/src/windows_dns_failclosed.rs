@@ -187,6 +187,90 @@ pub fn evaluate_windows_dns_failclosed_snapshot(
     }
 }
 
+/// W3 — IPv6 NRPT sibling-rule coverage evaluator. Independent of
+/// the main `evaluate_windows_dns_failclosed_snapshot` pass; callers
+/// (e.g. the `windows-dns-failclosed-check` subcommand) opt in when
+/// the reviewed posture requires dual-stack NRPT coverage.
+///
+/// The rule: for every NRPT namespace that appears in ANY rule, the
+/// union of name-servers covering that namespace must include at
+/// least one IPv4 loopback address AND at least one IPv6 loopback
+/// address. A namespace with only IPv4 loopback resolvers leaves
+/// the IPv6 query path uncovered — applications that fall back to
+/// AAAA-via-Happy-Eyeballs may then hit the host's default DNS
+/// path, defeating the mesh's fail-closed posture.
+///
+/// Returns the list of drift reasons (empty = ok). Cross-platform
+/// pure evaluator; no I/O.
+pub fn evaluate_nrpt_ipv6_sibling_coverage(snapshot: &WindowsDnsFailclosedSnapshot) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    if snapshot.schema_version != 1 {
+        return vec![format!(
+            "unsupported windows DNS fail-closed snapshot schema_version={}; \
+             IPv6 sibling check requires schema_version=1",
+            snapshot.schema_version
+        )];
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct AfCoverage {
+        v4_loopback_present: bool,
+        v6_loopback_present: bool,
+    }
+
+    // Use BTreeMap so drift reasons are emitted in stable namespace
+    // order — easier for operators to diff between runs.
+    let mut coverage: BTreeMap<String, AfCoverage> = BTreeMap::new();
+
+    for rule in &snapshot.nrpt_rules {
+        let mut rule_cov = AfCoverage::default();
+        for raw in &rule.name_servers {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(addr) = trimmed.parse::<IpAddr>()
+                && is_loopback_address(&addr)
+            {
+                match addr {
+                    IpAddr::V4(_) => rule_cov.v4_loopback_present = true,
+                    IpAddr::V6(_) => rule_cov.v6_loopback_present = true,
+                }
+            }
+        }
+        for ns in &rule.namespace {
+            let trimmed_ns = ns.trim().to_string();
+            if trimmed_ns.is_empty() {
+                continue;
+            }
+            let entry = coverage.entry(trimmed_ns).or_default();
+            entry.v4_loopback_present |= rule_cov.v4_loopback_present;
+            entry.v6_loopback_present |= rule_cov.v6_loopback_present;
+        }
+    }
+
+    let mut reasons: Vec<String> = Vec::new();
+    for (ns, cov) in coverage {
+        match (cov.v4_loopback_present, cov.v6_loopback_present) {
+            (true, true) => {}
+            (true, false) => reasons.push(format!(
+                "NRPT namespace {ns:?} lacks an IPv6 loopback sibling rule; \
+                 AAAA queries for this namespace fall through to the host default DNS path"
+            )),
+            (false, true) => reasons.push(format!(
+                "NRPT namespace {ns:?} lacks an IPv4 loopback sibling rule; \
+                 A queries for this namespace fall through to the host default DNS path"
+            )),
+            (false, false) => reasons.push(format!(
+                "NRPT namespace {ns:?} has no loopback resolver in any covering rule; \
+                 both A and AAAA queries fall through to the host default DNS path"
+            )),
+        }
+    }
+    reasons
+}
+
 fn nrpt_rules_cover_root_namespace(rules: &[WindowsNrptRule]) -> bool {
     rules.iter().any(|rule| {
         rule.namespace
@@ -1075,6 +1159,245 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("unparseable") || r.contains("family")),
             "family mismatch must surface: {reasons:?}"
+        );
+    }
+
+    // ---- W3: IPv6 NRPT sibling-rule coverage evaluator -----------------
+
+    fn dual_stack_root_snapshot() -> WindowsDnsFailclosedSnapshot {
+        // A namespace covered by BOTH an IPv4 loopback and IPv6
+        // loopback resolver. The reviewed posture once the sibling
+        // requirement is wired into production.
+        WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![WindowsNrptRule {
+                name: "{rustynet-root-rule-v4}".to_string(),
+                namespace: vec![".".to_string()],
+                name_servers: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            }],
+        }
+    }
+
+    #[test]
+    fn sibling_evaluator_accepts_dual_stack_root_in_single_rule() {
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&dual_stack_root_snapshot());
+        assert!(
+            reasons.is_empty(),
+            "single dual-stack rule must satisfy the sibling check: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_accepts_dual_stack_root_across_two_rules() {
+        // A v4-only rule + a v6-only rule covering the same
+        // namespace satisfies the union-based sibling requirement.
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![
+                WindowsNrptRule {
+                    name: "{root-v4}".to_string(),
+                    namespace: vec![".".to_string()],
+                    name_servers: vec!["127.0.0.1".to_string()],
+                },
+                WindowsNrptRule {
+                    name: "{root-v6}".to_string(),
+                    namespace: vec![".".to_string()],
+                    name_servers: vec!["::1".to_string()],
+                },
+            ],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert!(
+            reasons.is_empty(),
+            "v4 rule + v6 rule covering same namespace must satisfy: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_flags_v4_only_namespace_missing_v6_sibling() {
+        // The current reviewed_snapshot fixture: a single root rule
+        // with only 127.0.0.1. The sibling check must flag the
+        // namespace as missing its v6 sibling.
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&reviewed_snapshot());
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("lacks an IPv6 loopback sibling") && r.contains("\".\"")),
+            "v4-only root must surface as missing IPv6 sibling: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("AAAA queries")),
+            "drift reason must explain the AAAA leak shape: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_flags_v6_only_namespace_missing_v4_sibling() {
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![WindowsNrptRule {
+                name: "{root-v6-only}".to_string(),
+                namespace: vec![".".to_string()],
+                name_servers: vec!["::1".to_string()],
+            }],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("lacks an IPv4 loopback sibling")),
+            "v6-only must surface as missing IPv4 sibling: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("A queries")),
+            "drift reason must explain the A leak shape: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_flags_namespace_with_no_loopback_resolver_at_all() {
+        // A rule that's technically present but lists only external
+        // resolvers (the main evaluator catches the rule as non-
+        // loopback; the sibling check independently catches it as
+        // no-loopback-at-all so the namespace surfaces in both
+        // passes).
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![WindowsNrptRule {
+                name: "{no-loopback-rule}".to_string(),
+                namespace: vec![".mesh.local".to_string()],
+                name_servers: vec!["8.8.8.8".to_string(), "2606:4700:4700::1111".to_string()],
+            }],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert!(
+            reasons.iter().any(|r| r.contains("no loopback resolver")),
+            "both-families-non-loopback must surface as no-loopback-at-all: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_surfaces_missing_sibling_per_namespace_in_stable_order() {
+        // Multiple namespaces, each missing an IPv6 sibling. Pin
+        // that the reasons come out in BTreeMap-sorted order so
+        // operators can diff outputs.
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![
+                WindowsNrptRule {
+                    name: "{a-rule}".to_string(),
+                    namespace: vec![".zeta.local".to_string()],
+                    name_servers: vec!["127.0.0.1".to_string()],
+                },
+                WindowsNrptRule {
+                    name: "{b-rule}".to_string(),
+                    namespace: vec![".alpha.local".to_string()],
+                    name_servers: vec!["127.0.0.1".to_string()],
+                },
+            ],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert_eq!(reasons.len(), 2);
+        // Sorted: ".alpha.local" before ".zeta.local"
+        assert!(
+            reasons[0].contains(".alpha.local"),
+            "first reason must be the alphabetically first namespace: {reasons:?}"
+        );
+        assert!(
+            reasons[1].contains(".zeta.local"),
+            "second reason must be the alphabetically second namespace: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_ignores_empty_namespace_entries() {
+        // A rule with an empty-string namespace entry is malformed
+        // (caught by the main evaluator); the sibling check must
+        // skip empty namespaces rather than emitting a drift reason
+        // with `""` as the name.
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![WindowsNrptRule {
+                name: "{empty-ns-rule}".to_string(),
+                namespace: vec!["".to_string(), "  ".to_string()],
+                name_servers: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            }],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert!(
+            reasons.is_empty(),
+            "empty namespaces must not produce sibling drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_rejects_unsupported_schema_version() {
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 2,
+            interfaces: vec![],
+            nrpt_rules: vec![],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert!(
+            reasons.iter().any(|r| r.contains("schema_version=2")),
+            "unsupported schema_version must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_accepts_empty_snapshot_with_no_namespaces() {
+        // No rules → no namespaces to check → sibling check is
+        // silent. The main evaluator catches missing-root-coverage
+        // separately.
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert!(
+            reasons.is_empty(),
+            "empty rule list must produce no sibling reasons: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn sibling_evaluator_aggregates_across_namespaces_via_union_semantics() {
+        // Namespace `.mesh` is covered by a v4-only rule AND a
+        // v6-only rule (different rules). Union semantics: covered.
+        // Namespace `.mesh.special` only appears in the v4-only
+        // rule. Not covered.
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![
+                WindowsNrptRule {
+                    name: "{v4-mesh}".to_string(),
+                    namespace: vec![".mesh".to_string(), ".mesh.special".to_string()],
+                    name_servers: vec!["127.0.0.1".to_string()],
+                },
+                WindowsNrptRule {
+                    name: "{v6-mesh}".to_string(),
+                    namespace: vec![".mesh".to_string()],
+                    name_servers: vec!["::1".to_string()],
+                },
+            ],
+        };
+        let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
+        assert_eq!(
+            reasons.len(),
+            1,
+            "exactly one namespace (.mesh.special) must surface: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains(".mesh.special") && reasons[0].contains("IPv6"),
+            "uncovered namespace must be the .mesh.special one: {reasons:?}"
         );
     }
 }

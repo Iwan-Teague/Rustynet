@@ -361,12 +361,28 @@ inline. Cross-reference with:
   - mixed loopback+external IPv6 rule rejected (+ root drift)
   - secondary IPv6 external rule isolated drift (root stays clean)
   - root rule covered by `::1`-only accepted
-* `[ ]` Remaining scope (separate slice): IPv6 sibling-rule
-  requirement (every IPv4 mesh-zone rule must have an IPv6 sibling) +
-  Router Advertisement suppression check (no native IPv6 default
-  route during protected mode). Requires expanding the snapshot
-  collector to surface RA / default-route state and adding a
-  pairing-check pass to the evaluator.
+* `[~]` Sibling-coverage evaluator landed (commit pending). New
+  `evaluate_nrpt_ipv6_sibling_coverage` pass (independent of the
+  main `evaluate_windows_dns_failclosed_snapshot` so existing
+  callers/fixtures are unaffected) walks every NRPT rule, computes
+  the union of loopback name-server address-families per namespace,
+  and surfaces drift when any namespace lacks a v4-loopback or
+  v6-loopback sibling. Three drift shapes pinned with operator-
+  facing reasons explaining the leak path (A queries / AAAA queries
+  / both fall through to host default DNS). Namespace iteration via
+  BTreeMap → stable sorted reasons across runs. 10 new tests pin
+  the contract: dual-stack in one rule, dual-stack across two
+  rules (union semantics), v4-only flagged, v6-only flagged,
+  no-loopback-at-all flagged, two namespaces in stable order, empty
+  namespaces ignored, unsupported schema_version rejected, empty
+  snapshot tolerated, mixed-rule union semantics with one covered +
+  one uncovered namespace.
+* `[ ]` Remaining scope (separate slice): wire the sibling
+  evaluator into the `windows-dns-failclosed-check` subcommand
+  (currently opt-in only at the API surface) and Router
+  Advertisement suppression check (no native IPv6 default route
+  during protected mode). The RA check requires expanding the
+  PowerShell collector to surface RA / default-route state.
 
 ### W4. `windows_runtime_acls.rs` registry + service ACL drift extension
 
@@ -512,10 +528,25 @@ inline. Cross-reference with:
   round-trips all fields, and `into_value_map` omits a `None`
   evidence_mode. `#[allow(dead_code)]` removed from
   `read_ndjson_typed` now that it has a real call-site.
+* `[~]` All four `ops_phase9.rs` NDJSON consumers now migrated to
+  typed views (commit pending). Added three more typed views
+  matching the dr_drills shape:
+  - `Phase9IncidentDrillView` — same `executed_at_utc` reviewed
+    contract as Phase9DrDrillView
+  - `Phase9SloWindowView` — `window_end_utc` required-string field
+  - `Phase9PerformanceSampleView` — both `measured_at_utc`
+    (reviewed) and `timestamp_utc` (legacy alias) captured as
+    `Option<String>`; `resolved_timestamp_utc()` applies the
+    precedence and the downstream loop surfaces the legacy
+    "missing or invalid UTC field" reason verbatim if both are
+    absent. Each typed view exposes `into_value_map()` for the
+    Map-based downstream consumers.
+  10 new tests across the three views (clean line / missing
+  required field / into_value_map round-trip on each + extras for
+  the performance-view precedence shape). `read_ndjson_objects`
+  marked `#[allow(dead_code)]` with a doc-comment noting it
+  remains as a verified reference impl for future migrations.
 * `[ ]` Remaining Phase A typed views (next slices):
-  - migrate the other 3 NDJSON consumers in `ops_phase9.rs`:
-    `slo_windows.ndjson`, `performance_samples.ndjson`,
-    `incident_drills.ndjson`
   - cross-network reports (`ops_cross_network_reports.rs` — large)
   - discovery bundle validator (`ops_network_discovery.rs`)
   - live-lab summary / failure digest (further `Value` walks)

@@ -999,6 +999,15 @@ fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
         .map_err(|err| format!("create {label} failed ({}): {err}", path.display()))
 }
 
+// X2: All four production NDJSON consumers (slo_windows,
+// performance_samples, incident_drills, dr_drills) now use
+// `read_ndjson_typed<T>`. `read_ndjson_objects` remains as a
+// verified reference implementation paired with its own behaviour
+// tests (per-line error path, blank-line tolerance, missing-file
+// path) — future migrations can still call it if a typed view
+// isn't worth the slot. Marked dead_code-allow so the unused
+// warning doesn't fire while the test suite still pins it.
+#[allow(dead_code)]
 fn read_ndjson_objects(path: &Path, label: &str) -> Result<Vec<Map<String, Value>>, String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("read {label} failed ({}): {err}", path.display()))?;
@@ -1065,6 +1074,102 @@ impl Phase9DrDrillView {
             "executed_at_utc".to_string(),
             Value::String(self.executed_at_utc),
         );
+        if let Some(mode) = self.evidence_mode {
+            m.insert("evidence_mode".to_string(), Value::String(mode));
+        }
+        m
+    }
+}
+
+/// X2: Phase A typed view for one line of `incident_drills.ndjson`.
+/// Same `executed_at_utc` reviewed contract as Phase9DrDrillView —
+/// the two streams share a UTC-timestamp field name and downstream
+/// helper surface.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Phase9IncidentDrillView {
+    executed_at_utc: String,
+    #[serde(default)]
+    evidence_mode: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl Phase9IncidentDrillView {
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert(
+            "executed_at_utc".to_string(),
+            Value::String(self.executed_at_utc),
+        );
+        if let Some(mode) = self.evidence_mode {
+            m.insert("evidence_mode".to_string(), Value::String(mode));
+        }
+        m
+    }
+}
+
+/// X2: Phase A typed view for one line of `slo_windows.ndjson`. The
+/// reviewed contract differs from the drill streams: the required
+/// timestamp field is `window_end_utc`, not `executed_at_utc`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Phase9SloWindowView {
+    window_end_utc: String,
+    #[serde(default)]
+    evidence_mode: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl Phase9SloWindowView {
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert(
+            "window_end_utc".to_string(),
+            Value::String(self.window_end_utc),
+        );
+        if let Some(mode) = self.evidence_mode {
+            m.insert("evidence_mode".to_string(), Value::String(mode));
+        }
+        m
+    }
+}
+
+/// X2: Phase A typed view for one line of
+/// `performance_samples.ndjson`. Reviewed contract: at least one of
+/// `measured_at_utc` or `timestamp_utc` (legacy alias) must be
+/// present and a string. The typed view captures BOTH as optional;
+/// `resolved_timestamp_utc` returns the canonical value, preferring
+/// the reviewed name. The downstream loop checks for an empty
+/// resolved string and surfaces the legacy "missing or invalid UTC
+/// field" reason verbatim, so behaviour does not change.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Phase9PerformanceSampleView {
+    #[serde(default)]
+    measured_at_utc: Option<String>,
+    #[serde(default)]
+    timestamp_utc: Option<String>,
+    #[serde(default)]
+    evidence_mode: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl Phase9PerformanceSampleView {
+    fn resolved_timestamp_utc(&self) -> &str {
+        self.measured_at_utc
+            .as_deref()
+            .or(self.timestamp_utc.as_deref())
+            .unwrap_or("")
+    }
+
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        if let Some(measured) = self.measured_at_utc {
+            m.insert("measured_at_utc".to_string(), Value::String(measured));
+        }
+        if let Some(legacy) = self.timestamp_utc {
+            m.insert("timestamp_utc".to_string(), Value::String(legacy));
+        }
         if let Some(mode) = self.evidence_mode {
             m.insert("evidence_mode".to_string(), Value::String(mode));
         }
@@ -1471,14 +1576,21 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         return Err("crypto deprecation schedule requires non-empty entries".to_string());
     }
 
-    let slo_entries = read_ndjson_objects(
+    // X2: typed-view migration of slo_windows.ndjson. `window_end_utc`
+    // becomes a serde-required-field check; a missing or non-string
+    // value fails at deserialise rather than later as ok_or_else.
+    let slo_typed_entries = read_ndjson_typed::<Phase9SloWindowView>(
         source_dir.join("slo_windows.ndjson").as_path(),
         "slo_windows.ndjson",
     )?;
     let mut latest_slo: Option<(i64, Map<String, Value>)> = None;
-    for (index, entry) in slo_entries.iter().enumerate() {
-        phase9_require_measured_mode(entry, format!("slo_windows.ndjson entry {index}").as_str())?;
-        let window_end = entry
+    for (index, entry) in slo_typed_entries.into_iter().enumerate() {
+        let entry_map = entry.into_value_map();
+        phase9_require_measured_mode(
+            &entry_map,
+            format!("slo_windows.ndjson entry {index}").as_str(),
+        )?;
+        let window_end = entry_map
             .get("window_end_utc")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing or invalid UTC field: slo latest window_end_utc".to_string())?;
@@ -1488,30 +1600,35 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
             .map(|(latest, _)| timestamp > *latest)
             .unwrap_or(true)
         {
-            latest_slo = Some((timestamp, entry.clone()));
+            latest_slo = Some((timestamp, entry_map));
         }
     }
     let (slo_latest_timestamp, slo_latest) =
         latest_slo.ok_or_else(|| "no entries in ndjson source: slo_windows.ndjson".to_string())?;
     phase9_enforce_timestamp_freshness(slo_latest_timestamp, "latest slo window", now_unix)?;
 
-    let performance_entries = read_ndjson_objects(
+    // X2: typed-view migration of performance_samples.ndjson. The
+    // typed view captures both `measured_at_utc` (reviewed) and
+    // `timestamp_utc` (legacy alias); `resolved_timestamp_utc`
+    // applies the precedence. Both being absent still fails closed
+    // with the same operator-visible reason as before.
+    let performance_typed_entries = read_ndjson_typed::<Phase9PerformanceSampleView>(
         source_dir.join("performance_samples.ndjson").as_path(),
         "performance_samples.ndjson",
     )?;
     let mut performance_entries_sorted = Vec::new();
-    for (index, entry) in performance_entries.into_iter().enumerate() {
+    for (index, entry) in performance_typed_entries.into_iter().enumerate() {
+        let resolved = entry.resolved_timestamp_utc().to_string();
+        let entry_map = entry.into_value_map();
         phase9_require_measured_mode(
-            &entry,
+            &entry_map,
             format!("performance_samples.ndjson entry {index}").as_str(),
         )?;
-        let timestamp_raw = entry
-            .get("measured_at_utc")
-            .and_then(Value::as_str)
-            .or_else(|| entry.get("timestamp_utc").and_then(Value::as_str))
-            .ok_or_else(|| "missing or invalid UTC field: performance timestamp".to_string())?;
-        let timestamp = parse_utc_to_unix(timestamp_raw, "performance timestamp")?;
-        performance_entries_sorted.push((timestamp, entry));
+        if resolved.is_empty() {
+            return Err("missing or invalid UTC field: performance timestamp".to_string());
+        }
+        let timestamp = parse_utc_to_unix(resolved.as_str(), "performance timestamp")?;
+        performance_entries_sorted.push((timestamp, entry_map));
     }
     performance_entries_sorted.sort_by_key(|(timestamp, _)| *timestamp);
     let (performance_start, _) = performance_entries_sorted
@@ -1560,11 +1677,18 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         )?);
     }
 
-    let incident_entries = read_ndjson_objects(
+    // X2: typed-view migration of incident_drills.ndjson. Same
+    // `executed_at_utc` reviewed contract as dr_drills; the typed
+    // view enforces it at deserialise.
+    let incident_typed_entries = read_ndjson_typed::<Phase9IncidentDrillView>(
         source_dir.join("incident_drills.ndjson").as_path(),
         "incident_drills.ndjson",
     )?;
     let mut latest_incident: Option<(i64, Map<String, Value>)> = None;
+    let incident_entries: Vec<Map<String, Value>> = incident_typed_entries
+        .into_iter()
+        .map(Phase9IncidentDrillView::into_value_map)
+        .collect();
     for (index, entry) in incident_entries.iter().enumerate() {
         phase9_require_measured_mode(
             entry,
@@ -5783,5 +5907,219 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             map.get("executed_at_utc").and_then(|v| v.as_str()),
             Some("2026-05-01T00:00:00Z")
         );
+    }
+
+    // ---- X2: Phase9IncidentDrillView typed-view migration coverage ------
+
+    #[test]
+    fn phase9_incident_drill_view_accepts_clean_line() {
+        let path = ndjson_temp_path("incident-typed-clean");
+        fs::write(
+            &path,
+            r#"{"executed_at_utc":"2026-05-01T00:00:00Z","evidence_mode":"measured","ticket":"INC-1"}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<super::Phase9IncidentDrillView> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].executed_at_utc, "2026-05-01T00:00:00Z");
+        assert_eq!(entries[0].evidence_mode.as_deref(), Some("measured"));
+        assert!(entries[0].extra.contains_key("ticket"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase9_incident_drill_view_rejects_missing_executed_at_utc() {
+        let path = ndjson_temp_path("incident-typed-missing-utc");
+        fs::write(
+            &path,
+            r#"{"evidence_mode":"measured","ticket":"INC-1"}
+"#,
+        )
+        .expect("write ndjson");
+        let err = super::read_ndjson_typed::<super::Phase9IncidentDrillView>(
+            path.as_path(),
+            "incident_drills.ndjson",
+        )
+        .expect_err("missing executed_at_utc must fail-closed");
+        assert!(
+            err.contains("executed_at_utc"),
+            "error must name the missing field: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase9_incident_drill_view_into_value_map_round_trips() {
+        let view = super::Phase9IncidentDrillView {
+            executed_at_utc: "2026-05-01T00:00:00Z".to_string(),
+            evidence_mode: Some("measured".to_string()),
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "ticket".to_string(),
+                    serde_json::Value::String("INC-42".to_string()),
+                );
+                m
+            },
+        };
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("executed_at_utc").and_then(|v| v.as_str()),
+            Some("2026-05-01T00:00:00Z")
+        );
+        assert_eq!(
+            map.get("evidence_mode").and_then(|v| v.as_str()),
+            Some("measured")
+        );
+        assert_eq!(map.get("ticket").and_then(|v| v.as_str()), Some("INC-42"));
+    }
+
+    // ---- X2: Phase9SloWindowView typed-view migration coverage ----------
+
+    #[test]
+    fn phase9_slo_window_view_accepts_clean_line() {
+        let path = ndjson_temp_path("slo-typed-clean");
+        fs::write(
+            &path,
+            r#"{"window_end_utc":"2026-05-01T00:00:00Z","evidence_mode":"measured","slo_id":"availability"}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<super::Phase9SloWindowView> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].window_end_utc, "2026-05-01T00:00:00Z");
+        assert!(entries[0].extra.contains_key("slo_id"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase9_slo_window_view_rejects_missing_window_end_utc() {
+        let path = ndjson_temp_path("slo-typed-missing-utc");
+        fs::write(
+            &path,
+            r#"{"evidence_mode":"measured","slo_id":"availability"}
+"#,
+        )
+        .expect("write ndjson");
+        let err = super::read_ndjson_typed::<super::Phase9SloWindowView>(
+            path.as_path(),
+            "slo_windows.ndjson",
+        )
+        .expect_err("missing window_end_utc must fail-closed");
+        assert!(
+            err.contains("window_end_utc"),
+            "error must name the missing field: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase9_slo_window_view_into_value_map_round_trips() {
+        let view = super::Phase9SloWindowView {
+            window_end_utc: "2026-05-01T00:00:00Z".to_string(),
+            evidence_mode: Some("measured".to_string()),
+            extra: serde_json::Map::new(),
+        };
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("window_end_utc").and_then(|v| v.as_str()),
+            Some("2026-05-01T00:00:00Z")
+        );
+        assert_eq!(
+            map.get("evidence_mode").and_then(|v| v.as_str()),
+            Some("measured")
+        );
+    }
+
+    // ---- X2: Phase9PerformanceSampleView typed-view migration coverage --
+
+    #[test]
+    fn phase9_performance_sample_view_prefers_measured_at_utc_over_legacy() {
+        // Both fields present — reviewed `measured_at_utc` wins over
+        // the legacy `timestamp_utc` alias.
+        let path = ndjson_temp_path("perf-typed-prefers-reviewed");
+        fs::write(
+            &path,
+            r#"{"measured_at_utc":"2026-05-01T01:00:00Z","timestamp_utc":"2026-05-01T00:00:00Z","evidence_mode":"measured","idle_cpu_percent":0.1}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<super::Phase9PerformanceSampleView> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].resolved_timestamp_utc(),
+            "2026-05-01T01:00:00Z",
+            "measured_at_utc must take precedence"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase9_performance_sample_view_falls_back_to_legacy_timestamp_utc() {
+        let path = ndjson_temp_path("perf-typed-legacy-only");
+        fs::write(
+            &path,
+            r#"{"timestamp_utc":"2026-05-01T00:00:00Z","evidence_mode":"measured","idle_cpu_percent":0.1}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<super::Phase9PerformanceSampleView> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(
+            entries[0].resolved_timestamp_utc(),
+            "2026-05-01T00:00:00Z",
+            "must fall back to legacy timestamp_utc"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase9_performance_sample_view_resolved_empty_when_both_absent() {
+        // Neither field present. The typed view still parses (both
+        // are Option), but resolved_timestamp_utc returns "" so the
+        // caller can surface the legacy fail-closed reason.
+        let path = ndjson_temp_path("perf-typed-no-utc");
+        fs::write(
+            &path,
+            r#"{"evidence_mode":"measured","idle_cpu_percent":0.1}
+"#,
+        )
+        .expect("write ndjson");
+        let entries: Vec<super::Phase9PerformanceSampleView> =
+            super::read_ndjson_typed(path.as_path(), "test").expect("typed parse ok");
+        assert_eq!(
+            entries[0].resolved_timestamp_utc(),
+            "",
+            "both absent must return empty for caller to handle"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn phase9_performance_sample_view_into_value_map_preserves_both_aliases() {
+        let view = super::Phase9PerformanceSampleView {
+            measured_at_utc: Some("2026-05-01T01:00:00Z".to_string()),
+            timestamp_utc: Some("2026-05-01T00:00:00Z".to_string()),
+            evidence_mode: Some("measured".to_string()),
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("idle_cpu_percent".to_string(), serde_json::Value::from(0.1));
+                m
+            },
+        };
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("measured_at_utc").and_then(|v| v.as_str()),
+            Some("2026-05-01T01:00:00Z")
+        );
+        assert_eq!(
+            map.get("timestamp_utc").and_then(|v| v.as_str()),
+            Some("2026-05-01T00:00:00Z")
+        );
+        assert!(map.contains_key("idle_cpu_percent"));
     }
 }
