@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -58,21 +59,41 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<String> = env::args().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
+
+    if !cfg!(target_os = "macos") {
+        // macOS-only platform check: running this smoke gate off-macOS
+        // cannot evaluate its security claim. Operators must NOT retry
+        // on a different platform without changing orchestration.
+        eprintln!(
+            "error [{}]: macos dataplane smoke requires macOS",
+            ExitCode::PolicyReject
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
+    }
 
     println!("[macos-smoke] validating hardened macOS startup contracts in start.sh");
     for (pattern, target, error_message) in REQUIRED_PATTERNS {
         let should_match = *pattern != "install_macos_unprivileged_wireguard_tools";
         let matched = run_rg(&root_dir, pattern, target)?;
         if should_match && !matched {
-            eprintln!("[macos-smoke] {error_message}");
-            return Err(1);
+            // Hardened-contract pattern missing: fail-closed policy
+            // reject.
+            eprintln!(
+                "error [{}]: [macos-smoke] {error_message}",
+                ExitCode::PolicyReject
+            );
+            return Err(ExitCode::PolicyReject.as_i32());
         }
         if !should_match && matched {
-            eprintln!("[macos-smoke] {error_message}");
-            return Err(1);
+            // Forbidden insecure fallback present: policy reject.
+            eprintln!(
+                "error [{}]: [macos-smoke] {error_message}",
+                ExitCode::PolicyReject
+            );
+            return Err(ExitCode::PolicyReject.as_i32());
         }
     }
 
@@ -82,12 +103,19 @@ fn run() -> Result<(), i32> {
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("[macos-smoke] failed to run bash -n start.sh: {err}");
-            1
+            eprintln!(
+                "error [{}]: [macos-smoke] failed to run bash -n start.sh: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if !status.success() {
-        eprintln!("[macos-smoke] start.sh syntax check failed");
-        return Err(status_code(status));
+        // Malformed start.sh: configuration/source-asset error.
+        eprintln!(
+            "error [{}]: [macos-smoke] start.sh syntax check failed",
+            ExitCode::ConfigError
+        );
+        return Err(ExitCode::ConfigError.as_i32());
     }
 
     println!("[macos-smoke] running targeted macOS dataplane security tests");
@@ -119,8 +147,11 @@ fn run_rg(root_dir: &Path, pattern: &str, target: &str) -> Result<bool, i32> {
         .stderr(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("[macos-smoke] failed to execute rg for pattern {pattern}: {err}");
-            1
+            eprintln!(
+                "error [{}]: [macos-smoke] failed to execute rg for pattern {pattern}: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     Ok(status.success())
 }
@@ -143,13 +174,16 @@ fn run_required_test(root_dir: &Path, package: &str, test_filter: &str) -> Resul
         .status()
         .map_err(|err| {
             eprintln!(
-                "[macos-smoke] failed to execute required test helper for package={package} filter={test_filter}: {err}"
+                "error [{}]: [macos-smoke] failed to execute required test helper for package={package} filter={test_filter}: {err}",
+                ExitCode::TransientFailure
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through inner X6 taxonomy from the required-test
+        // helper.
         Err(status_code(status))
     }
 }

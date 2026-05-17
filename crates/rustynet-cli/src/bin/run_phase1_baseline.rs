@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -17,8 +18,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<String> = env::args().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let mut phase1_source = PathBuf::from(
         env::var("RUSTYNET_PHASE1_PERF_SAMPLES_PATH")
@@ -31,18 +32,20 @@ fn run() -> Result<(), i32> {
     }
     if !phase1_source.is_file() {
         eprintln!(
-            "missing measured phase1 source: {}",
+            "error [{}]: missing measured phase1 source: {}",
+            ExitCode::ConfigError,
             phase1_source.display()
         );
-        return Err(1);
+        return Err(ExitCode::ConfigError.as_i32());
     }
 
     let phase1_source_utf8 = phase1_source.to_str().ok_or_else(|| {
         eprintln!(
-            "phase1 source path is not valid UTF-8: {}",
+            "error [{}]: phase1 source path is not valid UTF-8: {}",
+            ExitCode::ConfigError,
             phase1_source.display()
         );
-        1
+        ExitCode::ConfigError.as_i32()
     })?;
 
     let status = Command::new("cargo")
@@ -59,12 +62,16 @@ fn run() -> Result<(), i32> {
         ])
         .status()
         .map_err(|err| {
-            eprintln!("failed to run run-phase1-baseline: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run run-phase1-baseline: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through inner X6 taxonomy code intact.
         Err(status_code(status))
     }
 }

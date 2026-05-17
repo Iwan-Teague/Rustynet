@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,8 +20,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let phase1_report = env::var_os("RUSTYNET_PHASE1_PERF_REPORT")
         .filter(|value| !value.is_empty())
@@ -46,13 +47,30 @@ fn run() -> Result<(), i32> {
         .arg(&phase3_report)
         .status()
         .map_err(|err| {
-            eprintln!("failed to execute performance regression gate: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to execute performance regression gate: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
-        Err(status_code(status))
+        // A detected performance regression is a hard verdict —
+        // PolicyReject — so retry-only-on-70 CI loops do not retry a
+        // real regression failure. The inner ops command already emits
+        // its own X6 code; if it returned 1 (generic) we upgrade to
+        // PolicyReject (78) here; other taxonomy codes pass through.
+        let inner = status_code(status);
+        if inner == ExitCode::GenericFailure.as_i32() {
+            eprintln!(
+                "error [{}]: perf regression detected",
+                ExitCode::PolicyReject
+            );
+            Err(ExitCode::PolicyReject.as_i32())
+        } else {
+            Err(inner)
+        }
     }
 }
 

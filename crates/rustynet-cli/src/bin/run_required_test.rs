@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -23,19 +24,21 @@ fn run() -> Result<(), i32> {
         .unwrap_or_else(|| OsString::from("run_required_test"));
     let mut remaining: Vec<OsString> = args.collect();
     if remaining.len() < 2 {
+        // Missing required arguments — BadArgs (64) per X6 taxonomy.
         eprintln!(
-            "usage: {} <cargo-package> <test-filter> [cargo-test-args...]",
+            "error [{}]: usage: {} <cargo-package> <test-filter> [cargo-test-args...]",
+            ExitCode::BadArgs,
             program.to_string_lossy()
         );
-        return Err(2);
+        return Err(ExitCode::BadArgs.as_i32());
     }
 
     let package = remaining.remove(0);
     let test_filter = remaining.remove(0);
     let extra_args = remaining;
     let tmp_output = TempOutputGuard::create().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::TransientFailure);
+        ExitCode::TransientFailure.as_i32()
     })?;
 
     let output_file = OpenOptions::new()
@@ -43,10 +46,11 @@ fn run() -> Result<(), i32> {
         .open(tmp_output.path())
         .map_err(|err| {
             eprintln!(
-                "failed to open temporary output file ({}): {err}",
+                "error [{}]: failed to open temporary output file ({}): {err}",
+                ExitCode::TransientFailure,
                 tmp_output.path().display()
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
     let mut cmd = Command::new("cargo");
     cmd.arg("test")
@@ -58,24 +62,31 @@ fn run() -> Result<(), i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file.try_clone().map_err(|err| {
             eprintln!(
-                "failed to clone output file handle ({}): {err}",
+                "error [{}]: failed to clone output file handle ({}): {err}",
+                ExitCode::TransientFailure,
                 tmp_output.path().display()
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?))
         .stderr(Stdio::from(output_file));
     let status = cmd.status().map_err(|err| {
-        eprintln!("failed to run cargo test: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to run cargo test: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if !status.success() {
         dump_file(tmp_output.path(), &mut io::stderr().lock())?;
         eprintln!(
-            "required test failed: package={} filter={}",
+            "error [{}]: required test failed: package={} filter={}",
+            ExitCode::GenericFailure,
             package.to_string_lossy(),
             test_filter.to_string_lossy()
         );
-        return Err(1);
+        // Pass through cargo test's own exit code (typically 101) so
+        // the caller sees the inner test runner's verdict intact.
+        return Err(status_code(status));
     }
 
     dump_file(tmp_output.path(), &mut io::stdout().lock())?;
@@ -89,21 +100,27 @@ fn verify_required_test_output(
 ) -> Result<(), i32> {
     let output_utf8 = output.to_str().ok_or_else(|| {
         eprintln!(
-            "required test output path is not UTF-8: {}",
+            "error [{}]: required test output path is not UTF-8: {}",
+            ExitCode::ConfigError,
             output.display()
         );
-        1
+        ExitCode::ConfigError.as_i32()
     })?;
     let package_utf8 = package.to_str().ok_or_else(|| {
-        eprintln!("package value is not UTF-8: {}", package.to_string_lossy());
-        1
+        eprintln!(
+            "error [{}]: package value is not UTF-8: {}",
+            ExitCode::ConfigError,
+            package.to_string_lossy()
+        );
+        ExitCode::ConfigError.as_i32()
     })?;
     let filter_utf8 = test_filter.to_str().ok_or_else(|| {
         eprintln!(
-            "test filter value is not UTF-8: {}",
+            "error [{}]: test filter value is not UTF-8: {}",
+            ExitCode::ConfigError,
             test_filter.to_string_lossy()
         );
-        1
+        ExitCode::ConfigError.as_i32()
     })?;
     let status = Command::new("cargo")
         .args([
@@ -124,33 +141,51 @@ fn verify_required_test_output(
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to run verify-required-test-output command: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run verify-required-test-output command: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through inner X6 taxonomy from the verifier.
         Err(status_code(status))
     }
 }
 
 fn dump_file(path: &Path, writer: &mut dyn Write) -> Result<(), i32> {
     let mut file = File::open(path).map_err(|err| {
-        eprintln!("failed to read output file ({}): {err}", path.display());
-        1
+        eprintln!(
+            "error [{}]: failed to read output file ({}): {err}",
+            ExitCode::TransientFailure,
+            path.display()
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     let mut data = Vec::new();
     file.read_to_end(&mut data).map_err(|err| {
-        eprintln!("failed to read output file ({}): {err}", path.display());
-        1
+        eprintln!(
+            "error [{}]: failed to read output file ({}): {err}",
+            ExitCode::TransientFailure,
+            path.display()
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     writer.write_all(&data).map_err(|err| {
-        eprintln!("failed to write command output stream: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to write command output stream: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     writer.flush().map_err(|err| {
-        eprintln!("failed to flush command output stream: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to flush command output stream: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     Ok(())
 }
