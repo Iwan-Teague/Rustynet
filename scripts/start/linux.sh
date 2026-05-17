@@ -82,3 +82,19 @@ __rustynet_linux_apply_profile_defaults() {
   WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
   SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
 }
+
+# Linux variant of enforce_host_storage_policy. Pins HOST_PROFILE and
+# re-threads the reviewed LINUX_* credential-blob paths into the
+# canonical runtime variables. The Linux variant intentionally does
+# NOT validate every storage path — those are owned by the systemd
+# unit and the privileged helper, not by start.sh. Guarded so a stray
+# call on a non-Linux host is a no-op rather than clobbering macOS
+# state mid-flight.
+__rustynet_linux_enforce_host_storage_policy() {
+  if ! is_linux_host; then
+    return 0
+  fi
+  HOST_PROFILE="linux"
+  WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+  SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+}
