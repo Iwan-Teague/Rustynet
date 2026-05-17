@@ -493,14 +493,33 @@ inline. Cross-reference with:
 
 ### X2. Phase A typed-schema continuation
 
-* `[ ]` Remaining Phase A typed views per
-  [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md):
+* `[~]` Incremental progress (commit pending). First of the four
+  NDJSON consumers in `ops_phase9.rs` migrated to
+  `read_ndjson_typed<T>`: `dr_drills.ndjson` now goes through the
+  new `Phase9DrDrillView` typed view that pins:
+  - required `executed_at_utc: String` (serde fail-closed when
+    missing or non-string)
+  - optional `evidence_mode: Option<String>` (typed Option keeps
+    the legacy `phase9_require_measured_mode` semantics)
+  - `#[serde(flatten)] extra: Map<String, Value>` to carry the
+    untyped fields the downstream Map-based helpers still walk
+  - `into_value_map()` bridge that re-merges the typed fields back
+    into a `Map<String, Value>` for the downstream code, lossless
+  6 new tests pin the migration: clean line accepted, missing
+  `executed_at_utc` rejected at the typed boundary with the file
+  label in the error, wrong-type `executed_at_utc` rejected,
+  missing `evidence_mode` accepted as `None`, `into_value_map`
+  round-trips all fields, and `into_value_map` omits a `None`
+  evidence_mode. `#[allow(dead_code)]` removed from
+  `read_ndjson_typed` now that it has a real call-site.
+* `[ ]` Remaining Phase A typed views (next slices):
+  - migrate the other 3 NDJSON consumers in `ops_phase9.rs`:
+    `slo_windows.ndjson`, `performance_samples.ndjson`,
+    `incident_drills.ndjson`
   - cross-network reports (`ops_cross_network_reports.rs` — large)
   - discovery bundle validator (`ops_network_discovery.rs`)
   - live-lab summary / failure digest (further `Value` walks)
   - fresh-install OS matrix (`ops_fresh_install_os_matrix.rs`)
-  - migrate the four NDJSON consumers in `ops_phase9.rs` to
-    `read_ndjson_typed<T>`
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
