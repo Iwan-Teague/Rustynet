@@ -774,6 +774,7 @@ fn validate_ssh_trust_summary_artifact(path: &Path) -> Vec<String> {
     problems
 }
 
+#[cfg(test)]
 fn parse_json_object_file(path: &Path, label: &str) -> Result<Map<String, Value>, String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("{}: read {label} failed: {err}", path.display()))?;
@@ -785,207 +786,334 @@ fn parse_json_object_file(path: &Path, label: &str) -> Result<Map<String, Value>
         .ok_or_else(|| format!("{}: {label} must be a JSON object", path.display()))
 }
 
+/// X2: Phase A typed view for the soak-monitor summary artifact. The
+/// reviewed contract pins every required scalar with serde
+/// required-field semantics, so missing fields and wrong-type fields
+/// (e.g. a stringified counter) fail at deserialize with a precise
+/// per-field error rather than silently flowing through
+/// `as_u64()`/`as_str()` returning `None`.
+///
+/// All 19 required counters are typed `u64` and all 8 required status
+/// strings are typed `String`. Cross-field invariants (sum of path
+/// modes == samples, end >= start, `direct_remote_exit_ready == pass`,
+/// etc.) are still enforced by `validate_soak_monitor_summary_artifact`
+/// using the typed fields directly.
+///
+/// Any extra keys in the artifact ride through `#[serde(flatten)]
+/// extra` and `into_value_map` re-injects the typed fields so any
+/// downstream Map walker keeps working.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CrossNetworkSoakMonitorSummaryView {
+    samples: u64,
+    failing_samples: u64,
+    max_consecutive_failures_observed: u64,
+    elapsed_secs: u64,
+    required_soak_duration_secs: u64,
+    allowed_failing_samples: u64,
+    allowed_max_consecutive_failures: u64,
+    direct_samples: u64,
+    relay_samples: u64,
+    fail_closed_samples: u64,
+    other_path_samples: u64,
+    path_transition_count: u64,
+    status_mismatch_samples: u64,
+    route_mismatch_samples: u64,
+    endpoint_mismatch_samples: u64,
+    dns_alarm_bad_samples: u64,
+    transport_identity_failures: u64,
+    endpoint_change_events_start: u64,
+    endpoint_change_events_end: u64,
+    endpoint_change_events_delta: u64,
+    direct_remote_exit_ready: String,
+    post_soak_bypass_ready: String,
+    no_plaintext_passphrase_files: String,
+    first_non_direct_reason: String,
+    first_failure_reason: String,
+    last_path_mode: String,
+    last_path_reason: String,
+    long_soak_stable: String,
+    // Extra (non-required) keys ride through `#[serde(flatten)]` so the
+    // soak summary may evolve forward-compatibly. The current
+    // validator drives every assertion from the typed fields above, so
+    // `extra` is observed only by tests via `into_value_map`.
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl CrossNetworkSoakMonitorSummaryView {
+    /// Bridge the typed view back to a `Map<String, Value>` for any
+    /// downstream helper that still walks the soak monitor summary
+    /// generically. Re-injects every typed field so callers observe the
+    /// full artifact shape. Exercised by the typed-view round-trip test.
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("samples".to_string(), Value::Number(self.samples.into()));
+        m.insert(
+            "failing_samples".to_string(),
+            Value::Number(self.failing_samples.into()),
+        );
+        m.insert(
+            "max_consecutive_failures_observed".to_string(),
+            Value::Number(self.max_consecutive_failures_observed.into()),
+        );
+        m.insert(
+            "elapsed_secs".to_string(),
+            Value::Number(self.elapsed_secs.into()),
+        );
+        m.insert(
+            "required_soak_duration_secs".to_string(),
+            Value::Number(self.required_soak_duration_secs.into()),
+        );
+        m.insert(
+            "allowed_failing_samples".to_string(),
+            Value::Number(self.allowed_failing_samples.into()),
+        );
+        m.insert(
+            "allowed_max_consecutive_failures".to_string(),
+            Value::Number(self.allowed_max_consecutive_failures.into()),
+        );
+        m.insert(
+            "direct_samples".to_string(),
+            Value::Number(self.direct_samples.into()),
+        );
+        m.insert(
+            "relay_samples".to_string(),
+            Value::Number(self.relay_samples.into()),
+        );
+        m.insert(
+            "fail_closed_samples".to_string(),
+            Value::Number(self.fail_closed_samples.into()),
+        );
+        m.insert(
+            "other_path_samples".to_string(),
+            Value::Number(self.other_path_samples.into()),
+        );
+        m.insert(
+            "path_transition_count".to_string(),
+            Value::Number(self.path_transition_count.into()),
+        );
+        m.insert(
+            "status_mismatch_samples".to_string(),
+            Value::Number(self.status_mismatch_samples.into()),
+        );
+        m.insert(
+            "route_mismatch_samples".to_string(),
+            Value::Number(self.route_mismatch_samples.into()),
+        );
+        m.insert(
+            "endpoint_mismatch_samples".to_string(),
+            Value::Number(self.endpoint_mismatch_samples.into()),
+        );
+        m.insert(
+            "dns_alarm_bad_samples".to_string(),
+            Value::Number(self.dns_alarm_bad_samples.into()),
+        );
+        m.insert(
+            "transport_identity_failures".to_string(),
+            Value::Number(self.transport_identity_failures.into()),
+        );
+        m.insert(
+            "endpoint_change_events_start".to_string(),
+            Value::Number(self.endpoint_change_events_start.into()),
+        );
+        m.insert(
+            "endpoint_change_events_end".to_string(),
+            Value::Number(self.endpoint_change_events_end.into()),
+        );
+        m.insert(
+            "endpoint_change_events_delta".to_string(),
+            Value::Number(self.endpoint_change_events_delta.into()),
+        );
+        m.insert(
+            "direct_remote_exit_ready".to_string(),
+            Value::String(self.direct_remote_exit_ready),
+        );
+        m.insert(
+            "post_soak_bypass_ready".to_string(),
+            Value::String(self.post_soak_bypass_ready),
+        );
+        m.insert(
+            "no_plaintext_passphrase_files".to_string(),
+            Value::String(self.no_plaintext_passphrase_files),
+        );
+        m.insert(
+            "first_non_direct_reason".to_string(),
+            Value::String(self.first_non_direct_reason),
+        );
+        m.insert(
+            "first_failure_reason".to_string(),
+            Value::String(self.first_failure_reason),
+        );
+        m.insert(
+            "last_path_mode".to_string(),
+            Value::String(self.last_path_mode),
+        );
+        m.insert(
+            "last_path_reason".to_string(),
+            Value::String(self.last_path_reason),
+        );
+        m.insert(
+            "long_soak_stable".to_string(),
+            Value::String(self.long_soak_stable),
+        );
+        m
+    }
+}
+
 fn validate_soak_monitor_summary_artifact(path: &Path) -> Vec<String> {
+    // X2: Phase A typed view migration. The soak monitor summary now
+    // parses through `CrossNetworkSoakMonitorSummaryView`, which pins
+    // every required counter and status with serde required-field
+    // semantics. A missing or wrong-type required field fails here at
+    // deserialize with a precise error rather than falling through to
+    // many follow-up "must be ..." problems from `as_u64()`/`as_str()`
+    // returning `None`.
+    let body = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(err) => {
+            return vec![format!(
+                "{}: read soak monitor summary failed: {err}",
+                path.display()
+            )];
+        }
+    };
+    let typed: CrossNetworkSoakMonitorSummaryView = match serde_json::from_str(&body) {
+        Ok(view) => view,
+        Err(err) => {
+            return vec![format!(
+                "{}: invalid soak monitor summary ({err})",
+                path.display()
+            )];
+        }
+    };
+
     let mut problems = Vec::new();
-    let payload = match parse_json_object_file(path, "soak monitor summary") {
-        Ok(payload) => payload,
-        Err(err) => return vec![err],
-    };
 
-    let read_u64 = |field: &str, problems: &mut Vec<String>| -> Option<u64> {
-        let value = payload.get(field).and_then(Value::as_u64);
-        if value.is_none() {
-            problems.push(format!(
-                "{}: {field} must be a non-negative integer",
-                path.display()
-            ));
-        }
-        value
-    };
-    let read_status = |field: &str, problems: &mut Vec<String>| -> Option<String> {
-        let value = value_as_non_empty_string(payload.get(field));
-        if value.is_none() {
-            problems.push(format!(
-                "{}: {field} must be a non-empty string",
-                path.display()
-            ));
-        }
-        value
-    };
-
-    let samples = read_u64("samples", &mut problems);
-    let failing_samples = read_u64("failing_samples", &mut problems);
-    let max_consecutive_failures_observed =
-        read_u64("max_consecutive_failures_observed", &mut problems);
-    let elapsed_secs = read_u64("elapsed_secs", &mut problems);
-    let required_soak_duration_secs = read_u64("required_soak_duration_secs", &mut problems);
-    let allowed_failing_samples = read_u64("allowed_failing_samples", &mut problems);
-    let allowed_max_consecutive_failures =
-        read_u64("allowed_max_consecutive_failures", &mut problems);
-    let direct_samples = read_u64("direct_samples", &mut problems);
-    let relay_samples = read_u64("relay_samples", &mut problems);
-    let fail_closed_samples = read_u64("fail_closed_samples", &mut problems);
-    let other_path_samples = read_u64("other_path_samples", &mut problems);
-    let path_transition_count = read_u64("path_transition_count", &mut problems);
-    let status_mismatch_samples = read_u64("status_mismatch_samples", &mut problems);
-    let route_mismatch_samples = read_u64("route_mismatch_samples", &mut problems);
-    let endpoint_mismatch_samples = read_u64("endpoint_mismatch_samples", &mut problems);
-    let dns_alarm_bad_samples = read_u64("dns_alarm_bad_samples", &mut problems);
-    let transport_identity_failures = read_u64("transport_identity_failures", &mut problems);
-    let endpoint_change_events_start = read_u64("endpoint_change_events_start", &mut problems);
-    let endpoint_change_events_end = read_u64("endpoint_change_events_end", &mut problems);
-    let endpoint_change_events_delta = read_u64("endpoint_change_events_delta", &mut problems);
-
-    let direct_remote_exit_ready = read_status("direct_remote_exit_ready", &mut problems);
-    let post_soak_bypass_ready = read_status("post_soak_bypass_ready", &mut problems);
-    let no_plaintext_passphrase_files = read_status("no_plaintext_passphrase_files", &mut problems);
-    let first_non_direct_reason = read_status("first_non_direct_reason", &mut problems);
-    let first_failure_reason = read_status("first_failure_reason", &mut problems);
-    let last_path_mode = read_status("last_path_mode", &mut problems);
-    let last_path_reason = read_status("last_path_reason", &mut problems);
-    let long_soak_stable = read_status("long_soak_stable", &mut problems);
-
-    if let (
-        Some(samples),
-        Some(direct_samples),
-        Some(relay_samples),
-        Some(fail_closed_samples),
-        Some(other_path_samples),
-    ) = (
-        samples,
-        direct_samples,
-        relay_samples,
-        fail_closed_samples,
-        other_path_samples,
-    ) && direct_samples + relay_samples + fail_closed_samples + other_path_samples != samples
+    if typed.direct_samples
+        + typed.relay_samples
+        + typed.fail_closed_samples
+        + typed.other_path_samples
+        != typed.samples
     {
         problems.push(format!(
             "{}: direct/relay/fail_closed/other sample counts must sum to samples",
             path.display()
         ));
     }
-    if let (Some(start), Some(end), Some(delta)) = (
-        endpoint_change_events_start,
-        endpoint_change_events_end,
-        endpoint_change_events_delta,
-    ) {
-        if end < start {
-            problems.push(format!(
-                "{}: endpoint_change_events_end must be >= endpoint_change_events_start",
-                path.display()
-            ));
-        }
-        if end.saturating_sub(start) != delta {
-            problems.push(format!(
-                "{}: endpoint_change_events_delta must equal end-start",
-                path.display()
-            ));
-        }
+    if typed.endpoint_change_events_end < typed.endpoint_change_events_start {
+        problems.push(format!(
+            "{}: endpoint_change_events_end must be >= endpoint_change_events_start",
+            path.display()
+        ));
+    }
+    if typed
+        .endpoint_change_events_end
+        .saturating_sub(typed.endpoint_change_events_start)
+        != typed.endpoint_change_events_delta
+    {
+        problems.push(format!(
+            "{}: endpoint_change_events_delta must equal end-start",
+            path.display()
+        ));
     }
 
-    if elapsed_secs
-        .zip(required_soak_duration_secs)
-        .is_some_and(|(elapsed, required)| elapsed < required)
-    {
+    if typed.elapsed_secs < typed.required_soak_duration_secs {
         problems.push(format!(
             "{}: elapsed_secs must be >= required_soak_duration_secs",
             path.display()
         ));
     }
-    if failing_samples
-        .zip(allowed_failing_samples)
-        .is_some_and(|(failing, allowed)| failing > allowed)
-    {
+    if typed.failing_samples > typed.allowed_failing_samples {
         problems.push(format!(
             "{}: failing_samples must be <= allowed_failing_samples",
             path.display()
         ));
     }
-    if max_consecutive_failures_observed
-        .zip(allowed_max_consecutive_failures)
-        .is_some_and(|(observed, allowed)| observed > allowed)
-    {
+    if typed.max_consecutive_failures_observed > typed.allowed_max_consecutive_failures {
         problems.push(format!(
             "{}: max_consecutive_failures_observed must be <= allowed_max_consecutive_failures",
             path.display()
         ));
     }
 
-    if direct_remote_exit_ready.as_deref() != Some(CHECK_PASS) {
+    if typed.direct_remote_exit_ready != CHECK_PASS {
         problems.push(format!(
             "{}: direct_remote_exit_ready must equal pass",
             path.display()
         ));
     }
-    if post_soak_bypass_ready.as_deref() != Some(CHECK_PASS) {
+    if typed.post_soak_bypass_ready != CHECK_PASS {
         problems.push(format!(
             "{}: post_soak_bypass_ready must equal pass",
             path.display()
         ));
     }
-    if no_plaintext_passphrase_files.as_deref() != Some(CHECK_PASS) {
+    if typed.no_plaintext_passphrase_files != CHECK_PASS {
         problems.push(format!(
             "{}: no_plaintext_passphrase_files must equal pass",
             path.display()
         ));
     }
-    if long_soak_stable.as_deref() != Some(CHECK_PASS) {
+    if typed.long_soak_stable != CHECK_PASS {
         problems.push(format!(
             "{}: long_soak_stable must equal pass",
             path.display()
         ));
     }
-    if direct_samples != samples {
+    if typed.direct_samples != typed.samples {
         problems.push(format!(
             "{}: direct_samples must equal samples for authoritative direct-path soak evidence",
             path.display()
         ));
     }
     for (field, value) in [
-        ("relay_samples", relay_samples),
-        ("fail_closed_samples", fail_closed_samples),
-        ("other_path_samples", other_path_samples),
-        ("path_transition_count", path_transition_count),
-        ("status_mismatch_samples", status_mismatch_samples),
-        ("route_mismatch_samples", route_mismatch_samples),
-        ("endpoint_mismatch_samples", endpoint_mismatch_samples),
-        ("dns_alarm_bad_samples", dns_alarm_bad_samples),
-        ("transport_identity_failures", transport_identity_failures),
-        ("failing_samples", failing_samples),
+        ("relay_samples", typed.relay_samples),
+        ("fail_closed_samples", typed.fail_closed_samples),
+        ("other_path_samples", typed.other_path_samples),
+        ("path_transition_count", typed.path_transition_count),
+        ("status_mismatch_samples", typed.status_mismatch_samples),
+        ("route_mismatch_samples", typed.route_mismatch_samples),
+        ("endpoint_mismatch_samples", typed.endpoint_mismatch_samples),
+        ("dns_alarm_bad_samples", typed.dns_alarm_bad_samples),
+        (
+            "transport_identity_failures",
+            typed.transport_identity_failures,
+        ),
+        ("failing_samples", typed.failing_samples),
         (
             "max_consecutive_failures_observed",
-            max_consecutive_failures_observed,
+            typed.max_consecutive_failures_observed,
         ),
     ] {
-        if value.is_some_and(|entry| entry != 0) {
+        if value != 0 {
             problems.push(format!(
                 "{}: {field} must equal 0 for authoritative direct-path soak evidence",
                 path.display()
             ));
         }
     }
-    if first_non_direct_reason.as_deref() != Some("none") {
+    if typed.first_non_direct_reason != "none" {
         problems.push(format!(
             "{}: first_non_direct_reason must equal none for authoritative direct-path soak evidence",
             path.display()
         ));
     }
-    if first_failure_reason.as_deref() != Some("none") {
+    if typed.first_failure_reason != "none" {
         problems.push(format!(
             "{}: first_failure_reason must equal none for authoritative direct-path soak evidence",
             path.display()
         ));
     }
-    if last_path_mode.as_deref() != Some("direct_active") {
+    if typed.last_path_mode != "direct_active" {
         problems.push(format!(
             "{}: last_path_mode must equal direct_active",
             path.display()
         ));
     }
-    if last_path_reason
-        .as_deref()
-        .is_none_or(|value| value.trim().is_empty() || value == "none")
-    {
+    let trimmed_reason = typed.last_path_reason.trim();
+    if trimmed_reason.is_empty() || trimmed_reason == "none" {
         problems.push(format!(
             "{}: last_path_reason must be a non-empty direct-path reason",
             path.display()
@@ -3026,6 +3154,149 @@ mod tests {
                 "path_evidence.traversal_alarm_state must not be critical|error|missing for pass reports"
             )),
             "expected critical traversal alarm rejection, got: {errors:?}"
+        );
+    }
+
+    /// Helper: build a clean soak-monitor-summary JSON `Value` whose
+    /// shape matches the reviewed contract pinned by
+    /// `CrossNetworkSoakMonitorSummaryView` (all 19 required counters,
+    /// all 8 required status strings, plus an extra ride-through key
+    /// to exercise `#[serde(flatten)] extra`).
+    fn clean_soak_summary_value() -> Value {
+        json!({
+            "samples": 24u64,
+            "failing_samples": 0u64,
+            "max_consecutive_failures_observed": 0u64,
+            "elapsed_secs": 120u64,
+            "required_soak_duration_secs": 120u64,
+            "allowed_failing_samples": 2u64,
+            "allowed_max_consecutive_failures": 1u64,
+            "direct_samples": 24u64,
+            "relay_samples": 0u64,
+            "fail_closed_samples": 0u64,
+            "other_path_samples": 0u64,
+            "path_transition_count": 0u64,
+            "status_mismatch_samples": 0u64,
+            "route_mismatch_samples": 0u64,
+            "endpoint_mismatch_samples": 0u64,
+            "dns_alarm_bad_samples": 0u64,
+            "transport_identity_failures": 0u64,
+            "endpoint_change_events_start": 1u64,
+            "endpoint_change_events_end": 1u64,
+            "endpoint_change_events_delta": 0u64,
+            "direct_remote_exit_ready": "pass",
+            "post_soak_bypass_ready": "pass",
+            "no_plaintext_passphrase_files": "pass",
+            "first_non_direct_reason": "none",
+            "first_failure_reason": "none",
+            "last_path_mode": "direct_active",
+            "last_path_reason": "fresh_handshake_observed",
+            "long_soak_stable": "pass",
+            "extra_field": "ride-through",
+        })
+    }
+
+    /// Clean fixture: a well-formed soak-monitor-summary deserializes
+    /// into the typed view, every typed field lands in its slot, and
+    /// the extra ride-through key flows into `#[serde(flatten)] extra`.
+    #[test]
+    fn cross_network_soak_monitor_summary_view_accepts_clean_artifact() {
+        let payload = clean_soak_summary_value();
+        let view: CrossNetworkSoakMonitorSummaryView = serde_json::from_value(payload)
+            .expect("typed view accepts the clean soak monitor summary fixture");
+        assert_eq!(view.samples, 24);
+        assert_eq!(view.direct_samples, 24);
+        assert_eq!(view.relay_samples, 0);
+        assert_eq!(view.direct_remote_exit_ready, "pass");
+        assert_eq!(view.last_path_mode, "direct_active");
+        assert_eq!(view.last_path_reason, "fresh_handshake_observed");
+        assert_eq!(
+            view.extra.get("extra_field").and_then(Value::as_str),
+            Some("ride-through"),
+            "non-required keys must ride through #[serde(flatten)] extra"
+        );
+    }
+
+    /// Missing required field rejected with a precise error that names
+    /// the missing field. The serde error must mention `direct_samples`
+    /// so the failure points to the source field — not a downstream
+    /// "must be a non-negative integer" line.
+    #[test]
+    fn cross_network_soak_monitor_summary_view_rejects_missing_required_field() {
+        let mut payload = clean_soak_summary_value();
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("direct_samples");
+        let err = serde_json::from_value::<CrossNetworkSoakMonitorSummaryView>(payload)
+            .expect_err("missing direct_samples must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("direct_samples"),
+            "error must name the missing required field: {message}"
+        );
+    }
+
+    /// Wrong-type required field rejected at deserialize. `samples` is
+    /// typed `u64`; supplying a string must fail at parse, not later
+    /// via `as_u64()` returning `None` and downstream cross-field logic
+    /// silently skipping.
+    #[test]
+    fn cross_network_soak_monitor_summary_view_rejects_wrong_type_required_field() {
+        let mut payload = clean_soak_summary_value();
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .insert("samples".to_string(), Value::String("twenty-four".into()));
+        let err = serde_json::from_value::<CrossNetworkSoakMonitorSummaryView>(payload)
+            .expect_err("string samples must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("samples") || message.contains("u64"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// `into_value_map` round-trips: every typed field is re-injected
+    /// at its original key and any flattened extras are preserved
+    /// verbatim. This is the bridge downstream Map-walking helpers
+    /// would rely on.
+    #[test]
+    fn cross_network_soak_monitor_summary_view_into_value_map_round_trips() {
+        let payload = clean_soak_summary_value();
+        let view: CrossNetworkSoakMonitorSummaryView =
+            serde_json::from_value(payload).expect("typed view parses the clean fixture");
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("samples").and_then(Value::as_u64),
+            Some(24),
+            "samples must round-trip"
+        );
+        assert_eq!(
+            map.get("direct_samples").and_then(Value::as_u64),
+            Some(24),
+            "direct_samples must round-trip"
+        );
+        assert_eq!(
+            map.get("endpoint_change_events_delta")
+                .and_then(Value::as_u64),
+            Some(0),
+            "endpoint_change_events_delta must round-trip"
+        );
+        assert_eq!(
+            map.get("direct_remote_exit_ready").and_then(Value::as_str),
+            Some("pass"),
+            "direct_remote_exit_ready must round-trip"
+        );
+        assert_eq!(
+            map.get("last_path_reason").and_then(Value::as_str),
+            Some("fresh_handshake_observed"),
+            "last_path_reason must round-trip"
+        );
+        assert_eq!(
+            map.get("extra_field").and_then(Value::as_str),
+            Some("ride-through"),
+            "scalar extras must be preserved verbatim"
         );
     }
 }
