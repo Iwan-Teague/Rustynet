@@ -101,18 +101,57 @@ fn etc_rustynet_install_dir_args() -> [&'static str; 9] {
 }
 
 fn main() {
-    let code = match run() {
-        Ok(()) => 0,
-        Err(code) => code,
-    };
-    std::process::exit(code);
+    if let Err(err) = run() {
+        let code = classify_live_lab_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
+    }
 }
 
-fn run() -> Result<(), i32> {
-    let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+/// X6 taxonomy classifier for live-lab test binaries. Mirrors the
+/// classifier in `live_linux_exit_handoff_test.rs`.
+fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
+    use rustynetd::exit_codes::ExitCode;
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("missing required")
+        || lower.contains("unknown command")
+        || lower.contains("missing required argument")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("drift")
+        || lower.contains("fail-closed")
+        || lower.contains("signature verification")
+        || lower.contains("policy reject")
+        || lower.contains("forbidden")
+    {
+        ExitCode::PolicyReject
+    } else if lower.contains("missing required command")
+        || lower.contains("identity file")
+        || lower.contains("invalid path")
+        || lower.contains("config")
+        || lower.contains("schema")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("ssh")
+        || lower.contains("scp")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("transient")
+        || lower.contains("retry")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
+    }
+}
+
+fn run() -> Result<(), String> {
+    let root_dir = repo_root()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let mut exit_host = String::from("debian@192.168.18.49");
     let mut client_host = String::from("debian@192.168.18.65");
@@ -173,9 +212,8 @@ fn run() -> Result<(), i32> {
                 return Ok(());
             }
             other => {
-                eprintln!("unknown argument: {other}");
                 print_usage();
-                return Err(2);
+                return Err(format!("unknown command: {other}"));
             }
         }
         idx += 1;
@@ -183,34 +221,21 @@ fn run() -> Result<(), i32> {
 
     if ssh_identity_file.is_empty() {
         print_usage();
-        return Err(2);
+        return Err("missing required argument: --ssh-identity-file".to_string());
     }
 
     if let Some(parent) = report_path.parent() {
-        ensure_dir_secure(parent).map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        ensure_dir_secure(parent)?;
     }
     if let Some(parent) = log_path.parent() {
-        ensure_dir_secure(parent).map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        ensure_dir_secure(parent)?;
     }
 
-    let logger = Logger::new(&log_path).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    let logger = Logger::new(&log_path)?;
     let mut ctx = LiveLabContext::new(
         "rustynet-lan-toggle",
         PathBuf::from(&ssh_identity_file).as_path(),
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let mut cleanup = LanToggleCleanup {
         ctx: ctx.clone(),
         exit_host: exit_host.clone(),
@@ -218,44 +243,17 @@ fn run() -> Result<(), i32> {
     };
 
     for host in [&exit_host, &client_host, &blind_exit_host] {
-        ctx.push_sudo_password(host).map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        ctx.push_sudo_password(host)?;
     }
 
-    logger
-        .line("Collecting WireGuard public keys")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    let exit_pub_hex = ctx.collect_pubkey_hex(&exit_host).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
-    let client_pub_hex = ctx.collect_pubkey_hex(&client_host).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
-    let blind_exit_pub_hex = ctx.collect_pubkey_hex(&blind_exit_host).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    logger.line("Collecting WireGuard public keys")?;
+    let exit_pub_hex = ctx.collect_pubkey_hex(&exit_host)?;
+    let client_pub_hex = ctx.collect_pubkey_hex(&client_host)?;
+    let blind_exit_pub_hex = ctx.collect_pubkey_hex(&blind_exit_host)?;
 
-    let exit_addr = LiveLabContext::resolved_target_address(&exit_host).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
-    let client_addr = LiveLabContext::resolved_target_address(&client_host).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
-    let blind_exit_addr =
-        LiveLabContext::resolved_target_address(&blind_exit_host).map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    let exit_addr = LiveLabContext::resolved_target_address(&exit_host)?;
+    let client_addr = LiveLabContext::resolved_target_address(&client_host)?;
+    let blind_exit_addr = LiveLabContext::resolved_target_address(&blind_exit_host)?;
 
     let nodes_spec = format!(
         "{exit_node_id}|{exit_addr}:51820|{exit_pub_hex};{client_node_id}|{client_addr}:51820|{client_pub_hex};{blind_exit_node_id}|{blind_exit_addr}:51820|{blind_exit_pub_hex}"
@@ -274,24 +272,11 @@ fn run() -> Result<(), i32> {
             ("ALLOW_SPEC", &allow_spec),
             ("ASSIGNMENTS_SPEC", &assignments_spec),
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
-    logger
-        .line(format!(
-            "Issuing signed LAN-toggle assignments on {exit_host}"
-        ))
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    issue_assignment_bundles_from_env(&ctx, &exit_host, &issue_env, "/tmp/rn_issue_lan.env")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    )?;
+    logger.line(format!(
+        "Issuing signed LAN-toggle assignments on {exit_host}"
+    ))?;
+    issue_assignment_bundles_from_env(&ctx, &exit_host, &issue_env, "/tmp/rn_issue_lan.env")?;
 
     let assign_pub_local = ctx.work_dir.join("assignment.pub");
     let exit_assignment_local = ctx.work_dir.join("assignment-exit");
@@ -323,35 +308,21 @@ fn run() -> Result<(), i32> {
     )?;
     let exit_scope = parse_assignment_authority_scope(
         std::fs::read_to_string(&exit_assignment_local)
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?
+            .map_err(|err| err.to_string())?
             .as_str(),
     )?;
     let client_scope = parse_assignment_authority_scope(
         std::fs::read_to_string(&client_assignment_local)
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?
+            .map_err(|err| err.to_string())?
             .as_str(),
     )?;
     let blind_exit_scope = parse_assignment_authority_scope(
         std::fs::read_to_string(&blind_exit_assignment_local)
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?
+            .map_err(|err| err.to_string())?
             .as_str(),
     )?;
 
-    logger
-        .line("Distributing signed assignments")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    logger.line("Distributing signed assignments")?;
     install_assignment_bundle(&ctx, &exit_host, &assign_pub_local, &exit_assignment_local)?;
     install_assignment_bundle(
         &ctx,
@@ -415,36 +386,20 @@ fn run() -> Result<(), i32> {
     write_secure_text(
         &exit_dns_records_local,
         &managed_dns_records_manifest_for_scope(&dns_base_records, &exit_scope)?,
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     write_secure_text(
         &client_dns_records_local,
         &managed_dns_records_manifest_for_scope(&dns_base_records, &client_scope)?,
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     write_secure_text(
         &blind_exit_dns_records_local,
         &managed_dns_records_manifest_for_scope(&dns_base_records, &blind_exit_scope)?,
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let dns_passphrase_remote = ctx
         .capture_root(
             &exit_host,
             &["mktemp", "/tmp/rn-lan-toggle-dns-passphrase.XXXXXX"],
-        )
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?
+        )?
         .trim()
         .to_string();
     ctx.run_root(
@@ -456,27 +411,15 @@ fn run() -> Result<(), i32> {
             "--output",
             dns_passphrase_remote.as_str(),
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     ctx.run_root(
         &exit_host,
         &["chmod", "0600", dns_passphrase_remote.as_str()],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     ctx.run_root(
         &exit_host,
         &["install", "-d", "-m", "0700", DNS_ZONE_ISSUE_DIR],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     cleanup.dns_passphrase_remote = Some(dns_passphrase_remote.clone());
     let traversal_refresh = TraversalRefreshConfig {
         signer_host: exit_host.as_str(),
@@ -539,17 +482,10 @@ fn run() -> Result<(), i32> {
         skip_assignment_refresh: false,
     };
     logger
-        .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")?;
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
 
-    logger.line("Enforcing runtime roles").map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    logger.line("Enforcing runtime roles")?;
     enforce_host(&ctx, &exit_host, "admin", &exit_node_id, &ssh_allow_cidrs)?;
     enforce_host(
         &ctx,
@@ -578,12 +514,7 @@ fn run() -> Result<(), i32> {
     // `route advertise 0.0.0.0/0` fails with "daemon is in
     // restricted-safe mode" on the exit and the LAN-toggle stage hard-
     // fails before the toggle is exercised at all.
-    logger
-        .line("Refreshing signed trust evidence on all nodes")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    logger.line("Refreshing signed trust evidence on all nodes")?;
     refresh_trust_evidence(&ctx, &exit_host)?;
     refresh_trust_evidence(&ctx, &client_host)?;
     refresh_trust_evidence(&ctx, &blind_exit_host)?;
@@ -609,29 +540,15 @@ fn run() -> Result<(), i32> {
     // sees a daemon out of restricted-safe.
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
 
-    logger
-        .line("Advertising default route on exit")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    logger.line("Advertising default route on exit")?;
     ctx.retry_root(
         &exit_host,
         &["rustynet", "route", "advertise", "0.0.0.0/0"],
         10,
         2,
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
 
-    logger
-        .line("Provisioning synthetic LAN subnet on exit")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    logger.line("Provisioning synthetic LAN subnet on exit")?;
     let _ = ctx.run_root_allow_failure(
         &exit_host,
         &["ip", "link", "add", LAN_TEST_INTERFACE, "type", "dummy"],
@@ -646,31 +563,13 @@ fn run() -> Result<(), i32> {
             "dev",
             LAN_TEST_INTERFACE,
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
-    ctx.run_root(&exit_host, &["ip", "link", "set", LAN_TEST_INTERFACE, "up"])
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    )?;
+    ctx.run_root(&exit_host, &["ip", "link", "set", LAN_TEST_INTERFACE, "up"])?;
 
     std::thread::sleep(std::time::Duration::from_secs(5));
 
-    let client_status_off_initial = ctx
-        .capture_root(&client_host, &["rustynet", "status"])
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    logger
-        .block("Initial client status", &client_status_off_initial)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    let client_status_off_initial = ctx.capture_root(&client_host, &["rustynet", "status"])?;
+    logger.block("Initial client status", &client_status_off_initial)?;
 
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
     let mut last_traversal_refresh_unix = unix_now();
@@ -782,36 +681,11 @@ fn run() -> Result<(), i32> {
     let exit_plaintext_check = no_plaintext_passphrase_check(&ctx, &exit_host)?;
     let blind_exit_plaintext_check = no_plaintext_passphrase_check(&ctx, &blind_exit_host)?;
 
-    logger
-        .block("Client status after LAN on", &client_status_on)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    logger
-        .block("Client status after first LAN off", &client_status_off)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    logger
-        .block("Client route to LAN probe after LAN on", &client_route_on)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    logger
-        .block("Client status after LAN off", &client_status_off_final)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    logger
-        .block("Blind exit status", &blind_exit_status)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    logger.block("Client status after LAN on", &client_status_on)?;
+    logger.block("Client status after first LAN off", &client_status_off)?;
+    logger.block("Client route to LAN probe after LAN on", &client_route_on)?;
+    logger.block("Client status after LAN off", &client_status_off_final)?;
+    logger.block("Blind exit status", &blind_exit_status)?;
 
     let check_lan_off_blocks = if lan_off_state && lan_off_ping_status {
         "pass"
@@ -910,22 +784,14 @@ fn run() -> Result<(), i32> {
         },
         "source_artifacts": [log_path.to_string_lossy().to_string()],
     });
-    write_secure_json(&report_path, &report).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    write_secure_json(&report_path, &report)?;
 
-    logger
-        .line(format!(
-            "LAN toggle report written: {}",
-            report_path.display()
-        ))
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    logger.line(format!(
+        "LAN toggle report written: {}",
+        report_path.display()
+    ))?;
     if overall != "pass" {
-        return Err(1);
+        return Err("LAN toggle test overall status: fail".to_string());
     }
     Ok(())
 }
@@ -964,16 +830,15 @@ fn apply_lan_access(
     target: &str,
     enable: bool,
     lan_routes: &str,
-) -> Result<(), i32> {
+) -> Result<(), String> {
     let output = run_lan_access_command(ctx, target, enable, lan_routes, 20)?;
     if output.status.success() {
         Ok(())
     } else {
-        eprintln!(
+        Err(format!(
             "apply-lan-access-coupling failed on {target}: {}",
             summarize_command_output(&output)
-        );
-        Err(1)
+        ))
     }
 }
 
@@ -985,7 +850,7 @@ fn wait_for_lan_probe_state(
     target: &str,
     desired_state: &str,
     attempts: u32,
-) -> Result<bool, i32> {
+) -> Result<bool, String> {
     for _ in 0..attempts {
         maybe_refresh_signed_state_artifacts(
             ctx,
@@ -1012,7 +877,7 @@ fn apply_lan_access_expect_denied(
     target: &str,
     enable: bool,
     lan_routes: &str,
-) -> Result<bool, i32> {
+) -> Result<bool, String> {
     let output = run_lan_access_command(ctx, target, enable, lan_routes, 20)?;
     if output.status.success() {
         return Ok(false);
@@ -1025,11 +890,10 @@ fn apply_lan_access_expect_denied(
     if combined.contains("LAN access coupling is not permitted for blind_exit role") {
         Ok(true)
     } else {
-        eprintln!(
+        Err(format!(
             "unexpected blind-exit LAN coupling failure on {target}: {}",
             summarize_command_output(&output)
-        );
-        Err(1)
+        ))
     }
 }
 
@@ -1039,17 +903,13 @@ fn run_lan_access_command(
     enable: bool,
     lan_routes: &str,
     socket_wait_attempts: u32,
-) -> Result<Output, i32> {
+) -> Result<Output, String> {
     ctx.wait_for_daemon_socket(
         target,
         "/run/rustynet/rustynetd.sock",
         socket_wait_attempts,
         1,
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
 
     let enable_flag = if enable { "true" } else { "false" };
     let mut args = vec![
@@ -1065,10 +925,7 @@ fn run_lan_access_command(
         args.push("--lan-routes");
         args.push(lan_routes);
     }
-    ctx.run_root_allow_failure(target, &args).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })
+    ctx.run_root_allow_failure(target, &args)
 }
 
 fn summarize_command_output(output: &Output) -> String {
@@ -1093,7 +950,7 @@ fn wait_for_lan_access_state(
     target: &str,
     expected_enabled: bool,
     attempts: u32,
-) -> Result<bool, i32> {
+) -> Result<bool, String> {
     let expected = if expected_enabled {
         "lan_access=on"
     } else {
@@ -1116,23 +973,19 @@ fn wait_for_lan_access_state(
     Ok(false)
 }
 
-fn no_plaintext_passphrase_check(ctx: &LiveLabContext, target: &str) -> Result<String, i32> {
+fn no_plaintext_passphrase_check(ctx: &LiveLabContext, target: &str) -> Result<String, String> {
     let checks = [
         "/var/lib/rustynet/keys/wireguard.passphrase",
         "/etc/rustynet/wireguard.passphrase",
         "/etc/rustynet/signing_key_passphrase",
     ];
     for check in checks {
-        ctx.run_root(target, &["test", "!", "-e", check])
-            .map_err(|err| {
-                eprintln!("{err}");
-                1
-            })?;
+        ctx.run_root(target, &["test", "!", "-e", check])?;
     }
     Ok("no-plaintext-passphrase-files".to_string())
 }
 
-fn write_assignment_env(path: &Path, items: &[(&str, &str)]) -> Result<(), i32> {
+fn write_assignment_env(path: &Path, items: &[(&str, &str)]) -> Result<(), String> {
     let mut contents = String::new();
     for (key, value) in items {
         contents.push_str(key);
@@ -1140,16 +993,12 @@ fn write_assignment_env(path: &Path, items: &[(&str, &str)]) -> Result<(), i32> 
         contents.push_str(&quote_env_value(value)?);
         contents.push('\n');
     }
-    write_secure_text(path, &contents).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })
+    write_secure_text(path, &contents)
 }
 
-fn quote_env_value(value: &str) -> Result<String, i32> {
+fn quote_env_value(value: &str) -> Result<String, String> {
     if value.chars().any(|ch| ch == '\n' || ch == '\r') {
-        eprintln!("env value contains newline characters");
-        return Err(1);
+        return Err("invalid path: env value contains newline characters".to_string());
     }
     let mut escaped = String::from("\"");
     for ch in value.chars() {
@@ -1171,7 +1020,7 @@ fn write_assignment_refresh_env(
     nodes_spec: &str,
     allow_spec: &str,
     exit_node_id: Option<&str>,
-) -> Result<(), i32> {
+) -> Result<(), String> {
     let mut items = vec![
         ("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID", target_node_id),
         ("RUSTYNET_ASSIGNMENT_NODES", nodes_spec),
@@ -1200,17 +1049,9 @@ fn capture_remote_file(
     target: &str,
     remote_path: &str,
     local_path: &Path,
-) -> Result<(), i32> {
-    let contents = ctx
-        .capture_root(target, &["cat", remote_path])
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    write_secure_text(local_path, &contents).map_err(|err| {
-        eprintln!("{err}");
-        1
-    })
+) -> Result<(), String> {
+    let contents = ctx.capture_root(target, &["cat", remote_path])?;
+    write_secure_text(local_path, &contents)
 }
 
 fn install_assignment_bundle(
@@ -1218,22 +1059,10 @@ fn install_assignment_bundle(
     target: &str,
     pubkey_local: &Path,
     bundle_local: &Path,
-) -> Result<(), i32> {
-    ctx.scp_to(pubkey_local, target, "/tmp/rn-assignment.pub")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.scp_to(bundle_local, target, "/tmp/rn-assignment.bundle")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.run_root(target, &etc_rustynet_install_dir_args())
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    ctx.scp_to(pubkey_local, target, "/tmp/rn-assignment.pub")?;
+    ctx.scp_to(bundle_local, target, "/tmp/rn-assignment.bundle")?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())?;
     ctx.run_root(
         target,
         &[
@@ -1247,11 +1076,7 @@ fn install_assignment_bundle(
             "/tmp/rn-assignment.pub",
             "/etc/rustynet/assignment.pub",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     ctx.run_root(
         target,
         &[
@@ -1265,11 +1090,7 @@ fn install_assignment_bundle(
             "/tmp/rn-assignment.bundle",
             "/var/lib/rustynet/rustynetd.assignment",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let _ = ctx.run_root_allow_failure(
         target,
         &[
@@ -1287,17 +1108,9 @@ fn install_assignment_refresh_env(
     ctx: &LiveLabContext,
     target: &str,
     env_local: &Path,
-) -> Result<(), i32> {
-    ctx.scp_to(env_local, target, "/tmp/rn-assignment-refresh.env")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.run_root(target, &etc_rustynet_install_dir_args())
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    ctx.scp_to(env_local, target, "/tmp/rn-assignment-refresh.env")?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())?;
     ctx.run_root(
         target,
         &[
@@ -1311,11 +1124,7 @@ fn install_assignment_refresh_env(
             "/tmp/rn-assignment-refresh.env",
             "/etc/rustynet/assignment-refresh.env",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let _ = ctx.run_root_allow_failure(target, &["rm", "-f", "/tmp/rn-assignment-refresh.env"]);
     Ok(())
 }
@@ -1325,22 +1134,10 @@ fn install_traversal_bundle(
     target: &str,
     pubkey_local: &Path,
     bundle_local: &Path,
-) -> Result<(), i32> {
-    ctx.scp_to(pubkey_local, target, "/tmp/rn-traversal.pub")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.scp_to(bundle_local, target, "/tmp/rn-traversal.bundle")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.run_root(target, &etc_rustynet_install_dir_args())
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    ctx.scp_to(pubkey_local, target, "/tmp/rn-traversal.pub")?;
+    ctx.scp_to(bundle_local, target, "/tmp/rn-traversal.bundle")?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())?;
     ctx.run_root(
         target,
         &[
@@ -1354,11 +1151,7 @@ fn install_traversal_bundle(
             "/tmp/rn-traversal.pub",
             "/etc/rustynet/traversal.pub",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     ctx.run_root(
         target,
         &[
@@ -1372,11 +1165,7 @@ fn install_traversal_bundle(
             "/tmp/rn-traversal.bundle",
             "/var/lib/rustynet/rustynetd.traversal",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let _ = ctx.run_root_allow_failure(
         target,
         &[
@@ -1395,22 +1184,10 @@ fn install_dns_zone_bundle(
     target: &str,
     verifier_local: &Path,
     bundle_local: &Path,
-) -> Result<(), i32> {
-    ctx.scp_to(verifier_local, target, "/tmp/rn-dns-zone.pub")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.scp_to(bundle_local, target, "/tmp/rn-dns-zone.bundle")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.run_root(target, &etc_rustynet_install_dir_args())
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    ctx.scp_to(verifier_local, target, "/tmp/rn-dns-zone.pub")?;
+    ctx.scp_to(bundle_local, target, "/tmp/rn-dns-zone.bundle")?;
+    ctx.run_root(target, &etc_rustynet_install_dir_args())?;
     ctx.run_root(
         target,
         &[
@@ -1424,11 +1201,7 @@ fn install_dns_zone_bundle(
             "/tmp/rn-dns-zone.pub",
             "/etc/rustynet/dns-zone.pub",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     ctx.run_root(
         target,
         &[
@@ -1442,11 +1215,7 @@ fn install_dns_zone_bundle(
             "/tmp/rn-dns-zone.bundle",
             "/var/lib/rustynet/rustynetd.dns-zone",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let _ = ctx.run_root_allow_failure(
         target,
         &[
@@ -1480,7 +1249,7 @@ fn refresh_signed_state_artifacts(
     ctx: &LiveLabContext,
     logger: &Logger,
     config: &SignedStateRefreshConfig<'_>,
-) -> Result<(), i32> {
+) -> Result<(), String> {
     // Re-issue assignment bundles before refreshing state so that the daemon's
     // 300-second max-age check never sees a stale bundle during long convergence
     // loops that span multiple traversal refresh cycles.
@@ -1503,13 +1272,8 @@ fn refresh_assignment_bundles(
     ctx: &LiveLabContext,
     logger: &Logger,
     config: &AssignmentRefreshConfig<'_>,
-) -> Result<(), i32> {
-    logger
-        .line("Refreshing signed assignment bundles for LAN-toggle participants")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    logger.line("Refreshing signed assignment bundles for LAN-toggle participants")?;
     issue_assignment_bundles_from_env(
         ctx,
         config.signer_host,
@@ -1574,13 +1338,8 @@ fn refresh_traversal_bundles(
     ctx: &LiveLabContext,
     logger: &Logger,
     config: &TraversalRefreshConfig<'_>,
-) -> Result<(), i32> {
-    logger
-        .line("Refreshing signed traversal bundles for LAN-toggle participants")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    logger.line("Refreshing signed traversal bundles for LAN-toggle participants")?;
     issue_traversal_bundles_from_env(
         ctx,
         config.signer_host,
@@ -1648,24 +1407,15 @@ fn refresh_dns_zone_bundles(
     ctx: &LiveLabContext,
     logger: &Logger,
     config: &DnsRefreshConfig<'_>,
-) -> Result<(), i32> {
-    logger
-        .line("Refreshing signed DNS zone bundles for LAN-toggle participants")
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    logger.line("Refreshing signed DNS zone bundles for LAN-toggle participants")?;
     for target in config.targets {
         let remote_records = format!("/tmp/rn-lan-toggle-dns-records-{}.manifest", target.node_id);
         ctx.scp_to(
             target.records_local,
             config.signer_host,
             remote_records.as_str(),
-        )
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        )?;
         ctx.run_root(
             config.signer_host,
             &[
@@ -1692,11 +1442,7 @@ fn refresh_dns_zone_bundles(
                 "--verifier-key-output",
                 DNS_ZONE_VERIFIER_REMOTE,
             ],
-        )
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+        )?;
         let _ =
             ctx.run_root_allow_failure(config.signer_host, &["rm", "-f", remote_records.as_str()]);
         capture_remote_file(
@@ -1726,7 +1472,7 @@ fn maybe_refresh_signed_state_artifacts(
     logger: &Logger,
     config: &SignedStateRefreshConfig<'_>,
     last_traversal_refresh_unix: &mut u64,
-) -> Result<(), i32> {
+) -> Result<(), String> {
     let now = unix_now();
     if now.saturating_sub(*last_traversal_refresh_unix)
         >= traversal_refresh_interval_secs(MAX_TRAVERSAL_COORDINATION_TTL_SECS)
@@ -1742,7 +1488,7 @@ fn traversal_refresh_interval_secs(coordination_ttl_secs: u64) -> u64 {
     std::cmp::max(1, bounded_ttl_secs / 2)
 }
 
-fn refresh_signed_state(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
+fn refresh_signed_state(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
     ctx.run_root(
         target,
         &[
@@ -1753,32 +1499,18 @@ fn refresh_signed_state(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
             "refresh",
         ],
     )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })
+    .map(|_| ())
 }
 
-fn refresh_signed_state_now(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
-    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+fn refresh_signed_state_now(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
     refresh_signed_state(ctx, target)
 }
 
-fn refresh_trust_evidence(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
-    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+fn refresh_trust_evidence(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
     ctx.run_root(target, &["rustynet", "ops", "refresh-signed-trust"])
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })
+        .map(|_| ())
 }
 
 fn issue_assignment_bundles_from_env(
@@ -1786,12 +1518,8 @@ fn issue_assignment_bundles_from_env(
     target: &str,
     env_local: &Path,
     remote_env_path: &str,
-) -> Result<(), i32> {
-    ctx.scp_to(env_local, target, remote_env_path)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    ctx.scp_to(env_local, target, remote_env_path)?;
     ctx.run_root(
         target,
         &[
@@ -1801,11 +1529,7 @@ fn issue_assignment_bundles_from_env(
             "--env-file",
             remote_env_path,
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let _ = ctx.run_root_allow_failure(target, &["rm", "-f", remote_env_path]);
     Ok(())
 }
@@ -1815,12 +1539,8 @@ fn issue_traversal_bundles_from_env(
     target: &str,
     env_local: &Path,
     remote_env_path: &str,
-) -> Result<(), i32> {
-    ctx.scp_to(env_local, target, remote_env_path)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+) -> Result<(), String> {
+    ctx.scp_to(env_local, target, remote_env_path)?;
     ctx.run_root(
         target,
         &[
@@ -1830,11 +1550,7 @@ fn issue_traversal_bundles_from_env(
             "--env-file",
             remote_env_path,
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
+    )?;
     let _ = ctx.run_root_allow_failure(target, &["rm", "-f", remote_env_path]);
     Ok(())
 }
@@ -1845,7 +1561,7 @@ fn enforce_host(
     role: &str,
     node_id: &str,
     ssh_allow_cidrs: &str,
-) -> Result<(), i32> {
+) -> Result<(), String> {
     let src_dir = LiveLabContext::remote_src_dir_for(target);
     ctx.run_root(
         target,
@@ -1863,13 +1579,10 @@ fn enforce_host(
             ssh_allow_cidrs,
         ],
     )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })
+    .map(|_| ())
 }
 
-fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<(), i32> {
+fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
     let _ = ctx.run_root_allow_failure(
         target,
         &[
@@ -1886,21 +1599,9 @@ fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<()
             "restart",
             "rustynetd-privileged-helper.service",
         ],
-    )
-    .map_err(|err| {
-        eprintln!("{err}");
-        1
-    })?;
-    ctx.run_root(target, &["systemctl", "restart", "rustynetd.service"])
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
-    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)
-        .map_err(|err| {
-            eprintln!("{err}");
-            1
-        })?;
+    )?;
+    ctx.run_root(target, &["systemctl", "restart", "rustynetd.service"])?;
+    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
     Ok(())
 }
 
@@ -1934,7 +1635,7 @@ fn managed_dns_base_records(
 fn managed_dns_records_manifest_for_scope(
     records: &[ManagedDnsRecordTemplate],
     scope: &AssignmentAuthorityScope,
-) -> Result<String, i32> {
+) -> Result<String, String> {
     let allowed_targets = scope.peer_node_ids.iter().cloned().collect::<HashSet<_>>();
     let filtered = records
         .iter()
@@ -1945,11 +1646,10 @@ fn managed_dns_records_manifest_for_scope(
         .cloned()
         .collect::<Vec<_>>();
     if filtered.is_empty() {
-        eprintln!(
-            "managed DNS scope for {} produced no policy-authorized records",
+        return Err(format!(
+            "policy reject: managed DNS scope for {} produced no policy-authorized records",
             scope.node_id
-        );
-        return Err(1);
+        ));
     }
     let mut manifest = String::new();
     manifest.push_str("version=1\n");
@@ -1972,15 +1672,14 @@ fn managed_dns_records_manifest_for_scope(
     Ok(manifest)
 }
 
-fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityScope, i32> {
+fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityScope, String> {
     let mut node_id = None;
     let mut peer_node_ids = Vec::new();
     for line in bundle.lines() {
         if let Some(value) = line.strip_prefix("node_id=") {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                eprintln!("assignment bundle node_id must not be empty");
-                return Err(1);
+                return Err("config: assignment bundle node_id must not be empty".to_string());
             }
             node_id = Some(trimmed.to_string());
             continue;
@@ -1991,8 +1690,9 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
         {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                eprintln!("assignment bundle peer id must not be empty: {prefix}");
-                return Err(1);
+                return Err(format!(
+                    "config: assignment bundle peer id must not be empty: {prefix}"
+                ));
             }
             peer_node_ids.push(trimmed.to_string());
         }
@@ -2004,10 +1704,7 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
             node_id,
             peer_node_ids,
         }),
-        None => {
-            eprintln!("assignment bundle is missing node_id");
-            Err(1)
-        }
+        None => Err("config schema: assignment bundle is missing node_id".to_string()),
     }
 }
 
@@ -2027,10 +1724,9 @@ fn git_commit(root_dir: &Path) -> String {
     }
 }
 
-fn required_value(args: &[String], idx: usize, flag: &str) -> Result<String, i32> {
+fn required_value(args: &[String], idx: usize, flag: &str) -> Result<String, String> {
     if idx >= args.len() {
-        eprintln!("missing value for {flag}");
-        return Err(2);
+        return Err(format!("missing required argument value for {flag}"));
     }
     Ok(args[idx].clone())
 }
