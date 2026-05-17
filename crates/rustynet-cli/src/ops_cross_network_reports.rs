@@ -1123,24 +1123,165 @@ fn validate_soak_monitor_summary_artifact(path: &Path) -> Vec<String> {
     problems
 }
 
+/// X2: Phase A typed view for the top-level cross-network report
+/// payload. Pins the required top-level scalars with serde typed
+/// semantics (wrong-type values like a stringified `schema_version`
+/// or numeric `git_commit` fail at deserialize with a precise
+/// per-field error) while preserving the legacy "missing field
+/// produces a domain-specific problem string" behaviour for fields
+/// that the existing walker tolerates by `unwrap_or_default()`.
+///
+/// Nested sections (`participants`, `network_context`, `checks`,
+/// `path_evidence`) and artifact lists (`source_artifacts`,
+/// `log_artifacts`) keep their `Map<String, Value>` / `Vec<Value>`
+/// shapes here. The downstream helpers (`artifact_list_has_basename`,
+/// `path_evidence_from_*`, `resolve_artifact_by_basename`,
+/// `value_as_non_empty_string`) still walk those sections directly,
+/// which keeps this slice behaviour-preserving while pinning the
+/// outermost shape.
+///
+/// Any extra keys ride through `#[serde(flatten)] extra` and
+/// `into_value_map` re-injects the typed fields so any downstream
+/// Map walker keeps working.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CrossNetworkReportPayloadView {
+    /// `suite` is the only field that MUST be present at the type
+    /// level — every caller pathway through `validate_report_payload`
+    /// supplies it, and the function's first action is to dispatch on
+    /// it. Missing or wrong-type here fails at deserialize with a
+    /// precise serde error rather than the legacy
+    /// `unwrap_or_default()` -> `unknown suite ""` shape.
+    suite: String,
+    /// Remaining top-level scalars stay `Option<T>` so that a missing
+    /// key continues to surface the legacy domain-specific problem
+    /// string (e.g. `git_commit must be a 40-character lowercase
+    /// hex commit id`) rather than a parse error. Wrong-type values
+    /// still fail at deserialize because `Option<T>` rejects type
+    /// mismatches.
+    #[serde(default)]
+    schema_version: Option<i64>,
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    evidence_mode: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
+    #[serde(default)]
+    captured_at_unix: Option<u64>,
+    #[serde(default)]
+    git_commit: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    failure_summary: Option<String>,
+    /// Nested objects and arrays stay raw so behaviour-preserving
+    /// helpers continue to walk them as before. The typed view only
+    /// guarantees the SHAPE (object vs not, array vs not) — content
+    /// validation still runs in `validate_report_payload`.
+    #[serde(default)]
+    participants: Option<Map<String, Value>>,
+    #[serde(default)]
+    network_context: Option<Map<String, Value>>,
+    #[serde(default)]
+    checks: Option<Map<String, Value>>,
+    #[serde(default)]
+    path_evidence: Option<Map<String, Value>>,
+    #[serde(default)]
+    source_artifacts: Option<Vec<Value>>,
+    #[serde(default)]
+    log_artifacts: Option<Vec<Value>>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl CrossNetworkReportPayloadView {
+    /// Bridge the typed view back to a `Map<String, Value>` for any
+    /// downstream helper that still walks the payload generically.
+    /// Re-injects every typed field so callers observe the full
+    /// payload shape. Exercised by the typed-view round-trip test.
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("suite".to_string(), Value::String(self.suite));
+        if let Some(v) = self.schema_version {
+            m.insert("schema_version".to_string(), Value::Number(v.into()));
+        }
+        if let Some(v) = self.phase {
+            m.insert("phase".to_string(), Value::String(v));
+        }
+        if let Some(v) = self.evidence_mode {
+            m.insert("evidence_mode".to_string(), Value::String(v));
+        }
+        if let Some(v) = self.environment {
+            m.insert("environment".to_string(), Value::String(v));
+        }
+        if let Some(v) = self.captured_at_unix {
+            m.insert("captured_at_unix".to_string(), Value::Number(v.into()));
+        }
+        if let Some(v) = self.git_commit {
+            m.insert("git_commit".to_string(), Value::String(v));
+        }
+        if let Some(v) = self.status {
+            m.insert("status".to_string(), Value::String(v));
+        }
+        if let Some(v) = self.failure_summary {
+            m.insert("failure_summary".to_string(), Value::String(v));
+        }
+        if let Some(v) = self.participants {
+            m.insert("participants".to_string(), Value::Object(v));
+        }
+        if let Some(v) = self.network_context {
+            m.insert("network_context".to_string(), Value::Object(v));
+        }
+        if let Some(v) = self.checks {
+            m.insert("checks".to_string(), Value::Object(v));
+        }
+        if let Some(v) = self.path_evidence {
+            m.insert("path_evidence".to_string(), Value::Object(v));
+        }
+        if let Some(v) = self.source_artifacts {
+            m.insert("source_artifacts".to_string(), Value::Array(v));
+        }
+        if let Some(v) = self.log_artifacts {
+            m.insert("log_artifacts".to_string(), Value::Array(v));
+        }
+        m
+    }
+}
+
 fn validate_report_payload(
     report_path: &Path,
     payload: &Value,
     max_evidence_age_seconds: Option<u64>,
     now_unix_override: Option<u64>,
 ) -> Vec<String> {
+    // X2: Phase A typed view migration. The report payload now parses
+    // through `CrossNetworkReportPayloadView`, which pins the
+    // outermost shape (object-ness, scalar types, nested object/array
+    // shapes). Wrong-type values fail at deserialize with a precise
+    // per-field serde error rather than silently flowing through
+    // `as_str()`/`as_u64()` returning `None`. Missing optional
+    // top-level scalars keep the legacy domain-specific problem
+    // string for parity with the prior `Value`-walk behaviour.
     let mut problems = Vec::new();
-    let Some(payload_object) = payload.as_object() else {
+    if !payload.is_object() {
         return vec![format!(
             "{}: report must be a JSON object",
             report_path.display()
         )];
+    }
+    let typed: CrossNetworkReportPayloadView = match serde_json::from_value(payload.clone()) {
+        Ok(view) => view,
+        Err(err) => {
+            return vec![format!(
+                "{}: invalid report payload ({err})",
+                report_path.display()
+            )];
+        }
     };
 
-    let suite = payload_object
-        .get("suite")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let suite = typed.suite.as_str();
     let Some(spec) = report_spec_by_suite(suite) else {
         let known = REPORT_SPECS
             .iter()
@@ -1163,24 +1304,27 @@ fn validate_report_payload(
         ));
     }
 
-    if payload_object.get("schema_version").and_then(Value::as_i64) != Some(SCHEMA_VERSION) {
+    if typed.schema_version != Some(SCHEMA_VERSION) {
         problems.push(format!("schema_version must equal {SCHEMA_VERSION}"));
     }
-    if payload_object.get("phase").and_then(Value::as_str) != Some(PHASE_NAME) {
+    if typed.phase.as_deref() != Some(PHASE_NAME) {
         problems.push(format!("phase must equal {PHASE_NAME:?}"));
     }
-    if payload_object.get("evidence_mode").and_then(Value::as_str) != Some(EVIDENCE_MODE) {
+    if typed.evidence_mode.as_deref() != Some(EVIDENCE_MODE) {
         problems.push(format!("evidence_mode must equal {EVIDENCE_MODE:?}"));
     }
 
-    if value_as_non_empty_string(payload_object.get("environment")).is_none() {
+    if typed
+        .environment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
         problems.push("environment must be a non-empty string".to_string());
     }
 
-    let captured_at_unix = payload_object
-        .get("captured_at_unix")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0);
+    let captured_at_unix = typed.captured_at_unix.filter(|value| *value > 0);
     let now_unix = now_unix_override.unwrap_or_else(unix_now);
     match captured_at_unix {
         Some(captured) => {
@@ -1196,26 +1340,17 @@ fn validate_report_payload(
         None => problems.push("captured_at_unix must be a positive integer".to_string()),
     }
 
-    let git_commit = payload_object
-        .get("git_commit")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let git_commit = typed.git_commit.as_deref().unwrap_or_default();
     if !is_lower_hex_commit(git_commit) {
         problems.push("git_commit must be a 40-character lowercase hex commit id".to_string());
     }
 
-    let status = payload_object
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let status = typed.status.as_deref().unwrap_or_default();
     if status != CHECK_PASS && status != CHECK_FAIL {
         problems.push("status must be 'pass' or 'fail'".to_string());
     }
 
-    match payload_object
-        .get("participants")
-        .and_then(Value::as_object)
-    {
+    match typed.participants.as_ref() {
         Some(participants) => {
             for field in spec.required_participants {
                 if value_as_non_empty_string(participants.get(*field)).is_none() {
@@ -1226,10 +1361,7 @@ fn validate_report_payload(
         None => problems.push("participants must be an object".to_string()),
     }
 
-    match payload_object
-        .get("network_context")
-        .and_then(Value::as_object)
-    {
+    match typed.network_context.as_ref() {
         Some(network_context) => {
             for field in spec.required_network_fields {
                 if value_as_non_empty_string(network_context.get(*field)).is_none() {
@@ -1255,8 +1387,11 @@ fn validate_report_payload(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for field_name in ["source_artifacts", "log_artifacts"] {
-        match payload_object.get(field_name).and_then(Value::as_array) {
+    for (field_name, entries_opt) in [
+        ("source_artifacts", typed.source_artifacts.as_deref()),
+        ("log_artifacts", typed.log_artifacts.as_deref()),
+    ] {
+        match entries_opt {
             Some(entries) if !entries.is_empty() => {
                 for entry in entries {
                     let Some(raw_path) = entry.as_str() else {
@@ -1316,7 +1451,7 @@ fn validate_report_payload(
         }
     }
 
-    let checks = payload_object.get("checks").and_then(Value::as_object);
+    let checks = typed.checks.as_ref();
     match checks {
         Some(check_map) => {
             for check_name in spec.required_checks {
@@ -1334,11 +1469,7 @@ fn validate_report_payload(
         None => problems.push("checks must be an object".to_string()),
     }
 
-    let failure_summary = payload_object
-        .get("failure_summary")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let failure_summary = typed.failure_summary.clone().unwrap_or_default();
     if status == CHECK_PASS {
         if let Some(check_map) = checks {
             let failing = spec
@@ -1373,9 +1504,7 @@ fn validate_report_payload(
         }
     }
 
-    let path_evidence = payload_object
-        .get("path_evidence")
-        .and_then(Value::as_object);
+    let path_evidence = typed.path_evidence.as_ref();
     let requires_live_path_evidence =
         status == CHECK_PASS && !matches!(spec.suite, "cross_network_traversal_adversarial");
     if requires_live_path_evidence && path_evidence.is_none() {
@@ -1553,10 +1682,7 @@ fn validate_report_payload(
     }
 
     if status == CHECK_PASS {
-        if let Some(entries) = payload_object
-            .get("source_artifacts")
-            .and_then(Value::as_array)
-        {
+        if let Some(entries) = typed.source_artifacts.as_deref() {
             for basename in spec.required_pass_source_artifacts {
                 if !artifact_list_has_basename(entries, basename) {
                     problems.push(format!(
@@ -1592,10 +1718,7 @@ fn validate_report_payload(
                 }
             }
         }
-        if let Some(entries) = payload_object
-            .get("log_artifacts")
-            .and_then(Value::as_array)
-        {
+        if let Some(entries) = typed.log_artifacts.as_deref() {
             for basename in spec.required_pass_log_artifacts {
                 if !artifact_list_has_basename(entries, basename) {
                     problems.push(format!(
@@ -3292,6 +3415,205 @@ mod tests {
             map.get("last_path_reason").and_then(Value::as_str),
             Some("fresh_handshake_observed"),
             "last_path_reason must round-trip"
+        );
+        assert_eq!(
+            map.get("extra_field").and_then(Value::as_str),
+            Some("ride-through"),
+            "scalar extras must be preserved verbatim"
+        );
+    }
+
+    /// Helper: build a clean cross-network report payload value whose
+    /// outermost shape matches the contract pinned by
+    /// `CrossNetworkReportPayloadView` (typed required `suite`, all
+    /// optional top-level scalars present, nested object/array
+    /// sections present, plus an extra ride-through key to exercise
+    /// `#[serde(flatten)] extra`).
+    fn clean_report_payload_value() -> Value {
+        json!({
+            "schema_version": SCHEMA_VERSION,
+            "phase": PHASE_NAME,
+            "suite": "cross_network_direct_remote_exit",
+            "environment": "unit_test",
+            "evidence_mode": EVIDENCE_MODE,
+            "captured_at_unix": 1_700_000_000u64,
+            "git_commit": "a".repeat(40),
+            "status": "pass",
+            "failure_summary": "",
+            "participants": {
+                "client_host": "client",
+                "exit_host": "exit",
+            },
+            "network_context": {
+                "client_network_id": "net-client",
+                "exit_network_id": "net-exit",
+                "nat_profile": "baseline_lan",
+                "impairment_profile": "none",
+            },
+            "checks": {
+                "direct_remote_exit_success": "pass",
+            },
+            "path_evidence": {
+                "path_mode": "direct_active",
+            },
+            "source_artifacts": ["source.txt"],
+            "log_artifacts": ["log.txt"],
+            "extra_field": "ride-through",
+        })
+    }
+
+    /// Clean fixture: a well-formed report payload deserializes into
+    /// the typed view, every typed field lands in its slot, and the
+    /// extra ride-through key flows into `#[serde(flatten)] extra`.
+    #[test]
+    fn cross_network_report_payload_view_accepts_clean_payload() {
+        let payload = clean_report_payload_value();
+        let view: CrossNetworkReportPayloadView = serde_json::from_value(payload)
+            .expect("typed view accepts the clean cross-network report payload fixture");
+        assert_eq!(view.suite, "cross_network_direct_remote_exit");
+        assert_eq!(view.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(view.phase.as_deref(), Some(PHASE_NAME));
+        assert_eq!(view.evidence_mode.as_deref(), Some(EVIDENCE_MODE));
+        assert_eq!(view.environment.as_deref(), Some("unit_test"));
+        assert_eq!(view.captured_at_unix, Some(1_700_000_000));
+        assert_eq!(view.git_commit.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(view.status.as_deref(), Some("pass"));
+        assert_eq!(view.failure_summary.as_deref(), Some(""));
+        assert!(
+            view.participants
+                .as_ref()
+                .and_then(|m| m.get("client_host"))
+                .and_then(Value::as_str)
+                == Some("client"),
+            "participants object must be retained"
+        );
+        assert!(
+            view.network_context
+                .as_ref()
+                .and_then(|m| m.get("nat_profile"))
+                .and_then(Value::as_str)
+                == Some("baseline_lan"),
+            "network_context object must be retained"
+        );
+        assert!(
+            view.checks
+                .as_ref()
+                .and_then(|m| m.get("direct_remote_exit_success"))
+                .and_then(Value::as_str)
+                == Some("pass"),
+            "checks object must be retained"
+        );
+        assert!(
+            view.path_evidence
+                .as_ref()
+                .and_then(|m| m.get("path_mode"))
+                .and_then(Value::as_str)
+                == Some("direct_active"),
+            "path_evidence object must be retained"
+        );
+        assert_eq!(
+            view.source_artifacts.as_deref().map(<[Value]>::len),
+            Some(1),
+            "source_artifacts must be retained"
+        );
+        assert_eq!(
+            view.log_artifacts.as_deref().map(<[Value]>::len),
+            Some(1),
+            "log_artifacts must be retained"
+        );
+        assert_eq!(
+            view.extra.get("extra_field").and_then(Value::as_str),
+            Some("ride-through"),
+            "non-required keys must ride through #[serde(flatten)] extra"
+        );
+    }
+
+    /// Missing required field rejected with a precise serde error
+    /// that names the missing field. `suite` is the only field pinned
+    /// as required-`String` (every caller pathway supplies it), so
+    /// removing it must fail at deserialize.
+    #[test]
+    fn cross_network_report_payload_view_rejects_missing_required_field() {
+        let mut payload = clean_report_payload_value();
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("suite");
+        let err = serde_json::from_value::<CrossNetworkReportPayloadView>(payload)
+            .expect_err("missing suite must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("suite"),
+            "error must name the missing required field: {message}"
+        );
+    }
+
+    /// Wrong-type required field rejected at deserialize. `suite` is
+    /// typed `String`; supplying a number must fail at parse, not
+    /// later via `as_str()` returning `None` and the downstream
+    /// `unknown suite` path silently catching it.
+    #[test]
+    fn cross_network_report_payload_view_rejects_wrong_type_required_field() {
+        let mut payload = clean_report_payload_value();
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .insert(
+                "schema_version".to_string(),
+                Value::String("one".to_string()),
+            );
+        let err = serde_json::from_value::<CrossNetworkReportPayloadView>(payload)
+            .expect_err("string schema_version must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("schema_version") || message.contains("i64"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// `into_value_map` round-trips: every typed field is re-injected
+    /// at its original key and any flattened extras are preserved
+    /// verbatim. This is the bridge downstream Map-walking helpers
+    /// would rely on.
+    #[test]
+    fn cross_network_report_payload_view_into_value_map_round_trips() {
+        let payload = clean_report_payload_value();
+        let view: CrossNetworkReportPayloadView =
+            serde_json::from_value(payload).expect("typed view parses the clean fixture");
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("suite").and_then(Value::as_str),
+            Some("cross_network_direct_remote_exit"),
+            "suite must round-trip"
+        );
+        assert_eq!(
+            map.get("schema_version").and_then(Value::as_i64),
+            Some(SCHEMA_VERSION),
+            "schema_version must round-trip"
+        );
+        assert_eq!(
+            map.get("captured_at_unix").and_then(Value::as_u64),
+            Some(1_700_000_000),
+            "captured_at_unix must round-trip"
+        );
+        assert_eq!(
+            map.get("status").and_then(Value::as_str),
+            Some("pass"),
+            "status must round-trip"
+        );
+        assert!(
+            map.get("participants")
+                .and_then(Value::as_object)
+                .and_then(|m| m.get("client_host"))
+                .and_then(Value::as_str)
+                == Some("client"),
+            "participants object must round-trip"
+        );
+        assert!(
+            map.get("source_artifacts")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.len() == 1),
+            "source_artifacts array must round-trip"
         );
         assert_eq!(
             map.get("extra_field").and_then(Value::as_str),
