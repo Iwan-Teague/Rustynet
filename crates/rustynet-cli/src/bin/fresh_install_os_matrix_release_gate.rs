@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -15,8 +16,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<String> = env::args().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     let status = Command::new("cargo")
@@ -32,10 +33,16 @@ fn run() -> Result<(), i32> {
         ])
         .status()
         .map_err(|err| {
-            eprintln!("failed to run fresh-install readiness checker: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run fresh-install readiness checker: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if !status.success() {
+        // Pass through: the inner readiness checker already classifies
+        // its OS-matrix verdict with the X6 taxonomy (missing artifacts
+        // / signature drift bubble as PolicyReject inside).
         return Err(status_code(status));
     }
 

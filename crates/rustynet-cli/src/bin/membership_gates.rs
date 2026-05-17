@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -19,8 +20,8 @@ fn run() -> Result<(), i32> {
 fn run_ops_with_passthrough(ops_subcommand: &str) -> Result<(), i32> {
     let passthrough_args: Vec<String> = env::args().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let mut command = Command::new("cargo");
     command.current_dir(root_dir).args([
@@ -34,12 +35,18 @@ fn run_ops_with_passthrough(ops_subcommand: &str) -> Result<(), i32> {
     ]);
     command.args(passthrough_args);
     let status = command.status().map_err(|err| {
-        eprintln!("failed to run membership gates command: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to run membership gates command: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through the subprocess's own exit code so the caller
+        // sees the inner taxonomy bucket intact (e.g. a PolicyReject
+        // from the membership integrity verifier stays a PolicyReject).
         Err(status_code(status))
     }
 }

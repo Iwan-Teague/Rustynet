@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -15,8 +16,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let passthrough_args: Vec<String> = env::args().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     let mut command = Command::new("cargo");
@@ -31,12 +32,19 @@ fn run() -> Result<(), i32> {
     ]);
     command.args(passthrough_args);
     let status = command.status().map_err(|err| {
-        eprintln!("failed to execute supply-chain integrity gates: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to execute supply-chain integrity gates: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through the subprocess's own exit code so the caller
+        // sees the inner supply-chain verifier taxonomy bucket intact
+        // (signature/attestation drift inside the verifier already
+        // bubbles as PolicyReject).
         Err(status_code(status))
     }
 }
