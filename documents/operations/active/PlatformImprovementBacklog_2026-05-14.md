@@ -603,8 +603,27 @@ inline. Cross-reference with:
   helpers. 8 new tests (4 per module): clean-line accepted,
   missing-required-field rejected, wrong-type rejected,
   `into_value_map` round-trip.
-* `[ ]` Remaining Phase A typed views (next slices):
-  - cross-network reports (`ops_cross_network_reports.rs` — large)
+* `[~]` First X2 slice on `ops_cross_network_reports.rs` landed
+  (commit 9a77aeb). Migrated `validate_soak_monitor_summary_artifact`
+  to `CrossNetworkSoakMonitorSummaryView` (19 required u64 + 8
+  required String fields + `#[serde(flatten)] extra` + lossless
+  `into_value_map()` bridge). 4 new tests pin: clean parse,
+  missing-required-field rejected, wrong-type rejected,
+  into_value_map round-trip.
+* `[ ]` Remaining Phase A typed views in
+  `ops_cross_network_reports.rs` (future slices, documented by
+  Agent L):
+  - `validate_report_payload` at line 998 (top-level cross-network
+    report — large; per-field sub-typed-views recommended)
+  - `validate_ssh_trust_summary_artifact` at line 644 (key=value
+    text parser — orthogonal)
+  - helpers consumed by `validate_report_payload`:
+    `path_evidence_from_status_line` (line 390),
+    `path_evidence_from_report` (line 468),
+    `artifact_list_has_basename` (line 457),
+    `resolve_optional_path_evidence` (line 478),
+    `value_as_non_empty_string` (line 576)
+* `[ ]` Remaining Phase A typed views (other modules):
   - live-lab summary / failure digest (further `Value` walks)
 * Each is an incremental slice.
 
@@ -768,9 +787,30 @@ inline. Cross-reference with:
     integers.
   Combined coverage: 37 of ~60 bin/ binaries now on the X6
   taxonomy (out of an initial 0).
-* `[ ]` Remaining scope (separate slice): continue threading
-  through the remaining ~23 bin/ binaries under
-  `crates/rustynet-cli/src/bin/`.
+* `[x]` Round 2 parallel batch completes the X6 bin/ migration
+  (commits 34d0960, 44980f7, e525668, dd63287). All ~71 bin/*.rs
+  binaries under `crates/rustynet-cli/src/bin/` now classify their
+  failure shapes through `rustynetd::exit_codes::ExitCode`:
+  - check_* (8): bootstrap_ci_tools + 7 check_*; dep-exception,
+    unsafe-detected, backend-boundary-leak → PolicyReject
+  - generate_* + real_wireguard_*_e2e (8): e2e leak/hijack/tamper/
+    signature-mismatch verdicts → PolicyReject
+  - run_/install/misc (8): perf-regression, macos-only-host
+    mismatch, install hardened-contract violation → PolicyReject
+  - validation/cross-network/misc (10): release attestation
+    failure, secrets-hygiene leak, trust-CLI decrypt failure → PolicyReject
+  In every batch, subprocess exit codes pass through unchanged so
+  inner taxonomy bubbles survive the wrapper.
+* W3 wire-up: `--enforce-ra-suppression` flag (commit 527d14f)
+  threads the W3 Router Advertisement evaluator into the
+  `windows-dns-failclosed-check` subcommand alongside
+  `--enforce-ipv6-sibling-rules`. 3 new flag-handler tests + help
+  pin.
+* W4 wire-up: new `rustynetd windows-registry-acls-check
+  [--no-fail-on-drift]` subcommand (commit 527d14f) calls the W4
+  stub collector. Today defaults fail-closed because the Win32
+  RegGetKeySecurity probe is still a follow-up slice. 4 new tests
+  pin the flag handler + default verdict.
 
 ### X7. CI gate enhancements
 
