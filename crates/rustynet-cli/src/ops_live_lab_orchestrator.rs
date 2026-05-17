@@ -3028,6 +3028,65 @@ pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
     Ok(report.status)
 }
 
+/// Typed view for the per-check verdicts inside the real-WireGuard
+/// no-leak-under-load report. Six pass/fail slots covering tunnel
+/// connectivity, packet counts, and fail-closed enforcement under
+/// load and tunnel-down conditions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RealWireguardNoLeakUnderLoadChecksView {
+    pub tunnel_up_connectivity: String,
+    pub load_ping_success: String,
+    pub tunnel_transport_observed_under_load: String,
+    pub no_underlay_cleartext_during_load: String,
+    pub tunnel_down_fail_closed: String,
+    pub no_underlay_cleartext_after_tunnel_down: String,
+}
+
+impl RealWireguardNoLeakUnderLoadChecksView {
+    fn overall_status(&self) -> &'static str {
+        let all_pass = [
+            self.tunnel_up_connectivity.as_str(),
+            self.load_ping_success.as_str(),
+            self.tunnel_transport_observed_under_load.as_str(),
+            self.no_underlay_cleartext_during_load.as_str(),
+            self.tunnel_down_fail_closed.as_str(),
+            self.no_underlay_cleartext_after_tunnel_down.as_str(),
+        ]
+        .iter()
+        .all(|value| *value == CHECK_PASS);
+        if all_pass { CHECK_PASS } else { CHECK_FAIL }
+    }
+}
+
+/// Typed view for the packet-count metrics block. Three u64 slots
+/// holding the raw counts feeding into the cleartext / tunnel-transport
+/// checks; serialized as a sibling of `checks` so consumers can
+/// re-derive the verdict from the underlying counts if desired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RealWireguardNoLeakUnderLoadMetricsView {
+    pub load_tunnel_packets: u64,
+    pub load_cleartext_packets: u64,
+    pub down_cleartext_packets: u64,
+}
+
+/// Typed view for the real-WireGuard no-leak-under-load report.
+/// Replaces the previous `json!({...})` literal plus 2 trailing
+/// `Value` walks. `source_artifacts` is the absolute paths to the
+/// two pcap inputs the verdict was computed from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RealWireguardNoLeakUnderLoadReportView {
+    pub phase: String,
+    pub mode: String,
+    pub evidence_mode: String,
+    pub environment: String,
+    pub captured_at: String,
+    pub captured_at_unix: u64,
+    pub status: String,
+    pub checks: RealWireguardNoLeakUnderLoadChecksView,
+    pub metrics: RealWireguardNoLeakUnderLoadMetricsView,
+    pub source_artifacts: Vec<String>,
+}
+
 pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
     config: WriteRealWireguardNoLeakUnderLoadReportConfig,
 ) -> Result<String, String> {
@@ -3062,52 +3121,41 @@ pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
     let load_cleartext_packets = count_no_leak_cleartext_packets(&load_lines);
     let down_cleartext_packets = count_no_leak_cleartext_packets(&down_lines);
 
-    let checks = json!({
-        "tunnel_up_connectivity": tunnel_up_status,
-        "load_ping_success": load_ping_status,
-        "tunnel_transport_observed_under_load": if load_tunnel_packets > 0 { CHECK_PASS } else { CHECK_FAIL },
-        "no_underlay_cleartext_during_load": if load_cleartext_packets == 0 { CHECK_PASS } else { CHECK_FAIL },
-        "tunnel_down_fail_closed": tunnel_down_block_status,
-        "no_underlay_cleartext_after_tunnel_down": if down_cleartext_packets == 0 { CHECK_PASS } else { CHECK_FAIL },
-    });
-    let status = if checks
-        .as_object()
-        .map(|items| {
-            items
-                .values()
-                .all(|value| value.as_str() == Some(CHECK_PASS))
-        })
-        .unwrap_or(false)
-    {
-        CHECK_PASS
-    } else {
-        CHECK_FAIL
+    let checks = RealWireguardNoLeakUnderLoadChecksView {
+        tunnel_up_connectivity: tunnel_up_status,
+        load_ping_success: load_ping_status,
+        tunnel_transport_observed_under_load: pass_or_fail(load_tunnel_packets > 0),
+        no_underlay_cleartext_during_load: pass_or_fail(load_cleartext_packets == 0),
+        tunnel_down_fail_closed: tunnel_down_block_status,
+        no_underlay_cleartext_after_tunnel_down: pass_or_fail(down_cleartext_packets == 0),
     };
-    let payload = json!({
-        "phase": "phase10",
-        "mode": "real_netns_no_leak_under_load",
-        "evidence_mode": "measured",
-        "environment": environment,
-        "captured_at": captured_at,
-        "captured_at_unix": captured_at_unix,
-        "status": status,
-        "checks": checks,
-        "metrics": {
-            "load_tunnel_packets": load_tunnel_packets,
-            "load_cleartext_packets": load_cleartext_packets,
-            "down_cleartext_packets": down_cleartext_packets,
+    let status = checks.overall_status().to_string();
+
+    let report = RealWireguardNoLeakUnderLoadReportView {
+        phase: "phase10".to_string(),
+        mode: "real_netns_no_leak_under_load".to_string(),
+        evidence_mode: "measured".to_string(),
+        environment,
+        captured_at,
+        captured_at_unix,
+        status,
+        checks,
+        metrics: RealWireguardNoLeakUnderLoadMetricsView {
+            load_tunnel_packets,
+            load_cleartext_packets,
+            down_cleartext_packets,
         },
-        "source_artifacts": [
+        source_artifacts: vec![
             load_pcap.display().to_string(),
-            down_pcap.display().to_string()
+            down_pcap.display().to_string(),
         ],
-    });
+    };
+
+    let payload = serde_json::to_value(&report).map_err(|err| {
+        format!("serialize real-wireguard-no-leak-under-load report failed: {err}")
+    })?;
     write_json_pretty(report_path.as_path(), &payload)?;
-    Ok(payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(CHECK_FAIL)
-        .to_string())
+    Ok(report.status)
 }
 
 pub fn execute_ops_verify_no_leak_dataplane_report(
@@ -3552,9 +3600,10 @@ mod tests {
         LiveLinuxEndpointHijackReportView, LiveLinuxServerIpBypassChecksView,
         LiveLinuxServerIpBypassEvidenceView, LiveLinuxServerIpBypassReportView,
         RealWireguardExitnodeE2eChecksView, RealWireguardExitnodeE2eReportView,
-        RewriteAssignmentMeshCidrConfig, RewriteAssignmentPeerEndpointIpConfig,
-        UpdateRoleSwitchHostResultConfig, ValidateCrossNetworkForensicsBundleConfig,
-        WriteActiveNetworkRoguePathHijackReportConfig,
+        RealWireguardNoLeakUnderLoadChecksView, RealWireguardNoLeakUnderLoadMetricsView,
+        RealWireguardNoLeakUnderLoadReportView, RewriteAssignmentMeshCidrConfig,
+        RewriteAssignmentPeerEndpointIpConfig, UpdateRoleSwitchHostResultConfig,
+        ValidateCrossNetworkForensicsBundleConfig, WriteActiveNetworkRoguePathHijackReportConfig,
         WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLabStageArtifactIndexConfig,
         WriteLiveLinuxControlSurfaceReportConfig, WriteLiveLinuxEndpointHijackReportConfig,
         WriteLiveLinuxLabRunSummaryConfig, WriteLiveLinuxRebootRecoveryReportConfig,
@@ -4716,6 +4765,137 @@ mod tests {
         assert_eq!(parsed.status, "pass");
         assert_eq!(parsed.checks.overall_status(), "pass");
         let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn baseline_real_wireguard_no_leak_under_load_pass_view()
+    -> RealWireguardNoLeakUnderLoadReportView {
+        RealWireguardNoLeakUnderLoadReportView {
+            phase: "phase10".to_string(),
+            mode: "real_netns_no_leak_under_load".to_string(),
+            evidence_mode: "measured".to_string(),
+            environment: "lab-netns".to_string(),
+            captured_at: "2026-03-21T12:00:00Z".to_string(),
+            captured_at_unix: 1_772_990_400,
+            status: "pass".to_string(),
+            checks: RealWireguardNoLeakUnderLoadChecksView {
+                tunnel_up_connectivity: "pass".to_string(),
+                load_ping_success: "pass".to_string(),
+                tunnel_transport_observed_under_load: "pass".to_string(),
+                no_underlay_cleartext_during_load: "pass".to_string(),
+                tunnel_down_fail_closed: "pass".to_string(),
+                no_underlay_cleartext_after_tunnel_down: "pass".to_string(),
+            },
+            metrics: RealWireguardNoLeakUnderLoadMetricsView {
+                load_tunnel_packets: 12,
+                load_cleartext_packets: 0,
+                down_cleartext_packets: 0,
+            },
+            source_artifacts: vec!["/tmp/load.pcap".to_string(), "/tmp/down.pcap".to_string()],
+        }
+    }
+
+    #[test]
+    fn real_wireguard_no_leak_under_load_view_round_trips_through_serde() {
+        let view = baseline_real_wireguard_no_leak_under_load_pass_view();
+        let serialized = serde_json::to_string(&view).expect("serialize");
+        let parsed: RealWireguardNoLeakUnderLoadReportView =
+            serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn real_wireguard_no_leak_under_load_checks_view_overall_status_is_pass_when_all_pass() {
+        assert_eq!(
+            baseline_real_wireguard_no_leak_under_load_pass_view()
+                .checks
+                .overall_status(),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn real_wireguard_no_leak_under_load_checks_view_overall_status_is_fail_per_slot() {
+        let baseline = baseline_real_wireguard_no_leak_under_load_pass_view().checks;
+        for tweak in [
+            |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
+                c.tunnel_up_connectivity = "fail".to_string()
+            },
+            |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
+                c.load_ping_success = "fail".to_string()
+            },
+            |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
+                c.tunnel_transport_observed_under_load = "fail".to_string()
+            },
+            |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
+                c.no_underlay_cleartext_during_load = "fail".to_string()
+            },
+            |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
+                c.tunnel_down_fail_closed = "fail".to_string()
+            },
+            |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
+                c.no_underlay_cleartext_after_tunnel_down = "fail".to_string()
+            },
+        ] {
+            let mut checks = baseline.clone();
+            tweak(&mut checks);
+            assert_eq!(checks.overall_status(), "fail");
+        }
+    }
+
+    #[test]
+    fn real_wireguard_no_leak_under_load_view_rejects_missing_required_field() {
+        let mut value =
+            serde_json::to_value(baseline_real_wireguard_no_leak_under_load_pass_view())
+                .expect("to_value");
+        value.as_object_mut().expect("object").remove("metrics");
+        let err = serde_json::from_value::<RealWireguardNoLeakUnderLoadReportView>(value)
+            .expect_err("missing metrics must fail closed at the typed boundary");
+        assert!(
+            err.to_string().contains("metrics"),
+            "error names missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn real_wireguard_no_leak_under_load_view_rejects_wrong_type_for_metrics_count() {
+        let mut value =
+            serde_json::to_value(baseline_real_wireguard_no_leak_under_load_pass_view())
+                .expect("to_value");
+        let metrics = value
+            .get_mut("metrics")
+            .and_then(Value::as_object_mut)
+            .expect("metrics object");
+        metrics.insert(
+            "load_tunnel_packets".to_string(),
+            Value::String("twelve".to_string()),
+        );
+        let err = serde_json::from_value::<RealWireguardNoLeakUnderLoadReportView>(value)
+            .expect_err("string load_tunnel_packets must fail closed at the typed boundary");
+        let message = err.to_string();
+        assert!(
+            message.contains("u64"),
+            "error references the u64 expected type: {message}"
+        );
+    }
+
+    #[test]
+    fn real_wireguard_no_leak_under_load_view_rejects_unsupported_source_artifact_type() {
+        let mut value =
+            serde_json::to_value(baseline_real_wireguard_no_leak_under_load_pass_view())
+                .expect("to_value");
+        // numeric source_artifact would silently parse as Value::Number — but
+        // the typed view pins Vec<String>, so this must fail closed.
+        value.as_object_mut().expect("object").insert(
+            "source_artifacts".to_string(),
+            serde_json::json!([42, "/tmp/down.pcap"]),
+        );
+        let err = serde_json::from_value::<RealWireguardNoLeakUnderLoadReportView>(value)
+            .expect_err("numeric source_artifacts entry must fail closed at the typed boundary");
+        let message = err.to_string();
+        assert!(
+            message.contains("string"),
+            "error references the string expected type: {message}"
+        );
     }
 
     #[test]
