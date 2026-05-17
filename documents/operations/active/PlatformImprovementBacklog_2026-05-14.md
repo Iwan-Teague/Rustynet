@@ -751,10 +751,21 @@ inline. Cross-reference with:
   tests. 6 new tests including a host-label-order regression test
   that would fire if a future refactor swapped `Map<String, Value>`
   for a `BTreeMap`-backed alternative.
+* `[~]` Sixth X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit a724fba). Migrated
+  `execute_ops_write_live_linux_endpoint_hijack_report` to
+  THREE typed views:
+  - `LiveLinuxEndpointHijackChecksView` (7 pass/fail slots +
+    `overall_status` helper)
+  - `LiveLinuxEndpointHijackEvidenceView` (8 typed String slots)
+  - `LiveLinuxEndpointHijackReportView` (9 typed top-level fields)
+  Removes 2 trailing `Value` walks (overall-status compute +
+  status-return echo). 6 new tests pin the contract (round-trip /
+  per-slot fail / missing required / wrong-type / writer-output
+  parsed back through the typed view).
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (7 production walks across 5 unrelated report-writer fns +
+  (6 production walks across 4 unrelated report-writer fns +
   1 intentional generic JSON-pointer reader):
-  - `write_live_linux_endpoint_hijack_report` (report writer)
   - `write_real_wireguard_exitnode_e2e_report`,
     `write_real_wireguard_no_leak_under_load_report`,
     `write_active_network_signed_state_tamper_report`,
