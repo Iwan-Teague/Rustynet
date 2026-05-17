@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,8 +8,36 @@ use std::process::{Command, ExitStatus, Stdio};
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
+        let code = classify_local_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
+    }
+}
+
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("resolve current directory failed")
+        || lower.contains("create temp dir failed")
+        || lower.contains("is not valid utf-8")
+        || lower.contains("clock failure")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("failed to run ") || lower.contains("write ssh identity fixture") {
+        ExitCode::TransientFailure
+    } else if lower.contains("expected validator to fail")
+        || (lower.contains("cargo run failed for ops command"))
+    {
+        // Skeleton validator inverted-success and inner ops failure
+        // are both fail-closed verdicts: the cross-network remote-exit
+        // skeleton must reject when prerequisites are absent.
+        ExitCode::PolicyReject
+    } else {
+        ExitCode::GenericFailure
     }
 }
 

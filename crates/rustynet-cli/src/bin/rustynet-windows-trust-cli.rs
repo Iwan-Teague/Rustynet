@@ -10,6 +10,7 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustynet_crypto::{
     KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
 };
+use rustynetd::exit_codes::ExitCode;
 use rustynetd::key_material::read_passphrase_file_explicit;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -19,9 +20,50 @@ fn main() {
             println!("{message}");
         }
         Err(err) => {
-            eprintln!("error: {err}");
-            std::process::exit(1);
+            let code = classify_local_error(err.as_str());
+            let hint = code.operator_hint();
+            if hint.is_empty() {
+                eprintln!("error [{code}]: {err}");
+            } else {
+                eprintln!("error [{code}]: {err}\n  hint: {hint}");
+            }
+            std::process::exit(code.as_i32());
         }
+    }
+}
+
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.starts_with("usage:")
+        || lower.contains("unexpected positional argument")
+        || lower.contains("missing value for option")
+        || lower.contains("missing required option")
+        || lower.contains("invalid --")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("passphrase file path must be absolute")
+        || lower.contains("path must not be a symlink")
+        || lower.contains("path must reference a regular file")
+        || lower.contains("path has no parent")
+        || lower.contains("already exists")
+        || lower.contains("inspect ")
+        || lower.contains("remove old ")
+        || lower.contains("create parent failed")
+        || lower.contains("write file failed")
+        || lower.contains("os randomness unavailable")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("passphrase source invalid")
+        || lower.contains("decrypt ")
+        || lower.contains("persist encrypted ")
+        || lower.contains("decrypted signing key must be exactly 32 bytes")
+    {
+        // Trust-key custody / signing-key decryption failures are
+        // fail-closed verdicts: corrupted or unauthorized key material
+        // must not be retried.
+        ExitCode::PolicyReject
+    } else {
+        ExitCode::GenericFailure
     }
 }
 
