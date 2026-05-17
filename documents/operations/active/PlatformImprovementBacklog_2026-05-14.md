@@ -773,11 +773,24 @@ inline. Cross-reference with:
     no evidence sub-block)
   Removes 2 trailing `Value` walks. 5 new tests including
   environment-default fallback semantics pin.
+* `[~]` Eighth X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 02a9e04). Migrated
+  `execute_ops_write_real_wireguard_no_leak_under_load_report`
+  to THREE typed views:
+  - `RealWireguardNoLeakUnderLoadChecksView` (6 pass/fail slots +
+    `overall_status` helper)
+  - `RealWireguardNoLeakUnderLoadMetricsView` (3 u64 counter
+    slots — pins counter type so a future widen to
+    `Value::String` trips a test)
+  - `RealWireguardNoLeakUnderLoadReportView` (10 typed top-level
+    fields including a `Vec<String>` source_artifacts list)
+  Removes 2 trailing `Value` walks. 6 new tests including a
+  numeric-source-artifact regression that pins the typed
+  `Vec<String>` boundary against future schema drift.
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (5 production walks across 3 unrelated report-writer fns +
+  (4 production walks across 2 unrelated report-writer fns +
   1 intentional generic JSON-pointer reader):
-  - `write_real_wireguard_no_leak_under_load_report`,
-    `write_active_network_signed_state_tamper_report`,
+  - `write_active_network_signed_state_tamper_report`,
     `write_active_network_rogue_path_hijack_report` (e2e writers)
   - `e2e_dns_query` (helper)
   - `execute_ops_read_json_field` (intentional generic shape-agnostic
