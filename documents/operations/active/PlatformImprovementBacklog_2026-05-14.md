@@ -75,17 +75,24 @@ inline. Cross-reference with:
   `/etc/rustynet-other/foo` boundary case and empty input) and
   `sanitize_macos_keychain_account` (6 shapes including degenerate
   all-bad-chars input). All checks pass today.
-* `[ ]` Remaining scope (separate slice): incrementally migrate the
-  larger platform-specific blocks from start.sh into the
+* `[~]` `apply_host_profile_defaults` split landed (commit 201dc2f).
+  `__rustynet_linux_apply_profile_defaults` lives in
+  `scripts/start/linux.sh`,
+  `__rustynet_macos_apply_profile_defaults` lives in
+  `scripts/start/macos.sh`, and `start.sh` retains a thin
+  dispatcher. The smoke gate has 6 new dispatch checks pinning
+  Linux→HOST_PROFILE=linux + LINUX_* credential paths,
+  Darwin→HOST_PROFILE=macos + WG_INTERFACE=utun9,
+  FreeBSD→HOST_PROFILE=unsupported. Operator-visible behaviour of
+  `./start.sh --help` unchanged.
+* `[ ]` Remaining scope (separate slices): incrementally migrate
+  the larger platform-specific blocks from start.sh into the
   per-platform modules:
   - systemd-unit install / `run_root` calls → `linux.sh`
   - launchd plist install / `pfctl` programming / Keychain
     secret-store wiring → `macos.sh`
-  - `apply_host_profile_defaults` (currently a 40-line cond block in
-    start.sh) → split into `__linux_apply_profile_defaults` and
-    `__macos_apply_profile_defaults` in the respective modules
-  Each future migration adds another smoke-test check that pins
-  the migrated function's reviewed behaviour.
+  Each future migration adds another smoke-test check pinning the
+  migrated function's reviewed behaviour.
 
 ### L2. `linux_runtime_acls.rs` security-relevant drift coverage
 
@@ -610,21 +617,41 @@ inline. Cross-reference with:
   `into_value_map()` bridge). 4 new tests pin: clean parse,
   missing-required-field rejected, wrong-type rejected,
   into_value_map round-trip.
-* `[ ]` Remaining Phase A typed views in
-  `ops_cross_network_reports.rs` (future slices, documented by
-  Agent L):
-  - `validate_report_payload` at line 998 (top-level cross-network
-    report — large; per-field sub-typed-views recommended)
+* `[~]` Second X2 slice on `ops_cross_network_reports.rs` landed
+  (commit 50e2bda). Migrated the top-level `validate_report_payload`
+  walker to `CrossNetworkReportPayloadView` (15 typed fields: 1
+  required String `suite` + 8 optional scalars + 4 optional nested
+  `Map<String, Value>` slots + 2 optional `Vec<Value>` artifact
+  lists, plus `#[serde(flatten)] extra`). The 5 named helpers
+  (`path_evidence_from_status_line`, `path_evidence_from_report`,
+  `artifact_list_has_basename`, `resolve_optional_path_evidence`,
+  `value_as_non_empty_string`) were INTENTIONALLY left as `Value`
+  walks — rationale: the first parses inline KEY=VALUE strings,
+  the second reads a sidecar JSON, the others are generic 1-line
+  helpers over `&[Value]` / `Option<&Value>`. The walker now drives
+  these helpers from typed-shape-pinned `Map`/`Vec` slots instead
+  of `payload.as_object().get(...).as_array()` walks. 4 new tests.
+* `[ ]` Remaining Phase A walks in
+  `ops_cross_network_reports.rs` (28 by regex; future slices):
   - `validate_ssh_trust_summary_artifact` at line 644 (key=value
     text parser — orthogonal)
-  - helpers consumed by `validate_report_payload`:
-    `path_evidence_from_status_line` (line 390),
-    `path_evidence_from_report` (line 468),
-    `artifact_list_has_basename` (line 457),
-    `resolve_optional_path_evidence` (line 478),
-    `value_as_non_empty_string` (line 576)
+  - the 5 helpers above (kept as `Value` walks intentionally — only
+    migrate if a future restructuring makes typed views worth it)
+  - `validate_report_paths` post-parse `git_commit`/`status` re-walk
+  - nested `path_evidence` block walkers
+* `[x]` ops_live_lab_failure_digest.rs typed-view migration
+  landed (commit b2f8b1c). Added 4 typed views
+  (`DigestNodeView`, `DigestFailedWorkerView` with 13 typed fields,
+  `DigestStageEntryView` with 12, `LiveLabFailureDigestView` with
+  10) covering the full failure-digest report shape. All 5 of the
+  module's Value walks eliminated; JSON output now goes through
+  `serde_json::to_string_pretty(&digest)` against the typed
+  struct. 17 new tests pin clean parse / missing-required-field /
+  wrong-type / `into_value_map` round-trip per view + a
+  null-bridge round-trip for `first_failure: Option<...>`.
 * `[ ]` Remaining Phase A typed views (other modules):
-  - live-lab summary / failure digest (further `Value` walks)
+  - `ops_live_lab_orchestrator.rs` (69 `Value` walks — large; needs
+    careful per-section slicing like the cross-network module)
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
@@ -679,11 +706,22 @@ inline. Cross-reference with:
   Module test count: 32 → 46. Regression-coverage gate floor bumped
   accordingly. Also bumped `windows_authenticode:21→38` floor that
   was lagging the W5 thumbprint-policy expansion.
-* `[ ]` Remaining scope (separate slice): bring
-  `windows_runtime_acls` to standalone module parity with Linux
-  (today the Windows ACL surface lives inside
-  `windows_service_hardening` and `windows_paths`). Add a dedicated
-  `windows_runtime_acls.rs` module if/when the surface justifies it.
+* `[~]` `windows_paths` test coverage parity sweep landed (commit
+  3c0053a). 15 new named drift tests covering the SDDL grant/deny
+  matcher (`sddl_grants_principal`, `sddl_denies_principal` —
+  including the substring-match negative), the local-secret ACL
+  evaluator (WD/AU/BU/AN forbidden-grant rejection + missing-owner
+  / missing-DACL rejection + service-SID + LocalSystem accept),
+  and the runtime-path validator (UNC reject, user-temp reject,
+  canonical ProgramData accept). `windows_paths` test count
+  46 → 61; new regression-coverage floor `windows_paths:61` added.
+* `[ ]` Remaining scope (separate slice): consider whether a
+  dedicated `windows_runtime_acls.rs` module is justified now that
+  the SDDL surface has explicit drift coverage. Today the
+  `windows_paths` + `windows_service_hardening` split holds up;
+  pulling the SDDL helpers into a third module would add little
+  value beyond reshuffling. Defer until a future addition makes
+  the dedicated module worth it.
 
 ### X5. Membership evidence + runbook automation
 
