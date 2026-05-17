@@ -85,14 +85,24 @@ inline. Cross-reference with:
   Darwin→HOST_PROFILE=macos + WG_INTERFACE=utun9,
   FreeBSD→HOST_PROFILE=unsupported. Operator-visible behaviour of
   `./start.sh --help` unchanged.
+* `[~]` macOS Keychain helpers extracted (commit b2fdc11).
+  `ensure_macos_keychain_passphrase_account` and
+  `macos_keychain_passphrase_exists` now live in
+  `scripts/start/macos.sh` with `is_macos_host` early-return guards;
+  smoke gate extended with 2 new module-sourcing declare-F asserts.
+  Call sites inside start.sh (lines 210, 1687, 1848, 2263, 2285,
+  3416) all sit downstream of the macos.sh source point — no
+  call-site edits needed. Operator-visible behaviour unchanged.
 * `[ ]` Remaining scope (separate slices): incrementally migrate
   the larger platform-specific blocks from start.sh into the
-  per-platform modules:
-  - systemd-unit install / `run_root` calls → `linux.sh`
-  - launchd plist install / `pfctl` programming / Keychain
-    secret-store wiring → `macos.sh`
-  Each future migration adds another smoke-test check pinning the
-  migrated function's reviewed behaviour.
+  per-platform modules. systemd-unit install + launchd plist
+  install paths already dispatch to Rust (`rustynet ops
+  write-daemon-env` etc.) so those big blocks are NOT actually
+  shell-to-Rust migrations. Remaining shell-only blocks:
+  - `pfctl` programming wrappers (`apply_managed_dns_routing` /
+    `clear_managed_dns_routing` on macOS path) → `macos.sh`
+  - `enforce_host_storage_policy` (Linux path) → `linux.sh`
+  Each future migration adds another smoke-test check.
 
 ### L2. `linux_runtime_acls.rs` security-relevant drift coverage
 
@@ -631,10 +641,18 @@ inline. Cross-reference with:
   helpers over `&[Value]` / `Option<&Value>`. The walker now drives
   these helpers from typed-shape-pinned `Map`/`Vec` slots instead
   of `payload.as_object().get(...).as_array()` walks. 4 new tests.
+* `[~]` Third X2 slice on `ops_cross_network_reports.rs` landed
+  (commit ba49ed8). Migrated `validate_ssh_trust_summary_artifact`
+  (key=value text parser, not JSON) to
+  `CrossNetworkSshTrustSummaryView` + `CrossNetworkSshTrustTargetView`
+  substruct (18 typed slots: 5 top-level `Option<String>` scalars
+  + `Option<usize>` `target_count` + `Option<String>` `target_count_raw`
+  + `Vec<CrossNetworkSshTrustTargetView>` of 6 `Option<String>`
+  per-target scalars; plus `extra: HashMap<String, String>` ride-through).
+  4 new tests pin clean parse, missing required field, wrong-type,
+  into_key_value_map round-trip.
 * `[ ]` Remaining Phase A walks in
-  `ops_cross_network_reports.rs` (28 by regex; future slices):
-  - `validate_ssh_trust_summary_artifact` at line 644 (key=value
-    text parser — orthogonal)
+  `ops_cross_network_reports.rs` (future slices):
   - the 5 helpers above (kept as `Value` walks intentionally — only
     migrate if a future restructuring makes typed views worth it)
   - `validate_report_paths` post-parse `git_commit`/`status` re-walk
@@ -649,9 +667,26 @@ inline. Cross-reference with:
   struct. 17 new tests pin clean parse / missing-required-field /
   wrong-type / `into_value_map` round-trip per view + a
   null-bridge round-trip for `first_failure: Option<...>`.
-* `[ ]` Remaining Phase A typed views (other modules):
-  - `ops_live_lab_orchestrator.rs` (69 `Value` walks — large; needs
-    careful per-section slicing like the cross-network module)
+* `[~]` First X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 6469306). Migrated `is_plaintext_no_leak_report` and its
+  caller `execute_ops_verify_no_leak_dataplane_report` to
+  `LiveLabOrchestratorNoLeakReportView` (2 required typed fields:
+  `status: String` + `checks: Map<String, Value>`, plus `extra`
+  flatten and an `into_value_map()` bridge). 11 new tests pin the
+  contract (5 view-shape tests + 5 report-validator tests + 1
+  serde round-trip). Walks removed from this validator: 4
+  `.get/as_str/as_object` calls + caller's manual
+  `payload.as_object()` adapter.
+* `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
+  (~45 walks in non-test code; future slices):
+  - `execute_ops_write_live_linux_lab_run_summary` (lines 1432-
+    1700; nodes/stages/worker_results array walker — bulk of
+    remaining walks; prime next-slice target)
+  - `execute_ops_validate_cross_network_forensics_bundle` (lines
+    1090-1275; nested forensics-manifest walker; second target)
+  - `json!({...})`-based report writers + their `.get("status")`
+    pull-back at the end (1-call usages; not high-value typed-view
+    candidates yet)
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
@@ -676,6 +711,21 @@ inline. Cross-reference with:
   audit logic itself (positive + negative shapes for each scan).
   Audit module is allow-listed from the placeholder scan because it
   necessarily mentions the forbidden tokens as constants.
+* `[~]` X3 extension landed (commit 38441fc). Three new scanners +
+  workspace sweeps:
+  - `scan_source_for_hex_encoded_secret_log_sites` — flags
+    `hex::encode(forbidden_ident)` and `format!("{:02x}…",
+    forbidden_ident[..])` shapes inside log macros.
+  - `scan_source_for_base64_encoded_secret_log_sites` — flags
+    `base64::*encode(forbidden_ident)` / `STANDARD.encode(...)`
+    shapes inside log macros (covers legacy and fully-qualified
+    forms).
+  - `scan_source_for_display_on_secret_types` — mirrors the
+    existing Debug scanner; forbids `impl Display for X` /
+    `impl fmt::Display for X` / `impl ToString for X` for the
+    canonical secret-bearing types.
+  3 new workspace sweeps + 13 new self-tests. Sweep over the
+  current tree found 0 offenders; no allowlist extensions needed.
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 
