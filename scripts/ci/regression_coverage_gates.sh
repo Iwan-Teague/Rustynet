@@ -84,17 +84,17 @@ LINUX_FLOORS=(
 # Keep the gate aligned with what's actually a top-level test module.
 WINDOWS_FLOORS=(
   "windows_service_hardening:33"
-  # Floor bumped 46→56 on W3 IPv6 NRPT sibling-rule coverage
-  # evaluator: 10 new tests covering union semantics across rules,
-  # v4-only / v6-only / no-loopback shapes, stable namespace order,
-  # empty-namespace tolerance, and schema_version forward-compat.
-  "windows_dns_failclosed:56"
+  # Floor bumped 56→67 on W3 RA suppression evaluator: 11 new
+  # tests pinning router-advertisement / IPv6-default-route
+  # observation contract.
+  "windows_dns_failclosed:67"
   "windows_mesh_status:14"
   "windows_key_custody:18"
-  # Bumped 21→38 on W5 thumbprint policy + evaluator (17 new tests
-  # covering normalisation, allowlist/denylist semantics, fail-
-  # closed shapes).
   "windows_authenticode:38"
+  # New module from W4: 17 tests pinning the registry-key ACL
+  # drift evaluator (forbidden principals, requirement
+  # invariants, SDDL grant detection, snapshot lists).
+  "windows_registry_acls:17"
 )
 
 run_module() {
