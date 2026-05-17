@@ -18,6 +18,7 @@ Start with these, depending on what you are doing:
 - security and compliance mapping: [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md), [ComplianceControlMap.md](./ComplianceControlMap.md), and [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
 - reviewer-facing security-posture snapshot (verifier modules, floors, audit gates, taxonomies): [SecurityPostureSummary.md](./SecurityPostureSummary.md)
 - shared CLI exit-code taxonomy + operator decision rules: [CliExitCodeTaxonomy.md](./CliExitCodeTaxonomy.md)
+- architecture decision records (design rationale, immutable once accepted): [adr/README.md](./adr/README.md)
 
 ## Classification Rules
 
