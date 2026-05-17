@@ -637,4 +637,88 @@ mod tests {
             "REVIEWED_HARDENING_DIRECTIVES changed shape; update this snapshot test in the same commit"
         );
     }
+
+    // ---- L8: reviewed systemd unit content pins ------------------------
+
+    /// Find the reviewed unit file at workspace-relative
+    /// `scripts/systemd/rustynetd.service`. Returns the file contents
+    /// so individual pins can assert on substring shapes.
+    fn read_reviewed_unit_file_body() -> String {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR must be set under cargo test");
+        let path = std::path::PathBuf::from(manifest_dir)
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("scripts/systemd/rustynetd.service"))
+            .expect("workspace root must resolve");
+        std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read reviewed unit file at {}: {err}",
+                path.display()
+            )
+        })
+    }
+
+    #[test]
+    fn reviewed_unit_file_includes_killswitch_boot_check_exec_start_pre() {
+        // L8: the reviewed unit must invoke
+        // `linux-killswitch-boot-check` as an ExecStartPre so the
+        // daemon refuses to start when the WireGuard interface is
+        // already up but the killswitch table is missing.
+        let body = read_reviewed_unit_file_body();
+        assert!(
+            body.contains("ExecStartPre=/usr/local/bin/rustynetd linux-killswitch-boot-check"),
+            "reviewed unit must include the L8 killswitch-boot-check ExecStartPre line; \
+             see scripts/systemd/rustynetd.service"
+        );
+        // The check must NOT use --no-fail-on-drift in the
+        // ExecStartPre; that would defeat the fail-closed posture.
+        for line in body.lines() {
+            if line.trim_start().starts_with("ExecStartPre=")
+                && line.contains("linux-killswitch-boot-check")
+            {
+                assert!(
+                    !line.contains("--no-fail-on-drift"),
+                    "killswitch-boot-check ExecStartPre must NOT pass --no-fail-on-drift: {line}"
+                );
+                assert!(
+                    line.contains("--iface"),
+                    "killswitch-boot-check ExecStartPre must pass --iface for the canonical WG iface: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reviewed_unit_file_pins_credential_load_lines() {
+        // Pin the two encrypted-credential paths so a refactor that
+        // accidentally renames `LoadCredentialEncrypted=` lines (or
+        // drops them) trips a named failure.
+        let body = read_reviewed_unit_file_body();
+        assert!(
+            body.contains(
+                "LoadCredentialEncrypted=wg_key_passphrase:/etc/rustynet/credentials/wg_key_passphrase.cred"
+            ),
+            "wg_key_passphrase LoadCredentialEncrypted line drifted"
+        );
+        assert!(
+            body.contains(
+                "ExecStartPre=/usr/bin/test -f /etc/rustynet/credentials/wg_key_passphrase.cred"
+            ),
+            "wg_key_passphrase.cred ExecStartPre presence-check drifted"
+        );
+    }
+
+    #[test]
+    fn reviewed_unit_file_pins_memory_deny_write_execute() {
+        // Earlier audit work noted the unit DID set
+        // `MemoryDenyWriteExecute=true`; this pin keeps it honest
+        // against a future refactor that might silently drop it.
+        let body = read_reviewed_unit_file_body();
+        assert!(
+            body.lines()
+                .any(|l| l.trim() == "MemoryDenyWriteExecute=true"),
+            "MemoryDenyWriteExecute=true must remain in the reviewed unit"
+        );
+    }
 }

@@ -248,10 +248,22 @@ inline. Cross-reference with:
     the rustynetd unit and (future) on a `network-online.target`-
     ordered service so the daemon refuses to bring the WG iface up
     when the killswitch isn't programmed yet.
-* `[ ]` Remaining scope (separate slice): wire the new subcommand
-  into `scripts/systemd/rustynetd.service` as `ExecStartPre=` and
-  add an integration test that reboots a netns lab node + asserts
-  no unprotected egress packets observed in the bring-up window.
+* `[~]` Wire-up landed (commit pending). The reviewed
+  `scripts/systemd/rustynetd.service` now invokes
+  `linux-killswitch-boot-check --iface ${RUSTYNET_WG_INTERFACE}` as
+  an `ExecStartPre=` (without `--no-fail-on-drift`, by design). On a
+  daemon restart where the iface was left up but the killswitch
+  table was flushed, systemd refuses to start the daemon until an
+  operator brings the iface down — fail-closed by construction. 3
+  new unit-file pins in `linux_service_hardening` lock the
+  contract: ExecStartPre presence + no `--no-fail-on-drift` +
+  `--iface` flag; encrypted-credential `LoadCredentialEncrypted=`
+  lines; `MemoryDenyWriteExecute=true`. Regression-coverage gate
+  bumped from `linux_service_hardening:30` → `:33` and added a new
+  `linux_killswitch_boot:21` floor.
+* `[ ]` Remaining scope (separate slice): netns-lab integration
+  test that reboots a node mid-tunnel + asserts no unprotected
+  egress packets observed in the bring-up window.
 
 ---
 

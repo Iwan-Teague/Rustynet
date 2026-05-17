@@ -71,6 +71,17 @@ ExecStartPre=/usr/bin/test -f ${RUSTYNET_WG_PUBLIC_KEY}
 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_EVIDENCE}
 ExecStartPre=/usr/bin/test -f ${RUSTYNET_TRUST_VERIFIER_KEY}
 ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET}
+# L8 — boot-time killswitch invariant. Refuses to start the daemon
+# when the WireGuard interface is already up but the reviewed
+# `inet rustynet` killswitch table is not programmed. The
+# cold-boot pre-up window (both absent) and the steady-state case
+# (both present with the reviewed chain + rule fragments) both pass.
+# When this gate fails, an operator must manually bring the iface
+# down (`ip link delete ${RUSTYNET_WG_INTERFACE}`) before retrying;
+# fail-closed by design — the alternative is to silently re-program
+# a killswitch on top of an iface that may already have leaked
+# traffic for an unknown duration.
+ExecStartPre=/usr/local/bin/rustynetd linux-killswitch-boot-check --iface ${RUSTYNET_WG_INTERFACE}
 User=rustynetd
 Group=rustynetd
 NoNewPrivileges=true

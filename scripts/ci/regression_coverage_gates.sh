@@ -66,11 +66,17 @@ esac
 # Updating a floor is a deliberate act — commit message must say why.
 LINUX_FLOORS=(
   "linux_runtime_acls:19"
-  "linux_service_hardening:30"
+  # Floor bumped 30→33 on L8 wire-up: 3 new pins on the reviewed
+  # rustynetd.service unit (ExecStartPre killswitch-boot-check,
+  # LoadCredentialEncrypted lines, MemoryDenyWriteExecute=true).
+  "linux_service_hardening:33"
   "linux_dns_failclosed:45"
   "linux_mesh_status:10"
   "linux_key_custody:15"
   "linux_authenticode:3"
+  # New module from L8: 21 tests pinning the boot-time killswitch
+  # invariant (evaluator + nft-ruleset parser + off-Linux blocker).
+  "linux_killswitch_boot:21"
 )
 
 # Note: `windows_runtime_acls` is not a standalone module — Windows
