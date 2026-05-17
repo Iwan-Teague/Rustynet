@@ -146,29 +146,6 @@ require_macos_path_var_exact() {
   fi
 }
 
-ensure_macos_keychain_passphrase_account() {
-  if ! is_macos_host; then
-    return 0
-  fi
-  if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
-    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "wg-passphrase-${DEVICE_NODE_ID}")"
-  else
-    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}")"
-  fi
-}
-
-macos_keychain_passphrase_exists() {
-  if ! is_macos_host; then
-    return 1
-  fi
-  if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
-    return 1
-  fi
-  security find-generic-password \
-    -s "${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
-    -a "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" >/dev/null 2>&1
-}
-
 enforce_host_storage_policy() {
   if is_linux_host; then
     HOST_PROFILE="linux"
