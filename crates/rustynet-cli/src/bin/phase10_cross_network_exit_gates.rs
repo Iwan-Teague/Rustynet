@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -23,8 +24,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        report_error(ExitCode::ConfigError, &err);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     require_command("cargo")?;
@@ -62,8 +63,8 @@ fn run() -> Result<(), i32> {
     let expected_commit = env::var_os("RUSTYNET_PHASE10_CROSS_NETWORK_EXIT_EXPECTED_GIT_COMMIT")
         .filter(|value| !value.is_empty())
         .unwrap_or(get_head_commit(&root_dir).map_err(|err| {
-            eprintln!("{err}");
-            1
+            report_error(ExitCode::TransientFailure, &err);
+            ExitCode::TransientFailure.as_i32()
         })?);
 
     run_bin(
@@ -120,8 +121,11 @@ fn require_command(command: &str) -> Result<(), i32> {
     if command_exists(command) {
         Ok(())
     } else {
-        eprintln!("missing required command: {command}");
-        Err(1)
+        report_error(
+            ExitCode::ConfigError,
+            &format!("missing required command: {command}"),
+        );
+        Err(ExitCode::ConfigError.as_i32())
     }
 }
 
@@ -165,12 +169,18 @@ fn run_bin(root_dir: &Path, bin_name: &str, args: &[OsString]) -> Result<(), i32
     ]);
     command.args(args.iter().map(OsString::as_os_str));
     let status = command.status().map_err(|err| {
-        eprintln!("failed to run bin {bin_name}: {err}");
-        1
+        report_error(
+            ExitCode::TransientFailure,
+            &format!("failed to run bin {bin_name}: {err}"),
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess exit code so the inner taxonomy
+        // bubble (e.g. PolicyReject from a downstream validator)
+        // survives unchanged.
         Err(status_code(status))
     }
 }
@@ -188,13 +198,25 @@ fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[OsString]) -> Result<(
     ]);
     command.args(args.iter().map(OsString::as_os_str));
     let status = command.status().map_err(|err| {
-        eprintln!("failed to run ops {ops_subcommand}: {err}");
-        1
+        report_error(
+            ExitCode::TransientFailure,
+            &format!("failed to run ops {ops_subcommand}: {err}"),
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
         Err(status_code(status))
+    }
+}
+
+fn report_error(code: ExitCode, message: &str) {
+    let hint = code.operator_hint();
+    if hint.is_empty() {
+        eprintln!("error [{code}]: {message}");
+    } else {
+        eprintln!("error [{code}]: {message}\n  hint: {hint}");
     }
 }
 

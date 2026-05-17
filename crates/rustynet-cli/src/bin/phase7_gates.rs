@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -52,8 +53,8 @@ fn main() {
 
 fn run() -> Result<(), i32> {
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        report_error(ExitCode::ConfigError, &err);
+        ExitCode::ConfigError.as_i32()
     })?;
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
         .ok()
@@ -118,8 +119,13 @@ fn run_required_test(
         .args(args)
         .status()
         .map_err(|err| {
-            eprintln!("failed to run required test package={package} filter={test_filter}: {err}");
-            1
+            report_error(
+                ExitCode::TransientFailure,
+                &format!(
+                    "failed to run required test package={package} filter={test_filter}: {err}"
+                ),
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
@@ -138,12 +144,17 @@ fn run_cargo(root_dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Resu
         command.env(key, value);
     }
     let status = command.status().map_err(|err| {
-        eprintln!("failed to run cargo {args:?}: {err}");
-        1
+        report_error(
+            ExitCode::TransientFailure,
+            &format!("failed to run cargo {args:?}: {err}"),
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess exit code so the inner taxonomy
+        // bubble (e.g. PolicyReject from a downstream gate) survives.
         Err(status_code(status))
     }
 }
@@ -154,13 +165,25 @@ fn run_script(root_dir: &Path, script: &str, args: &[&str]) -> Result<(), i32> {
         .args(args)
         .status()
         .map_err(|err| {
-            eprintln!("failed to run script {script}: {err}");
-            1
+            report_error(
+                ExitCode::TransientFailure,
+                &format!("failed to run script {script}: {err}"),
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
         Err(status_code(status))
+    }
+}
+
+fn report_error(code: ExitCode, message: &str) {
+    let hint = code.operator_hint();
+    if hint.is_empty() {
+        eprintln!("error [{code}]: {message}");
+    } else {
+        eprintln!("error [{code}]: {message}\n  hint: {hint}");
     }
 }
 

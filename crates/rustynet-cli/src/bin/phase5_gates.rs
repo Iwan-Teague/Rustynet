@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::OsString;
@@ -44,8 +45,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        report_error(ExitCode::ConfigError, &err);
+        ExitCode::ConfigError.as_i32()
     })?;
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
         .ok()
@@ -158,8 +159,11 @@ where
     F: FnOnce() -> Result<(), StepExecutionError>,
 {
     let step = report.step_mut(step_id).ok_or_else(|| {
-        eprintln!("phase5 gate report is missing step definition: {step_id}");
-        1
+        report_error(
+            ExitCode::ConfigError,
+            &format!("phase5 gate report is missing step definition: {step_id}"),
+        );
+        ExitCode::ConfigError.as_i32()
     })?;
     match action() {
         Ok(()) => {
@@ -171,10 +175,19 @@ where
         Err(err) => {
             step.status = GateStepStatus::ExecutedFailed;
             step.exit_code = Some(err.exit_code);
-            step.detail = Some(err.detail);
+            step.detail = Some(err.detail.clone());
             report.overall_status = GateRunStatus::ExecutedFailed;
             write_report(report_path, report)?;
-            Err(err.exit_code)
+            // Spawn/IO failures classify as TransientFailure; any
+            // other inner exit code from the subprocess passes
+            // through unchanged so the inner taxonomy bubble (e.g.
+            // PolicyReject from a fail-closed gate) survives.
+            if err.spawn_failure {
+                report_error(ExitCode::TransientFailure, &err.detail);
+                Err(ExitCode::TransientFailure.as_i32())
+            } else {
+                Err(err.exit_code)
+            }
         }
     }
 }
@@ -186,8 +199,9 @@ fn run_script(root_dir: &Path, script: &str, args: &[&str]) -> Result<(), StepEx
         .args(args)
         .status()
         .map_err(|err| StepExecutionError {
-            exit_code: 1,
+            exit_code: ExitCode::TransientFailure.as_i32(),
             detail: format!("failed to execute script {}: {err}", script_path.display()),
+            spawn_failure: true,
         })?;
     if status.success() {
         Ok(())
@@ -195,6 +209,7 @@ fn run_script(root_dir: &Path, script: &str, args: &[&str]) -> Result<(), StepEx
         Err(StepExecutionError {
             exit_code: status_code(status),
             detail: format!("script failed: {}", script_path.display()),
+            spawn_failure: false,
         })
     }
 }
@@ -214,8 +229,9 @@ fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[&str]) -> Result<(), S
         .args(args)
         .status()
         .map_err(|err| StepExecutionError {
-            exit_code: 1,
+            exit_code: ExitCode::TransientFailure.as_i32(),
             detail: format!("failed to run ops {ops_subcommand}: {err}"),
+            spawn_failure: true,
         })?;
     if status.success() {
         Ok(())
@@ -223,6 +239,7 @@ fn run_ops(root_dir: &Path, ops_subcommand: &str, args: &[&str]) -> Result<(), S
         Err(StepExecutionError {
             exit_code: status_code(status),
             detail: format!("ops {ops_subcommand} failed"),
+            spawn_failure: false,
         })
     }
 }
@@ -239,8 +256,9 @@ fn run_command(
         .envs(env_pairs.iter().copied())
         .status()
         .map_err(|err| StepExecutionError {
-            exit_code: 1,
+            exit_code: ExitCode::TransientFailure.as_i32(),
             detail: format!("failed to execute command {program}: {err}"),
+            spawn_failure: true,
         })?;
     if status.success() {
         Ok(())
@@ -248,6 +266,7 @@ fn run_command(
         Err(StepExecutionError {
             exit_code: status_code(status),
             detail: format!("command failed: {program} {}", args.join(" ")),
+            spawn_failure: false,
         })
     }
 }
@@ -263,8 +282,11 @@ fn require_files(root_dir: &Path, paths: &[&str], label: &str) -> Result<(), Ste
         Ok(())
     } else {
         Err(StepExecutionError {
-            exit_code: 1,
+            exit_code: ExitCode::ConfigError.as_i32(),
             detail: format!("missing {label}: {}", missing.join(", ")),
+            // Missing required artifact = ConfigError, not a spawn
+            // failure; let the classified code propagate.
+            spawn_failure: false,
         })
     }
 }
@@ -272,28 +294,46 @@ fn require_files(root_dir: &Path, paths: &[&str], label: &str) -> Result<(), Ste
 fn write_report(path: &Path, report: &mut GateExecutionReport) -> Result<(), i32> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
-            eprintln!(
-                "failed to create report directory {}: {err}",
-                parent.display()
+            report_error(
+                ExitCode::TransientFailure,
+                &format!(
+                    "failed to create report directory {}: {err}",
+                    parent.display()
+                ),
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
     }
     report.generated_at_unix = now_unix().map_err(|err| {
-        eprintln!("{err}");
-        1
+        report_error(ExitCode::GenericFailure, &err);
+        ExitCode::GenericFailure.as_i32()
     })?;
     let json = serde_json::to_vec_pretty(report).map_err(|err| {
-        eprintln!("failed to serialize phase5 gate report: {err}");
-        1
+        report_error(
+            ExitCode::GenericFailure,
+            &format!("failed to serialize phase5 gate report: {err}"),
+        );
+        ExitCode::GenericFailure.as_i32()
     })?;
     fs::write(path, json).map_err(|err| {
-        eprintln!(
-            "failed to write phase5 gate report {}: {err}",
-            path.display()
+        report_error(
+            ExitCode::TransientFailure,
+            &format!(
+                "failed to write phase5 gate report {}: {err}",
+                path.display()
+            ),
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })
+}
+
+fn report_error(code: ExitCode, message: &str) {
+    let hint = code.operator_hint();
+    if hint.is_empty() {
+        eprintln!("error [{code}]: {message}");
+    } else {
+        eprintln!("error [{code}]: {message}\n  hint: {hint}");
+    }
 }
 
 fn now_unix() -> Result<u64, String> {
@@ -538,6 +578,12 @@ impl GateExecutionReport {
 struct StepExecutionError {
     exit_code: i32,
     detail: String,
+    /// True when the child process failed to spawn (IO error) rather
+    /// than running and returning a non-zero status. Spawn failures
+    /// are retry-safe (`TransientFailure`); a non-zero subprocess
+    /// status must pass through unchanged so the inner taxonomy
+    /// bubble survives.
+    spawn_failure: bool,
 }
 
 #[cfg(test)]
