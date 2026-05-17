@@ -53,6 +53,38 @@ rustynet_macos_keychain_entry_exists() {
     >/dev/null 2>&1
 }
 
+# Guard + initialize/sanitize the per-device Keychain account name used
+# for the WireGuard passphrase entry. Idempotent: if the caller already
+# set WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT, the value is re-sanitized
+# through the common helper rather than trusted as-is. No-op on
+# non-macOS hosts so a stray call from a shared code path is safe.
+ensure_macos_keychain_passphrase_account() {
+  if ! is_macos_host; then
+    return 0
+  fi
+  if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
+    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "wg-passphrase-${DEVICE_NODE_ID}")"
+  else
+    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}")"
+  fi
+}
+
+# Return 0 iff a Keychain entry for the WireGuard passphrase exists for
+# the current account. Always returns 1 off macOS or when the account
+# var is unset. Argv-only `security` invocation; no shell-string
+# construction with operator-supplied values.
+macos_keychain_passphrase_exists() {
+  if ! is_macos_host; then
+    return 1
+  fi
+  if [[ -z "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" ]]; then
+    return 1
+  fi
+  security find-generic-password \
+    -s "${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}" \
+    -a "${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}" >/dev/null 2>&1
+}
+
 # Apply macOS-host profile defaults. Sets HOST_PROFILE and pins the
 # canonical per-user macOS runtime/state/log paths consumed by the
 # rest of start.sh. Guarded so a stray call on a non-macOS host is a

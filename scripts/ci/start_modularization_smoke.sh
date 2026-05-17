@@ -49,8 +49,13 @@ for host_os in Linux Darwin; do
       . "${ROOT_DIR}/scripts/start/common.sh"
       . "${ROOT_DIR}/scripts/start/linux.sh"
       . "${ROOT_DIR}/scripts/start/macos.sh"
+      # Module-sourcing check: ensure both function names are defined
+      # after sourcing common+linux+macos (so callers that depend on
+      # the legacy names still find them).
       for fn in print_info print_warn print_err is_linux_host is_macos_host \
-                path_in_linux_runtime_roots sanitize_macos_keychain_account; do
+                path_in_linux_runtime_roots sanitize_macos_keychain_account \
+                ensure_macos_keychain_passphrase_account \
+                macos_keychain_passphrase_exists; do
         if ! declare -F "${fn}" >/dev/null; then
           echo "MISSING_FUNCTION:${fn}"
           exit 1
