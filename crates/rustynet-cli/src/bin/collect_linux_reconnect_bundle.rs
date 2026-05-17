@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
@@ -121,9 +122,10 @@ fn main() {
 fn run() -> Result<(), i32> {
     let mut config = Config::default();
     let parse_result = parse_args_from(env::args_os(), &mut config).map_err(|err| {
-        eprintln!("[collect-reconnect] ERROR: {err}");
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-reconnect] {err}");
         eprintln!("{}", usage());
-        1
+        code.as_i32()
     })?;
     if parse_result == ParseResult::Help {
         print!("{}", usage());
@@ -131,22 +133,31 @@ fn run() -> Result<(), i32> {
     }
 
     ensure_linux().map_err(|err| {
-        eprintln!("[collect-reconnect] ERROR: {err}");
-        1
+        // Platform mismatch is a fail-closed condition.
+        eprintln!(
+            "error [{}]: [collect-reconnect] {err}",
+            ExitCode::PolicyReject
+        );
+        ExitCode::PolicyReject.as_i32()
     })?;
 
     let repo_root = repo_root().map_err(|err| {
-        eprintln!("[collect-reconnect] ERROR: {err}");
-        1
+        eprintln!(
+            "error [{}]: [collect-reconnect] {err}",
+            ExitCode::ConfigError
+        );
+        ExitCode::ConfigError.as_i32()
     })?;
 
     let collected_at_utc = collect_utc_timestamp().map_err(|err| {
-        eprintln!("[collect-reconnect] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-reconnect] {err}");
+        code.as_i32()
     })?;
     let collected_at_unix = collect_unix_timestamp().map_err(|err| {
-        eprintln!("[collect-reconnect] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-reconnect] {err}");
+        code.as_i32()
     })?;
 
     let output_path = config
@@ -154,8 +165,9 @@ fn run() -> Result<(), i32> {
         .clone()
         .unwrap_or_else(|| default_output_path(&collected_at_utc));
     let sudo = SudoContext::prepare(config.sudo_mode).map_err(|err| {
-        eprintln!("[collect-reconnect] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-reconnect] {err}");
+        code.as_i32()
     })?;
 
     log(config.quiet, "Collecting Linux reconnect bundle...");
@@ -169,14 +181,43 @@ fn run() -> Result<(), i32> {
 
     write_private_file(&output_path, report.as_bytes()).map_err(|err| {
         eprintln!(
-            "[collect-reconnect] ERROR: failed to write {}: {err}",
+            "error [{}]: [collect-reconnect] failed to write {}: {err}",
+            ExitCode::GenericFailure,
             output_path.display()
         );
-        1
+        ExitCode::GenericFailure.as_i32()
     })?;
 
     println!("{}", output_path.display());
     Ok(())
+}
+
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unknown argument")
+        || lower.contains("missing value for")
+        || lower.contains("invalid --journal-lines")
+        || lower.contains("--journal-lines must be")
+        || lower.contains("invalid --sudo value")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("only supports linux")
+        || lower.contains("sudo is not available but")
+        || lower.contains("sudo validation failed")
+    {
+        ExitCode::PolicyReject
+    } else if lower.contains("failed to validate sudo access")
+        || lower.contains("failed to execute date")
+        || lower.contains("date returned exit code")
+    {
+        ExitCode::TransientFailure
+    } else if lower.contains("invalid unix timestamp")
+        || lower.contains("failed to resolve repository root")
+    {
+        ExitCode::ConfigError
+    } else {
+        ExitCode::GenericFailure
+    }
 }
 
 fn ensure_linux() -> Result<(), String> {

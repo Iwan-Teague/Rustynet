@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use serde_json::{Value, json};
 use std::env;
 use std::ffi::OsString;
@@ -47,14 +48,19 @@ fn main() {
 
 fn run() -> Result<(), i32> {
     let config = parse_args().map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
 
     let require = |name: &str| {
         require_cmd(name).map_err(|err| {
-            eprintln!("[collect-discovery] ERROR: {err}");
-            1
+            // Required command missing is a config-level precondition.
+            eprintln!(
+                "error [{}]: [collect-discovery] {err}",
+                ExitCode::ConfigError
+            );
+            ExitCode::ConfigError.as_i32()
         })
     };
 
@@ -75,29 +81,35 @@ fn run() -> Result<(), i32> {
     }
 
     let host_name = hostname_value().map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
     let os_name = run_capture("uname", &["-s"]).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
     let os_release = os_release_value();
     let kernel = run_capture("uname", &["-r"]).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
     let arch = run_capture("uname", &["-m"]).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
     let collected_at_unix = run_capture("date", &["-u", "+%s"]).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
     let collected_at_iso = run_capture("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
 
     log(config.quiet, "Resolving Rustynet node identity...");
@@ -269,26 +281,31 @@ fn run() -> Result<(), i32> {
     });
 
     let json_output = serde_json::to_string_pretty(&discovery).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: failed to serialize discovery bundle: {err}");
-        1
+        eprintln!(
+            "error [{}]: [collect-discovery] failed to serialize discovery bundle: {err}",
+            ExitCode::GenericFailure
+        );
+        ExitCode::GenericFailure.as_i32()
     })?;
 
     if let Some(output_path) = &config.output_path {
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 eprintln!(
-                    "[collect-discovery] ERROR: create output parent directory failed ({}): {err}",
+                    "error [{}]: [collect-discovery] create output parent directory failed ({}): {err}",
+                    ExitCode::ConfigError,
                     parent.display()
                 );
-                1
+                ExitCode::ConfigError.as_i32()
             })?;
         }
         fs::write(output_path, &json_output).map_err(|err| {
             eprintln!(
-                "[collect-discovery] ERROR: write output failed ({}): {err}",
+                "error [{}]: [collect-discovery] write output failed ({}): {err}",
+                ExitCode::GenericFailure,
                 output_path.display()
             );
-            1
+            ExitCode::GenericFailure.as_i32()
         })?;
         log(
             config.quiet,
@@ -336,11 +353,16 @@ fn run() -> Result<(), i32> {
                 child.wait()
             })
             .map_err(|err| {
-                eprintln!("[collect-discovery] ERROR: failed to run jq: {err}");
-                1
+                eprintln!(
+                    "error [{}]: [collect-discovery] failed to run jq: {err}",
+                    ExitCode::TransientFailure
+                );
+                ExitCode::TransientFailure.as_i32()
             })?;
         if !status.success() {
-            return Err(status.code().unwrap_or(1));
+            // Pass through the jq exit code so the caller sees the
+            // inner subprocess code intact.
+            return Err(status.code().unwrap_or(ExitCode::GenericFailure.as_i32()));
         }
     } else {
         println!("{json_output}");
@@ -348,6 +370,26 @@ fn run() -> Result<(), i32> {
 
     log(config.quiet, "Done.");
     Ok(())
+}
+
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unknown option")
+        || lower.contains("missing value for")
+        || lower.contains("must be valid utf-8")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("required command") && lower.contains("not found") {
+        ExitCode::ConfigError
+    } else if lower.contains("failed to run") {
+        ExitCode::TransientFailure
+    } else if lower.contains("exited with status") {
+        // Subprocess returned non-zero — surface as PolicyReject so a
+        // retry-only-on-70 CI loop does not retry a real failure.
+        ExitCode::PolicyReject
+    } else {
+        ExitCode::GenericFailure
+    }
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -580,8 +622,9 @@ fn parse_listen_port_from_wg_show(text: &str) -> String {
 
 fn ip_interface_addresses(iface: &str) -> Result<String, i32> {
     let output = run_capture("ip", &["-4", "addr", "show", iface]).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
     let addresses = output
         .lines()
@@ -594,8 +637,9 @@ fn ip_interface_addresses(iface: &str) -> Result<String, i32> {
 
 fn collect_host_candidates(wg_iface: &str) -> Result<String, i32> {
     let output = run_capture("ip", &["-4", "addr", "show"]).map_err(|err| {
-        eprintln!("[collect-discovery] ERROR: {err}");
-        1
+        let code = classify_local_error(&err);
+        eprintln!("error [{code}]: [collect-discovery] {err}");
+        code.as_i32()
     })?;
     let mut result = String::new();
     let mut skip = false;
@@ -809,8 +853,9 @@ fn daemon_status(run_dir: &str) -> Result<Value, i32> {
             &["show", "rustynetd", "--property=MainPID", "--value"],
         )
         .map_err(|err| {
-            eprintln!("[collect-discovery] ERROR: {err}");
-            1
+            let code = classify_local_error(&err);
+            eprintln!("error [{code}]: [collect-discovery] {err}");
+            code.as_i32()
         })?;
         return Ok(json!({
             "active": "active",
@@ -974,8 +1019,11 @@ fn os_to_string(value: OsString, flag: &str) -> Result<String, String> {
 
 fn parse_u64(text: &str, field: &str) -> Result<u64, i32> {
     text.trim().parse::<u64>().map_err(|_| {
-        eprintln!("[collect-discovery] ERROR: {field} must be an integer");
-        1
+        eprintln!(
+            "error [{}]: [collect-discovery] {field} must be an integer",
+            ExitCode::GenericFailure
+        );
+        ExitCode::GenericFailure.as_i32()
     })
 }
 
