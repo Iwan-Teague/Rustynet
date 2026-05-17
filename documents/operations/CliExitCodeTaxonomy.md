@@ -76,19 +76,26 @@ re-enabling.
 
 ## CLI surface coverage
 
-Today the taxonomy is enforced at two top-level entry points:
+The taxonomy is enforced at the two top-level entry points plus every
+ancillary binary:
 
 * `crates/rustynetd/src/main.rs` — `classify_top_level_error` maps the
   daemon's startup-error strings to the taxonomy.
 * `crates/rustynet-cli/src/main.rs` — `classify_cli_error` maps the
   `execute()` result strings.
+* All 72 binaries under `crates/rustynet-cli/src/bin/` — each imports
+  `rustynetd::exit_codes::ExitCode` and routes its failure shapes
+  through the taxonomy. Phase-gate wrappers and cargo-spawn helpers
+  map repo-root / argv failures to `ConfigError(65)` and subprocess
+  spawn failures to `TransientFailure(70)`; security-sensitive gates
+  (tamper, attestation, integrity, drift, signature mismatch, hardened
+  install) map fail-closed verdicts to `PolicyReject(78)` instead of
+  passing them through as a retryable generic failure. Subprocess exit
+  codes pass through unchanged so an inner CLI's taxonomy verdict
+  survives the outer wrapper.
 
-Subcommand-specific binaries under `crates/rustynet-cli/src/bin/`
-continue to use legacy `exit(1)` patterns; threading the taxonomy
-through each of them is an incremental follow-up. Until that lands,
-sysadmins should rely on the two main entry points (which cover the
-production runtime path) and treat the bin/`exit(1)` paths as the
-"generic_failure" bucket.
+Operators can rely on the numeric code from any `rustynet*` binary —
+there are no legacy `exit(1)`-only paths left in production wrappers.
 
 ## Adding new variants
 
