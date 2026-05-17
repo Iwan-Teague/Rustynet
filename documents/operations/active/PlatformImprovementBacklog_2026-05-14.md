@@ -93,15 +93,21 @@ inline. Cross-reference with:
   Call sites inside start.sh (lines 210, 1687, 1848, 2263, 2285,
   3416) all sit downstream of the macos.sh source point — no
   call-site edits needed. Operator-visible behaviour unchanged.
+* `[~]` `enforce_host_storage_policy` extracted per-platform
+  (commit ecfd597). `__rustynet_linux_enforce_host_storage_policy`
+  in `linux.sh`, `__rustynet_macos_enforce_host_storage_policy` in
+  `macos.sh`; `require_macos_path_var_exact` moved alongside its
+  sole caller. start.sh retains a 3-branch dispatcher (linux /
+  macos / unsupported). Smoke gate now has 32 checks (+7 dispatch
+  assertions). Operator-visible behaviour unchanged.
 * `[ ]` Remaining scope (separate slices): incrementally migrate
-  the larger platform-specific blocks from start.sh into the
-  per-platform modules. systemd-unit install + launchd plist
-  install paths already dispatch to Rust (`rustynet ops
-  write-daemon-env` etc.) so those big blocks are NOT actually
-  shell-to-Rust migrations. Remaining shell-only blocks:
+  the larger platform-specific blocks from start.sh. systemd-unit
+  install + launchd plist install paths already dispatch to Rust
+  (`rustynet ops write-daemon-env` etc.) so those big blocks are
+  NOT actually shell-to-Rust migrations. Remaining shell-only
+  blocks:
   - `pfctl` programming wrappers (`apply_managed_dns_routing` /
     `clear_managed_dns_routing` on macOS path) → `macos.sh`
-  - `enforce_host_storage_policy` (Linux path) → `linux.sh`
   Each future migration adds another smoke-test check.
 
 ### L2. `linux_runtime_acls.rs` security-relevant drift coverage
@@ -677,16 +683,27 @@ inline. Cross-reference with:
   serde round-trip). Walks removed from this validator: 4
   `.get/as_str/as_object` calls + caller's manual
   `payload.as_object()` adapter.
+* `[~]` Second X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 60b05cb). Migrated
+  `execute_ops_write_live_linux_lab_run_summary` (lines
+  1432-1700, the prime next target) to FOUR typed views:
+  - `RunSummaryNodeView` (4 typed fields: label, target, node_id,
+    bootstrap_role)
+  - `RunSummaryWorkerView` (12 typed fields: 11 strings + rc:i64)
+  - `RunSummaryStageView` (10 typed fields: 7 strings + rc:i64
+    + failed_worker_count:u64 + worker_results: Vec<...>)
+  - `LiveLabRunSummaryView` (14 typed fields: 8 strings + 4 u64
+    + nodes/stages arrays)
+  16 new tests (clean parse / missing-required / wrong-type /
+  into_value_map round-trip per view).
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (~45 walks in non-test code; future slices):
-  - `execute_ops_write_live_linux_lab_run_summary` (lines 1432-
-    1700; nodes/stages/worker_results array walker — bulk of
-    remaining walks; prime next-slice target)
+  (~17 production walks; future slices):
   - `execute_ops_validate_cross_network_forensics_bundle` (lines
-    1090-1275; nested forensics-manifest walker; second target)
-  - `json!({...})`-based report writers + their `.get("status")`
-    pull-back at the end (1-call usages; not high-value typed-view
-    candidates yet)
+    1090-1275; nested forensics-manifest walker — largest cluster
+    left, prime next target)
+  - bundle-status / manifest reader at 2246-2294
+  - misc 1-call `.get("status")` pull-backs from `json!({...})`
+    report writers (low-value, leave for cleanup pass)
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
@@ -765,6 +782,18 @@ inline. Cross-reference with:
   and the runtime-path validator (UNC reject, user-temp reject,
   canonical ProgramData accept). `windows_paths` test count
   46 → 61; new regression-coverage floor `windows_paths:61` added.
+* `[~]` Linux-side coverage expansion sweep (commits 2d2e963,
+  1c8be79):
+  - `linux_authenticode` test count 3 → 22 (+19 named drift tests
+    covering applicability/reason invariants, schema_version pin,
+    determinism, serde round-trip + value-level round trip, drift
+    mutation detection per field, canonical serialized snapshot
+    pin). Floor bumped from 3 → 22.
+  - `linux_mesh_status` test count 10 → 24 (+14 tests covering
+    freshness boundary (==max accepted, max+1 rejected, 0/0 case),
+    missing-peer aggregation, exotic peer-id chars, schema_version
+    pin, per-variant serde round-trip with `load_status` tag,
+    forgiving-schema forward-compat). Floor bumped 10 → 24.
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the

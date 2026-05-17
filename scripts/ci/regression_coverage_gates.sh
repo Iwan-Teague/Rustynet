@@ -71,9 +71,17 @@ LINUX_FLOORS=(
   # LoadCredentialEncrypted lines, MemoryDenyWriteExecute=true).
   "linux_service_hardening:33"
   "linux_dns_failclosed:45"
-  "linux_mesh_status:10"
+  # Floor bumped 10→24 on X4 coverage expansion: 14 new tests
+  # covering freshness boundary, missing-peer aggregation, exotic
+  # peer-id chars, schema_version pin, per-variant serde round-trip.
+  "linux_mesh_status:24"
   "linux_key_custody:15"
-  "linux_authenticode:3"
+  # Floor bumped 3→22 on X4 coverage parity sweep: 19 new tests
+  # covering applicability/reason invariants, schema pin,
+  # determinism, serde round-trip + value-level round trip, drift
+  # mutation detection across each field, and a canonical
+  # serialized snapshot pin.
+  "linux_authenticode:22"
   # New module from L8: 21 tests pinning the boot-time killswitch
   # invariant (evaluator + nft-ruleset parser + off-Linux blocker).
   "linux_killswitch_boot:21"
