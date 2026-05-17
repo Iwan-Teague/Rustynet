@@ -2377,6 +2377,78 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
     Ok(report.status)
 }
 
+/// Typed view for the per-host pass/fail verdicts inside the control-
+/// surface exposure report. Field order is the on-disk JSON shape
+/// contract pinned by the round-trip tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxControlSurfaceHostChecksView {
+    pub daemon_socket_secure: String,
+    pub helper_socket_secure: String,
+    pub no_rustynet_tcp_listener: String,
+    pub rustynet_udp_loopback_only: String,
+}
+
+/// Typed view for the per-host evidence block (raw socket metadata
+/// plus the matched listener lines used to compute the checks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxControlSurfaceHostEvidenceView {
+    pub daemon_socket_meta: String,
+    pub helper_socket_meta: String,
+    pub managed_dns_service_state: String,
+    pub rustynet_listener_lines: Vec<String>,
+}
+
+/// Typed view for one host entry under the report's `hosts` map.
+/// Combining checks + evidence in the same shape lets callers
+/// re-evaluate a single host without re-walking the JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxControlSurfaceHostResultView {
+    pub checks: LiveLinuxControlSurfaceHostChecksView,
+    pub evidence: LiveLinuxControlSurfaceHostEvidenceView,
+}
+
+/// Typed view for the report-level aggregate `checks` block. The
+/// `all_*` fields are reductions over the per-host check fields;
+/// `remote_underlay_dns_probe_blocked` is the orchestrator-supplied
+/// probe verdict and follows the `pass`/`fail`/`skipped` contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxControlSurfaceAggregateChecksView {
+    pub all_daemon_sockets_secure: String,
+    pub all_helper_sockets_secure: String,
+    pub no_rustynet_tcp_listeners: String,
+    pub rustynet_udp_loopback_only: String,
+    pub remote_underlay_dns_probe_blocked: String,
+}
+
+/// Typed view for the report-level evidence block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxControlSurfaceEvidenceView {
+    pub remote_underlay_dns_probe_output: String,
+}
+
+/// Typed view for the full control-surface report. Replaces the
+/// previous `json!({...})` literal and removes 8 trailing
+/// `serde_json::Value` walks (4 per-host check fetches × 4
+/// aggregate reductions + the status-return echo). `hosts` stays as
+/// `Map<String, Value>` to preserve the orchestrator-supplied
+/// host-label insertion order (the workspace's `serde_json` is built
+/// with `preserve_order`, so this is an IndexMap-backed Map); each
+/// inserted value is the typed `LiveLinuxControlSurfaceHostResultView`
+/// converted via `serde_json::to_value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxControlSurfaceReportView {
+    pub phase: String,
+    pub mode: String,
+    pub evidence_mode: String,
+    pub captured_at: String,
+    pub captured_at_unix: u64,
+    pub status: String,
+    pub dns_bind_addr: String,
+    pub checks: LiveLinuxControlSurfaceAggregateChecksView,
+    pub hosts: Map<String, Value>,
+    pub evidence: LiveLinuxControlSurfaceEvidenceView,
+}
+
 pub fn execute_ops_write_live_linux_control_surface_report(
     config: WriteLiveLinuxControlSurfaceReportConfig,
 ) -> Result<String, String> {
@@ -2420,7 +2492,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
         config.captured_at_utc.trim().to_string()
     };
 
-    let mut host_results = Map::new();
+    let mut typed_hosts: Vec<(String, LiveLinuxControlSurfaceHostResultView)> = Vec::new();
     let mut overall = CHECK_PASS.to_string();
     for label in &config.host_labels {
         let daemon_meta = fs::read_to_string(work_dir.join(format!("{label}.daemon_socket.txt")))
@@ -2486,84 +2558,80 @@ pub fn execute_ops_write_live_linux_control_surface_report(
             overall = CHECK_FAIL.to_string();
         }
 
-        host_results.insert(
+        typed_hosts.push((
             label.to_string(),
-            json!({
-                "checks": {
-                    "daemon_socket_secure": if daemon_ok { CHECK_PASS } else { CHECK_FAIL },
-                    "helper_socket_secure": if helper_ok { CHECK_PASS } else { CHECK_FAIL },
-                    "no_rustynet_tcp_listener": if tcp_listener_ok { CHECK_PASS } else { CHECK_FAIL },
-                    "rustynet_udp_loopback_only": if udp_listener_ok { CHECK_PASS } else { CHECK_FAIL },
+            LiveLinuxControlSurfaceHostResultView {
+                checks: LiveLinuxControlSurfaceHostChecksView {
+                    daemon_socket_secure: pass_or_fail(daemon_ok),
+                    helper_socket_secure: pass_or_fail(helper_ok),
+                    no_rustynet_tcp_listener: pass_or_fail(tcp_listener_ok),
+                    rustynet_udp_loopback_only: pass_or_fail(udp_listener_ok),
                 },
-                "evidence": {
-                    "daemon_socket_meta": daemon_meta_trimmed,
-                    "helper_socket_meta": helper_meta_trimmed,
-                    "managed_dns_service_state": dns_service_state.trim(),
-                    "rustynet_listener_lines": rustynet_listener_lines,
-                }
-            }),
-        );
+                evidence: LiveLinuxControlSurfaceHostEvidenceView {
+                    daemon_socket_meta: daemon_meta_trimmed,
+                    helper_socket_meta: helper_meta_trimmed,
+                    managed_dns_service_state: dns_service_state.trim().to_string(),
+                    rustynet_listener_lines,
+                },
+            },
+        ));
     }
 
     if remote_dns_probe_status == CHECK_FAIL {
         overall = CHECK_FAIL.to_string();
     }
 
-    let all_daemon_ok = host_results.values().all(|value| {
-        value
-            .get("checks")
-            .and_then(|checks| checks.get("daemon_socket_secure"))
-            .and_then(Value::as_str)
-            == Some(CHECK_PASS)
-    });
-    let all_helper_ok = host_results.values().all(|value| {
-        value
-            .get("checks")
-            .and_then(|checks| checks.get("helper_socket_secure"))
-            .and_then(Value::as_str)
-            == Some(CHECK_PASS)
-    });
-    let all_no_tcp = host_results.values().all(|value| {
-        value
-            .get("checks")
-            .and_then(|checks| checks.get("no_rustynet_tcp_listener"))
-            .and_then(Value::as_str)
-            == Some(CHECK_PASS)
-    });
-    let all_udp_loopback = host_results.values().all(|value| {
-        value
-            .get("checks")
-            .and_then(|checks| checks.get("rustynet_udp_loopback_only"))
-            .and_then(Value::as_str)
-            == Some(CHECK_PASS)
-    });
+    let all_daemon_ok = typed_hosts
+        .iter()
+        .all(|(_, host)| host.checks.daemon_socket_secure == CHECK_PASS);
+    let all_helper_ok = typed_hosts
+        .iter()
+        .all(|(_, host)| host.checks.helper_socket_secure == CHECK_PASS);
+    let all_no_tcp = typed_hosts
+        .iter()
+        .all(|(_, host)| host.checks.no_rustynet_tcp_listener == CHECK_PASS);
+    let all_udp_loopback = typed_hosts
+        .iter()
+        .all(|(_, host)| host.checks.rustynet_udp_loopback_only == CHECK_PASS);
 
-    let payload = json!({
-        "phase": "phase10",
-        "mode": "live_linux_control_surface_exposure",
-        "evidence_mode": "measured",
-        "captured_at": captured_at,
-        "captured_at_unix": captured_at_unix,
-        "status": overall,
-        "dns_bind_addr": config.dns_bind_addr,
-        "checks": {
-            "all_daemon_sockets_secure": if all_daemon_ok { CHECK_PASS } else { CHECK_FAIL },
-            "all_helper_sockets_secure": if all_helper_ok { CHECK_PASS } else { CHECK_FAIL },
-            "no_rustynet_tcp_listeners": if all_no_tcp { CHECK_PASS } else { CHECK_FAIL },
-            "rustynet_udp_loopback_only": if all_udp_loopback { CHECK_PASS } else { CHECK_FAIL },
-            "remote_underlay_dns_probe_blocked": remote_dns_probe_status,
+    let mut hosts_map: Map<String, Value> = Map::new();
+    for (label, host_view) in &typed_hosts {
+        let host_value = serde_json::to_value(host_view).map_err(|err| {
+            format!("serialize control-surface host view ({label}) failed: {err}")
+        })?;
+        hosts_map.insert(label.clone(), host_value);
+    }
+
+    let report = LiveLinuxControlSurfaceReportView {
+        phase: "phase10".to_string(),
+        mode: "live_linux_control_surface_exposure".to_string(),
+        evidence_mode: "measured".to_string(),
+        captured_at,
+        captured_at_unix,
+        status: overall.clone(),
+        dns_bind_addr: config.dns_bind_addr,
+        checks: LiveLinuxControlSurfaceAggregateChecksView {
+            all_daemon_sockets_secure: pass_or_fail(all_daemon_ok),
+            all_helper_sockets_secure: pass_or_fail(all_helper_ok),
+            no_rustynet_tcp_listeners: pass_or_fail(all_no_tcp),
+            rustynet_udp_loopback_only: pass_or_fail(all_udp_loopback),
+            remote_underlay_dns_probe_blocked: remote_dns_probe_status,
         },
-        "hosts": Value::Object(host_results),
-        "evidence": {
-            "remote_underlay_dns_probe_output": config.remote_dns_probe_output,
+        hosts: hosts_map,
+        evidence: LiveLinuxControlSurfaceEvidenceView {
+            remote_underlay_dns_probe_output: config.remote_dns_probe_output,
         },
-    });
+    };
+
+    let payload = serde_json::to_value(&report)
+        .map_err(|err| format!("serialize control-surface report failed: {err}"))?;
     write_json_pretty(report_path.as_path(), &payload)?;
-    Ok(payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(CHECK_FAIL)
-        .to_string())
+    Ok(report.status)
+}
+
+#[inline]
+fn pass_or_fail(ok: bool) -> String {
+    if ok { CHECK_PASS } else { CHECK_FAIL }.to_string()
 }
 
 pub fn execute_ops_rewrite_assignment_peer_endpoint_ip(
@@ -3377,6 +3445,9 @@ pub fn execute_ops_write_active_network_rogue_path_hijack_report(
 mod tests {
     use super::{
         CheckLocalFileModeConfig, ExtractManagedDnsExpectedIpConfig,
+        LiveLinuxControlSurfaceAggregateChecksView, LiveLinuxControlSurfaceEvidenceView,
+        LiveLinuxControlSurfaceHostChecksView, LiveLinuxControlSurfaceHostEvidenceView,
+        LiveLinuxControlSurfaceHostResultView, LiveLinuxControlSurfaceReportView,
         LiveLinuxServerIpBypassChecksView, LiveLinuxServerIpBypassEvidenceView,
         LiveLinuxServerIpBypassReportView, RewriteAssignmentMeshCidrConfig,
         RewriteAssignmentPeerEndpointIpConfig, UpdateRoleSwitchHostResultConfig,
@@ -3965,6 +4036,230 @@ mod tests {
         assert_eq!(status, "pass");
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"status\": \"pass\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn baseline_control_surface_pass_view() -> LiveLinuxControlSurfaceReportView {
+        let mut hosts = serde_json::Map::new();
+        let host = LiveLinuxControlSurfaceHostResultView {
+            checks: LiveLinuxControlSurfaceHostChecksView {
+                daemon_socket_secure: "pass".to_string(),
+                helper_socket_secure: "pass".to_string(),
+                no_rustynet_tcp_listener: "pass".to_string(),
+                rustynet_udp_loopback_only: "pass".to_string(),
+            },
+            evidence: LiveLinuxControlSurfaceHostEvidenceView {
+                daemon_socket_meta: "socket|600|root|root".to_string(),
+                helper_socket_meta: "socket|660|root|rustynetd".to_string(),
+                managed_dns_service_state: "active".to_string(),
+                rustynet_listener_lines: vec![
+                    "udp UNCONN 0 0 127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=1,fd=4))"
+                        .to_string(),
+                ],
+            },
+        };
+        hosts.insert(
+            "client".to_string(),
+            serde_json::to_value(&host).expect("to_value"),
+        );
+        LiveLinuxControlSurfaceReportView {
+            phase: "phase10".to_string(),
+            mode: "live_linux_control_surface_exposure".to_string(),
+            evidence_mode: "measured".to_string(),
+            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            captured_at_unix: 1_772_983_200,
+            status: "pass".to_string(),
+            dns_bind_addr: "127.0.0.1:53535".to_string(),
+            checks: LiveLinuxControlSurfaceAggregateChecksView {
+                all_daemon_sockets_secure: "pass".to_string(),
+                all_helper_sockets_secure: "pass".to_string(),
+                no_rustynet_tcp_listeners: "pass".to_string(),
+                rustynet_udp_loopback_only: "pass".to_string(),
+                remote_underlay_dns_probe_blocked: "pass".to_string(),
+            },
+            hosts,
+            evidence: LiveLinuxControlSurfaceEvidenceView {
+                remote_underlay_dns_probe_output: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn control_surface_view_round_trips_through_serde() {
+        let view = baseline_control_surface_pass_view();
+        let body = serde_json::to_string(&view).expect("serialize");
+        let parsed: LiveLinuxControlSurfaceReportView =
+            serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn control_surface_view_rejects_missing_required_field() {
+        let mut value =
+            serde_json::to_value(baseline_control_surface_pass_view()).expect("to_value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("captured_at_unix");
+        let err = serde_json::from_value::<LiveLinuxControlSurfaceReportView>(value)
+            .expect_err("missing captured_at_unix must fail closed at the typed boundary");
+        assert!(
+            err.to_string().contains("captured_at_unix"),
+            "error names missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn control_surface_view_rejects_wrong_type_for_captured_at_unix() {
+        let mut value =
+            serde_json::to_value(baseline_control_surface_pass_view()).expect("to_value");
+        value.as_object_mut().expect("object").insert(
+            "captured_at_unix".to_string(),
+            Value::String("nope".to_string()),
+        );
+        let err = serde_json::from_value::<LiveLinuxControlSurfaceReportView>(value)
+            .expect_err("string captured_at_unix must fail closed at the typed boundary");
+        let message = err.to_string();
+        assert!(
+            message.contains("u64"),
+            "error references the u64 expected type: {message}"
+        );
+    }
+
+    #[test]
+    fn control_surface_host_view_round_trips_through_serde() {
+        let host = LiveLinuxControlSurfaceHostResultView {
+            checks: LiveLinuxControlSurfaceHostChecksView {
+                daemon_socket_secure: "pass".to_string(),
+                helper_socket_secure: "fail".to_string(),
+                no_rustynet_tcp_listener: "pass".to_string(),
+                rustynet_udp_loopback_only: "pass".to_string(),
+            },
+            evidence: LiveLinuxControlSurfaceHostEvidenceView {
+                daemon_socket_meta: "socket|600|root|root".to_string(),
+                helper_socket_meta: "socket|660|world|rustynetd".to_string(),
+                managed_dns_service_state: "active".to_string(),
+                rustynet_listener_lines: Vec::new(),
+            },
+        };
+        let body = serde_json::to_string(&host).expect("serialize");
+        let parsed: LiveLinuxControlSurfaceHostResultView =
+            serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, host);
+    }
+
+    #[test]
+    fn control_surface_report_fails_when_remote_dns_probe_fails() {
+        let work_dir = temp_path("control-surface-dns-probe-fail-work");
+        fs::create_dir_all(work_dir.as_path()).expect("mkdir");
+        fs::write(
+            work_dir.join("client.daemon_socket.txt"),
+            "socket|600|root|root\n",
+        )
+        .expect("write daemon");
+        fs::write(
+            work_dir.join("client.helper_socket.txt"),
+            "socket|660|root|rustynetd\n",
+        )
+        .expect("write helper");
+        fs::write(
+            work_dir.join("client.inet_listeners.txt"),
+            "udp UNCONN 0 0 127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=1,fd=4))\n",
+        )
+        .expect("write listeners");
+        fs::write(work_dir.join("client.managed_dns_state.txt"), "active\n").expect("write state");
+        let report_path = temp_path("control-surface-dns-probe-fail-report");
+        let status = execute_ops_write_live_linux_control_surface_report(
+            WriteLiveLinuxControlSurfaceReportConfig {
+                report_path: report_path.clone(),
+                dns_bind_addr: "127.0.0.1:53535".to_string(),
+                // probe failed → overall must flip to fail even though per-host checks pass
+                remote_dns_probe_status: "fail".to_string(),
+                remote_dns_probe_output: "leak observed".to_string(),
+                work_dir: work_dir.clone(),
+                host_labels: vec!["client".to_string()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "fail");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: LiveLinuxControlSurfaceReportView =
+            serde_json::from_str(&body).expect("typed parse of writer output");
+        assert_eq!(parsed.status, "fail");
+        assert_eq!(parsed.checks.all_daemon_sockets_secure, "pass");
+        assert_eq!(parsed.checks.remote_underlay_dns_probe_blocked, "fail");
+        // host-level checks remain pass; overall flips because of the probe verdict
+        assert_eq!(parsed.hosts.len(), 1);
+        let _ = fs::remove_file(work_dir.join("client.daemon_socket.txt"));
+        let _ = fs::remove_file(work_dir.join("client.helper_socket.txt"));
+        let _ = fs::remove_file(work_dir.join("client.inet_listeners.txt"));
+        let _ = fs::remove_file(work_dir.join("client.managed_dns_state.txt"));
+        let _ = fs::remove_dir(work_dir.as_path());
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn control_surface_report_preserves_host_label_insertion_order() {
+        // pin the orchestrator-supplied label order in the on-disk JSON
+        // shape. The workspace's serde_json is built with `preserve_order`,
+        // and a future Map<String, Value> -> BTreeMap swap would silently
+        // alphabetise these labels.
+        let work_dir = temp_path("control-surface-order-work");
+        fs::create_dir_all(work_dir.as_path()).expect("mkdir");
+        for label in ["zeta", "alpha", "mu"] {
+            fs::write(
+                work_dir.join(format!("{label}.daemon_socket.txt")),
+                "socket|600|root|root\n",
+            )
+            .expect("write daemon");
+            fs::write(
+                work_dir.join(format!("{label}.helper_socket.txt")),
+                "socket|660|root|rustynetd\n",
+            )
+            .expect("write helper");
+            fs::write(
+                work_dir.join(format!("{label}.inet_listeners.txt")),
+                "udp UNCONN 0 0 127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=1,fd=4))\n",
+            )
+            .expect("write listeners");
+            fs::write(
+                work_dir.join(format!("{label}.managed_dns_state.txt")),
+                "active\n",
+            )
+            .expect("write state");
+        }
+        let report_path = temp_path("control-surface-order-report");
+        let _ = execute_ops_write_live_linux_control_surface_report(
+            WriteLiveLinuxControlSurfaceReportConfig {
+                report_path: report_path.clone(),
+                dns_bind_addr: "127.0.0.1:53535".to_string(),
+                remote_dns_probe_status: "pass".to_string(),
+                remote_dns_probe_output: "{}".to_string(),
+                work_dir: work_dir.clone(),
+                host_labels: vec!["zeta".to_string(), "alpha".to_string(), "mu".to_string()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: LiveLinuxControlSurfaceReportView =
+            serde_json::from_str(&body).expect("typed parse");
+        let observed_labels: Vec<&String> = parsed.hosts.keys().collect();
+        assert_eq!(
+            observed_labels,
+            vec![&"zeta".to_string(), &"alpha".to_string(), &"mu".to_string(),],
+            "host iteration order MUST follow caller-supplied host_labels"
+        );
+        for label in ["zeta", "alpha", "mu"] {
+            let _ = fs::remove_file(work_dir.join(format!("{label}.daemon_socket.txt")));
+            let _ = fs::remove_file(work_dir.join(format!("{label}.helper_socket.txt")));
+            let _ = fs::remove_file(work_dir.join(format!("{label}.inet_listeners.txt")));
+            let _ = fs::remove_file(work_dir.join(format!("{label}.managed_dns_state.txt")));
+        }
+        let _ = fs::remove_dir(work_dir.as_path());
         let _ = fs::remove_file(report_path.as_path());
     }
 
