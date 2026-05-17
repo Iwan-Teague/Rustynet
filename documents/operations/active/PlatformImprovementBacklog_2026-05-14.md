@@ -528,9 +528,38 @@ inline. Cross-reference with:
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 
-* `[ ]` Linux side is fairly well-covered; Windows side has fewer
-  positive + drift tests. Bring Windows coverage to Linux parity. This
-  pairs naturally with the W2/W3/W4 hardening items.
+* `[~]` `windows_dns_failclosed` parity slice landed (commit
+  pending). 14 new tests close shape parity with the Linux side:
+  - IPv4 link-local interface DNS (`169.254.169.254`,
+    cloud-metadata) → reject
+  - IPv6 link-local interface DNS (`fe80::1`,
+    RA-installed) → reject
+  - IPv4 / IPv6 unspecified interface DNS (`0.0.0.0`, `::`) → reject
+  - NRPT rule forwarding to IPv6 link-local → reject
+  - NRPT rule forwarding to `::ffff:8.8.8.8` IPv4-mapped external
+    → reject (catches the "looks loopback-adjacent" leak)
+  - NRPT rule forwarding to `fe80::1%6` zoneid-suffixed link-local
+    → unparseable / drift
+  - NRPT rule forwarding to bracketed `[::1]` URL form → unparseable
+  - Multiple off-loopback entries on one interface → each surfaces
+    independently (no short-circuit)
+  - Empty snapshot (no interfaces, no NRPT rules) → missing
+    root-coverage drift
+  - Sub-namespace-only NRPT rule with no root rule → missing
+    root-coverage drift
+  - Root rule plus clean sub-namespace rule → pass
+  - `schema_version=0` (downgrade) → reject with the observed
+    value in the reason
+  - IPv6-family interface carrying IPv4 address → family-mismatch /
+    unparseable drift
+  Module test count: 32 → 46. Regression-coverage gate floor bumped
+  accordingly. Also bumped `windows_authenticode:21→38` floor that
+  was lagging the W5 thumbprint-policy expansion.
+* `[ ]` Remaining scope (separate slice): bring
+  `windows_runtime_acls` to standalone module parity with Linux
+  (today the Windows ACL surface lives inside
+  `windows_service_hardening` and `windows_paths`). Add a dedicated
+  `windows_runtime_acls.rs` module if/when the surface justifies it.
 
 ### X5. Membership evidence + runbook automation
 

@@ -821,4 +821,260 @@ mod tests {
         evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect("root rule with ::1-only must qualify as covered");
     }
+
+    // ---- X4: Windows DNS coverage parity with Linux side ----------------
+
+    /// IPv4 link-local (169.254.0.0/16) as an interface DNS server is
+    /// a real leak shape (cloud-metadata reachable / RFC3927). Pin so
+    /// the evaluator flags it as non-loopback drift.
+    #[test]
+    fn evaluator_rejects_ipv4_link_local_interface_dns() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[0].server_addresses = vec!["169.254.169.254".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv4 link-local must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("169.254.169.254") && r.contains("non-loopback")),
+            "rejection must name the cloud-metadata address: {reasons:?}"
+        );
+    }
+
+    /// IPv6 link-local (fe80::/10) as interface DNS — same leak shape
+    /// as IPv4 link-local but for Router-Advertisement-installed
+    /// resolvers.
+    #[test]
+    fn evaluator_rejects_ipv6_link_local_interface_dns() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[1].server_addresses = vec!["fe80::1".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv6 link-local must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("fe80::1") && r.contains("non-loopback")),
+            "rejection must name IPv6 link-local entry: {reasons:?}"
+        );
+    }
+
+    /// IPv4 unspecified 0.0.0.0 as interface DNS — meaningless and
+    /// definitely not loopback; must fail-closed.
+    #[test]
+    fn evaluator_rejects_ipv4_unspecified_interface_dns() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[0].server_addresses = vec!["0.0.0.0".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv4 unspecified must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("0.0.0.0") && r.contains("non-loopback")),
+            "rejection must name 0.0.0.0: {reasons:?}"
+        );
+    }
+
+    /// IPv6 unspecified `::` as interface DNS.
+    #[test]
+    fn evaluator_rejects_ipv6_unspecified_interface_dns() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[1].server_addresses = vec!["::".to_string()];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv6 unspecified must reject");
+        assert!(
+            reasons.iter().any(|r| r.contains("non-loopback")),
+            ":: must surface as non-loopback drift: {reasons:?}"
+        );
+    }
+
+    /// NRPT rule forwarding to a link-local IPv6 address — a real
+    /// shape that an attacker on the LAN could install via a hostile
+    /// DHCPv6 / RA response.
+    #[test]
+    fn evaluator_rejects_nrpt_rule_with_ipv6_link_local_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules.push(WindowsNrptRule {
+            name: "{ra-installed-rule}".to_string(),
+            namespace: vec![".lan".to_string()],
+            name_servers: vec!["fe80::1".to_string()],
+        });
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv6 link-local NRPT rule must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("fe80::1") && r.contains("non-loopback")),
+            "rejection must name the RA-shape entry: {reasons:?}"
+        );
+    }
+
+    /// NRPT rule forwarding to an IPv4-mapped IPv6 external address
+    /// (`::ffff:8.8.8.8`). Looks loopback-adjacent at a glance but is
+    /// the same wire address as 8.8.8.8 — must reject.
+    #[test]
+    fn evaluator_rejects_nrpt_rule_with_ipv4_mapped_external_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules.push(WindowsNrptRule {
+            name: "{mapped-external-rule}".to_string(),
+            namespace: vec![".mesh.test".to_string()],
+            name_servers: vec!["::ffff:8.8.8.8".to_string()],
+        });
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("IPv4-mapped external IPv6 NRPT rule must reject");
+        assert!(
+            reasons.iter().any(|r| r.contains("non-loopback")),
+            "rejection must surface mapped-external as non-loopback: {reasons:?}"
+        );
+    }
+
+    /// NRPT rule with a zone-id-suffixed link-local
+    /// (`fe80::1%6`) — not parseable as `IpAddr` in std, must surface
+    /// as a parse failure rather than silently passing.
+    #[test]
+    fn evaluator_rejects_nrpt_rule_with_zoneid_suffixed_link_local() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules.push(WindowsNrptRule {
+            name: "{zoneid-rule}".to_string(),
+            namespace: vec![".local".to_string()],
+            name_servers: vec!["fe80::1%6".to_string()],
+        });
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("zoneid-suffixed must surface as parse failure");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("unparseable") || r.contains("non-loopback")),
+            "zoneid-suffixed must surface as drift: {reasons:?}"
+        );
+    }
+
+    /// NRPT rule with bracketed `[::1]` — URL form, not a valid raw
+    /// address; must surface as unparseable.
+    #[test]
+    fn evaluator_rejects_nrpt_rule_with_bracketed_ipv6_name_server() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules.push(WindowsNrptRule {
+            name: "{bracketed-rule}".to_string(),
+            namespace: vec![".mesh".to_string()],
+            name_servers: vec!["[::1]".to_string()],
+        });
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("bracketed form must surface as parse failure");
+        assert!(
+            reasons.iter().any(|r| r.contains("unparseable")),
+            "bracketed form must reject: {reasons:?}"
+        );
+    }
+
+    /// Interface DNS list with multiple entries: one loopback,
+    /// one external. The evaluator must NOT short-circuit on the
+    /// first acceptable entry — every off-loopback entry must
+    /// surface independently.
+    #[test]
+    fn evaluator_aggregates_multiple_off_loopback_entries_on_one_interface() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[0].server_addresses = vec![
+            "127.0.0.1".to_string(),   // ok
+            "8.8.8.8".to_string(),     // drift
+            "1.1.1.1".to_string(),     // drift
+            "192.168.1.1".to_string(), // drift
+        ];
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("mixed off-loopback must fail closed");
+        let off_loopback_count = reasons
+            .iter()
+            .filter(|r| r.contains("non-loopback"))
+            .count();
+        assert_eq!(
+            off_loopback_count, 3,
+            "each off-loopback entry must surface: {reasons:?}"
+        );
+    }
+
+    /// Snapshot with no interfaces and no NRPT rules — there is no
+    /// root-namespace coverage at all. Pin that this counts as drift
+    /// (the empty-state must NOT silently pass).
+    #[test]
+    fn evaluator_rejects_empty_snapshot_with_no_root_coverage() {
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![],
+        };
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("empty snapshot must fail closed");
+        assert!(
+            reasons.iter().any(|r| r.contains("root namespace")),
+            "missing root-coverage must surface: {reasons:?}"
+        );
+    }
+
+    /// Snapshot with NRPT rule whose namespace is `.lan` (sub-namespace
+    /// only, no root rule) — the root namespace is not covered.
+    #[test]
+    fn evaluator_rejects_snapshot_with_only_sub_namespace_nrpt_rule() {
+        let snapshot = WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![WindowsNrptRule {
+                name: "{sub-only-rule}".to_string(),
+                namespace: vec![".lan".to_string()],
+                name_servers: vec!["127.0.0.1".to_string()],
+            }],
+        };
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("sub-namespace only must fail closed");
+        assert!(
+            reasons.iter().any(|r| r.contains("root namespace")),
+            "missing root-coverage must surface: {reasons:?}"
+        );
+    }
+
+    /// Multiple NRPT rules — one root-covering loopback rule + one
+    /// sub-namespace loopback rule — must pass. The evaluator must
+    /// not treat the presence of sub-namespace rules as drift when
+    /// the root is also covered.
+    #[test]
+    fn evaluator_accepts_root_rule_plus_clean_sub_namespace_rule() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.nrpt_rules.push(WindowsNrptRule {
+            name: "{clean-sub-rule}".to_string(),
+            namespace: vec![".mesh.local".to_string()],
+            name_servers: vec!["127.0.0.1".to_string()],
+        });
+        evaluate_windows_dns_failclosed_snapshot(&snapshot).expect("root+clean sub rule must pass");
+    }
+
+    /// Schema-version 0 (downgrade) — not the same as the "unsupported
+    /// future" path. Pin so the evaluator's reason text is consistent.
+    #[test]
+    fn evaluator_rejects_schema_version_zero_with_explicit_reason() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.schema_version = 0;
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("schema_version=0 must reject");
+        assert!(
+            reasons.iter().any(|r| r.contains("schema_version=0")),
+            "schema-version reason must include the observed value: {reasons:?}"
+        );
+    }
+
+    /// Address-family mismatch is already covered by an earlier test
+    /// for the IPv4 family with an IPv6 string. Pin the inverse shape
+    /// too: IPv6 family with an IPv4 string.
+    #[test]
+    fn evaluator_rejects_ipv6_family_carrying_ipv4_address() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[1].server_addresses = vec!["127.0.0.1".to_string()];
+        // The interface is declared as Ipv6, the address is IPv4 —
+        // the parser surfaces this as a family-mismatch reason.
+        let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
+            .expect_err("family mismatch must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("unparseable") || r.contains("family")),
+            "family mismatch must surface: {reasons:?}"
+        );
+    }
 }
