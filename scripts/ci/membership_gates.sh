@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-
 echo "Running membership CI gates..."
 
 # Lint and deny warnings
@@ -19,16 +16,10 @@ cargo test -p rustynet-policy -- --nocapture
 # above. Does not require lab artifacts.
 cargo run --quiet -p rustynet-cli -- ops write-membership-phase10-report
 
-# Verify the report was produced and is well-formed JSON with status=pass
-MEMBERSHIP_REPORT="${REPO_ROOT}/artifacts/phase10/membership_report.json"
-if [[ ! -f "${MEMBERSHIP_REPORT}" ]]; then
-    echo "GATE FAIL: artifacts/phase10/membership_report.json was not written" >&2
-    exit 1
-fi
-if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d.get('status')=='pass', 'status!=pass'" \
-        "${MEMBERSHIP_REPORT}" 2>/dev/null; then
-    echo "GATE FAIL: artifacts/phase10/membership_report.json schema validation failed" >&2
-    exit 1
-fi
-echo "membership_report.json schema validation: pass"
+# Verify the report was produced, parses against the typed schema, and has
+# status=pass. The Rust subcommand fails closed on missing file, malformed
+# JSON, missing/wrong-type required schema fields, or status!=pass, and maps
+# each failure onto the X6 exit-code taxonomy (ConfigError vs PolicyReject).
+cargo run --quiet -p rustynet-cli -- ops verify-membership-phase10-report
+
 echo "Membership CI gates: PASS"

@@ -448,6 +448,9 @@ enum OpsCommand {
     RunPhase10CiGates,
     RunMembershipCiGates,
     WriteMembershipPhase10Report,
+    VerifyMembershipPhase10Report {
+        config: ops_ci_release_perf::VerifyMembershipPhase10ReportConfig,
+    },
     RunSupplyChainIntegrityGates,
     RunSecurityRegressionGates,
     RunActiveNetworkSecurityGates,
@@ -1551,6 +1554,11 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::WriteMembershipPhase10Report)
         }
+        "verify-membership-phase10-report" => Ok(OpsCommand::VerifyMembershipPhase10Report {
+            config: ops_ci_release_perf::VerifyMembershipPhase10ReportConfig {
+                report_path: parser.optional_path("--report-path"),
+            },
+        }),
         "run-supply-chain-integrity-gates" => {
             if args.len() != 1 {
                 return Err(
@@ -5131,6 +5139,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::WriteMembershipPhase10Report => {
             ops_ci_release_perf::execute_ops_write_membership_phase10_report()
+        }
+        OpsCommand::VerifyMembershipPhase10Report { config } => {
+            ops_ci_release_perf::execute_ops_verify_membership_phase10_report(config)
         }
         OpsCommand::RunSupplyChainIntegrityGates => {
             ops_ci_release_perf::execute_ops_run_supply_chain_integrity_gates()
