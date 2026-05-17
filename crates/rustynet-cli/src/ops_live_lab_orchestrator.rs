@@ -2192,6 +2192,67 @@ pub fn execute_ops_write_role_switch_matrix_report(
     Ok(report_path.display().to_string())
 }
 
+/// Typed view for the per-check verdicts inside the server-IP-bypass
+/// report. Each field is a fixed-shape `pass`/`fail` string emitted by
+/// the writer; `overall_status_from_fields` AND the on-disk shape are
+/// pinned by tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxServerIpBypassChecksView {
+    pub internet_route_via_rustynet0: String,
+    pub probe_host_self_service_reachable: String,
+    pub probe_endpoint_route_direct_not_tunnelled: String,
+    pub probe_service_blocked_from_client: String,
+    pub no_unexpected_bypass_routes: String,
+}
+
+impl LiveLinuxServerIpBypassChecksView {
+    fn overall_status(&self) -> &'static str {
+        let all_pass = [
+            self.internet_route_via_rustynet0.as_str(),
+            self.probe_host_self_service_reachable.as_str(),
+            self.probe_endpoint_route_direct_not_tunnelled.as_str(),
+            self.probe_service_blocked_from_client.as_str(),
+            self.no_unexpected_bypass_routes.as_str(),
+        ]
+        .iter()
+        .all(|value| *value == CHECK_PASS);
+        if all_pass { CHECK_PASS } else { CHECK_FAIL }
+    }
+}
+
+/// Typed view for the raw evidence block emitted alongside the
+/// summarized checks. Field order MUST stay in sync with the JSON
+/// shape contract pinned by the round-trip tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxServerIpBypassEvidenceView {
+    pub client_internet_route: String,
+    pub client_probe_route: String,
+    pub client_table_51820: String,
+    pub client_endpoints: String,
+    pub probe_self_test: String,
+    pub client_probe_output: String,
+    pub unexpected_bypass_routes: Vec<String>,
+    pub allowed_management_cidrs: Vec<String>,
+}
+
+/// Typed view for the full server-IP-bypass report. Replaces the
+/// previous `json!({...})` literal so the report shape and overall
+/// status are pinned by the type system rather than walked as a
+/// `serde_json::Value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxServerIpBypassReportView {
+    pub phase: String,
+    pub mode: String,
+    pub evidence_mode: String,
+    pub captured_at: String,
+    pub captured_at_unix: u64,
+    pub status: String,
+    pub probe_host_ip: String,
+    pub probe_port: u16,
+    pub checks: LiveLinuxServerIpBypassChecksView,
+    pub evidence: LiveLinuxServerIpBypassEvidenceView,
+}
+
 pub fn execute_ops_write_live_linux_server_ip_bypass_report(
     config: WriteLiveLinuxServerIpBypassReportConfig,
 ) -> Result<String, String> {
@@ -2257,51 +2318,63 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
         }
     }
 
-    let checks = json!({
-        "internet_route_via_rustynet0": if internet_route_ok { CHECK_PASS } else { CHECK_FAIL },
-        "probe_host_self_service_reachable": if probe_host_self_reachable { CHECK_PASS } else { CHECK_FAIL },
-        "probe_endpoint_route_direct_not_tunnelled": if probe_route_direct { CHECK_PASS } else { CHECK_FAIL },
-        "probe_service_blocked_from_client": probe_from_client_status,
-        "no_unexpected_bypass_routes": if unexpected_bypass_routes.is_empty() { CHECK_PASS } else { CHECK_FAIL },
-    });
+    let checks = LiveLinuxServerIpBypassChecksView {
+        internet_route_via_rustynet0: if internet_route_ok {
+            CHECK_PASS
+        } else {
+            CHECK_FAIL
+        }
+        .to_string(),
+        probe_host_self_service_reachable: if probe_host_self_reachable {
+            CHECK_PASS
+        } else {
+            CHECK_FAIL
+        }
+        .to_string(),
+        probe_endpoint_route_direct_not_tunnelled: if probe_route_direct {
+            CHECK_PASS
+        } else {
+            CHECK_FAIL
+        }
+        .to_string(),
+        probe_service_blocked_from_client: probe_from_client_status,
+        no_unexpected_bypass_routes: if unexpected_bypass_routes.is_empty() {
+            CHECK_PASS
+        } else {
+            CHECK_FAIL
+        }
+        .to_string(),
+    };
+    let overall = checks.overall_status();
 
-    let overall = if checks
-        .as_object()
-        .map(|items| items.values().all(|v| v.as_str() == Some(CHECK_PASS)))
-        .unwrap_or(false)
-    {
-        CHECK_PASS
-    } else {
-        CHECK_FAIL
+    let evidence = LiveLinuxServerIpBypassEvidenceView {
+        client_internet_route: config.client_internet_route,
+        client_probe_route: config.client_probe_route,
+        client_table_51820: config.client_table_51820,
+        client_endpoints: config.client_endpoints,
+        probe_self_test: config.probe_self_test,
+        client_probe_output: config.probe_from_client_output,
+        unexpected_bypass_routes,
+        allowed_management_cidrs: allowed_networks.into_iter().map(|(raw, _)| raw).collect(),
     };
 
-    let payload = json!({
-        "phase": "phase10",
-        "mode": "live_linux_server_ip_bypass",
-        "evidence_mode": "measured",
-        "captured_at": captured_at,
-        "captured_at_unix": captured_at_unix,
-        "status": overall,
-        "probe_host_ip": probe_ip.to_string(),
-        "probe_port": config.probe_port,
-        "checks": checks,
-        "evidence": {
-            "client_internet_route": config.client_internet_route,
-            "client_probe_route": config.client_probe_route,
-            "client_table_51820": config.client_table_51820,
-            "client_endpoints": config.client_endpoints,
-            "probe_self_test": config.probe_self_test,
-            "client_probe_output": config.probe_from_client_output,
-            "unexpected_bypass_routes": unexpected_bypass_routes,
-            "allowed_management_cidrs": allowed_networks.into_iter().map(|(raw, _)| raw).collect::<Vec<_>>(),
-        }
-    });
+    let report = LiveLinuxServerIpBypassReportView {
+        phase: "phase10".to_string(),
+        mode: "live_linux_server_ip_bypass".to_string(),
+        evidence_mode: "measured".to_string(),
+        captured_at,
+        captured_at_unix,
+        status: overall.to_string(),
+        probe_host_ip: probe_ip.to_string(),
+        probe_port: config.probe_port,
+        checks,
+        evidence,
+    };
+
+    let payload = serde_json::to_value(&report)
+        .map_err(|err| format!("serialize server-ip-bypass report failed: {err}"))?;
     write_json_pretty(report_path.as_path(), &payload)?;
-    Ok(payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(CHECK_FAIL)
-        .to_string())
+    Ok(report.status)
 }
 
 pub fn execute_ops_write_live_linux_control_surface_report(
@@ -3304,9 +3377,10 @@ pub fn execute_ops_write_active_network_rogue_path_hijack_report(
 mod tests {
     use super::{
         CheckLocalFileModeConfig, ExtractManagedDnsExpectedIpConfig,
-        RewriteAssignmentMeshCidrConfig, RewriteAssignmentPeerEndpointIpConfig,
-        UpdateRoleSwitchHostResultConfig, ValidateCrossNetworkForensicsBundleConfig,
-        WriteActiveNetworkRoguePathHijackReportConfig,
+        LiveLinuxServerIpBypassChecksView, LiveLinuxServerIpBypassEvidenceView,
+        LiveLinuxServerIpBypassReportView, RewriteAssignmentMeshCidrConfig,
+        RewriteAssignmentPeerEndpointIpConfig, UpdateRoleSwitchHostResultConfig,
+        ValidateCrossNetworkForensicsBundleConfig, WriteActiveNetworkRoguePathHijackReportConfig,
         WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLabStageArtifactIndexConfig,
         WriteLiveLinuxControlSurfaceReportConfig, WriteLiveLinuxEndpointHijackReportConfig,
         WriteLiveLinuxLabRunSummaryConfig, WriteLiveLinuxRebootRecoveryReportConfig,
@@ -3620,6 +3694,191 @@ mod tests {
         assert_eq!(status, "pass");
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"status\": \"pass\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn baseline_server_ip_bypass_pass_view() -> LiveLinuxServerIpBypassReportView {
+        LiveLinuxServerIpBypassReportView {
+            phase: "phase10".to_string(),
+            mode: "live_linux_server_ip_bypass".to_string(),
+            evidence_mode: "measured".to_string(),
+            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            captured_at_unix: 1_772_983_200,
+            status: "pass".to_string(),
+            probe_host_ip: "192.168.1.10".to_string(),
+            probe_port: 18080,
+            checks: LiveLinuxServerIpBypassChecksView {
+                internet_route_via_rustynet0: "pass".to_string(),
+                probe_host_self_service_reachable: "pass".to_string(),
+                probe_endpoint_route_direct_not_tunnelled: "pass".to_string(),
+                probe_service_blocked_from_client: "pass".to_string(),
+                no_unexpected_bypass_routes: "pass".to_string(),
+            },
+            evidence: LiveLinuxServerIpBypassEvidenceView {
+                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
+                client_probe_route: "192.168.1.10 dev eth0".to_string(),
+                client_table_51820: "192.168.1.0/24 dev eth0\n".to_string(),
+                client_endpoints: "peer endpoints".to_string(),
+                probe_self_test: "probe-ok".to_string(),
+                client_probe_output: "blocked".to_string(),
+                unexpected_bypass_routes: Vec::new(),
+                allowed_management_cidrs: vec!["192.168.1.0/24".to_string()],
+            },
+        }
+    }
+
+    #[test]
+    fn server_ip_bypass_view_round_trips_through_serde() {
+        let view = baseline_server_ip_bypass_pass_view();
+        let serialized = serde_json::to_string(&view).expect("serialize");
+        let parsed: LiveLinuxServerIpBypassReportView =
+            serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn server_ip_bypass_checks_view_overall_status_is_pass_when_all_pass() {
+        assert_eq!(
+            baseline_server_ip_bypass_pass_view()
+                .checks
+                .overall_status(),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn server_ip_bypass_checks_view_overall_status_is_fail_when_any_check_fails() {
+        let baseline = baseline_server_ip_bypass_pass_view().checks;
+        // each check fail one at a time pins the per-slot contract — a future
+        // refactor that silently dropped a field from `overall_status` would
+        // trip the matching tweak case.
+        for tweak in [
+            |c: &mut LiveLinuxServerIpBypassChecksView| {
+                c.internet_route_via_rustynet0 = "fail".to_string()
+            },
+            |c: &mut LiveLinuxServerIpBypassChecksView| {
+                c.probe_host_self_service_reachable = "fail".to_string()
+            },
+            |c: &mut LiveLinuxServerIpBypassChecksView| {
+                c.probe_endpoint_route_direct_not_tunnelled = "fail".to_string()
+            },
+            |c: &mut LiveLinuxServerIpBypassChecksView| {
+                c.probe_service_blocked_from_client = "fail".to_string()
+            },
+            |c: &mut LiveLinuxServerIpBypassChecksView| {
+                c.no_unexpected_bypass_routes = "fail".to_string()
+            },
+        ] {
+            let mut checks = baseline.clone();
+            tweak(&mut checks);
+            assert_eq!(checks.overall_status(), "fail");
+        }
+    }
+
+    #[test]
+    fn server_ip_bypass_view_rejects_missing_required_field() {
+        let mut value =
+            serde_json::to_value(baseline_server_ip_bypass_pass_view()).expect("to_value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("captured_at_unix");
+        let err = serde_json::from_value::<LiveLinuxServerIpBypassReportView>(value)
+            .expect_err("missing required captured_at_unix must fail closed at the typed boundary");
+        assert!(
+            err.to_string().contains("captured_at_unix"),
+            "error names missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn server_ip_bypass_view_rejects_wrong_type_for_probe_port() {
+        let mut value =
+            serde_json::to_value(baseline_server_ip_bypass_pass_view()).expect("to_value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("probe_port".to_string(), Value::String("nope".to_string()));
+        let err = serde_json::from_value::<LiveLinuxServerIpBypassReportView>(value)
+            .expect_err("string probe_port must fail closed at the typed boundary");
+        let message = err.to_string();
+        // serde_json's leaf error for an integer-mismatch names the expected
+        // type, not the surrounding field. Pin the u16 type-mismatch shape so
+        // a future schema bump that loosens probe_port to a string trips
+        // this test.
+        assert!(
+            message.contains("u16"),
+            "error references the u16 expected type: {message}"
+        );
+    }
+
+    #[test]
+    fn server_ip_bypass_report_fails_when_management_cidr_route_unexpected() {
+        let report_path = temp_path("server-ip-bypass-report-fail");
+        let status = execute_ops_write_live_linux_server_ip_bypass_report(
+            WriteLiveLinuxServerIpBypassReportConfig {
+                report_path: report_path.clone(),
+                allowed_management_cidrs: "192.168.1.0/24".to_string(),
+                probe_from_client_status: "pass".to_string(),
+                probe_ip: "192.168.1.10".to_string(),
+                probe_port: 18080,
+                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
+                client_probe_route: "192.168.1.10 dev eth0".to_string(),
+                // 10.99.0.0/16 not in allowed_management_cidrs → unexpected bypass route
+                client_table_51820: "10.99.0.0/16 dev eth0\n10.0.0.0/8 dev rustynet0\n".to_string(),
+                client_endpoints: "peer endpoints".to_string(),
+                probe_self_test: "probe-ok".to_string(),
+                probe_from_client_output: "blocked".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "fail");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: LiveLinuxServerIpBypassReportView =
+            serde_json::from_str(&body).expect("typed parse of own output");
+        assert_eq!(parsed.status, "fail");
+        assert_eq!(parsed.checks.no_unexpected_bypass_routes, "fail");
+        assert_eq!(
+            parsed.evidence.unexpected_bypass_routes,
+            vec!["10.99.0.0/16 dev eth0".to_string()]
+        );
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    #[test]
+    fn server_ip_bypass_writer_emits_typed_shape_parseable_by_view() {
+        let report_path = temp_path("server-ip-bypass-shape-parse");
+        let _ = execute_ops_write_live_linux_server_ip_bypass_report(
+            WriteLiveLinuxServerIpBypassReportConfig {
+                report_path: report_path.clone(),
+                allowed_management_cidrs: "192.168.1.0/24".to_string(),
+                probe_from_client_status: "pass".to_string(),
+                probe_ip: "192.168.1.10".to_string(),
+                probe_port: 18080,
+                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
+                client_probe_route: "192.168.1.10 dev eth0".to_string(),
+                client_table_51820: "192.168.1.0/24 dev eth0\n10.0.0.0/8 dev rustynet0\n"
+                    .to_string(),
+                client_endpoints: "peer endpoints".to_string(),
+                probe_self_test: "probe-ok".to_string(),
+                probe_from_client_output: "blocked".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: LiveLinuxServerIpBypassReportView =
+            serde_json::from_str(&body).expect("typed parse of writer output");
+        assert_eq!(parsed.phase, "phase10");
+        assert_eq!(parsed.mode, "live_linux_server_ip_bypass");
+        assert_eq!(parsed.evidence_mode, "measured");
+        assert_eq!(parsed.probe_host_ip, "192.168.1.10");
+        assert_eq!(parsed.probe_port, 18080);
+        assert_eq!(parsed.checks.overall_status(), parsed.status.as_str());
+        assert!(parsed.evidence.unexpected_bypass_routes.is_empty());
         let _ = fs::remove_file(report_path.as_path());
     }
 
