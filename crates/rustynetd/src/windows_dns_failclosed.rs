@@ -88,6 +88,36 @@ pub struct WindowsDnsFailclosedSnapshot {
     pub schema_version: u32,
     pub interfaces: Vec<WindowsInterfaceDnsEntry>,
     pub nrpt_rules: Vec<WindowsNrptRule>,
+    /// W3 — Router Advertisement / IPv6 default-route observation.
+    /// `None` means the collector did not probe RA state (e.g. legacy
+    /// collectors or off-Windows hosts). The evaluator's
+    /// `evaluate_router_advertisement_suppression` pass fails closed
+    /// when this is `None` AND the caller opted into RA enforcement,
+    /// since a non-observation cannot prove suppression.
+    #[serde(default)]
+    pub router_advertisement_observation: Option<WindowsRouterAdvertisementObservation>,
+}
+
+/// W3 — observed Windows IPv6 RA / default-route state per-interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsRouterAdvertisementObservation {
+    pub schema_version: u32,
+    pub interfaces: Vec<WindowsInterfaceRaState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsInterfaceRaState {
+    pub interface_alias: String,
+    pub interface_index: u32,
+    /// True iff the interface accepts IPv6 Router Advertisements
+    /// from upstream (Net*IPv6Interface -RouterDiscovery=Enabled).
+    /// Reviewed posture for mesh-protected interfaces: false.
+    pub router_discovery_enabled: bool,
+    /// IPv6 default routes installed on this interface, source-tagged.
+    /// "ra" → installed by Router Advertisement; "manual"/"dhcp"/"none"
+    /// → other sources. The reviewed posture during protected mode is
+    /// either empty OR `manual`-only — no `ra`-sourced default routes.
+    pub ipv6_default_route_sources: Vec<String>,
 }
 
 /// Final report shape consumed by the `windows-dns-failclosed-check`
@@ -266,6 +296,84 @@ pub fn evaluate_nrpt_ipv6_sibling_coverage(snapshot: &WindowsDnsFailclosedSnapsh
                 "NRPT namespace {ns:?} has no loopback resolver in any covering rule; \
                  both A and AAAA queries fall through to the host default DNS path"
             )),
+        }
+    }
+    reasons
+}
+
+/// W3 — Router Advertisement suppression evaluator. Independent of
+/// the main `evaluate_windows_dns_failclosed_snapshot` and the
+/// `evaluate_nrpt_ipv6_sibling_coverage` passes; callers opt in
+/// when the reviewed posture requires RA suppression.
+///
+/// Drift shapes:
+///   - `router_advertisement_observation` is None → fail-closed
+///     (a non-observation cannot prove suppression)
+///   - any interface with `router_discovery_enabled = true` → drift
+///   - any interface with an `ra`-sourced IPv6 default route → drift
+///   - observation schema_version mismatch → drift
+///
+/// Returns drift reasons; empty = ok. Stable interface order via
+/// BTreeMap so operators can diff outputs.
+pub fn evaluate_router_advertisement_suppression(
+    snapshot: &WindowsDnsFailclosedSnapshot,
+) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    if snapshot.schema_version != 1 {
+        return vec![format!(
+            "unsupported windows DNS fail-closed snapshot schema_version={}; \
+             Router Advertisement suppression check requires schema_version=1",
+            snapshot.schema_version
+        )];
+    }
+
+    let observation = match &snapshot.router_advertisement_observation {
+        Some(obs) => obs,
+        None => {
+            return vec![
+                "router_advertisement_observation is absent; \
+                 RA suppression cannot be proven from a non-observation \
+                 (fail-closed)"
+                    .to_string(),
+            ];
+        }
+    };
+
+    if observation.schema_version != 1 {
+        return vec![format!(
+            "unsupported router_advertisement_observation schema_version={}; \
+             Router Advertisement suppression check requires schema_version=1",
+            observation.schema_version
+        )];
+    }
+
+    // BTreeMap key = (alias, index) for stable, deterministic ordering
+    // of drift reasons independent of input order.
+    let mut ordered: BTreeMap<(String, u32), &WindowsInterfaceRaState> = BTreeMap::new();
+    for iface in &observation.interfaces {
+        ordered.insert(
+            (iface.interface_alias.clone(), iface.interface_index),
+            iface,
+        );
+    }
+
+    let mut reasons: Vec<String> = Vec::new();
+    for ((alias, index), iface) in ordered {
+        if iface.router_discovery_enabled {
+            reasons.push(format!(
+                "interface {alias:?} (ifindex={index}) has IPv6 Router Discovery enabled; \
+                 mesh-protected posture forbids accepting Router Advertisements"
+            ));
+        }
+        for source in &iface.ipv6_default_route_sources {
+            if source.trim().eq_ignore_ascii_case("ra") {
+                reasons.push(format!(
+                    "interface {alias:?} (ifindex={index}) has an IPv6 default route \
+                     installed by Router Advertisement (source={source:?}); \
+                     mesh-protected posture forbids RA-sourced default routes"
+                ));
+            }
         }
     }
     reasons
@@ -465,6 +573,7 @@ mod tests {
                 namespace: vec![".".to_string()],
                 name_servers: vec!["127.0.0.1".to_string()],
             }],
+            router_advertisement_observation: None,
         }
     }
 
@@ -1084,6 +1193,7 @@ mod tests {
             schema_version: 1,
             interfaces: vec![],
             nrpt_rules: vec![],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("empty snapshot must fail closed");
@@ -1105,6 +1215,7 @@ mod tests {
                 namespace: vec![".lan".to_string()],
                 name_servers: vec!["127.0.0.1".to_string()],
             }],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("sub-namespace only must fail closed");
@@ -1176,6 +1287,7 @@ mod tests {
                 namespace: vec![".".to_string()],
                 name_servers: vec!["127.0.0.1".to_string(), "::1".to_string()],
             }],
+            router_advertisement_observation: None,
         }
     }
 
@@ -1207,6 +1319,7 @@ mod tests {
                     name_servers: vec!["::1".to_string()],
                 },
             ],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert!(
@@ -1243,6 +1356,7 @@ mod tests {
                 namespace: vec![".".to_string()],
                 name_servers: vec!["::1".to_string()],
             }],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert!(
@@ -1272,6 +1386,7 @@ mod tests {
                 namespace: vec![".mesh.local".to_string()],
                 name_servers: vec!["8.8.8.8".to_string(), "2606:4700:4700::1111".to_string()],
             }],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert!(
@@ -1300,6 +1415,7 @@ mod tests {
                     name_servers: vec!["127.0.0.1".to_string()],
                 },
             ],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert_eq!(reasons.len(), 2);
@@ -1328,6 +1444,7 @@ mod tests {
                 namespace: vec!["".to_string(), "  ".to_string()],
                 name_servers: vec!["127.0.0.1".to_string(), "::1".to_string()],
             }],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert!(
@@ -1342,6 +1459,7 @@ mod tests {
             schema_version: 2,
             interfaces: vec![],
             nrpt_rules: vec![],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert!(
@@ -1359,6 +1477,7 @@ mod tests {
             schema_version: 1,
             interfaces: vec![],
             nrpt_rules: vec![],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert!(
@@ -1388,6 +1507,7 @@ mod tests {
                     name_servers: vec!["::1".to_string()],
                 },
             ],
+            router_advertisement_observation: None,
         };
         let reasons = evaluate_nrpt_ipv6_sibling_coverage(&snapshot);
         assert_eq!(
@@ -1398,6 +1518,277 @@ mod tests {
         assert!(
             reasons[0].contains(".mesh.special") && reasons[0].contains("IPv6"),
             "uncovered namespace must be the .mesh.special one: {reasons:?}"
+        );
+    }
+
+    // ---- W3: Router Advertisement suppression evaluator ----
+
+    fn ra_clean_observation() -> WindowsRouterAdvertisementObservation {
+        WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![
+                WindowsInterfaceRaState {
+                    interface_alias: "Ethernet".to_string(),
+                    interface_index: 12,
+                    router_discovery_enabled: false,
+                    ipv6_default_route_sources: vec![],
+                },
+                WindowsInterfaceRaState {
+                    interface_alias: "Wi-Fi".to_string(),
+                    interface_index: 17,
+                    router_discovery_enabled: false,
+                    ipv6_default_route_sources: vec![],
+                },
+            ],
+        }
+    }
+
+    fn ra_base_snapshot() -> WindowsDnsFailclosedSnapshot {
+        WindowsDnsFailclosedSnapshot {
+            schema_version: 1,
+            interfaces: vec![],
+            nrpt_rules: vec![],
+            router_advertisement_observation: None,
+        }
+    }
+
+    #[test]
+    fn ra_evaluator_fails_closed_when_observation_is_none() {
+        let snapshot = ra_base_snapshot();
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert!(
+            !reasons.is_empty(),
+            "absent RA observation must fail closed"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("router_advertisement_observation is absent")),
+            "fail-closed reason must name the missing observation: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_accepts_clean_observation_with_router_discovery_disabled() {
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(ra_clean_observation());
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert!(
+            reasons.is_empty(),
+            "clean observation (RD disabled, no RA routes) must produce no drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_flags_interface_with_router_discovery_enabled() {
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![WindowsInterfaceRaState {
+                interface_alias: "Ethernet".to_string(),
+                interface_index: 12,
+                router_discovery_enabled: true,
+                ipv6_default_route_sources: vec![],
+            }],
+        });
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert_eq!(
+            reasons.len(),
+            1,
+            "exactly one drift reason expected: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("Ethernet")
+                && reasons[0].contains("ifindex=12")
+                && reasons[0].contains("Router Discovery"),
+            "drift must name interface + RD-enabled state: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_flags_interface_with_ra_sourced_default_route() {
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![WindowsInterfaceRaState {
+                interface_alias: "Wi-Fi".to_string(),
+                interface_index: 17,
+                router_discovery_enabled: false,
+                ipv6_default_route_sources: vec!["ra".to_string()],
+            }],
+        });
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert_eq!(
+            reasons.len(),
+            1,
+            "exactly one drift reason expected: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("Wi-Fi")
+                && reasons[0].contains("ifindex=17")
+                && reasons[0].contains("Router Advertisement")
+                && reasons[0].contains("\"ra\""),
+            "drift must name interface + ra source: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_flags_multiple_interfaces_in_stable_order() {
+        // Three interfaces, two with drift; inserted in non-sorted
+        // order to confirm BTreeMap-driven deterministic emission.
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![
+                WindowsInterfaceRaState {
+                    interface_alias: "zeta".to_string(),
+                    interface_index: 30,
+                    router_discovery_enabled: true,
+                    ipv6_default_route_sources: vec![],
+                },
+                WindowsInterfaceRaState {
+                    interface_alias: "alpha".to_string(),
+                    interface_index: 10,
+                    router_discovery_enabled: false,
+                    ipv6_default_route_sources: vec!["ra".to_string()],
+                },
+                WindowsInterfaceRaState {
+                    interface_alias: "middle".to_string(),
+                    interface_index: 20,
+                    router_discovery_enabled: false,
+                    ipv6_default_route_sources: vec![],
+                },
+            ],
+        });
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert_eq!(reasons.len(), 2, "two drifted interfaces: {reasons:?}");
+        // alpha sorts before zeta
+        assert!(
+            reasons[0].contains("alpha"),
+            "first reason must be alphabetically-first interface alpha: {reasons:?}"
+        );
+        assert!(
+            reasons[1].contains("zeta"),
+            "second reason must be zeta: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_rejects_unsupported_observation_schema_version() {
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
+            schema_version: 2,
+            interfaces: vec![],
+        });
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert!(
+            reasons.iter().any(|r| r.contains("schema_version=2")
+                && r.contains("router_advertisement_observation")),
+            "unsupported observation schema_version must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_accepts_manual_only_default_routes() {
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![WindowsInterfaceRaState {
+                interface_alias: "Ethernet".to_string(),
+                interface_index: 12,
+                router_discovery_enabled: false,
+                ipv6_default_route_sources: vec!["manual".to_string()],
+            }],
+        });
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert!(
+            reasons.is_empty(),
+            "operator-installed manual default route must not drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_flags_mixed_ra_and_manual_default_routes() {
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![WindowsInterfaceRaState {
+                interface_alias: "Ethernet".to_string(),
+                interface_index: 12,
+                router_discovery_enabled: false,
+                ipv6_default_route_sources: vec!["manual".to_string(), "ra".to_string()],
+            }],
+        });
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert_eq!(
+            reasons.len(),
+            1,
+            "mixed sources must surface one drift for the ra entry: {reasons:?}"
+        );
+        assert!(
+            reasons[0].contains("Ethernet") && reasons[0].contains("\"ra\""),
+            "drift must name the ra-sourced default route: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_evaluator_accepts_observation_with_no_interfaces() {
+        let mut snapshot = ra_base_snapshot();
+        snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![],
+        });
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert!(
+            reasons.is_empty(),
+            "present observation with no interfaces must not drift: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ra_observation_round_trips_through_serde() {
+        let original = WindowsRouterAdvertisementObservation {
+            schema_version: 1,
+            interfaces: vec![
+                WindowsInterfaceRaState {
+                    interface_alias: "Ethernet".to_string(),
+                    interface_index: 12,
+                    router_discovery_enabled: false,
+                    ipv6_default_route_sources: vec!["manual".to_string()],
+                },
+                WindowsInterfaceRaState {
+                    interface_alias: "Wi-Fi".to_string(),
+                    interface_index: 17,
+                    router_discovery_enabled: true,
+                    ipv6_default_route_sources: vec!["ra".to_string(), "dhcp".to_string()],
+                },
+            ],
+        };
+        let json = serde_json::to_string(&original).expect("observation must serialize");
+        let round_trip: WindowsRouterAdvertisementObservation =
+            serde_json::from_str(&json).expect("observation must deserialize");
+        assert_eq!(original, round_trip, "round-trip must preserve every field");
+    }
+
+    #[test]
+    fn ra_evaluator_tolerates_legacy_snapshot_json_without_ra_field() {
+        // Forward-compat: a snapshot JSON predating the RA field must
+        // still deserialize (router_advertisement_observation = None)
+        // and the evaluator must then fail closed.
+        let legacy_json = r#"{
+            "schema_version": 1,
+            "interfaces": [],
+            "nrpt_rules": []
+        }"#;
+        let snapshot: WindowsDnsFailclosedSnapshot =
+            serde_json::from_str(legacy_json).expect("legacy snapshot must deserialize");
+        assert!(snapshot.router_advertisement_observation.is_none());
+        let reasons = evaluate_router_advertisement_suppression(&snapshot);
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("router_advertisement_observation is absent")),
+            "legacy snapshot must fail closed under RA enforcement: {reasons:?}"
         );
     }
 }
