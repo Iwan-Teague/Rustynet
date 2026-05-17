@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::process::{Command, ExitStatus};
 
@@ -42,17 +43,22 @@ fn run() -> Result<(), i32> {
 
 fn run_cargo(args: &[&str]) -> Result<(), i32> {
     let status = Command::new("cargo").args(args).status().map_err(|err| {
-        eprintln!("failed to run cargo: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to run cargo: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
 
     if status.success() {
         return Ok(());
     }
 
+    // Pass through subprocess exit code; inner rustynet-cli already
+    // classifies parity / readiness failures via the X6 taxonomy.
     Err(exit_code(status))
 }
 
 fn exit_code(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
+    status.code().unwrap_or(ExitCode::GenericFailure.as_i32())
 }

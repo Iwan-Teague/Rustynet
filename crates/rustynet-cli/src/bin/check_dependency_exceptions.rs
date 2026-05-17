@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -18,8 +19,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let exceptions_path = env::var_os("RUSTYNET_DEPENDENCY_EXCEPTIONS_PATH")
         .filter(|value| !value.is_empty())
@@ -47,13 +48,30 @@ fn run_cargo(root_dir: &Path, args: &[OsString]) -> Result<(), i32> {
         .args(args.iter().map(OsString::as_os_str))
         .status()
         .map_err(|err| {
-            eprintln!("failed to execute cargo command: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to execute cargo command: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
-        Err(status_code(status))
+        // A non-zero verdict means a dependency exception policy
+        // violation. If the inner ops command already emitted a
+        // taxonomy code (64/65/70/78), pass it through; otherwise
+        // re-classify a bare GenericFailure as PolicyReject so CI
+        // retry-on-70 loops cannot mask a real policy reject.
+        let inner = status_code(status);
+        if inner == ExitCode::GenericFailure.as_i32() {
+            eprintln!(
+                "error [{}]: dependency exception policy violation",
+                ExitCode::PolicyReject
+            );
+            Err(ExitCode::PolicyReject.as_i32())
+        } else {
+            Err(inner)
+        }
     }
 }
 
