@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -16,22 +17,30 @@ fn main() {
 
 fn run() -> Result<(), i32> {
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let rustynet_bin = env::var("RUSTYNET_BIN")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| HARDED_PATH.to_string());
     if rustynet_bin != HARDED_PATH {
+        // Unit-file integrity / privilege precondition: a non-hardened
+        // binary path is a policy reject — installing a service from
+        // an unsanctioned path would violate the one-hardened-path
+        // contract.
         eprintln!(
-            "[install-systemd] one hardened path is enforced; expected {HARDED_PATH}, got: {rustynet_bin}"
+            "error [{}]: [install-systemd] one hardened path is enforced; expected {HARDED_PATH}, got: {rustynet_bin}",
+            ExitCode::PolicyReject
         );
-        return Err(1);
+        return Err(ExitCode::PolicyReject.as_i32());
     }
 
     let status = run_rustynet_ops(&rustynet_bin, &root_dir, &["verify-runtime-binary-custody"])?;
     if !status.success() {
+        // Custody verification failure: pass through the inner X6
+        // code intact (the verifier emits PolicyReject on integrity
+        // violations).
         return Err(status_code(status));
     }
     let status = run_rustynet_ops(&rustynet_bin, &root_dir, &["install-systemd"])?;
@@ -49,8 +58,11 @@ fn run_rustynet_ops(rustynet_bin: &str, root_dir: &Path, args: &[&str]) -> Resul
         .args(args)
         .status()
         .map_err(|err| {
-            eprintln!("failed to execute {rustynet_bin} ops {args:?}: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to execute {rustynet_bin} ops {args:?}: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })
 }
 
