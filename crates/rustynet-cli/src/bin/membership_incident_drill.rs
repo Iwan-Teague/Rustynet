@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,22 +23,26 @@ fn run() -> Result<(), i32> {
     let mut args = env::args().skip(1);
     let output_dir_arg = args.next();
     if args.next().is_some() {
-        eprintln!("usage: membership_incident_drill [output-dir]");
-        return Err(2);
+        eprintln!(
+            "error [{}]: usage: membership_incident_drill [output-dir]",
+            ExitCode::BadArgs
+        );
+        return Err(ExitCode::BadArgs.as_i32());
     }
 
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let output_dir = output_dir_arg.unwrap_or_else(|| DEFAULT_OUTPUT_DIR.to_string());
     let output_dir = resolve_path(&root_dir, Path::new(&output_dir));
     fs::create_dir_all(&output_dir).map_err(|err| {
         eprintln!(
-            "failed to create membership drill output dir {}: {err}",
+            "error [{}]: failed to create membership drill output dir {}: {err}",
+            ExitCode::TransientFailure,
             output_dir.display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })?;
 
     let snapshot = env::var("RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH")
@@ -91,12 +96,18 @@ fn run_membership_generate_evidence(
         .args(["--environment", environment])
         .status()
         .map_err(|err| {
-            eprintln!("failed to run membership generate-evidence: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run membership generate-evidence: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through: the membership generate-evidence subcommand
+        // already classifies its own failures with the X6 taxonomy
+        // (signature/integrity failures bubble as PolicyReject inside).
         Err(status_code(status))
     }
 }
@@ -110,39 +121,66 @@ fn verify_artifacts(output_dir: &Path) -> Result<(), i32> {
     ];
     for artifact in &required {
         if !artifact.is_file() {
-            eprintln!("missing membership drill artifact: {}", artifact.display());
-            return Err(1);
+            // Missing required membership evidence is a fail-closed
+            // verdict: the drill cannot attest to membership integrity
+            // without all four artifacts present. Operators must NOT
+            // retry; the absence is itself the policy signal.
+            eprintln!(
+                "error [{}]: missing membership drill artifact: {}",
+                ExitCode::PolicyReject,
+                artifact.display()
+            );
+            return Err(ExitCode::PolicyReject.as_i32());
         }
     }
 
     for artifact in &required[..3] {
         let text = fs::read_to_string(artifact).map_err(|err| {
-            eprintln!("failed to read artifact {}: {err}", artifact.display());
-            1
+            eprintln!(
+                "error [{}]: failed to read artifact {}: {err}",
+                ExitCode::TransientFailure,
+                artifact.display()
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
         if !text.contains(r#""evidence_mode":"measured""#)
             && !text.contains(r#""evidence_mode": "measured""#)
         {
-            eprintln!("artifact is not measured evidence: {}", artifact.display());
-            return Err(1);
+            // Non-measured evidence means the drill ran in a stub /
+            // synthetic mode — accepting that would defeat the
+            // membership-integrity claim. Fail-closed.
+            eprintln!(
+                "error [{}]: artifact is not measured evidence: {}",
+                ExitCode::PolicyReject,
+                artifact.display()
+            );
+            return Err(ExitCode::PolicyReject.as_i32());
         }
         if !text.contains("\"captured_at_unix\"") {
             eprintln!(
-                "artifact missing captured_at_unix metadata: {}",
+                "error [{}]: artifact missing captured_at_unix metadata: {}",
+                ExitCode::PolicyReject,
                 artifact.display()
             );
-            return Err(1);
+            return Err(ExitCode::PolicyReject.as_i32());
         }
         if !text.contains("\"environment\"") {
             eprintln!(
-                "artifact missing environment metadata: {}",
+                "error [{}]: artifact missing environment metadata: {}",
+                ExitCode::PolicyReject,
                 artifact.display()
             );
-            return Err(1);
+            return Err(ExitCode::PolicyReject.as_i32());
         }
         if !text.contains(r#""status":"pass""#) && !text.contains(r#""status": "pass""#) {
-            eprintln!("membership drill failed: {}", artifact.display());
-            return Err(1);
+            // The drill explicitly recorded a non-pass status — that
+            // is a real fail-closed membership verdict, not a flake.
+            eprintln!(
+                "error [{}]: membership drill failed: {}",
+                ExitCode::PolicyReject,
+                artifact.display()
+            );
+            return Err(ExitCode::PolicyReject.as_i32());
         }
     }
 
@@ -155,8 +193,11 @@ fn write_summary_log(root_dir: &Path, output_dir: &Path) -> Result<(), i32> {
         .args(["-u", "+%Y%m%dT%H%M%SZ"])
         .output()
         .map_err(|err| {
-            eprintln!("failed to run date -u for membership drill summary: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run date -u for membership drill summary: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if !timestamp.status.success() {
         return Err(status_code(timestamp.status));
@@ -171,10 +212,11 @@ fn write_summary_log(root_dir: &Path, output_dir: &Path) -> Result<(), i32> {
     );
     fs::write(output_dir.join("drill_summary.log"), summary).map_err(|err| {
         eprintln!(
-            "failed to write membership drill summary {}: {err}",
+            "error [{}]: failed to write membership drill summary {}: {err}",
+            ExitCode::TransientFailure,
             output_dir.join("drill_summary.log").display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })
 }
 
