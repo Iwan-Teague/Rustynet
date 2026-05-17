@@ -787,11 +787,24 @@ inline. Cross-reference with:
   Removes 2 trailing `Value` walks. 6 new tests including a
   numeric-source-artifact regression that pins the typed
   `Vec<String>` boundary against future schema drift.
+* `[~]` Ninth X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit e94edcb). Migrated
+  `execute_ops_write_active_network_signed_state_tamper_report`
+  to FOUR typed views:
+  - `ActiveNetworkSignedStateTamperChecksView` (5 pass/fail slots
+    + `overall_status` helper)
+  - `ActiveNetworkSignedStateTamperHostsView` (typed exit_host +
+    client_host pair)
+  - `ActiveNetworkSignedStateTamperEvidenceView` (3 typed slots)
+  - `ActiveNetworkSignedStateTamperReportView` (9 typed top-level
+    fields)
+  Removes 2 trailing `Value` walks. 6 new tests including a
+  writer-integration test that re-parses output through the typed
+  view to pin host-pair round-trip.
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (4 production walks across 2 unrelated report-writer fns +
-  1 intentional generic JSON-pointer reader):
-  - `write_active_network_signed_state_tamper_report`,
-    `write_active_network_rogue_path_hijack_report` (e2e writers)
+  (3 production walks across 1 unrelated report-writer fn +
+  1 helper + 1 intentional generic JSON-pointer reader):
+  - `write_active_network_rogue_path_hijack_report` (e2e writer)
   - `e2e_dns_query` (helper)
   - `execute_ops_read_json_field` (intentional generic shape-agnostic
     JSON-pointer reader — must stay Value-walk)
