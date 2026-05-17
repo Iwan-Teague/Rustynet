@@ -2780,6 +2780,68 @@ pub fn execute_ops_rewrite_assignment_mesh_cidr(
     Ok(mesh_cidr)
 }
 
+/// Typed view for the per-check verdicts inside the endpoint-hijack
+/// recovery report. Each of the 7 slots is a `pass`/`fail` string
+/// computed from the orchestrator-supplied evidence inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxEndpointHijackChecksView {
+    pub baseline_runtime_secure: String,
+    pub hijack_drives_fail_closed: String,
+    pub restricted_safe_mode_engaged: String,
+    pub netcheck_reports_fail_closed: String,
+    pub rogue_endpoint_not_adopted: String,
+    pub recovery_restores_secure_runtime: String,
+    pub recovery_keeps_rogue_endpoint_rejected: String,
+}
+
+impl LiveLinuxEndpointHijackChecksView {
+    fn overall_status(&self) -> &'static str {
+        let all_pass = [
+            self.baseline_runtime_secure.as_str(),
+            self.hijack_drives_fail_closed.as_str(),
+            self.restricted_safe_mode_engaged.as_str(),
+            self.netcheck_reports_fail_closed.as_str(),
+            self.rogue_endpoint_not_adopted.as_str(),
+            self.recovery_restores_secure_runtime.as_str(),
+            self.recovery_keeps_rogue_endpoint_rejected.as_str(),
+        ]
+        .iter()
+        .all(|value| *value == CHECK_PASS);
+        if all_pass { CHECK_PASS } else { CHECK_FAIL }
+    }
+}
+
+/// Typed view for the evidence block: 8 named text slots carrying the
+/// raw status / netcheck / endpoint dumps the orchestrator collected
+/// at each phase of the hijack-recovery experiment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxEndpointHijackEvidenceView {
+    pub baseline_status: String,
+    pub baseline_netcheck: String,
+    pub baseline_endpoints: String,
+    pub status_after_hijack: String,
+    pub netcheck_after_hijack: String,
+    pub endpoints_after_hijack: String,
+    pub status_after_recovery: String,
+    pub endpoints_after_recovery: String,
+}
+
+/// Typed view for the full endpoint-hijack report. Replaces the
+/// previous `json!({...})` literal plus 2 trailing `Value` walks
+/// (overall status compute + status-return echo).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveLinuxEndpointHijackReportView {
+    pub phase: String,
+    pub mode: String,
+    pub evidence_mode: String,
+    pub captured_at: String,
+    pub captured_at_unix: u64,
+    pub status: String,
+    pub rogue_endpoint_ip: String,
+    pub checks: LiveLinuxEndpointHijackChecksView,
+    pub evidence: LiveLinuxEndpointHijackEvidenceView,
+}
+
 pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     config: WriteLiveLinuxEndpointHijackReportConfig,
 ) -> Result<String, String> {
@@ -2806,60 +2868,65 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
         config.captured_at_utc.trim().to_string()
     };
 
-    let checks = json!({
-        "baseline_runtime_secure": if !config.baseline_status.contains("state=FailClosed") { CHECK_PASS } else { CHECK_FAIL },
-        "hijack_drives_fail_closed": if config.status_after_hijack.contains("state=FailClosed") { CHECK_PASS } else { CHECK_FAIL },
-        "restricted_safe_mode_engaged": if config.status_after_hijack.contains("restricted_safe_mode=true") { CHECK_PASS } else { CHECK_FAIL },
-        "netcheck_reports_fail_closed": if config.netcheck_after_hijack.contains("path_mode=fail_closed") { CHECK_PASS } else { CHECK_FAIL },
-        "rogue_endpoint_not_adopted": if !config.endpoints_after_hijack.contains(rogue_endpoint_ip.as_str()) { CHECK_PASS } else { CHECK_FAIL },
-        "recovery_restores_secure_runtime": if !config.status_after_recovery.contains("state=FailClosed")
-            && config.status_after_recovery.contains("restricted_safe_mode=false")
-        {
-            CHECK_PASS
-        } else {
-            CHECK_FAIL
-        },
-        "recovery_keeps_rogue_endpoint_rejected": if !config.endpoints_after_recovery.contains(rogue_endpoint_ip.as_str()) { CHECK_PASS } else { CHECK_FAIL },
-    });
-    let status = if checks
-        .as_object()
-        .map(|items| {
-            items
-                .values()
-                .all(|value| value.as_str() == Some(CHECK_PASS))
-        })
-        .unwrap_or(false)
-    {
-        CHECK_PASS
-    } else {
-        CHECK_FAIL
+    let checks = LiveLinuxEndpointHijackChecksView {
+        baseline_runtime_secure: pass_or_fail(!config.baseline_status.contains("state=FailClosed")),
+        hijack_drives_fail_closed: pass_or_fail(
+            config.status_after_hijack.contains("state=FailClosed"),
+        ),
+        restricted_safe_mode_engaged: pass_or_fail(
+            config
+                .status_after_hijack
+                .contains("restricted_safe_mode=true"),
+        ),
+        netcheck_reports_fail_closed: pass_or_fail(
+            config
+                .netcheck_after_hijack
+                .contains("path_mode=fail_closed"),
+        ),
+        rogue_endpoint_not_adopted: pass_or_fail(
+            !config
+                .endpoints_after_hijack
+                .contains(rogue_endpoint_ip.as_str()),
+        ),
+        recovery_restores_secure_runtime: pass_or_fail(
+            !config.status_after_recovery.contains("state=FailClosed")
+                && config
+                    .status_after_recovery
+                    .contains("restricted_safe_mode=false"),
+        ),
+        recovery_keeps_rogue_endpoint_rejected: pass_or_fail(
+            !config
+                .endpoints_after_recovery
+                .contains(rogue_endpoint_ip.as_str()),
+        ),
     };
-    let payload = json!({
-        "phase": "phase10",
-        "mode": "live_linux_endpoint_hijack",
-        "evidence_mode": "measured",
-        "captured_at": captured_at,
-        "captured_at_unix": captured_at_unix,
-        "status": status,
-        "rogue_endpoint_ip": rogue_endpoint_ip,
-        "checks": checks,
-        "evidence": {
-            "baseline_status": config.baseline_status,
-            "baseline_netcheck": config.baseline_netcheck,
-            "baseline_endpoints": config.baseline_endpoints,
-            "status_after_hijack": config.status_after_hijack,
-            "netcheck_after_hijack": config.netcheck_after_hijack,
-            "endpoints_after_hijack": config.endpoints_after_hijack,
-            "status_after_recovery": config.status_after_recovery,
-            "endpoints_after_recovery": config.endpoints_after_recovery,
+    let status = checks.overall_status().to_string();
+
+    let report = LiveLinuxEndpointHijackReportView {
+        phase: "phase10".to_string(),
+        mode: "live_linux_endpoint_hijack".to_string(),
+        evidence_mode: "measured".to_string(),
+        captured_at,
+        captured_at_unix,
+        status,
+        rogue_endpoint_ip,
+        checks,
+        evidence: LiveLinuxEndpointHijackEvidenceView {
+            baseline_status: config.baseline_status,
+            baseline_netcheck: config.baseline_netcheck,
+            baseline_endpoints: config.baseline_endpoints,
+            status_after_hijack: config.status_after_hijack,
+            netcheck_after_hijack: config.netcheck_after_hijack,
+            endpoints_after_hijack: config.endpoints_after_hijack,
+            status_after_recovery: config.status_after_recovery,
+            endpoints_after_recovery: config.endpoints_after_recovery,
         },
-    });
+    };
+
+    let payload = serde_json::to_value(&report)
+        .map_err(|err| format!("serialize endpoint-hijack report failed: {err}"))?;
     write_json_pretty(report_path.as_path(), &payload)?;
-    Ok(payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(CHECK_FAIL)
-        .to_string())
+    Ok(report.status)
 }
 
 pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
@@ -3448,10 +3515,12 @@ mod tests {
         LiveLinuxControlSurfaceAggregateChecksView, LiveLinuxControlSurfaceEvidenceView,
         LiveLinuxControlSurfaceHostChecksView, LiveLinuxControlSurfaceHostEvidenceView,
         LiveLinuxControlSurfaceHostResultView, LiveLinuxControlSurfaceReportView,
-        LiveLinuxServerIpBypassChecksView, LiveLinuxServerIpBypassEvidenceView,
-        LiveLinuxServerIpBypassReportView, RewriteAssignmentMeshCidrConfig,
-        RewriteAssignmentPeerEndpointIpConfig, UpdateRoleSwitchHostResultConfig,
-        ValidateCrossNetworkForensicsBundleConfig, WriteActiveNetworkRoguePathHijackReportConfig,
+        LiveLinuxEndpointHijackChecksView, LiveLinuxEndpointHijackEvidenceView,
+        LiveLinuxEndpointHijackReportView, LiveLinuxServerIpBypassChecksView,
+        LiveLinuxServerIpBypassEvidenceView, LiveLinuxServerIpBypassReportView,
+        RewriteAssignmentMeshCidrConfig, RewriteAssignmentPeerEndpointIpConfig,
+        UpdateRoleSwitchHostResultConfig, ValidateCrossNetworkForensicsBundleConfig,
+        WriteActiveNetworkRoguePathHijackReportConfig,
         WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLabStageArtifactIndexConfig,
         WriteLiveLinuxControlSurfaceReportConfig, WriteLiveLinuxEndpointHijackReportConfig,
         WriteLiveLinuxLabRunSummaryConfig, WriteLiveLinuxRebootRecoveryReportConfig,
@@ -4327,6 +4396,157 @@ mod tests {
         assert_eq!(status, "fail");
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"rogue_endpoint_not_adopted\": \"fail\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn baseline_endpoint_hijack_pass_view() -> LiveLinuxEndpointHijackReportView {
+        LiveLinuxEndpointHijackReportView {
+            phase: "phase10".to_string(),
+            mode: "live_linux_endpoint_hijack".to_string(),
+            evidence_mode: "measured".to_string(),
+            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            captured_at_unix: 1_772_983_200,
+            status: "pass".to_string(),
+            rogue_endpoint_ip: "192.168.18.77".to_string(),
+            checks: LiveLinuxEndpointHijackChecksView {
+                baseline_runtime_secure: "pass".to_string(),
+                hijack_drives_fail_closed: "pass".to_string(),
+                restricted_safe_mode_engaged: "pass".to_string(),
+                netcheck_reports_fail_closed: "pass".to_string(),
+                rogue_endpoint_not_adopted: "pass".to_string(),
+                recovery_restores_secure_runtime: "pass".to_string(),
+                recovery_keeps_rogue_endpoint_rejected: "pass".to_string(),
+            },
+            evidence: LiveLinuxEndpointHijackEvidenceView {
+                baseline_status: "state=ExitActive restricted_safe_mode=false".to_string(),
+                baseline_netcheck: "path_mode=direct_active".to_string(),
+                baseline_endpoints: "peer-a=192.168.18.51:51820".to_string(),
+                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_string(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
+                endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_string(),
+                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_string(),
+                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn endpoint_hijack_view_round_trips_through_serde() {
+        let view = baseline_endpoint_hijack_pass_view();
+        let serialized = serde_json::to_string(&view).expect("serialize");
+        let parsed: LiveLinuxEndpointHijackReportView =
+            serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn endpoint_hijack_checks_view_overall_status_is_pass_when_all_pass() {
+        assert_eq!(
+            baseline_endpoint_hijack_pass_view().checks.overall_status(),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn endpoint_hijack_checks_view_overall_status_is_fail_per_slot() {
+        // pin per-slot contract: fail any single field, overall flips to fail.
+        // a future refactor that drops a slot from overall_status would trip
+        // the matching tweak.
+        let baseline = baseline_endpoint_hijack_pass_view().checks;
+        for tweak in [
+            |c: &mut LiveLinuxEndpointHijackChecksView| {
+                c.baseline_runtime_secure = "fail".to_string()
+            },
+            |c: &mut LiveLinuxEndpointHijackChecksView| {
+                c.hijack_drives_fail_closed = "fail".to_string()
+            },
+            |c: &mut LiveLinuxEndpointHijackChecksView| {
+                c.restricted_safe_mode_engaged = "fail".to_string()
+            },
+            |c: &mut LiveLinuxEndpointHijackChecksView| {
+                c.netcheck_reports_fail_closed = "fail".to_string()
+            },
+            |c: &mut LiveLinuxEndpointHijackChecksView| {
+                c.rogue_endpoint_not_adopted = "fail".to_string()
+            },
+            |c: &mut LiveLinuxEndpointHijackChecksView| {
+                c.recovery_restores_secure_runtime = "fail".to_string()
+            },
+            |c: &mut LiveLinuxEndpointHijackChecksView| {
+                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_string()
+            },
+        ] {
+            let mut checks = baseline.clone();
+            tweak(&mut checks);
+            assert_eq!(checks.overall_status(), "fail");
+        }
+    }
+
+    #[test]
+    fn endpoint_hijack_view_rejects_missing_required_field() {
+        let mut value =
+            serde_json::to_value(baseline_endpoint_hijack_pass_view()).expect("to_value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("rogue_endpoint_ip");
+        let err = serde_json::from_value::<LiveLinuxEndpointHijackReportView>(value)
+            .expect_err("missing rogue_endpoint_ip must fail closed at the typed boundary");
+        assert!(
+            err.to_string().contains("rogue_endpoint_ip"),
+            "error names missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn endpoint_hijack_view_rejects_wrong_type_for_captured_at_unix() {
+        let mut value =
+            serde_json::to_value(baseline_endpoint_hijack_pass_view()).expect("to_value");
+        value.as_object_mut().expect("object").insert(
+            "captured_at_unix".to_string(),
+            Value::String("nope".to_string()),
+        );
+        let err = serde_json::from_value::<LiveLinuxEndpointHijackReportView>(value)
+            .expect_err("string captured_at_unix must fail closed at the typed boundary");
+        let message = err.to_string();
+        assert!(
+            message.contains("u64"),
+            "error references the u64 expected type: {message}"
+        );
+    }
+
+    #[test]
+    fn endpoint_hijack_writer_emits_typed_shape_parseable_by_view() {
+        let report_path = temp_path("endpoint-hijack-shape-parse");
+        let status = execute_ops_write_live_linux_endpoint_hijack_report(
+            WriteLiveLinuxEndpointHijackReportConfig {
+                report_path: report_path.clone(),
+                rogue_endpoint_ip: "192.168.18.77".to_string(),
+                baseline_status: "state=ExitActive restricted_safe_mode=false".to_string(),
+                baseline_netcheck: "path_mode=direct_active".to_string(),
+                baseline_endpoints: "peer-a=192.168.18.51:51820".to_string(),
+                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_string(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
+                endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_string(),
+                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_string(),
+                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        assert_eq!(status, "pass");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: LiveLinuxEndpointHijackReportView =
+            serde_json::from_str(&body).expect("typed parse of writer output");
+        assert_eq!(parsed.phase, "phase10");
+        assert_eq!(parsed.mode, "live_linux_endpoint_hijack");
+        assert_eq!(parsed.rogue_endpoint_ip, "192.168.18.77");
+        assert_eq!(parsed.checks.overall_status(), parsed.status.as_str());
+        assert_eq!(
+            parsed.evidence.endpoints_after_hijack,
+            parsed.evidence.baseline_endpoints
+        );
         let _ = fs::remove_file(report_path.as_path());
     }
 
