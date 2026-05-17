@@ -1087,6 +1087,206 @@ impl LiveLabRunSummaryView {
     }
 }
 
+/// X2: Phase A typed view for the cross-network failure-forensics
+/// manifest produced by
+/// `execute_ops_write_cross_network_forensics_manifest` and consumed by
+/// `execute_ops_validate_cross_network_forensics_bundle`. Captures the
+/// four manifest fields the validator inspects:
+///   - `mode` — must be the cross-network forensics sentinel
+///   - `stage` — must equal the validator's `--stage-name`
+///   - `bundle_dir` — must equal the resolved stage directory
+///   - `nodes` — the per-node array whose `.len()` is compared against
+///     the topology row count
+///
+/// Every field carries `#[serde(default)]` so missing keys are tolerated
+/// (the validator already converts each into an explicit
+/// `unexpected …` warning rather than aborting). Unknown keys ride
+/// through `extra`; `into_value_map` re-injects every typed field so
+/// Map-walking consumers keep working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrossNetworkForensicsManifestView {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    stage: String,
+    #[serde(default)]
+    bundle_dir: String,
+    #[serde(default)]
+    nodes: Vec<Value>,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl CrossNetworkForensicsManifestView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("mode".to_string(), Value::String(self.mode));
+        m.insert("stage".to_string(), Value::String(self.stage));
+        m.insert("bundle_dir".to_string(), Value::String(self.bundle_dir));
+        m.insert("nodes".to_string(), Value::Array(self.nodes));
+        m
+    }
+}
+
+/// X2: Phase A typed view for one entry in the cross-network forensics
+/// bundle validation report's `nodes` array. Mirrors the per-node JSON
+/// emitted by `execute_ops_validate_cross_network_forensics_bundle`:
+/// the four topology row columns (`label`, `target`, `node_id`,
+/// `role`), the absolute `node_dir`, and the per-node
+/// `missing_files`/`empty_files` lists scoped to that node's stage
+/// directory. Extra keys ride through `extra`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrossNetworkForensicsNodeReportView {
+    label: String,
+    target: String,
+    node_id: String,
+    role: String,
+    node_dir: String,
+    missing_files: Vec<String>,
+    empty_files: Vec<String>,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl CrossNetworkForensicsNodeReportView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("label".to_string(), Value::String(self.label));
+        m.insert("target".to_string(), Value::String(self.target));
+        m.insert("node_id".to_string(), Value::String(self.node_id));
+        m.insert("role".to_string(), Value::String(self.role));
+        m.insert("node_dir".to_string(), Value::String(self.node_dir));
+        m.insert(
+            "missing_files".to_string(),
+            Value::Array(self.missing_files.into_iter().map(Value::String).collect()),
+        );
+        m.insert(
+            "empty_files".to_string(),
+            Value::Array(self.empty_files.into_iter().map(Value::String).collect()),
+        );
+        m
+    }
+}
+
+/// X2: Phase A typed view for the top-level JSON envelope emitted by
+/// `execute_ops_validate_cross_network_forensics_bundle`. Captures
+/// every field the writer pins:
+///   - `schema_version` (`u64`) pins the contract version
+///   - `mode`, `stage_name`, `stage_dir`, `collected_at_utc`,
+///     `bundle_status` (`String`) identify the run
+///   - `node_count` (`u64`) mirrors `nodes.len()`
+///   - `required_stage_files`, `required_node_files` (`Vec<String>`)
+///     pin the validator's mandatory-file lists
+///   - `missing_file_count`, `empty_file_count`, `invalid_file_count`
+///     (`u64`) summarise the failure surface
+///   - `missing_files`, `empty_files`, `invalid_files` (`Vec<String>`)
+///     enumerate the failing paths and reasons
+///   - `nodes` is a typed view list
+///
+/// `into_value_map` re-injects every typed field so any downstream Map
+/// walker keeps working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CrossNetworkForensicsBundleValidationView {
+    schema_version: u64,
+    mode: String,
+    stage_name: String,
+    stage_dir: String,
+    collected_at_utc: String,
+    bundle_status: String,
+    node_count: u64,
+    required_stage_files: Vec<String>,
+    required_node_files: Vec<String>,
+    missing_file_count: u64,
+    empty_file_count: u64,
+    invalid_file_count: u64,
+    missing_files: Vec<String>,
+    empty_files: Vec<String>,
+    invalid_files: Vec<String>,
+    nodes: Vec<CrossNetworkForensicsNodeReportView>,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl CrossNetworkForensicsBundleValidationView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert(
+            "schema_version".to_string(),
+            Value::Number(self.schema_version.into()),
+        );
+        m.insert("mode".to_string(), Value::String(self.mode));
+        m.insert("stage_name".to_string(), Value::String(self.stage_name));
+        m.insert("stage_dir".to_string(), Value::String(self.stage_dir));
+        m.insert(
+            "collected_at_utc".to_string(),
+            Value::String(self.collected_at_utc),
+        );
+        m.insert(
+            "bundle_status".to_string(),
+            Value::String(self.bundle_status),
+        );
+        m.insert(
+            "node_count".to_string(),
+            Value::Number(self.node_count.into()),
+        );
+        m.insert(
+            "required_stage_files".to_string(),
+            Value::Array(
+                self.required_stage_files
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        m.insert(
+            "required_node_files".to_string(),
+            Value::Array(
+                self.required_node_files
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        m.insert(
+            "missing_file_count".to_string(),
+            Value::Number(self.missing_file_count.into()),
+        );
+        m.insert(
+            "empty_file_count".to_string(),
+            Value::Number(self.empty_file_count.into()),
+        );
+        m.insert(
+            "invalid_file_count".to_string(),
+            Value::Number(self.invalid_file_count.into()),
+        );
+        m.insert(
+            "missing_files".to_string(),
+            Value::Array(self.missing_files.into_iter().map(Value::String).collect()),
+        );
+        m.insert(
+            "empty_files".to_string(),
+            Value::Array(self.empty_files.into_iter().map(Value::String).collect()),
+        );
+        m.insert(
+            "invalid_files".to_string(),
+            Value::Array(self.invalid_files.into_iter().map(Value::String).collect()),
+        );
+        m.insert(
+            "nodes".to_string(),
+            Value::Array(
+                self.nodes
+                    .into_iter()
+                    .map(|n| Value::Object(n.into_value_map()))
+                    .collect(),
+            ),
+        );
+        m
+    }
+}
+
 fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, String> {
     if !path.exists() {
         return Ok(Map::new());
@@ -1417,41 +1617,28 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
         if body.trim().is_empty() {
             empty_files.push(manifest_path.display().to_string());
         } else {
-            match serde_json::from_str::<Value>(body.as_str()) {
+            match serde_json::from_str::<CrossNetworkForensicsManifestView>(body.as_str()) {
                 Ok(manifest) => {
-                    let manifest_mode = manifest
-                        .get("mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let manifest_stage = manifest
-                        .get("stage")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let manifest_bundle_dir = manifest
-                        .get("bundle_dir")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let manifest_nodes = manifest
-                        .get("nodes")
-                        .and_then(Value::as_array)
-                        .map(|nodes| nodes.len())
-                        .unwrap_or_default();
-                    if manifest_mode != "cross_network_failure_forensics" {
+                    let manifest_nodes = manifest.nodes.len();
+                    if manifest.mode != "cross_network_failure_forensics" {
                         invalid_files.push(format!(
-                            "{}: unexpected mode {manifest_mode:?}",
-                            manifest_path.display()
+                            "{}: unexpected mode {:?}",
+                            manifest_path.display(),
+                            manifest.mode
                         ));
                     }
-                    if manifest_stage != stage_name {
+                    if manifest.stage != stage_name {
                         invalid_files.push(format!(
-                            "{}: unexpected stage {manifest_stage:?}",
-                            manifest_path.display()
+                            "{}: unexpected stage {:?}",
+                            manifest_path.display(),
+                            manifest.stage
                         ));
                     }
-                    if manifest_bundle_dir != stage_dir.display().to_string() {
+                    if manifest.bundle_dir != stage_dir.display().to_string() {
                         invalid_files.push(format!(
-                            "{}: unexpected bundle_dir {manifest_bundle_dir:?}",
-                            manifest_path.display()
+                            "{}: unexpected bundle_dir {:?}",
+                            manifest_path.display(),
+                            manifest.bundle_dir
                         ));
                     }
                     if manifest_nodes != rows.len() {
@@ -1508,15 +1695,16 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
             }
         }
 
-        nodes.push(json!({
-            "label": label,
-            "target": target,
-            "node_id": node_id,
-            "role": role,
-            "node_dir": node_dir.display().to_string(),
-            "missing_files": node_missing_files,
-            "empty_files": node_empty_files,
-        }));
+        nodes.push(CrossNetworkForensicsNodeReportView {
+            label,
+            target,
+            node_id,
+            role,
+            node_dir: node_dir.display().to_string(),
+            missing_files: node_missing_files,
+            empty_files: node_empty_files,
+            extra: Map::new(),
+        });
     }
 
     let bundle_status =
@@ -1525,24 +1713,33 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
         } else {
             CHECK_FAIL
         };
-    let payload = json!({
-        "schema_version": 1,
-        "mode": "cross_network_forensics_bundle_validation",
-        "stage_name": stage_name,
-        "stage_dir": stage_dir.display().to_string(),
-        "collected_at_utc": collected_at_utc_now(),
-        "bundle_status": bundle_status,
-        "node_count": nodes.len(),
-        "required_stage_files": required_stage_files,
-        "required_node_files": expected_forensics_node_files(),
-        "missing_file_count": missing_files.len(),
-        "empty_file_count": empty_files.len(),
-        "invalid_file_count": invalid_files.len(),
-        "missing_files": missing_files,
-        "empty_files": empty_files,
-        "invalid_files": invalid_files,
-        "nodes": nodes,
-    });
+    let node_count = nodes.len() as u64;
+    let missing_file_count = missing_files.len() as u64;
+    let empty_file_count = empty_files.len() as u64;
+    let invalid_file_count = invalid_files.len() as u64;
+    let payload_view = CrossNetworkForensicsBundleValidationView {
+        schema_version: 1,
+        mode: "cross_network_forensics_bundle_validation".to_string(),
+        stage_name: stage_name.to_string(),
+        stage_dir: stage_dir.display().to_string(),
+        collected_at_utc: collected_at_utc_now(),
+        bundle_status: bundle_status.to_string(),
+        node_count,
+        required_stage_files: required_stage_files.iter().map(|s| s.to_string()).collect(),
+        required_node_files: expected_forensics_node_files()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        missing_file_count,
+        empty_file_count,
+        invalid_file_count,
+        missing_files,
+        empty_files,
+        invalid_files,
+        nodes,
+        extra: Map::new(),
+    };
+    let payload = Value::Object(payload_view.into_value_map());
     write_json_pretty(output.as_path(), &payload)?;
     if bundle_status != CHECK_PASS {
         return Err("cross-network forensics bundle validation failed".to_string());
@@ -3884,8 +4081,10 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
 #[cfg(test)]
 mod typed_parser_tests {
     use super::{
-        LiveLabOrchestratorNoLeakReportView, LiveLabRunSummaryView, RunSummaryNodeView,
-        RunSummaryStageView, RunSummaryWorkerView, is_plaintext_no_leak_report,
+        CrossNetworkForensicsBundleValidationView, CrossNetworkForensicsManifestView,
+        CrossNetworkForensicsNodeReportView, LiveLabOrchestratorNoLeakReportView,
+        LiveLabRunSummaryView, RunSummaryNodeView, RunSummaryStageView, RunSummaryWorkerView,
+        is_plaintext_no_leak_report,
     };
     use serde_json::{Value, json};
 
@@ -4431,6 +4630,353 @@ mod typed_parser_tests {
             workers[0].get("snapshot_path").and_then(Value::as_str),
             Some("/tmp/snapshot.txt")
         );
+        assert_eq!(
+            map.get("tooling_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+    }
+
+    // -------------------------------------------------------------
+    // X2 slice 3: cross-network forensics bundle validation views
+    // -------------------------------------------------------------
+
+    fn clean_manifest_payload() -> Value {
+        json!({
+            "schema_version": 1_u64,
+            "mode": "cross_network_failure_forensics",
+            "stage": "stage7_validate_failure_forensics",
+            "collected_at_utc": "2026-05-16T12:00:00Z",
+            "bundle_dir": "/tmp/bundle",
+            "nodes": [
+                {"label": "client", "files": ["/tmp/bundle/client/foo.txt"]},
+                {"label": "exit", "files": ["/tmp/bundle/exit/bar.txt"]},
+            ],
+            // Unknown top-level fields must ride through `extra`.
+            "tooling_hint": "future-field",
+        })
+    }
+
+    fn clean_node_report_payload() -> Value {
+        json!({
+            "label": "client",
+            "target": "debian@client",
+            "node_id": "client-1",
+            "role": "client",
+            "node_dir": "/tmp/bundle/client",
+            "missing_files": ["client/firewall.txt"],
+            "empty_files": ["client/dns_state.txt"],
+            // Unknown keys must ride through `extra`.
+            "extra_hint": "future-field",
+        })
+    }
+
+    fn clean_bundle_validation_payload() -> Value {
+        json!({
+            "schema_version": 1_u64,
+            "mode": "cross_network_forensics_bundle_validation",
+            "stage_name": "stage7_validate_failure_forensics",
+            "stage_dir": "/tmp/bundle",
+            "collected_at_utc": "2026-05-16T12:00:00Z",
+            "bundle_status": "fail",
+            "node_count": 1_u64,
+            "required_stage_files": ["manifest.json", "route_matrix.txt", "cluster_snapshot.txt"],
+            "required_node_files": ["service_snapshot.txt", "firewall.txt"],
+            "missing_file_count": 1_u64,
+            "empty_file_count": 1_u64,
+            "invalid_file_count": 0_u64,
+            "missing_files": ["client/firewall.txt"],
+            "empty_files": ["client/dns_state.txt"],
+            "invalid_files": [],
+            "nodes": [clean_node_report_payload()],
+            // Unknown top-level keys must ride through `extra`.
+            "tooling_hint": "future-field",
+        })
+    }
+
+    // ---- CrossNetworkForensicsManifestView ----
+
+    #[test]
+    fn cross_network_forensics_manifest_view_parses_clean_fixture() {
+        let view: CrossNetworkForensicsManifestView =
+            serde_json::from_value(clean_manifest_payload()).expect("clean parse");
+        assert_eq!(view.mode, "cross_network_failure_forensics");
+        assert_eq!(view.stage, "stage7_validate_failure_forensics");
+        assert_eq!(view.bundle_dir, "/tmp/bundle");
+        assert_eq!(view.nodes.len(), 2);
+        // Unknown top-level fields ride through `extra`.
+        assert_eq!(
+            view.extra.get("tooling_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+        // Typed fields must NOT also appear under `extra`.
+        assert!(!view.extra.contains_key("mode"));
+        assert!(!view.extra.contains_key("nodes"));
+    }
+
+    #[test]
+    fn cross_network_forensics_manifest_view_tolerates_missing_optional_fields() {
+        // Legacy behaviour: every manifest field is optional at parse
+        // time. The validator translates a missing or unexpected value
+        // into an explicit `unexpected …` warning rather than aborting.
+        // Pin that here so a future refactor cannot make the parse
+        // strict and silently change the validator's error surface.
+        let payload = json!({});
+        let view: CrossNetworkForensicsManifestView =
+            serde_json::from_value(payload).expect("missing-field tolerant parse");
+        assert_eq!(view.mode, "");
+        assert_eq!(view.stage, "");
+        assert_eq!(view.bundle_dir, "");
+        assert!(view.nodes.is_empty());
+    }
+
+    #[test]
+    fn cross_network_forensics_manifest_view_rejects_wrong_type_mode() {
+        let mut payload = clean_manifest_payload();
+        payload.as_object_mut().unwrap()["mode"] = json!(0_i64);
+        let err = serde_json::from_value::<CrossNetworkForensicsManifestView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("string"),
+            "wrong-type message must mention `string`: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_manifest_view_rejects_wrong_type_nodes() {
+        let mut payload = clean_manifest_payload();
+        payload.as_object_mut().unwrap()["nodes"] = json!("not-an-array");
+        let err = serde_json::from_value::<CrossNetworkForensicsManifestView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("sequence")
+                || err.to_string().to_ascii_lowercase().contains("array"),
+            "wrong-type message must mention sequence/array: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_manifest_view_into_value_map_round_trips() {
+        let view: CrossNetworkForensicsManifestView =
+            serde_json::from_value(clean_manifest_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("mode").and_then(Value::as_str),
+            Some("cross_network_failure_forensics")
+        );
+        assert_eq!(
+            map.get("stage").and_then(Value::as_str),
+            Some("stage7_validate_failure_forensics")
+        );
+        assert_eq!(
+            map.get("bundle_dir").and_then(Value::as_str),
+            Some("/tmp/bundle")
+        );
+        let nodes = map
+            .get("nodes")
+            .and_then(Value::as_array)
+            .expect("nodes re-injected");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(
+            map.get("tooling_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+    }
+
+    // ---- CrossNetworkForensicsNodeReportView ----
+
+    #[test]
+    fn cross_network_forensics_node_report_view_parses_clean_fixture() {
+        let view: CrossNetworkForensicsNodeReportView =
+            serde_json::from_value(clean_node_report_payload()).expect("clean parse");
+        assert_eq!(view.label, "client");
+        assert_eq!(view.target, "debian@client");
+        assert_eq!(view.node_id, "client-1");
+        assert_eq!(view.role, "client");
+        assert_eq!(view.node_dir, "/tmp/bundle/client");
+        assert_eq!(view.missing_files, vec!["client/firewall.txt".to_string()]);
+        assert_eq!(view.empty_files, vec!["client/dns_state.txt".to_string()]);
+        assert_eq!(
+            view.extra.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+        assert!(!view.extra.contains_key("missing_files"));
+    }
+
+    #[test]
+    fn cross_network_forensics_node_report_view_rejects_missing_node_dir() {
+        let mut payload = clean_node_report_payload();
+        payload.as_object_mut().unwrap().remove("node_dir");
+        let err =
+            serde_json::from_value::<CrossNetworkForensicsNodeReportView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("node_dir"),
+            "missing-required-field message must name `node_dir`: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_node_report_view_rejects_wrong_type_missing_files() {
+        let mut payload = clean_node_report_payload();
+        payload.as_object_mut().unwrap()["missing_files"] = json!("not-an-array");
+        let err =
+            serde_json::from_value::<CrossNetworkForensicsNodeReportView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("sequence")
+                || err.to_string().to_ascii_lowercase().contains("array"),
+            "wrong-type message must mention sequence/array: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_node_report_view_into_value_map_round_trips() {
+        let view: CrossNetworkForensicsNodeReportView =
+            serde_json::from_value(clean_node_report_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(map.get("label").and_then(Value::as_str), Some("client"));
+        assert_eq!(
+            map.get("node_dir").and_then(Value::as_str),
+            Some("/tmp/bundle/client")
+        );
+        let missing = map
+            .get("missing_files")
+            .and_then(Value::as_array)
+            .expect("missing_files re-injected as array");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].as_str(), Some("client/firewall.txt"));
+        let empty = map
+            .get("empty_files")
+            .and_then(Value::as_array)
+            .expect("empty_files re-injected as array");
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].as_str(), Some("client/dns_state.txt"));
+        assert_eq!(
+            map.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+    }
+
+    // ---- CrossNetworkForensicsBundleValidationView ----
+
+    #[test]
+    fn cross_network_forensics_bundle_validation_view_parses_clean_fixture() {
+        let view: CrossNetworkForensicsBundleValidationView =
+            serde_json::from_value(clean_bundle_validation_payload()).expect("clean parse");
+        assert_eq!(view.schema_version, 1);
+        assert_eq!(view.mode, "cross_network_forensics_bundle_validation");
+        assert_eq!(view.stage_name, "stage7_validate_failure_forensics");
+        assert_eq!(view.bundle_status, "fail");
+        assert_eq!(view.node_count, 1);
+        assert_eq!(view.required_stage_files.len(), 3);
+        assert_eq!(view.required_node_files.len(), 2);
+        assert_eq!(view.missing_file_count, 1);
+        assert_eq!(view.empty_file_count, 1);
+        assert_eq!(view.invalid_file_count, 0);
+        assert_eq!(view.missing_files, vec!["client/firewall.txt".to_string()]);
+        assert_eq!(view.empty_files, vec!["client/dns_state.txt".to_string()]);
+        assert!(view.invalid_files.is_empty());
+        assert_eq!(view.nodes.len(), 1);
+        assert_eq!(view.nodes[0].label, "client");
+        assert_eq!(
+            view.extra.get("tooling_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+        assert!(!view.extra.contains_key("nodes"));
+    }
+
+    #[test]
+    fn cross_network_forensics_bundle_validation_view_rejects_missing_schema_version() {
+        let mut payload = clean_bundle_validation_payload();
+        payload.as_object_mut().unwrap().remove("schema_version");
+        let err = serde_json::from_value::<CrossNetworkForensicsBundleValidationView>(payload)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version"),
+            "missing-required-field message must name `schema_version`: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_bundle_validation_view_rejects_missing_bundle_status() {
+        let mut payload = clean_bundle_validation_payload();
+        payload.as_object_mut().unwrap().remove("bundle_status");
+        let err = serde_json::from_value::<CrossNetworkForensicsBundleValidationView>(payload)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("bundle_status"),
+            "missing-required-field message must name `bundle_status`: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_bundle_validation_view_rejects_wrong_type_node_count() {
+        let mut payload = clean_bundle_validation_payload();
+        payload.as_object_mut().unwrap()["node_count"] = json!("not-a-number");
+        let err = serde_json::from_value::<CrossNetworkForensicsBundleValidationView>(payload)
+            .unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("integer")
+                || err.to_string().to_ascii_lowercase().contains("number"),
+            "wrong-type message must mention integer/number: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_bundle_validation_view_rejects_wrong_type_nodes() {
+        let mut payload = clean_bundle_validation_payload();
+        payload.as_object_mut().unwrap()["nodes"] = json!("not-an-array");
+        let err = serde_json::from_value::<CrossNetworkForensicsBundleValidationView>(payload)
+            .unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("sequence")
+                || err.to_string().to_ascii_lowercase().contains("array"),
+            "wrong-type message must mention sequence/array: {err}"
+        );
+    }
+
+    #[test]
+    fn cross_network_forensics_bundle_validation_view_into_value_map_round_trips() {
+        let view: CrossNetworkForensicsBundleValidationView =
+            serde_json::from_value(clean_bundle_validation_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(map.get("schema_version").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            map.get("mode").and_then(Value::as_str),
+            Some("cross_network_forensics_bundle_validation")
+        );
+        assert_eq!(
+            map.get("bundle_status").and_then(Value::as_str),
+            Some("fail")
+        );
+        assert_eq!(map.get("node_count").and_then(Value::as_u64), Some(1));
+        let required_stage = map
+            .get("required_stage_files")
+            .and_then(Value::as_array)
+            .expect("required_stage_files re-injected");
+        assert_eq!(required_stage.len(), 3);
+        let required_node = map
+            .get("required_node_files")
+            .and_then(Value::as_array)
+            .expect("required_node_files re-injected");
+        assert_eq!(required_node.len(), 2);
+        assert_eq!(
+            map.get("missing_file_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        let nodes = map
+            .get("nodes")
+            .and_then(Value::as_array)
+            .expect("nodes re-injected");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].get("label").and_then(Value::as_str),
+            Some("client")
+        );
+        // missing_files round-trips as a string array on the nested
+        // node view.
+        let nested_missing = nodes[0]
+            .get("missing_files")
+            .and_then(Value::as_array)
+            .expect("nested missing_files re-injected");
+        assert_eq!(nested_missing.len(), 1);
+        assert_eq!(nested_missing[0].as_str(), Some("client/firewall.txt"));
         assert_eq!(
             map.get("tooling_hint").and_then(Value::as_str),
             Some("future-field")
