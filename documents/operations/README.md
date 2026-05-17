@@ -16,6 +16,8 @@ Start with these, depending on what you are doing:
 - final release sign-off gate: [ReleaseReadinessGuardrails.md](./ReleaseReadinessGuardrails.md)
 - phase10 exit-node and dataplane behavior: [Phase10ExitNodeDataplaneRunbook.md](./Phase10ExitNodeDataplaneRunbook.md)
 - security and compliance mapping: [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md), [ComplianceControlMap.md](./ComplianceControlMap.md), and [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
+- reviewer-facing security-posture snapshot (verifier modules, floors, audit gates, taxonomies): [SecurityPostureSummary.md](./SecurityPostureSummary.md)
+- shared CLI exit-code taxonomy + operator decision rules: [CliExitCodeTaxonomy.md](./CliExitCodeTaxonomy.md)
 
 ## Classification Rules
 
