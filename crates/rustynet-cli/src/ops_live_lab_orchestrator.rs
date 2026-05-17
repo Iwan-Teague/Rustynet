@@ -3418,6 +3418,67 @@ pub fn execute_ops_extract_managed_dns_expected_ip(
     Ok(String::new())
 }
 
+/// Typed view for the per-check verdicts inside the active-network
+/// signed-state tamper report. Five pass/fail slots, one per
+/// adversarial step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkSignedStateTamperChecksView {
+    pub baseline_two_node_e2e: String,
+    pub tampered_signed_assignment_rejected: String,
+    pub fail_closed_engaged: String,
+    pub netcheck_reports_fail_closed: String,
+    pub recovery_restored_secure_runtime: String,
+}
+
+impl ActiveNetworkSignedStateTamperChecksView {
+    fn overall_status(&self) -> &'static str {
+        let all_pass = [
+            self.baseline_two_node_e2e.as_str(),
+            self.tampered_signed_assignment_rejected.as_str(),
+            self.fail_closed_engaged.as_str(),
+            self.netcheck_reports_fail_closed.as_str(),
+            self.recovery_restored_secure_runtime.as_str(),
+        ]
+        .iter()
+        .all(|value| *value == CHECK_PASS);
+        if all_pass { CHECK_PASS } else { CHECK_FAIL }
+    }
+}
+
+/// Typed view for the two-host pair the active-network experiments
+/// run against. Pinning both labels at the type level catches a
+/// future drop or reorder that would silently lose orchestrator
+/// context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkSignedStateTamperHostsView {
+    pub exit_host: String,
+    pub client_host: String,
+}
+
+/// Typed view for the post-tamper / post-recovery evidence block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkSignedStateTamperEvidenceView {
+    pub status_after_tamper: String,
+    pub netcheck_after_tamper: String,
+    pub status_after_recovery: String,
+}
+
+/// Typed view for the full active-network signed-state tamper
+/// report. Replaces the previous `json!({...})` literal and removes
+/// 2 trailing `Value` walks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkSignedStateTamperReportView {
+    pub phase: String,
+    pub mode: String,
+    pub evidence_mode: String,
+    pub captured_at: String,
+    pub captured_at_unix: u64,
+    pub status: String,
+    pub hosts: ActiveNetworkSignedStateTamperHostsView,
+    pub checks: ActiveNetworkSignedStateTamperChecksView,
+    pub evidence: ActiveNetworkSignedStateTamperEvidenceView,
+}
+
 pub fn execute_ops_write_active_network_signed_state_tamper_report(
     config: WriteActiveNetworkSignedStateTamperReportConfig,
 ) -> Result<String, String> {
@@ -3445,50 +3506,39 @@ pub fn execute_ops_write_active_network_signed_state_tamper_report(
         config.captured_at_utc.trim().to_string()
     };
 
-    let checks = json!({
-        "baseline_two_node_e2e": baseline_status,
-        "tampered_signed_assignment_rejected": tamper_reject_status,
-        "fail_closed_engaged": fail_closed_status,
-        "netcheck_reports_fail_closed": netcheck_fail_closed_status,
-        "recovery_restored_secure_runtime": recovery_status,
-    });
-    let status = if checks
-        .as_object()
-        .map(|items| {
-            items
-                .values()
-                .all(|value| value.as_str() == Some(CHECK_PASS))
-        })
-        .unwrap_or(false)
-    {
-        CHECK_PASS
-    } else {
-        CHECK_FAIL
+    let checks = ActiveNetworkSignedStateTamperChecksView {
+        baseline_two_node_e2e: baseline_status,
+        tampered_signed_assignment_rejected: tamper_reject_status,
+        fail_closed_engaged: fail_closed_status,
+        netcheck_reports_fail_closed: netcheck_fail_closed_status,
+        recovery_restored_secure_runtime: recovery_status,
     };
-    let payload = json!({
-        "phase": "phase10",
-        "mode": "active_network_signed_state_tamper",
-        "evidence_mode": "measured",
-        "captured_at": captured_at,
-        "captured_at_unix": captured_at_unix,
-        "status": status,
-        "hosts": {
-            "exit_host": config.exit_host,
-            "client_host": config.client_host,
+    let status = checks.overall_status().to_string();
+
+    let report = ActiveNetworkSignedStateTamperReportView {
+        phase: "phase10".to_string(),
+        mode: "active_network_signed_state_tamper".to_string(),
+        evidence_mode: "measured".to_string(),
+        captured_at,
+        captured_at_unix,
+        status,
+        hosts: ActiveNetworkSignedStateTamperHostsView {
+            exit_host: config.exit_host,
+            client_host: config.client_host,
         },
-        "checks": checks,
-        "evidence": {
-            "status_after_tamper": config.status_after_tamper,
-            "netcheck_after_tamper": config.netcheck_after_tamper,
-            "status_after_recovery": config.status_after_recovery,
+        checks,
+        evidence: ActiveNetworkSignedStateTamperEvidenceView {
+            status_after_tamper: config.status_after_tamper,
+            netcheck_after_tamper: config.netcheck_after_tamper,
+            status_after_recovery: config.status_after_recovery,
         },
-    });
+    };
+
+    let payload = serde_json::to_value(&report).map_err(|err| {
+        format!("serialize active-network-signed-state-tamper report failed: {err}")
+    })?;
     write_json_pretty(report_path.as_path(), &payload)?;
-    Ok(payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(CHECK_FAIL)
-        .to_string())
+    Ok(report.status)
 }
 
 pub fn execute_ops_write_active_network_rogue_path_hijack_report(
@@ -3592,6 +3642,8 @@ pub fn execute_ops_write_active_network_rogue_path_hijack_report(
 #[cfg(test)]
 mod tests {
     use super::{
+        ActiveNetworkSignedStateTamperChecksView, ActiveNetworkSignedStateTamperEvidenceView,
+        ActiveNetworkSignedStateTamperHostsView, ActiveNetworkSignedStateTamperReportView,
         CheckLocalFileModeConfig, ExtractManagedDnsExpectedIpConfig,
         LiveLinuxControlSurfaceAggregateChecksView, LiveLinuxControlSurfaceEvidenceView,
         LiveLinuxControlSurfaceHostChecksView, LiveLinuxControlSurfaceHostEvidenceView,
@@ -4964,6 +5016,143 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"mode\": \"active_network_signed_state_tamper\""));
         assert!(body.contains("\"status\": \"pass\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn baseline_active_network_signed_state_tamper_pass_view()
+    -> ActiveNetworkSignedStateTamperReportView {
+        ActiveNetworkSignedStateTamperReportView {
+            phase: "phase10".to_string(),
+            mode: "active_network_signed_state_tamper".to_string(),
+            evidence_mode: "measured".to_string(),
+            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            captured_at_unix: 1_772_983_200,
+            status: "pass".to_string(),
+            hosts: ActiveNetworkSignedStateTamperHostsView {
+                exit_host: "192.168.18.49".to_string(),
+                client_host: "192.168.18.50".to_string(),
+            },
+            checks: ActiveNetworkSignedStateTamperChecksView {
+                baseline_two_node_e2e: "pass".to_string(),
+                tampered_signed_assignment_rejected: "pass".to_string(),
+                fail_closed_engaged: "pass".to_string(),
+                netcheck_reports_fail_closed: "pass".to_string(),
+                recovery_restored_secure_runtime: "pass".to_string(),
+            },
+            evidence: ActiveNetworkSignedStateTamperEvidenceView {
+                status_after_tamper: "state=FailClosed".to_string(),
+                netcheck_after_tamper: "path_mode=fail_closed".to_string(),
+                status_after_recovery: "state=ExitActive".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn active_network_signed_state_tamper_view_round_trips_through_serde() {
+        let view = baseline_active_network_signed_state_tamper_pass_view();
+        let serialized = serde_json::to_string(&view).expect("serialize");
+        let parsed: ActiveNetworkSignedStateTamperReportView =
+            serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn active_network_signed_state_tamper_checks_view_overall_status_is_pass_when_all_pass() {
+        assert_eq!(
+            baseline_active_network_signed_state_tamper_pass_view()
+                .checks
+                .overall_status(),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn active_network_signed_state_tamper_checks_view_overall_status_is_fail_per_slot() {
+        let baseline = baseline_active_network_signed_state_tamper_pass_view().checks;
+        for tweak in [
+            |c: &mut ActiveNetworkSignedStateTamperChecksView| {
+                c.baseline_two_node_e2e = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkSignedStateTamperChecksView| {
+                c.tampered_signed_assignment_rejected = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkSignedStateTamperChecksView| {
+                c.fail_closed_engaged = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkSignedStateTamperChecksView| {
+                c.netcheck_reports_fail_closed = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkSignedStateTamperChecksView| {
+                c.recovery_restored_secure_runtime = "fail".to_string()
+            },
+        ] {
+            let mut checks = baseline.clone();
+            tweak(&mut checks);
+            assert_eq!(checks.overall_status(), "fail");
+        }
+    }
+
+    #[test]
+    fn active_network_signed_state_tamper_view_rejects_missing_hosts_block() {
+        let mut value =
+            serde_json::to_value(baseline_active_network_signed_state_tamper_pass_view())
+                .expect("to_value");
+        value.as_object_mut().expect("object").remove("hosts");
+        let err = serde_json::from_value::<ActiveNetworkSignedStateTamperReportView>(value)
+            .expect_err("missing hosts must fail closed at the typed boundary");
+        assert!(
+            err.to_string().contains("hosts"),
+            "error names missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn active_network_signed_state_tamper_view_rejects_wrong_type_for_client_host() {
+        let mut value =
+            serde_json::to_value(baseline_active_network_signed_state_tamper_pass_view())
+                .expect("to_value");
+        let hosts = value
+            .get_mut("hosts")
+            .and_then(Value::as_object_mut)
+            .expect("hosts object");
+        hosts.insert("client_host".to_string(), Value::Bool(true));
+        let err = serde_json::from_value::<ActiveNetworkSignedStateTamperReportView>(value)
+            .expect_err("bool client_host must fail closed at the typed boundary");
+        let message = err.to_string();
+        assert!(
+            message.contains("string"),
+            "error references the string expected type: {message}"
+        );
+    }
+
+    #[test]
+    fn active_network_signed_state_tamper_writer_emits_typed_shape_parseable_by_view() {
+        let report_path = temp_path("signed-state-tamper-shape-parse");
+        let _ = execute_ops_write_active_network_signed_state_tamper_report(
+            WriteActiveNetworkSignedStateTamperReportConfig {
+                report_path: report_path.clone(),
+                baseline_status: "pass".to_string(),
+                tamper_reject_status: "pass".to_string(),
+                fail_closed_status: "pass".to_string(),
+                netcheck_fail_closed_status: "pass".to_string(),
+                recovery_status: "pass".to_string(),
+                exit_host: "10.0.0.49".to_string(),
+                client_host: "10.0.0.50".to_string(),
+                status_after_tamper: "state=FailClosed".to_string(),
+                netcheck_after_tamper: "path_mode=fail_closed".to_string(),
+                status_after_recovery: "state=ExitActive".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: ActiveNetworkSignedStateTamperReportView =
+            serde_json::from_str(&body).expect("typed parse");
+        assert_eq!(parsed.hosts.exit_host, "10.0.0.49");
+        assert_eq!(parsed.hosts.client_host, "10.0.0.50");
+        assert_eq!(parsed.status, "pass");
+        assert_eq!(parsed.checks.overall_status(), "pass");
         let _ = fs::remove_file(report_path.as_path());
     }
 
