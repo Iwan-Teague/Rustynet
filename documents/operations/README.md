@@ -78,6 +78,8 @@ Current phase-local hardening checklist:
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
 - [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](./CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
 - [CrossNetworkRemoteExitIncidentPlaybook.md](./CrossNetworkRemoteExitIncidentPlaybook.md)
+- [CryptoDeprecationSchedule.md](./CryptoDeprecationSchedule.md) — algorithm deprecation/removal calendar and reviewed exception rules
+- [DependencyExceptionPolicy.md](./DependencyExceptionPolicy.md) — controlled-exception workflow for the dependency policy gate
 - [DisasterRecoveryValidation.md](./DisasterRecoveryValidation.md)
 - [FinalLaunchChecklist.md](./FinalLaunchChecklist.md)
 - [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md)
@@ -91,14 +93,18 @@ Current phase-local hardening checklist:
 - [Phase10ExitNodeDataplaneRunbook.md](./Phase10ExitNodeDataplaneRunbook.md)
 - [PlatformSupportMatrix.md](./PlatformSupportMatrix.md)
 - [PolicyRolloutRunbook.md](./PolicyRolloutRunbook.md)
+- [PostQuantumTransitionPlan.md](./PostQuantumTransitionPlan.md) — controlled PQ/hybrid evaluation plan; no custom-crypto in production paths
+- [PrivacyRetentionPolicy.md](./PrivacyRetentionPolicy.md) — telemetry data classes, retention windows, and minimization rules
 - [ProductionRunbook.md](./ProductionRunbook.md)
 - [ProductionSLOAndIncidentReadiness.md](./ProductionSLOAndIncidentReadiness.md)
 - [ReleaseReadinessGuardrails.md](./ReleaseReadinessGuardrails.md)
+- [ReleaseSigningRunbook.md](./ReleaseSigningRunbook.md) — Windows Authenticode signing flow for rustynetd.exe (W2.1b trust anchor)
 - [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
 - [SecretRedactionCoverage.md](./SecretRedactionCoverage.md)
 - [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md)
 - [SecurityRegressionLessons_2026-03-07.md](./SecurityRegressionLessons_2026-03-07.md)
 - [VulnerabilityResponse.md](./VulnerabilityResponse.md)
+- [WindowsWorkingNodeBringUpRunbook.md](./WindowsWorkingNodeBringUpRunbook.md) — operator walk-through from fresh Windows 11 host to mesh-joined node on `windows-wireguard-nt`
 
 ## Archived Reviews
 
