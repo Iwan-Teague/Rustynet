@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -26,8 +27,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     for test_filter in REQUIRED_TESTS {
@@ -55,13 +56,17 @@ fn run_required_test(root_dir: &Path, package: &str, test_filter: &str) -> Resul
         .status()
         .map_err(|err| {
             eprintln!(
-                "failed to execute required test helper for package={package} filter={test_filter}: {err}"
+                "error [{}]: failed to execute required test helper for package={package} filter={test_filter}: {err}",
+                ExitCode::TransientFailure
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through: a failing required role/auth test is a real
+        // fail-closed verdict, and run_required_test already classifies
+        // its exits with the X6 taxonomy. Wrapping would erase that.
         Err(status_code(status))
     }
 }
