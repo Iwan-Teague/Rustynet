@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -126,8 +127,8 @@ fn run() -> Result<(), i32> {
     }
 
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let audit_db_path = env::var_os("RUSTYNET_AUDIT_DB_PATH")
         .filter(|value| !value.is_empty())
@@ -135,10 +136,11 @@ fn run() -> Result<(), i32> {
         .unwrap_or_else(|| root_dir.join(".cargo-audit-db"));
     let audit_db = audit_db_path.to_str().ok_or_else(|| {
         eprintln!(
-            "advisory db path is not valid UTF-8: {}",
+            "error [{}]: advisory db path is not valid UTF-8: {}",
+            ExitCode::ConfigError,
             audit_db_path.display()
         );
-        1
+        ExitCode::ConfigError.as_i32()
     })?;
 
     run_command(
@@ -170,12 +172,15 @@ fn bootstrap_system_packages_enabled() -> bool {
 
 fn install_system_packages() -> Result<(), i32> {
     let use_sudo = current_uid().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::TransientFailure);
+        ExitCode::TransientFailure.as_i32()
     })? != 0;
     if use_sudo && !command_exists("sudo", None) {
-        eprintln!("missing required command: sudo");
-        return Err(1);
+        eprintln!(
+            "error [{}]: missing required command: sudo",
+            ExitCode::ConfigError
+        );
+        return Err(ExitCode::ConfigError.as_i32());
     }
 
     run_apt_get(use_sudo, &["update"])?;
@@ -211,8 +216,11 @@ fn run_apt_get(use_sudo: bool, args: &[&str]) -> Result<(), i32> {
         .stdin(Stdio::null())
         .env("DEBIAN_FRONTEND", "noninteractive");
     let status = command.status().map_err(|err| {
-        eprintln!("failed to execute apt-get: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to execute apt-get: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
@@ -225,8 +233,8 @@ fn install_rustup(path_prefix: Option<&Path>) -> Result<(), i32> {
     let path_env = match build_path_env(path_prefix) {
         Ok(path_env) => path_env,
         Err(err) => {
-            eprintln!("{err}");
-            return Err(1);
+            eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+            return Err(ExitCode::ConfigError.as_i32());
         }
     };
 
@@ -246,12 +254,18 @@ fn install_rustup(path_prefix: Option<&Path>) -> Result<(), i32> {
         curl_cmd.env("PATH", path_value);
     }
     let mut curl_child = curl_cmd.spawn().map_err(|err| {
-        eprintln!("failed to start rustup installer download: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to start rustup installer download: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     let curl_stdout = curl_child.stdout.take().ok_or_else(|| {
-        eprintln!("failed to capture rustup installer download output");
-        1
+        eprintln!(
+            "error [{}]: failed to capture rustup installer download output",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
 
     let mut sh_cmd = Command::new("sh");
@@ -272,12 +286,18 @@ fn install_rustup(path_prefix: Option<&Path>) -> Result<(), i32> {
         sh_cmd.env("PATH", path_value);
     }
     let sh_status = sh_cmd.status().map_err(|err| {
-        eprintln!("failed to execute rustup installer script: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to execute rustup installer script: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     let curl_status = curl_child.wait().map_err(|err| {
-        eprintln!("failed waiting for rustup installer download command: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed waiting for rustup installer download command: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if !curl_status.success() {
         return Err(status_code(curl_status));
@@ -298,17 +318,19 @@ fn publish_github_path(cargo_bin: &Path) -> Result<(), i32> {
         .open(Path::new(&path_file))
         .map_err(|err| {
             eprintln!(
-                "failed to open GITHUB_PATH target {}: {err}",
+                "error [{}]: failed to open GITHUB_PATH target {}: {err}",
+                ExitCode::ConfigError,
                 Path::new(&path_file).display()
             );
-            1
+            ExitCode::ConfigError.as_i32()
         })?;
     writeln!(file, "{}", cargo_bin.display()).map_err(|err| {
         eprintln!(
-            "failed to append cargo bin path to GITHUB_PATH file {}: {err}",
+            "error [{}]: failed to append cargo bin path to GITHUB_PATH file {}: {err}",
+            ExitCode::TransientFailure,
             Path::new(&path_file).display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })?;
     Ok(())
 }
@@ -322,8 +344,8 @@ fn run_command(
 ) -> Result<(), i32> {
     let mut cmd = Command::new(program);
     if let Some(path_value) = build_path_env(path_prefix).map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })? {
         cmd.env("PATH", path_value);
     }
@@ -336,11 +358,12 @@ fn run_command(
     }
     let status = cmd.status().map_err(|err| {
         eprintln!(
-            "failed to run command: {} {} ({err})",
+            "error [{}]: failed to run command: {} {} ({err})",
+            ExitCode::TransientFailure,
             program,
             args.join(" ")
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
