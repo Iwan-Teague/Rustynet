@@ -729,11 +729,32 @@ inline. Cross-reference with:
   contract (clean serde round-trip / overall_status pass + fail
   per-slot / missing required field / wrong-type / writer-output
   parsed back through the typed view / fail-path-route).
+* `[~]` Fifth X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 58e2700). Migrated
+  `execute_ops_write_live_linux_control_surface_report` (the
+  next prime target after the server-IP-bypass slice) to SIX
+  typed views:
+  - `LiveLinuxControlSurfaceHostChecksView` (4 pass/fail slots)
+  - `LiveLinuxControlSurfaceHostEvidenceView` (3 String + 1
+    `Vec<String>` slot)
+  - `LiveLinuxControlSurfaceHostResultView` (per-host combo)
+  - `LiveLinuxControlSurfaceAggregateChecksView` (5 pass/fail
+    slots = 4 all_X reductions + remote-DNS probe verdict)
+  - `LiveLinuxControlSurfaceEvidenceView` (1 slot)
+  - `LiveLinuxControlSurfaceReportView` (10 typed top-level
+    fields)
+  Removes 8 trailing `Value` walks (4 per-host check fetches
+  × 4 all_X aggregations + status-return echo). `hosts` stays
+  `Map<String, Value>` so caller-supplied host_labels insertion
+  order is preserved (the workspace's serde_json is built with
+  `preserve_order`); per-host shape pinned via separate typed-view
+  tests. 6 new tests including a host-label-order regression test
+  that would fire if a future refactor swapped `Map<String, Value>`
+  for a `BTreeMap`-backed alternative.
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (8 production walks across 6 unrelated report-writer fns +
+  (7 production walks across 5 unrelated report-writer fns +
   1 intentional generic JSON-pointer reader):
-  - `write_live_linux_control_surface_report`,
-    `write_live_linux_endpoint_hijack_report` (report writers)
+  - `write_live_linux_endpoint_hijack_report` (report writer)
   - `write_real_wireguard_exitnode_e2e_report`,
     `write_real_wireguard_no_leak_under_load_report`,
     `write_active_network_signed_state_tamper_report`,
