@@ -69,3 +69,16 @@ rustynet_linux_killswitch_programmed() {
   # actual drift signal.
   "${daemon_bin}" linux-killswitch-boot-check >/dev/null 2>&1
 }
+
+# Apply Linux-host profile defaults. Sets HOST_PROFILE and threads the
+# reviewed LINUX_* credential-blob paths into the canonical runtime
+# variables consumed by the rest of start.sh. Guarded so a stray call
+# on a non-Linux host is a no-op rather than clobbering macOS state.
+__rustynet_linux_apply_profile_defaults() {
+  if ! is_linux_host; then
+    return 0
+  fi
+  HOST_PROFILE="linux"
+  WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+  SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+}

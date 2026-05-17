@@ -126,6 +126,110 @@ check_sanitiser "-leading-and-trailing-" "leading-and-trailing"
 check_sanitiser "@@@" "-"  # pre-existing single-strip semantics; degenerate case
 check_sanitiser "" "rustynet-passphrase"
 
+# ---- 4. apply_host_profile_defaults per-platform dispatch -------------------
+#
+# Pin that:
+#   * the Linux variant threads LINUX_* credential paths through to the
+#     canonical runtime vars and sets HOST_PROFILE=linux
+#   * the macOS variant pins canonical macOS paths and WG_INTERFACE=utun9
+#     and sets HOST_PROFILE=macos
+#   * any other HOST_OS lands on HOST_PROFILE=unsupported
+#
+# The fixture sources common+linux+macos modules, seeds the LINUX_* /
+# MACOS_* constants that normally live at top-level in start.sh, defines
+# a dispatcher matching start.sh's, and asserts on the resulting state.
+
+run_profile_fixture() {
+  local host_os="$1"
+  HOST_OS="${host_os}" ROOT_DIR="${ROOT_DIR}" \
+  bash -c '
+    set -euo pipefail
+    ROOT_DIR="'"${ROOT_DIR}"'"
+    HOST_OS="'"${host_os}"'"
+    . "${ROOT_DIR}/scripts/start/common.sh"
+    . "${ROOT_DIR}/scripts/start/linux.sh"
+    . "${ROOT_DIR}/scripts/start/macos.sh"
+
+    # Seed constants that normally live near the top of start.sh. Pinned
+    # values here must stay in sync with the real defaults.
+    LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/wg_key_passphrase.cred"
+    LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/signing_key_passphrase.cred"
+    MACOS_STATE_BASE="${HOME}/Library/Application Support/rustynet"
+    MACOS_RUNTIME_BASE="${HOME}/Library/Caches/rustynet"
+    MACOS_LOG_BASE="${HOME}/Library/Logs/rustynet"
+    DEVICE_NODE_ID="smoke-node"
+
+    HOST_PROFILE=""
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=""
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=""
+    WG_INTERFACE=""
+
+    apply_host_profile_defaults() {
+      if is_linux_host; then
+        __rustynet_linux_apply_profile_defaults
+        return
+      fi
+      if is_macos_host; then
+        __rustynet_macos_apply_profile_defaults
+        return
+      fi
+      HOST_PROFILE="unsupported"
+    }
+
+    apply_host_profile_defaults
+    printf "HOST_PROFILE=%s\n" "${HOST_PROFILE}"
+    printf "WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n" "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    printf "SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n" "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    printf "WG_INTERFACE=%s\n" "${WG_INTERFACE}"
+  '
+}
+
+check_profile_field() {
+  local label="$1"
+  local fixture_output="$2"
+  local field="$3"
+  local expected="$4"
+  local got
+  got=$(grep -E "^${field}=" <<<"${fixture_output}" | head -n1 | cut -d= -f2-)
+  if [[ "${got}" == "${expected}" ]]; then
+    pass "${label}: ${field}=${expected}"
+  else
+    fail "${label}: ${field} expected='${expected}' got='${got}'"
+  fi
+}
+
+# Linux fixture
+if linux_out=$(run_profile_fixture Linux 2>&1); then
+  check_profile_field "apply_host_profile_defaults(Linux)" "${linux_out}" \
+    HOST_PROFILE "linux"
+  check_profile_field "apply_host_profile_defaults(Linux)" "${linux_out}" \
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH \
+    "/etc/rustynet/credentials/wg_key_passphrase.cred"
+  check_profile_field "apply_host_profile_defaults(Linux)" "${linux_out}" \
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH \
+    "/etc/rustynet/credentials/signing_key_passphrase.cred"
+else
+  fail "apply_host_profile_defaults(Linux) fixture failed: ${linux_out}"
+fi
+
+# Darwin fixture
+if darwin_out=$(run_profile_fixture Darwin 2>&1); then
+  check_profile_field "apply_host_profile_defaults(Darwin)" "${darwin_out}" \
+    HOST_PROFILE "macos"
+  check_profile_field "apply_host_profile_defaults(Darwin)" "${darwin_out}" \
+    WG_INTERFACE "utun9"
+else
+  fail "apply_host_profile_defaults(Darwin) fixture failed: ${darwin_out}"
+fi
+
+# FreeBSD (any non-Linux non-Darwin) fixture
+if freebsd_out=$(run_profile_fixture FreeBSD 2>&1); then
+  check_profile_field "apply_host_profile_defaults(FreeBSD)" "${freebsd_out}" \
+    HOST_PROFILE "unsupported"
+else
+  fail "apply_host_profile_defaults(FreeBSD) fixture failed: ${freebsd_out}"
+fi
+
 # ---- summary ---------------------------------------------------------------
 
 if [[ ${failed} -eq 0 ]]; then

@@ -121,45 +121,13 @@ fi
 
 apply_host_profile_defaults() {
   if is_linux_host; then
-    HOST_PROFILE="linux"
-    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
-    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    __rustynet_linux_apply_profile_defaults
     return
   fi
-
   if is_macos_host; then
-    HOST_PROFILE="macos"
-
-    SOCKET_PATH="${MACOS_RUNTIME_BASE}/rustynetd.sock"
-    STATE_PATH="${MACOS_STATE_BASE}/rustynetd.state"
-    TRUST_EVIDENCE_PATH="${MACOS_STATE_BASE}/trust/rustynetd.trust"
-    TRUST_VERIFIER_KEY_PATH="${MACOS_STATE_BASE}/trust/trust-evidence.pub"
-    TRUST_WATERMARK_PATH="${MACOS_STATE_BASE}/trust/rustynetd.trust.watermark"
-    AUTO_TUNNEL_BUNDLE_PATH="${MACOS_STATE_BASE}/assignment/rustynetd.assignment"
-    AUTO_TUNNEL_VERIFIER_KEY_PATH="${MACOS_STATE_BASE}/assignment/assignment.pub"
-    AUTO_TUNNEL_WATERMARK_PATH="${MACOS_STATE_BASE}/assignment/rustynetd.assignment.watermark"
-    TRAVERSAL_BUNDLE_PATH="${MACOS_STATE_BASE}/traversal/rustynetd.traversal"
-    TRAVERSAL_VERIFIER_KEY_PATH="${MACOS_STATE_BASE}/traversal/traversal.pub"
-    TRAVERSAL_WATERMARK_PATH="${MACOS_STATE_BASE}/traversal/rustynetd.traversal.watermark"
-    WG_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/keys/wireguard.key"
-    WG_ENCRYPTED_PRIVATE_KEY_PATH="${MACOS_STATE_BASE}/keys/wireguard.key.enc"
-    WG_KEY_PASSPHRASE_PATH="${MACOS_STATE_BASE}/keys/wireguard.passphrase"
-    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${MACOS_STATE_BASE}/keys/wg_key_passphrase.cred"
-    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="${MACOS_STATE_BASE}/keys/signing_key_passphrase.cred"
-    WG_PUBLIC_KEY_PATH="${MACOS_STATE_BASE}/keys/wireguard.pub"
-    WG_INTERFACE="utun9"
-    MEMBERSHIP_SNAPSHOT_PATH="${MACOS_STATE_BASE}/membership/membership.snapshot"
-    MEMBERSHIP_LOG_PATH="${MACOS_STATE_BASE}/membership/membership.log"
-    MEMBERSHIP_WATERMARK_PATH="${MACOS_STATE_BASE}/membership/membership.watermark"
-    MEMBERSHIP_OWNER_SIGNING_KEY_PATH="${MACOS_STATE_BASE}/membership/membership.owner.key"
-    TRUST_SIGNER_KEY_PATH="${MACOS_STATE_BASE}/trust/trust-evidence.key"
-    PRIVILEGED_HELPER_SOCKET_PATH="${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
-    MANUAL_PEER_AUDIT_LOG="${MACOS_LOG_BASE}/manual-peer-override.log"
-    WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "wg-passphrase-${DEVICE_NODE_ID}")"
-    MANUAL_PEER_OVERRIDE="0"
+    __rustynet_macos_apply_profile_defaults
     return
   fi
-
   HOST_PROFILE="unsupported"
 }
 
