@@ -3,27 +3,16 @@ set -euo pipefail
 
 echo "Running security regression gates..."
 
-# Run the Rust-based gates
+# Run the Rust-based gates. The historical G1 grep-based secret-
+# material-equality check that lived here has been migrated to a
+# typed Rust scanner with a structured allowlist + self-tests — see
+# `scan_source_for_secret_material_equality` in
+# `crates/rustynetd/src/secret_log_audit.rs`. That scanner runs as
+# part of `cargo test -p rustynetd` (e.g. via the full workspace
+# test gate). The shell intentionally no longer attempts a
+# fragile second pass for raw secret equality; the Rust scanner is
+# now the single source of truth for that policy.
 cargo run --quiet -p rustynet-cli --bin security_regression_gates -- "$@"
-
-# G1: Grep-based CI gate for secret material equality
-echo "Checking for raw equality on secret material..."
-if grep -rn --include="*.rs" -E '(token|csrf|session_key|nonce|mac|hmac|session_id)\s*(==|!=)\s' \
-  crates/rustynet-relay/src/ crates/rustynet-control/src/ 2>/dev/null | \
-  grep -v "// EXCEPTION:" | grep -v "ct_eq"; then
-  echo "ERROR: raw equality on secret material detected — use subtle::ConstantTimeEq" >&2
-  exit 2
-fi
-
-# Also check .as_bytes() == patterns
-if grep -rn --hidden --no-ignore --glob 'crates/**/*.rs' -E '\\.as_bytes\(\)\s*==\s*|\\.as_slice\(\)\s*==\s*|==.*csrf_token' \
-  crates/rustynet-relay/src/ crates/rustynet-control/src/ 2>/dev/null | \
-  grep -v "// EXCEPTION:" | grep -v "ct_eq"; then
-  echo "ERROR: raw equality on secret material detected — use subtle::ConstantTimeEq" >&2
-  exit 2
-fi
-
-echo "PASS: no raw secret equality detected"
 
 # G2a: Fail if sha1 or 3des appear in Cargo.lock (fast, no network)
 echo "Checking Cargo.lock for deprecated cryptographic algorithm packages..."
