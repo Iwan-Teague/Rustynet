@@ -984,3 +984,285 @@ pub struct PassphraseMaterial {
         "PassphraseMaterial without Display must pass: {hits:?}"
     );
 }
+
+// ---- Secret-material equality scanner ------------------------------
+//
+// Replaces the shell `grep -rn '(token|csrf|...)\s*(==|!=)'` block that
+// previously lived in `scripts/ci/security_regression_gates.sh`. The
+// shell version was fragile (no audit trail for `// EXCEPTION:`
+// comments, false-positives on integer counters like `nonce == 0`,
+// no self-tests). This scanner runs as a regular `cargo test`, keeps
+// a typed allowlist with one-line justifications, and ships with its
+// own self-tests so the gate's behaviour cannot silently regress.
+
+/// Identifier substrings whose equality (`==`/`!=`) comparison
+/// triggers the gate. Convention: time-side-channel-sensitive
+/// secret material that must go through `subtle::ConstantTimeEq`
+/// (helper name `ct_eq`) instead of `==`.
+const FORBIDDEN_SECRET_EQUALITY_TOKENS: &[&str] = &[
+    "token",
+    "csrf",
+    "session_key",
+    "nonce",
+    "mac",
+    "hmac",
+    "session_id",
+    "signature",
+];
+
+/// Reviewed allowlist of `(file_path_suffix, line_number, justification)`
+/// triples where an `==`/`!=` on a forbidden token is intentionally
+/// not a security issue (e.g. integer counter zero-check, all-zero
+/// sentinel rejection on a public field). Updating this list is a
+/// deliberate act — every entry must carry a one-line justification.
+///
+/// The path is matched by suffix (`file_path_label.ends_with(path)`)
+/// so workspace-prefix moves do not silently invalidate entries.
+const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
+    (
+        "crates/rustynet-control/src/lib.rs",
+        1480,
+        "nonce counter zero-check on relay fleet bundle u64 input (not secret material)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        1542,
+        "canonical-payload u64 round-trip equality for nonce field (structural check, not secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        1904,
+        "all-zero sentinel rejection on relay session token nonce field (not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        1937,
+        "canonical-payload string equality on relay session token (structural canonicalisation check, signature handled separately via ct_eq)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        2763,
+        "nonce counter zero-check on relay fleet request u64 input (not secret material)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        2917,
+        "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        2922,
+        "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        3055,
+        "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        3058,
+        "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        3990,
+        "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-control/src/lib.rs",
+        3995,
+        "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
+    ),
+    (
+        "crates/rustynet-relay/src/transport.rs",
+        374,
+        "public-scope label string equality on relay hello (relay token scope is a public domain string, not secret material)",
+    ),
+];
+
+/// Returns true iff the given `(file_path_label, line_number)` matches
+/// any entry in `REVIEWED_SECRET_EQUALITY_EXCEPTIONS`. Suffix-match
+/// on the path keeps entries stable across workspace-prefix changes.
+fn equality_hit_is_allowlisted(file_path_label: &str, line_number: usize) -> bool {
+    REVIEWED_SECRET_EQUALITY_EXCEPTIONS
+        .iter()
+        .any(|(path, line, _why)| {
+            file_path_label.ends_with(path) && (*line as usize) == line_number
+        })
+}
+
+/// Pure scan helper: returns the line numbers + matched-token strings
+/// for any source line that compares a forbidden secret-bearing
+/// identifier with `==` or `!=` outside the canonical constant-time
+/// helper (`ct_eq`) and outside the reviewed allowlist. Comment
+/// lines (`//`, `/*`) are skipped wholesale.
+pub(crate) fn scan_source_for_secret_material_equality(
+    body: &str,
+    file_path_label: &str,
+) -> Vec<(usize, String)> {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        // `ct_eq` is the canonical constant-time helper used through-
+        // out the workspace; its presence on the line means the
+        // developer already routed the compare correctly even if a
+        // forbidden token also appears in the same expression.
+        if line.contains("ct_eq") {
+            continue;
+        }
+        for token in FORBIDDEN_SECRET_EQUALITY_TOKENS {
+            // Find the token, then require a subsequent `==` or `!=`
+            // anywhere later on the same line. Substring matching is
+            // intentional — the allowlist absorbs the known false-
+            // positives (integer counter zero-checks, etc.).
+            let Some(pos) = line.find(token) else {
+                continue;
+            };
+            let rest = &line[pos + token.len()..];
+            if !(rest.contains("==") || rest.contains("!=")) {
+                continue;
+            }
+            if equality_hit_is_allowlisted(file_path_label, line_no) {
+                continue;
+            }
+            hits.push((line_no, (*token).to_string()));
+            // One hit per line is enough; further tokens on the same
+            // line would just produce duplicate offender entries.
+            break;
+        }
+    }
+    hits
+}
+
+/// Workspace sweep test — mirrors the scope the retired shell `grep`
+/// block walked (`crates/rustynet-relay/src/` + `crates/rustynet-
+/// control/src/`). The audit module itself is allow-listed because
+/// it necessarily mentions the forbidden tokens in constants and
+/// test bodies.
+#[test]
+fn no_secret_material_equality_in_workspace() {
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let sweep_roots = [
+        root.join("crates/rustynet-relay/src"),
+        root.join("crates/rustynet-control/src"),
+    ];
+    let mut offenders: Vec<String> = Vec::new();
+    for src_root in &sweep_roots {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(src_root, &mut files);
+        for file in files {
+            let rel = workspace_relative(&file, &root);
+            if allowlist.contains(&rel) {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&file) else {
+                continue;
+            };
+            let label = rel.display().to_string();
+            for (line_no, token) in scan_source_for_secret_material_equality(&body, &label) {
+                offenders.push(format!(
+                    "{label}:{line_no}: raw equality on secret-bearing identifier `{token}` — use subtle::ConstantTimeEq (`ct_eq`) or allow-list with justification in REVIEWED_SECRET_EQUALITY_EXCEPTIONS"
+                ));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        panic!(
+            "secret-material equality audit found {} offending compare site(s):\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn secret_equality_scanner_flags_token_equality_with_double_equals() {
+    let body = "if request_token == expected_token { /* ... */ }";
+    let hits = scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
+    assert!(
+        hits.iter().any(|(_, t)| t == "token"),
+        "raw `==` on token must be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn secret_equality_scanner_flags_csrf_inequality() {
+    let body = "if header_csrf != session_csrf { reject(); }";
+    let hits = scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
+    assert!(
+        hits.iter().any(|(_, t)| t == "csrf"),
+        "raw `!=` on csrf must be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn secret_equality_scanner_silent_on_line_with_ct_eq() {
+    let body = "let ok = bool::from(received_mac.ct_eq(&expected_mac));";
+    let hits = scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
+    assert!(
+        hits.is_empty(),
+        "ct_eq compare on mac must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn secret_equality_scanner_silent_on_allowlisted_line() {
+    // Synthesise a body whose first executable line offends, then
+    // claim a path+line that matches a real allowlist entry. The
+    // scanner must suppress the hit because the (path, line) pair
+    // matches REVIEWED_SECRET_EQUALITY_EXCEPTIONS.
+    let body = "if nonce == 0 { return; }";
+    let hits = scan_source_for_secret_material_equality(
+        body,
+        "workspace/crates/rustynet-control/src/lib.rs",
+    );
+    // The body's line 1 is not 1480, so this body alone won't match;
+    // pad with blank lines so the offending line lands on 1480.
+    let padded = format!("{}{}", "\n".repeat(1479), body);
+    let hits_padded = scan_source_for_secret_material_equality(
+        &padded,
+        "workspace/crates/rustynet-control/src/lib.rs",
+    );
+    assert!(
+        !hits.is_empty(),
+        "sanity: unallowlisted nonce==0 line must still fire: {hits:?}"
+    );
+    assert!(
+        hits_padded.is_empty(),
+        "allowlisted (path, line=1480) must suppress the nonce==0 hit: {hits_padded:?}"
+    );
+}
+
+#[test]
+fn secret_equality_scanner_silent_on_unrelated_integer_compare() {
+    let body = "if request_count == 0 { return; }\nlet retries = max_retries;";
+    let hits = scan_source_for_secret_material_equality(body, "crates/example/src/lib.rs");
+    assert!(
+        hits.is_empty(),
+        "unrelated integer compare must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn reviewed_exception_list_entries_have_justifications() {
+    for (path, line, why) in REVIEWED_SECRET_EQUALITY_EXCEPTIONS {
+        assert!(
+            !path.is_empty(),
+            "allowlist entry at line {line} has empty path"
+        );
+        assert!(
+            *line > 0,
+            "allowlist entry for {path} has zero/invalid line number"
+        );
+        assert!(
+            why.len() >= 16,
+            "allowlist entry {path}:{line} justification too short (need >= 16 chars): {why:?}"
+        );
+    }
+}
