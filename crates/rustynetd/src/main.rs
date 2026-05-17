@@ -51,6 +51,7 @@ use rustynetd::windows_backend_gate::{
 use rustynetd::windows_backend_readiness::collect_windows_backend_readiness_report;
 use rustynetd::windows_dns_failclosed::{
     build_windows_dns_failclosed_report, collect_windows_dns_failclosed_snapshot,
+    evaluate_nrpt_ipv6_sibling_coverage,
 };
 use rustynetd::windows_key_custody::collect_windows_key_custody_snapshot;
 use rustynetd::windows_mesh_status::{
@@ -1025,11 +1026,20 @@ fn run_macos_dns_failclosed_check_command(args: &[String]) -> Result<(), String>
 
 fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), String> {
     let mut fail_on_drift = true;
+    let mut enforce_ipv6_sibling = false;
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
             Some("--no-fail-on-drift") => {
                 fail_on_drift = false;
+                index += 1;
+            }
+            // W3 wire-up: opt-in to the IPv6 NRPT sibling-coverage
+            // check. Default false until the production posture pins
+            // dual-stack NRPT siblings as the reviewed contract; the
+            // evaluator itself is already pinned via unit tests.
+            Some("--enforce-ipv6-sibling-rules") => {
+                enforce_ipv6_sibling = true;
                 index += 1;
             }
             Some(flag) => {
@@ -1041,7 +1051,19 @@ fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), Strin
         }
     }
     let snapshot = collect_windows_dns_failclosed_snapshot()?;
-    let report = build_windows_dns_failclosed_report(snapshot);
+    let mut report = build_windows_dns_failclosed_report(snapshot);
+    if enforce_ipv6_sibling {
+        // Run the W3 sibling evaluator and fold any reasons into the
+        // existing report's drift_reasons + overall_ok. Each reason
+        // is prefixed so operators can tell which evaluator fired.
+        let sibling_reasons = evaluate_nrpt_ipv6_sibling_coverage(&report.snapshot);
+        if !sibling_reasons.is_empty() {
+            for reason in sibling_reasons {
+                report.drift_reasons.push(format!("ipv6-sibling: {reason}"));
+            }
+            report.overall_ok = false;
+        }
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&report)
@@ -2536,7 +2558,7 @@ fn help_text() -> String {
         "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
         "  rustynetd windows-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
-        "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift]",
+        "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift] [--enforce-ipv6-sibling-rules]",
         "  rustynetd windows-killswitch-assert [daemon options] [--no-fail-on-drift]",
         "  rustynetd windows-backend-readiness-check [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
@@ -2885,6 +2907,47 @@ mod tests {
         assert!(
             err.contains("unknown windows-dns-failclosed-check argument"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_dns_failclosed_check_command_accepts_enforce_ipv6_sibling_rules_flag() {
+        // The flag itself must parse without producing the
+        // "unknown argument" error. On non-Windows hosts the
+        // collector then fails closed with the requires-Windows
+        // blocker, so we accept either outcome — the assertion is
+        // only that the flag is recognized.
+        let err =
+            run_windows_dns_failclosed_check_command(&["--enforce-ipv6-sibling-rules".to_string()])
+                .err()
+                .unwrap_or_default();
+        assert!(
+            !err.contains("unknown windows-dns-failclosed-check argument"),
+            "--enforce-ipv6-sibling-rules must be recognized: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_dns_failclosed_check_command_accepts_combined_flags() {
+        // Both flags together must parse cleanly.
+        let err = run_windows_dns_failclosed_check_command(&[
+            "--no-fail-on-drift".to_string(),
+            "--enforce-ipv6-sibling-rules".to_string(),
+        ])
+        .err()
+        .unwrap_or_default();
+        assert!(
+            !err.contains("unknown windows-dns-failclosed-check argument"),
+            "combined flags must be recognized: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_enforce_ipv6_sibling_rules_flag() {
+        let help = help_text();
+        assert!(
+            help.contains("--enforce-ipv6-sibling-rules"),
+            "help text must advertise the new W3 flag"
         );
     }
 

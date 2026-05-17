@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -16,17 +17,27 @@ fn main() {
 
 fn run() -> Result<(), i32> {
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     if current_os() != "Linux" {
-        eprintln!("no-leak dataplane gate requires Linux");
-        return Err(1);
+        // Platform-mismatch is a policy / fail-closed reject: the
+        // gate was invoked on a host where its security claim cannot
+        // be evaluated. Operators must NOT retry on a different
+        // platform without changing the orchestration.
+        eprintln!(
+            "error [{}]: no-leak dataplane gate requires Linux",
+            ExitCode::PolicyReject
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
     }
     if current_uid()? != 0 {
-        eprintln!("no-leak dataplane gate requires root privileges");
-        return Err(1);
+        eprintln!(
+            "error [{}]: no-leak dataplane gate requires root privileges",
+            ExitCode::PolicyReject
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
     }
 
     let report_path = env::var_os("RUSTYNET_NO_LEAK_REPORT_PATH")
@@ -38,10 +49,15 @@ fn run() -> Result<(), i32> {
         .env("RUSTYNET_NO_LEAK_REPORT_PATH", &report_path)
         .status()
         .map_err(|err| {
-            eprintln!("failed to execute no-leak e2e script: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to execute no-leak e2e script: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if !status.success() {
+        // Pass through the script's own exit code: the e2e script
+        // already implements a fail-closed verdict on leak detection.
         return Err(status_code(status));
     }
 
@@ -60,12 +76,18 @@ fn run() -> Result<(), i32> {
         .arg(&report_path)
         .status()
         .map_err(|err| {
-            eprintln!("failed to verify no-leak dataplane report: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to verify no-leak dataplane report: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if verify_status.success() {
         Ok(())
     } else {
+        // Verifier failure: the X6 classifier in rustynet-cli/main
+        // already maps signature/policy errors to PolicyReject (78);
+        // pass through so the inner taxonomy bubble survives.
         Err(status_code(verify_status))
     }
 }
@@ -80,17 +102,26 @@ fn current_os() -> String {
 
 fn current_uid() -> Result<u32, i32> {
     let output = Command::new("id").args(["-u"]).output().map_err(|err| {
-        eprintln!("failed to determine uid: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to determine uid: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if !output.status.success() {
-        eprintln!("failed to determine uid");
-        return Err(1);
+        eprintln!(
+            "error [{}]: failed to determine uid",
+            ExitCode::TransientFailure
+        );
+        return Err(ExitCode::TransientFailure.as_i32());
     }
     let value = String::from_utf8_lossy(&output.stdout);
     value.trim().parse::<u32>().map_err(|err| {
-        eprintln!("failed to parse uid: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to parse uid: {err}",
+            ExitCode::ConfigError
+        );
+        ExitCode::ConfigError.as_i32()
     })
 }
 

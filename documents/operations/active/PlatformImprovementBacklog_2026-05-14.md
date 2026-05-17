@@ -377,12 +377,17 @@ inline. Cross-reference with:
   namespaces ignored, unsupported schema_version rejected, empty
   snapshot tolerated, mixed-rule union semantics with one covered +
   one uncovered namespace.
-* `[ ]` Remaining scope (separate slice): wire the sibling
-  evaluator into the `windows-dns-failclosed-check` subcommand
-  (currently opt-in only at the API surface) and Router
-  Advertisement suppression check (no native IPv6 default route
-  during protected mode). The RA check requires expanding the
-  PowerShell collector to surface RA / default-route state.
+* `[~]` CLI wire-up landed (commit pending). The `rustynetd
+  windows-dns-failclosed-check` subcommand now accepts
+  `--enforce-ipv6-sibling-rules`. When set, the sibling evaluator
+  runs alongside the main pass and any siblings drift is folded
+  into the report's `drift_reasons` with an `ipv6-sibling:` prefix
+  so operators can tell which evaluator fired. Default off for
+  back-compat. 3 new flag-handler tests + help-text pin.
+* `[ ]` Remaining scope (separate slice): Router Advertisement
+  suppression check (no native IPv6 default route during protected
+  mode). Needs PowerShell collector expansion to surface RA /
+  default-route state.
 
 ### W4. `windows_runtime_acls.rs` registry + service ACL drift extension
 
@@ -666,12 +671,25 @@ inline. Cross-reference with:
   documents the operator decision rules, the CI retry contract
   (retry only on 70), and the systemd integration guidance
   (`RestartPreventExitStatus=64 65 78`).
-* `[ ]` Remaining scope (separate slice): thread the taxonomy
-  through the ~60 individual bin/ binaries under
-  `crates/rustynet-cli/src/bin/`. Today they use legacy
-  `exit(1)`/`exit(0)` patterns — they still classify as
-  `generic_failure`, but a future slice should map each binary's
-  specific error shapes to the right bucket.
+* `[~]` First batch of bin/ binaries migrated (commit pending):
+  - `security_regression_gates.rs` — repo-root resolve →
+    ConfigError(65); cargo-spawn failure → TransientFailure(70);
+    subprocess code passes through.
+  - `active_network_security_gates.rs` — same pattern.
+  - `no_leak_dataplane_gate.rs` — platform-mismatch ("requires
+    Linux") and root-required preconditions now exit
+    PolicyReject(78) instead of `1`; uid/cmd helpers exit
+    ConfigError / TransientFailure as appropriate; subprocess
+    codes pass through so the inner CLI's X6 taxonomy bucket
+    bubbles up intact.
+  Each bin imports `rustynetd::exit_codes::ExitCode` and uses
+  `as_i32()` + the Display impl to print `error [label (N)]: ...`.
+  Pattern documented in commit; ~57 more bin/ binaries remain on
+  legacy `exit(1)`. Each future migration is a small,
+  independently-reviewed change.
+* `[ ]` Remaining scope (separate slice): continue threading
+  through the remaining ~57 bin/ binaries under
+  `crates/rustynet-cli/src/bin/`.
 
 ### X7. CI gate enhancements
 
