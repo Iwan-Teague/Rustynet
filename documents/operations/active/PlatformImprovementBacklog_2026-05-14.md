@@ -886,10 +886,13 @@ inline. Cross-reference with:
   retry-safety wording, plus per-classifier test coverage for both
   entry points (bad args / policy reject / config / transient /
   generic fallback / precedence ordering).
-* `[ ]` Runbook: `documents/operations/CliExitCodeTaxonomy.md`
+* `[x]` Runbook: `documents/operations/CliExitCodeTaxonomy.md`
   documents the operator decision rules, the CI retry contract
   (retry only on 70), and the systemd integration guidance
-  (`RestartPreventExitStatus=64 65 78`).
+  (`RestartPreventExitStatus=64 65 78`). Initial runbook landed
+  with the shared taxonomy in commit f48681b; surface-coverage
+  section refreshed to reflect the round-2 batches that migrated
+  every bin/*.rs binary off legacy `exit(1)` (commit pending).
 * `[~]` First batch of bin/ binaries migrated (commit pending):
   - `security_regression_gates.rs` — repo-root resolve →
     ConfigError(65); cargo-spawn failure → TransientFailure(70);
