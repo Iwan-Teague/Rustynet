@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -14,8 +15,39 @@ const DEFAULT_DISCOVERY_EXTENSION: &str = "json";
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
+        // X6 taxonomy: classify the error message body to pick the
+        // right bucket. The CLI's `classify_cli_error` is private to
+        // main.rs, so we mirror the precedence order here for the
+        // small set of error shapes this binary emits.
+        let code = classify_local_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
+    }
+}
+
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("does not accept options") {
+        ExitCode::BadArgs
+    } else if lower.contains("missing required command")
+        || lower.contains("no network discovery bundles found")
+        || lower.contains("artifact directory")
+        || lower.contains("failed to resolve repository root")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("failed to run ops") {
+        ExitCode::TransientFailure
+    } else if lower.contains("ops ") && lower.contains("failed with status") {
+        // Subprocess failure — surface as PolicyReject so retry-only-
+        // on-70 CI loops do not retry a real validation failure.
+        ExitCode::PolicyReject
+    } else {
+        ExitCode::GenericFailure
     }
 }
 
