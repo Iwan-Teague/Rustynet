@@ -11823,6 +11823,20 @@ fn emit_membership_evidence(
     let negative_path = output_dir.join("membership_negative_tests_report.json");
     let recovery_path = output_dir.join("membership_recovery_report.json");
     let audit_path = output_dir.join("membership_audit_integrity.log");
+    let diff_path = output_dir.join("membership_evidence_diff.json");
+    let prior_conformance_backup_path = output_dir.join("membership_conformance_report.prior.json");
+    let audit_replay_path = output_dir.join("membership_audit_replay.json");
+
+    // X5: snapshot the prior conformance report (if present) BEFORE
+    // we overwrite it, so the diff artifact can reference it and an
+    // operator can replay the prior state. Read failures are treated
+    // as "no prior evidence" — first-run case.
+    let prior_snapshot = read_prior_membership_evidence_snapshot(&conformance_path);
+    if let Some(prior_text) = &prior_snapshot.raw_body {
+        // Best-effort backup: failure to copy the prior body is not
+        // fatal — the diff JSON still records the old fields.
+        let _ = fs::write(&prior_conformance_backup_path, prior_text);
+    }
 
     write_membership_audit_log(&audit_path, &entries).map_err(|err| err.to_string())?;
 
@@ -11874,6 +11888,38 @@ fn emit_membership_evidence(
     );
     write_text_file(&recovery_path, &recovery)?;
 
+    // X5: write the diff-since-last evidence artifact. Always
+    // produced, even on the first run (prior_evidence_present:false).
+    let current_evidence = MembershipEvidenceSummary {
+        epoch: state.epoch,
+        entries_count: entries.len() as u64,
+        active_node_count: active_node_count as u64,
+        state_root_hex: state_root.clone(),
+        captured_at_unix,
+    };
+    let diff_json = build_membership_evidence_diff_json(
+        &environment,
+        prior_snapshot.summary.as_ref(),
+        &current_evidence,
+    );
+    write_text_file(&diff_path, &diff_json)?;
+
+    // X5: write the audit-replay artifact. Self-contained JSON the
+    // runbook can ingest in one step. Does NOT re-encode entry
+    // bodies (those live in the audit log); records the replay
+    // outcome + the path to the verifier-friendly log.
+    let audit_replay = build_membership_audit_replay_json(
+        &environment,
+        captured_at_unix,
+        state.epoch,
+        entries.len() as u64,
+        active_node_count as u64,
+        &state_root,
+        &audit_path,
+        &paths.log_path,
+    );
+    write_text_file(&audit_replay_path, &audit_replay)?;
+
     if negative_status != "pass" {
         return Err(
             "membership evidence generation failed: tampering checks did not fail closed"
@@ -11887,6 +11933,158 @@ fn emit_membership_evidence(
         entries.len(),
         state.epoch
     ))
+}
+
+/// X5 — typed summary of one membership-evidence snapshot used by
+/// the diff builder. Exposed (`pub(crate)`) so the unit tests can
+/// construct fixtures without going through the full evidence
+/// pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MembershipEvidenceSummary {
+    pub(crate) epoch: u64,
+    pub(crate) entries_count: u64,
+    pub(crate) active_node_count: u64,
+    pub(crate) state_root_hex: String,
+    pub(crate) captured_at_unix: u64,
+}
+
+/// X5 — prior-snapshot read result. Holds the raw text body so the
+/// backup file can be a byte-for-byte copy, plus the parsed summary
+/// (when JSON parse succeeded). A None summary with Some body means
+/// the prior file was present but its shape drifted; the diff
+/// artifact will record that as `prior_parse_error: true`.
+struct PriorMembershipEvidence {
+    raw_body: Option<String>,
+    summary: Option<MembershipEvidenceSummary>,
+}
+
+fn read_prior_membership_evidence_snapshot(path: &Path) -> PriorMembershipEvidence {
+    let raw_body = fs::read_to_string(path).ok();
+    let summary = raw_body
+        .as_deref()
+        .and_then(parse_prior_membership_evidence_body);
+    PriorMembershipEvidence { raw_body, summary }
+}
+
+/// Pure parser over a prior `membership_conformance_report.json`
+/// body. Exposed `pub(crate)` for unit testing. Returns `None` when
+/// the JSON does not contain every required field with the expected
+/// type — old report shapes that predate this slice will surface as
+/// `None`, which the diff JSON records as `prior_parse_error:true`.
+pub(crate) fn parse_prior_membership_evidence_body(
+    body: &str,
+) -> Option<MembershipEvidenceSummary> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = value.as_object()?;
+    Some(MembershipEvidenceSummary {
+        epoch: obj.get("epoch").and_then(serde_json::Value::as_u64)?,
+        entries_count: obj.get("entries").and_then(serde_json::Value::as_u64)?,
+        active_node_count: obj
+            .get("active_node_count")
+            .and_then(serde_json::Value::as_u64)?,
+        state_root_hex: obj
+            .get("state_root")
+            .and_then(serde_json::Value::as_str)?
+            .to_string(),
+        captured_at_unix: obj
+            .get("captured_at_unix")
+            .and_then(serde_json::Value::as_u64)?,
+    })
+}
+
+/// X5 — pure builder for the `membership_evidence_diff.json` body.
+/// Exposed `pub(crate)` so the unit tests can pin the exact JSON
+/// shape without writing to disk.
+pub(crate) fn build_membership_evidence_diff_json(
+    environment: &str,
+    prior: Option<&MembershipEvidenceSummary>,
+    current: &MembershipEvidenceSummary,
+) -> String {
+    let prior_present = prior.is_some();
+    let prior_epoch = prior.map(|p| p.epoch);
+    let prior_entries = prior.map(|p| p.entries_count);
+    let prior_active = prior.map(|p| p.active_node_count);
+    let prior_state_root = prior.map(|p| p.state_root_hex.clone());
+    let prior_captured_at = prior.map(|p| p.captured_at_unix);
+
+    let entries_delta = prior_entries.map(|p| (current.entries_count as i128) - (p as i128));
+    let active_delta = prior_active.map(|p| (current.active_node_count as i128) - (p as i128));
+    let epoch_delta = prior_epoch.map(|p| (current.epoch as i128) - (p as i128));
+    let captured_at_delta =
+        prior_captured_at.map(|p| (current.captured_at_unix as i128) - (p as i128));
+    let state_root_changed = prior_state_root
+        .as_ref()
+        .map(|p| p.as_str() != current.state_root_hex.as_str());
+
+    let opt_u64 = |o: Option<u64>| match o {
+        Some(v) => v.to_string(),
+        None => "null".to_string(),
+    };
+    let opt_i128 = |o: Option<i128>| match o {
+        Some(v) => v.to_string(),
+        None => "null".to_string(),
+    };
+    let opt_bool = |o: Option<bool>| match o {
+        Some(v) => v.to_string(),
+        None => "null".to_string(),
+    };
+    let opt_string = |o: Option<String>| match o {
+        Some(v) => format!("\"{}\"", escape_json(&v)),
+        None => "null".to_string(),
+    };
+
+    format!(
+        "{{\n  \"phase\": \"membership\",\n  \"evidence_mode\": \"measured\",\n  \"environment\": \"{}\",\n  \"artifact\": \"membership_evidence_diff\",\n  \"prior_evidence_present\": {},\n  \"prior_parse_error\": {},\n  \"prior_epoch\": {},\n  \"current_epoch\": {},\n  \"epoch_delta\": {},\n  \"prior_entries\": {},\n  \"current_entries\": {},\n  \"entries_delta\": {},\n  \"prior_active_nodes\": {},\n  \"current_active_nodes\": {},\n  \"active_nodes_delta\": {},\n  \"prior_state_root\": {},\n  \"current_state_root\": \"{}\",\n  \"state_root_changed\": {},\n  \"prior_captured_at_unix\": {},\n  \"current_captured_at_unix\": {},\n  \"captured_at_delta_secs\": {}\n}}\n",
+        escape_json(environment),
+        // prior_evidence_present is true even when parse failed; it
+        // means the file existed. prior_parse_error distinguishes.
+        prior_present,
+        prior_present && prior.is_none(),
+        opt_u64(prior_epoch),
+        current.epoch,
+        opt_i128(epoch_delta),
+        opt_u64(prior_entries),
+        current.entries_count,
+        opt_i128(entries_delta),
+        opt_u64(prior_active),
+        current.active_node_count,
+        opt_i128(active_delta),
+        opt_string(prior_state_root),
+        escape_json(&current.state_root_hex),
+        opt_bool(state_root_changed),
+        opt_u64(prior_captured_at),
+        current.captured_at_unix,
+        opt_i128(captured_at_delta),
+    )
+}
+
+/// X5 — pure builder for the `membership_audit_replay.json` body. A
+/// self-contained operator-facing JSON pointing at the audit log
+/// file. Does NOT re-encode log entries (those live in the audit
+/// log itself); the artifact is a one-stop reference for the
+/// runbook.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_membership_audit_replay_json(
+    environment: &str,
+    captured_at_unix: u64,
+    epoch: u64,
+    entries_count: u64,
+    active_node_count: u64,
+    state_root_hex: &str,
+    audit_log_path: &Path,
+    source_log_path: &Path,
+) -> String {
+    format!(
+        "{{\n  \"phase\": \"membership\",\n  \"evidence_mode\": \"measured\",\n  \"environment\": \"{}\",\n  \"artifact\": \"membership_audit_replay\",\n  \"captured_at_unix\": {},\n  \"epoch\": {},\n  \"entries_count\": {},\n  \"active_node_count\": {},\n  \"state_root\": \"{}\",\n  \"audit_log_path\": \"{}\",\n  \"source_log_path\": \"{}\",\n  \"replay_status\": \"ok\"\n}}\n",
+        escape_json(environment),
+        captured_at_unix,
+        epoch,
+        entries_count,
+        active_node_count,
+        escape_json(state_root_hex),
+        escape_json(&audit_log_path.display().to_string()),
+        escape_json(&source_log_path.display().to_string()),
+    )
 }
 
 fn detect_tampered_log(source_path: &Path, output_dir: &Path) -> Result<bool, String> {
@@ -16854,12 +17052,14 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, classify_cli_error,
-        command_supports_json_render, contains_ip_rule_lookup_table, detect_tampered_log, execute,
-        extract_json_flag, help_text, is_interface_absent_detail, launchd_xml_escape,
-        load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
-        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
-        parse_command, parse_managed_pf_anchors, parse_wireguard_go_pids_from_ps,
+        CliCommand, MembershipEvidenceSummary, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform,
+        build_membership_audit_replay_json, build_membership_evidence_diff_json,
+        classify_cli_error, command_supports_json_render, contains_ip_rule_lookup_table,
+        detect_tampered_log, execute, extract_json_flag, help_text, is_interface_absent_detail,
+        launchd_xml_escape, load_dns_zone_records_manifest, load_signing_key,
+        managed_dns_resolver_server_arg, managed_dns_routing_already_absent, parse_bool_value,
+        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
         persist_encrypted_secret_material, phase6_stage_probe_from_source,
         phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
         phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
@@ -20437,5 +20637,282 @@ mod tests {
         use rustynetd::exit_codes::ExitCode;
         let msg = "signature verification failed; schema-side malformed; retry impossible";
         assert_eq!(classify_cli_error(msg), ExitCode::PolicyReject);
+    }
+
+    // ---- X5: membership evidence diff + audit replay ----------------------
+
+    fn sample_evidence_summary(epoch: u64, entries: u64, root: &str) -> MembershipEvidenceSummary {
+        MembershipEvidenceSummary {
+            epoch,
+            entries_count: entries,
+            active_node_count: entries.saturating_sub(1),
+            state_root_hex: root.to_string(),
+            captured_at_unix: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn parse_prior_membership_evidence_body_round_trips_reviewed_shape() {
+        // Mirror the exact shape emit_membership_evidence writes.
+        let body = r#"{
+            "phase": "membership",
+            "evidence_mode": "measured",
+            "environment": "prod",
+            "captured_at_unix": 1700000000,
+            "status": "pass",
+            "network_id": "net-a",
+            "epoch": 7,
+            "entries": 12,
+            "active_node_count": 11,
+            "state_root": "abc123",
+            "snapshot_path": "/var/lib/rustynet/membership.snapshot",
+            "log_path": "/var/lib/rustynet/membership.log"
+        }"#;
+        let summary =
+            parse_prior_membership_evidence_body(body).expect("clean prior body must parse");
+        assert_eq!(summary.epoch, 7);
+        assert_eq!(summary.entries_count, 12);
+        assert_eq!(summary.active_node_count, 11);
+        assert_eq!(summary.state_root_hex, "abc123");
+        assert_eq!(summary.captured_at_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_prior_membership_evidence_body_returns_none_on_malformed_json() {
+        assert!(parse_prior_membership_evidence_body("{not-json}").is_none());
+        assert!(parse_prior_membership_evidence_body("").is_none());
+    }
+
+    #[test]
+    fn parse_prior_membership_evidence_body_returns_none_when_required_field_missing() {
+        // Missing state_root.
+        let body = r#"{"epoch":1,"entries":1,"active_node_count":1,"captured_at_unix":1}"#;
+        assert!(parse_prior_membership_evidence_body(body).is_none());
+    }
+
+    #[test]
+    fn build_diff_marks_first_run_with_null_prior_fields() {
+        let current = sample_evidence_summary(1, 3, "abc");
+        let json = build_membership_evidence_diff_json("prod", None, &current);
+        assert!(
+            json.contains("\"prior_evidence_present\": false"),
+            "first run must record prior_evidence_present=false: {json}"
+        );
+        assert!(
+            json.contains("\"prior_parse_error\": false"),
+            "first run must record prior_parse_error=false: {json}"
+        );
+        // Every prior_* numeric field must be `null` (not 0) so a
+        // consumer can distinguish "no prior" from "prior=0".
+        for needle in [
+            "\"prior_epoch\": null",
+            "\"prior_entries\": null",
+            "\"prior_active_nodes\": null",
+            "\"prior_state_root\": null",
+            "\"prior_captured_at_unix\": null",
+            "\"epoch_delta\": null",
+            "\"entries_delta\": null",
+            "\"active_nodes_delta\": null",
+            "\"state_root_changed\": null",
+            "\"captured_at_delta_secs\": null",
+        ] {
+            assert!(
+                json.contains(needle),
+                "first-run diff must contain `{needle}`: {json}"
+            );
+        }
+        // Current values present.
+        assert!(json.contains("\"current_epoch\": 1"));
+        assert!(json.contains("\"current_entries\": 3"));
+        assert!(json.contains("\"current_state_root\": \"abc\""));
+    }
+
+    #[test]
+    fn build_diff_computes_signed_deltas_for_growth_case() {
+        let prior = sample_evidence_summary(5, 10, "old-root");
+        let current = MembershipEvidenceSummary {
+            epoch: 7,
+            entries_count: 12,
+            active_node_count: 11,
+            state_root_hex: "new-root".to_string(),
+            captured_at_unix: 1_700_000_300, // 5 min later
+        };
+        let json = build_membership_evidence_diff_json("prod", Some(&prior), &current);
+        assert!(json.contains("\"prior_evidence_present\": true"));
+        assert!(json.contains("\"epoch_delta\": 2"));
+        assert!(json.contains("\"entries_delta\": 2"));
+        // active count: prior=9 (entries-1), current=11 → delta=2
+        assert!(json.contains("\"active_nodes_delta\": 2"));
+        assert!(json.contains("\"state_root_changed\": true"));
+        assert!(json.contains("\"captured_at_delta_secs\": 300"));
+    }
+
+    #[test]
+    fn build_diff_computes_negative_deltas_for_shrink_case() {
+        let prior = sample_evidence_summary(10, 8, "root-a");
+        let current = sample_evidence_summary(9, 5, "root-a");
+        let json = build_membership_evidence_diff_json("prod", Some(&prior), &current);
+        assert!(json.contains("\"epoch_delta\": -1"));
+        assert!(json.contains("\"entries_delta\": -3"));
+        // active count: prior=7, current=4 → delta=-3
+        assert!(json.contains("\"active_nodes_delta\": -3"));
+        // state root unchanged
+        assert!(json.contains("\"state_root_changed\": false"));
+    }
+
+    #[test]
+    fn build_diff_state_root_changed_only_when_strings_differ() {
+        let prior = sample_evidence_summary(1, 1, "same-root");
+        let current = sample_evidence_summary(2, 2, "same-root");
+        let json = build_membership_evidence_diff_json("prod", Some(&prior), &current);
+        assert!(
+            json.contains("\"state_root_changed\": false"),
+            "matching roots must record false: {json}"
+        );
+    }
+
+    #[test]
+    fn build_diff_escapes_environment_label_safely() {
+        // Operator supplies a label with a double-quote in it. The
+        // JSON must remain parseable.
+        let current = sample_evidence_summary(1, 1, "root");
+        let json = build_membership_evidence_diff_json("prod-\"with-quote\"", None, &current);
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("diff JSON must remain parseable when env has quotes");
+        assert_eq!(
+            parsed.get("environment").and_then(|v| v.as_str()),
+            Some("prod-\"with-quote\"")
+        );
+    }
+
+    #[test]
+    fn build_diff_emits_valid_json_for_first_run() {
+        let current = sample_evidence_summary(1, 0, "empty");
+        let json = build_membership_evidence_diff_json("prod", None, &current);
+        // Round-trip through serde_json to validate JSON shape.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("first-run diff must be valid JSON");
+        assert_eq!(
+            parsed.get("phase").and_then(|v| v.as_str()),
+            Some("membership")
+        );
+        assert_eq!(
+            parsed.get("artifact").and_then(|v| v.as_str()),
+            Some("membership_evidence_diff")
+        );
+        assert_eq!(
+            parsed
+                .get("prior_evidence_present")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn build_audit_replay_emits_self_contained_artifact() {
+        let json = build_membership_audit_replay_json(
+            "prod",
+            1_700_000_000,
+            7,
+            12,
+            11,
+            "abc123",
+            std::path::Path::new("/var/lib/rustynet/audit.log"),
+            std::path::Path::new("/var/lib/rustynet/membership.log"),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("audit replay must be valid JSON");
+        assert_eq!(
+            parsed.get("artifact").and_then(|v| v.as_str()),
+            Some("membership_audit_replay")
+        );
+        assert_eq!(parsed.get("epoch").and_then(|v| v.as_u64()), Some(7));
+        assert_eq!(
+            parsed.get("entries_count").and_then(|v| v.as_u64()),
+            Some(12)
+        );
+        assert_eq!(
+            parsed.get("active_node_count").and_then(|v| v.as_u64()),
+            Some(11)
+        );
+        assert_eq!(
+            parsed.get("audit_log_path").and_then(|v| v.as_str()),
+            Some("/var/lib/rustynet/audit.log")
+        );
+        assert_eq!(
+            parsed.get("source_log_path").and_then(|v| v.as_str()),
+            Some("/var/lib/rustynet/membership.log")
+        );
+        assert_eq!(
+            parsed.get("replay_status").and_then(|v| v.as_str()),
+            Some("ok")
+        );
+        assert_eq!(
+            parsed.get("evidence_mode").and_then(|v| v.as_str()),
+            Some("measured")
+        );
+    }
+
+    #[test]
+    fn build_audit_replay_escapes_environment_safely() {
+        let json = build_membership_audit_replay_json(
+            "prod-\"with-quote\"",
+            1,
+            1,
+            1,
+            0,
+            "root",
+            std::path::Path::new("/x/audit"),
+            std::path::Path::new("/x/source"),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("audit replay must be parseable with quoted env");
+        assert_eq!(
+            parsed.get("environment").and_then(|v| v.as_str()),
+            Some("prod-\"with-quote\"")
+        );
+    }
+
+    #[test]
+    fn build_audit_replay_does_not_leak_raw_log_entries() {
+        // Security invariant: the audit-replay artifact must NEVER
+        // re-encode log entry bodies (those live in the audit log
+        // file). If a future refactor adds an `entries` array, this
+        // test must trip so the choice is deliberate.
+        let json = build_membership_audit_replay_json(
+            "prod",
+            1,
+            1,
+            1,
+            0,
+            "root",
+            std::path::Path::new("/x/audit"),
+            std::path::Path::new("/x/source"),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().expect("must be an object");
+        // Only the reviewed keys are allowed.
+        let allowed: std::collections::HashSet<&str> = [
+            "phase",
+            "evidence_mode",
+            "environment",
+            "artifact",
+            "captured_at_unix",
+            "epoch",
+            "entries_count",
+            "active_node_count",
+            "state_root",
+            "audit_log_path",
+            "source_log_path",
+            "replay_status",
+        ]
+        .into_iter()
+        .collect();
+        for key in obj.keys() {
+            assert!(
+                allowed.contains(key.as_str()),
+                "unexpected key `{key}` in audit replay — must be deliberately added to the reviewed allowlist"
+            );
+        }
     }
 }

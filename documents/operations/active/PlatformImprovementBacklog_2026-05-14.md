@@ -582,9 +582,33 @@ inline. Cross-reference with:
 
 ### X5. Membership evidence + runbook automation
 
-* `[ ]` `rustynet membership generate-evidence` already emits JSON;
-  extend with diff-since-last-evidence + auto-included audit-log replay
-  artifact so the runbook can be a single command.
+* `[x]` Commit pending. `rustynet membership generate-evidence` now
+  emits two additional artifacts alongside the existing conformance
+  / negative / recovery reports + audit-integrity log:
+  - `membership_evidence_diff.json` — structured delta vs the prior
+    `membership_conformance_report.json` at the same output path.
+    Records `prior_evidence_present`, `prior_parse_error`, and
+    every prior_*/current_*/delta triple for epoch, entries,
+    active-node count, state-root (with `state_root_changed` bool),
+    and `captured_at_unix` (`captured_at_delta_secs`). Prior_*
+    fields are JSON `null` on first run so consumers can distinguish
+    "no prior" from "prior=0".
+  - `membership_conformance_report.prior.json` — byte-for-byte
+    snapshot of the prior conformance report (when present) so the
+    diff is reproducible.
+  - `membership_audit_replay.json` — self-contained operator-facing
+    JSON pointing at the audit log file. Records environment,
+    captured_at_unix, epoch, entries_count, active_node_count,
+    state_root, audit_log_path, source_log_path, replay_status="ok".
+    Does NOT re-encode log entry bodies (those live in the audit
+    log file) — security invariant pinned by a key-allowlist test
+    that fails if a future refactor adds an `entries` field.
+  12 new tests pin the artifact shapes: parser round-trip + 2
+  fail-closed shapes for the prior-evidence reader; 6 diff-builder
+  shapes including null-prior first-run, positive/negative deltas,
+  state-root-changed false case, environment-escaping safety, and
+  JSON round-trip; 3 audit-replay shapes including the no-leak
+  invariant.
 
 ### X6. CLI ergonomics + exit-code taxonomy
 
