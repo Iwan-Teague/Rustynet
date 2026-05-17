@@ -236,6 +236,239 @@ const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     "SigningKeyMaterial",
 ];
 
+/// Reviewed secret-bearing type names whose `Display` (and
+/// `ToString`) exposure is forbidden across the crate. A `Display`
+/// impl is just as dangerous as `Debug` because `format!("{}", x)`
+/// or `x.to_string()` would surface inner bytes.
+const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[
+    "PassphraseMaterial",
+    "WrappedKeyMaterial",
+    "RuntimePrivateKey",
+    "SigningKeyMaterial",
+];
+
+/// Returns true iff the given line is a call to one of the
+/// `LOG_MACRO_NAMES` macros. Used by the encoder scanners to scope
+/// their detection to log/print/format call-sites only.
+fn line_calls_log_macro(line: &str) -> bool {
+    for name in LOG_MACRO_NAMES {
+        let pat = format!("{name}!(");
+        let pat_ws = format!("{name}! (");
+        if line.contains(&pat) || line.contains(&pat_ws) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true iff `arg` contains any of the forbidden placeholder
+/// tokens as a substring. Used to flag encoder calls whose argument
+/// expression mentions a secret-bearing identifier.
+fn arg_mentions_forbidden_token(arg: &str) -> Option<&'static str> {
+    FORBIDDEN_PLACEHOLDER_TOKENS
+        .iter()
+        .find(|&token| arg.contains(token))
+        .copied()
+}
+
+/// Pure scan helper: looks for `hex::encode(<expr>)` or
+/// `format!("{:02x}…", <expr>)` shapes inside a log/print macro
+/// call where `<expr>` mentions a forbidden secret-bearing
+/// identifier. Returns `(line_no, encoder_call, forbidden_token)`.
+pub(crate) fn scan_source_for_hex_encoded_secret_log_sites(
+    body: &str,
+) -> Vec<(usize, String, String)> {
+    let mut hits: Vec<(usize, String, String)> = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        if !line_calls_log_macro(line) {
+            continue;
+        }
+        // Pattern A: `hex::encode(<expr>)` — scan every occurrence on
+        // the line and inspect the argument expression up to the
+        // matching `)`.
+        let mut search_from = 0usize;
+        while let Some(rel) = line[search_from..].find("hex::encode(") {
+            let start = search_from + rel + "hex::encode(".len();
+            // Find matching close-paren with depth counting.
+            let bytes = line.as_bytes();
+            let mut depth = 1usize;
+            let mut i = start;
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    break;
+                }
+                i += 1;
+            }
+            let arg = &line[start..i.min(bytes.len())];
+            if let Some(token) = arg_mentions_forbidden_token(arg) {
+                hits.push((idx + 1, format!("hex::encode({arg})"), token.to_string()));
+            }
+            search_from = i.saturating_add(1);
+        }
+        // Pattern B: inline `format!("{:02x}…", <expr…>)` or any
+        // log-macro call whose format string contains `{:02x}` /
+        // `{:x}` placeholders and whose args mention a forbidden
+        // token. We scan the whole remainder of the line after the
+        // macro name for both signals jointly.
+        let has_hex_fmt = line.contains("{:02x}")
+            || line.contains("{:x}")
+            || line.contains("{:02X}")
+            || line.contains("{:X}");
+        if has_hex_fmt && let Some(token) = arg_mentions_forbidden_token(line) {
+            let already_flagged = hits.iter().any(|(l, _, t)| *l == idx + 1 && t == token);
+            if !already_flagged {
+                hits.push((
+                    idx + 1,
+                    "format!(\"{:02x}…\", …)".to_string(),
+                    token.to_string(),
+                ));
+            }
+        }
+    }
+    hits
+}
+
+/// Pure scan helper: looks for `base64::*encode(<expr>)` or
+/// `STANDARD.encode(<expr>)` shapes inside a log/print macro call
+/// where `<expr>` mentions a forbidden secret-bearing identifier.
+/// Returns `(line_no, encoder_call, forbidden_token)`.
+pub(crate) fn scan_source_for_base64_encoded_secret_log_sites(
+    body: &str,
+) -> Vec<(usize, String, String)> {
+    let mut hits: Vec<(usize, String, String)> = Vec::new();
+    // Candidate encoder-call prefixes. Order matters only for
+    // dedup; we scan each independently.
+    let candidates: &[&str] = &[
+        "base64::engine::general_purpose::STANDARD.encode(",
+        "base64::engine::general_purpose::URL_SAFE.encode(",
+        "base64::engine::general_purpose::STANDARD_NO_PAD.encode(",
+        "base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(",
+        "base64::encode(",
+        "STANDARD.encode(",
+        "URL_SAFE.encode(",
+        "STANDARD_NO_PAD.encode(",
+        "URL_SAFE_NO_PAD.encode(",
+    ];
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        if !line_calls_log_macro(line) {
+            continue;
+        }
+        for prefix in candidates {
+            let mut search_from = 0usize;
+            while let Some(rel) = line[search_from..].find(prefix) {
+                let start = search_from + rel + prefix.len();
+                let bytes = line.as_bytes();
+                let mut depth = 1usize;
+                let mut i = start;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    i += 1;
+                }
+                let arg = &line[start..i.min(bytes.len())];
+                if let Some(token) = arg_mentions_forbidden_token(arg) {
+                    let call = format!("{}{arg})", prefix);
+                    hits.push((idx + 1, call, token.to_string()));
+                }
+                search_from = i.saturating_add(1);
+            }
+        }
+    }
+    hits
+}
+
+/// Pure scan helper: mirrors `scan_source_for_debug_on_secret_types`
+/// but for `Display` (and `fmt::Display`) impls on the canonical
+/// secret-bearing types. Returns `(line_no, type_name, reason)`.
+pub(crate) fn scan_source_for_display_on_secret_types(
+    body: &str,
+    secret_type_names: &[&str],
+) -> Vec<(usize, String, String)> {
+    let mut hits: Vec<(usize, String, String)> = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        // Pattern 1: derive Display on a secret type. Display is not
+        // a stdlib derive, but third-party derive macros exist
+        // (`derive_more::Display`) — flag the shape anyway.
+        if trimmed.starts_with("#[derive(") && trimmed.contains("Display") {
+            for next in body.lines().skip(idx + 1).take(4) {
+                let nt = next.trim_start();
+                let after_kw = if let Some(rest) = nt.strip_prefix("pub struct ") {
+                    Some(rest)
+                } else if let Some(rest) = nt.strip_prefix("struct ") {
+                    Some(rest)
+                } else if let Some(rest) = nt.strip_prefix("pub enum ") {
+                    Some(rest)
+                } else {
+                    nt.strip_prefix("enum ")
+                };
+                if let Some(rest) = after_kw {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if secret_type_names.iter().any(|t| *t == name) {
+                        hits.push((
+                            idx + 1,
+                            name.clone(),
+                            "derive(Display) on secret-bearing type".to_string(),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        // Pattern 2: `impl …Display for <SecretType>` and the same
+        // for `ToString`. We treat `Display for X` and
+        // `fmt::Display for X` uniformly (the `Display` token
+        // suffices) but require the preceding `impl ` to scope to
+        // trait-impl declarations.
+        if trimmed.starts_with("impl ") {
+            for name in secret_type_names {
+                let display_needle = format!("Display for {name}");
+                let to_string_needle = format!("ToString for {name}");
+                if line.contains(&display_needle) {
+                    hits.push((
+                        idx + 1,
+                        (*name).to_string(),
+                        "manual impl Display for secret-bearing type".to_string(),
+                    ));
+                }
+                if line.contains(&to_string_needle) {
+                    hits.push((
+                        idx + 1,
+                        (*name).to_string(),
+                        "manual impl ToString for secret-bearing type".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    hits
+}
+
 #[test]
 fn no_forbidden_placeholder_tokens_in_log_macros() {
     let root = workspace_root();
@@ -446,5 +679,308 @@ pub struct PassphraseMaterial {
     assert!(
         hits.is_empty(),
         "PassphraseMaterial without Debug must pass: {hits:?}"
+    );
+}
+
+// ---- Hex-encoder workspace sweep + self-tests ----------------------
+
+#[test]
+fn no_hex_encoded_secret_log_sites_in_workspace() {
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let mut offenders: Vec<String> = Vec::new();
+    for src_root in audited_source_roots(&root) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        for file in files {
+            let rel = workspace_relative(&file, &root);
+            if allowlist.contains(&rel) {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&file) else {
+                continue;
+            };
+            for (line_no, call, token) in scan_source_for_hex_encoded_secret_log_sites(&body) {
+                offenders.push(format!(
+                    "{}:{}: log macro encodes forbidden secret-bearing identifier via {call} ({token})",
+                    rel.display(),
+                    line_no
+                ));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        panic!(
+            "secret-leakage audit found {} hex-encoder offender(s):\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn hex_scanner_flags_hex_encode_of_passphrase_bytes() {
+    let body = r#"
+        fn leaky() {
+            let passphrase_bytes = vec![0u8; 32];
+            log::warn!("p = {}", hex::encode(passphrase_bytes));
+        }
+    "#;
+    let hits = scan_source_for_hex_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter().any(|(_, _, t)| t == "passphrase_bytes"),
+        "hex::encode(passphrase_bytes) must be detected: {hits:?}"
+    );
+}
+
+#[test]
+fn hex_scanner_silent_on_hex_encode_of_safe_identifier() {
+    let body = r#"
+        fn safe() {
+            let public_key_bytes = vec![0u8; 32];
+            eprintln!("hash = {}", hex::encode(public_key_bytes));
+        }
+    "#;
+    let hits = scan_source_for_hex_encoded_secret_log_sites(body);
+    assert!(
+        hits.is_empty(),
+        "public_key_bytes is not on the forbidden list: {hits:?}"
+    );
+}
+
+#[test]
+fn hex_scanner_flags_inline_format_02x_pattern() {
+    let body = r#"
+        fn leaky() {
+            let private_key_bytes = vec![0u8; 32];
+            eprintln!("{:02x}{:02x}", private_key_bytes[0], private_key_bytes[1]);
+        }
+    "#;
+    let hits = scan_source_for_hex_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter().any(|(_, _, t)| t == "private_key_bytes"),
+        "inline {{:02x}} over private_key_bytes must be detected: {hits:?}"
+    );
+}
+
+#[test]
+fn hex_scanner_silent_on_commented_offender() {
+    let body = r#"
+        fn safe() {
+            // log::warn!("p = {}", hex::encode(passphrase_bytes));
+        }
+    "#;
+    let hits = scan_source_for_hex_encoded_secret_log_sites(body);
+    assert!(
+        hits.is_empty(),
+        "commented hex-encoder offender must not be flagged: {hits:?}"
+    );
+}
+
+// ---- Base64-encoder workspace sweep + self-tests -------------------
+
+#[test]
+fn no_base64_encoded_secret_log_sites_in_workspace() {
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let mut offenders: Vec<String> = Vec::new();
+    for src_root in audited_source_roots(&root) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        for file in files {
+            let rel = workspace_relative(&file, &root);
+            if allowlist.contains(&rel) {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&file) else {
+                continue;
+            };
+            for (line_no, call, token) in scan_source_for_base64_encoded_secret_log_sites(&body) {
+                offenders.push(format!(
+                    "{}:{}: log macro encodes forbidden secret-bearing identifier via {call} ({token})",
+                    rel.display(),
+                    line_no
+                ));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        panic!(
+            "secret-leakage audit found {} base64-encoder offender(s):\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn base64_scanner_flags_legacy_base64_encode_of_signing_key_bytes() {
+    let body = r#"
+        fn leaky() {
+            let signing_key_bytes = vec![0u8; 32];
+            log::warn!("k = {}", base64::encode(signing_key_bytes));
+        }
+    "#;
+    let hits = scan_source_for_base64_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter().any(|(_, _, t)| t == "signing_key_bytes"),
+        "base64::encode(signing_key_bytes) must be detected: {hits:?}"
+    );
+}
+
+#[test]
+fn base64_scanner_flags_standard_engine_encode_of_passphrase_bytes() {
+    let body = r#"
+        fn leaky() {
+            let passphrase_bytes = vec![0u8; 32];
+            eprintln!("p = {}", STANDARD.encode(passphrase_bytes));
+        }
+    "#;
+    let hits = scan_source_for_base64_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter().any(|(_, _, t)| t == "passphrase_bytes"),
+        "STANDARD.encode(passphrase_bytes) must be detected: {hits:?}"
+    );
+}
+
+#[test]
+fn base64_scanner_flags_fully_qualified_general_purpose_encode() {
+    let body = r#"
+        fn leaky() {
+            let wrapped_secret = vec![0u8; 32];
+            log::error!("w = {}", base64::engine::general_purpose::STANDARD.encode(wrapped_secret));
+        }
+    "#;
+    let hits = scan_source_for_base64_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter().any(|(_, _, t)| t == "wrapped_secret"),
+        "fully-qualified general_purpose::STANDARD.encode(wrapped_secret) must be detected: {hits:?}"
+    );
+}
+
+#[test]
+fn base64_scanner_silent_on_encode_of_safe_identifier() {
+    let body = r#"
+        fn safe() {
+            let public_key_bytes = vec![0u8; 32];
+            eprintln!("pk = {}", base64::encode(public_key_bytes));
+        }
+    "#;
+    let hits = scan_source_for_base64_encoded_secret_log_sites(body);
+    assert!(
+        hits.is_empty(),
+        "public_key_bytes is not on the forbidden list: {hits:?}"
+    );
+}
+
+// ---- Display-impl workspace sweep + self-tests ---------------------
+
+#[test]
+fn no_display_impls_on_canonical_secret_types() {
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let mut offenders: Vec<String> = Vec::new();
+    for src_root in audited_source_roots(&root) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        for file in files {
+            let rel = workspace_relative(&file, &root);
+            if allowlist.contains(&rel) {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&file) else {
+                continue;
+            };
+            for (line_no, name, why) in
+                scan_source_for_display_on_secret_types(&body, FORBIDDEN_DISPLAY_SECRET_TYPES)
+            {
+                offenders.push(format!("{}:{}: {why}: {name}", rel.display(), line_no));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        panic!(
+            "secret-leakage audit found {} forbidden Display exposure(s) on secret-bearing types:\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn display_scanner_flags_impl_display_on_passphrase_material() {
+    let body = r#"
+impl Display for PassphraseMaterial {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "PassphraseMaterial(…)")
+    }
+}
+"#;
+    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, n, _)| n == "PassphraseMaterial"),
+        "impl Display for PassphraseMaterial must be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn display_scanner_flags_impl_fmt_display_on_signing_key_material() {
+    let body = r#"
+impl fmt::Display for SigningKeyMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SigningKeyMaterial(…)")
+    }
+}
+"#;
+    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, n, _)| n == "SigningKeyMaterial"),
+        "impl fmt::Display for SigningKeyMaterial must be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn display_scanner_flags_impl_to_string_on_runtime_private_key() {
+    let body = r#"
+impl ToString for RuntimePrivateKey {
+    fn to_string(&self) -> String {
+        String::from("RuntimePrivateKey(…)")
+    }
+}
+"#;
+    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, n, _)| n == "RuntimePrivateKey"),
+        "impl ToString for RuntimePrivateKey must be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn display_scanner_silent_on_non_secret_type_with_display() {
+    let body = r#"
+impl Display for PublicKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.bytes))
+    }
+}
+"#;
+    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    assert!(
+        hits.is_empty(),
+        "PublicKey is not on the secret list: {hits:?}"
+    );
+}
+
+#[test]
+fn display_scanner_silent_on_secret_type_without_display_impl() {
+    let body = r#"
+pub struct PassphraseMaterial {
+    bytes: Vec<u8>,
+}
+"#;
+    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    assert!(
+        hits.is_empty(),
+        "PassphraseMaterial without Display must pass: {hits:?}"
     );
 }
