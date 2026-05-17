@@ -95,6 +95,10 @@ WINDOWS_FLOORS=(
   # drift evaluator (forbidden principals, requirement
   # invariants, SDDL grant detection, snapshot lists).
   "windows_registry_acls:17"
+  # New floor from X4: SDDL grant/deny matcher + runtime-path
+  # validator coverage parity sweep. 46 baseline tests + 15 new
+  # named drift tests = 61 total pinned.
+  "windows_paths:61"
 )
 
 run_module() {
