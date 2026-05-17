@@ -1056,4 +1056,216 @@ mod tests {
             "schema_version bump must be deliberate"
         );
     }
+
+    // ---- X4: SDDL + path-validator coverage parity sweep -------------
+
+    /// Simple allow ACE for World registers as a grant. Baseline
+    /// positive case anchors the matcher against silent regression
+    /// where the allow-token recognition stops working.
+    #[test]
+    fn sddl_grants_principal_returns_true_for_simple_allow_ace_for_wd() {
+        assert!(sddl_grants_principal("D:P(A;;FA;;;WD)", "WD"));
+    }
+
+    /// Deny ACE for World does NOT register as a grant. Pins the
+    /// allow-vs-deny split that the broader-principal drift check
+    /// depends on (a deny WD ACE strengthens the ACL and must not
+    /// trip the forbidden-grant rejection).
+    #[test]
+    fn sddl_grants_principal_returns_false_for_deny_ace_for_wd() {
+        assert!(
+            !sddl_grants_principal("D:P(D;;FA;;;WD)", "WD"),
+            "deny ACE for WD must not register as a grant"
+        );
+    }
+
+    /// Deny ACE for World registers as a deny. Mirror of the grant
+    /// positive — confirms the deny-matcher works against the same
+    /// principal so the deny-LocalSystem / deny-Admins guards have
+    /// teeth.
+    #[test]
+    fn sddl_denies_principal_returns_true_for_deny_ace_for_wd() {
+        assert!(sddl_denies_principal("D:P(D;;FA;;;WD)", "WD"));
+    }
+
+    /// Allow ACE for World does NOT register as a deny. Inverse of
+    /// the grant positive; protects against a future refactor that
+    /// collapses both checks into one and over-triggers.
+    #[test]
+    fn sddl_denies_principal_returns_false_for_allow_ace_for_wd() {
+        assert!(
+            !sddl_denies_principal("D:P(A;;FA;;;WD)", "WD"),
+            "allow ACE for WD must not register as a deny"
+        );
+    }
+
+    /// Substring-only principal match must NOT trip. A SID-string
+    /// that happens to contain "WD" as a substring (e.g. a custom
+    /// SID with `WDXY`) must not be flagged. The matcher anchors on
+    /// the `;;;principal)` terminator, so the trailing `)` after the
+    /// exact principal token is load-bearing.
+    #[test]
+    fn sddl_grants_principal_exact_matches_only_wd_not_substring_match() {
+        assert!(
+            !sddl_grants_principal("D:P(A;;FA;;;WDXY)", "WD"),
+            "principal substring match must not register as a grant"
+        );
+    }
+
+    /// Authenticated Users (`AU`) allow ACE on a DPAPI blob must
+    /// trip the broader-principal guard inside the local secret
+    /// evaluator. Pins parity with the runtime evaluator's
+    /// forbidden-principal coverage.
+    #[test]
+    fn evaluate_windows_local_secret_acl_sddl_rejects_authenticated_users_grant() {
+        let sddl = "O:S-1-5-80-9999D:P(A;;FA;;;SY)(A;;FA;;;AU)";
+        let err = evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect_err("AU allow ACE on dpapi blob must fail");
+        assert!(
+            err.contains("broader-than-reviewed Windows principal") && err.contains("AU"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Anonymous (`AN`) allow ACE on the *runtime* evaluator must
+    /// be rejected via the owner whitelist: even though `AN` is not
+    /// in FORBIDDEN_WELL_KNOWN_SDDL_PRINCIPALS today (so the
+    /// protected-DACL helper does not flag the allow ACE itself),
+    /// the runtime evaluator's owner check rejects any owner that
+    /// is not LocalSystem / Builtin Administrators / service SID.
+    /// Pin that the anonymous-owner shape is rejected end-to-end so
+    /// any future refactor that softens the owner whitelist trips
+    /// a named drift failure.
+    #[test]
+    fn evaluate_windows_local_secret_acl_sddl_rejects_anonymous_grant() {
+        // Runtime evaluator path: `AN` owner + AN allow ACE fails
+        // at the owner whitelist. The local-secret evaluator does
+        // NOT enforce the owner whitelist (DPAPI blobs may live
+        // under per-user accounts), so this assertion lives on the
+        // runtime evaluator — that is where the reviewed-contract
+        // anonymous-owner guard exists.
+        let sddl = "O:ANG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_runtime_acl_sddl("state root", sddl, true)
+            .expect_err("anonymous owner must fail at runtime evaluator");
+        assert!(
+            err.contains("ACL owner must be LocalSystem"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Builtin Users (`BU`) allow ACE on a DPAPI blob must trip
+    /// the broader-principal guard. Pins parity with the runtime
+    /// evaluator forbidden-principal coverage.
+    #[test]
+    fn evaluate_windows_local_secret_acl_sddl_rejects_builtin_users_grant() {
+        let sddl = "O:S-1-5-80-9999D:P(A;;FA;;;SY)(A;;FA;;;BU)";
+        let err = evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect_err("BU allow ACE on dpapi blob must fail");
+        assert!(
+            err.contains("broader-than-reviewed Windows principal") && err.contains("BU"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Explicit World (`WD`) allow ACE on a DPAPI blob must trip
+    /// the broader-principal guard. Named drift case so removing
+    /// WD from the forbidden list ever in future is loud.
+    #[test]
+    fn evaluate_windows_local_secret_acl_sddl_rejects_world_grant() {
+        let sddl = "O:S-1-5-80-9999D:P(A;;FA;;;SY)(A;;FA;;;WD)";
+        let err = evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect_err("WD allow ACE on dpapi blob must fail");
+        assert!(
+            err.contains("broader-than-reviewed Windows principal") && err.contains("WD"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Reviewed posture: service SID owner + LocalSystem and
+    /// Builtin Administrators allow ACEs validate cleanly on a
+    /// DPAPI blob (file, not directory). Anchors the happy path so
+    /// any future tightening that breaks the canonical secret-ACL
+    /// posture is caught by name.
+    #[test]
+    fn evaluate_windows_local_secret_acl_sddl_accepts_service_sid_owner_and_localsystem_grant() {
+        let sddl = "O:S-1-5-80-9999D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect("service SID owner + SY + BA must validate on a DPAPI blob");
+    }
+
+    /// SDDL missing the `O:` owner prefix must fail. The local
+    /// secret evaluator demands an owner entry to prevent untrusted
+    /// owner takeover.
+    #[test]
+    fn evaluate_windows_local_secret_acl_sddl_rejects_when_owner_entry_missing() {
+        let sddl = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+        let err = evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect_err("missing owner entry must fail");
+        assert!(
+            err.contains("must expose an owner entry"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// SDDL missing the `D:` DACL marker must fail before owner
+    /// inspection. The protected-DACL helper is the first guard
+    /// inside the local-secret evaluator.
+    #[test]
+    fn evaluate_windows_local_secret_acl_sddl_rejects_when_dacl_marker_missing() {
+        let sddl = "O:S-1-5-80-9999";
+        let err = evaluate_windows_local_secret_acl_sddl("dpapi blob", sddl, false)
+            .expect_err("missing DACL marker must fail");
+        assert!(
+            err.contains("must expose a Windows DACL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// UNC paths (`\\fileserver\share\foo`) must reject. Remote
+    /// filesystems can be repointed by an attacker controlling the
+    /// share, breaking the reviewed-root contract.
+    #[test]
+    fn validate_windows_runtime_file_path_rejects_unc_paths() {
+        let err = validate_windows_runtime_file_path(
+            Path::new(r"\\fileserver\share\RustyNet\rustynetd.state"),
+            "state path",
+        )
+        .expect_err("UNC path must fail");
+        assert!(
+            err.contains("must not use a remote or UNC filesystem path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// User Temp paths under `C:\Users\...\AppData\Local\Temp` are
+    /// writable by low-privilege users and must reject. The
+    /// reviewed runtime roots live under `C:\ProgramData\RustyNet`;
+    /// any user-temp location is per-definition outside that root.
+    #[test]
+    fn validate_windows_runtime_file_path_rejects_user_temp_paths() {
+        let err = validate_windows_runtime_file_path(
+            Path::new(r"C:\Users\Public\AppData\Local\Temp\rustynetd.state"),
+            "state path",
+        )
+        .expect_err("user-temp path must fail");
+        assert!(
+            err.contains("reviewed RustyNet Windows runtime roots"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Canonical state file under `C:\ProgramData\RustyNet` must
+    /// validate. Mirror of the existing reviewed-path positive but
+    /// named explicitly to anchor the X4 parity sweep.
+    #[test]
+    fn validate_windows_runtime_file_path_accepts_canonical_program_data_paths() {
+        let result = validate_windows_runtime_file_path(
+            Path::new(r"C:\ProgramData\RustyNet\rustynetd.state"),
+            "state path",
+        );
+        assert!(
+            result.is_ok(),
+            "canonical ProgramData state path must validate: {result:?}"
+        );
+    }
 }
