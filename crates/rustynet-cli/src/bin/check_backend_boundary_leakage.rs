@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -25,12 +26,15 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let repo_root = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     if !command_exists("rg") {
-        eprintln!("missing required command: rg");
-        return Err(1);
+        eprintln!(
+            "error [{}]: missing required command: rg",
+            ExitCode::ConfigError
+        );
+        return Err(ExitCode::ConfigError.as_i32());
     }
 
     let status = Command::new("rg")
@@ -40,20 +44,35 @@ fn run() -> Result<(), i32> {
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to execute rg backend boundary scan: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to execute rg backend boundary scan: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
 
+    // ripgrep exit code conventions: 0 = matches found, 1 = no matches,
+    // 2 = error. Match-found (success) means a WireGuard token leaked
+    // into a backend-agnostic crate — a hard policy violation.
     if status.success() {
-        println!("backend boundary leakage gate failed");
-        return Err(1);
+        eprintln!(
+            "error [{}]: backend boundary leakage detected (WireGuard tokens in backend-agnostic crates)",
+            ExitCode::PolicyReject
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
     }
     if status.code() == Some(1) {
         println!("Backend boundary leakage checks: PASS");
         return Ok(());
     }
 
-    Err(status_code(status))
+    // rg failed to run cleanly (exit 2 or signal); surface as transient.
+    eprintln!(
+        "error [{}]: rg backend boundary scan failed (status {})",
+        ExitCode::TransientFailure,
+        status_code(status)
+    );
+    Err(ExitCode::TransientFailure.as_i32())
 }
 
 fn repo_root() -> Result<PathBuf, String> {

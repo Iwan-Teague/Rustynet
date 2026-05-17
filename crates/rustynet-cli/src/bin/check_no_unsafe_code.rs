@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -18,8 +19,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let scan_root = env::var_os("RUSTYNET_UNSAFE_SCAN_ROOT")
         .filter(|value| !value.is_empty())
@@ -39,13 +40,30 @@ fn run() -> Result<(), i32> {
         .arg(&scan_root)
         .status()
         .map_err(|err| {
-            eprintln!("failed to execute unsafe source scanner: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to execute unsafe source scanner: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
-        Err(status_code(status))
+        // A scanner non-zero verdict means `unsafe` code was found —
+        // a hard policy violation. If the inner ops command already
+        // emitted a taxonomy code (64/65/70/78), pass it through;
+        // otherwise re-classify a bare GenericFailure as PolicyReject
+        // so CI retry-on-70 loops cannot mask a real `unsafe` find.
+        let inner = status_code(status);
+        if inner == ExitCode::GenericFailure.as_i32() {
+            eprintln!(
+                "error [{}]: unsafe Rust sources detected by scanner",
+                ExitCode::PolicyReject
+            );
+            Err(ExitCode::PolicyReject.as_i32())
+        } else {
+            Err(inner)
+        }
     }
 }
 
