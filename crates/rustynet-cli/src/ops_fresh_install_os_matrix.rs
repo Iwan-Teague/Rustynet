@@ -441,6 +441,65 @@ fn resolve_artifact_path_for_verify(
     Ok(fs::canonicalize(resolved).unwrap_or_else(|_| PathBuf::from(raw)))
 }
 
+/// X2: Phase A typed view for the top-level shape of the fresh
+/// install OS matrix structured report consumed by
+/// `execute_ops_verify_linux_fresh_install_os_matrix_readiness`.
+///
+/// The reviewed contract pins:
+///
+/// - `schema_version: u64` — must deserialize as an unsigned integer;
+///   the downstream check still enforces the value (`== 1`).
+/// - `evidence_mode: String` — must deserialize as a string; the
+///   downstream check still enforces the value (`"measured"`).
+/// - `environment: String` — must deserialize as a non-empty string
+///   (emptiness is enforced downstream by
+///   `require_nonempty_string_field` via `into_value_map`).
+/// - `captured_at_unix: u64` — must deserialize as an unsigned
+///   integer; positivity and freshness are enforced downstream.
+/// - `git_commit: String` — must deserialize as a string; the
+///   downstream check still enforces the SHA-40 hex shape.
+///
+/// Everything else (security_assertions, scenarios, source_artifacts,
+/// etc.) rides through `#[serde(flatten)] extra: Map<String, Value>`
+/// so the downstream Map-walking validation logic keeps working.
+/// `into_value_map` re-injects the typed fields so the caller sees
+/// the full report shape.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FreshInstallOsMatrixReportView {
+    schema_version: u64,
+    evidence_mode: String,
+    environment: String,
+    captured_at_unix: u64,
+    git_commit: String,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl FreshInstallOsMatrixReportView {
+    /// Bridge the typed view back to a `Map<String, Value>` for
+    /// downstream code that still walks the report generically. Adds
+    /// the typed fields back into the map so callers see the full
+    /// report shape.
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert(
+            "schema_version".to_string(),
+            Value::Number(self.schema_version.into()),
+        );
+        m.insert(
+            "evidence_mode".to_string(),
+            Value::String(self.evidence_mode),
+        );
+        m.insert("environment".to_string(), Value::String(self.environment));
+        m.insert(
+            "captured_at_unix".to_string(),
+            Value::Number(self.captured_at_unix.into()),
+        );
+        m.insert("git_commit".to_string(), Value::String(self.git_commit));
+        m
+    }
+}
+
 fn validate_measured_child_report_for_verify(
     report_path: &Path,
     label: &str,
@@ -1120,28 +1179,42 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
             report_path.display()
         )
     })?;
-    let payload = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
-        format!(
-            "parse fresh install OS matrix report JSON failed ({}): {err}",
-            report_path.display()
-        )
-    })?;
-    let payload = payload
-        .as_object()
-        .ok_or_else(|| "fresh install OS matrix report must be a JSON object".to_string())?;
+    // X2: Phase A typed view migration. The top-level shape now goes
+    // through `FreshInstallOsMatrixReportView`, which pins
+    // `schema_version`, `evidence_mode`, `environment`,
+    // `captured_at_unix`, and `git_commit` with serde required-field
+    // semantics. A missing or wrong-type required field fails at
+    // deserialize with a precise error tied to
+    // `fresh_install_os_matrix_report`. Downstream Map-walking logic
+    // (security_assertions, scenarios, source_artifacts, etc.) is
+    // unchanged and consumes the report through `into_value_map`.
+    let typed_report: FreshInstallOsMatrixReportView = serde_json::from_str(body.as_str())
+        .map_err(|err| {
+            format!(
+                "parse fresh install OS matrix report failed ({}): {err}",
+                report_path.display()
+            )
+        })?;
 
-    if payload.get("schema_version").and_then(Value::as_u64) != Some(1) {
+    if typed_report.schema_version != 1 {
         return Err("fresh install OS matrix report must set schema_version=1".to_string());
     }
-    if payload.get("evidence_mode").and_then(Value::as_str) != Some("measured") {
+    if typed_report.evidence_mode != "measured" {
         return Err("fresh install OS matrix report must set evidence_mode=measured".to_string());
     }
-    require_nonempty_string_field(payload, "environment", "fresh_install_os_matrix_report")?;
-    let captured_at_unix = require_positive_u64_field(
-        payload,
-        "captured_at_unix",
-        "fresh_install_os_matrix_report",
-    )?;
+    if typed_report.environment.trim().is_empty() {
+        return Err(
+            "fresh_install_os_matrix_report requires non-empty string field: environment"
+                .to_string(),
+        );
+    }
+    let captured_at_unix = typed_report.captured_at_unix;
+    if captured_at_unix == 0 {
+        return Err(
+            "fresh_install_os_matrix_report requires positive integer field: captured_at_unix"
+                .to_string(),
+        );
+    }
     validate_timestamp(
         captured_at_unix,
         "fresh_install_os_matrix_report",
@@ -1149,8 +1222,13 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
         max_age_seconds,
     )?;
 
-    let git_commit =
-        require_nonempty_string_field(payload, "git_commit", "fresh_install_os_matrix_report")?;
+    let git_commit = typed_report.git_commit.clone();
+    if git_commit.trim().is_empty() {
+        return Err(
+            "fresh_install_os_matrix_report requires non-empty string field: git_commit"
+                .to_string(),
+        );
+    }
     if !is_lower_hex_sha40(git_commit.as_str()) {
         return Err(
             "fresh install OS matrix report git_commit must be a 40-char lowercase hex SHA"
@@ -1184,6 +1262,9 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
 
     let mut visited_reports = HashSet::new();
     visited_reports.insert(fs::canonicalize(report_path.as_path()).unwrap_or(report_path.clone()));
+    // X2: bridge the typed view back to a Map for downstream walking.
+    let payload = typed_report.into_value_map();
+    let payload = &payload;
     let source_artifacts = payload.get("source_artifacts").ok_or_else(|| {
         "fresh_install_os_matrix_report requires non-empty source_artifacts list".to_string()
     })?;
@@ -1695,10 +1776,10 @@ pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
 #[cfg(test)]
 mod tests {
     use super::{
-        WriteFreshInstallOsMatrixReadinessFixturesConfig,
+        FreshInstallOsMatrixReportView, WriteFreshInstallOsMatrixReadinessFixturesConfig,
         execute_ops_write_fresh_install_os_matrix_readiness_fixtures, parse_json_object,
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1754,5 +1835,127 @@ mod tests {
         }));
 
         fs::remove_dir_all(output_dir.as_path()).expect("cleanup fixture temp dir");
+    }
+
+    // ---- X2: FreshInstallOsMatrixReportView typed-view migration ------
+
+    /// Clean fixture: a well-formed top-level shape deserializes into
+    /// the typed view, the typed fields land in their slots, and the
+    /// remaining keys ride through `#[serde(flatten)] extra`.
+    #[test]
+    fn fresh_install_report_view_accepts_clean_top_level() {
+        let payload = json!({
+            "schema_version": 1,
+            "evidence_mode": "measured",
+            "environment": "live_linux_lab",
+            "captured_at_unix": 1_700_000_000u64,
+            "git_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "security_assertions": { "default_deny_enforced": true },
+            "scenarios": { "ubuntu_22_04": { "status": "pass" } },
+            "source_artifacts": ["evidence/log_one.json"],
+        });
+        let view: FreshInstallOsMatrixReportView =
+            serde_json::from_value(payload).expect("typed view accepts clean top-level shape");
+        assert_eq!(view.schema_version, 1);
+        assert_eq!(view.evidence_mode, "measured");
+        assert_eq!(view.environment, "live_linux_lab");
+        assert_eq!(view.captured_at_unix, 1_700_000_000);
+        assert_eq!(view.git_commit, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(view.extra.contains_key("security_assertions"));
+        assert!(view.extra.contains_key("scenarios"));
+        assert!(view.extra.contains_key("source_artifacts"));
+    }
+
+    /// Missing required field rejected with a precise error naming
+    /// the field. `git_commit` is required-string; omitting it must
+    /// fail at deserialize with a message that includes the field
+    /// name.
+    #[test]
+    fn fresh_install_report_view_rejects_missing_required_field() {
+        let payload = json!({
+            "schema_version": 1,
+            "evidence_mode": "measured",
+            "environment": "live_linux_lab",
+            "captured_at_unix": 1_700_000_000u64,
+        });
+        let err = serde_json::from_value::<FreshInstallOsMatrixReportView>(payload)
+            .expect_err("missing git_commit must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("git_commit"),
+            "error must name the missing required field: {message}"
+        );
+    }
+
+    /// Wrong-type required field rejected at deserialize.
+    /// `schema_version` is typed `u64`; supplying a string must fail
+    /// at parse, not later via `as_u64()` returning `None`.
+    #[test]
+    fn fresh_install_report_view_rejects_wrong_type_required_field() {
+        let payload = json!({
+            "schema_version": "one",
+            "evidence_mode": "measured",
+            "environment": "live_linux_lab",
+            "captured_at_unix": 1_700_000_000u64,
+            "git_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        });
+        let err = serde_json::from_value::<FreshInstallOsMatrixReportView>(payload)
+            .expect_err("string schema_version must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("schema_version") || message.contains("u64"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// `into_value_map` round-trips: typed fields are re-injected and
+    /// flattened extras are preserved verbatim for downstream walks.
+    #[test]
+    fn fresh_install_report_view_into_value_map_round_trips() {
+        let payload = json!({
+            "schema_version": 1,
+            "evidence_mode": "measured",
+            "environment": "live_linux_lab",
+            "captured_at_unix": 1_700_000_000u64,
+            "git_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "security_assertions": { "default_deny_enforced": true },
+            "scenarios": { "ubuntu_22_04": { "status": "pass" } },
+        });
+        let view: FreshInstallOsMatrixReportView =
+            serde_json::from_value(payload).expect("typed view parses");
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("schema_version").and_then(Value::as_u64),
+            Some(1),
+            "schema_version must round-trip"
+        );
+        assert_eq!(
+            map.get("evidence_mode").and_then(Value::as_str),
+            Some("measured"),
+            "evidence_mode must round-trip"
+        );
+        assert_eq!(
+            map.get("environment").and_then(Value::as_str),
+            Some("live_linux_lab"),
+            "environment must round-trip"
+        );
+        assert_eq!(
+            map.get("captured_at_unix").and_then(Value::as_u64),
+            Some(1_700_000_000),
+            "captured_at_unix must round-trip"
+        );
+        assert_eq!(
+            map.get("git_commit").and_then(Value::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "git_commit must round-trip"
+        );
+        assert!(
+            map.contains_key("security_assertions"),
+            "flattened extras must be preserved"
+        );
+        assert!(
+            map.contains_key("scenarios"),
+            "flattened extras must be preserved"
+        );
     }
 }
