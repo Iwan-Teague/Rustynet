@@ -11,6 +11,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -778,18 +779,50 @@ fn decode_first_dns_answer(
     Ok((rcode, answer_count, answer_ip, answer_ttl))
 }
 
-fn is_plaintext_no_leak_report(payload: &Map<String, Value>) -> Result<(), String> {
-    if payload.get("status").and_then(Value::as_str) != Some(CHECK_PASS) {
+/// X2: Phase A typed view for the no-leak dataplane report consumed by
+/// `execute_ops_verify_no_leak_dataplane_report`. Pins the two fields the
+/// gate actually inspects:
+///   - `status` (`String`) is the top-level overall status — the gate
+///     fails closed unless it equals `CHECK_PASS`.
+///   - `checks` (`Map<String, Value>`) is the per-check map. Values stay
+///     `Value` so the validator preserves the legacy behaviour of
+///     treating any non-`"pass"` string *or* non-string value (number,
+///     null, object) as a failed check, rather than rejecting the whole
+///     report at parse time.
+///
+/// Unknown top-level fields ride through `extra` so existing report
+/// envelopes (e.g. `phase`, `mode`, `metrics`, `source_artifacts`)
+/// continue to parse. `into_value_map` re-injects the typed fields so
+/// Map-walking consumers keep working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveLabOrchestratorNoLeakReportView {
+    status: String,
+    checks: Map<String, Value>,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl LiveLabOrchestratorNoLeakReportView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("status".to_string(), Value::String(self.status));
+        m.insert("checks".to_string(), Value::Object(self.checks));
+        m
+    }
+}
+
+fn is_plaintext_no_leak_report(
+    payload: &LiveLabOrchestratorNoLeakReportView,
+) -> Result<(), String> {
+    if payload.status != CHECK_PASS {
         return Err("no-leak dataplane report status must be pass".to_string());
     }
-    let checks = payload
-        .get("checks")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "no-leak dataplane report must contain non-empty checks".to_string())?;
-    if checks.is_empty() {
+    if payload.checks.is_empty() {
         return Err("no-leak dataplane report must contain non-empty checks".to_string());
     }
-    let failed = checks
+    let failed = payload
+        .checks
         .iter()
         .filter_map(|(key, value)| {
             if value.as_str() == Some(CHECK_PASS) {
@@ -2488,16 +2521,22 @@ pub fn execute_ops_verify_no_leak_dataplane_report(
     let report_path = resolve_path(config.report_path.as_path())?;
     let body = fs::read_to_string(report_path.as_path())
         .map_err(|err| format!("missing no-leak report: {} ({err})", report_path.display()))?;
-    let payload = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+    let raw: Value = serde_json::from_str(body.as_str()).map_err(|err| {
         format!(
             "invalid no-leak report JSON ({}): {err}",
             report_path.display()
         )
     })?;
-    let object = payload
-        .as_object()
-        .ok_or_else(|| "no-leak dataplane report must be a JSON object".to_string())?;
-    is_plaintext_no_leak_report(object)?;
+    if !raw.is_object() {
+        return Err("no-leak dataplane report must be a JSON object".to_string());
+    }
+    let view: LiveLabOrchestratorNoLeakReportView = serde_json::from_value(raw).map_err(|err| {
+        format!(
+            "invalid no-leak report shape ({}): {err}",
+            report_path.display()
+        )
+    })?;
+    is_plaintext_no_leak_report(&view)?;
     Ok("No-leak dataplane gate: PASS".to_string())
 }
 
@@ -3682,5 +3721,209 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         );
 
         let _ = fs::remove_dir_all(stage_dir);
+    }
+}
+
+#[cfg(test)]
+mod typed_parser_tests {
+    use super::{LiveLabOrchestratorNoLeakReportView, is_plaintext_no_leak_report};
+    use serde_json::{Value, json};
+
+    fn clean_payload() -> Value {
+        json!({
+            "phase": "phase10",
+            "mode": "real_netns_no_leak_under_load",
+            "evidence_mode": "measured",
+            "environment": "lab-netns",
+            "captured_at": "2026-05-16T12:00:00Z",
+            "captured_at_unix": 1_779_148_800_u64,
+            "status": "pass",
+            "checks": {
+                "tunnel_up_connectivity": "pass",
+                "load_ping_success": "pass",
+                "tunnel_transport_observed_under_load": "pass",
+                "no_underlay_cleartext_during_load": "pass",
+                "tunnel_down_fail_closed": "pass",
+                "no_underlay_cleartext_after_tunnel_down": "pass",
+            },
+            "metrics": {
+                "load_tunnel_packets": 1_u64,
+                "load_cleartext_packets": 0_u64,
+                "down_cleartext_packets": 0_u64,
+            },
+            "source_artifacts": ["/tmp/load.pcap", "/tmp/down.pcap"],
+        })
+    }
+
+    #[test]
+    fn no_leak_report_view_parses_clean_fixture() {
+        let view: LiveLabOrchestratorNoLeakReportView =
+            serde_json::from_value(clean_payload()).expect("clean parse");
+        assert_eq!(view.status, "pass");
+        assert_eq!(view.checks.len(), 6);
+        assert_eq!(
+            view.checks
+                .get("tunnel_up_connectivity")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+        // Unknown top-level fields ride through `extra`.
+        assert_eq!(
+            view.extra.get("phase").and_then(Value::as_str),
+            Some("phase10")
+        );
+        assert_eq!(
+            view.extra.get("mode").and_then(Value::as_str),
+            Some("real_netns_no_leak_under_load")
+        );
+        assert!(view.extra.contains_key("metrics"));
+        assert!(view.extra.contains_key("source_artifacts"));
+        // The typed fields must NOT also appear under `extra` (serde
+        // strips them before the flatten happens).
+        assert!(!view.extra.contains_key("status"));
+        assert!(!view.extra.contains_key("checks"));
+    }
+
+    #[test]
+    fn no_leak_report_view_rejects_missing_status() {
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap().remove("status");
+        let err =
+            serde_json::from_value::<LiveLabOrchestratorNoLeakReportView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("status"),
+            "missing-required-field message must name `status`: {err}"
+        );
+    }
+
+    #[test]
+    fn no_leak_report_view_rejects_missing_checks() {
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap().remove("checks");
+        let err =
+            serde_json::from_value::<LiveLabOrchestratorNoLeakReportView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("checks"),
+            "missing-required-field message must name `checks`: {err}"
+        );
+    }
+
+    #[test]
+    fn no_leak_report_view_rejects_wrong_type_status() {
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap()["status"] = json!(0_i64);
+        let err =
+            serde_json::from_value::<LiveLabOrchestratorNoLeakReportView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("string"),
+            "wrong-type message must mention `string`: {err}"
+        );
+    }
+
+    #[test]
+    fn no_leak_report_view_rejects_wrong_type_checks() {
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap()["checks"] = json!("not-an-object");
+        let err =
+            serde_json::from_value::<LiveLabOrchestratorNoLeakReportView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("map")
+                || err.to_string().to_ascii_lowercase().contains("object"),
+            "wrong-type message must mention map/object: {err}"
+        );
+    }
+
+    #[test]
+    fn no_leak_report_view_into_value_map_round_trips() {
+        let view: LiveLabOrchestratorNoLeakReportView =
+            serde_json::from_value(clean_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(map.get("status").and_then(Value::as_str), Some("pass"));
+        let checks = map
+            .get("checks")
+            .and_then(Value::as_object)
+            .expect("checks re-injected as object");
+        assert_eq!(checks.len(), 6);
+        assert_eq!(
+            checks.get("tunnel_up_connectivity").and_then(Value::as_str),
+            Some("pass")
+        );
+        // Extra fields preserved.
+        assert_eq!(map.get("phase").and_then(Value::as_str), Some("phase10"));
+        assert!(map.contains_key("metrics"));
+        assert!(map.contains_key("source_artifacts"));
+    }
+
+    #[test]
+    fn is_plaintext_no_leak_report_accepts_all_pass_payload() {
+        let view: LiveLabOrchestratorNoLeakReportView =
+            serde_json::from_value(clean_payload()).expect("clean parse");
+        is_plaintext_no_leak_report(&view).expect("all-pass payload must validate");
+    }
+
+    #[test]
+    fn is_plaintext_no_leak_report_rejects_top_level_non_pass_status() {
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap()["status"] = json!("fail");
+        let view: LiveLabOrchestratorNoLeakReportView =
+            serde_json::from_value(payload).expect("clean parse");
+        let err = is_plaintext_no_leak_report(&view).unwrap_err();
+        assert_eq!(err, "no-leak dataplane report status must be pass");
+    }
+
+    #[test]
+    fn is_plaintext_no_leak_report_rejects_empty_checks_map() {
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap()["checks"] = json!({});
+        let view: LiveLabOrchestratorNoLeakReportView =
+            serde_json::from_value(payload).expect("clean parse");
+        let err = is_plaintext_no_leak_report(&view).unwrap_err();
+        assert_eq!(
+            err,
+            "no-leak dataplane report must contain non-empty checks"
+        );
+    }
+
+    #[test]
+    fn is_plaintext_no_leak_report_lists_failed_checks() {
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap()["checks"] = json!({
+            "tunnel_up_connectivity": "pass",
+            "load_ping_success": "fail",
+            "no_underlay_cleartext_during_load": "fail",
+        });
+        let view: LiveLabOrchestratorNoLeakReportView =
+            serde_json::from_value(payload).expect("clean parse");
+        let err = is_plaintext_no_leak_report(&view).unwrap_err();
+        assert!(
+            err.starts_with("no-leak dataplane checks failed:"),
+            "error must list failures with the legacy prefix: {err}"
+        );
+        assert!(err.contains("load_ping_success"));
+        assert!(err.contains("no_underlay_cleartext_during_load"));
+        assert!(
+            !err.contains("tunnel_up_connectivity"),
+            "passed checks must not appear in the failure list: {err}"
+        );
+    }
+
+    #[test]
+    fn is_plaintext_no_leak_report_flags_non_string_check_values_as_failed() {
+        // Legacy behaviour: non-string values (numbers, null, nested
+        // objects) are treated as a failed check rather than aborting
+        // the parse. Pin that here so future refactors do not regress
+        // the typed view into a stricter shape.
+        let mut payload = clean_payload();
+        payload.as_object_mut().unwrap()["checks"] = json!({
+            "tunnel_up_connectivity": 1_i64,
+            "load_ping_success": Value::Null,
+            "tunnel_transport_observed_under_load": "pass",
+        });
+        let view: LiveLabOrchestratorNoLeakReportView =
+            serde_json::from_value(payload).expect("clean parse");
+        let err = is_plaintext_no_leak_report(&view).unwrap_err();
+        assert!(err.contains("tunnel_up_connectivity"));
+        assert!(err.contains("load_ping_success"));
+        assert!(!err.contains("tunnel_transport_observed_under_load"));
     }
 }
