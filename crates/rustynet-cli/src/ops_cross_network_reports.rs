@@ -641,65 +641,236 @@ fn parse_key_value_artifact(path: &Path) -> Result<HashMap<String, String>, Stri
     Ok(out)
 }
 
+/// X2: Phase A typed view for the SSH trust summary artifact. Unlike
+/// the soak-monitor and report-payload views (which deserialize JSON),
+/// this artifact is the key=value text format produced by
+/// `parse_key_value_artifact`. The typed view is therefore populated
+/// field-by-field from the parsed `HashMap<String, String>` rather than
+/// via `serde_json::from_value`, but the contract goal is identical:
+/// pin every required scalar (schema_version, the two pinned-known-
+/// hosts fields, the two all-targets flags, target_count) and every
+/// per-target scalar (target, configured_transport, checked_candidates,
+/// matched_candidate, host_key_status, passwordless_sudo_status) into a
+/// typed slot so downstream walkers no longer rely on raw `HashMap`
+/// lookups by stringly-typed keys.
+///
+/// Required string fields are stored as `Option<String>` so the
+/// validator can preserve the existing per-field "must be a non-empty
+/// string" / "must equal ..." error messages instead of bailing on the
+/// first missing key. `target_count` is `Option<usize>` because the
+/// validator must distinguish "missing/non-integer" from "zero". Any
+/// key not consumed by a typed slot rides through `extra` so callers
+/// can still inspect forward-compatible additions.
+#[derive(Debug, Clone, Default)]
+struct CrossNetworkSshTrustSummaryView {
+    schema_version: Option<String>,
+    pinned_known_hosts_file: Option<String>,
+    pinned_known_hosts_sha256: Option<String>,
+    all_targets_pinned: Option<String>,
+    all_targets_passwordless_sudo: Option<String>,
+    target_count: Option<usize>,
+    /// Raw `target_count` value as it appeared in the artifact, kept
+    /// so the validator can disambiguate "key missing/invalid" from
+    /// "key parsed to zero".
+    target_count_raw: Option<String>,
+    targets: Vec<CrossNetworkSshTrustTargetView>,
+    /// Extra (non-required) keys carried through verbatim. Round-tripped
+    /// by `into_key_value_map`.
+    #[allow(dead_code)]
+    extra: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CrossNetworkSshTrustTargetView {
+    target: Option<String>,
+    configured_transport: Option<String>,
+    checked_candidates: Option<String>,
+    matched_candidate: Option<String>,
+    host_key_status: Option<String>,
+    passwordless_sudo_status: Option<String>,
+}
+
+impl CrossNetworkSshTrustSummaryView {
+    /// Populate the typed view from the raw key=value HashMap. Each
+    /// required scalar is moved into its typed slot; per-target fields
+    /// are pulled by `target[N].<field>` until `target_count` slots are
+    /// filled. Anything left in the HashMap that wasn't consumed flows
+    /// into `extra` so downstream walkers see forward-compatible keys.
+    ///
+    /// Empty strings are treated as `None` so the validator can emit
+    /// the existing "must be a non-empty string" message uniformly for
+    /// both "key missing" and "key present but blank".
+    fn from_key_value(mut summary: HashMap<String, String>) -> Self {
+        fn take_non_empty(map: &mut HashMap<String, String>, key: &str) -> Option<String> {
+            map.remove(key)
+                .and_then(|value| (!value.trim().is_empty()).then_some(value))
+        }
+
+        let schema_version = take_non_empty(&mut summary, "schema_version");
+        let pinned_known_hosts_file = take_non_empty(&mut summary, "pinned_known_hosts_file");
+        let pinned_known_hosts_sha256 = take_non_empty(&mut summary, "pinned_known_hosts_sha256");
+        let all_targets_pinned = take_non_empty(&mut summary, "all_targets_pinned");
+        let all_targets_passwordless_sudo =
+            take_non_empty(&mut summary, "all_targets_passwordless_sudo");
+        let target_count_raw = summary.remove("target_count");
+        let target_count = target_count_raw
+            .as_deref()
+            .and_then(|value| value.trim().parse::<usize>().ok());
+
+        let mut targets = Vec::new();
+        if let Some(count) = target_count {
+            for index in 0..count {
+                let target_key = format!("target[{index}].target");
+                let configured_transport_key = format!("target[{index}].configured_transport");
+                let checked_candidates_key = format!("target[{index}].checked_candidates");
+                let matched_candidate_key = format!("target[{index}].matched_candidate");
+                let host_key_status_key = format!("target[{index}].host_key_status");
+                let passwordless_sudo_status_key =
+                    format!("target[{index}].passwordless_sudo_status");
+                targets.push(CrossNetworkSshTrustTargetView {
+                    target: take_non_empty(&mut summary, target_key.as_str()),
+                    configured_transport: take_non_empty(
+                        &mut summary,
+                        configured_transport_key.as_str(),
+                    ),
+                    checked_candidates: take_non_empty(
+                        &mut summary,
+                        checked_candidates_key.as_str(),
+                    ),
+                    matched_candidate: take_non_empty(&mut summary, matched_candidate_key.as_str()),
+                    host_key_status: take_non_empty(&mut summary, host_key_status_key.as_str()),
+                    passwordless_sudo_status: take_non_empty(
+                        &mut summary,
+                        passwordless_sudo_status_key.as_str(),
+                    ),
+                });
+            }
+        }
+
+        Self {
+            schema_version,
+            pinned_known_hosts_file,
+            pinned_known_hosts_sha256,
+            all_targets_pinned,
+            all_targets_passwordless_sudo,
+            target_count,
+            target_count_raw,
+            targets,
+            extra: summary,
+        }
+    }
+
+    /// Bridge the typed view back to a `HashMap<String, String>` for
+    /// any downstream helper that still walks the SSH trust summary
+    /// generically. Re-injects every typed scalar and every per-target
+    /// scalar at its original key, so the round-tripped map is
+    /// indistinguishable from the original parse modulo dropped
+    /// blank/empty fields (which the typed view treats as `None`).
+    /// Exercised by the typed-view round-trip test.
+    #[allow(dead_code)]
+    fn into_key_value_map(self) -> HashMap<String, String> {
+        let mut m = self.extra;
+        if let Some(value) = self.schema_version {
+            m.insert("schema_version".to_string(), value);
+        }
+        if let Some(value) = self.pinned_known_hosts_file {
+            m.insert("pinned_known_hosts_file".to_string(), value);
+        }
+        if let Some(value) = self.pinned_known_hosts_sha256 {
+            m.insert("pinned_known_hosts_sha256".to_string(), value);
+        }
+        if let Some(value) = self.all_targets_pinned {
+            m.insert("all_targets_pinned".to_string(), value);
+        }
+        if let Some(value) = self.all_targets_passwordless_sudo {
+            m.insert("all_targets_passwordless_sudo".to_string(), value);
+        }
+        if let Some(value) = self.target_count_raw {
+            m.insert("target_count".to_string(), value);
+        } else if let Some(count) = self.target_count {
+            m.insert("target_count".to_string(), count.to_string());
+        }
+        for (index, target) in self.targets.into_iter().enumerate() {
+            if let Some(value) = target.target {
+                m.insert(format!("target[{index}].target"), value);
+            }
+            if let Some(value) = target.configured_transport {
+                m.insert(format!("target[{index}].configured_transport"), value);
+            }
+            if let Some(value) = target.checked_candidates {
+                m.insert(format!("target[{index}].checked_candidates"), value);
+            }
+            if let Some(value) = target.matched_candidate {
+                m.insert(format!("target[{index}].matched_candidate"), value);
+            }
+            if let Some(value) = target.host_key_status {
+                m.insert(format!("target[{index}].host_key_status"), value);
+            }
+            if let Some(value) = target.passwordless_sudo_status {
+                m.insert(format!("target[{index}].passwordless_sudo_status"), value);
+            }
+        }
+        m
+    }
+}
+
 fn validate_ssh_trust_summary_artifact(path: &Path) -> Vec<String> {
+    // X2: Phase A typed view migration. The SSH trust summary now
+    // flows through `CrossNetworkSshTrustSummaryView::from_key_value`,
+    // which pins every required scalar (top-level + per-target) into a
+    // typed slot. The validator then drives every error message off
+    // typed fields rather than raw HashMap key lookups.
     let mut problems = Vec::new();
     let summary = match parse_key_value_artifact(path) {
         Ok(summary) => summary,
         Err(err) => return vec![err],
     };
+    let view = CrossNetworkSshTrustSummaryView::from_key_value(summary);
 
-    let expect_non_empty = |key: &str, problems: &mut Vec<String>| -> Option<String> {
-        let value = summary.get(key).cloned().unwrap_or_default();
-        if value.trim().is_empty() {
-            problems.push(format!(
-                "{}: {key} must be a non-empty string",
-                path.display()
-            ));
-            None
-        } else {
-            Some(value)
-        }
-    };
-
-    if summary.get("schema_version").map(String::as_str) != Some("1") {
+    if view.schema_version.as_deref() != Some("1") {
         problems.push(format!("{}: schema_version must equal 1", path.display()));
     }
-    if expect_non_empty("pinned_known_hosts_file", &mut problems).is_none() {
-        // recorded in problems
+    if view.pinned_known_hosts_file.is_none() {
+        problems.push(format!(
+            "{}: pinned_known_hosts_file must be a non-empty string",
+            path.display()
+        ));
     }
-    let pinned_known_hosts_sha256 = expect_non_empty("pinned_known_hosts_sha256", &mut problems);
-    if pinned_known_hosts_sha256.as_deref().is_some_and(|value| {
-        value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
+    if view.pinned_known_hosts_sha256.is_none() {
+        problems.push(format!(
+            "{}: pinned_known_hosts_sha256 must be a non-empty string",
+            path.display()
+        ));
+    }
+    if view
+        .pinned_known_hosts_sha256
+        .as_deref()
+        .is_some_and(|value| {
+            value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
         problems.push(format!(
             "{}: pinned_known_hosts_sha256 must be a 64-character lowercase hex digest",
             path.display()
         ));
     }
-    if summary.get("all_targets_pinned").map(String::as_str) != Some("true") {
+    if view.all_targets_pinned.as_deref() != Some("true") {
         problems.push(format!(
             "{}: all_targets_pinned must equal true",
             path.display()
         ));
     }
-    if summary
-        .get("all_targets_passwordless_sudo")
-        .map(String::as_str)
-        != Some("true")
-    {
+    if view.all_targets_passwordless_sudo.as_deref() != Some("true") {
         problems.push(format!(
             "{}: all_targets_passwordless_sudo must equal true",
             path.display()
         ));
     }
 
-    let target_count = summary
-        .get("target_count")
-        .and_then(|value| value.parse::<usize>().ok());
-    let Some(target_count) = target_count else {
+    let Some(target_count) = view.target_count else {
         problems.push(format!(
             "{}: target_count must be a positive integer",
             path.display()
@@ -713,7 +884,7 @@ fn validate_ssh_trust_summary_artifact(path: &Path) -> Vec<String> {
         ));
     }
 
-    for index in 0..target_count {
+    for (index, target) in view.targets.iter().enumerate() {
         let target_key = format!("target[{index}].target");
         let checked_candidates_key = format!("target[{index}].checked_candidates");
         let matched_candidate_key = format!("target[{index}].matched_candidate");
@@ -721,12 +892,32 @@ fn validate_ssh_trust_summary_artifact(path: &Path) -> Vec<String> {
         let passwordless_sudo_status_key = format!("target[{index}].passwordless_sudo_status");
         let configured_transport_key = format!("target[{index}].configured_transport");
 
-        let checked_candidates = expect_non_empty(checked_candidates_key.as_str(), &mut problems);
-        let matched_candidate = expect_non_empty(matched_candidate_key.as_str(), &mut problems);
-        let _target = expect_non_empty(target_key.as_str(), &mut problems);
-        let configured_transport =
-            expect_non_empty(configured_transport_key.as_str(), &mut problems);
-        if configured_transport
+        if target.checked_candidates.is_none() {
+            problems.push(format!(
+                "{}: {checked_candidates_key} must be a non-empty string",
+                path.display()
+            ));
+        }
+        if target.matched_candidate.is_none() {
+            problems.push(format!(
+                "{}: {matched_candidate_key} must be a non-empty string",
+                path.display()
+            ));
+        }
+        if target.target.is_none() {
+            problems.push(format!(
+                "{}: {target_key} must be a non-empty string",
+                path.display()
+            ));
+        }
+        if target.configured_transport.is_none() {
+            problems.push(format!(
+                "{}: {configured_transport_key} must be a non-empty string",
+                path.display()
+            ));
+        }
+        if target
+            .configured_transport
             .as_deref()
             .is_some_and(|value| !matches!(value, "ssh" | "utm"))
         {
@@ -735,29 +926,22 @@ fn validate_ssh_trust_summary_artifact(path: &Path) -> Vec<String> {
                 path.display()
             ));
         }
-        if summary
-            .get(host_key_status_key.as_str())
-            .map(String::as_str)
-            != Some(CHECK_PASS)
-        {
+        if target.host_key_status.as_deref() != Some(CHECK_PASS) {
             problems.push(format!(
                 "{}: {host_key_status_key} must equal pass",
                 path.display()
             ));
         }
-        if summary
-            .get(passwordless_sudo_status_key.as_str())
-            .map(String::as_str)
-            != Some(CHECK_PASS)
-        {
+        if target.passwordless_sudo_status.as_deref() != Some(CHECK_PASS) {
             problems.push(format!(
                 "{}: {passwordless_sudo_status_key} must equal pass",
                 path.display()
             ));
         }
-        if let (Some(checked_candidates), Some(matched_candidate)) =
-            (checked_candidates.as_deref(), matched_candidate.as_deref())
-        {
+        if let (Some(checked_candidates), Some(matched_candidate)) = (
+            target.checked_candidates.as_deref(),
+            target.matched_candidate.as_deref(),
+        ) {
             let matched = checked_candidates
                 .split(',')
                 .map(str::trim)
@@ -3617,6 +3801,213 @@ mod tests {
         );
         assert_eq!(
             map.get("extra_field").and_then(Value::as_str),
+            Some("ride-through"),
+            "scalar extras must be preserved verbatim"
+        );
+    }
+
+    /// Helper: build a clean key=value-text SSH trust summary as a
+    /// `HashMap<String, String>` matching the contract pinned by
+    /// `CrossNetworkSshTrustSummaryView`. The fixture covers the five
+    /// top-level required scalars, two targets (each with all six
+    /// per-target required scalars), and an extra ride-through key to
+    /// exercise the `extra` map.
+    fn clean_ssh_trust_summary_map() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("schema_version".to_string(), "1".to_string());
+        m.insert(
+            "pinned_known_hosts_file".to_string(),
+            "/tmp/rustynet-known_hosts".to_string(),
+        );
+        m.insert("pinned_known_hosts_sha256".to_string(), "b".repeat(64));
+        m.insert("all_targets_pinned".to_string(), "true".to_string());
+        m.insert(
+            "all_targets_passwordless_sudo".to_string(),
+            "true".to_string(),
+        );
+        m.insert("target_count".to_string(), "2".to_string());
+        for index in 0..2usize {
+            m.insert(format!("target[{index}].target"), format!("host-{index}"));
+            m.insert(
+                format!("target[{index}].configured_transport"),
+                "utm".to_string(),
+            );
+            m.insert(
+                format!("target[{index}].checked_candidates"),
+                format!("host-{index},192.0.2.{}", index + 10),
+            );
+            m.insert(
+                format!("target[{index}].matched_candidate"),
+                format!("host-{index}"),
+            );
+            m.insert(
+                format!("target[{index}].host_key_status"),
+                "pass".to_string(),
+            );
+            m.insert(
+                format!("target[{index}].passwordless_sudo_status"),
+                "pass".to_string(),
+            );
+        }
+        m.insert("extra_field".to_string(), "ride-through".to_string());
+        m
+    }
+
+    /// Clean fixture: a well-formed SSH trust summary populates every
+    /// typed slot, all per-target slots are filled for `target_count`
+    /// entries, and the extra ride-through key flows into `extra`.
+    #[test]
+    fn cross_network_ssh_trust_summary_view_accepts_clean_artifact() {
+        let map = clean_ssh_trust_summary_map();
+        let view = CrossNetworkSshTrustSummaryView::from_key_value(map);
+        assert_eq!(view.schema_version.as_deref(), Some("1"));
+        assert_eq!(
+            view.pinned_known_hosts_file.as_deref(),
+            Some("/tmp/rustynet-known_hosts")
+        );
+        assert_eq!(
+            view.pinned_known_hosts_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        assert_eq!(view.all_targets_pinned.as_deref(), Some("true"));
+        assert_eq!(view.all_targets_passwordless_sudo.as_deref(), Some("true"));
+        assert_eq!(view.target_count, Some(2));
+        assert_eq!(view.targets.len(), 2);
+        assert_eq!(view.targets[0].target.as_deref(), Some("host-0"));
+        assert_eq!(view.targets[0].configured_transport.as_deref(), Some("utm"));
+        assert_eq!(
+            view.targets[0].checked_candidates.as_deref(),
+            Some("host-0,192.0.2.10")
+        );
+        assert_eq!(view.targets[0].matched_candidate.as_deref(), Some("host-0"));
+        assert_eq!(view.targets[0].host_key_status.as_deref(), Some("pass"));
+        assert_eq!(
+            view.targets[0].passwordless_sudo_status.as_deref(),
+            Some("pass")
+        );
+        assert_eq!(view.targets[1].target.as_deref(), Some("host-1"));
+        assert_eq!(
+            view.extra.get("extra_field").map(String::as_str),
+            Some("ride-through"),
+            "non-required keys must ride through extra"
+        );
+    }
+
+    /// Missing required top-level field: when `pinned_known_hosts_file`
+    /// is absent from the parsed key=value map, the typed view loads
+    /// `None` into the typed slot and the validator surfaces the
+    /// existing "must be a non-empty string" message — verifying that
+    /// missing scalars are caught at the typed layer rather than via a
+    /// raw HashMap lookup deep in the validator.
+    #[test]
+    fn cross_network_ssh_trust_summary_view_rejects_missing_required_field() {
+        let mut map = clean_ssh_trust_summary_map();
+        map.remove("pinned_known_hosts_file");
+        let view = CrossNetworkSshTrustSummaryView::from_key_value(map);
+        assert!(
+            view.pinned_known_hosts_file.is_none(),
+            "missing required key must land as None in the typed slot"
+        );
+        // Still populated (the missing field is independent).
+        assert_eq!(view.schema_version.as_deref(), Some("1"));
+        assert_eq!(view.target_count, Some(2));
+    }
+
+    /// Wrong-type / non-parseable scalar: when `target_count` is not a
+    /// non-negative integer, the typed view's `target_count` slot lands
+    /// as `None` (and the `target_count_raw` slot preserves the
+    /// original string so the round-trip helper does not lose it).
+    /// This pins the typed-layer rejection that previously lived in
+    /// the validator's ad-hoc `parse::<usize>()` walk.
+    #[test]
+    fn cross_network_ssh_trust_summary_view_rejects_wrong_type_required_field() {
+        let mut map = clean_ssh_trust_summary_map();
+        map.insert("target_count".to_string(), "not-a-number".to_string());
+        let view = CrossNetworkSshTrustSummaryView::from_key_value(map);
+        assert!(
+            view.target_count.is_none(),
+            "non-integer target_count must reject at the typed layer"
+        );
+        assert_eq!(
+            view.target_count_raw.as_deref(),
+            Some("not-a-number"),
+            "raw target_count value must be retained so the round-trip helper does not silently drop it"
+        );
+        // Because target_count is None, the typed loader emits no
+        // per-target slots — preventing follow-on panics or N silent
+        // per-target validator errors.
+        assert!(
+            view.targets.is_empty(),
+            "no per-target slots are populated when target_count fails to parse"
+        );
+    }
+
+    /// `into_key_value_map` round-trips: every typed scalar (top-level
+    /// and per-target) is re-injected at its original key and any
+    /// non-consumed keys ride through `extra` verbatim. This is the
+    /// bridge downstream key=value walkers would rely on.
+    #[test]
+    fn cross_network_ssh_trust_summary_view_into_key_value_map_round_trips() {
+        let map = clean_ssh_trust_summary_map();
+        let view = CrossNetworkSshTrustSummaryView::from_key_value(map);
+        let round_tripped = view.into_key_value_map();
+        assert_eq!(
+            round_tripped.get("schema_version").map(String::as_str),
+            Some("1"),
+            "schema_version must round-trip"
+        );
+        assert_eq!(
+            round_tripped
+                .get("pinned_known_hosts_file")
+                .map(String::as_str),
+            Some("/tmp/rustynet-known_hosts"),
+            "pinned_known_hosts_file must round-trip"
+        );
+        assert_eq!(
+            round_tripped
+                .get("pinned_known_hosts_sha256")
+                .map(String::as_str),
+            Some("b".repeat(64).as_str()),
+            "pinned_known_hosts_sha256 must round-trip"
+        );
+        assert_eq!(
+            round_tripped.get("all_targets_pinned").map(String::as_str),
+            Some("true"),
+            "all_targets_pinned must round-trip"
+        );
+        assert_eq!(
+            round_tripped
+                .get("all_targets_passwordless_sudo")
+                .map(String::as_str),
+            Some("true"),
+            "all_targets_passwordless_sudo must round-trip"
+        );
+        assert_eq!(
+            round_tripped.get("target_count").map(String::as_str),
+            Some("2"),
+            "target_count must round-trip"
+        );
+        assert_eq!(
+            round_tripped.get("target[0].target").map(String::as_str),
+            Some("host-0"),
+            "per-target target slot must round-trip"
+        );
+        assert_eq!(
+            round_tripped
+                .get("target[1].configured_transport")
+                .map(String::as_str),
+            Some("utm"),
+            "per-target configured_transport must round-trip"
+        );
+        assert_eq!(
+            round_tripped
+                .get("target[1].host_key_status")
+                .map(String::as_str),
+            Some("pass"),
+            "per-target host_key_status must round-trip"
+        );
+        assert_eq!(
+            round_tripped.get("extra_field").map(String::as_str),
             Some("ride-through"),
             "scalar extras must be preserved verbatim"
         );
