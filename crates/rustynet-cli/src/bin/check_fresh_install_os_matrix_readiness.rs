@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let report_path = env::var_os("RUSTYNET_FRESH_INSTALL_OS_MATRIX_REPORT_PATH")
         .filter(|value| !value.is_empty())
@@ -57,12 +58,18 @@ fn run() -> Result<(), i32> {
         command.arg("--expected-git-commit").arg(expected_commit);
     }
     let status = command.status().map_err(|err| {
-        eprintln!("failed to execute fresh-install OS matrix readiness gate: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to execute fresh-install OS matrix readiness gate: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess code; the inner rustynet-cli ops
+        // command already classifies readiness failures via the X6
+        // taxonomy.
         Err(status_code(status))
     }
 }

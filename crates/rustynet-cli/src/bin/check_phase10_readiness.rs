@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,8 +20,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<OsString> = env::args_os().skip(1).collect();
     let repo_root = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let artifact_dir = phase10_artifact_dir();
     let max_evidence_age_seconds = phase10_max_evidence_age_seconds();
@@ -129,13 +130,18 @@ fn run_phase10_ops_command(
         ])
         .status()
         .map_err(|err| {
-            eprintln!("failed to run cargo run for ops command {ops_command}: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run cargo run for ops command {ops_command}: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
 
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess code; rustynet-cli already classifies
+        // provenance / readiness failures via the X6 taxonomy.
         Err(status_code(status))
     }
 }
