@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, ExitCode, Stdio};
+use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,12 +56,63 @@ impl Drop for Cleanup {
     }
 }
 
-fn main() -> ExitCode {
+fn main() {
     if let Err(err) = run() {
-        eprintln!("{err}");
-        return ExitCode::from(1);
+        let code = classify_local_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
     }
-    ExitCode::SUCCESS
+}
+
+/// Classify error-message text into the X6 taxonomy.
+///
+/// `real_wireguard_exitnode_e2e` runs the netns-based exit-node leak
+/// gate as root on Linux. Detected leaks (kill-switch fail, DNS leak,
+/// LAN reach when policy says block) are real fail-closed verdicts
+/// surfaced via the `report writer returned ...` path — those must map
+/// to `PolicyReject` so a retry-only-on-70 CI loop cannot mask a real
+/// security finding by retrying. Missing tools / non-root / non-Linux
+/// preconditions also map to `PolicyReject` since the gate's claim
+/// cannot be evaluated and the orchestration must change before retry.
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("must run as root") {
+        ExitCode::PolicyReject
+    } else if lower.contains("missing required command") {
+        ExitCode::ConfigError
+    } else if lower.contains("report writer returned") {
+        // Fail-closed verdict from the report writer: a leak / kill-
+        // switch failure / DNS escape was detected. Operator review
+        // required; do NOT retry.
+        ExitCode::PolicyReject
+    } else if lower.contains("report path has no parent")
+        || lower.contains("unable to resolve repository root")
+        || lower.contains("create report dir")
+        || lower.contains("create runtime dir")
+        || lower.contains("create key dir")
+        || lower.contains("path is not valid utf-8")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("spawn ")
+        || lower.contains("run command")
+        || lower.contains("wait ")
+        || lower.contains("write ")
+        || lower.contains("read ")
+        || lower.contains("not utf8")
+        || lower.contains("not utf-8")
+        || lower.contains("parse ")
+        || lower.contains("system clock")
+        || lower.contains("command failed with status")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
+    }
 }
 
 fn run() -> Result<(), String> {

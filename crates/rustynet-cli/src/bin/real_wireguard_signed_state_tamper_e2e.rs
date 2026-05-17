@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -109,13 +110,67 @@ impl SshContext {
     }
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::from(1)
+fn main() {
+    if let Err(err) = run() {
+        let code = classify_local_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
         }
+        std::process::exit(code.as_i32());
+    }
+}
+
+/// Classify error-message text into the X6 taxonomy.
+///
+/// `real_wireguard_signed_state_tamper_e2e` mutates the signed
+/// assignment under the daemon and asserts the daemon rejects the
+/// tampered state via the signature verifier. A non-`pass` overall
+/// status from the report writer means the verifier accepted the
+/// tampered state (or otherwise failed the tamper-reject contract) —
+/// that is a real fail-closed verdict and MUST surface as
+/// `PolicyReject` so retry-only-on-70 CI loops never accidentally
+/// retry a signature-mismatch finding.
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("missing value for")
+        || lower.contains("--exit-host and --client-host are required")
+        || lower.contains("--ssh-port must be numeric")
+        || lower.contains("--ssh-sudo must be one of")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("tamper e2e failed") || lower.contains("passwordless sudo is required")
+    {
+        // Fail-closed verdict (signature/tamper rejection contract
+        // violated) or a fail-closed precondition the orchestration
+        // must change before retry.
+        ExitCode::PolicyReject
+    } else if lower.contains("missing required command")
+        || lower.contains("missing pinned ssh known_hosts file")
+        || lower.contains("known_hosts file lacks host key")
+        || lower.contains("known_hosts file must not be a symlink")
+        || lower.contains("--ssh-identity does not exist")
+        || lower.contains("--ssh-known-hosts-file is required")
+        || lower.contains("report path has no parent")
+        || lower.contains("create report dir")
+        || lower.contains("unable to resolve repository root")
+        || lower.contains("cd ")
+        || lower.contains("resolve home")
+        || lower.contains("stat known_hosts")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("run ")
+        || lower.contains("spawn ")
+        || lower.contains("not utf8")
+        || lower.contains("not utf-8")
+        || lower.contains("system clock")
+        || lower.contains("command failed with status")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
     }
 }
 
