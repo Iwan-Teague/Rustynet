@@ -384,10 +384,26 @@ inline. Cross-reference with:
   into the report's `drift_reasons` with an `ipv6-sibling:` prefix
   so operators can tell which evaluator fired. Default off for
   back-compat. 3 new flag-handler tests + help-text pin.
-* `[ ]` Remaining scope (separate slice): Router Advertisement
-  suppression check (no native IPv6 default route during protected
-  mode). Needs PowerShell collector expansion to surface RA /
-  default-route state.
+* `[~]` Router Advertisement suppression evaluator landed (commit
+  1afcd12). New `evaluate_router_advertisement_suppression` pure
+  evaluator independent of the main + sibling passes. Snapshot
+  schema extended (forward-compat via `#[serde(default)]`) with:
+  - `WindowsRouterAdvertisementObservation { schema_version,
+    interfaces: Vec<WindowsInterfaceRaState> }`
+  - `WindowsInterfaceRaState { interface_alias, interface_index,
+    router_discovery_enabled, ipv6_default_route_sources }`
+  - `WindowsDnsFailclosedSnapshot.router_advertisement_observation:
+    Option<WindowsRouterAdvertisementObservation>`
+  Drift shapes pinned: None observation → fail closed;
+  `router_discovery_enabled=true` → drift; `ra`-sourced IPv6
+  default route → drift; observation schema_version mismatch →
+  drift. 11 new tests including BTreeMap-stable interface order +
+  forward-compat with legacy JSON. `windows_dns_failclosed`
+  coverage floor: 56 → 67.
+* `[ ]` Remaining scope (separate slice): CLI subcommand wire-up
+  (`--enforce-ra-suppression` flag mirroring
+  `--enforce-ipv6-sibling-rules`) + PowerShell collector that
+  surfaces the RA / default-route state.
 
 ### W4. `windows_runtime_acls.rs` registry + service ACL drift extension
 
@@ -406,11 +422,33 @@ inline. Cross-reference with:
   SACL audit isolation from DACL drift, anonymous + user-SID owner
   rejection, DPAPI blob WD rejection, an 8-entry reviewed-root path
   snapshot, and a `schema_version=1` deliberate-bump guard.
-* `[ ]` Remaining scope (separate slice): registry-key ACL drift
-  detection under `HKLM\SYSTEM\CurrentControlSet\Services\RustyNet*`
-  + service config-store DACL drift. Requires a new
-  `rustynet-windows-native` helper to inspect registry SDDL +
-  service-config ACL via the Win32 API; not landable as a pure-Rust
+* `[~]` Registry-ACL evaluator + typed snapshot landed (commit
+  5eb1e3d). New module `crates/rustynetd/src/windows_registry_acls.rs`
+  owns the evaluator over an observed-registry-ACL snapshot:
+  - `REVIEWED_REGISTRY_KEY_PATHS` constant pinning the reviewed
+    HKLM RustyNet service keys.
+  - `FORBIDDEN_PRINCIPALS_REGISTRY = ["WD", "AU", "BU", "AN"]`
+    pinning the broader-than-reviewed Windows principals.
+  - `WindowsRegistryKeyAclStatus { Ok / Missing / Invalid /
+    Unobserved }` typed status enum.
+  - `WindowsRegistryKeyEntry { label, key_path, requirement,
+    status }` + `WindowsRegistryAclReport` shapes.
+  - `evaluate_windows_registry_acls` pure evaluator with
+    fail-closed shapes: required+Missing/Unobserved → drift;
+    Invalid → drift; Ok with forbidden-principal grant → drift;
+    unknown requirement string → drift; empty entries →
+    fail closed. Optional+Missing tolerated.
+  - Cross-platform stub collector returns Unobserved entries with
+    a "collector not yet wired" reason so overall_ok=false until
+    the Win32 piece lands.
+  17 new tests + a snapshot test pinning the reviewed-keys list +
+  forbidden-principals list. `windows_registry_acls` gate floor
+  added at :17.
+* `[ ]` Remaining scope (separate slice): Win32 collector in
+  `rustynet-windows-native` that calls `RegGetKeySecurity` +
+  `ConvertSecurityDescriptorToStringSecurityDescriptor` to populate
+  the snapshot with real SDDLs. Service-config DACL drift via the
+  Win32 API; not landable as a pure-Rust
   audit extension.
 
 ### W5. `windows_authenticode.rs` thumbprint pinning + revocation deny-list
@@ -551,11 +589,23 @@ inline. Cross-reference with:
   the performance-view precedence shape). `read_ndjson_objects`
   marked `#[allow(dead_code)]` with a doc-comment noting it
   remains as a verified reference impl for future migrations.
+* `[~]` Two more typed-view migrations landed (commit b8f48da):
+  - `NetworkDiscoveryBundleView` in `ops_network_discovery.rs`
+    pins `schema_version: u64`, `purpose: String`, `collected_at_unix:
+    u64`. The recursive `validate_no_secrets` walker STAYS a
+    generic Value walk by design (must remain generic to catch
+    arbitrary nested keys).
+  - `FreshInstallOsMatrixReportView` in
+    `ops_fresh_install_os_matrix.rs` pins `schema_version`,
+    `evidence_mode`, `environment`, `captured_at_unix`,
+    `git_commit`; remaining fields via `#[serde(flatten)] extra`.
+  Each view exposes `into_value_map()` for downstream Map-based
+  helpers. 8 new tests (4 per module): clean-line accepted,
+  missing-required-field rejected, wrong-type rejected,
+  `into_value_map` round-trip.
 * `[ ]` Remaining Phase A typed views (next slices):
   - cross-network reports (`ops_cross_network_reports.rs` — large)
-  - discovery bundle validator (`ops_network_discovery.rs`)
   - live-lab summary / failure digest (further `Value` walks)
-  - fresh-install OS matrix (`ops_fresh_install_os_matrix.rs`)
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
@@ -687,8 +737,39 @@ inline. Cross-reference with:
   Pattern documented in commit; ~57 more bin/ binaries remain on
   legacy `exit(1)`. Each future migration is a small,
   independently-reviewed change.
+* `[~]` Parallel-batch migration: 29 more bin/ binaries threaded
+  in one batch (commits f6e71fc, 3366e22, a073b12, 1b47a2b):
+  - phase-gate bins (11): `phase[1,3-10]_gates.rs`,
+    `phase10_cross_network_exit_gates.rs`,
+    `phase10_hp2_gates.rs` — uniformly repo-root→ConfigError /
+    cargo-spawn→TransientFailure / subprocess→pass-through.
+  - collect bins (6): `collect_phase1_measured_env.rs`,
+    `collect_phase9_raw_evidence.rs`, `collect_platform_probe.rs`,
+    `collect_platform_parity_bundle.rs`,
+    `collect_linux_reconnect_bundle.rs`,
+    `collect_network_discovery_info.rs` — same shape plus
+    classify_local_error for the two with richer argv surfaces.
+  - release/security/membership bins (7): `membership_gates.rs`,
+    `membership_incident_drill.rs`,
+    `supply_chain_integrity_gates.rs`,
+    `release_readiness_gates.rs`, `role_auth_matrix_gates.rs`,
+    `fresh_install_os_matrix_release_gate.rs`,
+    `traversal_adversarial_gates.rs` — security-sensitive
+    binaries map fail-closed verdicts (tampering, attestation,
+    integrity, drift) to PolicyReject(78) instead of through-pass
+    so retry-only-on-70 CI loops never accidentally retry a real
+    fail-closed verdict.
+  - live-linux tests (5): `live_linux_{lan_toggle, managed_dns,
+    server_ip_bypass, control_surface_exposure,
+    endpoint_hijack}_test.rs` — verbatim `classify_live_lab_error`
+    helper from the existing exemplars. 4 of the 5 also got an
+    `Result<(), i32>` → `Result<(), String>` conversion so the
+    classifier sees real error messages instead of pre-translated
+    integers.
+  Combined coverage: 37 of ~60 bin/ binaries now on the X6
+  taxonomy (out of an initial 0).
 * `[ ]` Remaining scope (separate slice): continue threading
-  through the remaining ~57 bin/ binaries under
+  through the remaining ~23 bin/ binaries under
   `crates/rustynet-cli/src/bin/`.
 
 ### X7. CI gate enhancements
