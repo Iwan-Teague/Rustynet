@@ -235,6 +235,107 @@ else
   fail "apply_host_profile_defaults(FreeBSD) fixture failed: ${freebsd_out}"
 fi
 
+# ---- 5. enforce_host_storage_policy per-platform dispatch -------------------
+#
+# Pin that:
+#   * the Linux variant sets HOST_PROFILE=linux and re-threads the
+#     LINUX_* credential-blob paths into the canonical runtime vars
+#   * the macOS variant sets HOST_PROFILE=macos (the canonical-path
+#     validators pass when seeded via __rustynet_macos_apply_profile_defaults
+#     first; non-canonical input would have exit 1'd the fixture)
+#   * any other HOST_OS lands on HOST_PROFILE=unsupported
+#
+# The fixture sources common+linux+macos, seeds the LINUX_* / MACOS_*
+# constants and configuration vars that normally live at top-level in
+# start.sh, defines a dispatcher matching start.sh's, and asserts on
+# the resulting state.
+
+run_storage_policy_fixture() {
+  local host_os="$1"
+  HOST_OS="${host_os}" ROOT_DIR="${ROOT_DIR}" \
+  bash -c '
+    set -euo pipefail
+    ROOT_DIR="'"${ROOT_DIR}"'"
+    HOST_OS="'"${host_os}"'"
+    . "${ROOT_DIR}/scripts/start/common.sh"
+    . "${ROOT_DIR}/scripts/start/linux.sh"
+    . "${ROOT_DIR}/scripts/start/macos.sh"
+
+    # Seed constants that normally live near the top of start.sh.
+    LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/wg_key_passphrase.cred"
+    LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH="/etc/rustynet/credentials/signing_key_passphrase.cred"
+    MACOS_STATE_BASE="${HOME}/Library/Application Support/rustynet"
+    MACOS_RUNTIME_BASE="${HOME}/Library/Caches/rustynet"
+    MACOS_LOG_BASE="${HOME}/Library/Logs/rustynet"
+    DEVICE_NODE_ID="smoke-node"
+    CONFIG_FILE="/tmp/smoke-wizard.env"
+    MANUAL_PEER_OVERRIDE="0"
+    WG_INTERFACE="utun9"
+
+    HOST_PROFILE=""
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=""
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=""
+
+    # On macOS the storage policy expects canonical paths to already be
+    # in place — start.sh runs apply_host_profile_defaults before
+    # enforce_host_storage_policy. Mirror that ordering here so the
+    # validators see canonical input.
+    if is_macos_host; then
+      __rustynet_macos_apply_profile_defaults
+    fi
+
+    enforce_host_storage_policy() {
+      if is_linux_host; then
+        __rustynet_linux_enforce_host_storage_policy
+        return
+      fi
+      if is_macos_host; then
+        __rustynet_macos_enforce_host_storage_policy
+        return
+      fi
+      HOST_PROFILE="unsupported"
+    }
+
+    enforce_host_storage_policy
+    printf "HOST_PROFILE=%s\n" "${HOST_PROFILE}"
+    printf "WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n" "${WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    printf "SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH=%s\n" "${SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH}"
+    printf "WG_INTERFACE=%s\n" "${WG_INTERFACE}"
+  '
+}
+
+# Linux fixture
+if linux_sp_out=$(run_storage_policy_fixture Linux 2>&1); then
+  check_profile_field "enforce_host_storage_policy(Linux)" "${linux_sp_out}" \
+    HOST_PROFILE "linux"
+  check_profile_field "enforce_host_storage_policy(Linux)" "${linux_sp_out}" \
+    WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH \
+    "/etc/rustynet/credentials/wg_key_passphrase.cred"
+  check_profile_field "enforce_host_storage_policy(Linux)" "${linux_sp_out}" \
+    SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH \
+    "/etc/rustynet/credentials/signing_key_passphrase.cred"
+else
+  fail "enforce_host_storage_policy(Linux) fixture failed: ${linux_sp_out}"
+fi
+
+# Darwin fixture
+if darwin_sp_out=$(run_storage_policy_fixture Darwin 2>&1); then
+  check_profile_field "enforce_host_storage_policy(Darwin)" "${darwin_sp_out}" \
+    HOST_PROFILE "macos"
+  check_profile_field "enforce_host_storage_policy(Darwin)" "${darwin_sp_out}" \
+    WG_INTERFACE "utun9"
+else
+  fail "enforce_host_storage_policy(Darwin) fixture failed: ${darwin_sp_out}"
+fi
+
+# FreeBSD (any non-Linux non-Darwin) fixture
+if freebsd_sp_out=$(run_storage_policy_fixture FreeBSD 2>&1); then
+  check_profile_field "enforce_host_storage_policy(FreeBSD)" "${freebsd_sp_out}" \
+    HOST_PROFILE "unsupported"
+else
+  fail "enforce_host_storage_policy(FreeBSD) fixture failed: ${freebsd_sp_out}"
+fi
+
 # ---- summary ---------------------------------------------------------------
 
 if [[ ${failed} -eq 0 ]]; then
