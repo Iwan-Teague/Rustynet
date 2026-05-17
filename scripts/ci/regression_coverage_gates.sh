@@ -84,13 +84,11 @@ LINUX_FLOORS=(
 # Keep the gate aligned with what's actually a top-level test module.
 WINDOWS_FLOORS=(
   "windows_service_hardening:33"
-  # Floor bumped 32→46 on X4 Windows-DNS parity sweep: 14 new tests
-  # covering link-local/unspecified/mapped/zoneid/bracketed shapes
-  # on both interface DNS lists and NRPT rules, plus aggregation,
-  # empty-snapshot fail-closed, sub-namespace-only fail-closed,
-  # multi-rule clean shape, schema_version=0 reject, and family
-  # mismatch on the IPv6 side.
-  "windows_dns_failclosed:46"
+  # Floor bumped 46→56 on W3 IPv6 NRPT sibling-rule coverage
+  # evaluator: 10 new tests covering union semantics across rules,
+  # v4-only / v6-only / no-loopback shapes, stable namespace order,
+  # empty-namespace tolerance, and schema_version forward-compat.
+  "windows_dns_failclosed:56"
   "windows_mesh_status:14"
   "windows_key_custody:18"
   # Bumped 21→38 on W5 thumbprint policy + evaluator (17 new tests
