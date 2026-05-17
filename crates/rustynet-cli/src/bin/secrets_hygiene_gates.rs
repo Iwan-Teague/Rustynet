@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -77,8 +78,8 @@ fn run() -> Result<(), i32> {
     let root_dir = match find_root_dir() {
         Ok(path) => path,
         Err(err) => {
-            eprintln!("{err}");
-            return Err(1);
+            eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+            return Err(ExitCode::ConfigError.as_i32());
         }
     };
 
@@ -90,20 +91,7 @@ fn run() -> Result<(), i32> {
         run_required_test(package, test_filter)?;
     }
 
-    run_command(&[
-        "run",
-        "--quiet",
-        "-p",
-        "rustynet-cli",
-        "--",
-        "ops",
-        "check-secrets-hygiene",
-        "--root",
-        root_dir.to_str().ok_or_else(|| {
-            eprintln!("repository root is not valid UTF-8: {}", root_dir.display());
-            1
-        })?,
-    ])?;
+    run_check_secrets_hygiene(&root_dir)?;
 
     println!("Secrets hygiene gate: PASS");
     Ok(())
@@ -146,26 +134,30 @@ fn require_command(cmd: &str) -> Result<(), i32> {
     match status {
         Ok(exit_status) if exit_status.success() => Ok(()),
         Ok(_) | Err(_) => {
-            eprintln!("missing required command: {cmd}");
-            Err(1)
+            eprintln!(
+                "error [{}]: missing required command: {cmd}",
+                ExitCode::ConfigError
+            );
+            Err(ExitCode::ConfigError.as_i32())
         }
     }
 }
 
 fn run_required_test(package: &str, test_filter: &str) -> Result<(), i32> {
     let tmp_output = TempOutputGuard::create().map_err(|err| {
-        eprintln!("{err}");
-        1
+        eprintln!("error [{}]: {err}", ExitCode::ConfigError);
+        ExitCode::ConfigError.as_i32()
     })?;
     let output_file = OpenOptions::new()
         .write(true)
         .open(tmp_output.path())
         .map_err(|err| {
             eprintln!(
-                "failed to open required test output file ({}): {err}",
+                "error [{}]: failed to open required test output file ({}): {err}",
+                ExitCode::ConfigError,
                 tmp_output.path().display()
             );
-            1
+            ExitCode::ConfigError.as_i32()
         })?;
     let status = Command::new("cargo")
         .args(["test", "-p", package, test_filter])
@@ -173,29 +165,40 @@ fn run_required_test(package: &str, test_filter: &str) -> Result<(), i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file.try_clone().map_err(|err| {
             eprintln!(
-                "failed to clone required test output file handle ({}): {err}",
+                "error [{}]: failed to clone required test output file handle ({}): {err}",
+                ExitCode::TransientFailure,
                 tmp_output.path().display()
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?))
         .stderr(Stdio::from(output_file))
         .spawn()
         .map_err(|err| {
-            eprintln!("failed to run cargo test for package={package} filter={test_filter}: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to run cargo test for package={package} filter={test_filter}: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?
         .wait()
         .map_err(|err| {
             eprintln!(
-                "failed to wait for cargo test for package={package} filter={test_filter}: {err}"
+                "error [{}]: failed to wait for cargo test for package={package} filter={test_filter}: {err}",
+                ExitCode::TransientFailure
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
 
     if !status.success() {
         dump_file_to_stderr(tmp_output.path())?;
-        eprintln!("required test failed: package={package} filter={test_filter}");
-        return Err(1);
+        // A required hygiene-test failure is a secrets-hygiene policy
+        // violation: surface as PolicyReject so retry-only-on-70 CI
+        // loops never accidentally retry a real fail-closed verdict.
+        eprintln!(
+            "error [{}]: required test failed: package={package} filter={test_filter}",
+            ExitCode::PolicyReject
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
     }
 
     dump_file_to_stdout(tmp_output.path())?;
@@ -215,10 +218,11 @@ fn verify_required_test_output(output: &Path, package: &str, test_filter: &str) 
             "--output",
             output.to_str().ok_or_else(|| {
                 eprintln!(
-                    "required test output path is not valid UTF-8: {}",
+                    "error [{}]: required test output path is not valid UTF-8: {}",
+                    ExitCode::ConfigError,
                     output.display()
                 );
-                1
+                ExitCode::ConfigError.as_i32()
             })?,
             "--package",
             package,
@@ -229,25 +233,67 @@ fn verify_required_test_output(output: &Path, package: &str, test_filter: &str) 
         .status()
         .map_err(|err| {
             eprintln!(
-                "failed to run required test verification for package={package} filter={test_filter}: {err}"
+                "error [{}]: failed to run required test verification for package={package} filter={test_filter}: {err}",
+                ExitCode::TransientFailure
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
 
-    if status.success() { Ok(()) } else { Err(1) }
+    if status.success() {
+        Ok(())
+    } else {
+        // Verification failure = secrets-hygiene contract violation.
+        eprintln!(
+            "error [{}]: required test verification failed: package={package} filter={test_filter}",
+            ExitCode::PolicyReject
+        );
+        Err(ExitCode::PolicyReject.as_i32())
+    }
 }
 
-fn run_command(args: &[&str]) -> Result<(), i32> {
+fn run_check_secrets_hygiene(root_dir: &Path) -> Result<(), i32> {
+    let root_str = root_dir.to_str().ok_or_else(|| {
+        eprintln!(
+            "error [{}]: repository root is not valid UTF-8: {}",
+            ExitCode::ConfigError,
+            root_dir.display()
+        );
+        ExitCode::ConfigError.as_i32()
+    })?;
     let status = Command::new("cargo")
-        .args(args)
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "rustynet-cli",
+            "--",
+            "ops",
+            "check-secrets-hygiene",
+            "--root",
+            root_str,
+        ])
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to run cargo {}: {err}", args.join(" "));
-            1
+            eprintln!(
+                "error [{}]: failed to run cargo run ops check-secrets-hygiene: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
 
-    if status.success() { Ok(()) } else { Err(1) }
+    if status.success() {
+        Ok(())
+    } else {
+        // Secrets-hygiene scan rejected the repo state. Surface as
+        // PolicyReject so retry-only-on-70 CI loops do not retry a
+        // real secret-leak verdict.
+        eprintln!(
+            "error [{}]: secrets hygiene check failed",
+            ExitCode::PolicyReject
+        );
+        Err(ExitCode::PolicyReject.as_i32())
+    }
 }
 
 struct TempOutputGuard {
@@ -300,51 +346,67 @@ impl Drop for TempOutputGuard {
 fn dump_file_to_stdout(path: &Path) -> Result<(), i32> {
     let mut file = File::open(path).map_err(|err| {
         eprintln!(
-            "failed to read required test output file ({}): {err}",
+            "error [{}]: failed to read required test output file ({}): {err}",
+            ExitCode::TransientFailure,
             path.display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).map_err(|err| {
         eprintln!(
-            "failed to read required test output file ({}): {err}",
+            "error [{}]: failed to read required test output file ({}): {err}",
+            ExitCode::TransientFailure,
             path.display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })?;
     io::stdout().write_all(&buffer).map_err(|err| {
-        eprintln!("failed to write required test output to stdout: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to write required test output to stdout: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     io::stdout().flush().map_err(|err| {
-        eprintln!("failed to flush stdout: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to flush stdout: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })
 }
 
 fn dump_file_to_stderr(path: &Path) -> Result<(), i32> {
     let mut file = File::open(path).map_err(|err| {
         eprintln!(
-            "failed to read required test output file ({}): {err}",
+            "error [{}]: failed to read required test output file ({}): {err}",
+            ExitCode::TransientFailure,
             path.display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).map_err(|err| {
         eprintln!(
-            "failed to read required test output file ({}): {err}",
+            "error [{}]: failed to read required test output file ({}): {err}",
+            ExitCode::TransientFailure,
             path.display()
         );
-        1
+        ExitCode::TransientFailure.as_i32()
     })?;
     io::stderr().write_all(&buffer).map_err(|err| {
-        eprintln!("failed to write required test output to stderr: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to write required test output to stderr: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     io::stderr().flush().map_err(|err| {
-        eprintln!("failed to flush stderr: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to flush stderr: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })
 }

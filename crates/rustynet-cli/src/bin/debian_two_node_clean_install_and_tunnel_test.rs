@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -19,12 +20,17 @@ fn run() -> Result<(), i32> {
     command.args(["ops", "run-debian-two-node-e2e"]);
     command.args(passthrough_args);
     let status = command.status().map_err(|err| {
-        eprintln!("failed to execute rustynet ops run-debian-two-node-e2e: {err}");
-        1
+        eprintln!(
+            "error [{}]: failed to execute rustynet ops run-debian-two-node-e2e: {err}",
+            ExitCode::TransientFailure
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess code so the inner rustynet taxonomy
+        // (PolicyReject / TransientFailure) survives.
         Err(status_code(status))
     }
 }
@@ -35,14 +41,20 @@ fn ensure_rustynet_in_path() -> Result<(), i32> {
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to verify rustynet availability: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to verify rustynet availability: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
-        eprintln!("rustynet CLI is required in PATH");
-        Err(1)
+        eprintln!(
+            "error [{}]: missing required command: rustynet CLI is required in PATH",
+            ExitCode::ConfigError
+        );
+        Err(ExitCode::ConfigError.as_i32())
     }
 }
 

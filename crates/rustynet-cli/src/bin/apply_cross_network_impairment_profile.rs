@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -42,8 +43,11 @@ fn run() -> Result<(), i32> {
                     .get(index + 1)
                     .ok_or_else(|| print_usage_error("--profile requires a value"))?;
                 if !profile_supported(value) {
-                    eprintln!("unsupported impairment profile: {value}");
-                    return Err(2);
+                    eprintln!(
+                        "error [{}]: unsupported impairment profile: {value}",
+                        ExitCode::BadArgs
+                    );
+                    return Err(ExitCode::BadArgs.as_i32());
                 }
                 profile = value.clone();
                 index += 2;
@@ -53,8 +57,8 @@ fn run() -> Result<(), i32> {
                     .get(index + 1)
                     .ok_or_else(|| print_usage_error("--interface requires a value"))?;
                 if !valid_interface(value) {
-                    eprintln!("invalid interface: {value}");
-                    return Err(2);
+                    eprintln!("error [{}]: invalid interface: {value}", ExitCode::BadArgs);
+                    return Err(ExitCode::BadArgs.as_i32());
                 }
                 interface = value.clone();
                 index += 2;
@@ -64,16 +68,19 @@ fn run() -> Result<(), i32> {
                 return Ok(());
             }
             unknown => {
-                eprintln!("unknown argument: {unknown}");
+                eprintln!("error [{}]: unknown argument: {unknown}", ExitCode::BadArgs);
                 print_usage();
-                return Err(2);
+                return Err(ExitCode::BadArgs.as_i32());
             }
         }
     }
 
     let mode = mode.ok_or_else(|| {
-        eprintln!("--mode is required");
-        2
+        eprintln!(
+            "error [{}]: missing required argument: --mode is required",
+            ExitCode::BadArgs
+        );
+        ExitCode::BadArgs.as_i32()
     })?;
 
     require_command("ip")?;
@@ -93,16 +100,16 @@ fn parse_mode(value: &str) -> Result<Mode, i32> {
         "clear" => Ok(Mode::Clear),
         "status" => Ok(Mode::Status),
         other => {
-            eprintln!("unsupported mode: {other}");
-            Err(2)
+            eprintln!("error [{}]: unsupported mode: {other}", ExitCode::BadArgs);
+            Err(ExitCode::BadArgs.as_i32())
         }
     }
 }
 
 fn print_usage_error(message: &str) -> i32 {
-    eprintln!("{message}");
+    eprintln!("error [{}]: {message}", ExitCode::BadArgs);
     print_usage();
-    2
+    ExitCode::BadArgs.as_i32()
 }
 
 fn print_usage() {
@@ -139,14 +146,20 @@ fn require_command(command: &str) -> Result<(), i32> {
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to verify required command {command}: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to verify required command {command}: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
-        eprintln!("missing required command: {command}");
-        Err(1)
+        eprintln!(
+            "error [{}]: missing required command: {command}",
+            ExitCode::ConfigError
+        );
+        Err(ExitCode::ConfigError.as_i32())
     }
 }
 
@@ -158,14 +171,20 @@ fn ensure_interface_exists(interface: &str) -> Result<(), i32> {
         .stderr(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to inspect interface {interface}: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to inspect interface {interface}: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
-        eprintln!("interface does not exist: {interface}");
-        Err(1)
+        eprintln!(
+            "error [{}]: interface does not exist: {interface}",
+            ExitCode::ConfigError
+        );
+        Err(ExitCode::ConfigError.as_i32())
     }
 }
 
@@ -185,8 +204,11 @@ fn show_status(interface: &str) -> Result<(), i32> {
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to query qdisc status: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to query qdisc status: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
@@ -204,8 +226,14 @@ fn apply_profile(interface: &str, profile: &str) -> Result<(), i32> {
         && existing != "noqueue"
         && existing != "netem"
     {
-        eprintln!("refusing to overwrite existing root qdisc on {interface}: {existing}");
-        return Err(1);
+        // Refusing to overwrite an unexpected root qdisc is a fail-
+        // closed policy: the operator must clear it explicitly before
+        // re-running the impairment profile.
+        eprintln!(
+            "error [{}]: refusing to overwrite existing root qdisc on {interface}: {existing}",
+            ExitCode::PolicyReject
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
     }
 
     let args: Vec<&str> = match profile {
@@ -221,8 +249,11 @@ fn apply_profile(interface: &str, profile: &str) -> Result<(), i32> {
             "qdisc", "replace", "dev", interface, "root", "netem", "loss", "5%",
         ],
         _ => {
-            eprintln!("unsupported impairment profile: {profile}");
-            return Err(2);
+            eprintln!(
+                "error [{}]: unsupported impairment profile: {profile}",
+                ExitCode::BadArgs
+            );
+            return Err(ExitCode::BadArgs.as_i32());
         }
     };
 
@@ -231,8 +262,11 @@ fn apply_profile(interface: &str, profile: &str) -> Result<(), i32> {
         .stdin(Stdio::null())
         .status()
         .map_err(|err| {
-            eprintln!("failed to apply impairment profile: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to apply impairment profile: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
@@ -246,8 +280,11 @@ fn current_root_qdisc(interface: &str) -> Result<Option<String>, i32> {
         .args(["qdisc", "show", "dev", interface])
         .output()
         .map_err(|err| {
-            eprintln!("failed to query qdisc state for {interface}: {err}");
-            1
+            eprintln!(
+                "error [{}]: failed to query qdisc state for {interface}: {err}",
+                ExitCode::TransientFailure
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if !output.status.success() {
         return Err(status_code(output.status));
