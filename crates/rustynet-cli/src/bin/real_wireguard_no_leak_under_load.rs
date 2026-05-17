@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, ExitCode, Stdio};
+use std::process::{self, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,13 +59,62 @@ impl Drop for Cleanup {
     }
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::from(1)
+fn main() {
+    if let Err(err) = run() {
+        let code = classify_local_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
         }
+        std::process::exit(code.as_i32());
+    }
+}
+
+/// Classify error-message text into the X6 taxonomy.
+///
+/// `real_wireguard_no_leak_under_load` asserts no underlay packets
+/// escape when the tunnel is up (under load) and that traffic is
+/// fully blocked when the tunnel is down. A non-`pass` report writer
+/// output means a real leak was detected — a fail-closed verdict that
+/// MUST surface as `PolicyReject` so retry-only-on-70 CI loops never
+/// accidentally retry a real leak finding. Non-root invocation is
+/// also `PolicyReject` because the gate cannot evaluate its claim
+/// without privileges and the orchestration must change before retry.
+fn classify_local_error(message: &str) -> ExitCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("must run as root") {
+        ExitCode::PolicyReject
+    } else if lower.contains("missing required command") {
+        ExitCode::ConfigError
+    } else if lower.contains("report writer returned") {
+        // Fail-closed verdict: leak detected (underlay escape under
+        // load, or tunnel-down packets not blocked). Operator review
+        // required; do NOT retry.
+        ExitCode::PolicyReject
+    } else if lower.contains("report path has no parent")
+        || lower.contains("unable to resolve repository root")
+        || lower.contains("create report dir")
+        || lower.contains("create runtime dir")
+        || lower.contains("create key dir")
+        || lower.contains("path is not valid utf-8")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("spawn ")
+        || lower.contains("run command")
+        || lower.contains("wait ")
+        || lower.contains("write ")
+        || lower.contains("read ")
+        || lower.contains("not utf8")
+        || lower.contains("not utf-8")
+        || lower.contains("parse ")
+        || lower.contains("system clock")
+        || lower.contains("command failed with status")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
     }
 }
 
