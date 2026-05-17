@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -21,8 +22,8 @@ fn main() {
 fn run() -> Result<(), i32> {
     let _ignored_args: Vec<String> = env::args().skip(1).collect();
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        report_error(ExitCode::ConfigError, &err);
+        ExitCode::ConfigError.as_i32()
     })?;
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
         .ok()
@@ -149,15 +150,20 @@ fn run_script(root_dir: &Path, script: &str, args: &[&str]) -> Result<(), i32> {
         .args(args)
         .status()
         .map_err(|err| {
-            eprintln!(
-                "failed to execute script {}: {err}",
-                root_dir.join(script).display()
+            report_error(
+                ExitCode::TransientFailure,
+                &format!(
+                    "failed to execute script {}: {err}",
+                    root_dir.join(script).display()
+                ),
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess exit code to preserve the inner
+        // taxonomy bubble (e.g. PolicyReject from a downstream gate).
         Err(status_code(status))
     }
 }
@@ -184,10 +190,13 @@ fn run_required_test(
         .args(extra_args)
         .status()
         .map_err(|err| {
-            eprintln!(
-                "failed to execute required test helper for package={package} filter={test_filter}: {err}"
+            report_error(
+                ExitCode::TransientFailure,
+                &format!(
+                    "failed to execute required test helper for package={package} filter={test_filter}: {err}"
+                ),
             );
-            1
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
@@ -217,8 +226,11 @@ fn run_ops_with_env(
         .envs(env_pairs.iter().copied())
         .status()
         .map_err(|err| {
-            eprintln!("failed to run ops {ops_subcommand}: {err}");
-            1
+            report_error(
+                ExitCode::TransientFailure,
+                &format!("failed to run ops {ops_subcommand}: {err}"),
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
@@ -239,8 +251,11 @@ fn run_command(
         .envs(env_pairs.iter().copied())
         .status()
         .map_err(|err| {
-            eprintln!("failed to execute command {program}: {err}");
-            1
+            report_error(
+                ExitCode::TransientFailure,
+                &format!("failed to execute command {program}: {err}"),
+            );
+            ExitCode::TransientFailure.as_i32()
         })?;
     if status.success() {
         Ok(())
@@ -253,11 +268,23 @@ fn require_file(path: &Path) -> Result<(), i32> {
     if path.is_file() {
         Ok(())
     } else {
-        eprintln!(
-            "missing beta release integrity artifact: {}",
-            path.display()
+        report_error(
+            ExitCode::ConfigError,
+            &format!(
+                "missing beta release integrity artifact: {}",
+                path.display()
+            ),
         );
-        Err(1)
+        Err(ExitCode::ConfigError.as_i32())
+    }
+}
+
+fn report_error(code: ExitCode, message: &str) {
+    let hint = code.operator_hint();
+    if hint.is_empty() {
+        eprintln!("error [{code}]: {message}");
+    } else {
+        eprintln!("error [{code}]: {message}\n  hint: {hint}");
     }
 }
 

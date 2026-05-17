@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use rustynetd::exit_codes::ExitCode;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -17,8 +18,8 @@ fn main() {
 
 fn run() -> Result<(), i32> {
     let root_dir = repo_root().map_err(|err| {
-        eprintln!("{err}");
-        1
+        report_error(ExitCode::ConfigError, &err);
+        ExitCode::ConfigError.as_i32()
     })?;
 
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
@@ -71,13 +72,14 @@ fn run() -> Result<(), i32> {
             .unwrap_or_else(|| OsString::from(DEFAULT_PHASE1_SOURCE_PATH)),
     );
     if !phase1_source_path.is_file() {
-        return Err({
-            eprintln!(
+        report_error(
+            ExitCode::ConfigError,
+            &format!(
                 "missing measured phase1 source: {}",
                 phase1_source_path.display()
-            );
-            1
-        });
+            ),
+        );
+        return Err(ExitCode::ConfigError.as_i32());
     }
     let phase1_source_path_str = path_to_utf8(&phase1_source_path, "phase1 samples path")?;
     run_command(
@@ -156,8 +158,11 @@ fn resolve_source_path(root_dir: &Path, raw: OsString) -> PathBuf {
 
 fn path_to_utf8(path: &Path, label: &str) -> Result<String, i32> {
     path.to_str().map(|value| value.to_string()).ok_or_else(|| {
-        eprintln!("{label} is not valid UTF-8: {}", path.display());
-        1
+        report_error(
+            ExitCode::ConfigError,
+            &format!("{label} is not valid UTF-8: {}", path.display()),
+        );
+        ExitCode::ConfigError.as_i32()
     })
 }
 
@@ -176,13 +181,27 @@ fn run_command(
         command.env(key, value);
     }
     let status = command.status().map_err(|err| {
-        eprintln!("failed to run {program}: {err}");
-        1
+        report_error(
+            ExitCode::TransientFailure,
+            &format!("failed to run {program}: {err}"),
+        );
+        ExitCode::TransientFailure.as_i32()
     })?;
     if status.success() {
         Ok(())
     } else {
+        // Pass through subprocess exit code so the inner taxonomy
+        // bubble (e.g. PolicyReject from a downstream gate) survives.
         Err(status_code(status))
+    }
+}
+
+fn report_error(code: ExitCode, message: &str) {
+    let hint = code.operator_hint();
+    if hint.is_empty() {
+        eprintln!("error [{code}]: {message}");
+    } else {
+        eprintln!("error [{code}]: {message}\n  hint: {hint}");
     }
 }
 
