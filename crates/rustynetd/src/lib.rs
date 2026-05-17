@@ -37,6 +37,7 @@ pub mod windows_ipc;
 pub mod windows_key_custody;
 pub mod windows_mesh_status;
 pub mod windows_paths;
+pub mod windows_registry_acls;
 pub mod windows_runtime_boundary;
 pub mod windows_service;
 pub mod windows_service_hardening;
