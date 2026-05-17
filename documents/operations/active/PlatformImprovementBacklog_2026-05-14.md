@@ -763,11 +763,20 @@ inline. Cross-reference with:
   status-return echo). 6 new tests pin the contract (round-trip /
   per-slot fail / missing required / wrong-type / writer-output
   parsed back through the typed view).
+* `[~]` Seventh X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 1f38e59). Migrated
+  `execute_ops_write_real_wireguard_exitnode_e2e_report` to TWO
+  typed views:
+  - `RealWireguardExitnodeE2eChecksView` (6 pass/fail slots +
+    `overall_status` helper)
+  - `RealWireguardExitnodeE2eReportView` (8 typed top-level fields,
+    no evidence sub-block)
+  Removes 2 trailing `Value` walks. 5 new tests including
+  environment-default fallback semantics pin.
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (6 production walks across 4 unrelated report-writer fns +
+  (5 production walks across 3 unrelated report-writer fns +
   1 intentional generic JSON-pointer reader):
-  - `write_real_wireguard_exitnode_e2e_report`,
-    `write_real_wireguard_no_leak_under_load_report`,
+  - `write_real_wireguard_no_leak_under_load_report`,
     `write_active_network_signed_state_tamper_report`,
     `write_active_network_rogue_path_hijack_report` (e2e writers)
   - `e2e_dns_query` (helper)
