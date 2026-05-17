@@ -712,11 +712,27 @@ inline. Cross-reference with:
   - `CrossNetworkForensicsBundleValidationView` (16 required
     typed fields)
   15 new tests; target fn now has ZERO Value walks.
+* `[~]` Fourth X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 8a42e8f). Migrated
+  `execute_ops_write_live_linux_server_ip_bypass_report` (the
+  next prime target from the remaining-walks list) to THREE
+  typed views:
+  - `LiveLinuxServerIpBypassChecksView` (5 typed `pass`/`fail`
+    slots + an `overall_status` helper that names each slot
+    explicitly so a future field drop trips a per-slot test).
+  - `LiveLinuxServerIpBypassEvidenceView` (6 `String` + 2
+    `Vec<String>` slots covering the evidence block).
+  - `LiveLinuxServerIpBypassReportView` (10 typed fields
+    including nested check + evidence views).
+  Removes the two trailing `Value` walks (overall-status
+  calculation + status echo on return). 7 new tests pin the
+  contract (clean serde round-trip / overall_status pass + fail
+  per-slot / missing required field / wrong-type / writer-output
+  parsed back through the typed view / fail-path-route).
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (9 production walks across 7 unrelated report-writer fns +
+  (8 production walks across 6 unrelated report-writer fns +
   1 intentional generic JSON-pointer reader):
-  - `write_live_linux_server_ip_bypass_report`,
-    `write_live_linux_control_surface_report`,
+  - `write_live_linux_control_surface_report`,
     `write_live_linux_endpoint_hijack_report` (report writers)
   - `write_real_wireguard_exitnode_e2e_report`,
     `write_real_wireguard_no_leak_under_load_report`,
