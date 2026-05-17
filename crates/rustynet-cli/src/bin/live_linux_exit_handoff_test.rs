@@ -42,8 +42,54 @@ struct ManagedDnsRefreshTarget {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
+        // X6 taxonomy classifier for live-lab test binaries. The
+        // shape of errors these tests emit is well-known: missing
+        // commands / paths → ConfigError, ssh/scp transient
+        // failures → TransientFailure, daemon-state drift →
+        // PolicyReject.
+        let code = classify_live_lab_error(err.as_str());
+        let hint = code.operator_hint();
+        if hint.is_empty() {
+            eprintln!("error [{code}]: {err}");
+        } else {
+            eprintln!("error [{code}]: {err}\n  hint: {hint}");
+        }
+        std::process::exit(code.as_i32());
+    }
+}
+
+fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
+    use rustynetd::exit_codes::ExitCode;
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("missing required")
+        || lower.contains("unknown command")
+        || lower.contains("missing required argument")
+    {
+        ExitCode::BadArgs
+    } else if lower.contains("drift")
+        || lower.contains("fail-closed")
+        || lower.contains("signature verification")
+        || lower.contains("policy reject")
+        || lower.contains("forbidden")
+    {
+        ExitCode::PolicyReject
+    } else if lower.contains("missing required command")
+        || lower.contains("identity file")
+        || lower.contains("invalid path")
+        || lower.contains("config")
+        || lower.contains("schema")
+    {
+        ExitCode::ConfigError
+    } else if lower.contains("ssh")
+        || lower.contains("scp")
+        || lower.contains("timed out")
+        || lower.contains("connection refused")
+        || lower.contains("transient")
+        || lower.contains("retry")
+    {
+        ExitCode::TransientFailure
+    } else {
+        ExitCode::GenericFailure
     }
 }
 
