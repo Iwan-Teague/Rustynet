@@ -842,6 +842,251 @@ fn is_plaintext_no_leak_report(
     }
 }
 
+/// X2: Phase A typed view for one entry in the live-lab run summary
+/// `nodes` array. Required fields mirror the four columns of the nodes
+/// TSV. Any extra keys ride through `extra`; `into_value_map` re-injects
+/// the typed fields so Map-walking consumers keep working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunSummaryNodeView {
+    label: String,
+    target: String,
+    node_id: String,
+    bootstrap_role: String,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl RunSummaryNodeView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("label".to_string(), Value::String(self.label));
+        m.insert("target".to_string(), Value::String(self.target));
+        m.insert("node_id".to_string(), Value::String(self.node_id));
+        m.insert(
+            "bootstrap_role".to_string(),
+            Value::String(self.bootstrap_role),
+        );
+        m
+    }
+}
+
+/// X2: Phase A typed view for one entry in a stage's `worker_results`
+/// array. Required fields mirror the worker-result TSV columns consumed
+/// by `read_parallel_stage_results` and serialised by
+/// `execute_ops_write_live_linux_lab_run_summary`. `rc` is `i64` to
+/// match the worker schema; the remaining fields are strings. Extra
+/// keys ride through `extra`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunSummaryWorkerView {
+    label: String,
+    target: String,
+    node_id: String,
+    role: String,
+    rc: i64,
+    started_at: String,
+    finished_at: String,
+    log_path: String,
+    snapshot_path: String,
+    route_policy_path: String,
+    dns_state_path: String,
+    primary_failure_reason: String,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl RunSummaryWorkerView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("label".to_string(), Value::String(self.label));
+        m.insert("target".to_string(), Value::String(self.target));
+        m.insert("node_id".to_string(), Value::String(self.node_id));
+        m.insert("role".to_string(), Value::String(self.role));
+        m.insert("rc".to_string(), Value::Number(self.rc.into()));
+        m.insert("started_at".to_string(), Value::String(self.started_at));
+        m.insert("finished_at".to_string(), Value::String(self.finished_at));
+        m.insert("log_path".to_string(), Value::String(self.log_path));
+        m.insert(
+            "snapshot_path".to_string(),
+            Value::String(self.snapshot_path),
+        );
+        m.insert(
+            "route_policy_path".to_string(),
+            Value::String(self.route_policy_path),
+        );
+        m.insert(
+            "dns_state_path".to_string(),
+            Value::String(self.dns_state_path),
+        );
+        m.insert(
+            "primary_failure_reason".to_string(),
+            Value::String(self.primary_failure_reason),
+        );
+        m
+    }
+}
+
+/// X2: Phase A typed view for one entry in the run-summary `stages`
+/// array. Captures the full shape emitted by the run-summary writer: a
+/// stage name and severity classifier, a status string, an `i64` return
+/// code, the originating log path and free-form message, two
+/// RFC-3339 timestamps, the `u64` failed-worker count, a primary
+/// failure reason, and the nested `worker_results` typed view list.
+/// `into_value_map` re-injects every typed field (including the nested
+/// workers) so Map-walking consumers see the complete shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunSummaryStageView {
+    stage: String,
+    severity: String,
+    status: String,
+    rc: i64,
+    log_path: String,
+    message: String,
+    started_at: String,
+    finished_at: String,
+    failed_worker_count: u64,
+    primary_failure_reason: String,
+    worker_results: Vec<RunSummaryWorkerView>,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl RunSummaryStageView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert("stage".to_string(), Value::String(self.stage));
+        m.insert("severity".to_string(), Value::String(self.severity));
+        m.insert("status".to_string(), Value::String(self.status));
+        m.insert("rc".to_string(), Value::Number(self.rc.into()));
+        m.insert("log_path".to_string(), Value::String(self.log_path));
+        m.insert("message".to_string(), Value::String(self.message));
+        m.insert("started_at".to_string(), Value::String(self.started_at));
+        m.insert("finished_at".to_string(), Value::String(self.finished_at));
+        m.insert(
+            "failed_worker_count".to_string(),
+            Value::Number(self.failed_worker_count.into()),
+        );
+        m.insert(
+            "primary_failure_reason".to_string(),
+            Value::String(self.primary_failure_reason),
+        );
+        m.insert(
+            "worker_results".to_string(),
+            Value::Array(
+                self.worker_results
+                    .into_iter()
+                    .map(|w| Value::Object(w.into_value_map()))
+                    .collect(),
+            ),
+        );
+        m
+    }
+}
+
+/// X2: Phase A typed view for the live-lab run-summary top-level JSON
+/// emitted by `execute_ops_write_live_linux_lab_run_summary`. Captures
+/// the full envelope:
+///   - `schema_version` (`u64`) pins the contract version
+///   - `run_id`, `network_id`, `report_dir`, `overall_status` (`String`)
+///     identify the run
+///   - `started_at_*`, `finished_at_*`, `elapsed_*` track timing
+///     (string locals/UTCs and `u64` unix-second counters + duration)
+///   - `nodes` and `stages` are typed view lists
+///
+/// `into_value_map` re-injects every typed field (including the nested
+/// arrays) so any downstream Map walker keeps working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveLabRunSummaryView {
+    schema_version: u64,
+    run_id: String,
+    network_id: String,
+    report_dir: String,
+    overall_status: String,
+    started_at_local: String,
+    started_at_utc: String,
+    started_at_unix: u64,
+    finished_at_local: String,
+    finished_at_utc: String,
+    finished_at_unix: u64,
+    elapsed_secs: u64,
+    elapsed_human: String,
+    nodes: Vec<RunSummaryNodeView>,
+    stages: Vec<RunSummaryStageView>,
+    #[serde(flatten, default)]
+    extra: Map<String, Value>,
+}
+
+impl LiveLabRunSummaryView {
+    #[allow(dead_code)]
+    fn into_value_map(self) -> Map<String, Value> {
+        let mut m = self.extra;
+        m.insert(
+            "schema_version".to_string(),
+            Value::Number(self.schema_version.into()),
+        );
+        m.insert("run_id".to_string(), Value::String(self.run_id));
+        m.insert("network_id".to_string(), Value::String(self.network_id));
+        m.insert("report_dir".to_string(), Value::String(self.report_dir));
+        m.insert(
+            "overall_status".to_string(),
+            Value::String(self.overall_status),
+        );
+        m.insert(
+            "started_at_local".to_string(),
+            Value::String(self.started_at_local),
+        );
+        m.insert(
+            "started_at_utc".to_string(),
+            Value::String(self.started_at_utc),
+        );
+        m.insert(
+            "started_at_unix".to_string(),
+            Value::Number(self.started_at_unix.into()),
+        );
+        m.insert(
+            "finished_at_local".to_string(),
+            Value::String(self.finished_at_local),
+        );
+        m.insert(
+            "finished_at_utc".to_string(),
+            Value::String(self.finished_at_utc),
+        );
+        m.insert(
+            "finished_at_unix".to_string(),
+            Value::Number(self.finished_at_unix.into()),
+        );
+        m.insert(
+            "elapsed_secs".to_string(),
+            Value::Number(self.elapsed_secs.into()),
+        );
+        m.insert(
+            "elapsed_human".to_string(),
+            Value::String(self.elapsed_human),
+        );
+        m.insert(
+            "nodes".to_string(),
+            Value::Array(
+                self.nodes
+                    .into_iter()
+                    .map(|n| Value::Object(n.into_value_map()))
+                    .collect(),
+            ),
+        );
+        m.insert(
+            "stages".to_string(),
+            Value::Array(
+                self.stages
+                    .into_iter()
+                    .map(|s| Value::Object(s.into_value_map()))
+                    .collect(),
+            ),
+        );
+        m
+    }
+}
+
 fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, String> {
     if !path.exists() {
         return Ok(Map::new());
@@ -1474,20 +1719,19 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
     let node_rows = read_tsv_rows(nodes_tsv.as_path())?;
     let stage_rows = read_tsv_rows(stages_tsv.as_path())?;
 
-    let nodes = node_rows
+    let nodes: Vec<RunSummaryNodeView> = node_rows
         .into_iter()
         .filter(|row| row.len() == 4)
-        .map(|row| {
-            json!({
-                "label": row[0],
-                "target": row[1],
-                "node_id": row[2],
-                "bootstrap_role": row[3],
-            })
+        .map(|row| RunSummaryNodeView {
+            label: row[0].clone(),
+            target: row[1].clone(),
+            node_id: row[2].clone(),
+            bootstrap_role: row[3].clone(),
+            extra: Map::new(),
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    let stages = stage_rows
+    let stages: Vec<RunSummaryStageView> = stage_rows
         .into_iter()
         .filter(|row| row.len() == 8)
         .map(|row| {
@@ -1504,215 +1748,128 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
                 .find(|worker| worker.rc != 0)
                 .map(|worker| worker.primary_failure_reason.clone())
                 .unwrap_or_default();
-            json!({
-                "stage": stage_name,
-                "severity": row[1],
-                "status": row[2],
-                "rc": rc,
-                "log_path": row[4],
-                "message": row[5],
-                "started_at": row[6],
-                "finished_at": row[7],
-                "failed_worker_count": failed_worker_count,
-                "primary_failure_reason": primary_failure_reason,
-                "worker_results": worker_results
-                    .into_iter()
-                    .map(|worker: LiveLabWorkerResult| {
-                        json!({
-                            "label": worker.label,
-                            "target": worker.target,
-                            "node_id": worker.node_id,
-                            "role": worker.role,
-                            "rc": worker.rc,
-                            "started_at": worker.started_at,
-                            "finished_at": worker.finished_at,
-                            "log_path": worker.log_path,
-                            "snapshot_path": worker.snapshot_path,
-                            "route_policy_path": worker.route_policy_path,
-                            "dns_state_path": worker.dns_state_path,
-                            "primary_failure_reason": worker.primary_failure_reason,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            })
+            let worker_views: Vec<RunSummaryWorkerView> = worker_results
+                .into_iter()
+                .map(|worker: LiveLabWorkerResult| RunSummaryWorkerView {
+                    label: worker.label,
+                    target: worker.target,
+                    node_id: worker.node_id,
+                    role: worker.role,
+                    rc: worker.rc,
+                    started_at: worker.started_at,
+                    finished_at: worker.finished_at,
+                    log_path: worker.log_path,
+                    snapshot_path: worker.snapshot_path,
+                    route_policy_path: worker.route_policy_path,
+                    dns_state_path: worker.dns_state_path,
+                    primary_failure_reason: worker.primary_failure_reason,
+                    extra: Map::new(),
+                })
+                .collect();
+            RunSummaryStageView {
+                stage: stage_name,
+                severity: row[1].clone(),
+                status: row[2].clone(),
+                rc,
+                log_path: row[4].clone(),
+                message: row[5].clone(),
+                started_at: row[6].clone(),
+                finished_at: row[7].clone(),
+                failed_worker_count,
+                primary_failure_reason,
+                worker_results: worker_views,
+                extra: Map::new(),
+            }
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    let payload = json!({
-        "schema_version": 1,
-        "run_id": config.run_id,
-        "network_id": config.network_id,
-        "report_dir": report_dir.display().to_string(),
-        "overall_status": config.overall_status,
-        "started_at_local": config.started_at_local,
-        "started_at_utc": config.started_at_utc,
-        "started_at_unix": config.started_at_unix,
-        "finished_at_local": config.finished_at_local,
-        "finished_at_utc": config.finished_at_utc,
-        "finished_at_unix": config.finished_at_unix,
-        "elapsed_secs": config.elapsed_secs,
-        "elapsed_human": config.elapsed_human,
-        "nodes": nodes,
-        "stages": stages,
-    });
-    write_json_pretty(summary_json.as_path(), &payload)?;
+    let summary = LiveLabRunSummaryView {
+        schema_version: 1,
+        run_id: config.run_id.clone(),
+        network_id: config.network_id.clone(),
+        report_dir: report_dir.display().to_string(),
+        overall_status: config.overall_status.clone(),
+        started_at_local: config.started_at_local.clone(),
+        started_at_utc: config.started_at_utc.clone(),
+        started_at_unix: config.started_at_unix,
+        finished_at_local: config.finished_at_local.clone(),
+        finished_at_utc: config.finished_at_utc.clone(),
+        finished_at_unix: config.finished_at_unix,
+        elapsed_secs: config.elapsed_secs,
+        elapsed_human: config.elapsed_human.clone(),
+        nodes,
+        stages,
+        extra: Map::new(),
+    };
+
+    ensure_parent_dir(summary_json.as_path())?;
+    let summary_body = serde_json::to_string_pretty(&summary)
+        .map_err(|err| format!("serialize JSON failed: {err}"))?;
+    fs::write(summary_json.as_path(), format!("{summary_body}\n"))
+        .map_err(|err| format!("write JSON failed ({}): {err}", summary_json.display()))?;
 
     let mut lines = Vec::new();
     lines.push(format!(
         "# Live Linux Lab Orchestrator Summary ({})",
-        payload
-            .get("run_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+        summary.run_id
     ));
     lines.push(String::new());
-    lines.push(format!(
-        "- overall_status: `{}`",
-        payload
-            .get("overall_status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    ));
-    lines.push(format!(
-        "- network_id: `{}`",
-        payload
-            .get("network_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    ));
-    lines.push(format!(
-        "- report_dir: `{}`",
-        payload
-            .get("report_dir")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    ));
+    lines.push(format!("- overall_status: `{}`", summary.overall_status));
+    lines.push(format!("- network_id: `{}`", summary.network_id));
+    lines.push(format!("- report_dir: `{}`", summary.report_dir));
     lines.push(format!(
         "- started_at_local: `{}`",
-        payload
-            .get("started_at_local")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+        summary.started_at_local
     ));
-    lines.push(format!(
-        "- started_at_utc: `{}`",
-        payload
-            .get("started_at_utc")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    ));
+    lines.push(format!("- started_at_utc: `{}`", summary.started_at_utc));
     lines.push(format!(
         "- finished_at_local: `{}`",
-        payload
-            .get("finished_at_local")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+        summary.finished_at_local
     ));
-    lines.push(format!(
-        "- finished_at_utc: `{}`",
-        payload
-            .get("finished_at_utc")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    ));
-    lines.push(format!(
-        "- elapsed: `{}`",
-        payload
-            .get("elapsed_human")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-    ));
+    lines.push(format!("- finished_at_utc: `{}`", summary.finished_at_utc));
+    lines.push(format!("- elapsed: `{}`", summary.elapsed_human));
     lines.push(String::new());
     lines.push("## Nodes".to_string());
     lines.push(String::new());
-    if let Some(node_array) = payload.get("nodes").and_then(Value::as_array) {
-        for node in node_array {
-            lines.push(format!(
-                "- `{}`: `{}` (`{}`, bootstrap role `{}`)",
-                node.get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                node.get("target")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                node.get("node_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                node.get("bootstrap_role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-            ));
-        }
+    for node in &summary.nodes {
+        lines.push(format!(
+            "- `{}`: `{}` (`{}`, bootstrap role `{}`)",
+            node.label, node.target, node.node_id, node.bootstrap_role,
+        ));
     }
     lines.push(String::new());
     lines.push("## Stages".to_string());
     lines.push(String::new());
-    if let Some(stage_array) = payload.get("stages").and_then(Value::as_array) {
-        for stage in stage_array {
+    for stage in &summary.stages {
+        lines.push(format!(
+            "- `{}` [{}] -> `{}` (rc={})",
+            stage.stage, stage.severity, stage.status, stage.rc,
+        ));
+        lines.push(format!("  log: `{}`", stage.log_path));
+        let detail = if stage.message.is_empty() {
+            "stage detail unavailable"
+        } else {
+            stage.message.as_str()
+        };
+        lines.push(format!("  detail: {detail}"));
+        if !stage.worker_results.is_empty() {
             lines.push(format!(
-                "- `{}` [{}] -> `{}` (rc={})",
-                stage
-                    .get("stage")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                stage
-                    .get("severity")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                stage
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown"),
-                stage.get("rc").and_then(Value::as_i64).unwrap_or(1),
+                "  workers: {}/{} failed",
+                stage.failed_worker_count,
+                stage.worker_results.len()
             ));
-            lines.push(format!(
-                "  log: `{}`",
-                stage
-                    .get("log_path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-            ));
-            lines.push(format!(
-                "  detail: {}",
-                stage
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stage detail unavailable")
-            ));
-            if let Some(worker_results) = stage.get("worker_results").and_then(Value::as_array)
-                && !worker_results.is_empty()
-            {
+            if let Some(first_failed) = stage.worker_results.iter().find(|worker| worker.rc != 0) {
+                let reason = if first_failed.primary_failure_reason.is_empty() {
+                    "see worker log"
+                } else {
+                    first_failed.primary_failure_reason.as_str()
+                };
                 lines.push(format!(
-                    "  workers: {}/{} failed",
-                    stage
-                        .get("failed_worker_count")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    worker_results.len()
+                    "  first_failed_node: `{}` reason={}",
+                    first_failed.label, reason
                 ));
-                if let Some(first_failed) = worker_results
-                    .iter()
-                    .find(|worker| worker.get("rc").and_then(Value::as_i64).unwrap_or(0) != 0)
-                {
-                    lines.push(format!(
-                        "  first_failed_node: `{}` reason={}",
-                        first_failed
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown"),
-                        first_failed
-                            .get("primary_failure_reason")
-                            .and_then(Value::as_str)
-                            .filter(|value| !value.is_empty())
-                            .unwrap_or("see worker log")
-                    ));
-                    if let Some(snapshot_path) = first_failed
-                        .get("snapshot_path")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.is_empty())
-                    {
-                        lines.push(format!("  snapshot: `{snapshot_path}`"));
-                    }
+                if !first_failed.snapshot_path.is_empty() {
+                    lines.push(format!("  snapshot: `{}`", first_failed.snapshot_path));
                 }
             }
         }
@@ -3726,7 +3883,10 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
 
 #[cfg(test)]
 mod typed_parser_tests {
-    use super::{LiveLabOrchestratorNoLeakReportView, is_plaintext_no_leak_report};
+    use super::{
+        LiveLabOrchestratorNoLeakReportView, LiveLabRunSummaryView, RunSummaryNodeView,
+        RunSummaryStageView, RunSummaryWorkerView, is_plaintext_no_leak_report,
+    };
     use serde_json::{Value, json};
 
     fn clean_payload() -> Value {
@@ -3925,5 +4085,355 @@ mod typed_parser_tests {
         assert!(err.contains("tunnel_up_connectivity"));
         assert!(err.contains("load_ping_success"));
         assert!(!err.contains("tunnel_transport_observed_under_load"));
+    }
+
+    // -------------------------------------------------------------
+    // X2 slice 2: run-summary typed views
+    // -------------------------------------------------------------
+
+    fn clean_node_payload() -> Value {
+        json!({
+            "label": "client",
+            "target": "debian@client",
+            "node_id": "client-1",
+            "bootstrap_role": "client",
+            // Unknown keys must ride through `extra`.
+            "extra_hint": "future-field",
+        })
+    }
+
+    fn clean_worker_payload() -> Value {
+        json!({
+            "label": "client",
+            "target": "debian@client",
+            "node_id": "client-1",
+            "role": "client",
+            "rc": 1_i64,
+            "started_at": "2026-04-08T10:00:00Z",
+            "finished_at": "2026-04-08T10:00:10Z",
+            "log_path": "/tmp/client.log",
+            "snapshot_path": "/tmp/snapshot.txt",
+            "route_policy_path": "/tmp/route.txt",
+            "dns_state_path": "/tmp/dns.txt",
+            "primary_failure_reason": "route missing",
+            "extra_hint": "future-field",
+        })
+    }
+
+    fn clean_stage_payload() -> Value {
+        json!({
+            "stage": "validate_baseline_runtime",
+            "severity": "hard",
+            "status": "fail",
+            "rc": 1_i64,
+            "log_path": "/tmp/stage.log",
+            "message": "baseline validation failed",
+            "started_at": "2026-04-08T10:00:00Z",
+            "finished_at": "2026-04-08T10:00:10Z",
+            "failed_worker_count": 1_u64,
+            "primary_failure_reason": "route missing",
+            "worker_results": [clean_worker_payload()],
+            "extra_hint": "future-field",
+        })
+    }
+
+    fn clean_run_summary_payload() -> Value {
+        json!({
+            "schema_version": 1_u64,
+            "run_id": "run-1",
+            "network_id": "net-1",
+            "report_dir": "/tmp/report",
+            "overall_status": "fail",
+            "started_at_local": "2026-04-08 11:00:00 UTC",
+            "started_at_utc": "2026-04-08T10:00:00Z",
+            "started_at_unix": 1_u64,
+            "finished_at_local": "2026-04-08 11:00:10 UTC",
+            "finished_at_utc": "2026-04-08T10:00:10Z",
+            "finished_at_unix": 11_u64,
+            "elapsed_secs": 10_u64,
+            "elapsed_human": "00m 10s",
+            "nodes": [clean_node_payload()],
+            "stages": [clean_stage_payload()],
+            // Unknown top-level keys must ride through `extra`.
+            "tooling_hint": "future-field",
+        })
+    }
+
+    // ---- RunSummaryNodeView ----
+
+    #[test]
+    fn run_summary_node_view_parses_clean_fixture() {
+        let view: RunSummaryNodeView =
+            serde_json::from_value(clean_node_payload()).expect("clean parse");
+        assert_eq!(view.label, "client");
+        assert_eq!(view.target, "debian@client");
+        assert_eq!(view.node_id, "client-1");
+        assert_eq!(view.bootstrap_role, "client");
+        assert_eq!(
+            view.extra.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+        // Typed fields must NOT also appear under `extra`.
+        assert!(!view.extra.contains_key("label"));
+    }
+
+    #[test]
+    fn run_summary_node_view_rejects_missing_label() {
+        let mut payload = clean_node_payload();
+        payload.as_object_mut().unwrap().remove("label");
+        let err = serde_json::from_value::<RunSummaryNodeView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("label"),
+            "missing-required-field message must name `label`: {err}"
+        );
+    }
+
+    #[test]
+    fn run_summary_node_view_rejects_wrong_type_node_id() {
+        let mut payload = clean_node_payload();
+        payload.as_object_mut().unwrap()["node_id"] = json!(0_i64);
+        let err = serde_json::from_value::<RunSummaryNodeView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("string"),
+            "wrong-type message must mention `string`: {err}"
+        );
+    }
+
+    #[test]
+    fn run_summary_node_view_into_value_map_round_trips() {
+        let view: RunSummaryNodeView =
+            serde_json::from_value(clean_node_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(map.get("label").and_then(Value::as_str), Some("client"));
+        assert_eq!(
+            map.get("target").and_then(Value::as_str),
+            Some("debian@client")
+        );
+        assert_eq!(map.get("node_id").and_then(Value::as_str), Some("client-1"));
+        assert_eq!(
+            map.get("bootstrap_role").and_then(Value::as_str),
+            Some("client")
+        );
+        assert_eq!(
+            map.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+    }
+
+    // ---- RunSummaryWorkerView ----
+
+    #[test]
+    fn run_summary_worker_view_parses_clean_fixture() {
+        let view: RunSummaryWorkerView =
+            serde_json::from_value(clean_worker_payload()).expect("clean parse");
+        assert_eq!(view.label, "client");
+        assert_eq!(view.rc, 1);
+        assert_eq!(view.snapshot_path, "/tmp/snapshot.txt");
+        assert_eq!(view.primary_failure_reason, "route missing");
+        assert_eq!(
+            view.extra.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+        assert!(!view.extra.contains_key("rc"));
+    }
+
+    #[test]
+    fn run_summary_worker_view_rejects_missing_rc() {
+        let mut payload = clean_worker_payload();
+        payload.as_object_mut().unwrap().remove("rc");
+        let err = serde_json::from_value::<RunSummaryWorkerView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("rc"),
+            "missing-required-field message must name `rc`: {err}"
+        );
+    }
+
+    #[test]
+    fn run_summary_worker_view_rejects_wrong_type_rc() {
+        let mut payload = clean_worker_payload();
+        payload.as_object_mut().unwrap()["rc"] = json!("not-a-number");
+        let err = serde_json::from_value::<RunSummaryWorkerView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("integer")
+                || err.to_string().to_ascii_lowercase().contains("number"),
+            "wrong-type message must mention integer/number: {err}"
+        );
+    }
+
+    #[test]
+    fn run_summary_worker_view_into_value_map_round_trips() {
+        let view: RunSummaryWorkerView =
+            serde_json::from_value(clean_worker_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(map.get("label").and_then(Value::as_str), Some("client"));
+        assert_eq!(map.get("rc").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            map.get("snapshot_path").and_then(Value::as_str),
+            Some("/tmp/snapshot.txt")
+        );
+        assert_eq!(
+            map.get("primary_failure_reason").and_then(Value::as_str),
+            Some("route missing")
+        );
+        assert_eq!(
+            map.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+    }
+
+    // ---- RunSummaryStageView ----
+
+    #[test]
+    fn run_summary_stage_view_parses_clean_fixture() {
+        let view: RunSummaryStageView =
+            serde_json::from_value(clean_stage_payload()).expect("clean parse");
+        assert_eq!(view.stage, "validate_baseline_runtime");
+        assert_eq!(view.severity, "hard");
+        assert_eq!(view.status, "fail");
+        assert_eq!(view.rc, 1);
+        assert_eq!(view.failed_worker_count, 1);
+        assert_eq!(view.worker_results.len(), 1);
+        assert_eq!(view.worker_results[0].label, "client");
+        assert_eq!(
+            view.extra.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+        assert!(!view.extra.contains_key("worker_results"));
+    }
+
+    #[test]
+    fn run_summary_stage_view_rejects_missing_failed_worker_count() {
+        let mut payload = clean_stage_payload();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("failed_worker_count");
+        let err = serde_json::from_value::<RunSummaryStageView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("failed_worker_count"),
+            "missing-required-field message must name `failed_worker_count`: {err}"
+        );
+    }
+
+    #[test]
+    fn run_summary_stage_view_rejects_wrong_type_worker_results() {
+        let mut payload = clean_stage_payload();
+        payload.as_object_mut().unwrap()["worker_results"] = json!("not-an-array");
+        let err = serde_json::from_value::<RunSummaryStageView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("sequence")
+                || err.to_string().to_ascii_lowercase().contains("array"),
+            "wrong-type message must mention sequence/array: {err}"
+        );
+    }
+
+    #[test]
+    fn run_summary_stage_view_into_value_map_round_trips() {
+        let view: RunSummaryStageView =
+            serde_json::from_value(clean_stage_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(
+            map.get("stage").and_then(Value::as_str),
+            Some("validate_baseline_runtime")
+        );
+        assert_eq!(map.get("rc").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            map.get("failed_worker_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        let workers = map
+            .get("worker_results")
+            .and_then(Value::as_array)
+            .expect("worker_results re-injected");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(
+            workers[0].get("label").and_then(Value::as_str),
+            Some("client")
+        );
+        assert_eq!(
+            map.get("extra_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+    }
+
+    // ---- LiveLabRunSummaryView ----
+
+    #[test]
+    fn live_lab_run_summary_view_parses_clean_fixture() {
+        let view: LiveLabRunSummaryView =
+            serde_json::from_value(clean_run_summary_payload()).expect("clean parse");
+        assert_eq!(view.schema_version, 1);
+        assert_eq!(view.run_id, "run-1");
+        assert_eq!(view.network_id, "net-1");
+        assert_eq!(view.overall_status, "fail");
+        assert_eq!(view.elapsed_secs, 10);
+        assert_eq!(view.nodes.len(), 1);
+        assert_eq!(view.stages.len(), 1);
+        assert_eq!(view.stages[0].worker_results.len(), 1);
+        assert_eq!(
+            view.extra.get("tooling_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
+        assert!(!view.extra.contains_key("nodes"));
+        assert!(!view.extra.contains_key("stages"));
+    }
+
+    #[test]
+    fn live_lab_run_summary_view_rejects_missing_schema_version() {
+        let mut payload = clean_run_summary_payload();
+        payload.as_object_mut().unwrap().remove("schema_version");
+        let err = serde_json::from_value::<LiveLabRunSummaryView>(payload).unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version"),
+            "missing-required-field message must name `schema_version`: {err}"
+        );
+    }
+
+    #[test]
+    fn live_lab_run_summary_view_rejects_wrong_type_nodes() {
+        let mut payload = clean_run_summary_payload();
+        payload.as_object_mut().unwrap()["nodes"] = json!("not-an-array");
+        let err = serde_json::from_value::<LiveLabRunSummaryView>(payload).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("sequence")
+                || err.to_string().to_ascii_lowercase().contains("array"),
+            "wrong-type message must mention sequence/array: {err}"
+        );
+    }
+
+    #[test]
+    fn live_lab_run_summary_view_into_value_map_round_trips() {
+        let view: LiveLabRunSummaryView =
+            serde_json::from_value(clean_run_summary_payload()).expect("clean parse");
+        let map = view.into_value_map();
+        assert_eq!(map.get("schema_version").and_then(Value::as_u64), Some(1));
+        assert_eq!(map.get("run_id").and_then(Value::as_str), Some("run-1"));
+        assert_eq!(
+            map.get("elapsed_human").and_then(Value::as_str),
+            Some("00m 10s")
+        );
+        let nodes = map
+            .get("nodes")
+            .and_then(Value::as_array)
+            .expect("nodes re-injected");
+        assert_eq!(nodes.len(), 1);
+        let stages = map
+            .get("stages")
+            .and_then(Value::as_array)
+            .expect("stages re-injected");
+        assert_eq!(stages.len(), 1);
+        let workers = stages[0]
+            .get("worker_results")
+            .and_then(Value::as_array)
+            .expect("worker_results round-tripped through stage view");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(
+            workers[0].get("snapshot_path").and_then(Value::as_str),
+            Some("/tmp/snapshot.txt")
+        );
+        assert_eq!(
+            map.get("tooling_hint").and_then(Value::as_str),
+            Some("future-field")
+        );
     }
 }
