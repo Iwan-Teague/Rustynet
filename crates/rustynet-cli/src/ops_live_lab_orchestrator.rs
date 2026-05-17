@@ -2929,6 +2929,51 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     Ok(report.status)
 }
 
+/// Typed view for the per-check verdicts inside the real-WireGuard
+/// exit-node e2e report. Six pass/fail slots, one per acceptance
+/// step the orchestrator runs against the netns exit-node fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RealWireguardExitnodeE2eChecksView {
+    pub exit_node_routing: String,
+    pub lan_toggle_off_blocks: String,
+    pub lan_toggle_on_allows: String,
+    pub dns_reaches_protected_path_when_tunnel_up: String,
+    pub kill_switch_blocks_egress_when_tunnel_down: String,
+    pub dns_fail_close_when_tunnel_down: String,
+}
+
+impl RealWireguardExitnodeE2eChecksView {
+    fn overall_status(&self) -> &'static str {
+        let all_pass = [
+            self.exit_node_routing.as_str(),
+            self.lan_toggle_off_blocks.as_str(),
+            self.lan_toggle_on_allows.as_str(),
+            self.dns_reaches_protected_path_when_tunnel_up.as_str(),
+            self.kill_switch_blocks_egress_when_tunnel_down.as_str(),
+            self.dns_fail_close_when_tunnel_down.as_str(),
+        ]
+        .iter()
+        .all(|value| *value == CHECK_PASS);
+        if all_pass { CHECK_PASS } else { CHECK_FAIL }
+    }
+}
+
+/// Typed view for the real-WireGuard exit-node e2e report. No
+/// evidence sub-block; the report is a pure verdict + environment
+/// stamp. Replaces the previous `json!({...})` literal plus 2
+/// trailing `Value` walks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RealWireguardExitnodeE2eReportView {
+    pub phase: String,
+    pub mode: String,
+    pub evidence_mode: String,
+    pub environment: String,
+    pub captured_at: String,
+    pub captured_at_unix: u64,
+    pub status: String,
+    pub checks: RealWireguardExitnodeE2eChecksView,
+}
+
 pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
     config: WriteRealWireguardExitnodeE2eReportConfig,
 ) -> Result<String, String> {
@@ -2956,43 +3001,31 @@ pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
         config.captured_at_utc.trim().to_string()
     };
 
-    let checks = json!({
-        "exit_node_routing": exit_status,
-        "lan_toggle_off_blocks": lan_off_status,
-        "lan_toggle_on_allows": lan_on_status,
-        "dns_reaches_protected_path_when_tunnel_up": dns_up_status,
-        "kill_switch_blocks_egress_when_tunnel_down": kill_switch_status,
-        "dns_fail_close_when_tunnel_down": dns_down_status,
-    });
-    let status = if checks
-        .as_object()
-        .map(|items| {
-            items
-                .values()
-                .all(|value| value.as_str() == Some(CHECK_PASS))
-        })
-        .unwrap_or(false)
-    {
-        CHECK_PASS
-    } else {
-        CHECK_FAIL
+    let checks = RealWireguardExitnodeE2eChecksView {
+        exit_node_routing: exit_status,
+        lan_toggle_off_blocks: lan_off_status,
+        lan_toggle_on_allows: lan_on_status,
+        dns_reaches_protected_path_when_tunnel_up: dns_up_status,
+        kill_switch_blocks_egress_when_tunnel_down: kill_switch_status,
+        dns_fail_close_when_tunnel_down: dns_down_status,
     };
-    let payload = json!({
-        "phase": "phase10",
-        "mode": "real_netns_wireguard",
-        "evidence_mode": "measured",
-        "environment": environment,
-        "captured_at": captured_at,
-        "captured_at_unix": captured_at_unix,
-        "status": status,
-        "checks": checks,
-    });
+    let status = checks.overall_status().to_string();
+
+    let report = RealWireguardExitnodeE2eReportView {
+        phase: "phase10".to_string(),
+        mode: "real_netns_wireguard".to_string(),
+        evidence_mode: "measured".to_string(),
+        environment,
+        captured_at,
+        captured_at_unix,
+        status,
+        checks,
+    };
+
+    let payload = serde_json::to_value(&report)
+        .map_err(|err| format!("serialize real-wireguard-exitnode-e2e report failed: {err}"))?;
     write_json_pretty(report_path.as_path(), &payload)?;
-    Ok(payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(CHECK_FAIL)
-        .to_string())
+    Ok(report.status)
 }
 
 pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
@@ -3518,6 +3551,7 @@ mod tests {
         LiveLinuxEndpointHijackChecksView, LiveLinuxEndpointHijackEvidenceView,
         LiveLinuxEndpointHijackReportView, LiveLinuxServerIpBypassChecksView,
         LiveLinuxServerIpBypassEvidenceView, LiveLinuxServerIpBypassReportView,
+        RealWireguardExitnodeE2eChecksView, RealWireguardExitnodeE2eReportView,
         RewriteAssignmentMeshCidrConfig, RewriteAssignmentPeerEndpointIpConfig,
         UpdateRoleSwitchHostResultConfig, ValidateCrossNetworkForensicsBundleConfig,
         WriteActiveNetworkRoguePathHijackReportConfig,
@@ -4572,6 +4606,115 @@ mod tests {
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"mode\": \"real_netns_wireguard\""));
         assert!(body.contains("\"dns_fail_close_when_tunnel_down\": \"fail\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn baseline_real_wireguard_exitnode_pass_view() -> RealWireguardExitnodeE2eReportView {
+        RealWireguardExitnodeE2eReportView {
+            phase: "phase10".to_string(),
+            mode: "real_netns_wireguard".to_string(),
+            evidence_mode: "measured".to_string(),
+            environment: "lab-netns".to_string(),
+            captured_at: "2026-03-21T12:00:00Z".to_string(),
+            captured_at_unix: 1_772_990_400,
+            status: "pass".to_string(),
+            checks: RealWireguardExitnodeE2eChecksView {
+                exit_node_routing: "pass".to_string(),
+                lan_toggle_off_blocks: "pass".to_string(),
+                lan_toggle_on_allows: "pass".to_string(),
+                dns_reaches_protected_path_when_tunnel_up: "pass".to_string(),
+                kill_switch_blocks_egress_when_tunnel_down: "pass".to_string(),
+                dns_fail_close_when_tunnel_down: "pass".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn real_wireguard_exitnode_view_round_trips_through_serde() {
+        let view = baseline_real_wireguard_exitnode_pass_view();
+        let serialized = serde_json::to_string(&view).expect("serialize");
+        let parsed: RealWireguardExitnodeE2eReportView =
+            serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn real_wireguard_exitnode_checks_view_overall_status_is_pass_when_all_pass() {
+        assert_eq!(
+            baseline_real_wireguard_exitnode_pass_view()
+                .checks
+                .overall_status(),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn real_wireguard_exitnode_checks_view_overall_status_is_fail_per_slot() {
+        let baseline = baseline_real_wireguard_exitnode_pass_view().checks;
+        for tweak in [
+            |c: &mut RealWireguardExitnodeE2eChecksView| c.exit_node_routing = "fail".to_string(),
+            |c: &mut RealWireguardExitnodeE2eChecksView| {
+                c.lan_toggle_off_blocks = "fail".to_string()
+            },
+            |c: &mut RealWireguardExitnodeE2eChecksView| {
+                c.lan_toggle_on_allows = "fail".to_string()
+            },
+            |c: &mut RealWireguardExitnodeE2eChecksView| {
+                c.dns_reaches_protected_path_when_tunnel_up = "fail".to_string()
+            },
+            |c: &mut RealWireguardExitnodeE2eChecksView| {
+                c.kill_switch_blocks_egress_when_tunnel_down = "fail".to_string()
+            },
+            |c: &mut RealWireguardExitnodeE2eChecksView| {
+                c.dns_fail_close_when_tunnel_down = "fail".to_string()
+            },
+        ] {
+            let mut checks = baseline.clone();
+            tweak(&mut checks);
+            assert_eq!(checks.overall_status(), "fail");
+        }
+    }
+
+    #[test]
+    fn real_wireguard_exitnode_view_rejects_missing_required_field() {
+        let mut value =
+            serde_json::to_value(baseline_real_wireguard_exitnode_pass_view()).expect("to_value");
+        value.as_object_mut().expect("object").remove("environment");
+        let err = serde_json::from_value::<RealWireguardExitnodeE2eReportView>(value)
+            .expect_err("missing environment must fail closed at the typed boundary");
+        assert!(
+            err.to_string().contains("environment"),
+            "error names missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn real_wireguard_exitnode_writer_defaults_environment_when_empty() {
+        let report_path = temp_path("real-wireguard-exitnode-env-default");
+        let _ = execute_ops_write_real_wireguard_exitnode_e2e_report(
+            WriteRealWireguardExitnodeE2eReportConfig {
+                report_path: report_path.clone(),
+                exit_status: "pass".to_string(),
+                lan_off_status: "pass".to_string(),
+                lan_on_status: "pass".to_string(),
+                dns_up_status: "pass".to_string(),
+                kill_switch_status: "pass".to_string(),
+                dns_down_status: "pass".to_string(),
+                // empty environment exercises the default lab-netns fallback;
+                // pin it through the typed view so a future schema bump that
+                // drops the default trips this test.
+                environment: "   ".to_string(),
+                captured_at_utc: "2026-03-21T12:00:00Z".to_string(),
+                captured_at_unix: 1_772_990_400,
+            },
+        )
+        .expect("write report");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: RealWireguardExitnodeE2eReportView =
+            serde_json::from_str(&body).expect("typed parse");
+        assert_eq!(parsed.environment, "lab-netns");
+        assert_eq!(parsed.status, "pass");
+        assert_eq!(parsed.checks.overall_status(), "pass");
         let _ = fs::remove_file(report_path.as_path());
     }
 
