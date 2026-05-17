@@ -123,3 +123,72 @@ __rustynet_macos_apply_profile_defaults() {
   WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT="$(sanitize_macos_keychain_account "wg-passphrase-${DEVICE_NODE_ID}")"
   MANUAL_PEER_OVERRIDE="0"
 }
+
+# Exact-match validator for a macOS-canonical path variable. Fails
+# closed: missing or non-canonical values abort start.sh rather than
+# silently rewriting under the operator. Used only by the macOS
+# enforce-storage-policy variant below; lives here so the macOS
+# storage-policy boundary is self-contained in this module.
+require_macos_path_var_exact() {
+  local var_name="$1"
+  local expected="$2"
+  local current="${!var_name:-}"
+  if [[ -z "${current}" ]]; then
+    print_err "Missing required macOS path setting ${var_name}; expected '${expected}'."
+    exit 1
+  fi
+  if [[ "${current}" != "${expected}" ]]; then
+    print_err "Non-canonical macOS path for ${var_name}: '${current}' (expected '${expected}')."
+    print_info "Update ${CONFIG_FILE} to canonical macOS paths before continuing."
+    exit 1
+  fi
+}
+
+# macOS variant of enforce_host_storage_policy. Pins HOST_PROFILE,
+# validates every canonical macOS runtime/state/log path is the
+# reviewed value, ensures the Keychain account name is sanitized,
+# checks WG_INTERFACE matches `utunN`, and rejects the legacy
+# manual-peer-override break-glass. Guarded so a stray call on a
+# non-macOS host is a no-op — non-macOS hosts dispatch elsewhere.
+__rustynet_macos_enforce_host_storage_policy() {
+  if ! is_macos_host; then
+    return 0
+  fi
+  HOST_PROFILE="macos"
+  require_macos_path_var_exact SOCKET_PATH "${MACOS_RUNTIME_BASE}/rustynetd.sock"
+  require_macos_path_var_exact STATE_PATH "${MACOS_STATE_BASE}/rustynetd.state"
+  require_macos_path_var_exact TRUST_EVIDENCE_PATH "${MACOS_STATE_BASE}/trust/rustynetd.trust"
+  require_macos_path_var_exact TRUST_VERIFIER_KEY_PATH "${MACOS_STATE_BASE}/trust/trust-evidence.pub"
+  require_macos_path_var_exact TRUST_WATERMARK_PATH "${MACOS_STATE_BASE}/trust/rustynetd.trust.watermark"
+  require_macos_path_var_exact AUTO_TUNNEL_BUNDLE_PATH "${MACOS_STATE_BASE}/assignment/rustynetd.assignment"
+  require_macos_path_var_exact AUTO_TUNNEL_VERIFIER_KEY_PATH "${MACOS_STATE_BASE}/assignment/assignment.pub"
+  require_macos_path_var_exact AUTO_TUNNEL_WATERMARK_PATH "${MACOS_STATE_BASE}/assignment/rustynetd.assignment.watermark"
+  require_macos_path_var_exact TRAVERSAL_BUNDLE_PATH "${MACOS_STATE_BASE}/traversal/rustynetd.traversal"
+  require_macos_path_var_exact TRAVERSAL_VERIFIER_KEY_PATH "${MACOS_STATE_BASE}/traversal/traversal.pub"
+  require_macos_path_var_exact TRAVERSAL_WATERMARK_PATH "${MACOS_STATE_BASE}/traversal/rustynetd.traversal.watermark"
+  require_macos_path_var_exact WG_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/keys/wireguard.key"
+  require_macos_path_var_exact WG_ENCRYPTED_PRIVATE_KEY_PATH "${MACOS_STATE_BASE}/keys/wireguard.key.enc"
+  require_macos_path_var_exact WG_KEY_PASSPHRASE_PATH "${MACOS_STATE_BASE}/keys/wireguard.passphrase"
+  require_macos_path_var_exact WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH "${MACOS_STATE_BASE}/keys/wg_key_passphrase.cred"
+  require_macos_path_var_exact SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH "${MACOS_STATE_BASE}/keys/signing_key_passphrase.cred"
+  require_macos_path_var_exact WG_PUBLIC_KEY_PATH "${MACOS_STATE_BASE}/keys/wireguard.pub"
+  require_macos_path_var_exact PRIVILEGED_HELPER_SOCKET_PATH "${MACOS_RUNTIME_BASE}/rustynetd-privileged.sock"
+  require_macos_path_var_exact MEMBERSHIP_SNAPSHOT_PATH "${MACOS_STATE_BASE}/membership/membership.snapshot"
+  require_macos_path_var_exact MEMBERSHIP_LOG_PATH "${MACOS_STATE_BASE}/membership/membership.log"
+  require_macos_path_var_exact MEMBERSHIP_WATERMARK_PATH "${MACOS_STATE_BASE}/membership/membership.watermark"
+  require_macos_path_var_exact MEMBERSHIP_OWNER_SIGNING_KEY_PATH "${MACOS_STATE_BASE}/membership/membership.owner.key"
+  require_macos_path_var_exact TRUST_SIGNER_KEY_PATH "${MACOS_STATE_BASE}/trust/trust-evidence.key"
+  require_macos_path_var_exact MANUAL_PEER_AUDIT_LOG "${MACOS_LOG_BASE}/manual-peer-override.log"
+  ensure_macos_keychain_passphrase_account
+
+  if [[ ! "${WG_INTERFACE}" =~ ^utun[0-9]+$ ]]; then
+    print_err "WG_INTERFACE '${WG_INTERFACE}' is invalid for macOS; expected pattern utunN."
+    exit 1
+  fi
+
+  if [[ "${MANUAL_PEER_OVERRIDE}" != "0" ]]; then
+    print_err "Manual peer break-glass override is no longer supported."
+    print_info "Set MANUAL_PEER_OVERRIDE=0 in ${CONFIG_FILE}."
+    exit 1
+  fi
+}
