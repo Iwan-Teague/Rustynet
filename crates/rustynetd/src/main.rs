@@ -51,7 +51,7 @@ use rustynetd::windows_backend_gate::{
 use rustynetd::windows_backend_readiness::collect_windows_backend_readiness_report;
 use rustynetd::windows_dns_failclosed::{
     build_windows_dns_failclosed_report, collect_windows_dns_failclosed_snapshot,
-    evaluate_nrpt_ipv6_sibling_coverage,
+    evaluate_nrpt_ipv6_sibling_coverage, evaluate_router_advertisement_suppression,
 };
 use rustynetd::windows_key_custody::collect_windows_key_custody_snapshot;
 use rustynetd::windows_mesh_status::{
@@ -155,6 +155,9 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "windows-runtime-acls-check" => {
                 run_windows_runtime_acls_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-registry-acls-check" => {
+                run_windows_registry_acls_check_command(rest)
             }
             [cmd, rest @ ..] if cmd == "windows-service-hardening-check" => {
                 run_windows_service_hardening_check_command(rest)
@@ -539,6 +542,45 @@ fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String>
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_windows_registry_acls_check_command(args: &[String]) -> Result<(), String> {
+    // W4 wire-up: surface the registry-key ACL report via the daemon
+    // CLI. Today the stub collector returns Unobserved entries with
+    // a clear blocker reason (the Win32 RegGetKeySecurity probe is a
+    // separate slice). With --no-fail-on-drift the operator can
+    // capture the report shape on a host where the collector isn't
+    // wired yet; default-on, the gate fails closed.
+    use rustynetd::windows_registry_acls::collect_windows_registry_acl_report;
+    let mut fail_on_drift = true;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-registry-acls-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_windows_registry_acl_report();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize windows registry-acls report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "windows-registry-acls-check reported drift on at least one reviewed registry key"
                 .to_string(),
         );
     }
@@ -1027,6 +1069,7 @@ fn run_macos_dns_failclosed_check_command(args: &[String]) -> Result<(), String>
 fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), String> {
     let mut fail_on_drift = true;
     let mut enforce_ipv6_sibling = false;
+    let mut enforce_ra_suppression = false;
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -1040,6 +1083,17 @@ fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), Strin
             // evaluator itself is already pinned via unit tests.
             Some("--enforce-ipv6-sibling-rules") => {
                 enforce_ipv6_sibling = true;
+                index += 1;
+            }
+            // W3 wire-up: opt-in to Router Advertisement suppression
+            // enforcement. Fails closed when the snapshot's
+            // `router_advertisement_observation` is None — the
+            // PowerShell collector that surfaces that observation is
+            // a separate slice; until it lands, this flag will fail
+            // closed which is the correct security posture for
+            // staged rollout.
+            Some("--enforce-ra-suppression") => {
+                enforce_ra_suppression = true;
                 index += 1;
             }
             Some(flag) => {
@@ -1060,6 +1114,19 @@ fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), Strin
         if !sibling_reasons.is_empty() {
             for reason in sibling_reasons {
                 report.drift_reasons.push(format!("ipv6-sibling: {reason}"));
+            }
+            report.overall_ok = false;
+        }
+    }
+    if enforce_ra_suppression {
+        // Run the W3 RA suppression evaluator with the same fold-in
+        // pattern; reasons get an `ra-suppression:` prefix.
+        let ra_reasons = evaluate_router_advertisement_suppression(&report.snapshot);
+        if !ra_reasons.is_empty() {
+            for reason in ra_reasons {
+                report
+                    .drift_reasons
+                    .push(format!("ra-suppression: {reason}"));
             }
             report.overall_ok = false;
         }
@@ -2547,6 +2614,7 @@ fn help_text() -> String {
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
+        "  rustynetd windows-registry-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd linux-key-custody-check [--no-fail-on-drift]",
@@ -2558,7 +2626,7 @@ fn help_text() -> String {
         "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
         "  rustynetd windows-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
-        "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift] [--enforce-ipv6-sibling-rules]",
+        "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift] [--enforce-ipv6-sibling-rules] [--enforce-ra-suppression]",
         "  rustynetd windows-killswitch-assert [daemon options] [--no-fail-on-drift]",
         "  rustynetd windows-backend-readiness-check [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
@@ -2644,7 +2712,8 @@ mod tests {
         run_windows_authenticode_check_command, run_windows_backend_readiness_check_command,
         run_windows_dns_failclosed_check_command, run_windows_key_custody_check_command,
         run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
-        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
+        run_windows_registry_acls_check_command, run_windows_runtime_acls_check_command,
+        run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -2687,6 +2756,47 @@ mod tests {
         assert!(
             err.contains("unknown windows-runtime-acls-check argument"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_registry_acls_check_command_rejects_unknown_flags() {
+        let err = run_windows_registry_acls_check_command(&["--bogus".to_string()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown windows-registry-acls-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_registry_acls_check_command_fails_closed_without_no_fail_flag() {
+        // Stub collector returns Unobserved entries on every host
+        // (the Win32 RegGetKeySecurity probe is a follow-up slice),
+        // so the gate must fail closed by default. --no-fail-on-drift
+        // is the opt-out for "capture report shape without verdict".
+        let err = run_windows_registry_acls_check_command(&[])
+            .expect_err("stub collector must fail closed without --no-fail-on-drift");
+        assert!(
+            err.contains("windows-registry-acls-check reported drift"),
+            "fail-closed verdict must surface: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_registry_acls_check_command_no_fail_flag_returns_ok_despite_drift() {
+        // Same stub collector + --no-fail-on-drift = the operator
+        // wants the JSON without the verdict. Must return Ok.
+        run_windows_registry_acls_check_command(&["--no-fail-on-drift".to_string()])
+            .expect("--no-fail-on-drift must suppress the drift verdict");
+    }
+
+    #[test]
+    fn help_text_advertises_windows_registry_acls_check_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-registry-acls-check"),
+            "help text must advertise the new W4 subcommand"
         );
     }
 
@@ -2943,11 +3053,49 @@ mod tests {
     }
 
     #[test]
+    fn run_windows_dns_failclosed_check_command_accepts_enforce_ra_suppression_flag() {
+        // W3 wire-up: --enforce-ra-suppression must parse cleanly.
+        let err =
+            run_windows_dns_failclosed_check_command(&["--enforce-ra-suppression".to_string()])
+                .err()
+                .unwrap_or_default();
+        assert!(
+            !err.contains("unknown windows-dns-failclosed-check argument"),
+            "--enforce-ra-suppression must be recognized: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_dns_failclosed_check_command_accepts_all_three_flags() {
+        // All three opt-in flags together must parse cleanly.
+        let err = run_windows_dns_failclosed_check_command(&[
+            "--no-fail-on-drift".to_string(),
+            "--enforce-ipv6-sibling-rules".to_string(),
+            "--enforce-ra-suppression".to_string(),
+        ])
+        .err()
+        .unwrap_or_default();
+        assert!(
+            !err.contains("unknown windows-dns-failclosed-check argument"),
+            "all three flags must be recognized: {err}"
+        );
+    }
+
+    #[test]
     fn help_text_advertises_enforce_ipv6_sibling_rules_flag() {
         let help = help_text();
         assert!(
             help.contains("--enforce-ipv6-sibling-rules"),
             "help text must advertise the new W3 flag"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_enforce_ra_suppression_flag() {
+        let help = help_text();
+        assert!(
+            help.contains("--enforce-ra-suppression"),
+            "help text must advertise the W3 RA suppression flag"
         );
     }
 
