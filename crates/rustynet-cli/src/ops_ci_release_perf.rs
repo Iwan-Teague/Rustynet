@@ -679,6 +679,102 @@ fn write_membership_phase10_report(root_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Default path (relative to repo root) of the membership phase10 report
+/// written by [`write_membership_phase10_report`] and consumed by
+/// [`execute_ops_verify_membership_phase10_report`].
+pub const DEFAULT_MEMBERSHIP_PHASE10_REPORT_PATH: &str = "artifacts/phase10/membership_report.json";
+
+/// Config for [`execute_ops_verify_membership_phase10_report`]. The
+/// `report_path` is optional so the CLI subcommand can be invoked with no
+/// flags from `membership_gates.sh`; when `None`, the verify routine resolves
+/// the report at `<repo_root>/artifacts/phase10/membership_report.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerifyMembershipPhase10ReportConfig {
+    pub report_path: Option<PathBuf>,
+}
+
+/// Typed view of the minimum reviewed envelope of
+/// `artifacts/phase10/membership_report.json`. Only the trust-load-bearing
+/// fields the shell-side check used to walk are pinned here:
+///
+///   - `status` — the only pass/fail gate signal the script checked
+///   - `evidence_mode` — pinned so a future schema rename trips a named test
+///
+/// Unknown fields are intentionally ignored so the gate stays forward-
+/// compatible with non-load-bearing schema additions.
+#[derive(Debug, Clone, Deserialize)]
+struct MembershipPhase10ReportView {
+    status: String,
+    evidence_mode: String,
+}
+
+/// CLI entry point: verify `artifacts/phase10/membership_report.json` exists,
+/// parses against the [`MembershipPhase10ReportView`] schema, and reports
+/// `status == "pass"`. Replaces the shell-side `python3 -c` walk in
+/// `scripts/ci/membership_gates.sh` with a typed Rust check that maps
+/// failures onto the X6 exit-code taxonomy via `classify_cli_error`:
+///
+/// - missing file or malformed JSON or missing/wrong-type required schema
+///   fields  → `ConfigError`  (error string contains "schema" / "malformed" /
+///   "parse error")
+/// - well-formed report whose `status != "pass"`  → `PolicyReject`  (error
+///   string contains "fail-closed")
+///
+/// Returns the one-line success summary on `status == "pass"`.
+pub fn execute_ops_verify_membership_phase10_report(
+    config: VerifyMembershipPhase10ReportConfig,
+) -> Result<String, String> {
+    let root_dir = repo_root()?;
+    let report_path = match config.report_path {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => root_dir.join(path),
+        None => root_dir.join(DEFAULT_MEMBERSHIP_PHASE10_REPORT_PATH),
+    };
+    verify_membership_phase10_report(&report_path)
+}
+
+/// Read + typed-parse the membership phase10 report at `report_path` and
+/// fail closed with a precise reason when:
+///
+/// * the file does not exist — ConfigError: "schema validation" path missing
+/// * the file is not valid UTF-8 — ConfigError: "malformed"
+/// * the file is not valid JSON — ConfigError: "parse error"
+/// * a required schema field is missing or has the wrong type — ConfigError:
+///   "schema validation"
+/// * `status != "pass"` — PolicyReject: "fail-closed"
+fn verify_membership_phase10_report(report_path: &Path) -> Result<String, String> {
+    if !report_path.exists() {
+        return Err(format!(
+            "membership_report.json schema validation: file does not exist at {}",
+            report_path.display()
+        ));
+    }
+    let body = fs::read_to_string(report_path).map_err(|err| {
+        format!(
+            "membership_report.json malformed: read failed for {}: {err}",
+            report_path.display()
+        )
+    })?;
+    let view: MembershipPhase10ReportView = serde_json::from_str(body.as_str()).map_err(|err| {
+        format!(
+            "membership_report.json schema validation: parse error for {}: {err}",
+            report_path.display()
+        )
+    })?;
+    if view.status != "pass" {
+        return Err(format!(
+            "membership_report.json fail-closed: status={:?} (expected \"pass\") at {}",
+            view.status,
+            report_path.display()
+        ));
+    }
+    Ok(format!(
+        "membership_report.json verify: status=pass evidence_mode={} path={}",
+        view.evidence_mode,
+        report_path.display()
+    ))
+}
+
 pub fn execute_ops_run_supply_chain_integrity_gates() -> Result<String, String> {
     let root_dir = repo_root()?;
     require_commands(&["cargo", "rustup", "rustc"])?;
@@ -2626,6 +2722,116 @@ mod tests {
         assert!(value.get("checks").is_some());
         assert!(value.get("validated_by_tests").is_some());
         assert!(value.get("log_artifacts").is_some());
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---------- verify_membership_phase10_report tests ----------
+
+    fn write_membership_report(suffix: &str, body: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "rustynet-cli-membership-report-{}-{}.json",
+            unique_suffix(),
+            suffix
+        ));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn clean_membership_report_body() -> &'static str {
+        r#"{
+          "phase":"phase10",
+          "suite":"membership_governance",
+          "evidence_mode":"measured",
+          "environment":"ci",
+          "git_commit":"deadbeef",
+          "captured_at_unix":1700000000,
+          "status":"pass",
+          "checks":{"m0_schema_lock":"pass"},
+          "validated_by_tests":["t1"]
+        }"#
+    }
+
+    #[test]
+    fn verify_membership_phase10_report_accepts_clean_pass_artifact() {
+        let path = write_membership_report("pass", clean_membership_report_body());
+        let summary = verify_membership_phase10_report(&path)
+            .expect("clean status=pass membership report must verify");
+        assert!(
+            summary.contains("status=pass"),
+            "summary must surface status=pass: {summary}"
+        );
+        assert!(
+            summary.contains("evidence_mode=measured"),
+            "summary must surface evidence_mode=measured: {summary}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_membership_phase10_report_rejects_missing_file_as_config_error() {
+        // Path that does not exist must surface a ConfigError-classified
+        // message ("schema validation" is one of the classifier's keywords).
+        let path = env::temp_dir().join(format!(
+            "rustynet-cli-membership-missing-{}.json",
+            unique_suffix()
+        ));
+        assert!(!path.exists(), "precondition: tmp path must not exist");
+        let err =
+            verify_membership_phase10_report(&path).expect_err("missing file must fail closed");
+        assert!(
+            err.contains("does not exist"),
+            "missing-file message must mention nonexistence: {err}"
+        );
+        assert!(
+            err.to_ascii_lowercase().contains("schema"),
+            "missing-file message must classify as ConfigError via classifier keyword: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_membership_phase10_report_rejects_malformed_json_as_config_error() {
+        let path = write_membership_report("malformed", "not json at all");
+        let err =
+            verify_membership_phase10_report(&path).expect_err("malformed JSON must fail closed");
+        assert!(
+            err.to_ascii_lowercase().contains("parse error")
+                || err.to_ascii_lowercase().contains("schema"),
+            "malformed message must classify as ConfigError via classifier keyword: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_membership_phase10_report_rejects_missing_required_field_as_config_error() {
+        // Drop `status` — a required typed-view field. serde_json must
+        // surface a missing-field error, which we surface as a ConfigError-
+        // classified parse error.
+        let path = write_membership_report("missing-status", r#"{"evidence_mode":"measured"}"#);
+        let err = verify_membership_phase10_report(&path)
+            .expect_err("missing status field must fail closed");
+        assert!(
+            err.contains("status") || err.to_ascii_lowercase().contains("schema"),
+            "missing-required message must name the missing field or classify as ConfigError: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_membership_phase10_report_rejects_status_fail_as_policy_reject() {
+        // Well-formed schema but status=fail must surface a PolicyReject-
+        // classified message ("fail-closed" is the classifier's keyword).
+        let path =
+            write_membership_report("fail", r#"{"status":"fail","evidence_mode":"measured"}"#);
+        let err =
+            verify_membership_phase10_report(&path).expect_err("status=fail must fail closed");
+        assert!(
+            err.to_ascii_lowercase().contains("fail-closed"),
+            "status!=pass message must classify as PolicyReject via classifier keyword: {err}"
+        );
+        assert!(
+            err.contains("\"fail\""),
+            "status!=pass message must quote the offending status value: {err}"
+        );
         let _ = fs::remove_file(&path);
     }
 }
