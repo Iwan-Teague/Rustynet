@@ -60,6 +60,7 @@ These hold future mobile-client architecture and roadmap material.
 
 These are the first active work documents to check for current status and remaining work.
 
+- [RustynetDataplaneExecutionPlan_2026-05-18.md](./operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md) — current dataplane track (D2-D10): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding. Read this first for "what are we building and why."
 - [MasterWorkPlan_2026-03-22.md](./operations/active/MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 

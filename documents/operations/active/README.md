@@ -6,6 +6,7 @@ This folder contains the current implementation ledgers, active plans, and activ
 
 Start with these when you need current status, remaining work, or the public implementation ledger:
 
+- [RustynetDataplaneExecutionPlan_2026-05-18.md](./RustynetDataplaneExecutionPlan_2026-05-18.md) — source-of-truth plan for the cross-network dataplane track (peer-distributed coord, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding); supersedes nothing but is the active ledger for D2-D10 work
 - [MasterWorkPlan_2026-03-22.md](./MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - [OpenWorkIndex_2026-04-17.md](./OpenWorkIndex_2026-04-17.md)
