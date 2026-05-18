@@ -1002,7 +1002,7 @@ fn git_version_internal() -> Option<String> {
 fn git_version_internal() -> Option<String> {
     fs::metadata("/usr/bin/git")
         .ok()
-        .map(|_| "git (system)".to_string())
+        .map(|_| "git (system)".to_owned())
 }
 
 #[cfg(target_os = "windows")]
@@ -1032,7 +1032,7 @@ fn rustc_version_internal() -> Option<String> {
         .ok()?;
     String::from_utf8(output.stdout)
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_owned())
 }
 
 #[cfg(target_os = "windows")]
@@ -1200,11 +1200,11 @@ fn service_status_internal(service_name: &str) -> ServiceStatus {
     {
         Ok(output) if output.status.success() => ServiceStatus {
             running: true,
-            status_message: "running".to_string(),
+            status_message: "running".to_owned(),
         },
         _ => ServiceStatus {
             running: false,
-            status_message: "not running or launchctl unavailable".to_string(),
+            status_message: "not running or launchctl unavailable".to_owned(),
         },
     }
 }
@@ -1246,8 +1246,8 @@ fn system_info_internal() -> SystemInfo {
         .unwrap_or(1);
 
     SystemInfo {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
         cpu_count,
         kernel_version: get_kernel_version(),
     }
@@ -1267,7 +1267,7 @@ fn get_kernel_version() -> Option<String> {
         .output()
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_owned())
 }
 
 #[cfg(target_os = "windows")]
@@ -1313,7 +1313,7 @@ fn network_interfaces_internal() -> Vec<NetworkInterface> {
                         if !name.is_empty() {
                             let up = line.contains("UP");
                             interfaces.push(NetworkInterface {
-                                name: name.to_string(),
+                                name: name.to_owned(),
                                 up,
                                 addresses: vec![],
                             });
@@ -1416,13 +1416,13 @@ fn check_dependencies_internal() -> DependencyCheck {
     let mut messages = vec![];
 
     if !wireguard_available {
-        messages.push("WireGuard tools not found in PATH".to_string());
+        messages.push("WireGuard tools not found in PATH".to_owned());
     }
     if !git_available {
-        messages.push("Git not available".to_string());
+        messages.push("Git not available".to_owned());
     }
     if !dns_tools_available {
-        messages.push("DNS tools (dig) not available".to_string());
+        messages.push("DNS tools (dig) not available".to_owned());
     }
 
     DependencyCheck {
@@ -1445,11 +1445,11 @@ fn daemon_health_internal() -> DaemonHealth {
     let ipc_reachable = test_ipc_connection();
 
     if !running {
-        status_message = "daemon not running".to_string();
+        status_message = "daemon not running".to_owned();
     } else if !ipc_reachable {
-        status_message = "daemon running but IPC unreachable".to_string();
+        status_message = "daemon running but IPC unreachable".to_owned();
     } else {
-        status_message = "daemon healthy".to_string();
+        status_message = "daemon healthy".to_owned();
     }
 
     DaemonHealth {
@@ -1569,7 +1569,7 @@ fn get_daemon_uptime() -> Option<u64> {
 fn test_ipc_connection() -> bool {
     use std::os::unix::net::UnixStream;
     let socket_path = std::env::var("RUSTYNET_DAEMON_SOCKET")
-        .unwrap_or_else(|_| "/var/run/rustynet/daemon.sock".to_string());
+        .unwrap_or_else(|_| "/var/run/rustynet/daemon.sock".to_owned());
     UnixStream::connect(&socket_path).is_ok()
 }
 
@@ -1658,7 +1658,7 @@ fn wg_addresses_internal() -> Vec<String> {
                     if line.contains("inet ") && !line.contains("inet6") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() > 1 {
-                            addresses.push(parts[1].to_string());
+                            addresses.push(parts[1].to_owned());
                         }
                     }
                 }
@@ -1723,9 +1723,9 @@ fn route_list_internal() -> Vec<Route> {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 6 {
                         routes.push(Route {
-                            destination: parts[0].to_string(),
-                            gateway: parts[1].to_string(),
-                            interface: parts[5].to_string(),
+                            destination: parts[0].to_owned(),
+                            gateway: parts[1].to_owned(),
+                            interface: parts[5].to_owned(),
                         });
                     }
                 }
@@ -2102,7 +2102,7 @@ fn connection_test_internal() -> ConnectionTest {
     let dns_ok = test_dns_resolution("google.com").is_some();
 
     let message = if tunnel_up && exit_reachable && dns_ok {
-        "all tests passed".to_string()
+        "all tests passed".to_owned()
     } else {
         let mut issues = vec![];
         if !tunnel_up {
@@ -2295,7 +2295,7 @@ fn interface_stats_internal() -> Vec<InterfaceStats> {
     #[cfg(not(target_os = "linux"))]
     {
         stats.push(InterfaceStats {
-            name: "(detailed stats unavailable on this platform)".to_string(),
+            name: "(detailed stats unavailable on this platform)".to_owned(),
             bytes_in: 0,
             bytes_out: 0,
             packets_in: 0,
@@ -2321,27 +2321,27 @@ fn health_check_internal() -> HealthCheck {
 
     let mut issues = vec![];
     if !daemon_healthy {
-        issues.push("daemon not running or IPC unreachable".to_string());
+        issues.push("daemon not running or IPC unreachable".to_owned());
     }
     if !tunnel_healthy {
-        issues.push("tunnel interface down".to_string());
+        issues.push("tunnel interface down".to_owned());
     }
     if !connection_health.tunnel_reachable {
-        issues.push("tunnel not reachable".to_string());
+        issues.push("tunnel not reachable".to_owned());
     }
     if !connection_health.dns_working {
-        issues.push("dns resolution failing".to_string());
+        issues.push("dns resolution failing".to_owned());
     }
     if !config_health.passed {
         issues.extend(config_health.issues);
     }
 
     let overall_status = if system_healthy {
-        "healthy".to_string()
+        "healthy".to_owned()
     } else if daemon_healthy && network_healthy {
-        "degraded".to_string()
+        "degraded".to_owned()
     } else {
-        "critical".to_string()
+        "critical".to_owned()
     };
 
     HealthCheck {
@@ -2583,7 +2583,7 @@ fn disk_info_internal() -> Vec<DiskInfo> {
                 };
 
                 disks.push(DiskInfo {
-                    mount: "/".to_string(),
+                    mount: "/".to_owned(),
                     total_mb,
                     used_mb,
                     available_mb,
@@ -2595,7 +2595,7 @@ fn disk_info_internal() -> Vec<DiskInfo> {
 
     if disks.is_empty() {
         disks.push(DiskInfo {
-            mount: "/".to_string(),
+            mount: "/".to_owned(),
             total_mb: 0,
             used_mb: 0,
             available_mb: 0,
@@ -2684,7 +2684,7 @@ fn cpu_info_internal() -> CpuInfo {
 #[cfg(target_os = "macos")]
 fn cpu_info_internal() -> CpuInfo {
     let mut cores = 1usize;
-    let mut model = "Apple Silicon/Intel".to_string();
+    let mut model = "Apple Silicon/Intel".to_owned();
 
     if let Ok(output) = std::process::Command::new("sysctl").arg("hw.ncpu").output()
         && let Ok(s) = String::from_utf8(output.stdout)
@@ -2699,7 +2699,7 @@ fn cpu_info_internal() -> CpuInfo {
         && let Ok(s) = String::from_utf8(output.stdout)
         && let Some(val) = s.split(':').nth(1)
     {
-        model = val.trim().to_string();
+        model = val.trim().to_owned();
     }
 
     CpuInfo {
@@ -3023,7 +3023,7 @@ fn iface_list_internal() -> Vec<InterfaceDetail> {
                     ifaces.push(iface);
                 }
 
-                let name = line.split(':').next().unwrap_or("").to_string();
+                let name = line.split(':').next().unwrap_or("").to_owned();
                 current_iface = Some(InterfaceDetail {
                     name,
                     up: line.contains("UP"),
@@ -3034,12 +3034,12 @@ fn iface_list_internal() -> Vec<InterfaceDetail> {
             } else if let Some(ref mut iface) = current_iface {
                 if line.contains("HWaddr ") {
                     if let Some(mac) = line.split("HWaddr ").nth(1) {
-                        iface.mac_address = Some(mac.trim().to_string());
+                        iface.mac_address = Some(mac.trim().to_owned());
                     }
                 } else if line.contains("inet ")
                     && let Some(ip) = line.split_whitespace().nth(1)
                 {
-                    iface.ip_addresses.push(ip.to_string());
+                    iface.ip_addresses.push(ip.to_owned());
                 } else if line.contains("mtu ")
                     && let Some(mtu_str) = line.split("mtu ").nth(1)
                     && let Some(mtu) = mtu_str.split_whitespace().next()
@@ -3121,8 +3121,8 @@ fn dns_check_internal() -> DnsCheck {
 fn dns_check_internal() -> DnsCheck {
     DnsCheck {
         working: true,
-        resolvers: vec!["8.8.8.8".to_string()],
-        test_results: vec!["DNS available".to_string()],
+        resolvers: vec!["8.8.8.8".to_owned()],
+        test_results: vec!["DNS available".to_owned()],
     }
 }
 
@@ -3159,9 +3159,9 @@ fn kernel_info_internal() -> KernelInfo {
 #[cfg(target_os = "macos")]
 fn kernel_info_internal() -> KernelInfo {
     KernelInfo {
-        version: "Darwin".to_string(),
-        release: "unknown".to_string(),
-        machine: std::env::consts::ARCH.to_string(),
+        version: "Darwin".to_owned(),
+        release: "unknown".to_owned(),
+        machine: std::env::consts::ARCH.to_owned(),
     }
 }
 
@@ -3179,7 +3179,7 @@ fn service_check_internal() -> ServiceCheck {
         daemon_running: true,
         daemon_enabled: true,
         uptime_seconds: Some(3600),
-        status: "active".to_string(),
+        status: "active".to_owned(),
     }
 }
 
@@ -3257,7 +3257,7 @@ fn performance_test_internal() -> PerformanceTest {
 fn tls_check_internal() -> TlsCheck {
     TlsCheck {
         tls_available: true,
-        tls_version: Some("1.3".to_string()),
+        tls_version: Some("1.3".to_owned()),
         certificate_valid: true,
         issues: Vec::new(),
     }
@@ -3281,7 +3281,7 @@ fn nat_detection_internal() -> NatDetection {
         behind_nat,
         local_ip,
         public_ip,
-        detection_method: "network interface comparison".to_string(),
+        detection_method: "network interface comparison".to_owned(),
     }
 }
 
@@ -3337,13 +3337,13 @@ fn get_local_ip() -> String {
             for line in s.lines() {
                 if line.contains("inet ") && !line.contains("inet6") {
                     if let Some(ip) = line.split_whitespace().nth(1) {
-                        return ip.to_string();
+                        return ip.to_owned();
                     }
                 }
             }
         }
     }
-    "127.0.0.1".to_string()
+    "127.0.0.1".to_owned()
 }
 
 #[cfg(target_os = "windows")]
@@ -3375,9 +3375,9 @@ fn exit_node_status_internal() -> ExitNodeStatus {
         latency_ms: latency,
         exit_ip: None,
         status: if reachable {
-            "exit node reachable".to_string()
+            "exit node reachable".to_owned()
         } else {
-            "exit node unreachable".to_string()
+            "exit node unreachable".to_owned()
         },
     }
 }
@@ -3392,9 +3392,9 @@ fn ipv6_support_internal() -> Ipv6Support {
         ipv6_addresses,
         dns_ipv6_capable,
         status: if ipv6_available {
-            "IPv6 supported".to_string()
+            "IPv6 supported".to_owned()
         } else {
-            "IPv6 not available".to_string()
+            "IPv6 not available".to_owned()
         },
     }
 }
@@ -3427,7 +3427,7 @@ fn get_ipv6_addresses() -> Vec<String> {
             for line in s.lines() {
                 if line.contains("inet6") && !line.contains("::1") {
                     if let Some(addr) = line.split_whitespace().nth(1) {
-                        addrs.push(addr.to_string());
+                        addrs.push(addr.to_owned());
                     }
                 }
             }
@@ -3626,9 +3626,9 @@ fn system_clock_check_internal() -> SystemClockCheck {
                     time_offset_ms: None,
                     last_sync_seconds_ago: None,
                     status: if has_peers {
-                        "NTP synchronized".to_string()
+                        "NTP synchronized".to_owned()
                     } else {
-                        "NTP not synchronized".to_string()
+                        "NTP not synchronized".to_owned()
                     },
                 };
             }
@@ -3667,7 +3667,7 @@ fn system_clock_check_internal() -> SystemClockCheck {
         ntp_active: true,
         time_offset_ms: None,
         last_sync_seconds_ago: None,
-        status: "status unknown".to_string(),
+        status: "status unknown".to_owned(),
     }
 }
 
@@ -3808,9 +3808,9 @@ fn tcp_connections_internal() -> Vec<TcpConnection> {
                     continue;
                 }
                 connections.push(TcpConnection {
-                    local_addr: fields[3].to_string(),
-                    remote_addr: fields[4].to_string(),
-                    state: fields[5].to_string(),
+                    local_addr: fields[3].to_owned(),
+                    remote_addr: fields[4].to_owned(),
+                    state: fields[5].to_owned(),
                     pid: None,
                 });
             }
@@ -3887,7 +3887,7 @@ fn dns_resolver_info_internal() -> DnsResolverInfo {
                     if let Some(rest) = line.strip_prefix("  ServerAddresses :") {
                         let addrs = rest
                             .split(',')
-                            .map(|s| s.trim().trim_matches('{').trim_matches('}').to_string())
+                            .map(|s| s.trim().trim_matches('{').trim_matches('}').to_owned())
                             .filter(|s| !s.is_empty())
                             .collect();
                         resolvers = addrs;
@@ -3897,7 +3897,7 @@ fn dns_resolver_info_internal() -> DnsResolverInfo {
                     if let Some(rest) = line.strip_prefix("  SearchDomains :") {
                         search_domains = rest
                             .split(',')
-                            .map(|s| s.trim().trim_matches('{').trim_matches('}').to_string())
+                            .map(|s| s.trim().trim_matches('{').trim_matches('}').to_owned())
                             .filter(|s| !s.is_empty())
                             .collect();
                     }
@@ -3909,7 +3909,7 @@ fn dns_resolver_info_internal() -> DnsResolverInfo {
     DnsResolverInfo {
         resolvers,
         search_domains,
-        method: "scutil".to_string(),
+        method: "scutil".to_owned(),
     }
 }
 
@@ -4231,9 +4231,9 @@ fn active_network_routes_internal() -> Vec<RouteInfo> {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 6 {
                     routes.push(RouteInfo {
-                        destination: parts[0].to_string(),
-                        gateway: parts[1].to_string(),
-                        interface: parts[5].to_string(),
+                        destination: parts[0].to_owned(),
+                        gateway: parts[1].to_owned(),
+                        interface: parts[5].to_owned(),
                         metric: None,
                     });
                 }
@@ -4294,7 +4294,7 @@ fn mtu_path_discovery_internal(target_host: &str) -> DiscoveryResult {
 #[cfg(target_os = "macos")]
 fn mtu_path_discovery_internal(target_host: &str) -> DiscoveryResult {
     let mut result = DiscoveryResult {
-        host: target_host.to_string(),
+        host: target_host.to_owned(),
         mtu: None,
         hops: None,
         latency_ms: None,
@@ -4400,7 +4400,7 @@ fn dns_resolution_latency_internal(domain: &str, iterations: usize) -> DnsLatenc
         valid.iter().map(|&l| (l - avg).powi(2)).sum::<f64>() / (valid.len().max(1) as f64);
 
     DnsLatencyMetrics {
-        domain: domain.to_string(),
+        domain: domain.to_owned(),
         min_ms: valid.iter().copied().fold(f64::INFINITY, f64::min),
         max_ms: valid.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         avg_ms: avg,
@@ -4602,9 +4602,9 @@ fn arp_table_entries_internal() -> Vec<ArpEntry> {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 5 {
                     entries.push(ArpEntry {
-                        ip: parts[0].trim_matches('(').trim_matches(')').to_string(),
-                        mac: parts[3].to_string(),
-                        interface: parts[5].to_string(),
+                        ip: parts[0].trim_matches('(').trim_matches(')').to_owned(),
+                        mac: parts[3].to_owned(),
+                        interface: parts[5].to_owned(),
                         age_secs: None,
                         is_permanent: line.contains("permanent"),
                     });
@@ -4676,7 +4676,7 @@ fn listening_sockets_summary_internal() -> Vec<ListeningSocket> {
                     if let Some(colon_idx) = parts[3].rfind('.') {
                         let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
                         sockets.push(ListeningSocket {
-                            protocol: parts[0].to_string(),
+                            protocol: parts[0].to_owned(),
                             address: parts[3][..colon_idx].to_string(),
                             port,
                             pid: None,
@@ -4755,7 +4755,7 @@ fn network_drop_stats_internal() -> Vec<InterfaceDropStats> {
             let mut current_iface = String::new();
             for line in s.lines() {
                 if !line.starts_with('\t') && !line.starts_with(' ') {
-                    current_iface = line.split(':').next().unwrap_or("").to_string();
+                    current_iface = line.split(':').next().unwrap_or("").to_owned();
                 } else if line.contains("dropped") {
                     stats.push(InterfaceDropStats {
                         interface: current_iface.clone(),
@@ -4862,20 +4862,20 @@ fn tls_certificate_expiry_all_internal(paths: &[&str]) -> Vec<CertExpiry> {
             .output()
         {
             if let Ok(s) = String::from_utf8(output.stdout) {
-                let mut subject = "unknown".to_string();
-                let mut expires_at = "unknown".to_string();
+                let mut subject = "unknown".to_owned();
+                let mut expires_at = "unknown".to_owned();
 
                 for line in s.lines() {
                     if line.starts_with("subject=") {
                         subject = line
                             .strip_prefix("subject=")
                             .unwrap_or("unknown")
-                            .to_string();
+                            .to_owned();
                     } else if line.starts_with("notAfter=") {
                         expires_at = line
                             .strip_prefix("notAfter=")
                             .unwrap_or("unknown")
-                            .to_string();
+                            .to_owned();
                     }
                 }
 
@@ -4890,8 +4890,8 @@ fn tls_certificate_expiry_all_internal(paths: &[&str]) -> Vec<CertExpiry> {
         } else {
             results.push(CertExpiry {
                 path: path.to_string(),
-                subject: "error".to_string(),
-                expires_at: "unknown".to_string(),
+                subject: "error".to_owned(),
+                expires_at: "unknown".to_owned(),
                 days_until_expiry: 0,
                 is_expired: false,
             });
@@ -4968,7 +4968,7 @@ fn selinux_status_internal() -> SeLinuxStatus {
 fn selinux_status_internal() -> SeLinuxStatus {
     SeLinuxStatus {
         enabled: false,
-        mode: "not_applicable".to_string(),
+        mode: "not_applicable".to_owned(),
         policy_version: None,
         violations_since_boot: 0,
     }
@@ -5153,18 +5153,18 @@ fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo 
         .output()
     {
         if let Ok(s) = String::from_utf8(output.stdout) {
-            let mut suite_name = "unknown".to_string();
-            let mut tls_version = "unknown".to_string();
+            let mut suite_name = "unknown".to_owned();
+            let mut tls_version = "unknown".to_owned();
             let strength_bits;
 
             for line in s.lines() {
                 if line.contains("Cipher") && !line.contains('#') {
                     if let Some(cipher) = line.split(':').nth(1) {
-                        suite_name = cipher.trim().to_string();
+                        suite_name = cipher.trim().to_owned();
                     }
                 } else if line.contains("Protocol") {
                     if let Some(version) = line.split(':').nth(1) {
-                        tls_version = version.trim().to_string();
+                        tls_version = version.trim().to_owned();
                     }
                 }
             }
@@ -5178,9 +5178,9 @@ fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo 
 
             return CipherSuiteInfo {
                 suite_name,
-                key_exchange: "unknown".to_string(),
-                cipher: "unknown".to_string(),
-                mac: "unknown".to_string(),
+                key_exchange: "unknown".to_owned(),
+                cipher: "unknown".to_owned(),
+                mac: "unknown".to_owned(),
                 tls_version,
                 strength_bits,
             };
@@ -5188,11 +5188,11 @@ fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo 
     }
 
     CipherSuiteInfo {
-        suite_name: "unknown".to_string(),
-        key_exchange: "unknown".to_string(),
-        cipher: "unknown".to_string(),
-        mac: "unknown".to_string(),
-        tls_version: "unknown".to_string(),
+        suite_name: "unknown".to_owned(),
+        key_exchange: "unknown".to_owned(),
+        cipher: "unknown".to_owned(),
+        mac: "unknown".to_owned(),
+        tls_version: "unknown".to_owned(),
         strength_bits: 0,
     }
 }
@@ -5319,9 +5319,9 @@ fn open_security_vulnerabilities_internal(advisory_db_path: &str) -> Vulnerabili
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 3 {
                     vulnerable_packages.push(VulnPackage {
-                        name: parts[0].to_string(),
+                        name: parts[0].to_owned(),
                         version: parts.get(3..).map(|p| p.join(",")).unwrap_or_default(),
-                        cves: vec![parts[1].to_string()],
+                        cves: vec![parts[1].to_owned()],
                     });
                 }
             }
@@ -5539,7 +5539,7 @@ fn network_socket_limit_usage_internal() -> SocketLimitUsage {
     }
 
     SocketLimitUsage {
-        ephemeral_range: "49152-65535".to_string(),
+        ephemeral_range: "49152-65535".to_owned(),
         used: time_wait_count,
         available: 16383,
         time_wait_count,
@@ -5618,7 +5618,7 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
                     };
 
                     inodes.push(InodeUsage {
-                        filesystem: parts[5].to_string(),
+                        filesystem: parts[5].to_owned(),
                         total_inodes: total as u64,
                         used_inodes: used as u64,
                         available: available as u64,
@@ -5965,11 +5965,7 @@ fn daemon_open_file_handles_internal() -> Vec<OpenHandle> {
                                             .map(|p| p.join(" "))
                                             .unwrap_or_default(),
                                         fd: fd_str.parse().unwrap_or(0),
-                                        handle_type: parts
-                                            .get(4)
-                                            .copied()
-                                            .unwrap_or("")
-                                            .to_string(),
+                                        handle_type: parts.get(4).copied().unwrap_or("").to_owned(),
                                         size: size_str.parse().unwrap_or(0),
                                         inode: inode_str.parse().ok(),
                                     });
@@ -6101,7 +6097,7 @@ fn disk_io_latency_histogram_internal(device: &str, duration_secs: u64) -> IoLat
     }
 
     IoLatencyHistogram {
-        device: device.to_string(),
+        device: device.to_owned(),
         p50_ms,
         p95_ms,
         p99_ms,
@@ -6355,11 +6351,11 @@ fn file_integrity_check_internal(paths: &[&str]) -> Vec<IntegrityResult> {
     let mut results = Vec::new();
 
     for path in paths {
-        let mut current_hash = "unknown".to_string();
+        let mut current_hash = "unknown".to_owned();
         if let Ok(output) = std::process::Command::new("sha256sum").arg(path).output() {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 if let Some(hash) = s.split_whitespace().next() {
-                    current_hash = hash.to_string();
+                    current_hash = hash.to_owned();
                 }
             }
         }
@@ -6368,7 +6364,7 @@ fn file_integrity_check_internal(paths: &[&str]) -> Vec<IntegrityResult> {
             path: path.to_string(),
             matches_baseline: false,
             current_hash,
-            baseline_hash: "unknown".to_string(),
+            baseline_hash: "unknown".to_owned(),
         });
     }
 
@@ -6425,9 +6421,9 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
     for path in paths {
         if let Ok(output) = std::process::Command::new("getfacl").arg(path).output() {
             if let Ok(s) = String::from_utf8(output.stdout) {
-                let mut owner = "unknown".to_string();
-                let mut group = "unknown".to_string();
-                let mode = "0000".to_string();
+                let mut owner = "unknown".to_owned();
+                let mut group = "unknown".to_owned();
+                let mode = "0000".to_owned();
                 let mut extended_acl = Vec::new();
 
                 for line in s.lines() {
@@ -6436,17 +6432,17 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
                             .strip_prefix("# owner:")
                             .unwrap_or("")
                             .trim()
-                            .to_string();
+                            .to_owned();
                     }
                     if line.starts_with("# group:") {
                         group = line
                             .strip_prefix("# group:")
                             .unwrap_or("")
                             .trim()
-                            .to_string();
+                            .to_owned();
                     }
                     if line.starts_with("user:") || line.starts_with("group:") {
-                        extended_acl.push(line.to_string());
+                        extended_acl.push(line.to_owned());
                     }
                 }
 
@@ -6463,9 +6459,9 @@ fn access_control_list_audit_internal(paths: &[&str]) -> Vec<AclInfo> {
         } else {
             results.push(AclInfo {
                 path: path.to_string(),
-                owner: "unknown".to_string(),
-                group: "unknown".to_string(),
-                mode: "0000".to_string(),
+                owner: "unknown".to_owned(),
+                group: "unknown".to_owned(),
+                mode: "0000".to_owned(),
                 extended_acl: Vec::new(),
                 is_restrictive: false,
             });
@@ -6605,37 +6601,37 @@ fn compare_to_baseline_internal(snapshot: &SystemSnapshot) -> AnomalyReport {
 
     if baseline.process_count > snapshot.process_count + 50 {
         anomalies.push(Anomaly {
-            metric: "process_count".to_string(),
+            metric: "process_count".to_owned(),
             expected: snapshot.process_count.to_string(),
             actual: baseline.process_count.to_string(),
             deviation_percent: ((baseline.process_count as f64 - snapshot.process_count as f64)
                 / snapshot.process_count.max(1) as f64)
                 * 100.0,
-            severity: "warning".to_string(),
+            severity: "warning".to_owned(),
         });
     }
 
     if baseline.memory_used_mb > snapshot.memory_used_mb + 256 {
         anomalies.push(Anomaly {
-            metric: "memory_used_mb".to_string(),
+            metric: "memory_used_mb".to_owned(),
             expected: snapshot.memory_used_mb.to_string(),
             actual: baseline.memory_used_mb.to_string(),
             deviation_percent: ((baseline.memory_used_mb as f64 - snapshot.memory_used_mb as f64)
                 / snapshot.memory_used_mb.max(1) as f64)
                 * 100.0,
-            severity: "warning".to_string(),
+            severity: "warning".to_owned(),
         });
     }
 
     if baseline.load_avg_1 > snapshot.load_avg_1 + 2.0 {
         anomalies.push(Anomaly {
-            metric: "load_avg_1".to_string(),
+            metric: "load_avg_1".to_owned(),
             expected: format!("{:.2}", snapshot.load_avg_1),
             actual: format!("{:.2}", baseline.load_avg_1),
             deviation_percent: ((baseline.load_avg_1 - snapshot.load_avg_1)
                 / (snapshot.load_avg_1 + 1.0))
                 * 100.0,
-            severity: "info".to_string(),
+            severity: "info".to_owned(),
         });
     }
 
@@ -6674,7 +6670,7 @@ fn performance_regression_detection_internal(
                     } else {
                         "decreasing"
                     }
-                    .to_string(),
+                    .to_owned(),
                     slope_percent_per_day: change_percent,
                     projected_failure_date: None,
                 });

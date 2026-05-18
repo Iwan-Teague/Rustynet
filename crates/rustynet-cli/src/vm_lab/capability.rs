@@ -200,33 +200,30 @@ fn evaluate_setup_or_run(
                 (
                     VmLabCapabilityStatus::Unsupported,
                     reason_code::TOPOLOGY_MISMATCH,
-                    "the current live-lab wrapper path is Linux-shell based and cannot satisfy the selected mixed-platform topology"
-                        .to_string(),
+                    "the current live-lab wrapper path is Linux-shell based and cannot satisfy the selected mixed-platform topology".to_owned(),
                 )
             } else {
                 (
                     VmLabCapabilityStatus::Supported,
                     reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-                    "supported through the current Linux shell orchestrator path".to_string(),
+                    "supported through the current Linux shell orchestrator path".to_owned(),
                 )
             }
         }
         VmLabPlatform::Windows => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            "the current live-lab wrapper path is Linux-shell based and does not yet execute the top-level flow on Windows targets"
-                .to_string(),
+            "the current live-lab wrapper path is Linux-shell based and does not yet execute the top-level flow on Windows targets".to_owned(),
         ),
         VmLabPlatform::MacOS => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            "the current live-lab wrapper path is Linux-shell based and does not yet execute the top-level flow on macOS targets"
-                .to_string(),
+            "the current live-lab wrapper path is Linux-shell based and does not yet execute the top-level flow on macOS targets".to_owned(),
         ),
         VmLabPlatform::Ios | VmLabPlatform::Android => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::TARGET_PLATFORM_UNSUPPORTED,
-            "the current live-lab wrapper path does not target mobile platforms".to_string(),
+            "the current live-lab wrapper path does not target mobile platforms".to_owned(),
         ),
     }
 }
@@ -236,19 +233,17 @@ fn evaluate_composite(platform: VmLabPlatform) -> (VmLabCapabilityStatus, &'stat
         VmLabPlatform::Linux => (
             VmLabCapabilityStatus::PartiallySupported,
             reason_code::COMPOSITE_CAPABILITY,
-            "this composite capability must be derived from the weakest required subcommand"
-                .to_string(),
+            "this composite capability must be derived from the weakest required subcommand".to_owned(),
         ),
         VmLabPlatform::Windows | VmLabPlatform::MacOS => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            "the composite live-lab wrapper inherits a Linux-shell-only required subcommand and is therefore unsupported on this target"
-                .to_string(),
+            "the composite live-lab wrapper inherits a Linux-shell-only required subcommand and is therefore unsupported on this target".to_owned(),
         ),
         VmLabPlatform::Ios | VmLabPlatform::Android => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::TARGET_PLATFORM_UNSUPPORTED,
-            "composite live-lab wrappers do not target mobile platforms".to_string(),
+            "composite live-lab wrappers do not target mobile platforms".to_owned(),
         ),
     }
 }
@@ -262,15 +257,14 @@ fn evaluate_bootstrap_phase(
             VmLabCapabilityStatus::Unsupported,
             reason_code::BOOTSTRAP_PHASE_MISSING_FOR_BOOTSTRAP_SCOPE,
             "BootstrapPhase scope requires an explicit bootstrap phase before classification"
-                .to_string(),
+                .to_owned(),
         );
     };
     match (platform, phase) {
         (VmLabPlatform::Linux, _) => (
             VmLabCapabilityStatus::Supported,
             reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            "the current Linux bootstrap phase is supported by the shell orchestrator path"
-                .to_string(),
+            "the current Linux bootstrap phase is supported by the shell orchestrator path".to_owned(),
         ),
         (
             VmLabPlatform::Windows,
@@ -278,14 +272,12 @@ fn evaluate_bootstrap_phase(
         ) => (
             VmLabCapabilityStatus::Supported,
             reason_code::PLATFORM_SPECIFIC_HELPER_AVAILABLE,
-            "Windows sync-source and build-release are supported through the current PowerShell helper path, subject to source-mode and toolchain preconditions"
-                .to_string(),
+            "Windows sync-source and build-release are supported through the current PowerShell helper path, subject to source-mode and toolchain preconditions".to_owned(),
         ),
         (VmLabPlatform::Windows, VmLabBootstrapPhase::InstallRelease) => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED,
-            "Windows install-release is a protective stub only and is not current runtime-capable proof"
-                .to_string(),
+            "Windows install-release is a protective stub only and is not current runtime-capable proof".to_owned(),
         ),
         (
             VmLabPlatform::Windows,
@@ -293,18 +285,17 @@ fn evaluate_bootstrap_phase(
         ) => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::RUNTIME_HOST_NOT_YET_IMPLEMENTED,
-            "this Windows bootstrap phase remains blocked until rustynetd exposes a real Windows service/config host path"
-                .to_string(),
+            "this Windows bootstrap phase remains blocked until rustynetd exposes a real Windows service/config host path".to_owned(),
         ),
         (VmLabPlatform::MacOS, _) => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::TARGET_PLATFORM_UNSUPPORTED,
-            "macOS bootstrap phases are not part of the current wrapper surface".to_string(),
+            "macOS bootstrap phases are not part of the current wrapper surface".to_owned(),
         ),
         (VmLabPlatform::Ios | VmLabPlatform::Android, _) => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::TARGET_PLATFORM_UNSUPPORTED,
-            "mobile bootstrap is not part of the current wrapper surface".to_string(),
+            "mobile bootstrap is not part of the current wrapper surface".to_owned(),
         ),
     }
 }
@@ -316,24 +307,22 @@ fn evaluate_baseline_diagnostics(
         VmLabPlatform::Linux => (
             VmLabCapabilityStatus::Supported,
             reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            "Linux diagnostics are supported through the current shell orchestrator path".to_string(),
+            "Linux diagnostics are supported through the current shell orchestrator path".to_owned(),
         ),
         VmLabPlatform::Windows => (
             VmLabCapabilityStatus::PartiallySupported,
             reason_code::PARTIALLY_IMPLEMENTED_SUBCAPABILITY,
-            "Windows diagnostics are available through PowerShell helpers; the wrapper should still report exact per-target helper coverage"
-                .to_string(),
+            "Windows diagnostics are available through PowerShell helpers; the wrapper should still report exact per-target helper coverage".to_owned(),
         ),
         VmLabPlatform::MacOS => (
             VmLabCapabilityStatus::PartiallySupported,
             reason_code::PARTIALLY_IMPLEMENTED_SUBCAPABILITY,
-            "macOS diagnostics rely on host-side helpers with limited coverage; wrapper should report exact coverage"
-                .to_string(),
+            "macOS diagnostics rely on host-side helpers with limited coverage; wrapper should report exact coverage".to_owned(),
         ),
         VmLabPlatform::Ios | VmLabPlatform::Android => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::TARGET_PLATFORM_UNSUPPORTED,
-            "mobile diagnostics are not part of the current wrapper surface".to_string(),
+            "mobile diagnostics are not part of the current wrapper surface".to_owned(),
         ),
     }
 }
@@ -599,7 +588,7 @@ pub fn validate_vm_lab_target_topology(
             status: VmLabCapabilityStatus::Unsupported,
             reason_code: reason_code::TARGET_PLATFORM_UNSUPPORTED,
             message: "empty target topology: a live-lab wrapper needs at least one target node"
-                .to_string(),
+                .to_owned(),
         });
     }
     if platforms
@@ -611,7 +600,7 @@ pub fn validate_vm_lab_target_topology(
             status: VmLabCapabilityStatus::Unsupported,
             reason_code: reason_code::TARGET_PLATFORM_UNSUPPORTED,
             message: "mobile platforms (iOS/Android) are not part of the current wrapper surface"
-                .to_string(),
+                .to_owned(),
         });
     }
     // Count distinct desktop platform families.
@@ -636,8 +625,7 @@ pub fn validate_vm_lab_target_topology(
                 status: VmLabCapabilityStatus::Unsupported,
                 reason_code: reason_code::TOPOLOGY_MISMATCH,
                 message:
-                    "the current live-lab wrapper path requires a pure-Linux topology; mixed-platform targets are not supported yet"
-                        .to_string(),
+                    "the current live-lab wrapper path requires a pure-Linux topology; mixed-platform targets are not supported yet".to_owned(),
             });
         }
         // distinct.len() == 1 here
@@ -708,7 +696,7 @@ pub fn merge_vm_lab_capability_records(
             scope,
             status: VmLabCapabilityStatus::Unsupported,
             reason_code: MERGED_EMPTY_INPUT_REASON_CODE,
-            message: "composite capability cannot be derived from an empty record set".to_string(),
+            message: "composite capability cannot be derived from an empty record set".to_owned(),
         };
     }
 
@@ -926,7 +914,7 @@ pub fn execute_ops_vm_lab_report_capabilities(
     if matches!(config.scope, VmLabCapabilityScope::BootstrapPhase)
         && config.bootstrap_phase.is_none()
     {
-        return Err("--bootstrap-phase is required when --scope is bootstrap-phase".to_string());
+        return Err("--bootstrap-phase is required when --scope is bootstrap-phase".to_owned());
     }
     let context = VmLabCapabilityContext {
         scope: config.scope,
@@ -1284,7 +1272,7 @@ pub fn validate_vm_lab_capability_preconditions(
             mixed_platform_topology,
         };
         let bundle = VmLabCapabilityFailureContext {
-            command: command.to_string(),
+            command: command.to_owned(),
             context,
             // The topology rejection record IS the canonical failure
             // record for this precondition. Keep it intact (its
@@ -1610,7 +1598,7 @@ mod tests {
             scope: VmLabCapabilityScope::SetupLiveLab,
             status: VmLabCapabilityStatus::Supported,
             reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            message: "hello".to_string(),
+            message: "hello".to_owned(),
         };
         assert_eq!(
             render_capability_summary(&record),
@@ -1683,7 +1671,7 @@ mod tests {
             scope: VmLabCapabilityScope::SetupLiveLab,
             status: VmLabCapabilityStatus::Unsupported,
             reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            message: "preserved\twith\ttabs".to_string(),
+            message: "preserved\twith\ttabs".to_owned(),
         };
         let out = render_vm_lab_capability_error(&record);
         // The tabs survive untouched — sanitization is the caller's
@@ -1762,7 +1750,7 @@ mod tests {
             scope: VmLabCapabilityScope::SetupLiveLab,
             status,
             reason_code: reason,
-            message: message.to_string(),
+            message: message.to_owned(),
         }
     }
 
@@ -2724,7 +2712,7 @@ mod tests {
             scope: VmLabCapabilityScope::SetupLiveLab,
             status: VmLabCapabilityStatus::Supported,
             reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-            message: "needs \"quotes\" and a backslash \\ here".to_string(),
+            message: "needs \"quotes\" and a backslash \\ here".to_owned(),
         };
         let body = render_platform_capabilities_artifact_json(std::slice::from_ref(&record));
         assert!(body.contains("\\\"quotes\\\""));

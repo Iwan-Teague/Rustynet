@@ -47,7 +47,7 @@ pub fn collect_linux_authenticode_report() -> LinuxAuthenticodeReport {
              signature verification happens at install time via dpkg/rpm. \
              A runtime authenticode-equivalent is not part of the reviewed \
              Linux posture today."
-            .to_string(),
+            .to_owned(),
     }
 }
 
@@ -303,7 +303,7 @@ mod tests {
     fn report_with_mutated_reason_breaks_equality_with_canonical() {
         let canonical = canonical_reviewed_report();
         let mut mutated = canonical.clone();
-        mutated.reason = "different reason".to_string();
+        mutated.reason = "different reason".to_owned();
         assert_ne!(
             mutated, canonical,
             "reason is operator-facing; a silent rewrite must be \

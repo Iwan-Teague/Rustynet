@@ -68,8 +68,8 @@ pub fn collect_macos_runtime_acl_report() -> MacosRuntimeAclReport {
         .map(|(path_str, label, mode, owner, group)| {
             let status = inspect_runtime_root_status(path_str, label, *mode, owner, group);
             MacosRuntimeAclRootEntry {
-                label: (*label).to_string(),
-                path: (*path_str).to_string(),
+                label: (*label).to_owned(),
+                path: (*path_str).to_owned(),
                 status,
             }
         })
@@ -375,8 +375,8 @@ mod tests {
             schema_version: 1,
             overall_ok: true,
             roots: vec![MacosRuntimeAclRootEntry {
-                label: "state root".to_string(),
-                path: "/usr/local/var/rustynet".to_string(),
+                label: "state root".to_owned(),
+                path: "/usr/local/var/rustynet".to_owned(),
                 status: MacosRuntimeAclRootStatus::Ok,
             }],
         };
@@ -444,10 +444,10 @@ mod tests {
         // Pre-existing report_serde_round_trips only covered Ok. Pin
         // the Drifted variant so a future rename on `reason` trips.
         let entry = MacosRuntimeAclRootEntry {
-            label: "state root".to_string(),
-            path: "/usr/local/var/rustynet".to_string(),
+            label: "state root".to_owned(),
+            path: "/usr/local/var/rustynet".to_owned(),
             status: MacosRuntimeAclRootStatus::Drifted {
-                reason: "mode is 0o755, expected 0o700".to_string(),
+                reason: "mode is 0o755, expected 0o700".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -459,10 +459,10 @@ mod tests {
     #[test]
     fn root_status_missing_round_trips_through_serde() {
         let entry = MacosRuntimeAclRootEntry {
-            label: "state root".to_string(),
-            path: "/usr/local/var/rustynet".to_string(),
+            label: "state root".to_owned(),
+            path: "/usr/local/var/rustynet".to_owned(),
             status: MacosRuntimeAclRootStatus::Missing {
-                reason: "off-macOS probe stub".to_string(),
+                reason: "off-macOS probe stub".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");

@@ -107,7 +107,7 @@ impl VerifiedTraversalIndex {
     }
 
     pub fn get(&self, source: &str, target: &str) -> Option<&VerifiedTraversalRecord> {
-        self.index.get(&(source.to_string(), target.to_string()))
+        self.index.get(&(source.to_owned(), target.to_owned()))
     }
 
     pub fn prune_expired(&mut self, now_unix: u64) {
@@ -323,11 +323,11 @@ impl CandidateGatherer {
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
-                Err(TraversalError::Stun("stun response timed out".to_string()))
+                Err(TraversalError::Stun("stun response timed out".to_owned()))
             }
             Err(err) => {
                 if receive_started.elapsed() >= timeout {
-                    return Err(TraversalError::Stun("stun response timed out".to_string()));
+                    return Err(TraversalError::Stun("stun response timed out".to_owned()));
                 }
                 Err(TraversalError::Stun(format!(
                     "failed to receive stun response: {err}"
@@ -459,31 +459,29 @@ fn parse_stun_xor_mapped_address(
 ) -> Result<SocketAddr, TraversalError> {
     if message.len() < 20 {
         return Err(TraversalError::Stun(
-            "stun message is shorter than header".to_string(),
+            "stun message is shorter than header".to_owned(),
         ));
     }
     let message_type = u16::from_be_bytes([message[0], message[1]]);
     if message_type != STUN_BINDING_RESPONSE_TYPE {
         return Err(TraversalError::Stun(
-            "stun message is not a binding response".to_string(),
+            "stun message is not a binding response".to_owned(),
         ));
     }
     let declared_len = usize::from(u16::from_be_bytes([message[2], message[3]]));
     let expected_len = 20usize.saturating_add(declared_len);
     if expected_len > message.len() {
-        return Err(TraversalError::Stun(
-            "stun message is truncated".to_string(),
-        ));
+        return Err(TraversalError::Stun("stun message is truncated".to_owned()));
     }
     let cookie = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
     if cookie != STUN_MAGIC_COOKIE {
         return Err(TraversalError::Stun(
-            "stun magic cookie mismatch".to_string(),
+            "stun magic cookie mismatch".to_owned(),
         ));
     }
     if message[8..20] != transaction_id {
         return Err(TraversalError::Stun(
-            "stun transaction id mismatch".to_string(),
+            "stun transaction id mismatch".to_owned(),
         ));
     }
 
@@ -499,14 +497,14 @@ fn parse_stun_xor_mapped_address(
         let attr_end = offset.saturating_add(attr_len);
         if attr_end > expected_len {
             return Err(TraversalError::Stun(
-                "stun attribute exceeds message boundary".to_string(),
+                "stun attribute exceeds message boundary".to_owned(),
             ));
         }
         let value = &message[offset..attr_end];
         if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
             if attr_len < 8 {
                 return Err(TraversalError::Stun(
-                    "xor-mapped-address attribute too short".to_string(),
+                    "xor-mapped-address attribute too short".to_owned(),
                 ));
             }
             let family = value[1];
@@ -517,7 +515,7 @@ fn parse_stun_xor_mapped_address(
                 0x01 => {
                     if attr_len < 8 {
                         return Err(TraversalError::Stun(
-                            "xor-mapped-address ipv4 attribute too short".to_string(),
+                            "xor-mapped-address ipv4 attribute too short".to_owned(),
                         ));
                     }
                     let mut addr = [0u8; 4];
@@ -529,7 +527,7 @@ fn parse_stun_xor_mapped_address(
                 0x02 => {
                     if attr_len < 20 {
                         return Err(TraversalError::Stun(
-                            "xor-mapped-address ipv6 attribute too short".to_string(),
+                            "xor-mapped-address ipv6 attribute too short".to_owned(),
                         ));
                     }
                     let mut addr = [0u8; 16];
@@ -545,7 +543,7 @@ fn parse_stun_xor_mapped_address(
                 }
                 _ => {
                     return Err(TraversalError::Stun(
-                        "xor-mapped-address has unsupported address family".to_string(),
+                        "xor-mapped-address has unsupported address family".to_owned(),
                     ));
                 }
             };
@@ -556,7 +554,7 @@ fn parse_stun_xor_mapped_address(
     }
 
     Err(TraversalError::Stun(
-        "stun response does not contain xor-mapped-address".to_string(),
+        "stun response does not contain xor-mapped-address".to_owned(),
     ))
 }
 
@@ -585,13 +583,13 @@ fn verify_coordination_record_signature(
         || parsed.nonce != record.nonce
     {
         return Err(TraversalError::Coordination(
-            "coordination payload/header mismatch".to_string(),
+            "coordination payload/header mismatch".to_owned(),
         ));
     }
     let canonical_payload = serialize_coordination_payload(&parsed);
     if canonical_payload != record.payload {
         return Err(TraversalError::Coordination(
-            "coordination payload canonicalization mismatch".to_string(),
+            "coordination payload canonicalization mismatch".to_owned(),
         ));
     }
 
@@ -609,14 +607,14 @@ fn parse_coordination_payload(payload: &str) -> Result<ParsedCoordinationPayload
     let mut fields = BTreeMap::<String, String>::new();
     for line in payload.lines() {
         let (key, value) = line.split_once('=').ok_or_else(|| {
-            TraversalError::Coordination("coordination payload line missing '='".to_string())
+            TraversalError::Coordination("coordination payload line missing '='".to_owned())
         })?;
         if key.trim().is_empty() {
             return Err(TraversalError::Coordination(
-                "coordination payload key is empty".to_string(),
+                "coordination payload key is empty".to_owned(),
             ));
         }
-        if fields.insert(key.to_string(), value.to_string()).is_some() {
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
             return Err(TraversalError::Coordination(format!(
                 "coordination payload duplicate key: {key}"
             )));
@@ -624,24 +622,24 @@ fn parse_coordination_payload(payload: &str) -> Result<ParsedCoordinationPayload
     }
     if fields.len() != 9 {
         return Err(TraversalError::Coordination(
-            "coordination payload has unexpected field count".to_string(),
+            "coordination payload has unexpected field count".to_owned(),
         ));
     }
 
     let version = fields.get("version").ok_or_else(|| {
-        TraversalError::Coordination("coordination payload missing version".to_string())
+        TraversalError::Coordination("coordination payload missing version".to_owned())
     })?;
     if version != "1" {
         return Err(TraversalError::Coordination(
-            "coordination payload version is unsupported".to_string(),
+            "coordination payload version is unsupported".to_owned(),
         ));
     }
     let payload_type = fields.get("type").ok_or_else(|| {
-        TraversalError::Coordination("coordination payload missing type".to_string())
+        TraversalError::Coordination("coordination payload missing type".to_owned())
     })?;
     if payload_type != "traversal_coordination" {
         return Err(TraversalError::Coordination(
-            "coordination payload type is unsupported".to_string(),
+            "coordination payload type is unsupported".to_owned(),
         ));
     }
 
@@ -649,40 +647,40 @@ fn parse_coordination_payload(payload: &str) -> Result<ParsedCoordinationPayload
         fields
             .get("session_id")
             .ok_or_else(|| {
-                TraversalError::Coordination("coordination payload missing session_id".to_string())
+                TraversalError::Coordination("coordination payload missing session_id".to_owned())
             })?
             .as_str(),
     )
-    .map_err(|_| TraversalError::Coordination("coordination session_id is invalid".to_string()))?;
+    .map_err(|_| TraversalError::Coordination("coordination session_id is invalid".to_owned()))?;
     let nonce = decode_hex_to_fixed::<16>(
         fields
             .get("nonce")
             .ok_or_else(|| {
-                TraversalError::Coordination("coordination payload missing nonce".to_string())
+                TraversalError::Coordination("coordination payload missing nonce".to_owned())
             })?
             .as_str(),
     )
-    .map_err(|_| TraversalError::Coordination("coordination nonce is invalid".to_string()))?;
+    .map_err(|_| TraversalError::Coordination("coordination nonce is invalid".to_owned()))?;
     let probe_start_unix = parse_u64_field(&fields, "probe_start_unix")?;
     let issued_at_unix = parse_u64_field(&fields, "issued_at_unix")?;
     let expires_at_unix = parse_u64_field(&fields, "expires_at_unix")?;
     let node_a = fields
         .get("node_a")
         .ok_or_else(|| {
-            TraversalError::Coordination("coordination payload missing node_a".to_string())
+            TraversalError::Coordination("coordination payload missing node_a".to_owned())
         })?
         .trim()
-        .to_string();
+        .to_owned();
     let node_b = fields
         .get("node_b")
         .ok_or_else(|| {
-            TraversalError::Coordination("coordination payload missing node_b".to_string())
+            TraversalError::Coordination("coordination payload missing node_b".to_owned())
         })?
         .trim()
-        .to_string();
+        .to_owned();
     if node_a.is_empty() || node_b.is_empty() {
         return Err(TraversalError::Coordination(
-            "coordination payload node ids must not be empty".to_string(),
+            "coordination payload node ids must not be empty".to_owned(),
         ));
     }
     Ok(ParsedCoordinationPayload {
@@ -1218,13 +1216,13 @@ impl TraversalEngine {
     ) -> Result<CoordinationSchedule, TraversalError> {
         if record.issued_at_unix >= record.expires_at_unix {
             return Err(TraversalError::Coordination(
-                "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
+                "coordination expires_at_unix must be greater than issued_at_unix".to_owned(),
             ));
         }
         if record.expires_at_unix.saturating_sub(record.issued_at_unix) > MAX_COORDINATION_TTL_SECS
         {
             return Err(TraversalError::Coordination(
-                "coordination ttl exceeds max supported value".to_string(),
+                "coordination ttl exceeds max supported value".to_owned(),
             ));
         }
         if now_unix > record.expires_at_unix {
@@ -2011,7 +2009,7 @@ mod tests {
                     addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
                     port: 51820,
                 }),
-                Err(TraversalError::Stun("stun response timed out".to_string())),
+                Err(TraversalError::Stun("stun response timed out".to_owned())),
             ],
         );
         assert!(candidates.iter().any(|c| c.source == CandidateSource::Host));
@@ -2026,7 +2024,7 @@ mod tests {
             &rustynet_if_ip_set,
             1,
             vec![Err(TraversalError::Stun(
-                "stun response timed out".to_string(),
+                "stun response timed out".to_owned(),
             ))],
         );
         assert!(results.iter().all(|c| c.source == CandidateSource::Host));
@@ -2036,29 +2034,29 @@ mod tests {
     fn coordination_record_validation_and_execute_simultaneous_open_behaviour() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node:node-a".to_string(),
-            dst: "node:node-b".to_string(),
+            src: "node:node-a".to_owned(),
+            dst: "node:node-b".to_owned(),
             protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
         let node_a = rustynet_control::NodeMetadata {
-            node_id: "node-a".to_string(),
-            hostname: "a".to_string(),
-            os: "linux".to_string(),
+            node_id: "node-a".to_owned(),
+            hostname: "a".to_owned(),
+            os: "linux".to_owned(),
             tags: vec![],
-            owner: "owner-a".to_string(),
-            endpoint: "127.0.0.1:51820".to_string(),
+            owner: "owner-a".to_owned(),
+            endpoint: "127.0.0.1:51820".to_owned(),
             last_seen_unix: 1,
             public_key: [1u8; 32],
         };
         let node_b = rustynet_control::NodeMetadata {
-            node_id: "node-b".to_string(),
-            hostname: "b".to_string(),
-            os: "linux".to_string(),
+            node_id: "node-b".to_owned(),
+            hostname: "b".to_owned(),
+            os: "linux".to_owned(),
             tags: vec![],
-            owner: "owner-b".to_string(),
-            endpoint: "127.0.0.1:51821".to_string(),
+            owner: "owner-b".to_owned(),
+            endpoint: "127.0.0.1:51821".to_owned(),
             last_seen_unix: 1,
             public_key: [2u8; 32],
         };
@@ -2076,8 +2074,8 @@ mod tests {
         let record = TraversalCoordinationRecord {
             session_id,
             probe_start_unix: now.saturating_add(1),
-            node_a: "node-a".to_string(),
-            node_b: "node-b".to_string(),
+            node_a: "node-a".to_owned(),
+            node_b: "node-b".to_owned(),
             issued_at_unix: now,
             expires_at_unix: now.saturating_add(20),
             nonce,
@@ -2286,32 +2284,32 @@ mod tests {
     fn test_a4_forged_signature_coordination_record_rejected() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node:node-a".to_string(),
-            dst: "node:node-b".to_string(),
+            src: "node:node-a".to_owned(),
+            dst: "node:node-b".to_owned(),
             protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
         core.nodes
             .upsert(NodeMetadata {
-                node_id: "node-a".to_string(),
-                hostname: "host-a".to_string(),
-                os: "linux".to_string(),
+                node_id: "node-a".to_owned(),
+                hostname: "host-a".to_owned(),
+                os: "linux".to_owned(),
                 tags: vec![],
-                owner: "user".to_string(),
-                endpoint: "1.2.3.4:1234".to_string(),
+                owner: "user".to_owned(),
+                endpoint: "1.2.3.4:1234".to_owned(),
                 last_seen_unix: 0,
                 public_key: [0u8; 32],
             })
             .expect("upsert a");
         core.nodes
             .upsert(NodeMetadata {
-                node_id: "node-b".to_string(),
-                hostname: "host-b".to_string(),
-                os: "linux".to_string(),
+                node_id: "node-b".to_owned(),
+                hostname: "host-b".to_owned(),
+                os: "linux".to_owned(),
                 tags: vec![],
-                owner: "user".to_string(),
-                endpoint: "5.6.7.8:5678".to_string(),
+                owner: "user".to_owned(),
+                endpoint: "5.6.7.8:5678".to_owned(),
                 last_seen_unix: 0,
                 public_key: [0u8; 32],
             })
@@ -2324,8 +2322,8 @@ mod tests {
         let record = TraversalCoordinationRecord {
             session_id: [1u8; 16],
             probe_start_unix: now + 2,
-            node_a: "node-a".to_string(),
-            node_b: "node-b".to_string(),
+            node_a: "node-a".to_owned(),
+            node_b: "node-b".to_owned(),
             issued_at_unix: now,
             expires_at_unix: now + 20,
             nonce: [9u8; 16],
@@ -2364,32 +2362,32 @@ mod tests {
     fn test_a4_replayed_coordination_record_rejected() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node:node-a".to_string(),
-            dst: "node:node-b".to_string(),
+            src: "node:node-a".to_owned(),
+            dst: "node:node-b".to_owned(),
             protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
         let core = ControlPlaneCore::new(vec![0u8; 32], policy);
         core.nodes
             .upsert(NodeMetadata {
-                node_id: "node-a".to_string(),
-                hostname: "host-a".to_string(),
-                os: "linux".to_string(),
+                node_id: "node-a".to_owned(),
+                hostname: "host-a".to_owned(),
+                os: "linux".to_owned(),
                 tags: vec![],
-                owner: "user".to_string(),
-                endpoint: "1.2.3.4:1234".to_string(),
+                owner: "user".to_owned(),
+                endpoint: "1.2.3.4:1234".to_owned(),
                 last_seen_unix: 0,
                 public_key: [0u8; 32],
             })
             .expect("upsert a");
         core.nodes
             .upsert(NodeMetadata {
-                node_id: "node-b".to_string(),
-                hostname: "host-b".to_string(),
-                os: "linux".to_string(),
+                node_id: "node-b".to_owned(),
+                hostname: "host-b".to_owned(),
+                os: "linux".to_owned(),
                 tags: vec![],
-                owner: "user".to_string(),
-                endpoint: "5.6.7.8:5678".to_string(),
+                owner: "user".to_owned(),
+                endpoint: "5.6.7.8:5678".to_owned(),
                 last_seen_unix: 0,
                 public_key: [0u8; 32],
             })
@@ -2402,8 +2400,8 @@ mod tests {
         let record = TraversalCoordinationRecord {
             session_id: [2u8; 16],
             probe_start_unix: now + 1,
-            node_a: "node-a".to_string(),
-            node_b: "node-b".to_string(),
+            node_a: "node-a".to_owned(),
+            node_b: "node-b".to_owned(),
             issued_at_unix: now,
             expires_at_unix: now + 20,
             nonce: [0xab; 16],
@@ -2446,8 +2444,8 @@ mod tests {
     fn test_a4_expired_coordination_record_rejected() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node:node-a".to_string(),
-            dst: "node:node-b".to_string(),
+            src: "node:node-a".to_owned(),
+            dst: "node:node-b".to_owned(),
             protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
@@ -2455,12 +2453,12 @@ mod tests {
         for (node_id, endpoint) in [("node-a", "1.2.3.4:1234"), ("node-b", "5.6.7.8:5678")] {
             core.nodes
                 .upsert(NodeMetadata {
-                    node_id: node_id.to_string(),
-                    hostname: node_id.to_string(),
-                    os: "linux".to_string(),
+                    node_id: node_id.to_owned(),
+                    hostname: node_id.to_owned(),
+                    os: "linux".to_owned(),
                     tags: vec![],
-                    owner: "user".to_string(),
-                    endpoint: endpoint.to_string(),
+                    owner: "user".to_owned(),
+                    endpoint: endpoint.to_owned(),
                     last_seen_unix: 0,
                     public_key: [0u8; 32],
                 })
@@ -2475,8 +2473,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [3u8; 16],
                 probe_start_unix: now.saturating_sub(5),
-                node_a: "node-a".to_string(),
-                node_b: "node-b".to_string(),
+                node_a: "node-a".to_owned(),
+                node_b: "node-b".to_owned(),
                 issued_at_unix: now.saturating_sub(20),
                 expires_at_unix: now.saturating_sub(1),
                 nonce: [0xcd; 16],
@@ -2503,8 +2501,8 @@ mod tests {
     fn test_a4_wrong_node_coordination_record_rejected() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node:node-a".to_string(),
-            dst: "node:node-b".to_string(),
+            src: "node:node-a".to_owned(),
+            dst: "node:node-b".to_owned(),
             protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
@@ -2512,12 +2510,12 @@ mod tests {
         for (node_id, endpoint) in [("node-a", "1.2.3.4:1234"), ("node-b", "5.6.7.8:5678")] {
             core.nodes
                 .upsert(NodeMetadata {
-                    node_id: node_id.to_string(),
-                    hostname: node_id.to_string(),
-                    os: "linux".to_string(),
+                    node_id: node_id.to_owned(),
+                    hostname: node_id.to_owned(),
+                    os: "linux".to_owned(),
                     tags: vec![],
-                    owner: "user".to_string(),
-                    endpoint: endpoint.to_string(),
+                    owner: "user".to_owned(),
+                    endpoint: endpoint.to_owned(),
                     last_seen_unix: 0,
                     public_key: [0u8; 32],
                 })
@@ -2532,8 +2530,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [4u8; 16],
                 probe_start_unix: now.saturating_add(1),
-                node_a: "node-a".to_string(),
-                node_b: "node-b".to_string(),
+                node_a: "node-a".to_owned(),
+                node_b: "node-b".to_owned(),
                 issued_at_unix: now,
                 expires_at_unix: now.saturating_add(20),
                 nonce: [0xef; 16],
@@ -2560,8 +2558,8 @@ mod tests {
     fn test_a4_malformed_coordination_payload_rejected() {
         let mut policy = PolicySet::default();
         policy.rules.push(PolicyRule {
-            src: "node:node-a".to_string(),
-            dst: "node:node-b".to_string(),
+            src: "node:node-a".to_owned(),
+            dst: "node:node-b".to_owned(),
             protocol: Protocol::Udp,
             action: RuleAction::Allow,
         });
@@ -2569,12 +2567,12 @@ mod tests {
         for (node_id, endpoint) in [("node-a", "1.2.3.4:1234"), ("node-b", "5.6.7.8:5678")] {
             core.nodes
                 .upsert(NodeMetadata {
-                    node_id: node_id.to_string(),
-                    hostname: node_id.to_string(),
-                    os: "linux".to_string(),
+                    node_id: node_id.to_owned(),
+                    hostname: node_id.to_owned(),
+                    os: "linux".to_owned(),
                     tags: vec![],
-                    owner: "user".to_string(),
-                    endpoint: endpoint.to_string(),
+                    owner: "user".to_owned(),
+                    endpoint: endpoint.to_owned(),
                     last_seen_unix: 0,
                     public_key: [0u8; 32],
                 })
@@ -2589,8 +2587,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [5u8; 16],
                 probe_start_unix: now.saturating_add(1),
-                node_a: "node-a".to_string(),
-                node_b: "node-b".to_string(),
+                node_a: "node-a".to_owned(),
+                node_b: "node-b".to_owned(),
                 issued_at_unix: now,
                 expires_at_unix: now.saturating_add(20),
                 nonce: [0xaa; 16],
@@ -2717,7 +2715,7 @@ mod tests {
     /// the correct old/new address sets.
     #[test]
     fn test_b2a_interface_address_added_emits_event() {
-        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_string()]);
+        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_owned()]);
 
         // Baseline: no addresses seen yet → no event.
         let initial = addr_map(&[("eth0", &["192.0.2.1"])]);
@@ -2748,7 +2746,7 @@ mod tests {
     /// event with an empty `new_addrs` (interface went down).
     #[test]
     fn test_b2a_interface_down_emits_event() {
-        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_string()]);
+        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_owned()]);
 
         // Establish baseline.
         monitor.poll_with_addrs(addr_map(&[("eth0", &["198.51.100.5"])]));
@@ -2770,7 +2768,7 @@ mod tests {
     /// must be silently ignored — they are not underlay mobility events.
     #[test]
     fn test_b2a_rustynet_interface_changes_ignored() {
-        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_string()]);
+        let mut monitor = EndpointMonitor::new(vec!["rustynet".to_owned()]);
 
         // Only the tunnel interface changes.
         let tunnel_only = addr_map(&[("rustynet0", &["10.100.0.1"])]);
@@ -2821,7 +2819,7 @@ mod tests {
             verified_at_unix: 150,
         };
 
-        index.insert("node-a".to_string(), "node-b".to_string(), record.clone());
+        index.insert("node-a".to_owned(), "node-b".to_owned(), record.clone());
         assert_eq!(index.len(), 1);
 
         let retrieved = index.get("node-a", "node-b").expect("should exist");

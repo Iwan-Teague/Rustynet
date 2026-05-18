@@ -131,7 +131,7 @@ fn run() -> Result<(), String> {
 
     if ssh_identity_file.is_empty() || client_host.is_empty() {
         print_usage();
-        return Err("missing required argument: --ssh-identity-file, --client-host".to_string());
+        return Err("missing required argument: --ssh-identity-file, --client-host".to_owned());
     }
 
     if let Some(parent) = report_path.parent() {
@@ -168,7 +168,7 @@ fn run() -> Result<(), String> {
     append_host(&mut host_labels, &mut host_targets, "extra", &extra_host);
 
     if host_targets.is_empty() {
-        return Err("missing required argument: at least one target host is required".to_string());
+        return Err("missing required argument: at least one target host is required".to_owned());
     }
 
     for target in &host_targets {
@@ -214,8 +214,8 @@ fn run() -> Result<(), String> {
         )?;
     }
 
-    let mut remote_dns_probe_status = "skipped".to_string();
-    let mut remote_dns_probe_output = "not-applicable".to_string();
+    let mut remote_dns_probe_status = "skipped".to_owned();
+    let mut remote_dns_probe_output = "not-applicable".to_owned();
     let client_dns_state_file = ctx.work_dir.join("client.managed_dns_state.txt");
     if !probe_host.is_empty()
         && probe_host != client_host
@@ -227,7 +227,7 @@ fn run() -> Result<(), String> {
         let client_addr = LiveLabContext::resolved_target_address(&client_host)?;
         let dns_port = dns_bind_addr
             .rsplit_once(':')
-            .map_or_else(|| "53535".to_string(), |(_, port)| port.to_string());
+            .map_or_else(|| "53535".to_owned(), |(_, port)| port.to_owned());
         remote_dns_probe_output = ctx.capture_root_allow_failure(
             &probe_host,
             &[
@@ -264,9 +264,9 @@ fn run() -> Result<(), String> {
             )
             .is_err();
         remote_dns_probe_status = if blocked_probe {
-            "pass".to_string()
+            "pass".to_owned()
         } else {
-            "fail".to_string()
+            "fail".to_owned()
         };
     }
 
@@ -274,24 +274,24 @@ fn run() -> Result<(), String> {
     let captured_at_unix = now_unix();
     let work_dir_string = ctx.work_dir.to_string_lossy().to_string();
     let report_args = vec![
-        "--report-path".to_string(),
+        "--report-path".to_owned(),
         report_path.to_string_lossy().to_string(),
-        "--dns-bind-addr".to_string(),
+        "--dns-bind-addr".to_owned(),
         dns_bind_addr.clone(),
-        "--remote-dns-probe-status".to_string(),
+        "--remote-dns-probe-status".to_owned(),
         remote_dns_probe_status.clone(),
-        "--remote-dns-probe-output".to_string(),
+        "--remote-dns-probe-output".to_owned(),
         remote_dns_probe_output.clone(),
-        "--work-dir".to_string(),
+        "--work-dir".to_owned(),
         work_dir_string,
-        "--captured-at-utc".to_string(),
+        "--captured-at-utc".to_owned(),
         captured_at_utc,
-        "--captured-at-unix".to_string(),
+        "--captured-at-unix".to_owned(),
         captured_at_unix,
     ];
     let mut host_label_args = Vec::new();
     for label in &host_labels {
-        host_label_args.push("--host-label".to_string());
+        host_label_args.push("--host-label".to_owned());
         host_label_args.push(label.clone());
     }
     let mut cargo_args = report_args;
@@ -319,8 +319,8 @@ fn run() -> Result<(), String> {
 
 fn append_host(labels: &mut Vec<String>, targets: &mut Vec<String>, label: &str, target: &str) {
     if !target.is_empty() {
-        labels.push(label.to_string());
-        targets.push(target.to_string());
+        labels.push(label.to_owned());
+        targets.push(target.to_owned());
     }
 }
 
@@ -344,7 +344,7 @@ fn write_block(path: &PathBuf, contents: &str) -> Result<(), String> {
 
 fn now_unix() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
-        |_| "0".to_string(),
+        |_| "0".to_owned(),
         |duration| duration.as_secs().to_string(),
     )
 }

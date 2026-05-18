@@ -10,7 +10,7 @@ pub(crate) fn parse_env_value(raw: &str) -> Result<String, String> {
         return Ok(String::new());
     }
     if trimmed.contains('\0') {
-        return Err("env-file values must not contain NUL bytes".to_string());
+        return Err("env-file values must not contain NUL bytes".to_owned());
     }
     if trimmed.starts_with('"') {
         return parse_double_quoted_env_value(trimmed);
@@ -18,7 +18,7 @@ pub(crate) fn parse_env_value(raw: &str) -> Result<String, String> {
     if trimmed.starts_with('\'') {
         return parse_single_quoted_env_value(trimmed);
     }
-    Ok(trimmed.to_string())
+    Ok(trimmed.to_owned())
 }
 
 fn validate_env_key(key: &str) -> Result<(), String> {
@@ -34,7 +34,7 @@ fn validate_env_key(key: &str) -> Result<(), String> {
 
 fn quote_env_value(value: &str) -> Result<String, String> {
     if value.contains('\0') || value.contains('\n') || value.contains('\r') {
-        return Err("env-file values must not contain NUL or newline characters".to_string());
+        return Err("env-file values must not contain NUL or newline characters".to_owned());
     }
 
     let mut quoted = String::with_capacity(value.len() + 2);

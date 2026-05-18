@@ -100,7 +100,7 @@ pub fn install_daemon(
 
     Ok(InstallReport {
         daemon_path: LINUX_RUSTYNETD_PATH.into(),
-        service_name: LINUX_SERVICE_NAME.to_string(),
+        service_name: LINUX_SERVICE_NAME.to_owned(),
     })
 }
 
@@ -144,10 +144,10 @@ pub fn enforce_daemon(
     // bootstrap script extracts to (`${HOME}/Rustynet`).
     let home = ssh::run_remote(conn, "echo $HOME", Duration::from_secs(10))?
         .trim()
-        .to_string();
+        .to_owned();
     if home.is_empty() {
         return Err(AdapterError::Protocol {
-            message: "could not determine $HOME on remote for e2e-enforce-host".to_string(),
+            message: "could not determine $HOME on remote for e2e-enforce-host".to_owned(),
         });
     }
     let src_dir = format!("{home}/Rustynet");
@@ -284,7 +284,7 @@ mod tests {
     fn bootstrap_env_includes_role_and_node_id() {
         use std::collections::HashMap;
         let assignments = vec![NodeRoleAssignment {
-            alias: "node1".to_string(),
+            alias: "node1".to_owned(),
             role: NodeRole::Exit,
         }];
         let ctx = OrchestrationContext {
@@ -294,9 +294,9 @@ mod tests {
             report_dir: "/tmp".into(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "test-net".to_string(),
+            network_id: "test-net".to_owned(),
             node_ids: HashMap::new(),
-            ssh_allow_cidrs: "10.0.0.0/8".to_string(),
+            ssh_allow_cidrs: "10.0.0.0/8".to_owned(),
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
@@ -326,7 +326,7 @@ mod tests {
             report_dir: "/tmp".into(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

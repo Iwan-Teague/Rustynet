@@ -41,7 +41,7 @@ impl NodeConnection {
                 reason: "known_hosts file does not exist; \
                          StrictHostKeyChecking=yes requires this file \
                          to be pre-populated before connecting"
-                    .to_string(),
+                    .to_owned(),
             });
         }
         Ok(NodeConnection::Ssh {
@@ -128,7 +128,7 @@ mod tests {
         )
         .unwrap();
         let adb = NodeConnection::Adb {
-            device_serial: "serial123".to_string(),
+            device_serial: "serial123".to_owned(),
         };
 
         assert!(ssh.is_valid_for_platform(&VmGuestPlatform::Linux));

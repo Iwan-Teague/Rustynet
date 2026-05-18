@@ -40,7 +40,7 @@ impl TempDirGuard {
             }
         }
 
-        Err("create temp dir failed: exhausted unique path attempts".to_string())
+        Err("create temp dir failed: exhausted unique path attempts".to_owned())
     }
 
     fn path(&self) -> &Path {

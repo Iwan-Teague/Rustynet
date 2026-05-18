@@ -43,7 +43,7 @@ impl WireguardCommandRunner for LinuxCommandRunner {
             .output()
             .map_err(|err| BackendError::internal(format!("{program} spawn failed: {err}")))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             if stderr.is_empty() {
                 return Err(BackendError::internal(format!(
                     "{program} exited with status {}",
@@ -138,12 +138,12 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
     fn configure_interface(&mut self, context: &RuntimeContext) -> Result<(), BackendError> {
         Self::ensure_cidr(&context.local_cidr)?;
         let add_args = [
-            "link".to_string(),
-            "add".to_string(),
-            "dev".to_string(),
+            "link".to_owned(),
+            "add".to_owned(),
+            "dev".to_owned(),
             self.interface_name.clone(),
-            "type".to_string(),
-            "wireguard".to_string(),
+            "type".to_owned(),
+            "wireguard".to_owned(),
         ];
         if self.runner.run("ip", &add_args).is_err() {
             let _ = self.remove_interface();
@@ -152,11 +152,11 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
         if let Err(err) = self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "private-key".to_string(),
+                "private-key".to_owned(),
                 self.private_key_path.clone(),
-                "listen-port".to_string(),
+                "listen-port".to_owned(),
                 self.listen_port.to_string(),
             ],
         ) {
@@ -166,10 +166,10 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
         if let Err(err) = self.runner.run(
             "ip",
             &[
-                "address".to_string(),
-                "add".to_string(),
+                "address".to_owned(),
+                "add".to_owned(),
                 context.local_cidr.clone(),
-                "dev".to_string(),
+                "dev".to_owned(),
                 self.interface_name.clone(),
             ],
         ) {
@@ -179,10 +179,10 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
         if let Err(err) = self.runner.run(
             "ip",
             &[
-                "link".to_string(),
-                "set".to_string(),
-                "up".to_string(),
-                "dev".to_string(),
+                "link".to_owned(),
+                "set".to_owned(),
+                "up".to_owned(),
+                "dev".to_owned(),
                 self.interface_name.clone(),
             ],
         ) {
@@ -196,9 +196,9 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
         self.runner.run(
             "ip",
             &[
-                "link".to_string(),
-                "del".to_string(),
-                "dev".to_string(),
+                "link".to_owned(),
+                "del".to_owned(),
+                "dev".to_owned(),
                 self.interface_name.clone(),
             ],
         )
@@ -213,10 +213,10 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             match self.runner.run(
                 "ip",
                 &[
-                    "route".to_string(),
-                    "del".to_string(),
+                    "route".to_owned(),
+                    "del".to_owned(),
                     route.destination_cidr.clone(),
-                    "dev".to_string(),
+                    "dev".to_owned(),
                     self.interface_name.clone(),
                 ],
             ) {
@@ -237,10 +237,10 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             self.runner.run(
                 "ip",
                 &[
-                    "route".to_string(),
-                    "replace".to_string(),
+                    "route".to_owned(),
+                    "replace".to_owned(),
                     route.destination_cidr.clone(),
-                    "dev".to_string(),
+                    "dev".to_owned(),
                     self.interface_name.clone(),
                 ],
             )?;
@@ -258,10 +258,10 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 .run(
                     "ip",
                     &[
-                        "rule".to_string(),
-                        "del".to_string(),
-                        "table".to_string(),
-                        "51820".to_string(),
+                        "rule".to_owned(),
+                        "del".to_owned(),
+                        "table".to_owned(),
+                        "51820".to_owned(),
                     ],
                 )
                 .is_err()
@@ -270,12 +270,12 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             }
         }
         let delete_args = [
-            "rule".to_string(),
-            "del".to_string(),
-            "priority".to_string(),
-            EXIT_RULE_PRIORITY.to_string(),
-            "table".to_string(),
-            "51820".to_string(),
+            "rule".to_owned(),
+            "del".to_owned(),
+            "priority".to_owned(),
+            EXIT_RULE_PRIORITY.to_owned(),
+            "table".to_owned(),
+            "51820".to_owned(),
         ];
         match mode {
             ExitMode::Off => {
@@ -287,12 +287,12 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
                 self.runner.run(
                     "ip",
                     &[
-                        "rule".to_string(),
-                        "add".to_string(),
-                        "priority".to_string(),
-                        EXIT_RULE_PRIORITY.to_string(),
-                        "table".to_string(),
-                        "51820".to_string(),
+                        "rule".to_owned(),
+                        "add".to_owned(),
+                        "priority".to_owned(),
+                        EXIT_RULE_PRIORITY.to_owned(),
+                        "table".to_owned(),
+                        "51820".to_owned(),
                     ],
                 )
             }
@@ -310,9 +310,9 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
         let output = self.runner.run_capture(
             "wg",
             &[
-                "show".to_string(),
+                "show".to_owned(),
                 self.interface_name.clone(),
-                "latest-handshakes".to_string(),
+                "latest-handshakes".to_owned(),
             ],
         )?;
         let public_key = encode_wg_public_key_base64(&peer.public_key);
@@ -365,13 +365,13 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
         self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_string(),
+                "endpoint".to_owned(),
                 endpoint,
-                "allowed-ips".to_string(),
+                "allowed-ips".to_owned(),
                 allowed_ips,
             ],
         )?;
@@ -393,11 +393,11 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
         self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_string(),
+                "endpoint".to_owned(),
                 endpoint_value,
             ],
         )?;
@@ -429,11 +429,11 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
         self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "remove".to_string(),
+                "remove".to_owned(),
             ],
         )
     }
@@ -462,7 +462,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
 
     fn transport_socket_identity_blocker(&self) -> Option<String> {
         Some(
-            "linux wireguard backend is a command-only adapter over an OS-managed WireGuard UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string(),
+            "linux wireguard backend is a command-only adapter over an OS-managed WireGuard UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_owned(),
         )
     }
 
@@ -620,7 +620,7 @@ mod tests {
 
     impl RecordingRunner {
         fn fail_on(mut self, program: &str) -> Self {
-            self.fail_program = Some(program.to_string());
+            self.fail_program = Some(program.to_owned());
             self
         }
 
@@ -632,10 +632,10 @@ mod tests {
             stderr: &str,
         ) -> Self {
             self.capture_outputs.insert(
-                (program.to_string(), args.to_vec()),
+                (program.to_owned(), args.to_vec()),
                 WireguardCommandOutput {
-                    stdout: stdout.to_string(),
-                    stderr: stderr.to_string(),
+                    stdout: stdout.to_owned(),
+                    stderr: stderr.to_owned(),
                 },
             );
             self
@@ -644,7 +644,7 @@ mod tests {
 
     impl WireguardCommandRunner for RecordingRunner {
         fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
-            self.calls.push((program.to_string(), args.to_vec()));
+            self.calls.push((program.to_owned(), args.to_vec()));
             if self
                 .fail_program
                 .as_ref()
@@ -663,7 +663,7 @@ mod tests {
             self.run(program, args)?;
             Ok(self
                 .capture_outputs
-                .get(&(program.to_string(), args.to_vec()))
+                .get(&(program.to_owned(), args.to_vec()))
                 .cloned()
                 .unwrap_or(WireguardCommandOutput {
                     stdout: String::new(),
@@ -704,9 +704,9 @@ mod tests {
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("local-node").expect("valid node id"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.1/32".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.1/32".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         }
     }
 
@@ -718,7 +718,7 @@ mod tests {
                 port: 51820,
             },
             public_key: [7; 32],
-            allowed_ips: vec!["100.64.1.0/24".to_string()],
+            allowed_ips: vec!["100.64.1.0/24".to_owned()],
         }
     }
 
@@ -756,7 +756,7 @@ mod tests {
             .expect("peer configure should work");
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "100.100.1.0/24".to_string(),
+                destination_cidr: "100.100.1.0/24".to_owned(),
                 via_node: NodeId::new("peer-a").expect("id should parse"),
                 kind: rustynet_backend_api::RouteKind::Mesh,
             }])
@@ -784,20 +784,20 @@ mod tests {
             .expect("exit mode should work");
 
         let delete_rule = vec![
-            "rule".to_string(),
-            "del".to_string(),
-            "priority".to_string(),
-            "10000".to_string(),
-            "table".to_string(),
-            "51820".to_string(),
+            "rule".to_owned(),
+            "del".to_owned(),
+            "priority".to_owned(),
+            "10000".to_owned(),
+            "table".to_owned(),
+            "51820".to_owned(),
         ];
         let add_rule = vec![
-            "rule".to_string(),
-            "add".to_string(),
-            "priority".to_string(),
-            "10000".to_string(),
-            "table".to_string(),
-            "51820".to_string(),
+            "rule".to_owned(),
+            "add".to_owned(),
+            "priority".to_owned(),
+            "10000".to_owned(),
+            "table".to_owned(),
+            "51820".to_owned(),
         ];
 
         assert!(
@@ -892,7 +892,7 @@ mod tests {
             .expect("start should succeed");
 
         let mut peer = sample_peer("peer-a");
-        peer.allowed_ips = vec!["0.0.0.0/0;rm".to_string()];
+        peer.allowed_ips = vec!["0.0.0.0/0;rm".to_owned()];
         let err = backend
             .configure_peer(peer)
             .expect_err("invalid cidr should be rejected");
@@ -923,7 +923,7 @@ mod tests {
             .expect("backend should start");
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "100.100.1.0/24".to_string(),
+                destination_cidr: "100.100.1.0/24".to_owned(),
                 via_node: peer.clone(),
                 kind: rustynet_backend_api::RouteKind::Mesh,
             }])
@@ -938,9 +938,9 @@ mod tests {
     #[test]
     fn linux_backend_reads_latest_handshake_for_configured_peer() {
         let args = vec![
-            "show".to_string(),
-            "rustynet0".to_string(),
-            "latest-handshakes".to_string(),
+            "show".to_owned(),
+            "rustynet0".to_owned(),
+            "latest-handshakes".to_owned(),
         ];
         let runner = RecordingRunner::default().capture_output(
             "wg",

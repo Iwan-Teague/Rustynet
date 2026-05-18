@@ -28,7 +28,7 @@ impl RateLimiter {
     pub fn check_packet(&mut self, node_id: &str, packet_size_bytes: usize) -> bool {
         let bucket = self
             .buckets
-            .entry(node_id.to_string())
+            .entry(node_id.to_owned())
             .or_insert_with(|| TokenBucket::new(self.max_pps, self.max_bps));
 
         bucket.check_and_consume(1, packet_size_bytes * 8)

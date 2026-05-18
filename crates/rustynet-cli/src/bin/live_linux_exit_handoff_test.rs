@@ -401,7 +401,7 @@ fn run() -> Result<(), String> {
         "mktemp /tmp/rn-exit-handoff-dns-passphrase.XXXXXX",
     )?
     .trim()
-    .to_string();
+    .to_owned();
     let materialize_dns_passphrase_cmd = format!(
         "rustynet ops materialize-signing-passphrase --output {}",
         shell_quote(dns_passphrase_remote.as_str())
@@ -777,7 +777,7 @@ fn run() -> Result<(), String> {
     logger.line("[exit-handoff] final client route")?;
     logger.block(&(client_route_final.clone() + "\n"))?;
     logger.line("[exit-handoff] final client selected exit peer endpoint")?;
-    logger.block(&(selected_exit_peer_endpoint_final.to_string() + "\n"))?;
+    logger.block(&(selected_exit_peer_endpoint_final.to_owned() + "\n"))?;
     logger.line("[exit-handoff] final client wg endpoints (debug only)")?;
     logger.block(&(client_wg_endpoints_final.clone() + "\n"))?;
 
@@ -894,7 +894,7 @@ fn run() -> Result<(), String> {
         .as_str(),
     )?;
     if !overall {
-        return Err("exit-handoff validation failed".to_string());
+        return Err("exit-handoff validation failed".to_owned());
     }
     Ok(())
 }
@@ -924,13 +924,13 @@ impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
             ssh_identity_file: PathBuf::new(),
-            exit_a_host: "debian@192.168.18.49".to_string(),
-            exit_b_host: "mint@192.168.18.53".to_string(),
-            client_host: "debian@192.168.18.65".to_string(),
-            exit_a_node_id: "exit-49".to_string(),
-            exit_b_node_id: "client-53".to_string(),
-            client_node_id: "client-65".to_string(),
-            ssh_allow_cidrs: "192.168.18.0/24".to_string(),
+            exit_a_host: "debian@192.168.18.49".to_owned(),
+            exit_b_host: "mint@192.168.18.53".to_owned(),
+            client_host: "debian@192.168.18.65".to_owned(),
+            exit_a_node_id: "exit-49".to_owned(),
+            exit_b_node_id: "client-53".to_owned(),
+            client_node_id: "client-65".to_owned(),
+            ssh_allow_cidrs: "192.168.18.0/24".to_owned(),
             switch_iteration: 20,
             monitor_iterations: 55,
             traversal_ttl_secs: 120,
@@ -960,17 +960,17 @@ impl Config {
                 "--switch-iteration" => {
                     config.switch_iteration = next_value(&mut iter, &arg)?
                         .parse()
-                        .map_err(|_| "switch iteration must be a positive integer".to_string())?
+                        .map_err(|_| "switch iteration must be a positive integer".to_owned())?
                 }
                 "--monitor-iterations" => {
                     config.monitor_iterations = next_value(&mut iter, &arg)?
                         .parse()
-                        .map_err(|_| "monitor iterations must be a positive integer".to_string())?
+                        .map_err(|_| "monitor iterations must be a positive integer".to_owned())?
                 }
                 "--traversal-ttl-secs" => {
                     config.traversal_ttl_secs = next_value(&mut iter, &arg)?
                         .parse()
-                        .map_err(|_| "traversal ttl seconds must be an integer".to_string())?
+                        .map_err(|_| "traversal ttl seconds must be an integer".to_owned())?
                 }
                 "--report-path" => config.report_path = PathBuf::from(next_value(&mut iter, &arg)?),
                 "--log-path" => config.log_path = PathBuf::from(next_value(&mut iter, &arg)?),
@@ -991,13 +991,13 @@ impl Config {
         if config.ssh_identity_file.as_os_str().is_empty() {
             return Err(
                 "usage: live_linux_exit_handoff_test --ssh-identity-file <path> [options]"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         validate_positive_integer("switch iteration", config.switch_iteration)?;
         validate_positive_integer("monitor iterations", config.monitor_iterations)?;
         if config.traversal_ttl_secs == 0 || config.traversal_ttl_secs > 120 {
-            return Err("traversal ttl seconds must be in the range 1..=120".to_string());
+            return Err("traversal ttl seconds must be in the range 1..=120".to_owned());
         }
         config.traversal_refresh_interval_secs =
             traversal_refresh_interval_secs(config.traversal_ttl_secs);
@@ -1210,7 +1210,7 @@ fn refresh_dns_bundles(
     refresh_targets: &[ManagedDnsRefreshTarget],
 ) -> Result<(), String> {
     if refresh_targets.is_empty() {
-        return Err("managed DNS refresh requires at least one target".to_string());
+        return Err("managed DNS refresh requires at least one target".to_owned());
     }
     let mut verifier_captured = false;
     for target in refresh_targets {
@@ -1539,14 +1539,14 @@ fn managed_dns_base_records(
 ) -> Vec<ManagedDnsRecordTemplate> {
     vec![
         ManagedDnsRecordTemplate {
-            label: DNS_MANAGED_LABEL.to_string(),
-            target_node_id: signer_node_id.to_string(),
+            label: DNS_MANAGED_LABEL.to_owned(),
+            target_node_id: signer_node_id.to_owned(),
             ttl_secs: 300,
-            aliases: vec![DNS_MANAGED_ALIAS.to_string()],
+            aliases: vec![DNS_MANAGED_ALIAS.to_owned()],
         },
         ManagedDnsRecordTemplate {
-            label: "client".to_string(),
-            target_node_id: client_node_id.to_string(),
+            label: "client".to_owned(),
+            target_node_id: client_node_id.to_owned(),
             ttl_secs: 300,
             aliases: Vec::new(),
         },
@@ -1600,9 +1600,9 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
         if let Some(value) = line.strip_prefix("node_id=") {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                return Err("assignment bundle node_id must not be empty".to_string());
+                return Err("assignment bundle node_id must not be empty".to_owned());
             }
-            node_id = Some(trimmed.to_string());
+            node_id = Some(trimmed.to_owned());
             continue;
         }
         if let Some((prefix, value)) = line.split_once('=')
@@ -1615,13 +1615,13 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
                     "assignment bundle peer id must not be empty: {prefix}"
                 ));
             }
-            peer_node_ids.push(trimmed.to_string());
+            peer_node_ids.push(trimmed.to_owned());
         }
     }
     peer_node_ids.sort();
     peer_node_ids.dedup();
     Ok(AssignmentAuthorityScope {
-        node_id: node_id.ok_or_else(|| "assignment bundle is missing node_id".to_string())?,
+        node_id: node_id.ok_or_else(|| "assignment bundle is missing node_id".to_owned())?,
         peer_node_ids,
     })
 }
@@ -1823,12 +1823,12 @@ fn utc_now_string() -> String {
     if let Some(output) = output
         && output.status.success()
     {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if !text.is_empty() {
             return text;
         }
     }
-    "1970-01-01T00:00:00Z".to_string()
+    "1970-01-01T00:00:00Z".to_owned()
 }
 
 #[cfg(test)]
@@ -1843,13 +1843,13 @@ mod tests {
     fn sample_config() -> Config {
         Config {
             ssh_identity_file: PathBuf::from("/tmp/id"),
-            exit_a_host: "debian@192.168.128.22".to_string(),
-            exit_b_host: "debian@192.168.128.26".to_string(),
-            client_host: "debian@192.168.128.24".to_string(),
-            exit_a_node_id: "exit-1".to_string(),
-            exit_b_node_id: "client-2".to_string(),
-            client_node_id: "client-1".to_string(),
-            ssh_allow_cidrs: "192.168.128.0/24".to_string(),
+            exit_a_host: "debian@192.168.128.22".to_owned(),
+            exit_b_host: "debian@192.168.128.26".to_owned(),
+            client_host: "debian@192.168.128.24".to_owned(),
+            exit_a_node_id: "exit-1".to_owned(),
+            exit_b_node_id: "client-2".to_owned(),
+            client_node_id: "client-1".to_owned(),
+            ssh_allow_cidrs: "192.168.128.0/24".to_owned(),
             switch_iteration: 20,
             monitor_iterations: 55,
             traversal_ttl_secs: 120,
@@ -1931,7 +1931,7 @@ peer.1.endpoint=192.168.128.26:51820
         assert_eq!(scope.node_id, "exit-1");
         assert_eq!(
             scope.peer_node_ids,
-            vec!["client-1".to_string(), "client-2".to_string()]
+            vec!["client-1".to_owned(), "client-2".to_owned()]
         );
     }
 
@@ -1943,8 +1943,8 @@ peer.1.endpoint=192.168.128.26:51820
         .expect("scope should parse");
         let mut records = managed_dns_base_records("exit-1", "client-1");
         records.push(super::ManagedDnsRecordTemplate {
-            label: "unauthorized".to_string(),
-            target_node_id: "client-9".to_string(),
+            label: "unauthorized".to_owned(),
+            target_node_id: "client-9".to_owned(),
             ttl_secs: 300,
             aliases: Vec::new(),
         });

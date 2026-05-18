@@ -258,7 +258,7 @@ impl PolicyRolloutController {
         if !self.revisions.contains_key(revision_id) {
             return Err(RolloutError::UnknownRevision);
         }
-        self.active_revision = Some(revision_id.to_string());
+        self.active_revision = Some(revision_id.to_owned());
         self.canary_revision = None;
         Ok(())
     }
@@ -325,8 +325,8 @@ mod tests {
     fn policy_defaults_to_deny() {
         let set = PolicySet::default();
         let request = AccessRequest {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Tcp,
         };
 
@@ -338,14 +338,14 @@ mod tests {
         let set = PolicySet {
             rules: vec![
                 PolicyRule {
-                    src: "group:family".to_string(),
-                    dst: "tag:servers".to_string(),
+                    src: "group:family".to_owned(),
+                    dst: "tag:servers".to_owned(),
                     protocol: Protocol::Tcp,
                     action: RuleAction::Allow,
                 },
                 PolicyRule {
-                    src: "*".to_string(),
-                    dst: "*".to_string(),
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
                     protocol: Protocol::Any,
                     action: RuleAction::Deny,
                 },
@@ -353,8 +353,8 @@ mod tests {
         };
 
         let request = AccessRequest {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Tcp,
         };
 
@@ -365,8 +365,8 @@ mod tests {
     fn contextual_policy_defaults_to_deny_in_shared_contexts() {
         let set = ContextualPolicySet::default();
         let request = ContextualAccessRequest {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Tcp,
             context: TrafficContext::SharedExit,
         };
@@ -378,15 +378,15 @@ mod tests {
         let set = ContextualPolicySet {
             rules: vec![
                 ContextualPolicyRule {
-                    src: "group:family".to_string(),
-                    dst: "tag:servers".to_string(),
+                    src: "group:family".to_owned(),
+                    dst: "tag:servers".to_owned(),
                     protocol: Protocol::Tcp,
                     action: RuleAction::Allow,
                     contexts: vec![TrafficContext::SharedExit],
                 },
                 ContextualPolicyRule {
-                    src: "*".to_string(),
-                    dst: "*".to_string(),
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
                     protocol: Protocol::Any,
                     action: RuleAction::Deny,
                     contexts: vec![
@@ -399,14 +399,14 @@ mod tests {
         };
 
         let tcp_request = ContextualAccessRequest {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Tcp,
             context: TrafficContext::SharedExit,
         };
         let udp_request = ContextualAccessRequest {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Udp,
             context: TrafficContext::SharedExit,
         };
@@ -419,8 +419,8 @@ mod tests {
     fn contextual_policy_does_not_widen_between_shared_router_and_exit() {
         let set = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "group:family".to_string(),
-                dst: "tag:servers".to_string(),
+                src: "group:family".to_owned(),
+                dst: "tag:servers".to_owned(),
                 protocol: Protocol::Icmp,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::SharedSubnetRouter],
@@ -428,14 +428,14 @@ mod tests {
         };
 
         let router_request = ContextualAccessRequest {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Icmp,
             context: TrafficContext::SharedSubnetRouter,
         };
         let exit_request = ContextualAccessRequest {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Icmp,
             context: TrafficContext::SharedExit,
         };
@@ -450,8 +450,8 @@ mod tests {
 
         let invalid_policy = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
                 contexts: vec![
@@ -461,35 +461,35 @@ mod tests {
                 ],
             }],
         };
-        let rejected_result = controller.stage_revision("rev-blocked".to_string(), invalid_policy);
+        let rejected_result = controller.stage_revision("rev-blocked".to_owned(), invalid_policy);
         assert_eq!(rejected_result.err(), Some(RolloutError::UnsafeAllowAll));
 
         let safe_policy_v1 = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "group:family".to_string(),
-                dst: "tag:servers".to_string(),
+                src: "group:family".to_owned(),
+                dst: "tag:servers".to_owned(),
                 protocol: Protocol::Tcp,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::Mesh],
             }],
         };
         controller
-            .stage_revision("rev-1".to_string(), safe_policy_v1)
+            .stage_revision("rev-1".to_owned(), safe_policy_v1)
             .expect("safe revision should stage");
         controller.promote_canary().expect("canary should promote");
         assert_eq!(controller.active_revision(), Some("rev-1"));
 
         let safe_policy_v2 = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "group:family".to_string(),
-                dst: "tag:servers".to_string(),
+                src: "group:family".to_owned(),
+                dst: "tag:servers".to_owned(),
                 protocol: Protocol::Udp,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::Mesh],
             }],
         };
         controller
-            .stage_revision("rev-2".to_string(), safe_policy_v2)
+            .stage_revision("rev-2".to_owned(), safe_policy_v2)
             .expect("second safe revision should stage");
         controller.promote_canary().expect("canary should promote");
         assert_eq!(controller.active_revision(), Some("rev-2"));
@@ -504,8 +504,8 @@ mod tests {
     fn membership_aware_contextual_policy_denies_revoked_and_unknown_nodes() {
         let set = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "user:local".to_string(),
-                dst: "node:node-exit".to_string(),
+                src: "user:local".to_owned(),
+                dst: "node:node-exit".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::SharedExit],
@@ -513,8 +513,8 @@ mod tests {
         };
 
         let request = ContextualAccessRequest {
-            src: "user:local".to_string(),
-            dst: "node:node-exit".to_string(),
+            src: "user:local".to_owned(),
+            dst: "node:node-exit".to_owned(),
             protocol: Protocol::Tcp,
             context: TrafficContext::SharedExit,
         };
@@ -544,8 +544,8 @@ mod tests {
     fn membership_aware_policy_preserves_protocol_filters() {
         let set = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "user:local".to_string(),
-                dst: "node:node-a".to_string(),
+                src: "user:local".to_owned(),
+                dst: "node:node-a".to_owned(),
                 protocol: Protocol::Tcp,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::Mesh],
@@ -555,14 +555,14 @@ mod tests {
         membership.set_node_status("node-a", MembershipStatus::Active);
 
         let tcp = ContextualAccessRequest {
-            src: "user:local".to_string(),
-            dst: "node:node-a".to_string(),
+            src: "user:local".to_owned(),
+            dst: "node:node-a".to_owned(),
             protocol: Protocol::Tcp,
             context: TrafficContext::Mesh,
         };
         let udp = ContextualAccessRequest {
-            src: "user:local".to_string(),
-            dst: "node:node-a".to_string(),
+            src: "user:local".to_owned(),
+            dst: "node:node-a".to_owned(),
             protocol: Protocol::Udp,
             context: TrafficContext::Mesh,
         };
@@ -584,16 +584,16 @@ mod tests {
         // Wildcard allow-all rule — most permissive possible
         let set = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "*".to_string(),
-                dst: "node:revoked-node".to_string(),
+                src: "*".to_owned(),
+                dst: "node:revoked-node".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::Mesh],
             }],
         };
         let request = ContextualAccessRequest {
-            src: "user:alice".to_string(),
-            dst: "node:revoked-node".to_string(),
+            src: "user:alice".to_owned(),
+            dst: "node:revoked-node".to_owned(),
             protocol: Protocol::Tcp,
             context: TrafficContext::Mesh,
         };
@@ -614,16 +614,16 @@ mod tests {
     fn test_active_node_acl_proceeds_to_rule_evaluation() {
         let set = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "user:alice".to_string(),
-                dst: "node:active-node".to_string(),
+                src: "user:alice".to_owned(),
+                dst: "node:active-node".to_owned(),
                 protocol: Protocol::Tcp,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::Mesh],
             }],
         };
         let request = ContextualAccessRequest {
-            src: "user:alice".to_string(),
-            dst: "node:active-node".to_string(),
+            src: "user:alice".to_owned(),
+            dst: "node:active-node".to_owned(),
             protocol: Protocol::Tcp,
             context: TrafficContext::Mesh,
         };

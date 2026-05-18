@@ -58,11 +58,11 @@ pub fn node_adapter_for(
         VmGuestPlatform::Macos => Ok(Box::new(MacosNodeAdapter::new(alias, conn, remote_workdir))),
         VmGuestPlatform::Ios => Err(AdapterError::UnsupportedPlatform {
             platform,
-            message: IOS_UNSUPPORTED_MSG.to_string(),
+            message: IOS_UNSUPPORTED_MSG.to_owned(),
         }),
         VmGuestPlatform::Android => Err(AdapterError::UnsupportedPlatform {
             platform,
-            message: ANDROID_UNSUPPORTED_MSG.to_string(),
+            message: ANDROID_UNSUPPORTED_MSG.to_owned(),
         }),
     }
 }
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn factory_ios_returns_unsupported_error_with_security_message() {
         let conn = NodeConnection::Mdm {
-            enrollment_id: "enroll-123".to_string(),
+            enrollment_id: "enroll-123".to_owned(),
         };
         let err = node_adapter_for("ios-node", VmGuestPlatform::Ios, conn, None).unwrap_err();
         let msg = err.to_string();
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn factory_android_returns_unsupported_error_with_security_message() {
         let conn = NodeConnection::Adb {
-            device_serial: "abc123".to_string(),
+            device_serial: "abc123".to_owned(),
         };
         let err =
             node_adapter_for("android-node", VmGuestPlatform::Android, conn, None).unwrap_err();
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn factory_rejects_adb_for_linux() {
         let conn = NodeConnection::Adb {
-            device_serial: "abc123".to_string(),
+            device_serial: "abc123".to_owned(),
         };
         let err = node_adapter_for("node", VmGuestPlatform::Linux, conn, None).unwrap_err();
         assert!(

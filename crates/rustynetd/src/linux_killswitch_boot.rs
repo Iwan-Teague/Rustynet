@@ -231,7 +231,7 @@ pub(crate) fn parse_nft_ruleset_for_killswitch(body: &str) -> (bool, Vec<String>
         if in_killswitch_chain {
             for frag in REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS {
                 if line.contains(frag) && !matched_fragments.iter().any(|m| m == frag) {
-                    matched_fragments.push((*frag).to_string());
+                    matched_fragments.push((*frag).to_owned());
                 }
             }
         }
@@ -293,13 +293,13 @@ fn collect_linux_killswitch_boot_report_inner(iface_name: &str) -> LinuxKillswit
     // reason — overall_ok stays false without us having to claim
     // anything about the killswitch state itself.
     let snapshot = LinuxKillswitchBootSnapshot {
-        ruleset_source: "off-Linux host: nft not invoked".to_string(),
+        ruleset_source: "off-Linux host: nft not invoked".to_owned(),
         host_observable: false,
         table_present: false,
         chains_present: Vec::new(),
         killswitch_rule_fragments_present: Vec::new(),
         tunnel_interface_present: false,
-        tunnel_interface_name: iface_name.to_string(),
+        tunnel_interface_name: iface_name.to_owned(),
     };
     build_linux_killswitch_boot_report(snapshot)
 }
@@ -310,16 +310,16 @@ mod tests {
 
     fn ok_snapshot() -> LinuxKillswitchBootSnapshot {
         LinuxKillswitchBootSnapshot {
-            ruleset_source: "test fixture".to_string(),
+            ruleset_source: "test fixture".to_owned(),
             host_observable: true,
             table_present: true,
-            chains_present: vec!["killswitch".to_string(), "forward".to_string()],
+            chains_present: vec!["killswitch".to_owned(), "forward".to_owned()],
             killswitch_rule_fragments_present: REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS
                 .iter()
-                .map(|s| (*s).to_string())
+                .map(|s| (*s).to_owned())
                 .collect(),
             tunnel_interface_present: true,
-            tunnel_interface_name: "rustynet0".to_string(),
+            tunnel_interface_name: "rustynet0".to_owned(),
         }
     }
 
@@ -329,7 +329,7 @@ mod tests {
     fn evaluator_rejects_unobservable_host() {
         let mut snap = ok_snapshot();
         snap.host_observable = false;
-        snap.ruleset_source = "off-Linux host: nft not invoked".to_string();
+        snap.ruleset_source = "off-Linux host: nft not invoked".to_owned();
         let reasons = evaluate_linux_killswitch_boot_snapshot(&snap);
         assert!(
             reasons
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_missing_killswitch_chain() {
         let mut snap = ok_snapshot();
-        snap.chains_present = vec!["forward".to_string()];
+        snap.chains_present = vec!["forward".to_owned()];
         snap.killswitch_rule_fragments_present.clear();
         let reasons = evaluate_linux_killswitch_boot_snapshot(&snap);
         assert!(
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_missing_forward_chain() {
         let mut snap = ok_snapshot();
-        snap.chains_present = vec!["killswitch".to_string()];
+        snap.chains_present = vec!["killswitch".to_owned()];
         let reasons = evaluate_linux_killswitch_boot_snapshot(&snap);
         assert!(
             reasons
@@ -442,7 +442,7 @@ mod tests {
         // fragments missing" would be noise — the chain-missing
         // reason already covers it.
         let mut snap = ok_snapshot();
-        snap.chains_present = vec!["forward".to_string()];
+        snap.chains_present = vec!["forward".to_owned()];
         snap.killswitch_rule_fragments_present.clear();
         let reasons = evaluate_linux_killswitch_boot_snapshot(&snap);
         // Exactly one drift reason: the chain-missing one. No noisy
@@ -470,13 +470,13 @@ mod tests {
         // message). The evaluator must surface both chain-missing
         // reasons.
         let snap = LinuxKillswitchBootSnapshot {
-            ruleset_source: "agg test".to_string(),
+            ruleset_source: "agg test".to_owned(),
             host_observable: true,
             table_present: true,
             chains_present: Vec::new(),
             killswitch_rule_fragments_present: Vec::new(),
             tunnel_interface_present: true,
-            tunnel_interface_name: "rustynet0".to_string(),
+            tunnel_interface_name: "rustynet0".to_owned(),
         };
         let reasons = evaluate_linux_killswitch_boot_snapshot(&snap);
         let chain_count = reasons

@@ -180,7 +180,7 @@ pub fn evaluate_thumbprint_policy(
             reasons.push(
                 "signer thumbprint could not be extracted from PKCS#7; thumbprint-pinned \
                  policy fails closed without an observed signer"
-                    .to_string(),
+                    .to_owned(),
             );
             return reasons;
         }
@@ -315,7 +315,7 @@ pub fn inspect_authenticode_signature_with_thumbprint_policy(
         WindowsAuthenticodeChainStatus::NotEvaluated {
             reason:
                 "chain validation skipped: presence stage did not find a PKCS-signed certificate"
-                    .to_string(),
+                    .to_owned(),
         }
     } else {
         match verify_authenticode_chain(path) {
@@ -409,10 +409,10 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
         ));
     }
     if &bytes[0..2] != PE_DOS_MAGIC {
-        return Err("binary does not start with the PE DOS magic 'MZ'".to_string());
+        return Err("binary does not start with the PE DOS magic 'MZ'".to_owned());
     }
     let e_lfanew = read_u32_le(bytes, 0x3C)
-        .ok_or_else(|| "failed to read e_lfanew at offset 0x3C".to_string())?;
+        .ok_or_else(|| "failed to read e_lfanew at offset 0x3C".to_owned())?;
     let pe_header_offset = e_lfanew as usize;
     if pe_header_offset.saturating_add(24) > bytes.len() {
         return Err(format!(
@@ -427,16 +427,16 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
     // COFF header: 4 bytes magic + 20 bytes COFF (machine, n_sections, time, sym_ptr, n_syms, opt_hdr_size, characteristics).
     let coff_header_offset = pe_header_offset + 4;
     let optional_header_size = read_u16_le(bytes, coff_header_offset + 16)
-        .ok_or_else(|| "failed to read SizeOfOptionalHeader".to_string())?;
+        .ok_or_else(|| "failed to read SizeOfOptionalHeader".to_owned())?;
     if optional_header_size == 0 {
-        return Err("PE has SizeOfOptionalHeader=0; not a normal Windows binary".to_string());
+        return Err("PE has SizeOfOptionalHeader=0; not a normal Windows binary".to_owned());
     }
     let optional_header_offset = coff_header_offset + 20;
     if optional_header_offset.saturating_add(optional_header_size as usize) > bytes.len() {
-        return Err("optional header runs past end of binary".to_string());
+        return Err("optional header runs past end of binary".to_owned());
     }
     let optional_magic = read_u16_le(bytes, optional_header_offset)
-        .ok_or_else(|| "failed to read optional header magic".to_string())?;
+        .ok_or_else(|| "failed to read optional header magic".to_owned())?;
     let data_directories_offset = match optional_magic {
         PE_OPTIONAL_HEADER_MAGIC_PE32 => optional_header_offset + 96,
         PE_OPTIONAL_HEADER_MAGIC_PE32_PLUS => optional_header_offset + 112,
@@ -449,21 +449,21 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
     let security_dir_offset =
         data_directories_offset + PE_OPTIONAL_HEADER_DATA_DIRECTORY_INDEX_SECURITY * 8;
     if security_dir_offset.saturating_add(8) > bytes.len() {
-        return Err("Certificate Table directory entry runs past end of binary".to_string());
+        return Err("Certificate Table directory entry runs past end of binary".to_owned());
     }
     let cert_table_offset = read_u32_le(bytes, security_dir_offset)
-        .ok_or_else(|| "failed to read Certificate Table offset".to_string())?;
+        .ok_or_else(|| "failed to read Certificate Table offset".to_owned())?;
     let cert_table_size = read_u32_le(bytes, security_dir_offset + 4)
-        .ok_or_else(|| "failed to read Certificate Table size".to_string())?;
+        .ok_or_else(|| "failed to read Certificate Table size".to_owned())?;
     if cert_table_offset == 0 || cert_table_size == 0 {
         return Err(
-            "PE has an empty Certificate Table directory entry; binary is unsigned".to_string(),
+            "PE has an empty Certificate Table directory entry; binary is unsigned".to_owned(),
         );
     }
     let cert_start = cert_table_offset as usize;
     let cert_end = cert_start
         .checked_add(cert_table_size as usize)
-        .ok_or_else(|| "Certificate Table size overflowed when added to offset".to_string())?;
+        .ok_or_else(|| "Certificate Table size overflowed when added to offset".to_owned())?;
     if cert_end > bytes.len() {
         return Err(format!(
             "Certificate Table extends from 0x{cert_table_offset:08x} for {cert_table_size} bytes but binary is only {} bytes",
@@ -484,11 +484,11 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
             break;
         }
         let length = read_u32_le(bytes, cursor)
-            .ok_or_else(|| "failed to read WIN_CERTIFICATE length".to_string())?;
+            .ok_or_else(|| "failed to read WIN_CERTIFICATE length".to_owned())?;
         let revision = read_u16_le(bytes, cursor + 4)
-            .ok_or_else(|| "failed to read WIN_CERTIFICATE revision".to_string())?;
+            .ok_or_else(|| "failed to read WIN_CERTIFICATE revision".to_owned())?;
         let cert_type = read_u16_le(bytes, cursor + 6)
-            .ok_or_else(|| "failed to read WIN_CERTIFICATE type".to_string())?;
+            .ok_or_else(|| "failed to read WIN_CERTIFICATE type".to_owned())?;
         if length < 8 {
             drift_reasons.push(format!(
                 "WIN_CERTIFICATE at 0x{cursor:08x} has length {length} < 8 (minimum header size)"
@@ -497,7 +497,7 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
         }
         let entry_end = cursor
             .checked_add(length as usize)
-            .ok_or_else(|| "WIN_CERTIFICATE length overflowed".to_string())?;
+            .ok_or_else(|| "WIN_CERTIFICATE length overflowed".to_owned())?;
         if entry_end > cert_end {
             drift_reasons.push(format!(
                 "WIN_CERTIFICATE at 0x{cursor:08x} length {length} exceeds Certificate Table bounds"
@@ -524,7 +524,7 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
     if pkcs_count == 0 {
         drift_reasons.push(
             "Certificate Table is present but contains no PKCS-signed Authenticode entry"
-                .to_string(),
+                .to_owned(),
         );
     }
 
@@ -761,7 +761,7 @@ mod tests {
     fn report_serializes_with_certificate_metadata_and_round_trips() {
         let report = WindowsAuthenticodeReport {
             schema_version: 1,
-            binary_path: r"C:\Program Files\RustyNet\rustynetd.exe".to_string(),
+            binary_path: r"C:\Program Files\RustyNet\rustynetd.exe".to_owned(),
             binary_size_bytes: 1234,
             overall_ok: true,
             signature_present: true,
@@ -787,7 +787,7 @@ mod tests {
     fn report_round_trips_chain_status_untrusted_variant() {
         let report = WindowsAuthenticodeReport {
             schema_version: 1,
-            binary_path: r"C:\Program Files\RustyNet\rustynetd.exe".to_string(),
+            binary_path: r"C:\Program Files\RustyNet\rustynetd.exe".to_owned(),
             binary_size_bytes: 1234,
             overall_ok: false,
             signature_present: true,
@@ -800,7 +800,7 @@ mod tests {
             }],
             chain_status: WindowsAuthenticodeChainStatus::Untrusted {
                 reason: "WinVerifyTrust returned 0x800b0109 (CERT_E_UNTRUSTEDROOT) for ..."
-                    .to_string(),
+                    .to_owned(),
                 hresult: 0x800B0109_i64,
             },
             signer_thumbprint_sha256: None,
@@ -808,7 +808,7 @@ mod tests {
             drift_reasons: vec![
                 "chain validation rejected binary: WinVerifyTrust returned 0x800b0109 \
                  (CERT_E_UNTRUSTEDROOT) for ..."
-                    .to_string(),
+                    .to_owned(),
             ],
         };
         let json = serde_json::to_string(&report).expect("serialize untrusted");
@@ -823,7 +823,7 @@ mod tests {
     fn report_round_trips_chain_status_not_evaluated_variant() {
         let report = WindowsAuthenticodeReport {
             schema_version: 1,
-            binary_path: "/tmp/x".to_string(),
+            binary_path: "/tmp/x".to_owned(),
             binary_size_bytes: 0,
             overall_ok: false,
             signature_present: false,
@@ -831,11 +831,11 @@ mod tests {
             certificate_table_size: None,
             certificates: Vec::new(),
             chain_status: WindowsAuthenticodeChainStatus::NotEvaluated {
-                reason: "off-Windows host".to_string(),
+                reason: "off-Windows host".to_owned(),
             },
             signer_thumbprint_sha256: None,
             thumbprint_policy_applied: None,
-            drift_reasons: vec!["chain validation not evaluated: off-Windows host".to_string()],
+            drift_reasons: vec!["chain validation not evaluated: off-Windows host".to_owned()],
         };
         let json = serde_json::to_string(&report).expect("serialize not_evaluated");
         let restored: WindowsAuthenticodeReport =
@@ -1116,7 +1116,7 @@ mod tests {
     #[test]
     fn evaluate_thumbprint_policy_rejects_observed_thumbprint_when_not_on_allowlist() {
         let policy = WindowsAuthenticodeThumbprintPolicy {
-            allowlist_sha256: vec![TP_B.to_string()],
+            allowlist_sha256: vec![TP_B.to_owned()],
             denylist_sha256: vec![],
         };
         let reasons = evaluate_thumbprint_policy(Some(TP_A), &policy);
@@ -1131,7 +1131,7 @@ mod tests {
     #[test]
     fn evaluate_thumbprint_policy_accepts_observed_thumbprint_on_allowlist() {
         let policy = WindowsAuthenticodeThumbprintPolicy {
-            allowlist_sha256: vec![TP_A.to_string()],
+            allowlist_sha256: vec![TP_A.to_owned()],
             denylist_sha256: vec![],
         };
         let reasons = evaluate_thumbprint_policy(Some(TP_A), &policy);
@@ -1144,8 +1144,8 @@ mod tests {
         // rotation that left the thumbprint on the allowlist is no
         // excuse to accept a revoked signer.
         let policy = WindowsAuthenticodeThumbprintPolicy {
-            allowlist_sha256: vec![TP_A.to_string()],
-            denylist_sha256: vec![TP_A.to_string()],
+            allowlist_sha256: vec![TP_A.to_owned()],
+            denylist_sha256: vec![TP_A.to_owned()],
         };
         let reasons = evaluate_thumbprint_policy(Some(TP_A), &policy);
         assert!(
@@ -1163,7 +1163,7 @@ mod tests {
         let denylist_raw = "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF";
         let policy = WindowsAuthenticodeThumbprintPolicy {
             allowlist_sha256: vec![],
-            denylist_sha256: vec![denylist_raw.to_string()],
+            denylist_sha256: vec![denylist_raw.to_owned()],
         };
         let reasons = evaluate_thumbprint_policy(Some(TP_A), &policy);
         assert!(
@@ -1179,7 +1179,7 @@ mod tests {
         // policy is in effect. The gate must NEVER pass without an
         // observed thumbprint.
         let policy = WindowsAuthenticodeThumbprintPolicy {
-            allowlist_sha256: vec![TP_A.to_string()],
+            allowlist_sha256: vec![TP_A.to_owned()],
             denylist_sha256: vec![],
         };
         let reasons = evaluate_thumbprint_policy(None, &policy);
@@ -1196,7 +1196,7 @@ mod tests {
         // The native extractor returned something, but it's not a
         // valid SHA-256 thumbprint. The gate must reject.
         let policy = WindowsAuthenticodeThumbprintPolicy {
-            allowlist_sha256: vec![TP_A.to_string()],
+            allowlist_sha256: vec![TP_A.to_owned()],
             denylist_sha256: vec![],
         };
         let reasons = evaluate_thumbprint_policy(Some("not-a-thumbprint"), &policy);
@@ -1213,7 +1213,7 @@ mod tests {
         // A typo'd allowlist entry must be named as drift; the
         // verifier can't silently fall through to "no match found".
         let policy = WindowsAuthenticodeThumbprintPolicy {
-            allowlist_sha256: vec!["typo-thumbprint".to_string()],
+            allowlist_sha256: vec!["typo-thumbprint".to_owned()],
             denylist_sha256: vec![],
         };
         let reasons = evaluate_thumbprint_policy(Some(TP_A), &policy);
@@ -1229,7 +1229,7 @@ mod tests {
     fn evaluate_thumbprint_policy_surfaces_malformed_denylist_entries_as_drift() {
         let policy = WindowsAuthenticodeThumbprintPolicy {
             allowlist_sha256: vec![],
-            denylist_sha256: vec!["typo-deny".to_string()],
+            denylist_sha256: vec!["typo-deny".to_owned()],
         };
         let reasons = evaluate_thumbprint_policy(Some(TP_A), &policy);
         assert!(
@@ -1246,7 +1246,7 @@ mod tests {
         // isn't on it. Must pass.
         let policy = WindowsAuthenticodeThumbprintPolicy {
             allowlist_sha256: vec![],
-            denylist_sha256: vec![TP_B.to_string()],
+            denylist_sha256: vec![TP_B.to_owned()],
         };
         let reasons = evaluate_thumbprint_policy(Some(TP_A), &policy);
         assert!(
@@ -1268,8 +1268,8 @@ mod tests {
     #[test]
     fn policy_serde_round_trips() {
         let policy = WindowsAuthenticodeThumbprintPolicy {
-            allowlist_sha256: vec![TP_A.to_string(), TP_B.to_string()],
-            denylist_sha256: vec![TP_B.to_string()],
+            allowlist_sha256: vec![TP_A.to_owned(), TP_B.to_owned()],
+            denylist_sha256: vec![TP_B.to_owned()],
         };
         let json = serde_json::to_string(&policy).expect("serialize");
         let parsed: WindowsAuthenticodeThumbprintPolicy =

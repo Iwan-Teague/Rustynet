@@ -28,12 +28,12 @@ pub fn issue_membership_owner_key(
         &format!("cat '{MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH}' 2>/dev/null || echo ''"),
         SHORT_TIMEOUT,
     )?;
-    let pem = pem.trim().to_string();
+    let pem = pem.trim().to_owned();
     if pem.is_empty() {
         return Err(AdapterError::Protocol {
             message: "membership owner public key not found on remote; \
                       has membership been initialized?"
-                .to_string(),
+                .to_owned(),
         });
     }
     Ok(MembershipOwnerKey {
@@ -186,7 +186,7 @@ fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        Ok(value.to_string())
+        Ok(value.to_owned())
     } else {
         Err(AdapterError::Protocol {
             message: format!(
@@ -199,10 +199,10 @@ fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
 
 fn hex_32_safe_arg(value: &str) -> Result<String, AdapterError> {
     if NodeMembershipPeer::is_valid_public_key_hex(value) {
-        Ok(value.to_string())
+        Ok(value.to_owned())
     } else {
         Err(AdapterError::Protocol {
-            message: "WireGuard public key must be 64 hex chars".to_string(),
+            message: "WireGuard public key must be 64 hex chars".to_owned(),
         })
     }
 }
@@ -234,7 +234,7 @@ fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
         })
         .map_err(|err| format!("base64 -d spawn failed: {err}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(format!("base64 -d failed: {stderr}"));
     }
     Ok(output.stdout)

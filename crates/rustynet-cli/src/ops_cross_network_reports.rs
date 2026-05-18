@@ -352,7 +352,7 @@ fn non_empty_option(value: Option<String>) -> Option<String> {
         if trimmed.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some(trimmed.to_owned())
         }
     })
 }
@@ -389,19 +389,19 @@ fn extract_optional_u64_inline_field(line: &str, key: &str) -> Result<Option<u64
 
 fn path_evidence_from_status_line(status_line: &str) -> Result<Value, String> {
     let path_mode = extract_inline_field(status_line, "path_mode")
-        .ok_or_else(|| "status line missing path_mode".to_string())?;
+        .ok_or_else(|| "status line missing path_mode".to_owned())?;
     let path_reason = extract_inline_field(status_line, "path_reason")
-        .ok_or_else(|| "status line missing path_reason".to_string())?;
+        .ok_or_else(|| "status line missing path_reason".to_owned())?;
     let path_programmed_mode = extract_inline_field(status_line, "path_programmed_mode")
-        .ok_or_else(|| "status line missing path_programmed_mode".to_string())?;
+        .ok_or_else(|| "status line missing path_programmed_mode".to_owned())?;
     let transport_socket_identity_state =
         extract_inline_field(status_line, "transport_socket_identity_state")
-            .ok_or_else(|| "status line missing transport_socket_identity_state".to_string())?;
+            .ok_or_else(|| "status line missing transport_socket_identity_state".to_owned())?;
     let transport_socket_identity_error =
         extract_inline_field(status_line, "transport_socket_identity_error")
-            .ok_or_else(|| "status line missing transport_socket_identity_error".to_string())?;
+            .ok_or_else(|| "status line missing transport_socket_identity_error".to_owned())?;
     let path_live_proven = match extract_inline_field(status_line, "path_live_proven")
-        .ok_or_else(|| "status line missing path_live_proven".to_string())?
+        .ok_or_else(|| "status line missing path_live_proven".to_owned())?
         .as_str()
     {
         "true" => true,
@@ -515,7 +515,7 @@ fn current_git_commit() -> Result<String, String> {
         .trim()
         .to_ascii_lowercase();
     if commit.is_empty() {
-        return Err("resolve git commit failed: empty output".to_string());
+        return Err("resolve git commit failed: empty output".to_owned());
     }
     Ok(commit)
 }
@@ -540,7 +540,7 @@ fn parse_check_overrides(items: &[String]) -> Result<HashMap<String, String>, St
                 "invalid --check value {item:?}; expected key=pass|fail"
             ));
         }
-        overrides.insert(key.to_string(), value.to_string());
+        overrides.insert(key.to_owned(), value.to_owned());
     }
     Ok(overrides)
 }
@@ -578,7 +578,7 @@ fn value_as_non_empty_string(value: Option<&Value>) -> Option<String> {
         if trimmed.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some(trimmed.to_owned())
         }
     })
 }
@@ -631,7 +631,7 @@ fn parse_key_value_artifact(path: &Path) -> Result<HashMap<String, String>, Stri
             ));
         }
         if out
-            .insert(key.to_string(), raw_value.trim().to_string())
+            .insert(key.to_owned(), raw_value.trim().to_owned())
             .is_some()
         {
             return Err(format!("{}: duplicate key {:?}", path.display(), key));
@@ -770,24 +770,24 @@ impl CrossNetworkSshTrustSummaryView {
     fn into_key_value_map(self) -> HashMap<String, String> {
         let mut m = self.extra;
         if let Some(value) = self.schema_version {
-            m.insert("schema_version".to_string(), value);
+            m.insert("schema_version".to_owned(), value);
         }
         if let Some(value) = self.pinned_known_hosts_file {
-            m.insert("pinned_known_hosts_file".to_string(), value);
+            m.insert("pinned_known_hosts_file".to_owned(), value);
         }
         if let Some(value) = self.pinned_known_hosts_sha256 {
-            m.insert("pinned_known_hosts_sha256".to_string(), value);
+            m.insert("pinned_known_hosts_sha256".to_owned(), value);
         }
         if let Some(value) = self.all_targets_pinned {
-            m.insert("all_targets_pinned".to_string(), value);
+            m.insert("all_targets_pinned".to_owned(), value);
         }
         if let Some(value) = self.all_targets_passwordless_sudo {
-            m.insert("all_targets_passwordless_sudo".to_string(), value);
+            m.insert("all_targets_passwordless_sudo".to_owned(), value);
         }
         if let Some(value) = self.target_count_raw {
-            m.insert("target_count".to_string(), value);
+            m.insert("target_count".to_owned(), value);
         } else if let Some(count) = self.target_count {
-            m.insert("target_count".to_string(), count.to_string());
+            m.insert("target_count".to_owned(), count.to_string());
         }
         for (index, target) in self.targets.into_iter().enumerate() {
             if let Some(value) = target.target {
@@ -1032,113 +1032,113 @@ impl CrossNetworkSoakMonitorSummaryView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("samples".to_string(), Value::Number(self.samples.into()));
+        m.insert("samples".to_owned(), Value::Number(self.samples.into()));
         m.insert(
-            "failing_samples".to_string(),
+            "failing_samples".to_owned(),
             Value::Number(self.failing_samples.into()),
         );
         m.insert(
-            "max_consecutive_failures_observed".to_string(),
+            "max_consecutive_failures_observed".to_owned(),
             Value::Number(self.max_consecutive_failures_observed.into()),
         );
         m.insert(
-            "elapsed_secs".to_string(),
+            "elapsed_secs".to_owned(),
             Value::Number(self.elapsed_secs.into()),
         );
         m.insert(
-            "required_soak_duration_secs".to_string(),
+            "required_soak_duration_secs".to_owned(),
             Value::Number(self.required_soak_duration_secs.into()),
         );
         m.insert(
-            "allowed_failing_samples".to_string(),
+            "allowed_failing_samples".to_owned(),
             Value::Number(self.allowed_failing_samples.into()),
         );
         m.insert(
-            "allowed_max_consecutive_failures".to_string(),
+            "allowed_max_consecutive_failures".to_owned(),
             Value::Number(self.allowed_max_consecutive_failures.into()),
         );
         m.insert(
-            "direct_samples".to_string(),
+            "direct_samples".to_owned(),
             Value::Number(self.direct_samples.into()),
         );
         m.insert(
-            "relay_samples".to_string(),
+            "relay_samples".to_owned(),
             Value::Number(self.relay_samples.into()),
         );
         m.insert(
-            "fail_closed_samples".to_string(),
+            "fail_closed_samples".to_owned(),
             Value::Number(self.fail_closed_samples.into()),
         );
         m.insert(
-            "other_path_samples".to_string(),
+            "other_path_samples".to_owned(),
             Value::Number(self.other_path_samples.into()),
         );
         m.insert(
-            "path_transition_count".to_string(),
+            "path_transition_count".to_owned(),
             Value::Number(self.path_transition_count.into()),
         );
         m.insert(
-            "status_mismatch_samples".to_string(),
+            "status_mismatch_samples".to_owned(),
             Value::Number(self.status_mismatch_samples.into()),
         );
         m.insert(
-            "route_mismatch_samples".to_string(),
+            "route_mismatch_samples".to_owned(),
             Value::Number(self.route_mismatch_samples.into()),
         );
         m.insert(
-            "endpoint_mismatch_samples".to_string(),
+            "endpoint_mismatch_samples".to_owned(),
             Value::Number(self.endpoint_mismatch_samples.into()),
         );
         m.insert(
-            "dns_alarm_bad_samples".to_string(),
+            "dns_alarm_bad_samples".to_owned(),
             Value::Number(self.dns_alarm_bad_samples.into()),
         );
         m.insert(
-            "transport_identity_failures".to_string(),
+            "transport_identity_failures".to_owned(),
             Value::Number(self.transport_identity_failures.into()),
         );
         m.insert(
-            "endpoint_change_events_start".to_string(),
+            "endpoint_change_events_start".to_owned(),
             Value::Number(self.endpoint_change_events_start.into()),
         );
         m.insert(
-            "endpoint_change_events_end".to_string(),
+            "endpoint_change_events_end".to_owned(),
             Value::Number(self.endpoint_change_events_end.into()),
         );
         m.insert(
-            "endpoint_change_events_delta".to_string(),
+            "endpoint_change_events_delta".to_owned(),
             Value::Number(self.endpoint_change_events_delta.into()),
         );
         m.insert(
-            "direct_remote_exit_ready".to_string(),
+            "direct_remote_exit_ready".to_owned(),
             Value::String(self.direct_remote_exit_ready),
         );
         m.insert(
-            "post_soak_bypass_ready".to_string(),
+            "post_soak_bypass_ready".to_owned(),
             Value::String(self.post_soak_bypass_ready),
         );
         m.insert(
-            "no_plaintext_passphrase_files".to_string(),
+            "no_plaintext_passphrase_files".to_owned(),
             Value::String(self.no_plaintext_passphrase_files),
         );
         m.insert(
-            "first_non_direct_reason".to_string(),
+            "first_non_direct_reason".to_owned(),
             Value::String(self.first_non_direct_reason),
         );
         m.insert(
-            "first_failure_reason".to_string(),
+            "first_failure_reason".to_owned(),
             Value::String(self.first_failure_reason),
         );
         m.insert(
-            "last_path_mode".to_string(),
+            "last_path_mode".to_owned(),
             Value::String(self.last_path_mode),
         );
         m.insert(
-            "last_path_reason".to_string(),
+            "last_path_reason".to_owned(),
             Value::String(self.last_path_reason),
         );
         m.insert(
-            "long_soak_stable".to_string(),
+            "long_soak_stable".to_owned(),
             Value::String(self.long_soak_stable),
         );
         m
@@ -1431,7 +1431,7 @@ fn non_empty_trimmed_string(opt: &Option<String>) -> Option<String> {
         if t.is_empty() {
             None
         } else {
-            Some(t.to_string())
+            Some(t.to_owned())
         }
     })
 }
@@ -1444,48 +1444,48 @@ impl CrossNetworkReportPayloadView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("suite".to_string(), Value::String(self.suite));
+        m.insert("suite".to_owned(), Value::String(self.suite));
         if let Some(v) = self.schema_version {
-            m.insert("schema_version".to_string(), Value::Number(v.into()));
+            m.insert("schema_version".to_owned(), Value::Number(v.into()));
         }
         if let Some(v) = self.phase {
-            m.insert("phase".to_string(), Value::String(v));
+            m.insert("phase".to_owned(), Value::String(v));
         }
         if let Some(v) = self.evidence_mode {
-            m.insert("evidence_mode".to_string(), Value::String(v));
+            m.insert("evidence_mode".to_owned(), Value::String(v));
         }
         if let Some(v) = self.environment {
-            m.insert("environment".to_string(), Value::String(v));
+            m.insert("environment".to_owned(), Value::String(v));
         }
         if let Some(v) = self.captured_at_unix {
-            m.insert("captured_at_unix".to_string(), Value::Number(v.into()));
+            m.insert("captured_at_unix".to_owned(), Value::Number(v.into()));
         }
         if let Some(v) = self.git_commit {
-            m.insert("git_commit".to_string(), Value::String(v));
+            m.insert("git_commit".to_owned(), Value::String(v));
         }
         if let Some(v) = self.status {
-            m.insert("status".to_string(), Value::String(v));
+            m.insert("status".to_owned(), Value::String(v));
         }
         if let Some(v) = self.failure_summary {
-            m.insert("failure_summary".to_string(), Value::String(v));
+            m.insert("failure_summary".to_owned(), Value::String(v));
         }
         if let Some(v) = self.participants {
-            m.insert("participants".to_string(), Value::Object(v));
+            m.insert("participants".to_owned(), Value::Object(v));
         }
         if let Some(v) = self.network_context {
-            m.insert("network_context".to_string(), Value::Object(v));
+            m.insert("network_context".to_owned(), Value::Object(v));
         }
         if let Some(v) = self.checks {
-            m.insert("checks".to_string(), Value::Object(v));
+            m.insert("checks".to_owned(), Value::Object(v));
         }
         if let Some(v) = self.path_evidence {
-            m.insert("path_evidence".to_string(), Value::Object(v));
+            m.insert("path_evidence".to_owned(), Value::Object(v));
         }
         if let Some(v) = self.source_artifacts {
-            m.insert("source_artifacts".to_string(), Value::Array(v));
+            m.insert("source_artifacts".to_owned(), Value::Array(v));
         }
         if let Some(v) = self.log_artifacts {
-            m.insert("log_artifacts".to_string(), Value::Array(v));
+            m.insert("log_artifacts".to_owned(), Value::Array(v));
         }
         m
     }
@@ -1562,7 +1562,7 @@ fn validate_report_payload(
         .filter(|value| !value.is_empty())
         .is_none()
     {
-        problems.push("environment must be a non-empty string".to_string());
+        problems.push("environment must be a non-empty string".to_owned());
     }
 
     let captured_at_unix = typed.captured_at_unix.filter(|value| *value > 0);
@@ -1570,25 +1570,25 @@ fn validate_report_payload(
     match captured_at_unix {
         Some(captured) => {
             if captured > now_unix.saturating_add(300) {
-                problems.push("captured_at_unix is too far in the future".to_string());
+                problems.push("captured_at_unix is too far in the future".to_owned());
             }
             if let Some(max_age) = max_evidence_age_seconds
                 && now_unix.saturating_sub(captured) > max_age
             {
-                problems.push("captured_at_unix is stale".to_string());
+                problems.push("captured_at_unix is stale".to_owned());
             }
         }
-        None => problems.push("captured_at_unix must be a positive integer".to_string()),
+        None => problems.push("captured_at_unix must be a positive integer".to_owned()),
     }
 
     let git_commit = typed.git_commit.as_deref().unwrap_or_default();
     if !is_lower_hex_commit(git_commit) {
-        problems.push("git_commit must be a 40-character lowercase hex commit id".to_string());
+        problems.push("git_commit must be a 40-character lowercase hex commit id".to_owned());
     }
 
     let status = typed.status.as_deref().unwrap_or_default();
     if status != CHECK_PASS && status != CHECK_FAIL {
-        problems.push("status must be 'pass' or 'fail'".to_string());
+        problems.push("status must be 'pass' or 'fail'".to_owned());
     }
 
     match typed.participants.as_ref() {
@@ -1599,7 +1599,7 @@ fn validate_report_payload(
                 }
             }
         }
-        None => problems.push("participants must be an object".to_string()),
+        None => problems.push("participants must be an object".to_owned()),
     }
 
     match typed.network_context.as_ref() {
@@ -1617,10 +1617,10 @@ fn validate_report_payload(
             if let (Some(client), Some(exit)) = (client_network_id, exit_network_id)
                 && client == exit
             {
-                problems.push("client_network_id and exit_network_id must differ".to_string());
+                problems.push("client_network_id and exit_network_id must differ".to_owned());
             }
         }
-        None => problems.push("network_context must be an object".to_string()),
+        None => problems.push("network_context must be an object".to_owned()),
     }
 
     let report_dir = report_path
@@ -1706,7 +1706,7 @@ fn validate_report_payload(
                 }
             }
         }
-        None => problems.push("checks must be an object".to_string()),
+        None => problems.push("checks must be an object".to_owned()),
     }
 
     let failure_summary = typed.failure_summary.clone().unwrap_or_default();
@@ -1726,11 +1726,11 @@ fn validate_report_payload(
             }
         }
         if !failure_summary.trim().is_empty() {
-            problems.push("failure_summary must be absent or empty when status=pass".to_string());
+            problems.push("failure_summary must be absent or empty when status=pass".to_owned());
         }
     } else if status == CHECK_FAIL {
         if failure_summary.trim().is_empty() {
-            problems.push("failure_summary must be non-empty when status=fail".to_string());
+            problems.push("failure_summary must be non-empty when status=fail".to_owned());
         }
         if let Some(check_map) = checks {
             let all_required_checks_pass = spec
@@ -1739,7 +1739,7 @@ fn validate_report_payload(
                 .all(|name| check_map.get(*name).and_then(Value::as_str) == Some(CHECK_PASS));
             if all_required_checks_pass {
                 problems
-                    .push("status=fail requires at least one required check to fail".to_string());
+                    .push("status=fail requires at least one required check to fail".to_owned());
             }
         }
     }
@@ -1748,7 +1748,7 @@ fn validate_report_payload(
     let requires_live_path_evidence =
         status == CHECK_PASS && !matches!(spec.suite, "cross_network_traversal_adversarial");
     if requires_live_path_evidence && path_evidence.is_none() {
-        problems.push("path_evidence must be present for pass reports".to_string());
+        problems.push("path_evidence must be present for pass reports".to_owned());
     }
     if let Some(path_evidence) = path_evidence {
         // X2: deserialise the path_evidence map once into the typed
@@ -1823,37 +1823,35 @@ fn validate_report_payload(
 
         if requires_live_path_evidence {
             if path_mode.is_none() {
-                problems.push("path_evidence.path_mode must be a non-empty string".to_string());
+                problems.push("path_evidence.path_mode must be a non-empty string".to_owned());
             }
             if path_reason.is_none() {
-                problems.push("path_evidence.path_reason must be a non-empty string".to_string());
+                problems.push("path_evidence.path_reason must be a non-empty string".to_owned());
             }
             if path_programmed_mode.is_none() {
                 problems.push(
-                    "path_evidence.path_programmed_mode must be a non-empty string".to_string(),
+                    "path_evidence.path_programmed_mode must be a non-empty string".to_owned(),
                 );
             }
             if path_live_proven != Some(true) {
-                problems.push("path_evidence.path_live_proven must be true".to_string());
+                problems.push("path_evidence.path_live_proven must be true".to_owned());
             }
             if path_latest_live_handshake_unix.is_none() {
                 problems.push(
                     "path_evidence.path_latest_live_handshake_unix must be a positive integer"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             if transport_socket_identity_state.as_deref()
                 != Some("authoritative_backend_shared_transport")
             {
                 problems.push(
-                    "path_evidence.transport_socket_identity_state must equal authoritative_backend_shared_transport for pass reports"
-                        .to_string(),
+                    "path_evidence.transport_socket_identity_state must equal authoritative_backend_shared_transport for pass reports".to_owned(),
                 );
             }
             if transport_socket_identity_error.as_deref() != Some("none") {
                 problems.push(
-                    "path_evidence.transport_socket_identity_error must equal none for pass reports"
-                        .to_string(),
+                    "path_evidence.transport_socket_identity_error must equal none for pass reports".to_owned(),
                 );
             }
             if transport_socket_identity_label
@@ -1861,8 +1859,7 @@ fn validate_report_payload(
                 .is_none_or(|value| value == "none")
             {
                 problems.push(
-                    "path_evidence.transport_socket_identity_label must be a non-empty backend identity label"
-                        .to_string(),
+                    "path_evidence.transport_socket_identity_label must be a non-empty backend identity label".to_owned(),
                 );
             }
             if transport_socket_identity_local_addr
@@ -1870,8 +1867,7 @@ fn validate_report_payload(
                 .is_none_or(|value| value == "none")
             {
                 problems.push(
-                    "path_evidence.transport_socket_identity_local_addr must be a non-empty backend local address"
-                        .to_string(),
+                    "path_evidence.transport_socket_identity_local_addr must be a non-empty backend local address".to_owned(),
                 );
             }
             if traversal_alarm_state
@@ -1879,8 +1875,7 @@ fn validate_report_payload(
                 .is_some_and(|value| matches!(value, "critical" | "error" | "missing"))
             {
                 problems.push(
-                    "path_evidence.traversal_alarm_state must not be critical|error|missing for pass reports"
-                        .to_string(),
+                    "path_evidence.traversal_alarm_state must not be critical|error|missing for pass reports".to_owned(),
                 );
             }
             if dns_alarm_state
@@ -1888,8 +1883,7 @@ fn validate_report_payload(
                 .is_some_and(|value| matches!(value, "critical" | "error" | "missing"))
             {
                 problems.push(
-                    "path_evidence.dns_alarm_state must not be critical|error|missing for pass reports"
-                        .to_string(),
+                    "path_evidence.dns_alarm_state must not be critical|error|missing for pass reports".to_owned(),
                 );
             }
             if traversal_error
@@ -1897,7 +1891,7 @@ fn validate_report_payload(
                 .is_some_and(|value| value != "none")
             {
                 problems.push(
-                    "path_evidence.traversal_error must equal none for pass reports".to_string(),
+                    "path_evidence.traversal_error must equal none for pass reports".to_owned(),
                 );
             }
             if traversal_alarm_reason
@@ -1906,7 +1900,7 @@ fn validate_report_payload(
             {
                 problems.push(
                     "path_evidence.traversal_alarm_reason must equal none for pass reports"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             if dns_alarm_reason
@@ -1914,7 +1908,7 @@ fn validate_report_payload(
                 .is_some_and(|value| value != "none")
             {
                 problems.push(
-                    "path_evidence.dns_alarm_reason must equal none for pass reports".to_string(),
+                    "path_evidence.dns_alarm_reason must equal none for pass reports".to_owned(),
                 );
             }
         }
@@ -1923,29 +1917,26 @@ fn validate_report_payload(
             if requires_live_path_evidence && path_mode.ends_with("_programmed") {
                 problems.push(
                     "path_evidence.path_mode must represent a live path, not a programmed path"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             match spec.suite {
                 "cross_network_direct_remote_exit" if status == CHECK_PASS => {
                     if path_mode != "direct_active" {
                         problems.push(
-                            "direct remote-exit pass reports require path_evidence.path_mode=direct_active"
-                                .to_string(),
+                            "direct remote-exit pass reports require path_evidence.path_mode=direct_active".to_owned(),
                         );
                     }
                 }
                 "cross_network_relay_remote_exit" if status == CHECK_PASS => {
                     if path_mode != "relay_active" {
                         problems.push(
-                            "relay remote-exit pass reports require path_evidence.path_mode=relay_active"
-                                .to_string(),
+                            "relay remote-exit pass reports require path_evidence.path_mode=relay_active".to_owned(),
                         );
                     }
                     if relay_session_state.as_deref() != Some("live") {
                         problems.push(
-                            "relay remote-exit pass reports require path_evidence.relay_session_state=live"
-                                .to_string(),
+                            "relay remote-exit pass reports require path_evidence.relay_session_state=live".to_owned(),
                         );
                     }
                 }
@@ -1953,7 +1944,7 @@ fn validate_report_payload(
                     if path_mode != "direct_active" {
                         problems.push(
                             "failback pass reports require path_evidence.path_mode=direct_active"
-                                .to_string(),
+                                .to_owned(),
                         );
                     }
                 }
@@ -2051,9 +2042,9 @@ fn parse_report_payload(path: &Path) -> Result<Value, String> {
 
 fn markdown_for_schema_validation(report_paths: &[PathBuf], errors: &[String]) -> String {
     let mut lines = vec![
-        "# Cross-Network Remote Exit Report Validation".to_string(),
+        "# Cross-Network Remote Exit Report Validation".to_owned(),
         String::new(),
-        "## Reports".to_string(),
+        "## Reports".to_owned(),
         String::new(),
     ];
     for path in report_paths {
@@ -2061,15 +2052,15 @@ fn markdown_for_schema_validation(report_paths: &[PathBuf], errors: &[String]) -
     }
     lines.push(String::new());
     if errors.is_empty() {
-        lines.push("## Result".to_string());
+        lines.push("## Result".to_owned());
         lines.push(String::new());
         lines.push(
             "All supplied cross-network remote-exit reports matched the required schema."
-                .to_string(),
+                .to_owned(),
         );
         lines.push(String::new());
     } else {
-        lines.push("## Errors".to_string());
+        lines.push("## Errors".to_owned());
         lines.push(String::new());
         for error in errors {
             lines.push(format!("- {error}"));
@@ -2087,8 +2078,8 @@ fn parse_csv_unique(raw: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if seen.insert(entry.to_string()) {
-            out.push(entry.to_string());
+        if seen.insert(entry.to_owned()) {
+            out.push(entry.to_owned());
         }
     }
     out
@@ -2281,7 +2272,7 @@ fn discover_matrix_records(
             .and_then(|value| value.get("suite"))
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_string();
+            .to_owned();
         if !known_suites.contains(suite.as_str()) {
             continue;
         }
@@ -2312,7 +2303,7 @@ fn discover_matrix_records(
             .and_then(|value| value.get("status"))
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_string();
+            .to_owned();
         if require_pass_status && status != CHECK_PASS {
             errors.push(format!(
                 "{}: status must be 'pass' for matrix validation",
@@ -2363,7 +2354,7 @@ fn discover_matrix_records(
 fn validate_matrix(records: &[ReportRecord], required_nat_profiles: &[String]) -> Vec<String> {
     let mut errors = Vec::new();
     if required_nat_profiles.is_empty() {
-        errors.push("required_nat_profiles must not be empty".to_string());
+        errors.push("required_nat_profiles must not be empty".to_owned());
         return errors;
     }
 
@@ -2391,29 +2382,29 @@ fn markdown_for_nat_matrix(
     errors: &[String],
 ) -> String {
     let mut lines = vec![
-        "# Cross-Network NAT Matrix Validation".to_string(),
+        "# Cross-Network NAT Matrix Validation".to_owned(),
         String::new(),
-        "## Required NAT Profiles".to_string(),
+        "## Required NAT Profiles".to_owned(),
         String::new(),
     ];
     for profile in required_nat_profiles {
         lines.push(format!("- `{profile}`"));
     }
     lines.push(String::new());
-    lines.push("## Reports Considered".to_string());
+    lines.push("## Reports Considered".to_owned());
     lines.push(String::new());
     if report_paths.is_empty() {
-        lines.push("- none".to_string());
+        lines.push("- none".to_owned());
     } else {
         for path in report_paths {
             lines.push(format!("- `{}`", path.display()));
         }
     }
     lines.push(String::new());
-    lines.push("## Matrix Records".to_string());
+    lines.push("## Matrix Records".to_owned());
     lines.push(String::new());
     if records.is_empty() {
-        lines.push("- none".to_string());
+        lines.push("- none".to_owned());
     } else {
         let mut sorted = records.iter().collect::<Vec<_>>();
         sorted.sort_by(|left, right| {
@@ -2434,10 +2425,10 @@ fn markdown_for_nat_matrix(
         }
     }
     lines.push(String::new());
-    lines.push("## Result".to_string());
+    lines.push("## Result".to_owned());
     lines.push(String::new());
     if errors.is_empty() {
-        lines.push("Matrix validation passed.".to_string());
+        lines.push("Matrix validation passed.".to_owned());
     } else {
         for error in errors {
             lines.push(format!("- {error}"));
@@ -2474,9 +2465,9 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
         )
     })?;
 
-    let status = config.status.trim().to_string();
+    let status = config.status.trim().to_owned();
     if status != CHECK_PASS && status != CHECK_FAIL {
-        return Err("status must be pass or fail".to_string());
+        return Err("status must be pass or fail".to_owned());
     }
 
     let report_path = resolve_path(&config.report_path)?;
@@ -2509,7 +2500,7 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
     let check_overrides = parse_check_overrides(&config.check_overrides)?;
     let mut checks = Map::new();
     for check in spec.required_checks {
-        checks.insert((*check).to_string(), Value::String(CHECK_FAIL.to_string()));
+        checks.insert((*check).to_owned(), Value::String(CHECK_FAIL.to_owned()));
     }
     for (key, value) in check_overrides {
         checks.insert(key, Value::String(value));
@@ -2517,38 +2508,38 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
 
     let mut participants = Map::new();
     if let Some(value) = non_empty_option(config.client_host) {
-        participants.insert("client_host".to_string(), Value::String(value));
+        participants.insert("client_host".to_owned(), Value::String(value));
     }
     if let Some(value) = non_empty_option(config.exit_host) {
-        participants.insert("exit_host".to_string(), Value::String(value));
+        participants.insert("exit_host".to_owned(), Value::String(value));
     }
     if let Some(value) = non_empty_option(config.relay_host) {
-        participants.insert("relay_host".to_string(), Value::String(value));
+        participants.insert("relay_host".to_owned(), Value::String(value));
     }
     if let Some(value) = non_empty_option(config.probe_host) {
-        participants.insert("probe_host".to_string(), Value::String(value));
+        participants.insert("probe_host".to_owned(), Value::String(value));
     }
 
     let mut network_context = Map::new();
     if let Some(value) = non_empty_option(config.client_network_id) {
-        network_context.insert("client_network_id".to_string(), Value::String(value));
+        network_context.insert("client_network_id".to_owned(), Value::String(value));
     }
     if let Some(value) = non_empty_option(config.exit_network_id) {
-        network_context.insert("exit_network_id".to_string(), Value::String(value));
+        network_context.insert("exit_network_id".to_owned(), Value::String(value));
     }
     if let Some(value) = non_empty_option(config.relay_network_id) {
-        network_context.insert("relay_network_id".to_string(), Value::String(value));
+        network_context.insert("relay_network_id".to_owned(), Value::String(value));
     }
     if !config.nat_profile.trim().is_empty() {
         network_context.insert(
-            "nat_profile".to_string(),
-            Value::String(config.nat_profile.trim().to_string()),
+            "nat_profile".to_owned(),
+            Value::String(config.nat_profile.trim().to_owned()),
         );
     }
     if !config.impairment_profile.trim().is_empty() {
         network_context.insert(
-            "impairment_profile".to_string(),
-            Value::String(config.impairment_profile.trim().to_string()),
+            "impairment_profile".to_owned(),
+            Value::String(config.impairment_profile.trim().to_owned()),
         );
     }
 
@@ -2565,7 +2556,7 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
         "schema_version": SCHEMA_VERSION,
         "phase": PHASE_NAME,
         "suite": spec.suite,
-        "environment": if config.environment.trim().is_empty() { "live_linux_skeleton".to_string() } else { config.environment.trim().to_string() },
+        "environment": if config.environment.trim().is_empty() { "live_linux_skeleton".to_owned() } else { config.environment.trim().to_owned() },
         "evidence_mode": EVIDENCE_MODE,
         "captured_at_unix": unix_now(),
         "git_commit": current_git_commit()?,
@@ -2576,9 +2567,9 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
         "source_artifacts": source_artifacts,
         "log_artifacts": log_artifacts,
         "implementation_state": if config.implementation_state.trim().is_empty() {
-            "not_implemented".to_string()
+            "not_implemented".to_owned()
         } else {
-            config.implementation_state.trim().to_string()
+            config.implementation_state.trim().to_owned()
         },
     });
     if let Some(path_evidence) = resolve_optional_path_evidence(
@@ -2589,19 +2580,16 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
         payload
             .as_object_mut()
             .expect("payload object")
-            .insert("path_evidence".to_string(), path_evidence);
+            .insert("path_evidence".to_owned(), path_evidence);
     }
     if status == CHECK_FAIL {
         let failure_summary = if config.failure_summary.trim().is_empty() {
             format!("{} is not implemented yet", spec.title)
         } else {
-            config.failure_summary.trim().to_string()
+            config.failure_summary.trim().to_owned()
         };
         if let Some(object) = payload.as_object_mut() {
-            object.insert(
-                "failure_summary".to_string(),
-                Value::String(failure_summary),
-            );
+            object.insert("failure_summary".to_owned(), Value::String(failure_summary));
         }
     }
 
@@ -2649,7 +2637,7 @@ pub fn execute_ops_validate_cross_network_remote_exit_reports(
     }
 
     if errors.is_empty() {
-        Ok("cross-network report schema validation passed".to_string())
+        Ok("cross-network report schema validation passed".to_owned())
     } else {
         Err(errors.join("\n"))
     }
@@ -2685,7 +2673,7 @@ pub fn execute_ops_validate_cross_network_nat_matrix(
     }
 
     if errors.is_empty() {
-        Ok("cross-network NAT matrix validation passed".to_string())
+        Ok("cross-network NAT matrix validation passed".to_owned())
     } else {
         Err(errors.join("\n"))
     }
@@ -2734,7 +2722,7 @@ fn same_prefix(
             let b_bits = u128::from_be_bytes(b.octets());
             Ok((a_bits & mask) == (b_bits & mask))
         }
-        _ => Err("ip-a and ip-b must use the same IP family".to_string()),
+        _ => Err("ip-a and ip-b must use the same IP family".to_owned()),
     }
 }
 
@@ -2745,9 +2733,9 @@ pub fn execute_ops_classify_cross_network_topology(
     let ip_b = parse_ip_addr("ip-b", &config.ip_b)?;
     let same = same_prefix(ip_a, ip_b, config.ipv4_prefix, config.ipv6_prefix)?;
     Ok(if same {
-        CHECK_FAIL.to_string()
+        CHECK_FAIL.to_owned()
     } else {
-        CHECK_PASS.to_string()
+        CHECK_PASS.to_owned()
     })
 }
 
@@ -2756,8 +2744,7 @@ pub fn execute_ops_read_cross_network_report_fields(
 ) -> Result<String, String> {
     if !config.include_status && config.checks.is_empty() && config.network_fields.is_empty() {
         return Err(
-            "at least one output selector is required (--include-status, --check, or --network-field)"
-                .to_string(),
+            "at least one output selector is required (--include-status, --check, or --network-field)".to_owned(),
         );
     }
 
@@ -2768,7 +2755,7 @@ pub fn execute_ops_read_cross_network_report_fields(
         .ok_or_else(|| format!("{}: report must be a JSON object", report_path.display()))?;
 
     let default_value = if config.default_value.is_empty() {
-        CHECK_FAIL.to_string()
+        CHECK_FAIL.to_owned()
     } else {
         config.default_value
     };
@@ -2786,7 +2773,7 @@ pub fn execute_ops_read_cross_network_report_fields(
     for key in config.checks {
         let name = key.trim();
         if name.is_empty() {
-            return Err("check selector must not be empty".to_string());
+            return Err("check selector must not be empty".to_owned());
         }
         values.push(
             checks
@@ -2800,7 +2787,7 @@ pub fn execute_ops_read_cross_network_report_fields(
     for key in config.network_fields {
         let name = key.trim();
         if name.is_empty() {
-            return Err("network-field selector must not be empty".to_string());
+            return Err("network-field selector must not be empty".to_owned());
         }
         values.push(
             network
@@ -2827,15 +2814,14 @@ pub fn execute_ops_choose_cross_network_roam_alias(
             }
             if config.ipv4_prefix == 32 {
                 return Err(
-                    "cannot choose roam alias in /32; IPv4 prefix must allow host space"
-                        .to_string(),
+                    "cannot choose roam alias in /32; IPv4 prefix must allow host space".to_owned(),
                 );
             }
             let mut used = HashSet::new();
             for raw in &config.used_ips {
                 let parsed = parse_ip_addr("used-ip", raw)?;
                 let IpAddr::V4(value) = parsed else {
-                    return Err("all --used-ip values must match exit-ip family".to_string());
+                    return Err("all --used-ip values must match exit-ip family".to_owned());
                 };
                 used.insert(u32::from(value));
             }
@@ -2855,7 +2841,7 @@ pub fn execute_ops_choose_cross_network_roam_alias(
                     return Ok(format!("{ip}\n{}", config.ipv4_prefix));
                 }
             }
-            Err("failed to find available IPv4 roam alias in selected prefix".to_string())
+            Err("failed to find available IPv4 roam alias in selected prefix".to_owned())
         }
         IpAddr::V6(exit_v6) => {
             if config.ipv6_prefix > 128 {
@@ -2867,14 +2853,14 @@ pub fn execute_ops_choose_cross_network_roam_alias(
             if config.ipv6_prefix == 128 {
                 return Err(
                     "cannot choose roam alias in /128; IPv6 prefix must allow host space"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             let mut used = HashSet::new();
             for raw in &config.used_ips {
                 let parsed = parse_ip_addr("used-ip", raw)?;
                 let IpAddr::V6(value) = parsed else {
-                    return Err("all --used-ip values must match exit-ip family".to_string());
+                    return Err("all --used-ip values must match exit-ip family".to_owned());
                 };
                 used.insert(u128::from_be_bytes(value.octets()));
             }
@@ -2898,7 +2884,7 @@ pub fn execute_ops_choose_cross_network_roam_alias(
                     return Ok(format!("{ip}\n{}", config.ipv6_prefix));
                 }
             }
-            Err("failed to find available IPv6 roam alias in selected prefix".to_string())
+            Err("failed to find available IPv6 roam alias in selected prefix".to_owned())
         }
     }
 }
@@ -3035,39 +3021,36 @@ mod tests {
 
         let mut participants = Map::new();
         for field in spec.required_participants {
-            participants.insert(
-                (*field).to_string(),
-                Value::String(format!("{field}-value")),
-            );
+            participants.insert((*field).to_owned(), Value::String(format!("{field}-value")));
         }
 
         let mut network_context = Map::new();
         network_context.insert(
-            "client_network_id".to_string(),
-            Value::String("net-client".to_string()),
+            "client_network_id".to_owned(),
+            Value::String("net-client".to_owned()),
         );
         network_context.insert(
-            "exit_network_id".to_string(),
-            Value::String("net-exit".to_string()),
+            "exit_network_id".to_owned(),
+            Value::String("net-exit".to_owned()),
         );
         network_context.insert(
-            "nat_profile".to_string(),
-            Value::String("baseline_lan".to_string()),
+            "nat_profile".to_owned(),
+            Value::String("baseline_lan".to_owned()),
         );
         network_context.insert(
-            "impairment_profile".to_string(),
-            Value::String("none".to_string()),
+            "impairment_profile".to_owned(),
+            Value::String("none".to_owned()),
         );
         if spec.required_network_fields.contains(&"relay_network_id") {
             network_context.insert(
-                "relay_network_id".to_string(),
-                Value::String("net-relay".to_string()),
+                "relay_network_id".to_owned(),
+                Value::String("net-relay".to_owned()),
             );
         }
 
         let mut checks = Map::new();
         for check in spec.required_checks {
-            checks.insert((*check).to_string(), Value::String(CHECK_PASS.to_string()));
+            checks.insert((*check).to_owned(), Value::String(CHECK_PASS.to_owned()));
         }
 
         let path_mode = match spec.suite {
@@ -3104,7 +3087,7 @@ mod tests {
         });
         if status == CHECK_PASS && spec.suite != "cross_network_traversal_adversarial" {
             payload.as_object_mut().expect("payload object").insert(
-                "path_evidence".to_string(),
+                "path_evidence".to_owned(),
                 json!({
                     "path_mode": path_mode,
                     "path_reason": "fresh_handshake_observed",
@@ -3130,8 +3113,8 @@ mod tests {
         }
         if status == CHECK_FAIL {
             payload.as_object_mut().expect("payload object").insert(
-                "failure_summary".to_string(),
-                Value::String("simulated failure".to_string()),
+                "failure_summary".to_owned(),
+                Value::String("simulated failure".to_owned()),
             );
         }
         Ok(payload)
@@ -3145,9 +3128,9 @@ mod tests {
         let artifact_body = if basename.ends_with("_ssh_trust_summary.txt") {
             let target_count = spec.required_participants.len();
             let mut lines = vec![
-                "schema_version=1".to_string(),
+                "schema_version=1".to_owned(),
                 format!("generated_at_unix={}", unix_now()),
-                "pinned_known_hosts_file=/tmp/rustynet-known_hosts".to_string(),
+                "pinned_known_hosts_file=/tmp/rustynet-known_hosts".to_owned(),
                 format!("pinned_known_hosts_sha256={}", "b".repeat(64)),
                 format!("target_count={target_count}"),
             ];
@@ -3162,8 +3145,8 @@ mod tests {
                 lines.push(format!("target[{index}].host_key_status=pass"));
                 lines.push(format!("target[{index}].passwordless_sudo_status=pass"));
             }
-            lines.push("all_targets_pinned=true".to_string());
-            lines.push("all_targets_passwordless_sudo=true".to_string());
+            lines.push("all_targets_pinned=true".to_owned());
+            lines.push("all_targets_passwordless_sudo=true".to_owned());
             format!("{}\n", lines.join("\n"))
         } else if basename == "cross_network_remote_exit_soak_monitor_summary.json" {
             serde_json::to_string_pretty(&json!({
@@ -3199,7 +3182,7 @@ mod tests {
             .map(|rendered| format!("{rendered}\n"))
             .map_err(|err| format!("serialize soak monitor summary failed: {err}"))?
         } else if basename.ends_with(".json") {
-            "{\n  \"status\": \"pass\"\n}\n".to_string()
+            "{\n  \"status\": \"pass\"\n}\n".to_owned()
         } else {
             format!("measured {basename}\n")
         };
@@ -3234,7 +3217,7 @@ mod tests {
         let report_path = temp_dir.path().join(spec.filename);
         let mut payload =
             report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
-        payload["checks"]["direct_remote_exit_success"] = Value::String(CHECK_FAIL.to_string());
+        payload["checks"]["direct_remote_exit_success"] = Value::String(CHECK_FAIL.to_owned());
 
         let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
 
@@ -3320,24 +3303,24 @@ mod tests {
             .expect("write child fail report");
 
         let config = GenerateCrossNetworkRemoteExitReportConfig {
-            suite: "cross_network_remote_exit_dns".to_string(),
+            suite: "cross_network_remote_exit_dns".to_owned(),
             report_path: report_path.clone(),
             log_path,
-            status: CHECK_FAIL.to_string(),
-            failure_summary: "direct child failed before live path proof".to_string(),
-            environment: "unit_test".to_string(),
-            implementation_state: "live_measured_validator".to_string(),
+            status: CHECK_FAIL.to_owned(),
+            failure_summary: "direct child failed before live path proof".to_owned(),
+            environment: "unit_test".to_owned(),
+            implementation_state: "live_measured_validator".to_owned(),
             source_artifacts: vec![source_path],
             log_artifacts: Vec::new(),
-            client_host: Some("client-host".to_string()),
-            exit_host: Some("exit-host".to_string()),
+            client_host: Some("client-host".to_owned()),
+            exit_host: Some("exit-host".to_owned()),
             relay_host: None,
             probe_host: None,
-            client_network_id: Some("client-net".to_string()),
-            exit_network_id: Some("exit-net".to_string()),
+            client_network_id: Some("client-net".to_owned()),
+            exit_network_id: Some("exit-net".to_owned()),
             relay_network_id: None,
-            nat_profile: "baseline_lan".to_string(),
-            impairment_profile: "none".to_string(),
+            nat_profile: "baseline_lan".to_owned(),
+            impairment_profile: "none".to_owned(),
             check_overrides: Vec::new(),
             path_status_line: None,
             path_evidence_report: Some(child_report_path),
@@ -3389,28 +3372,28 @@ mod tests {
         fs::write(&managed_dns_log_path, "managed dns log\n").expect("write managed dns log");
 
         let config = GenerateCrossNetworkRemoteExitReportConfig {
-            suite: "cross_network_remote_exit_dns".to_string(),
+            suite: "cross_network_remote_exit_dns".to_owned(),
             report_path,
             log_path,
-            status: CHECK_PASS.to_string(),
+            status: CHECK_PASS.to_owned(),
             failure_summary: String::new(),
-            environment: "unit_test".to_string(),
-            implementation_state: "live_measured_validator".to_string(),
+            environment: "unit_test".to_owned(),
+            implementation_state: "live_measured_validator".to_owned(),
             source_artifacts: vec![source_path, direct_report_path, managed_dns_report_path],
             log_artifacts: vec![direct_log_path, managed_dns_log_path],
-            client_host: Some("client-host".to_string()),
-            exit_host: Some("exit-host".to_string()),
+            client_host: Some("client-host".to_owned()),
+            exit_host: Some("exit-host".to_owned()),
             relay_host: None,
             probe_host: None,
-            client_network_id: Some("client-net".to_string()),
-            exit_network_id: Some("exit-net".to_string()),
+            client_network_id: Some("client-net".to_owned()),
+            exit_network_id: Some("exit-net".to_owned()),
             relay_network_id: None,
-            nat_profile: "baseline_lan".to_string(),
-            impairment_profile: "none".to_string(),
+            nat_profile: "baseline_lan".to_owned(),
+            impairment_profile: "none".to_owned(),
             check_overrides: vec![
-                "managed_dns_resolution_success=pass".to_string(),
-                "remote_exit_dns_fail_closed=pass".to_string(),
-                "remote_exit_no_underlay_leak=pass".to_string(),
+                "managed_dns_resolution_success=pass".to_owned(),
+                "remote_exit_dns_fail_closed=pass".to_owned(),
+                "remote_exit_no_underlay_leak=pass".to_owned(),
             ],
             path_status_line: None,
             path_evidence_report: Some(child_report_path),
@@ -3464,7 +3447,7 @@ mod tests {
         let mut payload =
             report_payload_for_test(spec, temp_dir.path(), CHECK_PASS).expect("test payload");
         payload["path_evidence"]["transport_socket_identity_state"] =
-            Value::String("blocked_backend_opaque_socket".to_string());
+            Value::String("blocked_backend_opaque_socket".to_owned());
 
         let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
 
@@ -3515,11 +3498,11 @@ mod tests {
         let mut soak_summary =
             parse_json_object_file(soak_summary_path.as_path(), "soak monitor summary")
                 .expect("parse soak summary");
-        soak_summary.insert("direct_samples".to_string(), Value::from(23u64));
-        soak_summary.insert("relay_samples".to_string(), Value::from(1u64));
+        soak_summary.insert("direct_samples".to_owned(), Value::from(23u64));
+        soak_summary.insert("relay_samples".to_owned(), Value::from(1u64));
         soak_summary.insert(
-            "first_non_direct_reason".to_string(),
-            Value::String("relay_selected_no_direct_candidate".to_string()),
+            "first_non_direct_reason".to_owned(),
+            Value::String("relay_selected_no_direct_candidate".to_owned()),
         );
         fs::write(
             &soak_summary_path,
@@ -3556,8 +3539,8 @@ mod tests {
             .and_then(Value::as_object_mut)
             .expect("path evidence object")
             .insert(
-                "traversal_alarm_state".to_string(),
-                Value::String("critical".to_string()),
+                "traversal_alarm_state".to_owned(),
+                Value::String("critical".to_owned()),
             );
 
         let errors = validate_report_payload(&report_path, &payload, Some(60), Some(unix_now()));
@@ -3660,7 +3643,7 @@ mod tests {
         payload
             .as_object_mut()
             .expect("payload is an object")
-            .insert("samples".to_string(), Value::String("twenty-four".into()));
+            .insert("samples".to_owned(), Value::String("twenty-four".into()));
         let err = serde_json::from_value::<CrossNetworkSoakMonitorSummaryView>(payload)
             .expect_err("string samples must be rejected at deserialize");
         let message = err.to_string();
@@ -3848,10 +3831,7 @@ mod tests {
         payload
             .as_object_mut()
             .expect("payload is an object")
-            .insert(
-                "schema_version".to_string(),
-                Value::String("one".to_string()),
-            );
+            .insert("schema_version".to_owned(), Value::String("one".to_owned()));
         let err = serde_json::from_value::<CrossNetworkReportPayloadView>(payload)
             .expect_err("string schema_version must be rejected at deserialize");
         let message = err.to_string();
@@ -4014,8 +3994,8 @@ mod tests {
             .as_object_mut()
             .expect("path_evidence fixture is an object")
             .insert(
-                "path_live_proven".to_string(),
-                Value::String("true".to_string()),
+                "path_live_proven".to_owned(),
+                Value::String("true".to_owned()),
             );
         let err = serde_json::from_value::<CrossNetworkPathEvidenceView>(block)
             .expect_err("string path_live_proven must be rejected at deserialize");
@@ -4034,10 +4014,10 @@ mod tests {
     fn non_empty_trimmed_string_folds_empty_and_whitespace_to_none() {
         assert!(non_empty_trimmed_string(&None).is_none());
         assert!(non_empty_trimmed_string(&Some(String::new())).is_none());
-        assert!(non_empty_trimmed_string(&Some("   ".to_string())).is_none());
-        assert!(non_empty_trimmed_string(&Some("\t\n  ".to_string())).is_none());
+        assert!(non_empty_trimmed_string(&Some("   ".to_owned())).is_none());
+        assert!(non_empty_trimmed_string(&Some("\t\n  ".to_owned())).is_none());
         assert_eq!(
-            non_empty_trimmed_string(&Some("  direct_active  ".to_string())).as_deref(),
+            non_empty_trimmed_string(&Some("  direct_active  ".to_owned())).as_deref(),
             Some("direct_active"),
             "non-whitespace content must be returned trimmed"
         );
@@ -4052,14 +4032,14 @@ mod tests {
     fn validate_report_payload_falls_back_to_untyped_walk_on_wrong_type_slot() {
         let mut payload = clean_report_payload_value();
         let payload_map = payload.as_object_mut().expect("payload is an object");
-        payload_map.insert("path_evidence".to_string(), clean_path_evidence_value());
+        payload_map.insert("path_evidence".to_owned(), clean_path_evidence_value());
         let path_evidence_map = payload_map
             .get_mut("path_evidence")
             .and_then(Value::as_object_mut)
             .expect("path_evidence is an object");
         path_evidence_map.insert(
-            "path_live_proven".to_string(),
-            Value::String("not_a_bool".to_string()),
+            "path_live_proven".to_owned(),
+            Value::String("not_a_bool".to_owned()),
         );
         let problems =
             validate_report_payload(Path::new("/tmp/fake_report.json"), &payload, None, None);
@@ -4085,23 +4065,23 @@ mod tests {
     /// exercise the `extra` map.
     fn clean_ssh_trust_summary_map() -> HashMap<String, String> {
         let mut m = HashMap::new();
-        m.insert("schema_version".to_string(), "1".to_string());
+        m.insert("schema_version".to_owned(), "1".to_owned());
         m.insert(
-            "pinned_known_hosts_file".to_string(),
-            "/tmp/rustynet-known_hosts".to_string(),
+            "pinned_known_hosts_file".to_owned(),
+            "/tmp/rustynet-known_hosts".to_owned(),
         );
-        m.insert("pinned_known_hosts_sha256".to_string(), "b".repeat(64));
-        m.insert("all_targets_pinned".to_string(), "true".to_string());
+        m.insert("pinned_known_hosts_sha256".to_owned(), "b".repeat(64));
+        m.insert("all_targets_pinned".to_owned(), "true".to_owned());
         m.insert(
-            "all_targets_passwordless_sudo".to_string(),
-            "true".to_string(),
+            "all_targets_passwordless_sudo".to_owned(),
+            "true".to_owned(),
         );
-        m.insert("target_count".to_string(), "2".to_string());
+        m.insert("target_count".to_owned(), "2".to_owned());
         for index in 0..2usize {
             m.insert(format!("target[{index}].target"), format!("host-{index}"));
             m.insert(
                 format!("target[{index}].configured_transport"),
-                "utm".to_string(),
+                "utm".to_owned(),
             );
             m.insert(
                 format!("target[{index}].checked_candidates"),
@@ -4113,14 +4093,14 @@ mod tests {
             );
             m.insert(
                 format!("target[{index}].host_key_status"),
-                "pass".to_string(),
+                "pass".to_owned(),
             );
             m.insert(
                 format!("target[{index}].passwordless_sudo_status"),
-                "pass".to_string(),
+                "pass".to_owned(),
             );
         }
-        m.insert("extra_field".to_string(), "ride-through".to_string());
+        m.insert("extra_field".to_owned(), "ride-through".to_owned());
         m
     }
 
@@ -4193,7 +4173,7 @@ mod tests {
     #[test]
     fn cross_network_ssh_trust_summary_view_rejects_wrong_type_required_field() {
         let mut map = clean_ssh_trust_summary_map();
-        map.insert("target_count".to_string(), "not-a-number".to_string());
+        map.insert("target_count".to_owned(), "not-a-number".to_owned());
         let view = CrossNetworkSshTrustSummaryView::from_key_value(map);
         assert!(
             view.target_count.is_none(),

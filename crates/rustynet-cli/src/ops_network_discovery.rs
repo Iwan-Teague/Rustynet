@@ -66,7 +66,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         .filter(|ch| !ch.is_ascii_whitespace())
         .collect::<Vec<_>>();
     if clean.is_empty() || clean.len() % 4 != 0 {
-        return Err("invalid base64".to_string());
+        return Err("invalid base64".to_owned());
     }
     let mut output = Vec::with_capacity(clean.len() / 4 * 3);
     for chunk in clean.chunks(4) {
@@ -79,7 +79,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
             } else if let Some(value) = reverse.get(ch) {
                 sextets[index] = *value;
             } else {
-                return Err("invalid base64".to_string());
+                return Err("invalid base64".to_owned());
             }
         }
         let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
@@ -211,12 +211,12 @@ impl NetworkDiscoveryBundleView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "schema_version".to_string(),
+            "schema_version".to_owned(),
             Value::Number(self.schema_version.into()),
         );
-        m.insert("purpose".to_string(), Value::String(self.purpose));
+        m.insert("purpose".to_owned(), Value::String(self.purpose));
         m.insert(
-            "collected_at_unix".to_string(),
+            "collected_at_unix".to_owned(),
             Value::Number(self.collected_at_unix.into()),
         );
         m
@@ -448,22 +448,22 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
     };
 
     if typed.schema_version != 1 {
-        problems.push("schema_version must equal 1".to_string());
+        problems.push("schema_version must equal 1".to_owned());
     }
     if typed.purpose != "cross_network_discovery_bundle" {
-        problems.push("purpose must equal 'cross_network_discovery_bundle'".to_string());
+        problems.push("purpose must equal 'cross_network_discovery_bundle'".to_owned());
     }
 
     let now_unix = unix_now();
     let collected_at_unix = typed.collected_at_unix;
     if collected_at_unix == 0 {
-        problems.push("collected_at_unix must be a positive integer".to_string());
+        problems.push("collected_at_unix must be a positive integer".to_owned());
     } else {
         if collected_at_unix > now_unix.saturating_add(300) {
-            problems.push("collected_at_unix is too far in the future".to_string());
+            problems.push("collected_at_unix is too far in the future".to_owned());
         }
         if now_unix.saturating_sub(collected_at_unix) > config.max_age_seconds {
-            problems.push("collected_at_unix is stale".to_string());
+            problems.push("collected_at_unix is stale".to_owned());
         }
     }
 
@@ -473,7 +473,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
     match deserialize_sub_block::<NodeIdentityView>(object, "node_identity") {
         Ok(Some(view)) => {
             if !matches!(view.node_id.as_deref(), Some(value) if valid_node_id(value)) {
-                problems.push("node_identity.node_id must match [A-Za-z0-9._-]+".to_string());
+                problems.push("node_identity.node_id must match [A-Za-z0-9._-]+".to_owned());
             }
             for (field, slot) in [
                 ("hostname", &view.hostname),
@@ -491,7 +491,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        Ok(None) => problems.push("node_identity must be an object".to_string()),
+        Ok(None) => problems.push("node_identity must be an object".to_owned()),
         Err(err) => problems.push(err),
     }
 
@@ -504,7 +504,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 .filter(|value| !value.is_empty())
                 .is_some();
             if !interface {
-                problems.push("wireguard.interface must be a non-empty string".to_string());
+                problems.push("wireguard.interface must be a non-empty string".to_owned());
             }
 
             let pubkey_ok = view
@@ -514,11 +514,11 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 .is_some_and(decode_b64_32);
             if !pubkey_ok {
                 problems
-                    .push("wireguard.public_key must be valid base64 for 32-byte key".to_string());
+                    .push("wireguard.public_key must be valid base64 for 32-byte key".to_owned());
             }
 
             if !matches!(view.listen_port, Some(value) if (1..=65535).contains(&value)) {
-                problems.push("wireguard.listen_port must be an integer in [1, 65535]".to_string());
+                problems.push("wireguard.listen_port must be an integer in [1, 65535]".to_owned());
             }
 
             let stanza = view
@@ -529,10 +529,10 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 .is_some();
             if !stanza {
                 problems
-                    .push("wireguard.peer_stanza_template must be a non-empty string".to_string());
+                    .push("wireguard.peer_stanza_template must be a non-empty string".to_owned());
             }
         }
-        Ok(None) => problems.push("wireguard must be an object".to_string()),
+        Ok(None) => problems.push("wireguard must be an object".to_owned()),
         Err(err) => problems.push(err),
     }
 
@@ -594,7 +594,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                         "endpoint_candidates[{index}].priority must be an integer"
                     ));
                 }
-                let candidate_key = (candidate_type.to_string(), endpoint.to_string());
+                let candidate_key = (candidate_type.to_owned(), endpoint.to_owned());
                 if seen.contains(&candidate_key) {
                     problems.push(format!(
                         "endpoint_candidates[{index}] duplicates candidate type/endpoint pair"
@@ -603,13 +603,13 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 seen.insert(candidate_key);
             }
         }
-        _ => problems.push("endpoint_candidates must be a non-empty list".to_string()),
+        _ => problems.push("endpoint_candidates must be a non-empty list".to_owned()),
     }
 
     match deserialize_sub_block::<NatProfileView>(object, "nat_profile") {
         Ok(Some(view)) => {
             if view.behind_nat.is_none() {
-                problems.push("nat_profile.behind_nat must be boolean".to_string());
+                problems.push("nat_profile.behind_nat must be boolean".to_owned());
             }
             for (field, slot) in [
                 ("first_lan_ip", &view.first_lan_ip),
@@ -625,7 +625,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        Ok(None) => problems.push("nat_profile must be an object".to_string()),
+        Ok(None) => problems.push("nat_profile must be an object".to_owned()),
         Err(err) => problems.push(err),
     }
 
@@ -650,7 +650,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        Ok(None) => problems.push("verifier_keys must be an object".to_string()),
+        Ok(None) => problems.push("verifier_keys must be an object".to_owned()),
         Err(err) => problems.push(err),
     }
 
@@ -714,7 +714,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        None => problems.push("rustynet_artifacts must be an object".to_string()),
+        None => problems.push("rustynet_artifacts must be an object".to_owned()),
     }
 
     match deserialize_sub_block::<DaemonStatusView>(object, "daemon_status") {
@@ -723,27 +723,27 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
             if !matches!(active, "active" | "inactive" | "socket_present" | "unknown") {
                 problems.push(
                     "daemon_status.active must be one of active/inactive/socket_present/unknown"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             if config.require_daemon_active && !matches!(active, "active" | "socket_present") {
-                problems.push("daemon_status.active must indicate active runtime".to_string());
+                problems.push("daemon_status.active must indicate active runtime".to_owned());
             }
             match view.socket_present {
                 Some(socket_present) => {
                     if config.require_socket_present && !socket_present {
                         problems.push(
-                            "daemon_status.socket_present must be true in strict mode".to_string(),
+                            "daemon_status.socket_present must be true in strict mode".to_owned(),
                         );
                     }
                 }
-                None => problems.push("daemon_status.socket_present must be boolean".to_string()),
+                None => problems.push("daemon_status.socket_present must be boolean".to_owned()),
             }
             if !validate_absolute_path(view.socket_path.as_ref()) {
-                problems.push("daemon_status.socket_path must be absolute".to_string());
+                problems.push("daemon_status.socket_path must be absolute".to_owned());
             }
         }
-        Ok(None) => problems.push("daemon_status must be an object".to_string()),
+        Ok(None) => problems.push("daemon_status must be an object".to_owned()),
         Err(err) => problems.push(err),
     }
 
@@ -782,7 +782,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        None => problems.push("known_peers must be a list".to_string()),
+        None => problems.push("known_peers must be a list".to_owned()),
     }
 
     match object
@@ -803,7 +803,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        _ => problems.push("remote_network_checklist must be a non-empty list".to_string()),
+        _ => problems.push("remote_network_checklist must be a non-empty list".to_owned()),
     }
 
     problems
@@ -814,14 +814,14 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
 
 fn render_markdown(results: &[(PathBuf, Vec<String>)]) -> String {
     let mut lines = vec![
-        "# Network Discovery Bundle Validation".to_string(),
+        "# Network Discovery Bundle Validation".to_owned(),
         String::new(),
     ];
     for (bundle_path, errors) in results {
         lines.push(format!("## `{}`", bundle_path.display()));
         lines.push(String::new());
         if errors.is_empty() {
-            lines.push("- Validation passed.".to_string());
+            lines.push("- Validation passed.".to_owned());
         } else {
             for error in errors {
                 lines.push(format!("- {error}"));
@@ -848,10 +848,10 @@ pub fn execute_ops_validate_network_discovery_bundle(
     config: ValidateNetworkDiscoveryBundleConfig,
 ) -> Result<String, String> {
     if config.max_age_seconds == 0 {
-        return Err("--max-age-seconds must be > 0".to_string());
+        return Err("--max-age-seconds must be > 0".to_owned());
     }
     if config.bundles.is_empty() {
-        return Err("at least one bundle path is required (--bundle or --bundles)".to_string());
+        return Err("at least one bundle path is required (--bundle or --bundles)".to_owned());
     }
 
     let validation_config = ValidationConfig {
@@ -896,7 +896,7 @@ pub fn execute_ops_validate_network_discovery_bundle(
     }
 
     if overall_errors.is_empty() {
-        Ok("network discovery bundle validation passed".to_string())
+        Ok("network discovery bundle validation passed".to_owned())
     } else {
         Err(overall_errors.join("\n"))
     }
@@ -1125,7 +1125,7 @@ mod tests {
             deserialize_sub_block(&object, "nat_profile");
         assert!(matches!(missing, Ok(None)));
 
-        object.insert("nat_profile".to_string(), Value::String("oops".to_string()));
+        object.insert("nat_profile".to_owned(), Value::String("oops".to_owned()));
         let wrong: Result<Option<NatProfileView>, String> =
             deserialize_sub_block(&object, "nat_profile");
         let err = wrong.expect_err("string sub-block must surface invalid field shape");
@@ -1134,7 +1134,7 @@ mod tests {
             "error must prefix with sub-block key: {err}"
         );
 
-        object.insert("nat_profile".to_string(), json!({ "behind_nat": false }));
+        object.insert("nat_profile".to_owned(), json!({ "behind_nat": false }));
         let present: Result<Option<NatProfileView>, String> =
             deserialize_sub_block(&object, "nat_profile");
         let view = present

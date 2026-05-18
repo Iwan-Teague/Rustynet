@@ -26,7 +26,7 @@ impl OrchestrationStage for BootstrapHostsStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let source = match ctx.source_archive.clone() {
             Some(s) => s,
-            None => return StageOutcome::Failed("no source archive in context".to_string()),
+            None => return StageOutcome::Failed("no source archive in context".to_owned()),
         };
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results: Vec<(String, Result<(), String>)> = aliases
@@ -68,7 +68,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

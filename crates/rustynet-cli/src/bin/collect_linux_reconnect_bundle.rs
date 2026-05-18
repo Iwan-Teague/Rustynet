@@ -69,7 +69,7 @@ impl Default for Config {
         Self {
             output_path: None,
             probe_targets: Vec::new(),
-            wg_interface: DEFAULT_WG_INTERFACE.to_string(),
+            wg_interface: DEFAULT_WG_INTERFACE.to_owned(),
             daemon_socket: PathBuf::from(DEFAULT_DAEMON_SOCKET),
             journal_lines: DEFAULT_JOURNAL_LINES,
             sudo_mode: SudoMode::Auto,
@@ -224,7 +224,7 @@ fn ensure_linux() -> Result<(), String> {
     if env::consts::OS == "linux" {
         Ok(())
     } else {
-        Err("this collector only supports Linux hosts".to_string())
+        Err("this collector only supports Linux hosts".to_owned())
     }
 }
 
@@ -261,7 +261,7 @@ where
                     .parse::<usize>()
                     .map_err(|_| format!("invalid --journal-lines value: {value}"))?;
                 if config.journal_lines == 0 {
-                    return Err("--journal-lines must be greater than zero".to_string());
+                    return Err("--journal-lines must be greater than zero".to_owned());
                 }
             }
             "--sudo" => {
@@ -300,19 +300,19 @@ impl SudoContext {
         match mode {
             SudoMode::Never => Ok(Self {
                 enabled: false,
-                summary: "sudo disabled by operator request".to_string(),
+                summary: "sudo disabled by operator request".to_owned(),
             }),
             SudoMode::Auto | SudoMode::Always => {
                 if !command_exists("sudo") {
                     if mode == SudoMode::Always {
                         return Err(
-                            "sudo is not available but --sudo=always was requested".to_string()
+                            "sudo is not available but --sudo=always was requested".to_owned()
                         );
                     }
                     return Ok(Self {
                         enabled: false,
                         summary: "sudo not available; privileged probes will run unprivileged"
-                            .to_string(),
+                            .to_owned(),
                     });
                 }
 
@@ -325,7 +325,7 @@ impl SudoContext {
                 match validation {
                     Ok(status) if status.success() => Ok(Self {
                         enabled: true,
-                        summary: "sudo available; privileged probes enabled".to_string(),
+                        summary: "sudo available; privileged probes enabled".to_owned(),
                     }),
                     Ok(status) => {
                         if mode == SudoMode::Always {
@@ -533,8 +533,8 @@ fn build_report(
         "State File mtimes",
         &run_command(
             CommandSpec {
-                display: "stat -c %n size=%s mtime=%y <state_paths>".to_string(),
-                program: "stat".to_string(),
+                display: "stat -c %n size=%s mtime=%y <state_paths>".to_owned(),
+                program: "stat".to_owned(),
                 args: build_stat_args(),
                 current_dir: None,
                 env: Vec::new(),
@@ -566,7 +566,7 @@ fn build_report(
         report,
         "- probe_targets: {}",
         if resolved_probe_targets.is_empty() {
-            "none".to_string()
+            "none".to_owned()
         } else {
             resolved_probe_targets.join(", ")
         }
@@ -627,8 +627,8 @@ fn build_report(
 }
 
 fn build_stat_args() -> Vec<String> {
-    let mut args = vec!["-c".to_string(), "%n size=%s mtime=%y".to_string()];
-    args.extend(STATE_PATHS.iter().map(|path| (*path).to_string()));
+    let mut args = vec!["-c".to_owned(), "%n size=%s mtime=%y".to_owned()];
+    args.extend(STATE_PATHS.iter().map(|path| (*path).to_owned()));
     args
 }
 
@@ -643,7 +643,7 @@ fn resolve_probe_targets(
     for target in &config.probe_targets {
         let trimmed = target.trim();
         if !trimmed.is_empty() {
-            targets.insert(trimmed.to_string());
+            targets.insert(trimmed.to_owned());
         }
     }
 
@@ -756,7 +756,7 @@ fn parse_private_probe_cidr_or_ip(value: &str) -> Option<String> {
 fn parse_private_probe_ipv4(value: &str) -> Option<String> {
     let octets = parse_ipv4_octets(value)?;
     if is_private_or_mesh_ipv4(&octets) {
-        Some(value.to_string())
+        Some(value.to_owned())
     } else {
         None
     }
@@ -798,9 +798,9 @@ struct CommandSpec {
 impl CommandSpec {
     fn plain(display: &str, program: &str, args: &[&str]) -> Self {
         Self {
-            display: display.to_string(),
-            program: program.to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            display: display.to_owned(),
+            program: program.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             current_dir: None,
             env: Vec::new(),
             privilege: Privilege::PlainOnly,
@@ -809,9 +809,9 @@ impl CommandSpec {
 
     fn prefer_root(display: &str, program: &str, args: &[&str]) -> Self {
         Self {
-            display: display.to_string(),
-            program: program.to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            display: display.to_owned(),
+            program: program.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             current_dir: None,
             env: Vec::new(),
             privilege: Privilege::PreferRoot,
@@ -829,9 +829,9 @@ fn run_first_success(specs: &[CommandSpec], sudo: &SudoContext) -> CommandRecord
         last = Some(record);
     }
     last.unwrap_or_else(|| CommandRecord {
-        command_display: "(no command)".to_string(),
+        command_display: "(no command)".to_owned(),
         exit_code: None,
-        output: "no commands were attempted".to_string(),
+        output: "no commands were attempted".to_owned(),
         ran_with_sudo: false,
     })
 }
@@ -844,25 +844,25 @@ fn run_rustynet_command(
     display: &str,
 ) -> CommandRecord {
     let mut args = vec![
-        "run".to_string(),
-        "--quiet".to_string(),
-        "-p".to_string(),
-        "rustynet-cli".to_string(),
-        "--bin".to_string(),
-        "rustynet-cli".to_string(),
-        "--".to_string(),
-        subcommand.to_string(),
+        "run".to_owned(),
+        "--quiet".to_owned(),
+        "-p".to_owned(),
+        "rustynet-cli".to_owned(),
+        "--bin".to_owned(),
+        "rustynet-cli".to_owned(),
+        "--".to_owned(),
+        subcommand.to_owned(),
     ];
-    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
+    args.extend(extra_args.iter().map(|arg| (*arg).to_owned()));
 
     run_command(
         CommandSpec {
-            display: display.to_string(),
-            program: "cargo".to_string(),
+            display: display.to_owned(),
+            program: "cargo".to_owned(),
             args,
             current_dir: Some(repo_root.to_path_buf()),
             env: vec![(
-                "RUSTYNET_DAEMON_SOCKET".to_string(),
+                "RUSTYNET_DAEMON_SOCKET".to_owned(),
                 daemon_socket.display().to_string(),
             )],
             privilege: Privilege::PlainOnly,
@@ -932,10 +932,10 @@ fn status_code(status: ExitStatus) -> i32 {
 }
 
 fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
     match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => "(no output)".to_string(),
+        (true, true) => "(no output)".to_owned(),
         (false, true) => stdout,
         (true, false) => format!("[stderr]\n{stderr}"),
         (false, false) => format!("{stdout}\n\n[stderr]\n{stderr}"),
@@ -952,7 +952,7 @@ fn append_command_section(report: &mut String, title: &str, record: &CommandReco
         "- exit_code: {}",
         record
             .exit_code
-            .map_or_else(|| "launch_error".to_string(), |value| value.to_string())
+            .map_or_else(|| "launch_error".to_owned(), |value| value.to_string())
     )
     .unwrap();
     writeln!(
@@ -979,7 +979,7 @@ fn append_filtered_command_section(
             command_display: record.command_display.clone(),
             exit_code: record.exit_code,
             output: if filtered.trim().is_empty() {
-                "(no matching lines)".to_string()
+                "(no matching lines)".to_owned()
             } else {
                 filtered
             },
@@ -1004,7 +1004,7 @@ fn append_filtered_env_section(
             command_display: record.command_display.clone(),
             exit_code: record.exit_code,
             output: if filtered.trim().is_empty() {
-                "(no allowed keys present)".to_string()
+                "(no allowed keys present)".to_owned()
             } else {
                 filtered
             },
@@ -1066,7 +1066,7 @@ fn filter_env_lines(output: &str, allowed_keys: &[&str], allowed_prefixes: &[&st
                     .iter()
                     .any(|prefix| key.starts_with(prefix)))
         {
-            retained.push(trimmed.to_string());
+            retained.push(trimmed.to_owned());
         }
     }
     retained.join("\n")
@@ -1099,7 +1099,7 @@ fn collect_utc_timestamp() -> Result<String, String> {
             status_code(output.status)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn collect_unix_timestamp() -> Result<u64, String> {
@@ -1175,7 +1175,7 @@ fn write_private_file(_path: &Path, _contents: &[u8]) -> io::Result<()> {
 
 fn temporary_path(path: &Path) -> PathBuf {
     let file_name = path.file_name().map_or_else(
-        || DEFAULT_OUTPUT_PREFIX.to_string(),
+        || DEFAULT_OUTPUT_PREFIX.to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
     path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
@@ -1242,7 +1242,7 @@ mod tests {
         assert_eq!(result, ParseResult::Config);
         assert_eq!(
             config.probe_targets,
-            vec!["100.109.33.213".to_string(), "192.168.64.22".to_string()]
+            vec!["100.109.33.213".to_owned(), "192.168.64.22".to_owned()]
         );
         assert_eq!(config.wg_interface, "wg-test0");
         assert_eq!(config.daemon_socket, PathBuf::from("/tmp/rustynetd.sock"));
@@ -1291,27 +1291,27 @@ tcp   LISTEN 0      128    127.0.0.1:8080  0.0.0.0:*     users:((\"python\",pid=
     #[test]
     fn auto_probe_targets_are_discovered_from_private_state() {
         let routes = CommandRecord {
-            command_display: "ip route".to_string(),
+            command_display: "ip route".to_owned(),
             exit_code: Some(0),
-            output: "default via 192.168.64.1 dev eth0\n10.0.0.0/24 dev rustynet0".to_string(),
+            output: "default via 192.168.64.1 dev eth0\n10.0.0.0/24 dev rustynet0".to_owned(),
             ran_with_sudo: false,
         };
         let route_table = CommandRecord {
-            command_display: "ip route show table 51820".to_string(),
+            command_display: "ip route show table 51820".to_owned(),
             exit_code: Some(0),
-            output: "100.109.33.213 dev rustynet0 scope link\n1.1.1.1 dev rustynet0".to_string(),
+            output: "100.109.33.213 dev rustynet0 scope link\n1.1.1.1 dev rustynet0".to_owned(),
             ran_with_sudo: false,
         };
         let wg_endpoints = CommandRecord {
-            command_display: "wg show rustynet0 endpoints".to_string(),
+            command_display: "wg show rustynet0 endpoints".to_owned(),
             exit_code: Some(0),
-            output: "peer-a\t192.168.64.22:51820\npeer-b\t203.0.113.10:51820".to_string(),
+            output: "peer-a\t192.168.64.22:51820\npeer-b\t203.0.113.10:51820".to_owned(),
             ran_with_sudo: false,
         };
         let wg_allowed_ips = CommandRecord {
-            command_display: "wg show rustynet0 allowed-ips".to_string(),
+            command_display: "wg show rustynet0 allowed-ips".to_owned(),
             exit_code: Some(0),
-            output: "peer-a\t100.109.33.213/32, 0.0.0.0/0\npeer-b\t192.168.128.30/32".to_string(),
+            output: "peer-a\t100.109.33.213/32, 0.0.0.0/0\npeer-b\t192.168.128.30/32".to_owned(),
             ran_with_sudo: false,
         };
 
@@ -1320,10 +1320,10 @@ tcp   LISTEN 0      128    127.0.0.1:8080  0.0.0.0:*     users:((\"python\",pid=
         assert_eq!(
             targets,
             vec![
-                "100.109.33.213".to_string(),
-                "192.168.128.30".to_string(),
-                "192.168.64.1".to_string(),
-                "192.168.64.22".to_string()
+                "100.109.33.213".to_owned(),
+                "192.168.128.30".to_owned(),
+                "192.168.64.1".to_owned(),
+                "192.168.64.22".to_owned()
             ]
         );
     }

@@ -118,14 +118,14 @@ mod tests {
     fn report_serde_round_trips() {
         let report = MacosMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_MACOS_STATE_PATH.to_string(),
+            state_path: DEFAULT_MACOS_STATE_PATH.to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::Missing {
-                reason: "not found".to_string(),
+                reason: "not found".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec!["state file missing".to_string()],
+            drift_reasons: vec!["state file missing".to_owned()],
         };
         let json = serde_json::to_string(&report).expect("serialize");
         let parsed: MacosMeshStatusReport = serde_json::from_str(&json).expect("deserialize");
@@ -193,16 +193,16 @@ mod tests {
         // change on WindowsMeshSnapshotLoad::Ok trips this test.
         let report = MacosMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_MACOS_STATE_PATH.to_string(),
+            state_path: DEFAULT_MACOS_STATE_PATH.to_owned(),
             overall_ok: true,
             snapshot: WindowsMeshSnapshotLoad::Ok {
                 timestamp_unix: 1_700_000_000,
                 age_seconds: 30,
-                peer_ids: vec!["peer-a".to_string()],
-                selected_exit_node: Some("peer-a".to_string()),
+                peer_ids: vec!["peer-a".to_owned()],
+                selected_exit_node: Some("peer-a".to_owned()),
                 lan_access_enabled: false,
             },
-            expected_peer_ids: vec!["peer-a".to_string()],
+            expected_peer_ids: vec!["peer-a".to_owned()],
             max_age_seconds: Some(300),
             drift_reasons: Vec::new(),
         };
@@ -219,14 +219,14 @@ mod tests {
     fn report_integrity_mismatch_snapshot_round_trips_through_serde() {
         let report = MacosMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_MACOS_STATE_PATH.to_string(),
+            state_path: DEFAULT_MACOS_STATE_PATH.to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::IntegrityMismatch {
-                reason: "checksum mismatch".to_string(),
+                reason: "checksum mismatch".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec!["state snapshot integrity mismatch: checksum mismatch".to_string()],
+            drift_reasons: vec!["state snapshot integrity mismatch: checksum mismatch".to_owned()],
         };
         let body = serde_json::to_string(&report).expect("serialize");
         assert!(
@@ -241,16 +241,14 @@ mod tests {
     fn report_invalid_format_snapshot_round_trips_through_serde() {
         let report = MacosMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_MACOS_STATE_PATH.to_string(),
+            state_path: DEFAULT_MACOS_STATE_PATH.to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::InvalidFormat {
-                reason: "missing required field".to_string(),
+                reason: "missing required field".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec![
-                "state snapshot invalid format: missing required field".to_string(),
-            ],
+            drift_reasons: vec!["state snapshot invalid format: missing required field".to_owned()],
         };
         let body = serde_json::to_string(&report).expect("serialize");
         assert!(

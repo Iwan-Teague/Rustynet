@@ -50,7 +50,7 @@ fn run() -> Result<(), String> {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     if !args.is_empty() {
         return Err(
-            "test_validate_cross_network_remote_exit_reports does not accept options".to_string(),
+            "test_validate_cross_network_remote_exit_reports does not accept options".to_owned(),
         );
     }
 
@@ -123,12 +123,12 @@ fn get_head_commit(root_dir: &Path) -> Result<OsString, String> {
         .output()
         .map_err(|err| format!("failed to run git rev-parse HEAD: {err}"))?;
     if !output.status.success() {
-        return Err("git rev-parse HEAD failed".to_string());
+        return Err("git rev-parse HEAD failed".to_owned());
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err("git rev-parse HEAD returned empty output".to_string());
+        return Err("git rev-parse HEAD returned empty output".to_owned());
     }
     Ok(OsString::from(trimmed))
 }

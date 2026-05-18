@@ -42,7 +42,7 @@ dns-failclosed-check not implemented for iOS; \
 fn ios_unsupported() -> AdapterError {
     AdapterError::UnsupportedPlatform {
         platform: VmGuestPlatform::Ios,
-        message: IOS_UNSUPPORTED_MSG.to_string(),
+        message: IOS_UNSUPPORTED_MSG.to_owned(),
     }
 }
 
@@ -116,7 +116,7 @@ impl NodeAdapter for IosNodeAdapter {
         Err(ios_unsupported())
     }
     fn endpoint(&self) -> String {
-        "0.0.0.0:0".to_string()
+        "0.0.0.0:0".to_owned()
     }
     fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
         Err(ios_unsupported())

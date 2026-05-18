@@ -192,7 +192,7 @@ struct CheckReport {
 impl CheckReport {
     fn add(&mut self, name: &str, status: &str, detail: String) {
         self.checks
-            .push((name.to_string(), status.to_string(), detail));
+            .push((name.to_owned(), status.to_owned(), detail));
         if status != "PASS" {
             self.fail_count += 1;
         }
@@ -744,7 +744,7 @@ pub fn execute_ops_e2e_enforce_host(
 /// On non-Windows hosts this always returns an error.
 #[cfg(not(windows))]
 pub fn execute_ops_install_windows_service() -> Result<String, String> {
-    Err("ops install-windows-service is only supported on Windows hosts".to_string())
+    Err("ops install-windows-service is only supported on Windows hosts".to_owned())
 }
 
 /// Install the `rustynet-relay` Windows service.
@@ -756,7 +756,7 @@ pub fn execute_ops_install_windows_service() -> Result<String, String> {
 /// On non-Windows hosts this always returns an error.
 #[cfg(not(windows))]
 pub fn execute_ops_install_windows_relay_service() -> Result<String, String> {
-    Err("ops install-windows-relay-service is only supported on Windows hosts".to_string())
+    Err("ops install-windows-relay-service is only supported on Windows hosts".to_owned())
 }
 
 /// Uninstall the `rustynet-relay` Windows service.
@@ -768,7 +768,7 @@ pub fn execute_ops_install_windows_relay_service() -> Result<String, String> {
 /// On non-Windows hosts this always returns an error.
 #[cfg(not(windows))]
 pub fn execute_ops_uninstall_windows_relay_service() -> Result<String, String> {
-    Err("ops uninstall-windows-relay-service is only supported on Windows hosts".to_string())
+    Err("ops uninstall-windows-relay-service is only supported on Windows hosts".to_owned())
 }
 
 /// Install the `rustynetd` Windows service.
@@ -1464,7 +1464,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
 
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     if nodes.len() < 2 {
-        return Err("traversal issue requires at least two nodes in NODES_SPEC".to_string());
+        return Err("traversal issue requires at least two nodes in NODES_SPEC".to_owned());
     }
     let endpoints_by_node = nodes
         .iter()
@@ -1581,7 +1581,7 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
     let zone_name = env_values
         .get("DNS_ZONE_NAME")
         .cloned()
-        .unwrap_or_else(|| "rustynet".to_string());
+        .unwrap_or_else(|| "rustynet".to_owned());
     ensure_safe_token("dns-zone-name", zone_name.as_str())?;
     let ttl_secs = env_values
         .get("DNS_ZONE_TTL_SECS")
@@ -1600,7 +1600,7 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
 
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     if nodes.is_empty() {
-        return Err("dns zone issue requires at least one node in NODES_SPEC".to_string());
+        return Err("dns zone issue requires at least one node in NODES_SPEC".to_owned());
     }
     let known_node_ids = nodes
         .iter()
@@ -1706,7 +1706,7 @@ fn parse_simple_env_content(
                 index + 1
             )
         })?;
-        if values.insert(key.to_string(), value).is_some() {
+        if values.insert(key.to_owned(), value).is_some() {
             return Err(format!("{label} contains duplicate key: {key}"));
         }
     }
@@ -1852,7 +1852,7 @@ pub(crate) fn issue_dns_zone_bundles_locally(
     let zone_name = env_values
         .get("DNS_ZONE_NAME")
         .cloned()
-        .unwrap_or_else(|| "rustynet".to_string());
+        .unwrap_or_else(|| "rustynet".to_owned());
     ensure_safe_token("dns-zone-name", zone_name.as_str())?;
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
@@ -1933,24 +1933,24 @@ fn issue_two_node_traversal_artifacts(
     let core = ControlPlaneCore::new(signing_secret.to_vec(), policy);
     core.nodes
         .upsert(NodeMetadata {
-            node_id: exit_node_id.to_string(),
-            hostname: exit_node_id.to_string(),
-            os: "linux".to_string(),
+            node_id: exit_node_id.to_owned(),
+            hostname: exit_node_id.to_owned(),
+            os: "linux".to_owned(),
             tags: Vec::new(),
-            owner: exit_node_id.to_string(),
-            endpoint: exit_endpoint.to_string(),
+            owner: exit_node_id.to_owned(),
+            endpoint: exit_endpoint.to_owned(),
             last_seen_unix: now_unix,
             public_key: decode_hex_32(exit_pubkey_hex)?,
         })
         .map_err(|err| format!("register exit node failed: {err}"))?;
     core.nodes
         .upsert(NodeMetadata {
-            node_id: client_node_id.to_string(),
-            hostname: client_node_id.to_string(),
-            os: "linux".to_string(),
+            node_id: client_node_id.to_owned(),
+            hostname: client_node_id.to_owned(),
+            os: "linux".to_owned(),
             tags: Vec::new(),
-            owner: client_node_id.to_string(),
-            endpoint: client_endpoint.to_string(),
+            owner: client_node_id.to_owned(),
+            endpoint: client_endpoint.to_owned(),
             last_seen_unix: now_unix,
             public_key: decode_hex_32(client_pubkey_hex)?,
         })
@@ -1958,40 +1958,40 @@ fn issue_two_node_traversal_artifacts(
 
     let exit_bundle = core
         .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
-            source_node_id: exit_node_id.to_string(),
-            target_node_id: client_node_id.to_string(),
+            source_node_id: exit_node_id.to_owned(),
+            target_node_id: client_node_id.to_owned(),
             generated_at_unix: now_unix,
             ttl_secs: 120,
             nonce: traversal_nonce(now_unix, 0),
             candidates: vec![EndpointHintCandidate {
                 candidate_type: EndpointHintCandidateType::Host,
-                endpoint: client_endpoint.to_string(),
+                endpoint: client_endpoint.to_owned(),
                 relay_id: None,
                 priority: 900,
             }],
         })
         .map_err(|err| format!("issue exit traversal bundle failed: {err}"))?;
     if !core.verify_signed_endpoint_hint_bundle(&exit_bundle) {
-        return Err("self-verify failed for exit traversal bundle".to_string());
+        return Err("self-verify failed for exit traversal bundle".to_owned());
     }
 
     let client_bundle = core
         .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
-            source_node_id: client_node_id.to_string(),
-            target_node_id: exit_node_id.to_string(),
+            source_node_id: client_node_id.to_owned(),
+            target_node_id: exit_node_id.to_owned(),
             generated_at_unix: now_unix,
             ttl_secs: 120,
             nonce: traversal_nonce(now_unix, 1),
             candidates: vec![EndpointHintCandidate {
                 candidate_type: EndpointHintCandidateType::Host,
-                endpoint: exit_endpoint.to_string(),
+                endpoint: exit_endpoint.to_owned(),
                 relay_id: None,
                 priority: 900,
             }],
         })
         .map_err(|err| format!("issue client traversal bundle failed: {err}"))?;
     if !core.verify_signed_endpoint_hint_bundle(&client_bundle) {
-        return Err("self-verify failed for client traversal bundle".to_string());
+        return Err("self-verify failed for client traversal bundle".to_owned());
     }
 
     Ok(TwoNodeTraversalArtifacts {
@@ -2024,7 +2024,7 @@ fn control_plane_core_from_generic_specs(
             .upsert(NodeMetadata {
                 node_id: node.node_id.clone(),
                 hostname: node.node_id.clone(),
-                os: "linux".to_string(),
+                os: "linux".to_owned(),
                 tags: Vec::new(),
                 owner: node.node_id.clone(),
                 endpoint: node.endpoint.clone(),
@@ -2055,7 +2055,7 @@ fn issue_assignment_bundle_artifacts(
                     generated_at_unix,
                     ttl_secs,
                     nonce: crate::generate_assignment_nonce().saturating_add(index as u64),
-                    mesh_cidr: "100.64.0.0/10".to_string(),
+                    mesh_cidr: "100.64.0.0/10".to_owned(),
                     exit_node_id: assignment.exit_node_id.clone(),
                     lan_routes: Vec::new(),
                 })
@@ -2239,7 +2239,7 @@ fn issue_dns_zone_bundle_artifacts(
                 .collect::<Result<Vec<_>, String>>()?;
             let bundle = core
                 .signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
-                    zone_name: zone_name.to_string(),
+                    zone_name: zone_name.to_owned(),
                     subject_node_id: subject.node_id.clone(),
                     generated_at_unix,
                     ttl_secs,
@@ -2272,9 +2272,9 @@ fn traversal_nonce(now_unix: u64, offset: u64) -> u64 {
 
 fn traversal_coordination_pair_key(left: &str, right: &str) -> (String, String) {
     if left <= right {
-        (left.to_string(), right.to_string())
+        (left.to_owned(), right.to_owned())
     } else {
-        (right.to_string(), left.to_string())
+        (right.to_owned(), left.to_owned())
     }
 }
 
@@ -2447,7 +2447,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         false,
     )?
     .trim()
-    .to_string();
+    .to_owned();
     let client_wg_pub = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
@@ -2462,10 +2462,10 @@ pub fn execute_ops_run_debian_two_node_e2e(
         false,
     )?
     .trim()
-    .to_string();
+    .to_owned();
     if exit_wg_pub.is_empty() || client_wg_pub.is_empty() {
         close_open_masters(ssh_opts.as_slice(), &open_targets);
-        return Err("failed to collect wireguard public keys".to_string());
+        return Err("failed to collect wireguard public keys".to_owned());
     }
     let exit_wg_pub_hex = base64_to_hex(exit_wg_pub.as_str())?;
     let client_wg_pub_hex = base64_to_hex(client_wg_pub.as_str())?;
@@ -3012,7 +3012,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     )?;
     let exit_tunnel_ip = extract_first_ipv4(exit_tunnel_addr_output.as_str())
         .unwrap_or_default()
-        .to_string();
+        .to_owned();
     let exit_assignment_timer_state = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
@@ -3027,7 +3027,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         true,
     )?
     .trim()
-    .to_string();
+    .to_owned();
     let client_assignment_timer_state = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
@@ -3042,7 +3042,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         true,
     )?
     .trim()
-    .to_string();
+    .to_owned();
 
     if !exit_tunnel_ip.is_empty() {
         run_remote_program_checked(
@@ -3295,7 +3295,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "exit-assignment-refresh-timer",
             "PASS",
-            "rustynetd-assignment-refresh.timer is active".to_string(),
+            "rustynetd-assignment-refresh.timer is active".to_owned(),
         );
     } else {
         report.add(
@@ -3315,7 +3315,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "client-assignment-refresh-timer",
             "PASS",
-            "rustynetd-assignment-refresh.timer is active".to_string(),
+            "rustynetd-assignment-refresh.timer is active".to_owned(),
         );
     } else {
         report.add(
@@ -3335,7 +3335,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "exit-tunnel-ip",
             "FAIL",
-            "unable to detect tunnel IP".to_string(),
+            "unable to detect tunnel IP".to_owned(),
         );
     } else {
         report.add("exit-tunnel-ip", "PASS", exit_tunnel_ip.clone());
@@ -3354,13 +3354,13 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "wg-latest-handshake",
             "PASS",
-            "latest-handshakes includes non-zero timestamp".to_string(),
+            "latest-handshakes includes non-zero timestamp".to_owned(),
         );
     } else {
         report.add(
             "wg-latest-handshake",
             "FAIL",
-            "no non-zero handshake timestamp observed".to_string(),
+            "no non-zero handshake timestamp observed".to_owned(),
         );
     }
 
@@ -3368,13 +3368,13 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "no-plaintext-passphrase-files",
             "PASS",
-            "legacy plaintext passphrase files absent".to_string(),
+            "legacy plaintext passphrase files absent".to_owned(),
         );
     } else {
         report.add(
             "no-plaintext-passphrase-files",
             "FAIL",
-            "found plaintext passphrase file(s)".to_string(),
+            "found plaintext passphrase file(s)".to_owned(),
         );
     }
 
@@ -3382,7 +3382,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "credential-blob-permissions",
             "PASS",
-            "wg credential blob mode is 0600 root:root on both hosts".to_string(),
+            "wg credential blob mode is 0600 root:root on both hosts".to_owned(),
         );
     } else {
         report.add(
@@ -3396,7 +3396,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "signing-credential-blob-permissions",
             "PASS",
-            "signing credential blob mode is 0600 root:root on both hosts".to_string(),
+            "signing credential blob mode is 0600 root:root on both hosts".to_owned(),
         );
     } else {
         report.add(
@@ -3410,7 +3410,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "encrypted-key-permissions",
             "PASS",
-            "encrypted key mode is 0600 rustynetd:rustynetd on both hosts".to_string(),
+            "encrypted key mode is 0600 rustynetd:rustynetd on both hosts".to_owned(),
         );
     } else {
         report.add(
@@ -3426,7 +3426,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "assignment-signing-secret-permissions",
             "PASS",
-            "encrypted assignment signing secret mode is 0600 root:root on both hosts".to_string(),
+            "encrypted assignment signing secret mode is 0600 root:root on both hosts".to_owned(),
         );
     } else {
         report.add(
@@ -3440,7 +3440,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         report.add(
             "trust-signer-key-permissions",
             "PASS",
-            "encrypted trust signer key mode is 0600 root:root on both hosts".to_string(),
+            "encrypted trust signer key mode is 0600 root:root on both hosts".to_owned(),
         );
     } else {
         report.add(
@@ -3470,9 +3470,9 @@ pub fn execute_ops_run_debian_two_node_e2e(
             format!(
                 "generated_at before={} after={}",
                 exit_assignment_generated_before
-                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
                 exit_assignment_generated_after
-                    .map_or_else(|| "none".to_string(), |value| value.to_string())
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string())
             ),
         );
     }
@@ -3497,9 +3497,9 @@ pub fn execute_ops_run_debian_two_node_e2e(
             format!(
                 "generated_at before={} after={}",
                 client_assignment_generated_before
-                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
                 client_assignment_generated_after
-                    .map_or_else(|| "none".to_string(), |value| value.to_string())
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string())
             ),
         );
     }
@@ -3546,7 +3546,7 @@ fn validate_config(config: &DebianTwoNodeE2eConfig) -> Result<(), String> {
         || config.client_host.trim().is_empty()
         || config.ssh_allow_cidrs.trim().is_empty()
     {
-        return Err("--exit-host, --client-host, and --ssh-allow-cidrs are required".to_string());
+        return Err("--exit-host, --client-host, and --ssh-allow-cidrs are required".to_owned());
     }
     if !config.remote_root.is_absolute() {
         return Err(format!(
@@ -3656,7 +3656,7 @@ fn load_simple_env_file(path: &Path, label: &str) -> Result<BTreeMap<String, Str
                 index + 1
             )
         })?;
-        if values.insert(key.to_string(), value).is_some() {
+        if values.insert(key.to_owned(), value).is_some() {
             return Err(format!("{label} contains duplicate key: {key}"));
         }
     }
@@ -3698,13 +3698,13 @@ fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, S
         ensure_safe_token("endpoint", endpoint)?;
         ensure_hex_32("node-public-key-hex", public_key_hex)?;
         nodes.push(GenericTraversalNodeSpec {
-            node_id: node_id.to_string(),
-            endpoint: endpoint.to_string(),
+            node_id: node_id.to_owned(),
+            endpoint: endpoint.to_owned(),
             public_key: decode_hex_32(public_key_hex)?,
         });
     }
     if nodes.is_empty() {
-        return Err("NODES_SPEC must include at least one node".to_string());
+        return Err("NODES_SPEC must include at least one node".to_owned());
     }
     Ok(nodes)
 }
@@ -3724,12 +3724,12 @@ fn parse_generic_allow_specs(encoded: &str) -> Result<Vec<GenericTraversalAllowS
         ensure_safe_token("source-node-id", source_node_id)?;
         ensure_safe_token("target-node-id", target_node_id)?;
         pairs.push(GenericTraversalAllowSpec {
-            source_node_id: source_node_id.to_string(),
-            target_node_id: target_node_id.to_string(),
+            source_node_id: source_node_id.to_owned(),
+            target_node_id: target_node_id.to_owned(),
         });
     }
     if pairs.is_empty() {
-        return Err("ALLOW_SPEC must include at least one allow pair".to_string());
+        return Err("ALLOW_SPEC must include at least one allow pair".to_owned());
     }
     Ok(pairs)
 }
@@ -3751,16 +3751,16 @@ fn parse_generic_assignment_specs(encoded: &str) -> Result<Vec<GenericAssignment
             "" | "-" => None,
             value => {
                 ensure_safe_token("exit-node-id", value)?;
-                Some(value.to_string())
+                Some(value.to_owned())
             }
         };
         assignments.push(GenericAssignmentSpec {
-            target_node_id: target_node_id.to_string(),
+            target_node_id: target_node_id.to_owned(),
             exit_node_id,
         });
     }
     if assignments.is_empty() {
-        return Err("ASSIGNMENTS_SPEC must include at least one target".to_string());
+        return Err("ASSIGNMENTS_SPEC must include at least one target".to_owned());
     }
     Ok(assignments)
 }
@@ -3823,8 +3823,8 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
     ensure_hex_32("hex", value)?;
     let mut out = [0u8; 32];
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        let hi = decode_hex_nibble(chunk[0]).ok_or_else(|| "invalid hex".to_string())?;
-        let lo = decode_hex_nibble(chunk[1]).ok_or_else(|| "invalid hex".to_string())?;
+        let hi = decode_hex_nibble(chunk[0]).ok_or_else(|| "invalid hex".to_owned())?;
+        let lo = decode_hex_nibble(chunk[1]).ok_or_else(|| "invalid hex".to_owned())?;
         out[index] = (hi << 4) | lo;
     }
     Ok(out)
@@ -3844,7 +3844,7 @@ fn e2e_backend_mode_from_env() -> Result<Option<String>, String> {
         Ok(value) => parse_e2e_backend_mode_value(value.as_str()).map(|ok| ok.map(str::to_owned)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
-            Err("RUSTYNET_BACKEND must be valid UTF-8".to_string())
+            Err("RUSTYNET_BACKEND must be valid UTF-8".to_owned())
         }
     }
 }
@@ -3870,7 +3870,7 @@ fn ensure_running_as_root() -> Result<(), String> {
     if Uid::effective().is_root() {
         return Ok(());
     }
-    Err("this operation requires root".to_string())
+    Err("this operation requires root".to_owned())
 }
 
 /// On Windows, `net session` succeeds only when the caller holds a local
@@ -3904,10 +3904,10 @@ fn run_status(
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let detail = match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => "no stdout/stderr output".to_string(),
+        (true, true) => "no stdout/stderr output".to_owned(),
         (true, false) => format!("stderr={stderr}"),
         (false, true) => format!("stdout={stdout}"),
         (false, false) => format!("stdout={stdout}; stderr={stderr}"),
@@ -4086,7 +4086,7 @@ fn parse_os_release_value(contents: &str, key: &str) -> String {
     contents
         .lines()
         .find_map(|line| line.strip_prefix(prefix.as_str()))
-        .map(|value| value.trim_matches('"').to_string())
+        .map(|value| value.trim_matches('"').to_owned())
         .unwrap_or_default()
 }
 
@@ -4106,7 +4106,7 @@ fn rust_toolchain_channel(repo_root: &Path) -> Result<String, String> {
         let Some((_, value)) = trimmed.split_once('=') else {
             continue;
         };
-        let channel = value.trim().trim_matches('"').to_string();
+        let channel = value.trim().trim_matches('"').to_owned();
         if !channel.is_empty() {
             return Ok(channel);
         }
@@ -4146,7 +4146,7 @@ fn rustup_bootstrap_path() -> Result<PathBuf, String> {
             return Ok(path);
         }
     }
-    Err("missing rustup bootstrap binary; expected rustup or rustup-init".to_string())
+    Err("missing rustup bootstrap binary; expected rustup or rustup-init".to_owned())
 }
 
 fn ensure_pinned_rust_toolchain(repo_root: &Path) -> Result<String, String> {
@@ -4225,7 +4225,7 @@ fn ensure_pinned_rust_toolchain(repo_root: &Path) -> Result<String, String> {
     )
     .map_err(|err| format!("verifying pinned rust toolchain failed: {err}"))?;
     if rustc_version.trim().is_empty() {
-        return Err("pinned rust toolchain verification returned empty rustc version".to_string());
+        return Err("pinned rust toolchain verification returned empty rustc version".to_owned());
     }
     rustup_proxy_path("cargo")?;
     rustup_proxy_path("rustc")?;
@@ -4243,9 +4243,9 @@ fn resolve_repo_root() -> Result<PathBuf, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if root.is_empty() {
-        return Err("repository root path is empty".to_string());
+        return Err("repository root path is empty".to_owned());
     }
     Ok(PathBuf::from(root))
 }
@@ -4272,7 +4272,7 @@ fn rev_parse_short(repo_root: &Path, repo_ref: &str) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn ensure_command_exists(command: &str) -> Result<(), String> {
@@ -4325,7 +4325,7 @@ fn resolve_ssh_known_hosts_file(path: Option<&Path>) -> Result<PathBuf, String> 
         let Some(home) = env::var_os("HOME") else {
             return Err(
                 "missing pinned known_hosts file; provide --ssh-known-hosts-file or set HOME"
-                    .to_string(),
+                    .to_owned(),
             );
         };
         PathBuf::from(home).join(".ssh/known_hosts")
@@ -4365,7 +4365,7 @@ fn resolve_ssh_known_hosts_file(path: Option<&Path>) -> Result<PathBuf, String> 
 
 fn ensure_known_hosts_has_entry(known_hosts: &Path, host: &str, port: u16) -> Result<(), String> {
     let lookup_host = if port == 22 {
-        host.to_string()
+        host.to_owned()
     } else {
         format!("[{host}]:{port}")
     };
@@ -4405,20 +4405,20 @@ fn clear_rustynet_nftables_state() -> Result<(), String> {
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    Err("residual rustynet nftables state remained after cleanup".to_string())
+    Err("residual rustynet nftables state remained after cleanup".to_owned())
 }
 
 fn qualify_target(raw: &str, ssh_user: &str) -> Target {
     if raw.contains('@') {
-        let address = raw.split('@').nth(1).unwrap_or_default().to_string();
+        let address = raw.split('@').nth(1).unwrap_or_default().to_owned();
         return Target {
-            qualified: raw.to_string(),
+            qualified: raw.to_owned(),
             address,
         };
     }
     Target {
         qualified: format!("{ssh_user}@{raw}"),
-        address: raw.to_string(),
+        address: raw.to_owned(),
     }
 }
 
@@ -4436,7 +4436,7 @@ fn load_sudo_password(path: Option<&Path>, required: bool) -> Result<String, Str
     }
     let Some(path) = path else {
         return Err(
-            "sudo is required for non-root SSH targets; provide --sudo-password-file".to_string(),
+            "sudo is required for non-root SSH targets; provide --sudo-password-file".to_owned(),
         );
     };
     let metadata = fs::symlink_metadata(path)
@@ -4470,10 +4470,10 @@ fn load_sudo_password(path: Option<&Path>, required: bool) -> Result<String, Str
         .next()
         .unwrap_or_default()
         .trim()
-        .to_string();
+        .to_owned();
     if first_line.is_empty() {
         return Err(
-            "--sudo-password-file must contain a non-empty password on first line".to_string(),
+            "--sudo-password-file must contain a non-empty password on first line".to_owned(),
         );
     }
     Ok(first_line)
@@ -4557,7 +4557,7 @@ fn create_git_archive(repo_root: &Path, repo_ref: &str, output_path: &Path) -> R
         .status()
         .map_err(|err| format!("git archive failed to start: {err}"))?;
     if !status.success() {
-        return Err("git archive failed".to_string());
+        return Err("git archive failed".to_owned());
     }
     Ok(())
 }
@@ -5047,10 +5047,10 @@ fn run_remote_rustynet_ops_command(
     sudo_password: &str,
     ops_args: &[&str],
 ) -> Result<(), String> {
-    let mut remote_args = vec!["ops".to_string()];
+    let mut remote_args = vec!["ops".to_owned()];
     for arg in ops_args {
         ensure_safe_token("remote-arg", arg)?;
-        remote_args.push((*arg).to_string());
+        remote_args.push((*arg).to_owned());
     }
     let remote_refs = remote_args.iter().map(String::as_str).collect::<Vec<_>>();
     run_remote_program_command(
@@ -5200,7 +5200,7 @@ fn retry_remote_program(
             Err(err) => return Err(err),
         }
     }
-    Err("retry exhausted".to_string())
+    Err("retry exhausted".to_owned())
 }
 
 fn normalize_membership_permissions(
@@ -5257,10 +5257,10 @@ fn set_membership_state_permissions_local(owner_group: &str) -> Result<(), Strin
         .output()
         .map_err(|err| format!("membership state chown spawn failed: {err}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let detail = match (stdout.is_empty(), stderr.is_empty()) {
-            (true, true) => "no stdout/stderr output".to_string(),
+            (true, true) => "no stdout/stderr output".to_owned(),
             (true, false) => format!("stderr={stderr}"),
             (false, true) => format!("stdout={stdout}"),
             (false, false) => format!("stdout={stdout}; stderr={stderr}"),
@@ -5368,7 +5368,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         .filter(|ch| !ch.is_ascii_whitespace())
         .collect::<Vec<_>>();
     if clean.is_empty() || clean.len() % 4 != 0 {
-        return Err("invalid base64 wireguard public key".to_string());
+        return Err("invalid base64 wireguard public key".to_owned());
     }
     let mut output = Vec::with_capacity(clean.len() / 4 * 3);
     for chunk in clean.chunks(4) {
@@ -5381,7 +5381,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
             } else if let Some(value) = reverse.get(ch) {
                 sextets[index] = *value;
             } else {
-                return Err("invalid base64 wireguard public key".to_string());
+                return Err("invalid base64 wireguard public key".to_owned());
             }
         }
         let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
@@ -5549,9 +5549,9 @@ fn utc_timestamp() -> String {
         .output();
     match output {
         Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
         }
-        _ => "unknown".to_string(),
+        _ => "unknown".to_owned(),
     }
 }
 
@@ -5695,11 +5695,11 @@ mod tests {
             std::process::id()
         ));
         let env = AssignmentRefreshEnv {
-            target_node_id: "client-50".to_string(),
+            target_node_id: "client-50".to_owned(),
             nodes_spec: "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def"
-                .to_string(),
-            allow_spec: "client-50|exit-49;exit-49|client-50".to_string(),
-            exit_node_id: Some("exit-49".to_string()),
+                .to_owned(),
+            allow_spec: "client-50|exit-49;exit-49|client-50".to_owned(),
+            exit_node_id: Some("exit-49".to_owned()),
         };
         write_assignment_refresh_env(path.as_path(), env).expect("write assignment refresh env");
         let body = fs::read_to_string(path.as_path()).expect("read assignment refresh env");
@@ -5714,7 +5714,7 @@ mod tests {
 
     #[test]
     fn remote_sudo_prompt_is_non_empty() {
-        let prompt = REMOTE_SUDO_PROMPT.to_string();
+        let prompt = REMOTE_SUDO_PROMPT.to_owned();
         assert!(!prompt.is_empty());
     }
 

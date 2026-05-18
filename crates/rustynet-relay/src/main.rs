@@ -170,37 +170,37 @@ mod daemon {
     impl RelayConfig {
         fn validate(&self) -> Result<(), String> {
             if self.relay_id == [0; 16] {
-                return Err("--relay-id is required".to_string());
+                return Err("--relay-id is required".to_owned());
             }
             if self.verifier_key_path.trim().is_empty() {
-                return Err("--verifier-key is required".to_string());
+                return Err("--verifier-key is required".to_owned());
             }
             if self.replay_store_path.trim().is_empty() {
-                return Err("--replay-store is required".to_string());
+                return Err("--replay-store is required".to_owned());
             }
             if !Path::new(&self.verifier_key_path).is_absolute() {
-                return Err("--verifier-key must be an absolute path".to_string());
+                return Err("--verifier-key must be an absolute path".to_owned());
             }
             if !Path::new(&self.replay_store_path).is_absolute() {
-                return Err("--replay-store must be an absolute path".to_string());
+                return Err("--replay-store must be an absolute path".to_owned());
             }
             if self.bind_addr.port() == 0 {
-                return Err("--bind port must not be 0".to_string());
+                return Err("--bind port must not be 0".to_owned());
             }
             if self.port_range_start == 0 || self.port_range_end == 0 {
-                return Err("--port-range must not include port 0".to_string());
+                return Err("--port-range must not include port 0".to_owned());
             }
             if self.port_range_start > self.port_range_end {
-                return Err("--port-range start must be <= end".to_string());
+                return Err("--port-range start must be <= end".to_owned());
             }
             if (self.port_range_start..=self.port_range_end).contains(&self.bind_addr.port()) {
-                return Err("--port-range must not include the control bind port".to_string());
+                return Err("--port-range must not include the control bind port".to_owned());
             }
             if self.max_sessions_per_node == 0 {
-                return Err("--max-sessions-per-node must be greater than 0".to_string());
+                return Err("--max-sessions-per-node must be greater than 0".to_owned());
             }
             if self.max_total_sessions == 0 {
-                return Err("--max-total-sessions must be greater than 0".to_string());
+                return Err("--max-total-sessions must be greater than 0".to_owned());
             }
             let available_dataplane_ports =
                 usize::from(self.port_range_end) - usize::from(self.port_range_start) + 1;
@@ -211,14 +211,14 @@ mod daemon {
                 ));
             }
             if self.cleanup_interval_secs == 0 {
-                return Err("cleanup interval must be greater than 0".to_string());
+                return Err("cleanup interval must be greater than 0".to_owned());
             }
             if let Some(health_bind_addr) = self.health_bind_addr {
                 if health_bind_addr.port() == 0 {
-                    return Err("--health-bind port must not be 0".to_string());
+                    return Err("--health-bind port must not be 0".to_owned());
                 }
                 if !health_bind_addr.ip().is_loopback() {
-                    return Err("--health-bind must use a loopback address".to_string());
+                    return Err("--health-bind must use a loopback address".to_owned());
                 }
             }
             Ok(())
@@ -296,7 +296,7 @@ mod daemon {
 
             loop {
                 if attempts >= range_size {
-                    return Err("no available ports in range".to_string());
+                    return Err("no available ports in range".to_owned());
                 }
 
                 let port = *next;
@@ -416,7 +416,7 @@ mod daemon {
             from_addr: SocketAddr,
         ) -> Result<(), String> {
             if data.is_empty() {
-                return Err("empty packet".to_string());
+                return Err("empty packet".to_owned());
             }
 
             match data[0] {
@@ -673,20 +673,20 @@ mod daemon {
     /// Parses a RelayHello from wire format.
     fn parse_relay_hello(data: &[u8]) -> Result<rustynet_relay::transport::RelayHello, String> {
         if data.is_empty() || data[0] != RELAY_HELLO_MSG_TYPE {
-            return Err("not a hello message".to_string());
+            return Err("not a hello message".to_owned());
         }
 
         let mut pos = 1;
 
         // Node ID
         if pos + 2 > data.len() {
-            return Err("truncated node_id length".to_string());
+            return Err("truncated node_id length".to_owned());
         }
         let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if pos + node_id_len > data.len() {
-            return Err("truncated node_id".to_string());
+            return Err("truncated node_id".to_owned());
         }
         let node_id =
             String::from_utf8(data[pos..pos + node_id_len].to_vec()).map_err(|e| e.to_string())?;
@@ -694,13 +694,13 @@ mod daemon {
 
         // Peer node ID
         if pos + 2 > data.len() {
-            return Err("truncated peer_node_id length".to_string());
+            return Err("truncated peer_node_id length".to_owned());
         }
         let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if pos + peer_node_id_len > data.len() {
-            return Err("truncated peer_node_id".to_string());
+            return Err("truncated peer_node_id".to_owned());
         }
         let peer_node_id = String::from_utf8(data[pos..pos + peer_node_id_len].to_vec())
             .map_err(|e| e.to_string())?;
@@ -708,13 +708,13 @@ mod daemon {
 
         // Token
         if pos + 2 > data.len() {
-            return Err("truncated token length".to_string());
+            return Err("truncated token length".to_owned());
         }
         let token_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if pos + token_len > data.len() {
-            return Err("truncated token".to_string());
+            return Err("truncated token".to_owned());
         }
         let token_data = &data[pos..pos + token_len];
         let session_token = parse_relay_token(token_data)?;
@@ -734,7 +734,7 @@ mod daemon {
 
         // Version
         if pos >= data.len() {
-            return Err("missing version".to_string());
+            return Err("missing version".to_owned());
         }
         let version = data[pos];
         if version != 1 {
@@ -744,13 +744,13 @@ mod daemon {
 
         // Node ID
         if pos + 2 > data.len() {
-            return Err("truncated token node_id length".to_string());
+            return Err("truncated token node_id length".to_owned());
         }
         let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if pos + node_id_len > data.len() {
-            return Err("truncated token node_id".to_string());
+            return Err("truncated token node_id".to_owned());
         }
         let node_id = String::from_utf8(data[pos..pos + node_id_len].to_vec())
             .map_err(|e| format!("invalid token node_id: {e}"))?;
@@ -758,13 +758,13 @@ mod daemon {
 
         // Peer node ID
         if pos + 2 > data.len() {
-            return Err("truncated token peer_node_id length".to_string());
+            return Err("truncated token peer_node_id length".to_owned());
         }
         let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if pos + peer_node_id_len > data.len() {
-            return Err("truncated token peer_node_id".to_string());
+            return Err("truncated token peer_node_id".to_owned());
         }
         let peer_node_id = String::from_utf8(data[pos..pos + peer_node_id_len].to_vec())
             .map_err(|e| format!("invalid token peer_node_id: {e}"))?;
@@ -772,7 +772,7 @@ mod daemon {
 
         // Relay ID (16 bytes)
         if pos + 16 > data.len() {
-            return Err("truncated relay_id".to_string());
+            return Err("truncated relay_id".to_owned());
         }
         let relay_id: [u8; 16] = data[pos..pos + 16]
             .try_into()
@@ -781,13 +781,13 @@ mod daemon {
 
         // Scope
         if pos + 2 > data.len() {
-            return Err("truncated scope length".to_string());
+            return Err("truncated scope length".to_owned());
         }
         let scope_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
         if pos + scope_len > data.len() {
-            return Err("truncated scope".to_string());
+            return Err("truncated scope".to_owned());
         }
         let scope = String::from_utf8(data[pos..pos + scope_len].to_vec())
             .map_err(|e| format!("invalid scope: {e}"))?;
@@ -795,7 +795,7 @@ mod daemon {
 
         // Timestamps
         if pos + 16 > data.len() {
-            return Err("truncated timestamps".to_string());
+            return Err("truncated timestamps".to_owned());
         }
         let issued_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
         pos += 8;
@@ -804,7 +804,7 @@ mod daemon {
 
         // Nonce (16 bytes)
         if pos + 16 > data.len() {
-            return Err("truncated nonce".to_string());
+            return Err("truncated nonce".to_owned());
         }
         let nonce: [u8; 16] = data[pos..pos + 16]
             .try_into()
@@ -813,7 +813,7 @@ mod daemon {
 
         // Signature (64 bytes)
         if pos + 64 > data.len() {
-            return Err("truncated signature".to_string());
+            return Err("truncated signature".to_owned());
         }
         let signature: [u8; 64] = data[pos..pos + 64]
             .try_into()
@@ -869,12 +869,12 @@ mod daemon {
 
     fn validate_verifier_key_path(path: &Path) -> Result<(), String> {
         if !path.is_absolute() {
-            return Err("verifier key path must be absolute".to_string());
+            return Err("verifier key path must be absolute".to_owned());
         }
         let metadata =
             fs::symlink_metadata(path).map_err(|err| format!("stat verifier key: {err}"))?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return Err("verifier key path must be a regular file".to_string());
+            return Err("verifier key path must be a regular file".to_owned());
         }
         #[cfg(unix)]
         {
@@ -889,7 +889,7 @@ mod daemon {
             let metadata = fs::symlink_metadata(parent)
                 .map_err(|err| format!("stat verifier key dir: {err}"))?;
             if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                return Err("verifier key parent must be a directory".to_string());
+                return Err("verifier key parent must be a directory".to_owned());
             }
             #[cfg(unix)]
             {
@@ -914,7 +914,7 @@ mod daemon {
 
     async fn bind_health_listener(bind_addr: SocketAddr) -> Result<TcpListener, String> {
         if !bind_addr.ip().is_loopback() {
-            return Err("health endpoint bind address must be loopback".to_string());
+            return Err("health endpoint bind address must be loopback".to_owned());
         }
         TcpListener::bind(bind_addr)
             .await
@@ -958,7 +958,7 @@ mod daemon {
                         "text/plain; version=0.0.4",
                         render_metrics(snapshot),
                     ),
-                    _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
+                    _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
                 };
                 let response = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -1036,8 +1036,7 @@ mod daemon {
         if let Some(service) = service {
             if relay_args.len() > 1 {
                 return Err(
-                    "--windows-service does not accept inline relay flags; use --env-file with RUSTYNET_RELAY_ARGS_JSON"
-                        .to_string(),
+                    "--windows-service does not accept inline relay flags; use --env-file with RUSTYNET_RELAY_ARGS_JSON".to_owned(),
                 );
             }
             return Ok(RelayHostEntrySelection::WindowsService(service));
@@ -1063,14 +1062,14 @@ mod daemon {
                 "--service-name" => {
                     let value = args
                         .get(index + 1)
-                        .ok_or_else(|| "--service-name requires a value".to_string())?;
+                        .ok_or_else(|| "--service-name requires a value".to_owned())?;
                     service_name = Some(value.clone());
                     index += 2;
                 }
                 "--env-file" => {
                     let value = args
                         .get(index + 1)
-                        .ok_or_else(|| "--env-file requires a value".to_string())?;
+                        .ok_or_else(|| "--env-file requires a value".to_owned())?;
                     env_file = Some(PathBuf::from(value));
                     index += 2;
                 }
@@ -1083,17 +1082,16 @@ mod daemon {
 
         if !windows_service {
             if service_name.is_some() {
-                return Err("--service-name requires --windows-service".to_string());
+                return Err("--service-name requires --windows-service".to_owned());
             }
             if env_file.is_some() {
-                return Err("--env-file requires --windows-service".to_string());
+                return Err("--env-file requires --windows-service".to_owned());
             }
             return Ok((relay_args, None));
         }
 
         let env_file = env_file.ok_or_else(|| {
-            "--windows-service requires --env-file so the Windows SCM host loads reviewed config input"
-                .to_string()
+            "--windows-service requires --env-file so the Windows SCM host loads reviewed config input".to_owned()
         })?;
         validate_windows_relay_service_env_file_path(&env_file)?;
 
@@ -1101,7 +1099,7 @@ mod daemon {
             relay_args,
             Some(WindowsRelayServiceOptions {
                 service_name: service_name
-                    .unwrap_or_else(|| DEFAULT_WINDOWS_RELAY_SERVICE_NAME.to_string()),
+                    .unwrap_or_else(|| DEFAULT_WINDOWS_RELAY_SERVICE_NAME.to_owned()),
                 env_file,
             }),
         ))
@@ -1149,11 +1147,11 @@ mod daemon {
         validate_windows_relay_service_runtime_arg_shape(args)?;
         let verifier_key =
             extract_unique_relay_arg_value(args, "--verifier-key")?.ok_or_else(|| {
-                "Windows relay service runtime args must include --verifier-key".to_string()
+                "Windows relay service runtime args must include --verifier-key".to_owned()
             })?;
         let replay_store =
             extract_unique_relay_arg_value(args, "--replay-store")?.ok_or_else(|| {
-                "Windows relay service runtime args must include --replay-store".to_string()
+                "Windows relay service runtime args must include --replay-store".to_owned()
             })?;
 
         validate_windows_relay_service_runtime_path(
@@ -1174,7 +1172,7 @@ mod daemon {
             let flag = args[index].as_str();
             if flag == "--help" || flag == "-h" {
                 return Err(
-                    "Windows relay service runtime args must not include --help/-h".to_string(),
+                    "Windows relay service runtime args must not include --help/-h".to_owned(),
                 );
             }
             if !windows_relay_service_runtime_flag_takes_value(flag) {
@@ -1216,7 +1214,7 @@ mod daemon {
             .transpose()?
             .unwrap_or_else(|| "0.0.0.0:4500".parse().expect("default bind must parse"));
         if bind_addr.port() == 0 {
-            return Err("Windows relay service --bind port must not be 0".to_string());
+            return Err("Windows relay service --bind port must not be 0".to_owned());
         }
 
         if let Some(health_bind) = extract_unique_relay_arg_value(args, "--health-bind")? {
@@ -1224,7 +1222,7 @@ mod daemon {
             if health_bind.port() == 0 || !health_bind.ip().is_loopback() {
                 return Err(
                     "Windows relay service --health-bind must use a non-zero loopback address"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
         }
@@ -1234,7 +1232,7 @@ mod daemon {
             if (start..=end).contains(&bind_addr.port()) {
                 return Err(
                     "Windows relay service --port-range must not include the control bind port"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
         }
@@ -1281,7 +1279,7 @@ mod daemon {
     fn parse_windows_relay_service_port_range(value: &str) -> Result<(u16, u16), String> {
         let (start_raw, end_raw) = value
             .split_once('-')
-            .ok_or_else(|| "Windows relay service --port-range must be START-END".to_string())?;
+            .ok_or_else(|| "Windows relay service --port-range must be START-END".to_owned())?;
         let start = start_raw
             .parse::<u16>()
             .map_err(|err| format!("invalid Windows relay service port range start: {err}"))?;
@@ -1290,7 +1288,7 @@ mod daemon {
             .map_err(|err| format!("invalid Windows relay service port range end: {err}"))?;
         if start == 0 || end == 0 || start > end {
             return Err(
-                "Windows relay service --port-range must be non-zero and ordered".to_string(),
+                "Windows relay service --port-range must be non-zero and ordered".to_owned(),
             );
         }
         Ok((start, end))
@@ -1411,10 +1409,7 @@ mod daemon {
                     "invalid Windows relay service env-file key '{key}' on line {line_no}"
                 ));
             }
-            if variables
-                .insert(key.to_string(), value.to_string())
-                .is_some()
-            {
+            if variables.insert(key.to_owned(), value.to_owned()).is_some() {
                 return Err(format!(
                     "duplicate Windows relay service env-file key '{key}' on line {line_no}"
                 ));
@@ -1431,7 +1426,7 @@ mod daemon {
         #[cfg(not(windows))]
         {
             if !path.is_absolute() {
-                return Err("--env-file must be an absolute path".to_string());
+                return Err("--env-file must be an absolute path".to_owned());
             }
             Ok(())
         }
@@ -1515,7 +1510,7 @@ mod daemon {
         let text = path.to_string_lossy();
         let normalized = text.replace('/', "\\");
         if normalized.is_empty() {
-            return Err("Windows relay service env-file path must not be empty".to_string());
+            return Err("Windows relay service env-file path must not be empty".to_owned());
         }
         if is_linux_runtime_root_text(text.as_ref()) {
             return Err(format!(
@@ -1661,8 +1656,7 @@ mod daemon {
             let argv_tail = &snapshot.binary_image_argv[1..];
             if !argv_tail.iter().any(|arg| arg == "--windows-service") {
                 reasons.push(
-                    "Windows relay service argv must include --windows-service so the SCM host path is taken"
-                        .to_string(),
+                    "Windows relay service argv must include --windows-service so the SCM host path is taken".to_owned(),
                 );
             }
             let env_files = windows_relay_service_flag_values(argv_tail, "--env-file");
@@ -1689,8 +1683,7 @@ mod daemon {
             let env_file = env_files.first().copied();
             if env_file.is_none() {
                 reasons.push(
-                    "Windows relay service argv must include --env-file <path> so relay args are read from reviewed config input"
-                        .to_string(),
+                    "Windows relay service argv must include --env-file <path> so relay args are read from reviewed config input".to_owned(),
                 );
             }
             if let Some(env_file) = env_file {
@@ -1721,7 +1714,7 @@ mod daemon {
                 if snapshot.env_file_acl_sddl.trim().is_empty() {
                     reasons.push(
                         "Windows relay service env-file ACL SDDL is empty; cannot verify lockdown"
-                            .to_string(),
+                            .to_owned(),
                     );
                 } else if let Err(err) = evaluate_windows_relay_service_acl_sddl(
                     "Windows relay service env-file",
@@ -1732,8 +1725,7 @@ mod daemon {
                 }
                 if snapshot.env_file_parent_acl_sddl.trim().is_empty() {
                     reasons.push(
-                        "Windows relay service env-file parent ACL SDDL is empty; cannot verify lockdown"
-                            .to_string(),
+                        "Windows relay service env-file parent ACL SDDL is empty; cannot verify lockdown".to_owned(),
                     );
                 } else if let Err(err) = evaluate_windows_relay_service_acl_sddl(
                     "Windows relay service env-file parent",
@@ -1773,22 +1765,19 @@ mod daemon {
 
         if snapshot.interactive_process {
             reasons.push(
-                "Windows relay service must not carry SERVICE_INTERACTIVE_PROCESS; relay service is non-interactive"
-                    .to_string(),
+                "Windows relay service must not carry SERVICE_INTERACTIVE_PROCESS; relay service is non-interactive".to_owned(),
             );
         }
 
         if snapshot.failure_action_count == 0 {
             reasons.push(
-                "Windows relay service must have at least one configured failure action"
-                    .to_string(),
+                "Windows relay service must have at least one configured failure action".to_owned(),
             );
         }
 
         if snapshot.binary_path_acl_sddl.trim().is_empty() {
             reasons.push(
-                "Windows relay service binary ACL SDDL is empty; cannot verify lockdown"
-                    .to_string(),
+                "Windows relay service binary ACL SDDL is empty; cannot verify lockdown".to_owned(),
             );
         } else if let Err(err) = evaluate_windows_relay_service_acl_sddl(
             "Windows relay service binary",
@@ -1875,8 +1864,7 @@ mod daemon {
         #[cfg(not(windows))]
         {
             Err(
-                "windows-service-hardening-check is only available on Windows hosts; relay service snapshot collection requires Win32 SCM access"
-                    .to_string(),
+                "windows-service-hardening-check is only available on Windows hosts; relay service snapshot collection requires Win32 SCM access".to_owned(),
             )
         }
         #[cfg(windows)]
@@ -1913,7 +1901,7 @@ mod daemon {
                 "--bind" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--bind requires an argument".to_string());
+                        return Err("--bind requires an argument".to_owned());
                     }
                     config.bind_addr = args[i]
                         .parse()
@@ -1922,32 +1910,32 @@ mod daemon {
                 "--relay-id" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--relay-id requires an argument".to_string());
+                        return Err("--relay-id requires an argument".to_owned());
                     }
                     config.relay_id = parse_relay_id_arg(&args[i])?;
                 }
                 "--verifier-key" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--verifier-key requires an argument".to_string());
+                        return Err("--verifier-key requires an argument".to_owned());
                     }
                     config.verifier_key_path = args[i].clone();
                 }
                 "--replay-store" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--replay-store requires an argument".to_string());
+                        return Err("--replay-store requires an argument".to_owned());
                     }
                     config.replay_store_path = args[i].clone();
                 }
                 "--port-range" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--port-range requires an argument".to_string());
+                        return Err("--port-range requires an argument".to_owned());
                     }
                     let parts: Vec<&str> = args[i].split('-').collect();
                     if parts.len() != 2 {
-                        return Err("--port-range must be START-END".to_string());
+                        return Err("--port-range must be START-END".to_owned());
                     }
                     config.port_range_start = parts[0]
                         .parse()
@@ -1959,7 +1947,7 @@ mod daemon {
                 "--max-sessions-per-node" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--max-sessions-per-node requires an argument".to_string());
+                        return Err("--max-sessions-per-node requires an argument".to_owned());
                     }
                     config.max_sessions_per_node = args[i]
                         .parse()
@@ -1968,7 +1956,7 @@ mod daemon {
                 "--max-total-sessions" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--max-total-sessions requires an argument".to_string());
+                        return Err("--max-total-sessions requires an argument".to_owned());
                     }
                     config.max_total_sessions = args[i]
                         .parse()
@@ -1977,7 +1965,7 @@ mod daemon {
                 "--health-bind" => {
                     i += 1;
                     if i >= args.len() {
-                        return Err("--health-bind requires an argument".to_string());
+                        return Err("--health-bind requires an argument".to_owned());
                     }
                     config.health_bind_addr = Some(
                         args[i]
@@ -2014,7 +2002,7 @@ mod daemon {
 
     pub async fn run_relay_from_args(mut args: Vec<String>) -> Result<(), String> {
         if args.first().is_none_or(|value| value.starts_with('-')) {
-            args.insert(0, "rustynet-relay".to_string());
+            args.insert(0, "rustynet-relay".to_owned());
         }
         reset_relay_stop_requested();
         let config = parse_args_from(args)?;
@@ -2028,7 +2016,7 @@ mod daemon {
         #[cfg(not(windows))]
         {
             let _ = options;
-            Err("--windows-service is only supported on Windows SCM hosts".to_string())
+            Err("--windows-service is only supported on Windows SCM hosts".to_owned())
         }
         #[cfg(windows)]
         {
@@ -2046,8 +2034,7 @@ mod daemon {
         );
         if fail_on_drift && !report.overall_ok {
             return Err(
-                "windows-service-hardening-check reported drift in the live RustyNet relay service registration"
-                    .to_string(),
+                "windows-service-hardening-check reported drift in the live RustyNet relay service registration".to_owned(),
             );
         }
         Ok(())
@@ -2349,8 +2336,8 @@ mod daemon {
         fn valid_config() -> RelayConfig {
             RelayConfig {
                 relay_id: parse_relay_id_arg("relay-eu-1").expect("relay id should parse"),
-                verifier_key_path: "/tmp/rustynet-relay-verifier.pub".to_string(),
-                replay_store_path: "/tmp/rustynet-relay-replay.store".to_string(),
+                verifier_key_path: "/tmp/rustynet-relay-verifier.pub".to_owned(),
+                replay_store_path: "/tmp/rustynet-relay-replay.store".to_owned(),
                 ..RelayConfig::default()
             }
         }
@@ -2358,7 +2345,7 @@ mod daemon {
         fn reviewed_relay_service_snapshot() -> WindowsRelayServiceHardeningSnapshot {
             WindowsRelayServiceHardeningSnapshot {
                 schema_version: 1,
-                service_name: super::DEFAULT_WINDOWS_RELAY_SERVICE_NAME.to_string(),
+                service_name: super::DEFAULT_WINDOWS_RELAY_SERVICE_NAME.to_owned(),
                 binary_image_path: format!(
                     "\"{}\\{}\" --windows-service --env-file {}\\relay.env",
                     super::DEFAULT_WINDOWS_INSTALL_ROOT,
@@ -2371,22 +2358,22 @@ mod daemon {
                         super::DEFAULT_WINDOWS_INSTALL_ROOT,
                         super::DEFAULT_WINDOWS_RELAY_BINARY_FILE_NAME
                     ),
-                    "--windows-service".to_string(),
-                    "--env-file".to_string(),
+                    "--windows-service".to_owned(),
+                    "--env-file".to_owned(),
                     format!("{}\\relay.env", super::DEFAULT_WINDOWS_RELAY_ROOT),
                 ],
-                start_name: "LocalSystem".to_string(),
-                service_sid_type: "unrestricted".to_string(),
-                start_type: "auto_start".to_string(),
+                start_name: "LocalSystem".to_owned(),
+                service_sid_type: "unrestricted".to_owned(),
+                start_type: "auto_start".to_owned(),
                 interactive_process: false,
                 failure_action_count: 3,
-                binary_path_acl_sddl: "O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
-                env_file_acl_sddl: "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
-                env_file_parent_acl_sddl: "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string(),
+                binary_path_acl_sddl: "O:BAG:BAD:(A;;FA;;;SY)(A;;FA;;;BA)".to_owned(),
+                env_file_acl_sddl: "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned(),
+                env_file_parent_acl_sddl: "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned(),
                 env_file_runtime_args_valid: true,
-                env_file_runtime_args_reason: "valid".to_string(),
+                env_file_runtime_args_reason: "valid".to_owned(),
                 binary_authenticode_trusted: true,
-                binary_authenticode_reason: "verified".to_string(),
+                binary_authenticode_reason: "verified".to_owned(),
             }
         }
 
@@ -2518,36 +2505,36 @@ mod daemon {
         #[test]
         fn relay_windows_service_entry_requires_env_file_and_rejects_inline_flags() {
             let err = select_relay_host_entry(&[
-                "rustynet-relay".to_string(),
-                "--windows-service".to_string(),
+                "rustynet-relay".to_owned(),
+                "--windows-service".to_owned(),
             ])
             .expect_err("service mode without env file must fail closed");
             assert!(err.contains("--env-file"));
 
             let selection = select_relay_host_entry(&[
-                "rustynet-relay".to_string(),
-                "--windows-service".to_string(),
-                "--env-file".to_string(),
-                "/tmp/rustynet-relay.env".to_string(),
-                "--service-name".to_string(),
-                "RustyNetRelayTest".to_string(),
+                "rustynet-relay".to_owned(),
+                "--windows-service".to_owned(),
+                "--env-file".to_owned(),
+                "/tmp/rustynet-relay.env".to_owned(),
+                "--service-name".to_owned(),
+                "RustyNetRelayTest".to_owned(),
             ])
             .expect("service mode should parse");
             assert_eq!(
                 selection,
                 RelayHostEntrySelection::WindowsService(WindowsRelayServiceOptions {
-                    service_name: "RustyNetRelayTest".to_string(),
+                    service_name: "RustyNetRelayTest".to_owned(),
                     env_file: PathBuf::from("/tmp/rustynet-relay.env"),
                 })
             );
 
             let err = select_relay_host_entry(&[
-                "rustynet-relay".to_string(),
-                "--windows-service".to_string(),
-                "--env-file".to_string(),
-                "/tmp/rustynet-relay.env".to_string(),
-                "--bind".to_string(),
-                "0.0.0.0:4500".to_string(),
+                "rustynet-relay".to_owned(),
+                "--windows-service".to_owned(),
+                "--env-file".to_owned(),
+                "/tmp/rustynet-relay.env".to_owned(),
+                "--bind".to_owned(),
+                "0.0.0.0:4500".to_owned(),
             ])
             .expect_err("service mode must reject inline relay flags");
             assert!(err.contains("does not accept inline relay flags"));
@@ -2761,33 +2748,33 @@ mod daemon {
         #[test]
         fn relay_windows_service_runtime_args_require_reviewed_runtime_paths() {
             let args = vec![
-                "--relay-id".to_string(),
-                "relay-eu-1".to_string(),
-                "--verifier-key".to_string(),
-                r"C:\ProgramData\RustyNet\relay\relay-verifier.key".to_string(),
-                "--replay-store".to_string(),
-                r"C:\ProgramData\RustyNet\relay\relay-replay.nonces".to_string(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                r"C:\ProgramData\RustyNet\relay\relay-verifier.key".to_owned(),
+                "--replay-store".to_owned(),
+                r"C:\ProgramData\RustyNet\relay\relay-replay.nonces".to_owned(),
             ];
             super::validate_windows_relay_service_runtime_args(&args)
                 .expect("reviewed relay runtime paths should pass");
 
             let mut outside_root = args.clone();
-            outside_root[3] = r"C:\Temp\relay-verifier.key".to_string();
+            outside_root[3] = r"C:\Temp\relay-verifier.key".to_owned();
             let err = super::validate_windows_relay_service_runtime_args(&outside_root)
                 .expect_err("verifier key outside reviewed root must fail closed");
             assert!(err.contains("Windows relay verifier key"));
             assert!(err.contains("reviewed relay runtime root"));
 
             let mut linux_path = args.clone();
-            linux_path[5] = "/var/lib/rustynet/relay-replay.nonces".to_string();
+            linux_path[5] = "/var/lib/rustynet/relay-replay.nonces".to_owned();
             let err = super::validate_windows_relay_service_runtime_args(&linux_path)
                 .expect_err("Linux runtime path must fail closed in Windows service mode");
             assert!(err.contains("Linux runtime roots"));
 
             let mut duplicate = args.clone();
             duplicate.extend([
-                "--replay-store".to_string(),
-                r"C:\ProgramData\RustyNet\relay\other.nonces".to_string(),
+                "--replay-store".to_owned(),
+                r"C:\ProgramData\RustyNet\relay\other.nonces".to_owned(),
             ]);
             let err = super::validate_windows_relay_service_runtime_args(&duplicate)
                 .expect_err("duplicate runtime path flag must fail closed");
@@ -2797,30 +2784,30 @@ mod daemon {
         #[test]
         fn relay_windows_service_runtime_args_reject_ambiguous_or_side_effect_flags() {
             let args = vec![
-                "--relay-id".to_string(),
-                "relay-eu-1".to_string(),
-                "--verifier-key".to_string(),
-                r"C:\ProgramData\RustyNet\relay\relay-verifier.key".to_string(),
-                "--replay-store".to_string(),
-                r"C:\ProgramData\RustyNet\relay\relay-replay.nonces".to_string(),
-                "--health-bind".to_string(),
-                "127.0.0.1:9100".to_string(),
-                "--port-range".to_string(),
-                "50000-59999".to_string(),
-                "--max-total-sessions".to_string(),
-                "4096".to_string(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                r"C:\ProgramData\RustyNet\relay\relay-verifier.key".to_owned(),
+                "--replay-store".to_owned(),
+                r"C:\ProgramData\RustyNet\relay\relay-replay.nonces".to_owned(),
+                "--health-bind".to_owned(),
+                "127.0.0.1:9100".to_owned(),
+                "--port-range".to_owned(),
+                "50000-59999".to_owned(),
+                "--max-total-sessions".to_owned(),
+                "4096".to_owned(),
             ];
             super::validate_windows_relay_service_runtime_args(&args)
                 .expect("reviewed optional runtime args should validate");
 
             let mut help = args.clone();
-            help.push("--help".to_string());
+            help.push("--help".to_owned());
             let err = super::validate_windows_relay_service_runtime_args(&help)
                 .expect_err("help flag must fail closed in service runtime args");
             assert!(err.contains("--help"));
 
             let mut unknown = args.clone();
-            unknown.extend(["--unknown".to_string(), "value".to_string()]);
+            unknown.extend(["--unknown".to_owned(), "value".to_owned()]);
             let err = super::validate_windows_relay_service_runtime_args(&unknown)
                 .expect_err("unknown runtime flags must fail closed");
             assert!(err.contains("unsupported argument"));
@@ -2830,14 +2817,14 @@ mod daemon {
                 .iter_mut()
                 .find(|arg| arg.as_str() == "127.0.0.1:9100")
                 .expect("health bind value should exist");
-            *health_value = "0.0.0.0:9100".to_string();
+            *health_value = "0.0.0.0:9100".to_owned();
             let err = super::validate_windows_relay_service_runtime_args(&public_health)
                 .expect_err("public health bind must fail closed");
             assert!(err.contains("--health-bind"));
 
             let mut duplicate_optional = args.clone();
-            duplicate_optional.extend(["--bind".to_string(), "0.0.0.0:4500".to_string()]);
-            duplicate_optional.extend(["--bind".to_string(), "0.0.0.0:4501".to_string()]);
+            duplicate_optional.extend(["--bind".to_owned(), "0.0.0.0:4500".to_owned()]);
+            duplicate_optional.extend(["--bind".to_owned(), "0.0.0.0:4501".to_owned()]);
             let err = super::validate_windows_relay_service_runtime_args(&duplicate_optional)
                 .expect_err("duplicate optional flags must fail closed");
             assert!(err.contains("--bind at most once"));
@@ -2938,8 +2925,8 @@ mod daemon {
         #[test]
         fn relay_windows_service_hardening_check_entry_parses_flags() {
             let selection = select_relay_host_entry(&[
-                "rustynet-relay".to_string(),
-                "windows-service-hardening-check".to_string(),
+                "rustynet-relay".to_owned(),
+                "windows-service-hardening-check".to_owned(),
             ])
             .expect("service hardening check should parse");
             assert_eq!(
@@ -2950,9 +2937,9 @@ mod daemon {
             );
 
             let selection = select_relay_host_entry(&[
-                "rustynet-relay".to_string(),
-                "windows-service-hardening-check".to_string(),
-                "--no-fail-on-drift".to_string(),
+                "rustynet-relay".to_owned(),
+                "windows-service-hardening-check".to_owned(),
+                "--no-fail-on-drift".to_owned(),
             ])
             .expect("service hardening check no-fail flag should parse");
             assert_eq!(
@@ -2963,9 +2950,9 @@ mod daemon {
             );
 
             let err = select_relay_host_entry(&[
-                "rustynet-relay".to_string(),
-                "windows-service-hardening-check".to_string(),
-                "--bogus".to_string(),
+                "rustynet-relay".to_owned(),
+                "windows-service-hardening-check".to_owned(),
+                "--bogus".to_owned(),
             ])
             .expect_err("unknown service hardening flag must fail closed");
             assert!(err.contains("unknown windows-service-hardening-check argument"));
@@ -2980,8 +2967,8 @@ mod daemon {
         #[test]
         fn relay_windows_service_hardening_evaluator_accepts_service_account() {
             let mut snapshot = reviewed_relay_service_snapshot();
-            snapshot.start_name = r"NT SERVICE\RustyNetRelay".to_string();
-            snapshot.service_sid_type = "restricted".to_string();
+            snapshot.start_name = r"NT SERVICE\RustyNetRelay".to_owned();
+            snapshot.service_sid_type = "restricted".to_owned();
             evaluate_windows_relay_service_hardening(&snapshot)
                 .expect("reviewed NT SERVICE account should validate");
         }
@@ -2991,10 +2978,10 @@ mod daemon {
             for mutate in [
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| snapshot.schema_version = 99,
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.service_name = "RustyNet".to_string()
+                    snapshot.service_name = "RustyNet".to_owned()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.binary_image_argv[0] = r"C:\Tools\rustynet-relay.exe".to_string()
+                    snapshot.binary_image_argv[0] = r"C:\Tools\rustynet-relay.exe".to_owned()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.binary_image_argv[0] =
@@ -3009,15 +2996,13 @@ mod daemon {
                     snapshot.binary_image_argv.retain(|arg| arg != "--env-file")
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot
-                        .binary_image_argv
-                        .push("--verifier-key".to_string())
+                    snapshot.binary_image_argv.push("--verifier-key".to_owned())
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.start_name = r".\Administrator".to_string()
+                    snapshot.start_name = r".\Administrator".to_owned()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.service_sid_type = "none".to_string()
+                    snapshot.service_sid_type = "none".to_owned()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.interactive_process = true
@@ -3029,31 +3014,30 @@ mod daemon {
                     snapshot.binary_path_acl_sddl = String::new()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.binary_path_acl_sddl = "O:BAG:BAD:(A;;FA;;;WD)".to_string()
+                    snapshot.binary_path_acl_sddl = "O:BAG:BAD:(A;;FA;;;WD)".to_owned()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_acl_sddl = String::new()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_acl_sddl =
-                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_string()
+                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_owned()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_parent_acl_sddl = String::new()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_parent_acl_sddl =
-                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_string()
+                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_owned()
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_runtime_args_valid = false;
                     snapshot.env_file_runtime_args_reason =
-                        "Windows relay service runtime args must include --replay-store"
-                            .to_string();
+                        "Windows relay service runtime args must include --replay-store".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.binary_authenticode_trusted = false;
-                    snapshot.binary_authenticode_reason = "TRUST_E_NOSIGNATURE".to_string();
+                    snapshot.binary_authenticode_reason = "TRUST_E_NOSIGNATURE".to_owned();
                 },
             ] {
                 let mut snapshot = reviewed_relay_service_snapshot();
@@ -3072,7 +3056,7 @@ mod daemon {
                 .iter_mut()
                 .find(|arg| arg.ends_with("relay.env"))
                 .expect("env-file arg should exist");
-            *env_arg = r"C:\ProgramData\RustyNet\config\relay.env".to_string();
+            *env_arg = r"C:\ProgramData\RustyNet\config\relay.env".to_owned();
             let reasons = evaluate_windows_relay_service_hardening(&snapshot)
                 .expect_err("env-file outside reviewed relay root must fail");
             assert!(
@@ -3085,7 +3069,7 @@ mod daemon {
         fn relay_windows_service_hardening_rejects_env_file_acl_and_runtime_arg_drift() {
             let mut snapshot = reviewed_relay_service_snapshot();
             snapshot.env_file_acl_sddl =
-                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_string();
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_owned();
             let reasons = evaluate_windows_relay_service_hardening(&snapshot)
                 .expect_err("broad env-file ACL must fail closed");
             assert!(
@@ -3097,7 +3081,7 @@ mod daemon {
 
             let mut snapshot = reviewed_relay_service_snapshot();
             snapshot.env_file_parent_acl_sddl =
-                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_string();
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_owned();
             let reasons = evaluate_windows_relay_service_hardening(&snapshot)
                 .expect_err("broad env-file parent ACL must fail closed");
             assert!(
@@ -3110,8 +3094,7 @@ mod daemon {
             let mut snapshot = reviewed_relay_service_snapshot();
             snapshot.env_file_runtime_args_valid = false;
             snapshot.env_file_runtime_args_reason =
-                "Windows relay verifier key must stay under reviewed relay runtime root"
-                    .to_string();
+                "Windows relay verifier key must stay under reviewed relay runtime root".to_owned();
             let reasons = evaluate_windows_relay_service_hardening(&snapshot)
                 .expect_err("runtime args drift must fail closed");
             assert!(
@@ -3126,7 +3109,7 @@ mod daemon {
         fn relay_windows_service_hardening_rejects_ambiguous_service_argv() {
             let mut snapshot = reviewed_relay_service_snapshot();
             snapshot.binary_image_argv.extend([
-                "--env-file".to_string(),
+                "--env-file".to_owned(),
                 format!("{}\\second.env", super::DEFAULT_WINDOWS_RELAY_ROOT),
             ]);
             let reasons = evaluate_windows_relay_service_hardening(&snapshot)
@@ -3141,7 +3124,7 @@ mod daemon {
             let mut snapshot = reviewed_relay_service_snapshot();
             snapshot
                 .binary_image_argv
-                .extend(["--service-name".to_string(), "OtherRelay".to_string()]);
+                .extend(["--service-name".to_owned(), "OtherRelay".to_owned()]);
             let reasons = evaluate_windows_relay_service_hardening(&snapshot)
                 .expect_err("wrong service-name flag must fail closed");
             assert!(
@@ -3171,10 +3154,10 @@ mod daemon {
             assert_eq!(
                 argv,
                 vec![
-                    r"C:\Program Files\RustyNet\rustynet-relay.exe".to_string(),
-                    "--windows-service".to_string(),
-                    "--env-file".to_string(),
-                    r"C:\ProgramData\RustyNet\relay\relay.env".to_string(),
+                    r"C:\Program Files\RustyNet\rustynet-relay.exe".to_owned(),
+                    "--windows-service".to_owned(),
+                    "--env-file".to_owned(),
+                    r"C:\ProgramData\RustyNet\relay\relay.env".to_owned(),
                 ]
             );
             assert!(parse_windows_image_path_argv("   ").is_empty());
@@ -3200,10 +3183,10 @@ mod daemon {
             assert_eq!(
                 argv,
                 vec![
-                    r"C:\RustyNet\rustynet-relay.exe".to_string(),
-                    "--windows-service".to_string(),
-                    "--env-file".to_string(),
-                    r"C:\ProgramData\RustyNet\relay\relay.env".to_string(),
+                    r"C:\RustyNet\rustynet-relay.exe".to_owned(),
+                    "--windows-service".to_owned(),
+                    "--env-file".to_owned(),
+                    r"C:\ProgramData\RustyNet\relay\relay.env".to_owned(),
                 ]
             );
         }
@@ -3222,10 +3205,10 @@ mod daemon {
             assert_eq!(
                 argv,
                 vec![
-                    r"C:\rustynet-relay.exe".to_string(),
-                    "--windows-service".to_string(),
-                    "--env-file".to_string(),
-                    r"C:\relay.env".to_string(),
+                    r"C:\rustynet-relay.exe".to_owned(),
+                    "--windows-service".to_owned(),
+                    "--env-file".to_owned(),
+                    r"C:\relay.env".to_owned(),
                 ]
             );
         }
@@ -3242,9 +3225,9 @@ mod daemon {
             assert_eq!(
                 argv,
                 vec![
-                    r"C:\My\Strange  Path\rustynet-relay.exe".to_string(),
-                    "--env-file".to_string(),
-                    r"C:\With Spaces\relay.env".to_string(),
+                    r"C:\My\Strange  Path\rustynet-relay.exe".to_owned(),
+                    "--env-file".to_owned(),
+                    r"C:\With Spaces\relay.env".to_owned(),
                 ]
             );
         }
@@ -3259,7 +3242,7 @@ mod daemon {
             // hardening comparison fails closed if the SCM ImagePath ever
             // contains such a value.
             let argv = parse_windows_image_path_argv(r#"abc"def"ghi --flag"#);
-            assert_eq!(argv, vec!["abcdefghi".to_string(), "--flag".to_string()]);
+            assert_eq!(argv, vec!["abcdefghi".to_owned(), "--flag".to_owned()]);
         }
 
         #[cfg(not(windows))]
@@ -3284,11 +3267,11 @@ mod daemon {
         #[test]
         fn relay_config_validation_requires_absolute_security_paths() {
             let mut config = valid_config();
-            config.verifier_key_path = "control.pub".to_string();
+            config.verifier_key_path = "control.pub".to_owned();
             assert!(config.validate().unwrap_err().contains("absolute"));
 
             let mut config = valid_config();
-            config.replay_store_path = "relay.replay".to_string();
+            config.replay_store_path = "relay.replay".to_owned();
             assert!(config.validate().unwrap_err().contains("absolute"));
         }
 

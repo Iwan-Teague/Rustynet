@@ -31,7 +31,7 @@ pub fn translate_legacy_role_flags(
                 let trimmed = a.trim();
                 if !trimmed.is_empty() {
                     out.push(NodeRoleAssignment {
-                        alias: trimmed.to_string(),
+                        alias: trimmed.to_owned(),
                         role,
                     });
                 }
@@ -60,7 +60,7 @@ pub struct NodeRoleAssignment {
 pub fn parse_node_role_arg(s: &str) -> Result<NodeRoleAssignment, String> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("--node argument must not be empty".to_string());
+        return Err("--node argument must not be empty".to_owned());
     }
     let (alias, role_str) = s
         .split_once(':')
@@ -75,7 +75,7 @@ pub fn parse_node_role_arg(s: &str) -> Result<NodeRoleAssignment, String> {
     }
     let role = NodeRole::parse(role_str)?;
     Ok(NodeRoleAssignment {
-        alias: alias.to_string(),
+        alias: alias.to_owned(),
         role,
     })
 }
@@ -103,7 +103,7 @@ mod tests {
     fn parse_custom_role() {
         let result = parse_node_role_arg("my-device:custom-relay").unwrap();
         assert_eq!(result.alias, "my-device");
-        assert_eq!(result.role, NodeRole::Custom("relay".to_string()));
+        assert_eq!(result.role, NodeRole::Custom("relay".to_owned()));
     }
 
     #[test]

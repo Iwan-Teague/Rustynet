@@ -159,9 +159,9 @@ impl TunnelBackend for ContractBackend {
 pub fn sample_context() -> RuntimeContext {
     RuntimeContext {
         local_node: NodeId::new("local-node").expect("valid node id"),
-        interface_name: "rustynet0".to_string(),
-        mesh_cidr: "100.64.0.0/10".to_string(),
-        local_cidr: "100.64.0.1/32".to_string(),
+        interface_name: "rustynet0".to_owned(),
+        mesh_cidr: "100.64.0.0/10".to_owned(),
+        local_cidr: "100.64.0.1/32".to_owned(),
     }
 }
 
@@ -173,7 +173,7 @@ pub fn peer(name: &str) -> PeerConfig {
             port: 51820,
         },
         public_key: [7; 32],
-        allowed_ips: vec!["100.64.1.0/24".to_string()],
+        allowed_ips: vec!["100.64.1.0/24".to_owned()],
     }
 }
 
@@ -185,7 +185,7 @@ pub fn peer_with_key(name: &str, key_byte: u8) -> PeerConfig {
             port: 51820,
         },
         public_key: [key_byte; 32],
-        allowed_ips: vec!["100.64.2.0/24".to_string()],
+        allowed_ips: vec!["100.64.2.0/24".to_owned()],
     }
 }
 
@@ -427,12 +427,12 @@ fn contract_routes_replaced_deterministically(b: &mut dyn TunnelBackend) {
     b.start(sample_context()).expect("start");
     b.apply_routes(vec![
         Route {
-            destination_cidr: "192.168.0.0/24".to_string(),
+            destination_cidr: "192.168.0.0/24".to_owned(),
             via_node: nid("r-peer-a"),
             kind: RouteKind::Mesh,
         },
         Route {
-            destination_cidr: "0.0.0.0/0".to_string(),
+            destination_cidr: "0.0.0.0/0".to_owned(),
             via_node: nid("r-peer-b"),
             kind: RouteKind::ExitNodeDefault,
         },
@@ -440,7 +440,7 @@ fn contract_routes_replaced_deterministically(b: &mut dyn TunnelBackend) {
     .expect("first apply_routes");
 
     b.apply_routes(vec![Route {
-        destination_cidr: "10.0.0.0/8".to_string(),
+        destination_cidr: "10.0.0.0/8".to_owned(),
         via_node: nid("r-peer-c"),
         kind: RouteKind::ExitNodeLan,
     }])
@@ -454,7 +454,7 @@ fn contract_routes_replaced_deterministically(b: &mut dyn TunnelBackend) {
 fn contract_routes_cleared_on_empty_apply(b: &mut dyn TunnelBackend) {
     b.start(sample_context()).expect("start");
     b.apply_routes(vec![Route {
-        destination_cidr: "0.0.0.0/0".to_string(),
+        destination_cidr: "0.0.0.0/0".to_owned(),
         via_node: nid("exit-peer"),
         kind: RouteKind::ExitNodeDefault,
     }])
@@ -552,9 +552,9 @@ fn contract_configure_same_peer_multiple_ips(b: &mut dyn TunnelBackend) {
         },
         public_key: [0x01; 32],
         allowed_ips: vec![
-            "100.64.5.0/24".to_string(),
-            "192.168.100.0/24".to_string(),
-            "10.10.0.0/16".to_string(),
+            "100.64.5.0/24".to_owned(),
+            "192.168.100.0/24".to_owned(),
+            "10.10.0.0/16".to_owned(),
         ],
     };
     b.configure_peer(base)
@@ -578,7 +578,7 @@ fn backend_contract_ipv6_endpoint_accepted_if_supported() {
         node_id: nid("ipv6-peer"),
         endpoint: ipv6_ep,
         public_key: [5; 32],
-        allowed_ips: vec!["100.64.6.0/24".to_string()],
+        allowed_ips: vec!["100.64.6.0/24".to_owned()],
     };
     // Backend may accept or reject IPv6; contract only requires no panic
     let _ = b.configure_peer(p);

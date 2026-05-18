@@ -43,11 +43,11 @@ impl DigestNodeView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("label".to_string(), Value::String(self.label));
-        m.insert("target".to_string(), Value::String(self.target));
-        m.insert("node_id".to_string(), Value::String(self.node_id));
+        m.insert("label".to_owned(), Value::String(self.label));
+        m.insert("target".to_owned(), Value::String(self.target));
+        m.insert("node_id".to_owned(), Value::String(self.node_id));
         m.insert(
-            "bootstrap_role".to_string(),
+            "bootstrap_role".to_owned(),
             Value::String(self.bootstrap_role),
         );
         m
@@ -81,32 +81,32 @@ impl DigestFailedWorkerView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("label".to_string(), Value::String(self.label));
-        m.insert("target".to_string(), Value::String(self.target));
-        m.insert("node_id".to_string(), Value::String(self.node_id));
-        m.insert("role".to_string(), Value::String(self.role));
-        m.insert("rc".to_string(), Value::Number(self.rc.into()));
-        m.insert("started_at".to_string(), Value::String(self.started_at));
-        m.insert("finished_at".to_string(), Value::String(self.finished_at));
-        m.insert("log_path".to_string(), Value::String(self.log_path));
+        m.insert("label".to_owned(), Value::String(self.label));
+        m.insert("target".to_owned(), Value::String(self.target));
+        m.insert("node_id".to_owned(), Value::String(self.node_id));
+        m.insert("role".to_owned(), Value::String(self.role));
+        m.insert("rc".to_owned(), Value::Number(self.rc.into()));
+        m.insert("started_at".to_owned(), Value::String(self.started_at));
+        m.insert("finished_at".to_owned(), Value::String(self.finished_at));
+        m.insert("log_path".to_owned(), Value::String(self.log_path));
         m.insert(
-            "snapshot_path".to_string(),
+            "snapshot_path".to_owned(),
             Value::String(self.snapshot_path),
         );
         m.insert(
-            "route_policy_path".to_string(),
+            "route_policy_path".to_owned(),
             Value::String(self.route_policy_path),
         );
         m.insert(
-            "dns_state_path".to_string(),
+            "dns_state_path".to_owned(),
             Value::String(self.dns_state_path),
         );
         m.insert(
-            "primary_failure_reason".to_string(),
+            "primary_failure_reason".to_owned(),
             Value::String(self.primary_failure_reason),
         );
         m.insert(
-            "likely_reason".to_string(),
+            "likely_reason".to_owned(),
             Value::String(self.likely_reason),
         );
         m
@@ -145,28 +145,28 @@ impl DigestStageEntryView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("stage".to_string(), Value::String(self.stage));
-        m.insert("severity".to_string(), Value::String(self.severity));
-        m.insert("status".to_string(), Value::String(self.status));
-        m.insert("rc".to_string(), Value::Number(self.rc.into()));
-        m.insert("description".to_string(), Value::String(self.description));
-        m.insert("started_at".to_string(), Value::String(self.started_at));
-        m.insert("finished_at".to_string(), Value::String(self.finished_at));
-        m.insert("log_path".to_string(), Value::String(self.log_path));
+        m.insert("stage".to_owned(), Value::String(self.stage));
+        m.insert("severity".to_owned(), Value::String(self.severity));
+        m.insert("status".to_owned(), Value::String(self.status));
+        m.insert("rc".to_owned(), Value::Number(self.rc.into()));
+        m.insert("description".to_owned(), Value::String(self.description));
+        m.insert("started_at".to_owned(), Value::String(self.started_at));
+        m.insert("finished_at".to_owned(), Value::String(self.finished_at));
+        m.insert("log_path".to_owned(), Value::String(self.log_path));
         m.insert(
-            "condensed_result".to_string(),
+            "condensed_result".to_owned(),
             Value::String(self.condensed_result),
         );
         m.insert(
-            "primary_failure_reason".to_string(),
+            "primary_failure_reason".to_owned(),
             Value::String(self.primary_failure_reason),
         );
         m.insert(
-            "likely_reason".to_string(),
+            "likely_reason".to_owned(),
             Value::String(self.likely_reason),
         );
         m.insert(
-            "failed_workers".to_string(),
+            "failed_workers".to_owned(),
             Value::Array(
                 self.failed_workers
                     .into_iter()
@@ -214,22 +214,22 @@ impl LiveLabFailureDigestView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "schema_version".to_string(),
+            "schema_version".to_owned(),
             Value::Number(self.schema_version.into()),
         );
-        m.insert("run_id".to_string(), Value::String(self.run_id));
-        m.insert("network_id".to_string(), Value::String(self.network_id));
-        m.insert("report_dir".to_string(), Value::String(self.report_dir));
+        m.insert("run_id".to_owned(), Value::String(self.run_id));
+        m.insert("network_id".to_owned(), Value::String(self.network_id));
+        m.insert("report_dir".to_owned(), Value::String(self.report_dir));
         m.insert(
-            "overall_status".to_string(),
+            "overall_status".to_owned(),
             Value::String(self.overall_status),
         );
         m.insert(
-            "node_count".to_string(),
+            "node_count".to_owned(),
             Value::Number(self.node_count.into()),
         );
         m.insert(
-            "nodes".to_string(),
+            "nodes".to_owned(),
             Value::Array(
                 self.nodes
                     .into_iter()
@@ -238,7 +238,7 @@ impl LiveLabFailureDigestView {
             ),
         );
         m.insert(
-            "stages".to_string(),
+            "stages".to_owned(),
             Value::Array(
                 self.stages
                     .into_iter()
@@ -247,11 +247,11 @@ impl LiveLabFailureDigestView {
             ),
         );
         m.insert(
-            "failed_stage_count".to_string(),
+            "failed_stage_count".to_owned(),
             Value::Number(self.failed_stage_count.into()),
         );
         m.insert(
-            "first_failure".to_string(),
+            "first_failure".to_owned(),
             match self.first_failure {
                 Some(stage) => Value::Object(stage.into_value_map()),
                 None => Value::Null,
@@ -417,7 +417,7 @@ fn strip_ansi_escape(line: &str) -> String {
 }
 
 fn sanitize_line(line: &str) -> String {
-    strip_ansi_escape(line).trim().to_string()
+    strip_ansi_escape(line).trim().to_owned()
 }
 
 fn is_ignored_line(line: &str) -> bool {
@@ -431,7 +431,7 @@ fn is_ignored_line(line: &str) -> bool {
 
 fn shorten(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
-        return text.to_string();
+        return text.to_owned();
     }
     format!("{}...", text[..max_len.saturating_sub(3)].trim_end())
 }
@@ -454,11 +454,11 @@ fn matches_preferred_reason(line: &str) -> bool {
 
 fn extract_likely_reason(log_path: &Path) -> String {
     if !log_path.exists() {
-        return "log file missing".to_string();
+        return "log file missing".to_owned();
     }
     let lines = match fs::read_to_string(log_path) {
         Ok(body) => body.lines().map(ToString::to_string).collect::<Vec<_>>(),
-        Err(_) => return "log file unreadable".to_string(),
+        Err(_) => return "log file unreadable".to_owned(),
     };
     let mut candidates = Vec::new();
     for raw_line in lines {
@@ -469,7 +469,7 @@ fn extract_likely_reason(log_path: &Path) -> String {
         candidates.push(line);
     }
     if candidates.is_empty() {
-        return "see full log".to_string();
+        return "see full log".to_owned();
     }
     for line in candidates.iter().rev() {
         if matches_preferred_reason(line.as_str()) {
@@ -506,7 +506,7 @@ fn extract_extended_soak_reason(report_dir: &Path) -> Option<String> {
         if value == "fail"
             && let Some(reason) = reboot_check_reason_text(name.as_str())
         {
-            reasons.push(reason.to_string());
+            reasons.push(reason.to_owned());
         }
     }
 
@@ -517,13 +517,13 @@ fn extract_extended_soak_reason(report_dir: &Path) -> Option<String> {
         .filter(|line| !line.is_empty())
     {
         match line {
-            "client_reboot_wait=fail" => reasons.push("client reboot wait timed out".to_string()),
-            "exit_reboot_wait=fail" => reasons.push("exit reboot wait timed out".to_string()),
-            "exit_post=" => reasons.push("exit post-reboot boot_id capture was empty".to_string()),
+            "client_reboot_wait=fail" => reasons.push("client reboot wait timed out".to_owned()),
+            "exit_reboot_wait=fail" => reasons.push("exit reboot wait timed out".to_owned()),
+            "exit_post=" => reasons.push("exit post-reboot boot_id capture was empty".to_owned()),
             "client_post=" => {
-                reasons.push("client post-reboot boot_id capture was empty".to_string())
+                reasons.push("client post-reboot boot_id capture was empty".to_owned())
             }
-            _ if line.starts_with("ssh_port22_hosts=") => reasons.push(line.to_string()),
+            _ if line.starts_with("ssh_port22_hosts=") => reasons.push(line.to_owned()),
             _ => {}
         }
     }
@@ -565,10 +565,10 @@ fn stage_sentence(
     if status == "pass" {
         return stage_text(stage_name, "pass")
             .unwrap_or("stage passed")
-            .to_string();
+            .to_owned();
     }
     if status == "skipped" {
-        return "stage skipped".to_string();
+        return "stage skipped".to_owned();
     }
     if !worker_results.is_empty() {
         let total = worker_results.len();
@@ -578,7 +578,7 @@ fn stage_sentence(
     }
     stage_text(stage_name, "fail")
         .unwrap_or("stage failed")
-        .to_string()
+        .to_owned()
 }
 
 pub fn execute_ops_generate_live_linux_lab_failure_digest(
@@ -692,12 +692,12 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
         format!("- report_dir: `{}`", digest.report_dir),
         format!("- node_count: `{}`", digest.node_count),
         String::new(),
-        "## Condensed Checks".to_string(),
+        "## Condensed Checks".to_owned(),
         String::new(),
     ];
 
     if digest.stages.is_empty() {
-        lines.push("- no stage results recorded yet".to_string());
+        lines.push("- no stage results recorded yet".to_owned());
     } else {
         for stage in &digest.stages {
             lines.push(format!(
@@ -709,9 +709,9 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
         }
     }
 
-    lines.extend([String::new(), "## Failure Focus".to_string(), String::new()]);
+    lines.extend([String::new(), "## Failure Focus".to_owned(), String::new()]);
     match first_failure {
-        None => lines.push("- no failed stage recorded".to_string()),
+        None => lines.push("- no failed stage recorded".to_owned()),
         Some(first) => {
             lines.push(format!("- first_failed_stage: `{}`", first.stage));
             lines.push(format!("- severity: `{}`", first.severity));
@@ -719,7 +719,7 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
             lines.push(format!("- likely_reason: {}", first.likely_reason));
             lines.push(format!("- full_log: `{}`", first.log_path));
             if !first.failed_workers.is_empty() {
-                lines.extend([String::new(), "### Failed Nodes".to_string(), String::new()]);
+                lines.extend([String::new(), "### Failed Nodes".to_owned(), String::new()]);
                 for worker in &first.failed_workers {
                     let snapshot = if worker.snapshot_path.is_empty() {
                         "n/a"
@@ -1215,10 +1215,10 @@ mod typed_parser_tests {
     fn live_lab_failure_digest_view_into_value_map_emits_null_first_failure() {
         let view = LiveLabFailureDigestView {
             schema_version: 1,
-            run_id: "run-x".to_string(),
-            network_id: "net-x".to_string(),
-            report_dir: "/tmp".to_string(),
-            overall_status: "pass".to_string(),
+            run_id: "run-x".to_owned(),
+            network_id: "net-x".to_owned(),
+            report_dir: "/tmp".to_owned(),
+            overall_status: "pass".to_owned(),
             node_count: 0,
             nodes: Vec::new(),
             stages: Vec::new(),

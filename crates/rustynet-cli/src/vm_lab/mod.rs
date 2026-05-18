@@ -392,8 +392,7 @@ pub fn run_distribute_windows_state(
         || config.dns_zone_bundle.is_some();
     if !any_bundle {
         return Err(
-            "at least one of --membership-bundle, --assignment-bundle, --traversal-bundle, --dns-zone-bundle is required"
-                .to_string(),
+            "at least one of --membership-bundle, --assignment-bundle, --traversal-bundle, --dns-zone-bundle is required".to_owned(),
         );
     }
 
@@ -871,7 +870,7 @@ pub fn validate_orchestrate_live_lab_config(
         return Err(
             "--legacy-bash-orchestrator is mutually exclusive with --node; \
              pass either the legacy --*-vm flag set or --node assignments, not both"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -982,13 +981,13 @@ pub fn legacy_role_flags_deprecation_warnings(
         "deprecated: --exit-vm/--client-vm/--entry-vm/--aux-vm/--extra-vm/\
          --fifth-client-vm/--windows-vm are transitional aliases; prefer \
          repeated --node <alias>:<role> flags for the same role assignment."
-            .to_string(),
+            .to_owned(),
         "the bash orchestrator remains the default execution path; once \
          W5.5 cross-orchestrator parity evidence is captured the Rust \
          orchestrator becomes default and the legacy flags will translate \
          to --node automatically. Pass --legacy-bash-orchestrator to lock \
          in the bash path explicitly."
-            .to_string(),
+            .to_owned(),
     ]
 }
 
@@ -1478,28 +1477,28 @@ fn default_rustynet_src_dir_for_profile(
 ) -> String {
     match profile.platform {
         VmGuestPlatform::Linux => match ssh_user {
-            Some("root") => "/root/Rustynet".to_string(),
+            Some("root") => "/root/Rustynet".to_owned(),
             Some(user) => format!("/home/{user}/Rustynet"),
-            None => "/home/debian/Rustynet".to_string(),
+            None => "/home/debian/Rustynet".to_owned(),
         },
         VmGuestPlatform::Macos => match ssh_user {
-            Some("root") => "/var/root/Rustynet".to_string(),
+            Some("root") => "/var/root/Rustynet".to_owned(),
             Some(user) => format!("/Users/{user}/Rustynet"),
-            None => "/Users/Shared/Rustynet".to_string(),
+            None => "/Users/Shared/Rustynet".to_owned(),
         },
-        VmGuestPlatform::Windows => r"C:\Rustynet".to_string(),
-        VmGuestPlatform::Ios => "/var/mobile/Rustynet-unsupported".to_string(),
-        VmGuestPlatform::Android => "/data/local/tmp/Rustynet-unsupported".to_string(),
+        VmGuestPlatform::Windows => r"C:\Rustynet".to_owned(),
+        VmGuestPlatform::Ios => "/var/mobile/Rustynet-unsupported".to_owned(),
+        VmGuestPlatform::Android => "/data/local/tmp/Rustynet-unsupported".to_owned(),
     }
 }
 
 fn default_remote_temp_dir_for_profile(profile: VmPlatformProfile) -> String {
     match profile.platform {
-        VmGuestPlatform::Linux => "/var/tmp".to_string(),
-        VmGuestPlatform::Macos => "/private/var/tmp".to_string(),
-        VmGuestPlatform::Windows => r"C:\ProgramData\Rustynet\vm-lab".to_string(),
-        VmGuestPlatform::Ios => "/var/mobile/tmp/rustynet-unsupported".to_string(),
-        VmGuestPlatform::Android => "/data/local/tmp/rustynet-unsupported".to_string(),
+        VmGuestPlatform::Linux => "/var/tmp".to_owned(),
+        VmGuestPlatform::Macos => "/private/var/tmp".to_owned(),
+        VmGuestPlatform::Windows => r"C:\ProgramData\Rustynet\vm-lab".to_owned(),
+        VmGuestPlatform::Ios => "/var/mobile/tmp/rustynet-unsupported".to_owned(),
+        VmGuestPlatform::Android => "/data/local/tmp/rustynet-unsupported".to_owned(),
     }
 }
 
@@ -2044,7 +2043,7 @@ fn default_live_lab_setup_profile_path(report_dir: &Path) -> PathBuf {
 fn default_utm_documents_root() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME is required to discover local UTM documents".to_string())?;
+        .ok_or_else(|| "HOME is required to discover local UTM documents".to_owned())?;
     Ok(home.join("Library/Containers/com.utmapp.UTM/Data/Documents"))
 }
 
@@ -2144,7 +2143,7 @@ fn current_git_provenance(
     Ok(LiveLabGitProvenance {
         git_commit: git_head_commit()?,
         git_tree_clean: !git_worktree_is_dirty()?,
-        source_mode: source_mode.to_string(),
+        source_mode: source_mode.to_owned(),
         repo_ref: repo_ref.map(ToOwned::to_owned),
     })
 }
@@ -2327,7 +2326,7 @@ fn build_setup_manifest(input: &LiveLabSetupManifestInput) -> Result<LiveLabSetu
         script: file_binding(input.script_path.as_path())?,
         inventory: optional_file_binding(input.inventory_path.as_deref())?,
         wrapper_source: current_wrapper_source_binding()?,
-        wrapper_version: env!("CARGO_PKG_VERSION").to_string(),
+        wrapper_version: env!("CARGO_PKG_VERSION").to_owned(),
         git: current_git_provenance(input.source_mode.as_str(), input.repo_ref.as_deref())?,
         setup_flags: LiveLabSetupModeFlags {
             require_same_network: input.require_same_network,
@@ -2447,7 +2446,7 @@ fn build_run_provenance(
         profile_semantic_sha256: semantic_live_lab_profile_sha256(profile_path)?,
         script: file_binding(script_path)?,
         wrapper_source: current_wrapper_source_binding()?,
-        wrapper_version: env!("CARGO_PKG_VERSION").to_string(),
+        wrapper_version: env!("CARGO_PKG_VERSION").to_owned(),
         git: current_git_provenance(source_mode, repo_ref)?,
         run_flags: flags.clone(),
     })
@@ -2526,7 +2525,7 @@ fn validate_setup_manifest(
         }
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => {
-            return Err("setup manifest inventory provenance mismatch".to_string());
+            return Err("setup manifest inventory provenance mismatch".to_owned());
         }
     }
     let current_wrapper_source = current_wrapper_source_binding()?;
@@ -2548,9 +2547,9 @@ fn validate_setup_manifest(
         return Err(format!(
             "setup manifest git provenance mismatch: actual={} current={}",
             serde_json::to_string(&actual.git)
-                .unwrap_or_else(|_| "<git-serialize-error>".to_string()),
+                .unwrap_or_else(|_| "<git-serialize-error>".to_owned()),
             serde_json::to_string(&current_git)
-                .unwrap_or_else(|_| "<git-serialize-error>".to_string())
+                .unwrap_or_else(|_| "<git-serialize-error>".to_owned())
         ));
     }
     if let Some(value) = expected.require_same_network
@@ -2561,7 +2560,7 @@ fn validate_setup_manifest(
             actual
                 .setup_flags
                 .require_same_network
-                .map_or_else(|| "none".to_string(), |flag| flag.to_string())
+                .map_or_else(|| "none".to_owned(), |flag| flag.to_string())
         ));
     }
     if let Some(value) = expected.dry_run
@@ -2580,7 +2579,7 @@ fn validate_setup_manifest(
             actual
                 .setup_flags
                 .max_parallel_node_workers
-                .map_or_else(|| "none".to_string(), |v| v.to_string())
+                .map_or_else(|| "none".to_owned(), |v| v.to_string())
         ));
     }
     Ok(())
@@ -2669,7 +2668,7 @@ fn resolve_run_setup_reuse(
         profile_path: profile_path.to_path_buf(),
         script_path: script_path.to_path_buf(),
         inventory_path: None,
-        source_mode: source_mode.to_string(),
+        source_mode: source_mode.to_owned(),
         repo_ref: repo_ref.map(ToOwned::to_owned),
         require_same_network: None,
         dry_run: None,
@@ -2707,7 +2706,7 @@ fn resolve_run_setup_reuse(
 impl VmLabIterationValidationStep {
     fn label(&self) -> String {
         match self {
-            Self::FmtCheck => "fmt".to_string(),
+            Self::FmtCheck => "fmt".to_owned(),
             Self::CargoCheckPackage { package } => format!("check:{package}"),
             Self::CargoCheckBin { package, bin } => format!("check-bin:{package}:{bin}"),
             Self::CargoTestPackage { package, filter } => match filter {
@@ -2736,21 +2735,21 @@ pub fn parse_vm_lab_iteration_validation_step_spec(
         ["check", package] => {
             ensure_no_control_chars("validation package", package)?;
             Ok(VmLabIterationValidationStep::CargoCheckPackage {
-                package: (*package).to_string(),
+                package: (*package).to_owned(),
             })
         }
         ["check-bin", package, bin] => {
             ensure_no_control_chars("validation package", package)?;
             ensure_no_control_chars("validation binary", bin)?;
             Ok(VmLabIterationValidationStep::CargoCheckBin {
-                package: (*package).to_string(),
-                bin: (*bin).to_string(),
+                package: (*package).to_owned(),
+                bin: (*bin).to_owned(),
             })
         }
         ["test", package] => {
             ensure_no_control_chars("validation package", package)?;
             Ok(VmLabIterationValidationStep::CargoTestPackage {
-                package: (*package).to_string(),
+                package: (*package).to_owned(),
                 filter: None,
             })
         }
@@ -2758,16 +2757,16 @@ pub fn parse_vm_lab_iteration_validation_step_spec(
             ensure_no_control_chars("validation package", package)?;
             ensure_no_control_chars("validation test filter", filter)?;
             Ok(VmLabIterationValidationStep::CargoTestPackage {
-                package: (*package).to_string(),
-                filter: Some((*filter).to_string()),
+                package: (*package).to_owned(),
+                filter: Some((*filter).to_owned()),
             })
         }
         ["test-bin", package, bin] => {
             ensure_no_control_chars("validation package", package)?;
             ensure_no_control_chars("validation binary", bin)?;
             Ok(VmLabIterationValidationStep::CargoTestBin {
-                package: (*package).to_string(),
-                bin: (*bin).to_string(),
+                package: (*package).to_owned(),
+                bin: (*bin).to_owned(),
                 filter: None,
             })
         }
@@ -2776,9 +2775,9 @@ pub fn parse_vm_lab_iteration_validation_step_spec(
             ensure_no_control_chars("validation binary", bin)?;
             ensure_no_control_chars("validation test filter", filter)?;
             Ok(VmLabIterationValidationStep::CargoTestBin {
-                package: (*package).to_string(),
-                bin: (*bin).to_string(),
-                filter: Some((*filter).to_string()),
+                package: (*package).to_owned(),
+                bin: (*bin).to_owned(),
+                filter: Some((*filter).to_owned()),
             })
         }
         _ => Err(format!(
@@ -2803,7 +2802,7 @@ pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String
                 utm_name,
                 bundle_path.display()
             ),
-            None => "controller=none".to_string(),
+            None => "controller=none".to_owned(),
         };
         lines.push(format!(
             "alias={} ssh_target={} ssh_user={} os={} last_known_ip={} parent_device={} last_known_network={} network_group={} node_id={} lab_role={} mesh_ip={} exit_capable={} relay_capable={} rustynet_src_dir={} {}",
@@ -2811,30 +2810,30 @@ pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String
             entry.ssh_target,
             entry
                 .ssh_user
-                .unwrap_or_else(|| "<ssh-default>".to_string()),
-            entry.os.unwrap_or_else(|| "<unknown>".to_string()),
+                .unwrap_or_else(|| "<ssh-default>".to_owned()),
+            entry.os.unwrap_or_else(|| "<unknown>".to_owned()),
             entry
                 .last_known_ip
-                .unwrap_or_else(|| "<unknown>".to_string()),
+                .unwrap_or_else(|| "<unknown>".to_owned()),
             entry
                 .parent_device
-                .unwrap_or_else(|| "<unknown>".to_string()),
+                .unwrap_or_else(|| "<unknown>".to_owned()),
             entry
                 .last_known_network
-                .unwrap_or_else(|| "<unknown>".to_string()),
+                .unwrap_or_else(|| "<unknown>".to_owned()),
             entry
                 .network_group
-                .unwrap_or_else(|| "<unset>".to_string()),
-            entry.node_id.unwrap_or_else(|| "<unset>".to_string()),
-            entry.lab_role.unwrap_or_else(|| "<unset>".to_string()),
-            entry.mesh_ip.unwrap_or_else(|| "<unset>".to_string()),
+                .unwrap_or_else(|| "<unset>".to_owned()),
+            entry.node_id.unwrap_or_else(|| "<unset>".to_owned()),
+            entry.lab_role.unwrap_or_else(|| "<unset>".to_owned()),
+            entry.mesh_ip.unwrap_or_else(|| "<unset>".to_owned()),
             entry
-                .exit_capable.map_or_else(|| "<unset>".to_string(), |value| value.to_string()),
+                .exit_capable.map_or_else(|| "<unset>".to_owned(), |value| value.to_string()),
             entry
-                .relay_capable.map_or_else(|| "<unset>".to_string(), |value| value.to_string()),
+                .relay_capable.map_or_else(|| "<unset>".to_owned(), |value| value.to_string()),
             entry
                 .rustynet_src_dir
-                .unwrap_or_else(|| "<unset>".to_string()),
+                .unwrap_or_else(|| "<unset>".to_owned()),
             controller_summary
         ));
     }
@@ -2906,7 +2905,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                     bundle_path.display()
                 )
             })?
-            .to_string();
+            .to_owned();
         let inventory_match = inventory.iter().find(|entry| {
             matches_local_utm_inventory_entry(entry, bundle_path.as_path(), utm_name.as_str())
         });
@@ -2927,12 +2926,12 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         };
 
         let mut discovery_notes = Vec::new();
-        let mut live_ip_source = "unavailable".to_string();
+        let mut live_ip_source = "unavailable".to_owned();
         let mut live_ip = None;
         let mut authoritative_ssh_target = None;
         let mut authoritative_target_present = false;
         let mut advisory_ssh_target = None;
-        let mut ssh_target_source = "unavailable".to_string();
+        let mut ssh_target_source = "unavailable".to_owned();
         let mut ssh_user = None;
         let mut inventory_alias = None;
         let mut inventory_node_id = None;
@@ -2964,16 +2963,16 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 resolved_inventory_ssh_target_with_utmctl(entry, utmctl_path.as_path());
             authoritative_ssh_target = Some(resolved_target.clone());
             authoritative_target_present = true;
-            ssh_target_source = "inventory".to_string();
+            ssh_target_source = "inventory".to_owned();
             ssh_user = entry.ssh_user.clone();
             if let Some(ip) = resolve_local_utm_live_host(entry, utmctl_path.as_path()) {
-                live_ip_source = "utmctl".to_string();
+                live_ip_source = "utmctl".to_owned();
                 live_ip = Some(ip);
             } else if let Some(ip) = entry.last_known_ip.as_deref() {
-                live_ip_source = "inventory.last_known_ip".to_string();
-                live_ip = Some(ip.to_string());
+                live_ip_source = "inventory.last_known_ip".to_owned();
+                live_ip = Some(ip.to_owned());
                 discovery_notes
-                    .push("utmctl-ip-address-unavailable-using-inventory-fallback".to_string());
+                    .push("utmctl-ip-address-unavailable-using-inventory-fallback".to_owned());
             }
             entry.platform_profile()
         } else {
@@ -2986,7 +2985,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 None,
                 utmctl_path.as_path(),
             ) {
-                live_ip_source = "utmctl".to_string();
+                live_ip_source = "utmctl".to_owned();
                 live_ip = Some(ip);
             }
             if let Some(ip) = live_ip.clone() {
@@ -2995,11 +2994,10 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 advisory_ssh_target =
                     unmatched_local_utm_advisory_target(inferred_platform, ip.as_str());
                 if inferred_platform == VmGuestPlatform::Linux {
-                    ssh_user = Some("debian".to_string());
+                    ssh_user = Some("debian".to_owned());
                 } else {
                     discovery_notes.push(
-                        "windows-utm-discovered-without-inventory-no-linux-user-assumed"
-                            .to_string(),
+                        "windows-utm-discovered-without-inventory-no-linux-user-assumed".to_owned(),
                     );
                 }
             }
@@ -3011,14 +3009,14 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             Some(ip) if live_ip_source == "utmctl" => ProbeState::Ok { value: ip },
             Some(ip) if live_ip_source == "inventory.last_known_ip" => ProbeState::Fallback {
                 value: ip,
-                reason: "utmctl-ip-address-unavailable".to_string(),
+                reason: "utmctl-ip-address-unavailable".to_owned(),
             },
             Some(ip) => ProbeState::Fallback {
                 value: ip,
                 reason: format!("live-ip-source={live_ip_source}"),
             },
             None => ProbeState::Missing {
-                reason: "live-ip-unavailable".to_string(),
+                reason: "live-ip-unavailable".to_owned(),
             },
         };
         if matches!(
@@ -3028,7 +3026,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             live_ip_count += 1;
         }
 
-        let mut ssh_port_status = "skipped".to_string();
+        let mut ssh_port_status = "skipped".to_owned();
         let mut ssh_port_error = None;
         if let Some(ip) = live_ip.as_deref() {
             match probe_tcp_port_status(ip, ssh_port, timeout) {
@@ -3037,7 +3035,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                     ssh_port_error = error;
                 }
                 Err(err) => {
-                    ssh_port_status = "unknown".to_string();
+                    ssh_port_status = "unknown".to_owned();
                     ssh_port_error = Some(err);
                 }
             }
@@ -3047,12 +3045,12 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 value: PortStatus::Open,
             },
             "skipped" => ProbeState::Missing {
-                reason: "no-live-ip".to_string(),
+                reason: "no-live-ip".to_owned(),
             },
             "unknown" => ProbeState::Error {
                 reason: ssh_port_error
                     .clone()
-                    .unwrap_or_else(|| "tcp-port-probe-failed".to_string()),
+                    .unwrap_or_else(|| "tcp-port-probe-failed".to_owned()),
             },
             value => ProbeState::Fallback {
                 value: if value == "closed" {
@@ -3068,7 +3066,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
         let windows_ssh_probe_state = if discovery_platform == VmGuestPlatform::Windows {
             if !process_present {
                 Some(ProbeState::Missing {
-                    reason: "process-not-ready".to_string(),
+                    reason: "process-not-ready".to_owned(),
                 })
             } else if live_ip.is_some() {
                 Some(probe_windows_local_utm_ssh_readiness(
@@ -3077,7 +3075,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 ))
             } else {
                 Some(ProbeState::Missing {
-                    reason: "live-ip-not-authoritative".to_string(),
+                    reason: "live-ip-not-authoritative".to_owned(),
                 })
             }
         } else {
@@ -3101,13 +3099,13 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                 .or(advisory_ssh_target.as_deref()),
         ) {
             (None, _, _) => ProbeState::Missing {
-                reason: "no-live-ip".to_string(),
+                reason: "no-live-ip".to_owned(),
             },
             (_, None, _) => ProbeState::Missing {
-                reason: "no-ssh-user".to_string(),
+                reason: "no-ssh-user".to_owned(),
             },
             (_, _, None) => ProbeState::Missing {
-                reason: "no-ssh-target".to_string(),
+                reason: "no-ssh-target".to_owned(),
             },
             (_, _, Some(_)) if ssh_port_status != "open" => ProbeState::Missing {
                 reason: format!("ssh-port-status={ssh_port_status}"),
@@ -3123,11 +3121,11 @@ pub fn execute_ops_vm_lab_discover_local_utm(
                         timeout,
                     ) {
                         Ok(status) if status.success() => ProbeState::Ok {
-                            value: "ok".to_string(),
+                            value: "ok".to_owned(),
                         },
                         Ok(status) => ProbeState::Fallback {
                             value: format!("failed-exit-{}", status_code(status)),
-                            reason: "ssh-auth-command-failed".to_string(),
+                            reason: "ssh-auth-command-failed".to_owned(),
                         },
                         Err(err) => ProbeState::Error { reason: err },
                     },
@@ -3230,7 +3228,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
     };
     let inventory_update = if config.update_inventory_live_ips {
         let inventory_path = config.inventory_path.as_deref().ok_or_else(|| {
-            "vm-lab-discover-local-utm --update-inventory-live-ips requires --inventory".to_string()
+            "vm-lab-discover-local-utm --update-inventory-live-ips requires --inventory".to_owned()
         })?;
         Some(if matched_inventory_count == 0 {
             format!(
@@ -3297,7 +3295,7 @@ pub fn execute_ops_vm_lab_discover_local_utm_summary(
     let rendered = render_local_utm_discovery_summary(
         report
             .as_object()
-            .ok_or_else(|| "local UTM discovery report must be a JSON object".to_string())?,
+            .ok_or_else(|| "local UTM discovery report must be a JSON object".to_owned())?,
     )?;
     if let Some(report_dir) = summary_report_dir.as_deref() {
         write_orchestration_artifact(
@@ -3316,11 +3314,11 @@ fn render_local_utm_discovery_summary(
     let summary = report
         .get("summary")
         .and_then(Value::as_object)
-        .ok_or_else(|| "local UTM discovery report is missing summary data".to_string())?;
+        .ok_or_else(|| "local UTM discovery report is missing summary data".to_owned())?;
     let entries = report
         .get("entries")
         .and_then(Value::as_array)
-        .ok_or_else(|| "local UTM discovery report is missing entries data".to_string())?;
+        .ok_or_else(|| "local UTM discovery report is missing entries data".to_owned())?;
 
     let summary_string = |key: &str| -> Result<String, String> {
         summary
@@ -3396,7 +3394,7 @@ fn render_local_utm_discovery_summary(
         let prefix = format!("node[{index}]");
         lines.push(format!(
             "{prefix}.alias={}",
-            entry_string(entry, "alias").unwrap_or_else(|| "<unknown>".to_string())
+            entry_string(entry, "alias").unwrap_or_else(|| "<unknown>".to_owned())
         ));
         if let Some(value) = entry_string(entry, "inventory_alias") {
             lines.push(format!("{prefix}.inventory_alias={value}"));
@@ -3712,19 +3710,19 @@ fn resolve_repo_sync_source(
 ) -> Result<RepoSyncSource, String> {
     match (repo_url, local_source_dir) {
         (Some(_), Some(_)) => Err(
-            "specify either --repo-url or --local-source-dir for vm-lab sync, not both".to_string(),
+            "specify either --repo-url or --local-source-dir for vm-lab sync, not both".to_owned(),
         ),
         (None, None) => {
-            Err("specify one of --repo-url or --local-source-dir for vm-lab sync".to_string())
+            Err("specify one of --repo-url or --local-source-dir for vm-lab sync".to_owned())
         }
         (Some(repo_url), None) => {
             ensure_no_control_chars("repo URL", repo_url)?;
             ensure_no_control_chars("branch", branch)?;
             ensure_no_control_chars("remote", remote)?;
             Ok(RepoSyncSource::Git {
-                repo_url: repo_url.to_string(),
-                branch: branch.to_string(),
-                remote: remote.to_string(),
+                repo_url: repo_url.to_owned(),
+                branch: branch.to_owned(),
+                remote: remote.to_owned(),
             })
         }
         (None, Some(local_source_dir)) => {
@@ -3754,7 +3752,7 @@ fn sync_repo_targets(
     }) {
         return Err(
             "iOS and Android targets are scaffolding-only for vm-lab repo sync right now"
-                .to_string(),
+                .to_owned(),
         );
     }
     let mut results = Vec::new();
@@ -4068,7 +4066,7 @@ pub fn execute_ops_vm_lab_write_live_lab_profile(
     )?;
 
     let mut lines = vec![
-        "# Generated by rustynet-cli ops vm-lab-write-live-lab-profile".to_string(),
+        "# Generated by rustynet-cli ops vm-lab-write-live-lab-profile".to_owned(),
         format_env_assignment("EXIT_TARGET", exit_target.normalized_target.as_str())?,
         format_env_assignment("CLIENT_TARGET", client_target.normalized_target.as_str())?,
         format_env_assignment(
@@ -4268,49 +4266,48 @@ fn resolve_live_lab_vm_aliases(
     push_unique_alias(
         &mut aliases,
         match exit_vm {
-            Some(value) => Some(value.to_string()),
+            Some(value) => Some(value.to_owned()),
             None => default_inventory_alias_for_lab_roles(inventory_path, &["exit"])?,
         },
     );
     push_unique_alias(
         &mut aliases,
         match client_vm {
-            Some(value) => Some(value.to_string()),
+            Some(value) => Some(value.to_owned()),
             None => default_inventory_alias_for_lab_roles(inventory_path, &["client"])?,
         },
     );
     push_unique_alias(
         &mut aliases,
         match entry_vm {
-            Some(value) => Some(value.to_string()),
+            Some(value) => Some(value.to_owned()),
             None => default_inventory_alias_for_lab_roles(inventory_path, &["entry", "relay"])?,
         },
     );
     push_unique_alias(
         &mut aliases,
         match aux_vm {
-            Some(value) => Some(value.to_string()),
+            Some(value) => Some(value.to_owned()),
             None => default_inventory_alias_for_lab_roles(inventory_path, &["aux"])?,
         },
     );
     push_unique_alias(
         &mut aliases,
         match extra_vm {
-            Some(value) => Some(value.to_string()),
+            Some(value) => Some(value.to_owned()),
             None => default_inventory_alias_for_lab_roles(inventory_path, &["extra"])?,
         },
     );
     push_unique_alias(
         &mut aliases,
         match fifth_client_vm {
-            Some(value) => Some(value.to_string()),
+            Some(value) => Some(value.to_owned()),
             None => default_inventory_alias_for_lab_roles(inventory_path, &["fifth_client"])?,
         },
     );
     if aliases.is_empty() {
         return Err(
-            "could not resolve any live-lab VM aliases from explicit flags or inventory lab_role metadata"
-                .to_string(),
+            "could not resolve any live-lab VM aliases from explicit flags or inventory lab_role metadata".to_owned(),
         );
     }
     Ok(aliases)
@@ -4366,12 +4363,12 @@ fn selected_local_utm_readiness_from_report(
 
 fn render_selected_local_utm_readiness(summary: &LocalUtmSelectedReadinessSummary) -> String {
     let ready = if summary.ready_aliases.is_empty() {
-        "none".to_string()
+        "none".to_owned()
     } else {
         summary.ready_aliases.join(", ")
     };
     let unready = if summary.unready_entries.is_empty() {
-        "none".to_string()
+        "none".to_owned()
     } else {
         summary
             .unready_entries
@@ -4404,7 +4401,7 @@ fn stage_outcome(
     artifacts: Vec<PathBuf>,
 ) -> VmLabStageOutcome {
     VmLabStageOutcome {
-        stage: stage.to_string(),
+        stage: stage.to_owned(),
         status,
         summary: summary.into(),
         artifacts: artifacts
@@ -4609,7 +4606,7 @@ fn finalize_vm_lab_orchestration_result(
 ) -> Result<String, String> {
     let overall_status = orchestrated_command_status(outcomes.as_slice(), warnings.as_slice());
     let rendered = serialize_vm_lab_command_result(&VmLabCommandResult {
-        command: command.to_string(),
+        command: command.to_owned(),
         overall_status: overall_status.clone(),
         report_dir: report_dir.display().to_string(),
         outcomes,
@@ -4646,7 +4643,7 @@ fn build_vm_lab_command_result_output(
 ) -> Result<(String, VmLabCommandOverallStatus), String> {
     let overall_status = orchestrated_command_status(outcomes.as_slice(), warnings.as_slice());
     let rendered = serialize_vm_lab_command_result(&VmLabCommandResult {
-        command: command.to_string(),
+        command: command.to_owned(),
         overall_status: overall_status.clone(),
         report_dir: report_dir_label(report_dir, fallback_report_dir),
         outcomes,
@@ -4774,7 +4771,7 @@ fn render_vm_lab_command_result(
     let overall_status =
         overall_status_override.unwrap_or_else(|| command_status_from_summary(summary));
     serialize_vm_lab_command_result(&VmLabCommandResult {
-        command: command.to_string(),
+        command: command.to_owned(),
         overall_status,
         report_dir: report_dir.display().to_string(),
         outcomes: stage_outcomes_from_records(records),
@@ -4809,7 +4806,7 @@ pub fn execute_ops_vm_lab_setup_live_lab(
     if config.resume_from.is_some() && config.rerun_stage.is_some() {
         return Err(
             "vm-lab-setup-live-lab accepts either --resume-from or --rerun-stage, not both"
-                .to_string(),
+                .to_owned(),
         );
     }
     let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
@@ -5390,7 +5387,7 @@ pub trait ServiceManager {
 /// naming rules).
 fn validate_service_name(service_name: &str) -> Result<(), String> {
     if service_name.is_empty() {
-        return Err("service name must not be empty".to_string());
+        return Err("service name must not be empty".to_owned());
     }
     if service_name.len() > 128 {
         return Err(format!(
@@ -5422,40 +5419,40 @@ impl ServiceManager for LinuxServiceManager {
         // systemd "install" semantically = reload daemon so the unit
         // file (already on disk under /etc/systemd/system) is picked up.
         Ok(ServiceCommand::Argv(vec![
-            "systemctl".to_string(),
-            "daemon-reload".to_string(),
+            "systemctl".to_owned(),
+            "daemon-reload".to_owned(),
         ]))
     }
     fn enable(&self, service_name: &str) -> Result<ServiceCommand, String> {
         validate_service_name(service_name)?;
         Ok(ServiceCommand::Argv(vec![
-            "systemctl".to_string(),
-            "enable".to_string(),
-            service_name.to_string(),
+            "systemctl".to_owned(),
+            "enable".to_owned(),
+            service_name.to_owned(),
         ]))
     }
     fn start(&self, service_name: &str) -> Result<ServiceCommand, String> {
         validate_service_name(service_name)?;
         Ok(ServiceCommand::Argv(vec![
-            "systemctl".to_string(),
-            "start".to_string(),
-            service_name.to_string(),
+            "systemctl".to_owned(),
+            "start".to_owned(),
+            service_name.to_owned(),
         ]))
     }
     fn stop(&self, service_name: &str) -> Result<ServiceCommand, String> {
         validate_service_name(service_name)?;
         Ok(ServiceCommand::Argv(vec![
-            "systemctl".to_string(),
-            "stop".to_string(),
-            service_name.to_string(),
+            "systemctl".to_owned(),
+            "stop".to_owned(),
+            service_name.to_owned(),
         ]))
     }
     fn restart(&self, service_name: &str) -> Result<ServiceCommand, String> {
         validate_service_name(service_name)?;
         Ok(ServiceCommand::Argv(vec![
-            "systemctl".to_string(),
-            "restart".to_string(),
-            service_name.to_string(),
+            "systemctl".to_owned(),
+            "restart".to_owned(),
+            service_name.to_owned(),
         ]))
     }
     fn status(&self, service_name: &str) -> Result<ServiceCommand, String> {
@@ -5463,18 +5460,18 @@ impl ServiceManager for LinuxServiceManager {
         // is-active gives a single-word answer the caller can grep
         // without color codes / pager invocation that `status` uses.
         Ok(ServiceCommand::Argv(vec![
-            "systemctl".to_string(),
-            "is-active".to_string(),
-            service_name.to_string(),
+            "systemctl".to_owned(),
+            "is-active".to_owned(),
+            service_name.to_owned(),
         ]))
     }
     fn uninstall(&self, service_name: &str) -> Result<ServiceCommand, String> {
         validate_service_name(service_name)?;
         Ok(ServiceCommand::Argv(vec![
-            "systemctl".to_string(),
-            "disable".to_string(),
-            "--now".to_string(),
-            service_name.to_string(),
+            "systemctl".to_owned(),
+            "disable".to_owned(),
+            "--now".to_owned(),
+            service_name.to_owned(),
         ]))
     }
     fn platform_label(&self) -> &'static str {
@@ -5496,14 +5493,14 @@ pub struct WindowsServiceManager;
 impl WindowsServiceManager {
     fn powershell_argv(command: &str) -> Vec<String> {
         vec![
-            "powershell.exe".to_string(),
-            "-NoLogo".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-Command".to_string(),
-            command.to_string(),
+            "powershell.exe".to_owned(),
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-ExecutionPolicy".to_owned(),
+            "Bypass".to_owned(),
+            "-Command".to_owned(),
+            command.to_owned(),
         ]
     }
 }
@@ -5515,9 +5512,9 @@ impl ServiceManager for WindowsServiceManager {
         // every other parameter (paths, ACLs, failure actions) is set
         // by the helper itself.
         Ok(ServiceCommand::HelperScript {
-            helper_label: "Windows install helper".to_string(),
-            script_basename: "Install-RustyNetWindowsService.ps1".to_string(),
-            args: vec!["-ServiceName".to_string(), service_name.to_string()],
+            helper_label: "Windows install helper".to_owned(),
+            script_basename: "Install-RustyNetWindowsService.ps1".to_owned(),
+            args: vec!["-ServiceName".to_owned(), service_name.to_owned()],
         })
     }
     fn enable(&self, service_name: &str) -> Result<ServiceCommand, String> {
@@ -5699,16 +5696,16 @@ impl RemoteExec for PosixRemoteExec {
         argv: &[String],
     ) -> Result<RemoteInvocation, String> {
         if ssh_target.trim().is_empty() {
-            return Err("ssh_target must not be empty".to_string());
+            return Err("ssh_target must not be empty".to_owned());
         }
         if argv.is_empty() {
-            return Err("argv must not be empty".to_string());
+            return Err("argv must not be empty".to_owned());
         }
         for arg in argv {
             ensure_no_control_chars("posix remote argv", arg)?;
         }
         Ok(RemoteInvocation::PosixSshArgv {
-            ssh_target: ssh_target.to_string(),
+            ssh_target: ssh_target.to_owned(),
             argv: argv.to_vec(),
         })
     }
@@ -5741,10 +5738,10 @@ impl RemoteExec for WindowsRemoteExec {
         argv: &[String],
     ) -> Result<RemoteInvocation, String> {
         if ssh_target.trim().is_empty() {
-            return Err("ssh_target must not be empty".to_string());
+            return Err("ssh_target must not be empty".to_owned());
         }
         if argv.is_empty() {
-            return Err("argv must not be empty".to_string());
+            return Err("argv must not be empty".to_owned());
         }
         for arg in argv {
             ensure_no_control_chars("windows remote argv", arg)?;
@@ -5761,7 +5758,7 @@ impl RemoteExec for WindowsRemoteExec {
             format!("& {exe} @({arg_list})")
         };
         Ok(RemoteInvocation::WindowsSshEncodedPowerShell {
-            ssh_target: ssh_target.to_string(),
+            ssh_target: ssh_target.to_owned(),
             powershell_body: body,
         })
     }
@@ -5888,7 +5885,7 @@ impl DaemonProbe for LinuxDaemonProbe {
     fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String> {
         let daemon = daemon_path.to_string_lossy().into_owned();
         if daemon.is_empty() {
-            return Err("daemon_path must not be empty".to_string());
+            return Err("daemon_path must not be empty".to_owned());
         }
         // The Linux daemon ships parity validator subcommands one at a
         // time. Until each lands, the adapter rejects with the precise
@@ -5905,8 +5902,8 @@ impl DaemonProbe for LinuxDaemonProbe {
         };
         Ok(vec![
             daemon,
-            subcommand.to_string(),
-            "--no-fail-on-drift".to_string(),
+            subcommand.to_owned(),
+            "--no-fail-on-drift".to_owned(),
         ])
     }
     fn platform_label(&self) -> &'static str {
@@ -5924,7 +5921,7 @@ impl DaemonProbe for WindowsDaemonProbe {
     fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String> {
         let daemon = daemon_path.to_string_lossy().into_owned();
         if daemon.is_empty() {
-            return Err("daemon_path must not be empty".to_string());
+            return Err("daemon_path must not be empty".to_owned());
         }
         let subcommand = match op {
             DaemonProbeOp::RuntimeAcls => "windows-runtime-acls-check",
@@ -5936,8 +5933,8 @@ impl DaemonProbe for WindowsDaemonProbe {
         };
         Ok(vec![
             daemon,
-            subcommand.to_string(),
-            "--no-fail-on-drift".to_string(),
+            subcommand.to_owned(),
+            "--no-fail-on-drift".to_owned(),
         ])
     }
     fn platform_label(&self) -> &'static str {
@@ -5951,7 +5948,7 @@ impl DaemonProbe for MacosDaemonProbe {
     fn build_argv(&self, op: DaemonProbeOp, daemon_path: &Path) -> Result<Vec<String>, String> {
         let daemon = daemon_path.to_string_lossy().into_owned();
         if daemon.is_empty() {
-            return Err("daemon_path must not be empty".to_string());
+            return Err("daemon_path must not be empty".to_owned());
         }
         let subcommand = match op {
             DaemonProbeOp::RuntimeAcls => "macos-runtime-acls-check",
@@ -5963,8 +5960,8 @@ impl DaemonProbe for MacosDaemonProbe {
         };
         Ok(vec![
             daemon,
-            subcommand.to_string(),
-            "--no-fail-on-drift".to_string(),
+            subcommand.to_owned(),
+            "--no-fail-on-drift".to_owned(),
         ])
     }
     fn platform_label(&self) -> &'static str {
@@ -6257,7 +6254,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     if can_continue_from_setup && !config.skip_setup {
         warnings.push(
             "auto-detected completed setup stages in report dir; continued with test stages only"
-                .to_string(),
+                .to_owned(),
         );
     }
     let completeness_error = if release_gate_report.requested
@@ -6355,9 +6352,9 @@ fn execute_rust_native_orchestration(
     use orchestrator::error::StageOutcome;
     use orchestrator::runner::StateMachineRunner;
 
-    let known_hosts = config.known_hosts_path.ok_or_else(|| {
-        "--known-hosts-file is required when --node flags are present".to_string()
-    })?;
+    let known_hosts = config
+        .known_hosts_path
+        .ok_or_else(|| "--known-hosts-file is required when --node flags are present".to_owned())?;
     ensure_local_regular_file_path(config.ssh_identity_file.as_path(), "SSH identity file")?;
     ensure_local_regular_file_path(known_hosts.as_path(), "SSH known-hosts file")?;
 
@@ -6389,7 +6386,7 @@ fn execute_rust_native_orchestration(
     if let Some(cidrs) = config.orchestrate_ssh_allow_cidrs.as_deref() {
         let trimmed = cidrs.trim();
         if !trimmed.is_empty() {
-            ctx.ssh_allow_cidrs = trimmed.to_string();
+            ctx.ssh_allow_cidrs = trimmed.to_owned();
         }
     }
 
@@ -6447,7 +6444,7 @@ fn execute_rust_native_orchestration(
             .last_known_ip
             .as_deref()
             .unwrap_or(entry.ssh_target.as_str())
-            .to_string();
+            .to_owned();
 
         let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
         if !assignment.role.is_lab_assignable_for_platform(&platform) {
@@ -6683,7 +6680,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             "--validate-linux-daemon-state was passed with --windows-only; Linux daemon \
              validators will not run because --windows-only skips all Linux peers. \
              Drop one of the two flags to remove the ambiguity."
-                .to_string(),
+                .to_owned(),
         );
     }
     // --windows-only: skip all Linux stages and go straight to Windows orchestration.
@@ -6691,7 +6688,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         let windows_alias = config
             .windows_vm
             .as_deref()
-            .ok_or_else(|| "--windows-only requires --windows-vm to be set".to_string())?;
+            .ok_or_else(|| "--windows-only requires --windows-vm to be set".to_owned())?;
         // Only the Windows VM needs to be ready for a Windows-only run; ignore Linux VMs.
         let windows_unready: Vec<String> = unready_aliases
             .iter()
@@ -6894,7 +6891,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             ));
             next_actions.push(
                 "Rerun without --dry-run or inspect the discovery artifacts for readiness blockers"
-                    .to_string(),
+                    .to_owned(),
             );
         } else {
             next_actions.push(format!(
@@ -7413,7 +7410,7 @@ fn locate_windows_bundle_paths_from_report_dir(
             .map_err(|err| format!("could not resolve Linux exit alias from inventory: {err}"))?
             .ok_or_else(|| {
                 "no Linux exit alias resolvable from --exit-vm or inventory lab_role=exit"
-                    .to_string()
+                    .to_owned()
             })?,
     };
     let inventory = load_inventory(inventory_path)?;
@@ -7610,7 +7607,7 @@ fn run_windows_orchestration_stages_with_options(
     } else {
         let result = (|| -> Result<String, String> {
             let targets =
-                resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])?;
+                resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])?;
             let target = targets
                 .into_iter()
                 .next()
@@ -7623,7 +7620,7 @@ fn run_windows_orchestration_stages_with_options(
             }
             let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
             let host_key = if options.skip_access_bootstrap {
-                "skipped-access-bootstrap".to_string()
+                "skipped-access-bootstrap".to_owned()
             } else {
                 // Read the `.pub` sibling of the identity file so the
                 // prepare-transport helper can write it to
@@ -7634,12 +7631,12 @@ fn run_windows_orchestration_stages_with_options(
                 let pub_key_path = ssh_identity_file.with_extension(
                     match ssh_identity_file.extension().and_then(|e| e.to_str()) {
                         Some(ext) => format!("{ext}.pub"),
-                        None => "pub".to_string(),
+                        None => "pub".to_owned(),
                     },
                 );
                 let automation_public_key = std::fs::read_to_string(&pub_key_path)
                     .ok()
-                    .map(|s| s.trim().to_string());
+                    .map(|s| s.trim().to_owned());
                 bootstrap_windows_access_for_target(
                     &target,
                     None,
@@ -7740,7 +7737,7 @@ fn run_windows_orchestration_stages_with_options(
     } else {
         let result = (|| -> Result<String, String> {
             let targets =
-                resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])?;
+                resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])?;
             let target = targets
                 .into_iter()
                 .next()
@@ -7757,7 +7754,7 @@ fn run_windows_orchestration_stages_with_options(
                 service_script.as_str(),
                 timeout,
             )?;
-            let service_status = service_output.trim().to_string();
+            let service_status = service_output.trim().to_owned();
             if service_status != "Running" {
                 return Err(format!(
                     "RustyNet service is not Running on {windows_alias}: status={service_status:?}"
@@ -8528,7 +8525,7 @@ fn run_windows_orchestration_stages_with_options(
             "amend_membership_for_windows",
             VmLabStageStatus::Skipped,
             "skipped: no linux_exit_alias configured; Windows membership amendment disabled"
-                .to_string(),
+                .to_owned(),
             vec![],
         )
     } else if !dns_failclosed_passed {
@@ -8591,7 +8588,7 @@ fn run_windows_orchestration_stages_with_options(
             "issue_windows_assignment",
             VmLabStageStatus::Skipped,
             "skipped: no linux_exit_alias configured; Windows assignment issuance disabled"
-                .to_string(),
+                .to_owned(),
             vec![],
         )
     } else if !amend_membership_passed {
@@ -9067,7 +9064,7 @@ fn parse_windows_exit_evidence_inventory(raw_json: &str) -> Result<HashSet<Strin
         .map_err(|err| format!("parse Windows Exit evidence inventory failed: {err}"))?;
     let entries = parsed
         .as_array()
-        .ok_or_else(|| "Windows Exit evidence inventory must be a JSON array".to_string())?;
+        .ok_or_else(|| "Windows Exit evidence inventory must be a JSON array".to_owned())?;
     let allowed_labels = windows_exit_evidence_artifact_specs()
         .iter()
         .map(|spec| spec.label)
@@ -9081,7 +9078,7 @@ fn parse_windows_exit_evidence_inventory(raw_json: &str) -> Result<HashSet<Strin
             ));
         }
         if require_json_bool(entry, "exists")? {
-            found.insert(label.to_string());
+            found.insert(label.to_owned());
         }
     }
     Ok(found)
@@ -9297,7 +9294,7 @@ fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize,
         .map_err(|err| format!("parse Windows Exit evidence capture summary failed: {err}"))?;
     if require_json_u64(&report, "schema_version")? != 1 {
         return Err(
-            "Windows Exit evidence capture summary returned unsupported schema_version".to_string(),
+            "Windows Exit evidence capture summary returned unsupported schema_version".to_owned(),
         );
     }
     let allowed_labels = windows_exit_evidence_artifact_specs()
@@ -9308,7 +9305,7 @@ fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize,
     for label in written {
         let label = label
             .as_str()
-            .ok_or_else(|| "written_labels entries must be strings".to_string())?;
+            .ok_or_else(|| "written_labels entries must be strings".to_owned())?;
         if !allowed_labels.contains(label) {
             return Err(format!(
                 "Windows Exit evidence capture returned unexpected label {label:?}"
@@ -9328,7 +9325,7 @@ fn capture_windows_exit_evidence_artifacts(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String, bool), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -9362,7 +9359,7 @@ fn capture_windows_exit_evidence_artifacts(
             String::new(),
         )
     })?;
-    let raw_trimmed = raw_output.trim().to_string();
+    let raw_trimmed = raw_output.trim().to_owned();
     let (written_count, skipped_summary) =
         parse_windows_exit_evidence_capture_summary(raw_trimmed.as_str())
             .map_err(|err| (err, raw_trimmed.clone()))?;
@@ -9386,7 +9383,7 @@ fn pull_windows_exit_evidence_artifacts(
     known_hosts_path: Option<&Path>,
     local_artifact_root: &Path,
 ) -> Result<(String, String, Vec<PathBuf>), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -9431,7 +9428,7 @@ fn pull_windows_exit_evidence_artifacts(
             String::new(),
         )
     })?;
-    let raw_inventory = raw_inventory.trim().to_string();
+    let raw_inventory = raw_inventory.trim().to_owned();
     let available = parse_windows_exit_evidence_inventory(raw_inventory.as_str())
         .map_err(|err| (err, raw_inventory.clone()))?;
     if available.is_empty() {
@@ -9512,7 +9509,7 @@ fn run_validate_windows_runtime_acls_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -9548,7 +9545,7 @@ fn run_validate_windows_runtime_acls_stage(
             String::new(),
         )
     })?;
-    let raw_trimmed = raw_output.trim().to_string();
+    let raw_trimmed = raw_output.trim().to_owned();
     evaluate_windows_runtime_acls_report(windows_alias, raw_trimmed.as_str())
         .map(|summary| (summary, raw_trimmed.clone()))
         .map_err(|reason| (reason, raw_trimmed))
@@ -9573,7 +9570,7 @@ fn evaluate_windows_runtime_acls_report(
         return Err(
             "windows-runtime-acls-check returned an empty roots list; expected the canonical \
              Windows runtime root set"
-                .to_string(),
+                .to_owned(),
         );
     }
     if !report.overall_ok {
@@ -9592,7 +9589,7 @@ fn evaluate_windows_runtime_acls_report(
             .collect::<Vec<_>>();
         let drifted_summary = if drifted.is_empty() {
             "report set overall_ok=false but every per-root entry is Ok; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             drifted.join("; ")
         };
@@ -9609,7 +9606,7 @@ fn evaluate_windows_runtime_acls_report(
         return Err(
             "report set overall_ok=true but at least one per-root entry is not Ok; output is \
              inconsistent"
-                .to_string(),
+                .to_owned(),
         );
     }
     let inspected_count = report.roots.len();
@@ -9624,7 +9621,7 @@ fn run_validate_windows_service_hardening_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -9660,7 +9657,7 @@ fn run_validate_windows_service_hardening_stage(
             String::new(),
         )
     })?;
-    let raw_trimmed = raw_output.trim().to_string();
+    let raw_trimmed = raw_output.trim().to_owned();
     evaluate_windows_service_hardening_report(windows_alias, raw_trimmed.as_str())
         .map(|summary| (summary, raw_trimmed.clone()))
         .map_err(|reason| (reason, raw_trimmed))
@@ -9686,7 +9683,7 @@ fn evaluate_windows_service_hardening_report(
     if !report.overall_ok {
         let reasons = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -9714,7 +9711,7 @@ fn run_validate_windows_key_custody_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -9750,7 +9747,7 @@ fn run_validate_windows_key_custody_stage(
             String::new(),
         )
     })?;
-    let raw_trimmed = raw_output.trim().to_string();
+    let raw_trimmed = raw_output.trim().to_owned();
     evaluate_windows_key_custody_report(windows_alias, raw_trimmed.as_str())
         .map(|summary| (summary, raw_trimmed.clone()))
         .map_err(|reason| (reason, raw_trimmed))
@@ -9774,13 +9771,13 @@ fn evaluate_windows_key_custody_report(
         return Err(
             "windows-key-custody-check returned an empty entries list; expected the canonical \
              custody artifact set"
-                .to_string(),
+                .to_owned(),
         );
     }
     if !report.overall_ok {
         let reasons = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -9804,7 +9801,7 @@ fn run_validate_windows_authenticode_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -9825,8 +9822,8 @@ fn run_validate_windows_authenticode_stage(
     let script = build_windows_security_check_invocation(
         "windows-authenticode-check",
         &[
-            "--binary-path".to_string(),
-            WINDOWS_RUSTYNETD_EXE_PATH.to_string(),
+            "--binary-path".to_owned(),
+            WINDOWS_RUSTYNETD_EXE_PATH.to_owned(),
         ],
     )
     .map_err(|err| (err, String::new()))?;
@@ -9846,7 +9843,7 @@ fn run_validate_windows_authenticode_stage(
             String::new(),
         )
     })?;
-    let raw_trimmed = raw_output.trim().to_string();
+    let raw_trimmed = raw_output.trim().to_owned();
     evaluate_windows_authenticode_report(windows_alias, raw_trimmed.as_str())
         .map(|summary| (summary, raw_trimmed.clone()))
         .map_err(|reason| (reason, raw_trimmed))
@@ -9869,7 +9866,7 @@ fn evaluate_windows_authenticode_report(
     if !report.overall_ok {
         let reasons = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -9917,7 +9914,7 @@ fn run_validate_windows_dns_failclosed_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -9953,7 +9950,7 @@ fn run_validate_windows_dns_failclosed_stage(
             String::new(),
         )
     })?;
-    let raw_trimmed = raw_output.trim().to_string();
+    let raw_trimmed = raw_output.trim().to_owned();
     evaluate_windows_dns_failclosed_report(windows_alias, raw_trimmed.as_str())
         .map(|summary| (summary, raw_trimmed.clone()))
         .map_err(|reason| (reason, raw_trimmed))
@@ -9979,7 +9976,7 @@ fn evaluate_windows_dns_failclosed_report(
     if !report.overall_ok {
         let reasons = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -10017,13 +10014,13 @@ fn evaluate_windows_exit_nat_lifecycle_artifact(
     validate_cidr_like("mesh_cidr", mesh_cidr)?;
     let nat_name = require_json_str(&report, "nat_name")?;
     if nat_name.trim().is_empty() {
-        return Err("windows exit NAT lifecycle artifact has empty nat_name".to_string());
+        return Err("windows exit NAT lifecycle artifact has empty nat_name".to_owned());
     }
     let during = require_json_value(&report, "during_run")?;
     if !require_json_bool(during, "netnat_present")? {
         return Err(
             "windows exit NAT lifecycle artifact did not prove NetNat present during run"
-                .to_string(),
+                .to_owned(),
         );
     }
     let internal_prefix = require_json_str(during, "internal_prefix")?;
@@ -10038,13 +10035,13 @@ fn evaluate_windows_exit_nat_lifecycle_artifact(
     let after = require_json_value(&report, "after_stop")?;
     if require_json_bool(after, "netnat_present")? {
         return Err(
-            "windows exit NAT lifecycle artifact left NetNat present after daemon stop".to_string(),
+            "windows exit NAT lifecycle artifact left NetNat present after daemon stop".to_owned(),
         );
     }
     if !require_json_bool(after, "forwarding_restored")? {
         return Err(
             "windows exit NAT lifecycle artifact did not prove forwarding was restored after stop"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(format!(
@@ -10065,10 +10062,10 @@ fn evaluate_windows_exit_dns_leak_artifact_dir(
         .eq(&1)
         .then_some(())
         .ok_or_else(|| {
-            "firewall_block_rules.json returned unsupported schema_version".to_string()
+            "firewall_block_rules.json returned unsupported schema_version".to_owned()
         })?;
     if !require_json_bool(&firewall_report, "overall_ok")? {
-        return Err("firewall_block_rules.json did not report overall_ok=true".to_string());
+        return Err("firewall_block_rules.json did not report overall_ok=true".to_owned());
     }
     let rules = require_json_array(&firewall_report, "rules")?;
     require_dns_block_rule(rules, "RustyNetDNS-BlockLanUdp")?;
@@ -10089,7 +10086,7 @@ fn evaluate_windows_exit_dns_leak_artifact_dir(
         || !require_json_bool(&positive_report, "resolved")?
     {
         return Err(
-            "tunnel_path_resolves.json did not prove tunnel DNS positive control".to_string(),
+            "tunnel_path_resolves.json did not prove tunnel DNS positive control".to_owned(),
         );
     }
 
@@ -10137,23 +10134,23 @@ fn evaluate_windows_exit_killswitch_precedence_artifact(
         .then_some(())
         .ok_or_else(|| {
             "windows exit killswitch precedence artifact returned unsupported schema_version"
-                .to_string()
+                .to_owned()
         })?;
     let baseline = require_json_value(&report, "baseline_assert")?;
     if !require_json_bool(baseline, "overall_ok")? {
-        return Err("baseline killswitch assertion did not pass before tamper".to_string());
+        return Err("baseline killswitch assertion did not pass before tamper".to_owned());
     }
     let tampered = require_json_value(&report, "tampered_assert")?;
     if require_json_bool(tampered, "overall_ok")? {
-        return Err("tampered killswitch assertion reported overall_ok=true".to_string());
+        return Err("tampered killswitch assertion reported overall_ok=true".to_owned());
     }
     let exit_code = require_json_i64(tampered, "exit_code")?;
     if exit_code == 0 {
-        return Err("tampered killswitch assertion exited zero".to_string());
+        return Err("tampered killswitch assertion exited zero".to_owned());
     }
     let reason = require_json_str(tampered, "reason")?;
     if reason.trim().is_empty() {
-        return Err("tampered killswitch assertion did not record a reason".to_string());
+        return Err("tampered killswitch assertion did not record a reason".to_owned());
     }
     Ok(format!(
         "Windows exit killswitch precedence verified on {windows_alias}: tamper rejected with exit_code={exit_code}"
@@ -10264,7 +10261,7 @@ fn run_validate_windows_mesh_join_stage(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<(String, String), (String, String)> {
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -10300,7 +10297,7 @@ fn run_validate_windows_mesh_join_stage(
             String::new(),
         )
     })?;
-    let raw_trimmed = raw_output.trim().to_string();
+    let raw_trimmed = raw_output.trim().to_owned();
     evaluate_windows_mesh_join_report(windows_alias, raw_trimmed.as_str())
         .map(|summary| (summary, raw_trimmed.clone()))
         .map_err(|reason| (reason, raw_trimmed))
@@ -10327,7 +10324,7 @@ fn evaluate_windows_mesh_join_report(
     if !report.overall_ok {
         let reasons = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -10590,7 +10587,7 @@ fn run_distribute_windows_bundle_stage(
         ));
     }
 
-    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_string()], false, &[])
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
         .map_err(|err| (err, String::new()))?;
     let target = targets.into_iter().next().ok_or_else(|| {
         (
@@ -10880,7 +10877,7 @@ fn validate_mesh_node_id(id: &str) -> Result<(), String> {
 /// separators used in the spec format.
 fn validate_mesh_endpoint_address(addr: &str) -> Result<(), String> {
     if addr.is_empty() {
-        return Err("endpoint address must not be empty".to_string());
+        return Err("endpoint address must not be empty".to_owned());
     }
     if !addr
         .chars()
@@ -10970,7 +10967,7 @@ fn amend_membership_for_windows_node(
         Duration::from_secs(30),
     )
     .map_err(|e| format!("collect Windows WireGuard pubkey from {windows_alias} failed: {e}"))?;
-    let pubkey_hex = raw_hex.trim().to_string();
+    let pubkey_hex = raw_hex.trim().to_owned();
     if pubkey_hex.len() != 64 || !pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
             "Windows WireGuard pubkey from {windows_alias} is not a 64-char lowercase hex \
@@ -11081,9 +11078,9 @@ fn issue_assignment_for_windows_node(
     let env_text = std::fs::read_to_string(&base_env_path)
         .map_err(|e| format!("read base assignment env failed: {e}"))?;
     let nodes_spec = extract_env_var_from_text(env_text.as_str(), "NODES_SPEC")
-        .ok_or_else(|| "NODES_SPEC not found in base assignment env".to_string())?;
+        .ok_or_else(|| "NODES_SPEC not found in base assignment env".to_owned())?;
     let allow_spec = extract_env_var_from_text(env_text.as_str(), "ALLOW_SPEC")
-        .ok_or_else(|| "ALLOW_SPEC not found in base assignment env".to_string())?;
+        .ok_or_else(|| "ALLOW_SPEC not found in base assignment env".to_owned())?;
 
     // Extend the specs with the Windows node.
     // Port 51820 matches the hardcoded WireGuard listen port used by
@@ -11217,7 +11214,7 @@ fn build_linux_daemon_check_invocation(
     ensure_no_control_chars("linux daemon path", daemon_path)?;
     ensure_no_control_chars("linux daemon subcommand", subcommand)?;
     if subcommand.is_empty() {
-        return Err("linux daemon subcommand must not be empty".to_string());
+        return Err("linux daemon subcommand must not be empty".to_owned());
     }
     if !subcommand
         .chars()
@@ -11252,7 +11249,7 @@ fn run_linux_daemon_check_remote(
     subcommand: &str,
     extra_args: &[String],
 ) -> Result<String, String> {
-    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_string()], false, &[])?;
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_owned()], false, &[])?;
     let target = targets
         .into_iter()
         .next()
@@ -11275,7 +11272,7 @@ fn run_linux_daemon_check_remote(
         timeout,
     )
     .map_err(|err| format!("remote dispatch of {subcommand} failed: {err}"))?;
-    Ok(raw_output.trim().to_string())
+    Ok(raw_output.trim().to_owned())
 }
 
 /// Pure evaluator for the JSON output of `rustynetd linux-runtime-acls-check`.
@@ -11293,7 +11290,7 @@ fn evaluate_linux_runtime_acls_report(linux_alias: &str, raw_json: &str) -> Resu
         return Err(
             "linux-runtime-acls-check returned an empty roots list; expected the canonical \
              Linux runtime root set"
-                .to_string(),
+                .to_owned(),
         );
     }
     if !report.overall_ok {
@@ -11312,7 +11309,7 @@ fn evaluate_linux_runtime_acls_report(linux_alias: &str, raw_json: &str) -> Resu
             .collect::<Vec<_>>();
         let summary = if drifted.is_empty() {
             "report set overall_ok=false but every per-root entry is Ok; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             drifted.join("; ")
         };
@@ -11337,7 +11334,7 @@ fn evaluate_linux_mesh_status_report(linux_alias: &str, raw_json: &str) -> Resul
     if !report.overall_ok {
         let summary = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -11363,13 +11360,13 @@ fn evaluate_linux_key_custody_report(linux_alias: &str, raw_json: &str) -> Resul
         return Err(
             "linux-key-custody-check returned an empty entries list; expected the canonical \
              Linux key-custody artifacts"
-                .to_string(),
+                .to_owned(),
         );
     }
     if !report.overall_ok {
         let summary = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -11445,7 +11442,7 @@ fn evaluate_linux_service_hardening_report(
     if !report.overall_ok {
         let summary = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -11473,7 +11470,7 @@ fn evaluate_linux_dns_failclosed_report(
     if !report.overall_ok {
         let summary = if report.drift_reasons.is_empty() {
             "report set overall_ok=false but no drift_reasons were recorded; output is inconsistent"
-                .to_string()
+                .to_owned()
         } else {
             report.drift_reasons.join("; ")
         };
@@ -11517,15 +11514,15 @@ fn run_validate_linux_runtime_acls_stage(
 fn build_linux_mesh_status_extra_args(overrides: &MeshStatusOverrides) -> Vec<String> {
     let mut extras: Vec<String> = Vec::new();
     if let Some(path) = overrides.state_path.as_ref() {
-        extras.push("--state-path".to_string());
+        extras.push("--state-path".to_owned());
         extras.push(path.display().to_string());
     }
     for peer in &overrides.expected_peer_ids {
-        extras.push("--expected-peer-id".to_string());
+        extras.push("--expected-peer-id".to_owned());
         extras.push(peer.clone());
     }
     if let Some(secs) = overrides.max_age_seconds {
-        extras.push("--max-age-seconds".to_string());
+        extras.push("--max-age-seconds".to_owned());
         extras.push(secs.to_string());
     }
     extras
@@ -12088,7 +12085,7 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
 ) -> Result<String, String> {
     if config.validation_steps.is_empty() {
         return Err(
-            "specify at least one --validation-step for vm-lab-iterate-live-lab".to_string(),
+            "specify at least one --validation-step for vm-lab-iterate-live-lab".to_owned(),
         );
     }
 
@@ -12149,7 +12146,7 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
                 config
                     .backend
                     .clone()
-                    .unwrap_or_else(|| "linux-wireguard-userspace-shared".to_string()),
+                    .unwrap_or_else(|| "linux-wireguard-userspace-shared".to_owned()),
             ),
             source_mode: Some(resolved_source_mode.clone()),
             repo_ref: resolved_repo_ref.clone(),
@@ -12220,7 +12217,7 @@ pub fn execute_ops_vm_lab_validate_live_lab_profile(
     if let Some(mode) = source_mode.as_deref() {
         validate_live_lab_source_mode(mode)?;
         if mode == "ref" && profile.optional("REPO_REF").is_none() {
-            return Err("live-lab profile SOURCE_MODE=ref requires REPO_REF".to_string());
+            return Err("live-lab profile SOURCE_MODE=ref requires REPO_REF".to_owned());
         }
     }
     if config.require_five_node {
@@ -12265,12 +12262,12 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
     ensure_live_lab_profile_linux_only(&profile, "vm-lab-diagnose-live-lab-failure")?;
     let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
     let stage = if let Some(stage) = config.stage.as_deref() {
-        stage.to_string()
+        stage.to_owned()
     } else {
         summary
             .first_failed_stage
             .clone()
-            .ok_or_else(|| "live-lab report does not contain a failed stage".to_string())?
+            .ok_or_else(|| "live-lab report does not contain a failed stage".to_owned())?
     };
     let stage_records = parse_live_lab_stage_records(report_dir.as_path())?;
     let stage_record = stage_records
@@ -12310,8 +12307,7 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
         Ok(output) => output,
         Err(output) => {
             warnings.push(
-                "vm-lab-status reported probe failures; inspect vm_lab_status.json for partial results"
-                    .to_string(),
+                "vm-lab-status reported probe failures; inspect vm_lab_status.json for partial results".to_owned(),
             );
             output
         }
@@ -12335,8 +12331,7 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
             timeout,
         ) {
             warnings.push(
-                "artifact collection reported probe failures; inspect artifacts/collection_error.txt for details"
-                    .to_string(),
+                "artifact collection reported probe failures; inspect artifacts/collection_error.txt for details".to_owned(),
             );
             fs::create_dir_all(artifacts_dir.as_path()).map_err(|create_err| {
                 format!(
@@ -12415,7 +12410,7 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
     })?;
     validate_live_lab_diagnostics_artifacts(diagnostics_dir.as_path())?;
     serialize_vm_lab_command_result(&VmLabCommandResult {
-        command: "vm-lab-diagnose-live-lab-failure".to_string(),
+        command: "vm-lab-diagnose-live-lab-failure".to_owned(),
         overall_status: VmLabCommandOverallStatus::Pass,
         report_dir: diagnostics_dir.display().to_string(),
         outcomes: vec![VmLabStageOutcome {
@@ -12457,15 +12452,15 @@ fn infer_live_lab_stage_record(
             body.lines().find_map(|line| {
                 line.trim()
                     .strip_prefix(description_prefix.as_str())
-                    .map(|value| value.trim().to_string())
+                    .map(|value| value.trim().to_owned())
             })
         })
         .unwrap_or_else(|| stage.replace('_', " "));
 
     Ok(LiveLabStageRecord {
-        name: stage.to_string(),
-        severity: "unknown".to_string(),
-        status: "incomplete".to_string(),
+        name: stage.to_owned(),
+        severity: "unknown".to_owned(),
+        status: "incomplete".to_owned(),
         rc: String::new(),
         log_path,
         description,
@@ -12480,7 +12475,7 @@ fn collect_live_lab_stage_forensics(
     targets: &[ResolvedLiveLabTarget],
     timeout: Duration,
 ) -> Result<LiveLabStageForensicsBundle, String> {
-    let strategy = live_lab_stage_forensics_strategy(stage_record.name.as_str()).to_string();
+    let strategy = live_lab_stage_forensics_strategy(stage_record.name.as_str()).to_owned();
     let local_bundle =
         collect_live_lab_stage_local_bundle(report_dir, stage_record, summary, diagnostics_dir)?;
     let mut notes = live_lab_stage_forensics_notes(stage_record.name.as_str());
@@ -12705,7 +12700,7 @@ fn write_live_lab_worker_results_summary(
     })?;
 
     let mut lines = vec![
-        "# Live-Lab Worker Results".to_string(),
+        "# Live-Lab Worker Results".to_owned(),
         String::new(),
         format!("- worker_count={}", worker_results.len()),
         format!(
@@ -12768,7 +12763,7 @@ fn collect_windows_diagnostics_for_target(
         &context,
         helper_local_path.as_path(),
         WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
-        &["-OutputRoot".to_string(), remote_root.clone()],
+        &["-OutputRoot".to_owned(), remote_root.clone()],
     )?;
     let helper_output_root = output.trim();
     if helper_output_root.is_empty() {
@@ -13062,7 +13057,7 @@ fn collect_validate_baseline_runtime_remote_probe(
     })?;
 
     let mut summary_notes = vec![
-        "Baseline runtime forensics include focused remote probes for rustynet status, daemon socket presence, route selection, plaintext-passphrase absence, runtime state files, time state, and the last 80 journal lines from rustynetd.".to_string(),
+        "Baseline runtime forensics include focused remote probes for rustynet status, daemon socket presence, route selection, plaintext-passphrase absence, runtime state files, time state, and the last 80 journal lines from rustynetd.".to_owned(),
     ];
     summary_notes.extend(notes);
 
@@ -13085,7 +13080,7 @@ fn render_live_lab_stage_forensics_review(context: LiveLabStageReviewContext<'_>
         warnings,
     } = context;
     let mut lines = vec![
-        "# Live-Lab Stage Forensics".to_string(),
+        "# Live-Lab Stage Forensics".to_owned(),
         String::new(),
         format!("- report_dir={}", report_dir.display()),
         format!("- stage={}", stage_record.name),
@@ -13119,7 +13114,7 @@ fn render_live_lab_stage_forensics_review(context: LiveLabStageReviewContext<'_>
 
     if !notes.is_empty() {
         lines.push(String::new());
-        lines.push("## Notes".to_string());
+        lines.push("## Notes".to_owned());
         for note in notes {
             lines.push(format!("- {note}"));
         }
@@ -13127,7 +13122,7 @@ fn render_live_lab_stage_forensics_review(context: LiveLabStageReviewContext<'_>
 
     if !warnings.is_empty() {
         lines.push(String::new());
-        lines.push("## Warnings".to_string());
+        lines.push("## Warnings".to_owned());
         for warning in warnings {
             lines.push(format!("- {warning}"));
         }
@@ -13135,7 +13130,7 @@ fn render_live_lab_stage_forensics_review(context: LiveLabStageReviewContext<'_>
 
     if !local_bundle.worker_results.is_empty() {
         lines.push(String::new());
-        lines.push("## Worker Results".to_string());
+        lines.push("## Worker Results".to_owned());
         for result in &local_bundle.worker_results {
             let reason = if result.primary_failure_reason.trim().is_empty() {
                 "none"
@@ -13158,7 +13153,7 @@ fn render_live_lab_stage_forensics_review(context: LiveLabStageReviewContext<'_>
     }
 
     lines.push(String::new());
-    lines.push("## Copied Report Context".to_string());
+    lines.push("## Copied Report Context".to_owned());
     for path in &local_bundle.copied_paths {
         lines.push(format!("- {}", path.display()));
     }
@@ -13176,12 +13171,12 @@ fn live_lab_stage_forensics_strategy(stage_name: &str) -> &'static str {
 fn live_lab_stage_forensics_notes(stage_name: &str) -> Vec<String> {
     match stage_name {
         "validate_baseline_runtime" => vec![
-            "Expected rustynet status fields: transport_socket_identity_state=authoritative_backend_shared_transport, transport_socket_identity_error=none, encrypted_key_store=true, auto_tunnel_enforce=true, membership_active_nodes=5.".to_string(),
-            "Expected client routing on non-exit nodes: exit_node=exit-1 and `ip -4 route get 1.1.1.1` selects `dev rustynet0`.".to_string(),
-            "Expected plaintext-passphrase hygiene result: no-plaintext-passphrase-files.".to_string(),
+            "Expected rustynet status fields: transport_socket_identity_state=authoritative_backend_shared_transport, transport_socket_identity_error=none, encrypted_key_store=true, auto_tunnel_enforce=true, membership_active_nodes=5.".to_owned(),
+            "Expected client routing on non-exit nodes: exit_node=exit-1 and `ip -4 route get 1.1.1.1` selects `dev rustynet0`.".to_owned(),
+            "Expected plaintext-passphrase hygiene result: no-plaintext-passphrase-files.".to_owned(),
         ],
         _ => vec![
-            "The report_context bundle includes the report summary, the failing stage log, and any parallel-stage evidence copied from the original report directory.".to_string(),
+            "The report_context bundle includes the report summary, the failing stage log, and any parallel-stage evidence copied from the original report directory.".to_owned(),
         ],
     }
 }
@@ -13303,7 +13298,7 @@ fn collected_at_utc_now() -> String {
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.trim().to_string())
+        .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| format!("unix:{}", unix_now()))
 }
@@ -13395,7 +13390,7 @@ fn resolve_iteration_source_selection(
     dirty_worktree: bool,
 ) -> Result<(String, Option<String>), String> {
     if (require_clean_tree || require_local_head) && dirty_worktree {
-        return Err("git worktree must be clean for this live-lab iteration".to_string());
+        return Err("git worktree must be clean for this live-lab iteration".to_owned());
     }
     if require_local_head {
         if let Some(source_mode) = configured_source_mode
@@ -13412,19 +13407,19 @@ fn resolve_iteration_source_selection(
                 "--require-local-head is incompatible with --repo-ref {repo_ref} (expected HEAD)"
             ));
         }
-        return Ok(("local-head".to_string(), None));
+        return Ok(("local-head".to_owned(), None));
     }
     let source_mode = configured_source_mode.unwrap_or("working-tree");
     validate_live_lab_source_mode(source_mode)?;
     let repo_ref = if source_mode == "ref" {
         let value = configured_repo_ref
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "source-mode=ref requires --repo-ref".to_string())?;
-        Some(value.to_string())
+            .ok_or_else(|| "source-mode=ref requires --repo-ref".to_owned())?;
+        Some(value.to_owned())
     } else {
         None
     };
-    Ok((source_mode.to_string(), repo_ref))
+    Ok((source_mode.to_owned(), repo_ref))
 }
 
 fn git_worktree_is_dirty() -> Result<bool, String> {
@@ -13461,14 +13456,14 @@ impl LiveLabProfile {
     fn configured_targets(&self) -> Result<Vec<LiveLabProfileTarget>, String> {
         let mut targets = vec![
             LiveLabProfileTarget {
-                role: "exit".to_string(),
+                role: "exit".to_owned(),
                 target: self.required("EXIT_TARGET")?,
                 utm_name: self
                     .optional("EXIT_UTM_NAME")
                     .filter(|value| !value.trim().is_empty()),
             },
             LiveLabProfileTarget {
-                role: "client".to_string(),
+                role: "client".to_owned(),
                 target: self.required("CLIENT_TARGET")?,
                 utm_name: self
                     .optional("CLIENT_UTM_NAME")
@@ -13489,7 +13484,7 @@ impl LiveLabProfile {
                 && !target.trim().is_empty()
             {
                 targets.push(LiveLabProfileTarget {
-                    role: role.to_string(),
+                    role: role.to_owned(),
                     target,
                     utm_name: self
                         .optional(utm_key)
@@ -13810,7 +13805,7 @@ fn load_live_lab_profile(path: &Path) -> Result<LiveLabProfile, String> {
                 err
             )
         })?;
-        values.insert(key.to_string(), value);
+        values.insert(key.to_owned(), value);
     }
     let profile = LiveLabProfile { values };
     ensure_ssh_target("EXIT_TARGET", profile.required("EXIT_TARGET")?.as_str())?;
@@ -13930,12 +13925,12 @@ fn parse_live_lab_stage_records(report_dir: &Path) -> Result<Vec<LiveLabStageRec
             continue;
         }
         records.push(LiveLabStageRecord {
-            name: columns[0].to_string(),
-            severity: columns[1].to_string(),
-            status: columns[2].to_string(),
-            rc: columns[3].to_string(),
+            name: columns[0].to_owned(),
+            severity: columns[1].to_owned(),
+            status: columns[2].to_owned(),
+            rc: columns[3].to_owned(),
             log_path: resolve_report_relative_path(columns[4], report_dir.as_path())?,
-            description: columns[5].to_string(),
+            description: columns[5].to_owned(),
         });
     }
     Ok(records)
@@ -14022,7 +14017,7 @@ fn summarize_live_lab_report(
             continue;
         }
         if columns[2] == "fail" {
-            first_failed_stage = Some(columns[0].to_string());
+            first_failed_stage = Some(columns[0].to_owned());
             key_log_path = Some(resolve_report_relative_path(
                 columns[4],
                 report_dir.as_path(),
@@ -14044,9 +14039,9 @@ fn summarize_live_lab_report(
     };
     Ok(LiveLabStageSummary {
         overall_status: if first_failed_stage.is_some() {
-            "fail".to_string()
+            "fail".to_owned()
         } else {
-            "pass".to_string()
+            "pass".to_owned()
         },
         first_failed_stage,
         key_report_path: failure_digest_path,
@@ -14073,7 +14068,7 @@ fn resolve_report_relative_path(value: &str, report_dir: &Path) -> Result<PathBu
 
 fn extract_iteration_likely_reason(log_path: &Path) -> String {
     let Ok(body) = fs::read_to_string(log_path) else {
-        return "see full log".to_string();
+        return "see full log".to_owned();
     };
     let mut candidates = Vec::new();
     for raw_line in body.lines() {
@@ -14089,10 +14084,10 @@ fn extract_iteration_likely_reason(log_path: &Path) -> String {
         if line.starts_with("[parallel:") || line.starts_with("----- ") {
             continue;
         }
-        candidates.push(line.to_string());
+        candidates.push(line.to_owned());
     }
     if candidates.is_empty() {
-        return "see full log".to_string();
+        return "see full log".to_owned();
     }
     for line in candidates.iter().rev() {
         let lowered = line.to_ascii_lowercase();
@@ -14114,7 +14109,7 @@ fn extract_iteration_likely_reason(log_path: &Path) -> String {
     candidates
         .last()
         .cloned()
-        .unwrap_or_else(|| "see full log".to_string())
+        .unwrap_or_else(|| "see full log".to_owned())
 }
 
 fn tail_log_lines(path: &Path, max_lines: usize) -> Result<String, String> {
@@ -14150,16 +14145,16 @@ fn render_live_lab_iteration_summary(
             summary
                 .key_log_path
                 .as_deref()
-                .map_or_else(|| "none".to_string(), |path| path.display().to_string())
+                .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
         ),
     ];
     if let Some(reason) = summary.likely_reason.as_deref() {
         lines.push(format!("likely_reason={reason}"));
     }
     if let Some(tail) = summary.failed_log_tail.as_deref() {
-        lines.push("diagnostic_log_tail<<EOF".to_string());
-        lines.push(tail.to_string());
-        lines.push("EOF".to_string());
+        lines.push("diagnostic_log_tail<<EOF".to_owned());
+        lines.push(tail.to_owned());
+        lines.push("EOF".to_owned());
     }
     lines.join("\n")
 }
@@ -14195,7 +14190,7 @@ fn port_status_from_probe_error(reason: Option<&str>) -> PortStatus {
 
 fn push_unique_reason_code(reason_codes: &mut Vec<String>, reason_code: &str) {
     if !reason_codes.iter().any(|existing| existing == reason_code) {
-        reason_codes.push(reason_code.to_string());
+        reason_codes.push(reason_code.to_owned());
     }
 }
 
@@ -14212,7 +14207,7 @@ fn known_hosts_lookup_candidates(
     let mut hosts = BTreeSet::new();
     hosts.insert(ssh_target_host(authoritative_target));
     if let Some(live_ip) = live_ip {
-        hosts.insert(live_ip.to_string());
+        hosts.insert(live_ip.to_owned());
     }
     hosts
         .into_iter()
@@ -14235,14 +14230,14 @@ fn windows_discovery_known_hosts_state(
     let path = known_hosts_path?;
     let Some(authoritative_target) = authoritative_target else {
         return Some(ProbeState::Missing {
-            reason: "no-authoritative-ssh-target".to_string(),
+            reason: "no-authoritative-ssh-target".to_owned(),
         });
     };
     let candidates = known_hosts_lookup_candidates(authoritative_target, live_ip, ssh_port);
     Some(match find_known_hosts_match(path, candidates.as_slice()) {
         Ok(Some(_)) => ProbeState::Ok { value: true },
         Ok(None) => ProbeState::Missing {
-            reason: "known-hosts-entry-missing".to_string(),
+            reason: "known-hosts-entry-missing".to_owned(),
         },
         Err(err) => ProbeState::Error { reason: err },
     })
@@ -14318,7 +14313,7 @@ fn read_windows_local_utm_utf8_file(path: &Path, label: &str) -> Result<String, 
         fs::read(path).map_err(|err| format!("{label} read failed ({}): {err}", path.display()))?;
     let text =
         String::from_utf8(bytes).map_err(|err| format!("{label} was not valid UTF-8: {err}"))?;
-    Ok(text.trim_start_matches('\u{feff}').to_string())
+    Ok(text.trim_start_matches('\u{feff}').to_owned())
 }
 
 fn format_windows_local_utm_result_pull_failure(
@@ -14412,8 +14407,7 @@ $result = [ordered]@{
 }
 $result | ConvertTo-Json -Compress
 "#
-    .trim()
-    .to_string()
+    .trim().to_owned()
 }
 
 fn build_windows_ssh_readiness_result_script(remote_result_path: &str) -> Result<String, String> {
@@ -14679,19 +14673,19 @@ fn build_utm_readiness(inputs: UtmReadinessInputs<'_>) -> VmLabReadiness {
     } else {
         let mut reason_codes = Vec::new();
         if !powered {
-            reason_codes.push("process-not-ready".to_string());
+            reason_codes.push("process-not-ready".to_owned());
         }
         if !networked {
-            reason_codes.push("live-ip-not-authoritative".to_string());
+            reason_codes.push("live-ip-not-authoritative".to_owned());
         }
         if !tcp_ready {
-            reason_codes.push("ssh-tcp-not-open".to_string());
+            reason_codes.push("ssh-tcp-not-open".to_owned());
         }
         if !auth_ready {
-            reason_codes.push("ssh-auth-not-ready".to_string());
+            reason_codes.push("ssh-auth-not-ready".to_owned());
         }
         if !inputs.authoritative_target_present {
-            reason_codes.push("no-authoritative-ssh-target".to_string());
+            reason_codes.push("no-authoritative-ssh-target".to_owned());
         }
         reason_codes
     };
@@ -14846,13 +14840,13 @@ fn build_release_gate_completeness_report(
         .collect::<HashSet<_>>();
     let required_stages = FULL_RELEASE_GATE_REQUIRED_STAGES
         .iter()
-        .map(|stage| (*stage).to_string())
+        .map(|stage| (*stage).to_owned())
         .collect::<Vec<_>>();
     let missing_or_non_pass_stages = if requested {
         FULL_RELEASE_GATE_REQUIRED_STAGES
             .iter()
             .filter(|stage| !observed_pass_set.contains(**stage))
-            .map(|stage| (*stage).to_string())
+            .map(|stage| (*stage).to_owned())
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -14866,7 +14860,7 @@ fn build_release_gate_completeness_report(
     };
     ReleaseGateCompletenessReport {
         requested,
-        status: status.to_string(),
+        status: status.to_owned(),
         required_stages,
         observed_pass_stages,
         missing_or_non_pass_stages,
@@ -15065,13 +15059,13 @@ pub fn execute_ops_vm_lab_preflight(config: VmLabPreflightConfig) -> Result<Stri
                 }
                 let mut problems = Vec::new();
                 if !sudo_ok {
-                    problems.push("sudo-n".to_string());
+                    problems.push("sudo-n".to_owned());
                 }
                 if free_kib < config.min_free_kib {
                     problems.push(format!("free_kib<{min}", min = config.min_free_kib));
                 }
                 if config.require_rustynet_installed && !rustynet_installed {
-                    problems.push("rustynet-missing".to_string());
+                    problems.push("rustynet-missing".to_owned());
                 }
                 if !missing_commands.is_empty() {
                     problems.push(format!("missing-commands={}", missing_commands.join(",")));
@@ -15092,7 +15086,7 @@ pub fn execute_ops_vm_lab_preflight(config: VmLabPreflightConfig) -> Result<Stri
                         let key = format!("cmd.{command_name}");
                         (
                             command_name.clone(),
-                            values.get(key.as_str()).cloned().unwrap_or_else(|| "missing".to_string())
+                            values.get(key.as_str()).cloned().unwrap_or_else(|| "missing".to_owned())
                         )
                     }).collect::<BTreeMap<_, _>>(),
                     "status": if problems.is_empty() { "pass" } else { "fail" },
@@ -15165,7 +15159,7 @@ pub fn execute_ops_vm_lab_readiness_check(
     if targets.is_empty() {
         return Err(
             "no targets selected for readiness check; pass --vms <alias[,alias...]> or --all"
-                .to_string(),
+                .to_owned(),
         );
     }
     let connect_timeout = Duration::from_secs(if config.connect_timeout_secs == 0 {
@@ -15178,30 +15172,30 @@ pub fn execute_ops_vm_lab_readiness_check(
     let mut failures = 0usize;
 
     for target in &targets {
-        let platform = target.platform_profile.platform.as_str().to_string();
+        let platform = target.platform_profile.platform.as_str().to_owned();
         let ssh_user_for_probe =
             target
                 .ssh_user
                 .clone()
                 .unwrap_or_else(|| match target.platform_profile.platform {
-                    VmGuestPlatform::Windows => "Administrator".to_string(),
-                    _ => "user".to_string(),
+                    VmGuestPlatform::Windows => "Administrator".to_owned(),
+                    _ => "user".to_owned(),
                 });
         let mut entry = serde_json::Map::new();
         entry.insert(
-            "alias".to_string(),
+            "alias".to_owned(),
             serde_json::Value::String(target.label.clone()),
         );
         entry.insert(
-            "ssh_target".to_string(),
+            "ssh_target".to_owned(),
             serde_json::Value::String(target.ssh_target.clone()),
         );
         entry.insert(
-            "platform".to_string(),
+            "platform".to_owned(),
             serde_json::Value::String(platform.clone()),
         );
         entry.insert(
-            "ssh_user".to_string(),
+            "ssh_user".to_owned(),
             serde_json::Value::String(ssh_user_for_probe.clone()),
         );
 
@@ -15212,24 +15206,24 @@ pub fn execute_ops_vm_lab_readiness_check(
             connect_timeout,
         ) {
             Ok((status, reason)) => (status, reason),
-            Err(err) => ("invalid".to_string(), Some(err)),
+            Err(err) => ("invalid".to_owned(), Some(err)),
         };
         let port_open = port_status.0 == "open";
         entry.insert(
-            "tcp_port_open".to_string(),
+            "tcp_port_open".to_owned(),
             serde_json::Value::Bool(port_open),
         );
         if let Some(reason) = port_status.1 {
             entry.insert(
-                "tcp_probe_reason".to_string(),
+                "tcp_probe_reason".to_owned(),
                 serde_json::Value::String(reason),
             );
         }
         if !port_open {
             failures += 1;
-            entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+            entry.insert("ready".to_owned(), serde_json::Value::Bool(false));
             entry.insert(
-                "blocker".to_string(),
+                "blocker".to_owned(),
                 serde_json::Value::String(format!(
                     "TCP/{} not reachable on {} (VM offline, sshd not running, or firewall)",
                     config.ssh_port, target.ssh_target
@@ -15241,14 +15235,14 @@ pub fn execute_ops_vm_lab_readiness_check(
 
         // Step 2: SSH identity probe (`whoami`).
         let identity_script = match target.platform_profile.remote_shell {
-            VmRemoteShell::Posix => "whoami".to_string(),
+            VmRemoteShell::Posix => "whoami".to_owned(),
             VmRemoteShell::Powershell => match build_ssh_powershell_encoded_invocation("whoami") {
                 Ok(script) => script,
                 Err(err) => {
                     failures += 1;
-                    entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+                    entry.insert("ready".to_owned(), serde_json::Value::Bool(false));
                     entry.insert(
-                        "blocker".to_string(),
+                        "blocker".to_owned(),
                         serde_json::Value::String(format!(
                             "build PS-encoded whoami invocation failed: {err}"
                         )),
@@ -15259,9 +15253,9 @@ pub fn execute_ops_vm_lab_readiness_check(
             },
             VmRemoteShell::Unsupported => {
                 failures += 1;
-                entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+                entry.insert("ready".to_owned(), serde_json::Value::Bool(false));
                 entry.insert(
-                    "blocker".to_string(),
+                    "blocker".to_owned(),
                     serde_json::Value::String(format!(
                         "remote shell unsupported for platform {platform}"
                     )),
@@ -15279,20 +15273,20 @@ pub fn execute_ops_vm_lab_readiness_check(
             connect_timeout,
         ) {
             Ok(observed) => {
-                let observed_trimmed = observed.trim().to_string();
-                entry.insert("auth_ok".to_string(), serde_json::Value::Bool(true));
+                let observed_trimmed = observed.trim().to_owned();
+                entry.insert("auth_ok".to_owned(), serde_json::Value::Bool(true));
                 entry.insert(
-                    "observed_user".to_string(),
+                    "observed_user".to_owned(),
                     serde_json::Value::String(observed_trimmed.clone()),
                 );
-                entry.insert("ready".to_string(), serde_json::Value::Bool(true));
+                entry.insert("ready".to_owned(), serde_json::Value::Bool(true));
             }
             Err(err) => {
                 failures += 1;
-                entry.insert("auth_ok".to_string(), serde_json::Value::Bool(false));
-                entry.insert("ready".to_string(), serde_json::Value::Bool(false));
+                entry.insert("auth_ok".to_owned(), serde_json::Value::Bool(false));
+                entry.insert("ready".to_owned(), serde_json::Value::Bool(false));
                 entry.insert(
-                    "blocker".to_string(),
+                    "blocker".to_owned(),
                     serde_json::Value::String(format!("SSH identity probe failed: {err}")),
                 );
             }
@@ -15481,7 +15475,7 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
         if config.wait_ready {
             return Err(
                 "--wait-ready is only supported for local UTM VM restarts, not --service restarts"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         let result = execute_ops_vm_lab_run(
@@ -15490,9 +15484,9 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                 vm_aliases: config.vm_aliases,
                 raw_targets: config.raw_targets,
                 select_all: config.select_all,
-                workdir: "/".to_string(),
-                program: "systemctl".to_string(),
-                argv: vec!["restart".to_string(), service.to_string()],
+                workdir: "/".to_owned(),
+                program: "systemctl".to_owned(),
+                argv: vec!["restart".to_owned(), service.to_owned()],
                 ssh_user: config.ssh_user,
                 ssh_identity_file: config.ssh_identity_file,
                 known_hosts_path: config.known_hosts_path,
@@ -15599,7 +15593,7 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                     stop_artifact.into_iter().collect(),
                 )],
                 Vec::new(),
-                vec!["Inspect the stop artifact and UTM controller state".to_string()],
+                vec!["Inspect the stop artifact and UTM controller state".to_owned()],
             )?;
             return if config.json_output {
                 match overall_status {
@@ -15649,7 +15643,7 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                     ),
                 ],
                 Vec::new(),
-                vec!["Inspect the start artifact and UTM controller state".to_string()],
+                vec!["Inspect the start artifact and UTM controller state".to_owned()],
             )?;
             return if config.json_output {
                 match overall_status {
@@ -15690,7 +15684,7 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                 ),
             ],
             Vec::new(),
-            vec!["Run vm-lab-discover-local-utm-summary to verify readiness".to_string()],
+            vec!["Run vm-lab-discover-local-utm-summary to verify readiness".to_owned()],
         )?;
         return if config.json_output {
             match overall_status {
@@ -15751,7 +15745,7 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                     ),
                 ],
                 Vec::new(),
-                vec!["Inspect the wait-ready artifact for the last observed VM states".to_string()],
+                vec!["Inspect the wait-ready artifact for the last observed VM states".to_owned()],
             )?;
             return if config.json_output {
                 match overall_status {
@@ -15826,7 +15820,7 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                     ),
                 ],
                 Vec::new(),
-                vec!["Inspect the inventory update artifact and inventory JSON".to_string()],
+                vec!["Inspect the inventory update artifact and inventory JSON".to_owned()],
             )?;
             return if config.json_output {
                 match overall_status {
@@ -16415,11 +16409,10 @@ pub fn execute_ops_vm_lab_bootstrap_phase(
             .values()
             .next()
             .cloned()
-            .ok_or_else(|| "no targets selected for bootstrap phase".to_string())?;
+            .ok_or_else(|| "no targets selected for bootstrap phase".to_owned())?;
         if workdirs.values().any(|workdir| workdir != &sync_dest_dir) {
             return Err(
-                "bootstrap sync-source/all requires a single destination directory across selected targets"
-                    .to_string(),
+                "bootstrap sync-source/all requires a single destination directory across selected targets".to_owned(),
             );
         }
         let sync_source = resolve_repo_sync_source(
@@ -16582,7 +16575,7 @@ fn unmatched_local_utm_advisory_target(platform: VmGuestPlatform, live_ip: &str)
         VmGuestPlatform::Macos
         | VmGuestPlatform::Windows
         | VmGuestPlatform::Ios
-        | VmGuestPlatform::Android => Some(live_ip.to_string()),
+        | VmGuestPlatform::Android => Some(live_ip.to_owned()),
     }
 }
 
@@ -16615,21 +16608,21 @@ fn observe_local_utm_target_ready(
         VmGuestPlatform::Linux | VmGuestPlatform::Macos
     );
     let ssh_port_status = if !requires_ssh {
-        "n/a".to_string()
+        "n/a".to_owned()
     } else {
         match live_ip.as_deref() {
             Some(ip) => probe_tcp_port_status(ip, ssh_port, timeout)
-                .map_or_else(|_| "unknown".to_string(), |(status, _)| status),
-            None => "unavailable".to_string(),
+                .map_or_else(|_| "unknown".to_owned(), |(status, _)| status),
+            None => "unavailable".to_owned(),
         }
     };
     let ssh_auth_status = if !requires_ssh {
-        "n/a".to_string()
+        "n/a".to_owned()
     } else {
         match (live_ip.as_deref(), target.ssh_user.as_deref()) {
-            (None, _) => "skipped-no-live-ip".to_string(),
-            (_, None) => "skipped-no-ssh-user".to_string(),
-            (_, Some(_)) if ssh_port_status != "open" => "skipped-port-not-open".to_string(),
+            (None, _) => "skipped-no-live-ip".to_owned(),
+            (_, None) => "skipped-no-ssh-user".to_owned(),
+            (_, Some(_)) if ssh_port_status != "open" => "skipped-port-not-open".to_owned(),
             (Some(ip), Some(ssh_user)) => match ssh_auth_probe_command(target.platform_profile) {
                 Ok(probe_command) => match run_remote_shell_command(
                     ip,
@@ -16639,7 +16632,7 @@ fn observe_local_utm_target_ready(
                     probe_command,
                     timeout,
                 ) {
-                    Ok(status) if status.success() => "ok".to_string(),
+                    Ok(status) if status.success() => "ok".to_owned(),
                     Ok(status) => format!("failed-exit-{}", status_code(status)),
                     Err(err) => format!("error:{err}"),
                 },
@@ -16746,7 +16739,7 @@ fn persist_local_utm_ready_states_to_inventory(
                 .and_then(Value::as_str)
                 == Some(*alias)
         }) else {
-            missing_aliases.push((*alias).to_string());
+            missing_aliases.push((*alias).to_owned());
             continue;
         };
         let entry = entry_value.as_object_mut().ok_or_else(|| {
@@ -16761,19 +16754,19 @@ fn persist_local_utm_ready_states_to_inventory(
         ensure_ssh_target("ssh_target", new_ssh_target.as_str())?;
         ensure_no_control_chars("last_known_ip", live_ip)?;
         entry.insert(
-            "ssh_target".to_string(),
+            "ssh_target".to_owned(),
             Value::String(new_ssh_target.clone()),
         );
         entry.insert(
-            "last_known_ip".to_string(),
-            Value::String((*live_ip).to_string()),
+            "last_known_ip".to_owned(),
+            Value::String((*live_ip).to_owned()),
         );
         if let Some(existing_live_ips) = entry.get_mut("live_ips") {
-            let mut ordered = vec![(*live_ip).to_string()];
+            let mut ordered = vec![(*live_ip).to_owned()];
             if let Some(values) = existing_live_ips.as_array() {
                 for value in values.iter().filter_map(Value::as_str) {
                     if !ordered.iter().any(|existing| existing == value) {
-                        ordered.push(value.to_string());
+                        ordered.push(value.to_owned());
                     }
                 }
             }
@@ -16824,7 +16817,7 @@ fn write_text_file_atomically(path: &Path, contents: &str) -> Result<(), String>
         unique_suffix()
     ));
     let normalized_contents = if contents.ends_with('\n') {
-        contents.to_string()
+        contents.to_owned()
     } else {
         format!("{contents}\n")
     };
@@ -16879,7 +16872,7 @@ fn resolve_remote_targets(
     }
 
     if resolved.is_empty() {
-        return Err("specify at least one inventory alias/--all or explicit --target".to_string());
+        return Err("specify at least one inventory alias/--all or explicit --target".to_owned());
     }
 
     Ok(resolved)
@@ -16964,8 +16957,8 @@ fn resolve_role_target_from_raw(role_label: &str, raw_target: &str) -> Result<Ro
     let platform_profile = default_platform_profile(VmGuestPlatform::Linux);
     let ssh_user = ssh_target_user(raw_target).map(str::to_string);
     Ok(RoleTarget {
-        label: raw_target.to_string(),
-        normalized_target: raw_target.to_string(),
+        label: raw_target.to_owned(),
+        normalized_target: raw_target.to_owned(),
         network_group: None,
         utm_name: None,
         platform_profile,
@@ -16983,7 +16976,7 @@ fn normalized_ssh_target(
 ) -> Result<String, String> {
     ensure_ssh_target(label, ssh_target)?;
     if ssh_target.contains('@') {
-        return Ok(ssh_target.to_string());
+        return Ok(ssh_target.to_owned());
     }
     let ssh_user = ssh_user.ok_or_else(|| {
         format!(
@@ -17150,7 +17143,7 @@ fn probe_tcp_port_status(
         .map_err(|err| format!("invalid SSH probe IP {ip:?}: {err}"))?;
     let socket_addr = SocketAddr::new(parsed_ip, port);
     match TcpStream::connect_timeout(&socket_addr, timeout) {
-        Ok(_) => Ok(("open".to_string(), None)),
+        Ok(_) => Ok(("open".to_owned(), None)),
         Err(primary_err) => {
             // On macOS, the 192.168.64.0/24 UTM shared-network route is SCOPED to bridge100
             // and absent from the global routing table. TcpStream::connect_timeout uses the
@@ -17167,12 +17160,12 @@ fn probe_tcp_port_status(
                                 .connect_timeout(&SockAddr::from(socket_addr), timeout)
                                 .is_ok()
                         {
-                            return Ok(("open".to_string(), None));
+                            return Ok(("open".to_owned(), None));
                         }
                     }
                 }
             }
-            Ok(("closed".to_string(), Some(format!("{primary_err}"))))
+            Ok(("closed".to_owned(), Some(format!("{primary_err}"))))
         }
     }
 }
@@ -17323,7 +17316,7 @@ fn rewrite_ssh_target_host(ssh_target: &str, new_host: &str) -> String {
     let formatted_host = if new_host.contains(':') {
         format!("[{new_host}]")
     } else {
-        new_host.to_string()
+        new_host.to_owned()
     };
     match ssh_target.rsplit_once('@') {
         Some((user, _)) => format!("{user}@{formatted_host}"),
@@ -17351,7 +17344,7 @@ fn select_inventory_entries(
         aliases.to_vec()
     };
     if requested.is_empty() {
-        return Err("specify at least one --vm alias or use --all".to_string());
+        return Err("specify at least one --vm alias or use --all".to_owned());
     }
     let mut selected = Vec::new();
     let mut seen_aliases = HashSet::new();
@@ -17377,8 +17370,7 @@ fn ensure_remote_selection_declares_single_network(
 ) -> Result<String, String> {
     if !raw_targets.is_empty() {
         return Err(
-            "require-same-network only supports inventory-backed targets; raw --target values do not declare network metadata"
-                .to_string(),
+            "require-same-network only supports inventory-backed targets; raw --target values do not declare network metadata".to_owned(),
         );
     }
     let inventory = load_inventory(inventory_path)?;
@@ -17396,7 +17388,7 @@ fn ensure_inventory_entries_share_network(entries: &[VmInventoryEntry]) -> Resul
             )
         })?;
         match chosen_group.as_deref() {
-            None => chosen_group = Some(group.to_string()),
+            None => chosen_group = Some(group.to_owned()),
             Some(existing) if existing == group => {}
             Some(existing) => {
                 return Err(format!(
@@ -17406,7 +17398,7 @@ fn ensure_inventory_entries_share_network(entries: &[VmInventoryEntry]) -> Resul
             }
         }
     }
-    chosen_group.ok_or_else(|| "no inventory-backed targets were selected".to_string())
+    chosen_group.ok_or_else(|| "no inventory-backed targets were selected".to_owned())
 }
 
 fn ensure_role_targets_share_network(targets: &[Option<RoleTarget>]) -> Result<String, String> {
@@ -17422,7 +17414,7 @@ fn ensure_role_targets_share_network(targets: &[Option<RoleTarget>]) -> Result<S
             )
         })?;
         match chosen_group.as_deref() {
-            None => chosen_group = Some(group.to_string()),
+            None => chosen_group = Some(group.to_owned()),
             Some(existing) if existing == group => {}
             Some(existing) => {
                 return Err(format!(
@@ -17433,7 +17425,7 @@ fn ensure_role_targets_share_network(targets: &[Option<RoleTarget>]) -> Result<S
         }
     }
     chosen_group
-        .ok_or_else(|| "same-network validation requires at least one resolved target".to_string())
+        .ok_or_else(|| "same-network validation requires at least one resolved target".to_owned())
 }
 
 fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
@@ -17486,7 +17478,7 @@ fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
 fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| "vm inventory entry must be an object".to_string())?;
+        .ok_or_else(|| "vm inventory entry must be an object".to_owned())?;
     let alias = required_string_field(object, "alias")?;
     ensure_inventory_alias(alias.as_str())?;
     let ssh_target = required_string_field(object, "ssh_target")?;
@@ -17606,7 +17598,7 @@ fn parse_inventory_entry(value: &Value) -> Result<VmInventoryEntry, String> {
 fn parse_controller(value: &Value) -> Result<VmController, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| "vm controller must be an object".to_string())?;
+        .ok_or_else(|| "vm controller must be an object".to_owned())?;
     let controller_type = required_string_field(object, "type")?;
     match controller_type.as_str() {
         "local_utm" => {
@@ -17653,7 +17645,7 @@ fn optional_string_field(
             if trimmed.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(trimmed.to_string()))
+                Ok(Some(trimmed.to_owned()))
             }
         }
         _ => Err(format!(
@@ -17677,7 +17669,7 @@ fn optional_bool_field(
 
 fn ensure_inventory_alias(value: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err("vm alias must not be empty".to_string());
+        return Err("vm alias must not be empty".to_owned());
     }
     let allowed = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.');
     if !value.chars().all(allowed) {
@@ -17698,7 +17690,7 @@ fn ensure_ssh_target(label: &str, value: &str) -> Result<(), String> {
 
 fn ensure_ssh_user(value: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err("SSH user must not be empty".to_string());
+        return Err("SSH user must not be empty".to_owned());
     }
     if value.chars().any(char::is_whitespace) {
         return Err(format!("SSH user must not contain whitespace: {value}"));
@@ -18088,7 +18080,7 @@ fn write_git_worktree_archive(
         }
         let relative = std::str::from_utf8(raw_path)
             .map_err(|err| format!("local source file list contained non-utf8 path: {err}"))?;
-        if relative.is_empty() || !seen.insert(relative.to_string()) {
+        if relative.is_empty() || !seen.insert(relative.to_owned()) {
             continue;
         }
         let relative_path = Path::new(relative);
@@ -18161,7 +18153,7 @@ fn write_git_worktree_zip_archive(
         }
         let relative = std::str::from_utf8(raw_path)
             .map_err(|err| format!("local source file list contained non-utf8 path: {err}"))?;
-        if relative.is_empty() || !seen.insert(relative.to_string()) {
+        if relative.is_empty() || !seen.insert(relative.to_owned()) {
             continue;
         }
         let relative_path = Path::new(relative);
@@ -18225,7 +18217,7 @@ fn prepare_local_source_bundle_extras(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(output.stderr.as_slice())
             .trim()
-            .to_string();
+            .to_owned();
         if stderr.contains("--offline was specified")
             || stderr.contains("failed to download")
             || stderr.contains("failed to sync")
@@ -18274,7 +18266,7 @@ fn prepare_local_source_bundle_extras(
 }
 
 fn build_vendored_cargo_config(vendor_stdout: &str) -> String {
-    let mut config = vendor_stdout.trim().to_string();
+    let mut config = vendor_stdout.trim().to_owned();
     if !config.ends_with('\n') {
         config.push('\n');
     }
@@ -18756,15 +18748,15 @@ fn remote_target_effective_user(
 ) -> Result<String, String> {
     if let Some(ssh_user) = ssh_user_override {
         ensure_ssh_user(ssh_user)?;
-        return Ok(ssh_user.to_string());
+        return Ok(ssh_user.to_owned());
     }
     if let Some(ssh_user) = target.ssh_user.as_deref() {
         ensure_ssh_user(ssh_user)?;
-        return Ok(ssh_user.to_string());
+        return Ok(ssh_user.to_owned());
     }
     if let Some(ssh_user) = ssh_target_user(target.ssh_target.as_str()) {
         ensure_ssh_user(ssh_user)?;
-        return Ok(ssh_user.to_string());
+        return Ok(ssh_user.to_owned());
     }
     Err(format!(
         "UTM-backed target {} requires an explicit ssh_user or user@host SSH target",
@@ -18774,7 +18766,7 @@ fn remote_target_effective_user(
 
 fn remote_target_home(ssh_user: &str) -> String {
     if ssh_user == "root" {
-        "/root".to_string()
+        "/root".to_owned()
     } else {
         format!("/home/{ssh_user}")
     }
@@ -18806,7 +18798,7 @@ fn utm_push_raw(
     command.stderr(Stdio::piped());
     // Use _preserve to avoid run_output_with_timeout overriding our stdin setup.
     let output = run_output_with_timeout_preserve(&mut command, timeout)?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return Err(format!(
             "UTM file push reported error for {utm_name}:{dst}: {stderr}"
@@ -18841,7 +18833,7 @@ fn utm_pull_raw(
             dst.display()
         )
     })?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         let _ = fs::remove_file(dst);
         return Err(format!(
@@ -18933,7 +18925,7 @@ fn execute_utm_remote_script_as_user(
     ensure_ssh_user(ssh_user)?;
     ensure_no_control_chars("UTM exec home", home)?;
     if remote_script.chars().any(|ch| ch == '\0') {
-        return Err("UTM remote script contains unsupported NUL byte".to_string());
+        return Err("UTM remote script contains unsupported NUL byte".to_owned());
     }
 
     let temp_root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-{}", unique_suffix()));
@@ -19271,7 +19263,7 @@ enum RemoteTransportPhase {
 /// path lives inside the hardened tree.
 fn remote_target_windows_utm_staging_dir(target: &RemoteTarget) -> Result<String, String> {
     if let Some(dir) = target.utm_staging_dir.as_deref() {
-        return Ok(dir.to_string());
+        return Ok(dir.to_owned());
     }
     default_utm_staging_dir_for_profile(target.platform_profile, target.ssh_user.as_deref())
         .ok_or_else(|| {
@@ -19609,7 +19601,7 @@ fn scp_to_remote_for_target_with_phase(
                         parent.is_empty() || windows_path_is_within(parent.as_str(), staging_dir);
                     if needs_mkdir {
                         let mkdir_target = if parent.is_empty() {
-                            staging_dir.to_string()
+                            staging_dir.to_owned()
                         } else {
                             parent
                         };
@@ -20290,7 +20282,7 @@ fn powershell_quote(value: &str) -> Result<String, String> {
 
 fn encode_powershell_command(script: &str) -> Result<String, String> {
     if script.chars().any(|ch| ch == '\0') {
-        return Err("PowerShell script contains unsupported NUL byte".to_string());
+        return Err("PowerShell script contains unsupported NUL byte".to_owned());
     }
     let mut bytes = Vec::with_capacity(script.len() * 2);
     for unit in script.encode_utf16() {
@@ -20358,7 +20350,7 @@ fn remote_script_for_ssh_transport(
     remote_script: &str,
 ) -> Result<String, String> {
     match target.platform_profile.remote_shell {
-        VmRemoteShell::Posix => Ok(remote_script.to_string()),
+        VmRemoteShell::Posix => Ok(remote_script.to_owned()),
         VmRemoteShell::Powershell => build_ssh_powershell_encoded_invocation(remote_script),
         VmRemoteShell::Unsupported => Err(format!(
             "SSH transport is not yet implemented for platform {} ({})",
@@ -20373,7 +20365,7 @@ fn remote_copy_destination_for_target(target: &RemoteTarget, dst: &str) -> Strin
         VmGuestPlatform::Linux
         | VmGuestPlatform::Macos
         | VmGuestPlatform::Ios
-        | VmGuestPlatform::Android => dst.to_string(),
+        | VmGuestPlatform::Android => dst.to_owned(),
         VmGuestPlatform::Windows => dst.replace('\\', "/"),
     }
 }
@@ -20383,7 +20375,7 @@ fn remote_copy_source_for_target(target: &RemoteTarget, src: &str) -> String {
         VmGuestPlatform::Linux
         | VmGuestPlatform::Macos
         | VmGuestPlatform::Ios
-        | VmGuestPlatform::Android => src.to_string(),
+        | VmGuestPlatform::Android => src.to_owned(),
         VmGuestPlatform::Windows => src.replace('\\', "/"),
     }
 }
@@ -20443,7 +20435,7 @@ fn windows_orchestration_root(target: &RemoteTarget) -> String {
         && remote_target_local_utm(target).is_some()
         && let Some(staging) = target.utm_staging_dir.as_deref()
     {
-        return staging.to_string();
+        return staging.to_owned();
     }
     target
         .remote_temp_dir
@@ -20519,7 +20511,7 @@ fn utm_exec_windows_raw(
         // denied") is what we actually care about.
         let stderr_filtered = strip_powershell_clixml_noise(stderr_raw.as_ref())
             .trim()
-            .to_string();
+            .to_owned();
         if !stderr_filtered.is_empty() {
             return Err(format!(
                 "UTM Windows exec reported error for {utm_name}: {stderr_filtered}"
@@ -20685,7 +20677,7 @@ fn execute_utm_remote_powershell_capture(
     timeout: Duration,
 ) -> Result<(i32, String), String> {
     if powershell_script.chars().any(|ch| ch == '\0') {
-        return Err("UTM remote PowerShell script contains unsupported NUL byte".to_string());
+        return Err("UTM remote PowerShell script contains unsupported NUL byte".to_owned());
     }
     ensure_no_control_chars("UTM Windows staging dir", staging_dir)?;
 
@@ -20776,7 +20768,7 @@ fn execute_utm_remote_powershell_capture(
     let rc = match rc_text.trim().parse::<i32>() {
         Ok(rc) => rc,
         Err(_) => {
-            let trimmed = rc_text.trim().to_string();
+            let trimmed = rc_text.trim().to_owned();
             cleanup(local_root.as_path());
             return Err(format!(
                 "UTM Windows rc was not a valid integer for {utm_name}: {trimmed}"
@@ -20913,8 +20905,8 @@ fn build_windows_result_file_helper_invocation_script(
         .windows(2)
         .any(|pair| pair[0] == "-OutputPath" || pair[0] == "-ResultPath");
     if !has_result_path {
-        helper_args.push("-OutputPath".to_string());
-        helper_args.push(remote_result_path.to_string());
+        helper_args.push("-OutputPath".to_owned());
+        helper_args.push(remote_result_path.to_owned());
     }
     let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
     let encoded_helper = encode_powershell_command(helper_command.as_str())?;
@@ -21113,16 +21105,16 @@ fn build_windows_access_bootstrap_args(
     automation_public_key: Option<&str>,
     result_path: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let mut args = vec!["-Phase".to_string(), "prepare-transport".to_string()];
+    let mut args = vec!["-Phase".to_owned(), "prepare-transport".to_owned()];
     if let Some(public_key) = automation_public_key {
         ensure_no_control_chars("automation public key", public_key)?;
-        args.push("-AutomationPublicKey".to_string());
-        args.push(public_key.to_string());
+        args.push("-AutomationPublicKey".to_owned());
+        args.push(public_key.to_owned());
     }
     if let Some(result_path) = result_path {
         ensure_no_control_chars("Windows access bootstrap result path", result_path)?;
-        args.push("-ResultPath".to_string());
-        args.push(result_path.to_string());
+        args.push("-ResultPath".to_owned());
+        args.push(result_path.to_owned());
     }
     Ok(args)
 }
@@ -21182,12 +21174,12 @@ fn render_known_hosts_line(host: &str, port: u16, public_key_line: &str) -> Resu
     let mut parts = public_key_line.split_whitespace();
     let key_type = parts
         .next()
-        .ok_or_else(|| "Windows SSH host key line is missing key type".to_string())?;
+        .ok_or_else(|| "Windows SSH host key line is missing key type".to_owned())?;
     let key_data = parts
         .next()
-        .ok_or_else(|| "Windows SSH host key line is missing key payload".to_string())?;
+        .ok_or_else(|| "Windows SSH host key line is missing key payload".to_owned())?;
     let host_field = if port == 22 {
-        host.to_string()
+        host.to_owned()
     } else {
         format!("[{host}]:{port}")
     };
@@ -21421,15 +21413,15 @@ fn bootstrap_windows_access_for_target(
         append_known_hosts_entry(path, rendered.as_str())?;
     }
 
-    Ok(host_key_line.to_string())
+    Ok(host_key_line.to_owned())
 }
 
 fn summarize_ssh_probe_streams(stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
+    let stderr_text = String::from_utf8_lossy(stderr).trim().to_owned();
     if !stderr_text.is_empty() {
         return stderr_text;
     }
-    let stdout_text = String::from_utf8_lossy(stdout).trim().to_string();
+    let stdout_text = String::from_utf8_lossy(stdout).trim().to_owned();
     if !stdout_text.is_empty() {
         return stdout_text;
     }
@@ -21441,13 +21433,13 @@ fn classify_windows_ssh_access_probe_failure(detail: &str, status: Option<ExitSt
     let lowered = normalized_detail.to_ascii_lowercase();
     let status_detail = status.map(status_code);
     let fallback_detail = status_detail.map_or_else(
-        || "remote command failed".to_string(),
+        || "remote command failed".to_owned(),
         |code| format!("remote command exited with status {code}"),
     );
     let rendered_detail = if normalized_detail.is_empty() {
         fallback_detail
     } else {
-        normalized_detail.to_string()
+        normalized_detail.to_owned()
     };
     if lowered.contains("host key verification failed")
         || lowered.contains("remote host identification has changed")
@@ -21491,7 +21483,7 @@ fn prove_windows_ssh_access_for_target(
     let ssh_target = target.ssh_target.as_str();
     let ssh_user = ssh_user_override.or(target.ssh_user.as_deref());
     if ssh_user.is_none() {
-        return Err("no-authoritative-ssh-target: no Windows ssh_user is configured".to_string());
+        return Err("no-authoritative-ssh-target: no Windows ssh_user is configured".to_owned());
     }
     validate_target_user_combination(ssh_target, ssh_user)?;
     let probe_command = ssh_auth_probe_command(target.platform_profile)?;
@@ -21594,7 +21586,7 @@ fn sanitize_label_for_path(value: &str) -> String {
         }
     }
     if out.is_empty() {
-        "target".to_string()
+        "target".to_owned()
     } else {
         out
     }
@@ -21606,7 +21598,7 @@ fn ssh_target_host(value: &str) -> String {
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
         .unwrap_or(without_user)
-        .to_string()
+        .to_owned()
 }
 
 fn ssh_target_user(value: &str) -> Option<&str> {
@@ -21641,7 +21633,7 @@ fn resolve_known_hosts_targets(
                     .iter()
                     .any(|candidate| candidate == last_known_ip)
             {
-                candidates.push(last_known_ip.to_string());
+                candidates.push(last_known_ip.to_owned());
             }
             if seen.insert(entry.alias.clone()) {
                 results.push(KnownHostsTarget {
@@ -21662,7 +21654,7 @@ fn resolve_known_hosts_targets(
         }
     }
     if results.is_empty() {
-        return Err("specify at least one inventory alias/--all or explicit --target".to_string());
+        return Err("specify at least one inventory alias/--all or explicit --target".to_owned());
     }
     Ok(results)
 }
@@ -21726,7 +21718,7 @@ fn parse_key_value_output(output: &str) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
     for line in output.lines() {
         if let Some((key, value)) = line.split_once('=') {
-            values.insert(key.trim().to_string(), value.trim().to_string());
+            values.insert(key.trim().to_owned(), value.trim().to_owned());
         }
     }
     values
@@ -21749,13 +21741,13 @@ fn parse_section_capture(output: &str) -> BTreeMap<String, String> {
     let mut current_body = String::new();
     for line in output.lines() {
         if let Some(name) = line.strip_prefix("__VM_LAB_SECTION__") {
-            current_name = Some(name.to_string());
+            current_name = Some(name.to_owned());
             current_body.clear();
             continue;
         }
         if line == "__VM_LAB_SECTION_END__" {
             if let Some(name) = current_name.take() {
-                sections.insert(name, current_body.trim_end().to_string());
+                sections.insert(name, current_body.trim_end().to_owned());
             }
             current_body.clear();
             continue;
@@ -21861,40 +21853,40 @@ fn load_vm_lab_topology(path: &Path) -> Result<VmLabTopology, String> {
 fn parse_vm_lab_topology(value: Value) -> Result<VmLabTopology, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| "vm-lab topology must be a JSON object".to_string())?;
+        .ok_or_else(|| "vm-lab topology must be a JSON object".to_owned())?;
     let version = object
         .get("version")
         .and_then(Value::as_u64)
-        .ok_or_else(|| "vm-lab topology is missing numeric version".to_string())?;
+        .ok_or_else(|| "vm-lab topology is missing numeric version".to_owned())?;
     if version != 1 {
         return Err(format!("unsupported vm-lab topology version: {version}"));
     }
     let suite = object
         .get("suite")
         .and_then(Value::as_str)
-        .ok_or_else(|| "vm-lab topology is missing suite".to_string())?
-        .to_string();
+        .ok_or_else(|| "vm-lab topology is missing suite".to_owned())?
+        .to_owned();
     let suite = normalized_suite_name(suite.as_str())?;
     let roles_object = object
         .get("roles")
         .and_then(Value::as_object)
-        .ok_or_else(|| "vm-lab topology is missing roles object".to_string())?;
+        .ok_or_else(|| "vm-lab topology is missing roles object".to_owned())?;
     let mut roles = BTreeMap::new();
     for (key, value) in roles_object {
         let alias = value
             .as_str()
             .ok_or_else(|| format!("vm-lab topology role {key} must be a string alias"))?;
-        roles.insert(key.clone(), alias.to_string());
+        roles.insert(key.clone(), alias.to_owned());
     }
     let node_array = object
         .get("nodes")
         .and_then(Value::as_array)
-        .ok_or_else(|| "vm-lab topology is missing nodes array".to_string())?;
+        .ok_or_else(|| "vm-lab topology is missing nodes array".to_owned())?;
     let mut nodes = BTreeMap::new();
     for node_value in node_array {
         let node_object = node_value
             .as_object()
-            .ok_or_else(|| "vm-lab topology node must be an object".to_string())?;
+            .ok_or_else(|| "vm-lab topology node must be an object".to_owned())?;
         let alias = required_string_field(node_object, "alias")?;
         let normalized_target = required_string_field(node_object, "normalized_target")?;
         let node_id = required_string_field(node_object, "node_id")?;
@@ -22880,7 +22872,7 @@ mod tests {
         let raw_targets: Vec<String> = Vec::new();
         let target = resolve_remote_targets(
             path.as_path(),
-            &[alias.to_string()],
+            &[alias.to_owned()],
             false,
             raw_targets.as_slice(),
         )
@@ -22938,7 +22930,7 @@ mod tests {
     }
 
     fn append_default_live_lab_platform_metadata(rendered: &str) -> String {
-        let mut rendered = rendered.to_string();
+        let mut rendered = rendered.to_owned();
         for role in ["EXIT", "CLIENT", "ENTRY", "AUX", "EXTRA", "FIFTH_CLIENT"] {
             let target_key = format!("{role}_TARGET=");
             let platform_key = format!("{role}_PLATFORM=");
@@ -22983,8 +22975,8 @@ mod tests {
             profile_path: profile_path.to_path_buf(),
             script_path: script_path.to_path_buf(),
             inventory_path: inventory_path.map(Path::to_path_buf),
-            source_mode: "local-head".to_string(),
-            repo_ref: Some("HEAD".to_string()),
+            source_mode: "local-head".to_owned(),
+            repo_ref: Some("HEAD".to_owned()),
             require_same_network: Some(true),
             dry_run: false,
             max_parallel_node_workers: None,
@@ -23194,9 +23186,9 @@ mod tests {
     fn select_inventory_entries_skips_all_excluded_rows() {
         let inventory = vec![
             VmInventoryEntry {
-                alias: "debian-headless-1".to_string(),
-                ssh_target: "debian-headless-1".to_string(),
-                ssh_user: Some("debian".to_string()),
+                alias: "debian-headless-1".to_owned(),
+                ssh_target: "debian-headless-1".to_owned(),
+                ssh_user: Some("debian".to_owned()),
                 ssh_password: None,
                 include_in_all: Some(true),
                 os: None,
@@ -23219,10 +23211,10 @@ mod tests {
                 controller: None,
             },
             VmInventoryEntry {
-                alias: "debian-lan-11".to_string(),
-                ssh_target: "debian-lan-11".to_string(),
-                ssh_user: Some("debian".to_string()),
-                ssh_password: Some("tempo".to_string()),
+                alias: "debian-lan-11".to_owned(),
+                ssh_target: "debian-lan-11".to_owned(),
+                ssh_user: Some("debian".to_owned()),
+                ssh_password: Some("tempo".to_owned()),
                 include_in_all: Some(false),
                 os: None,
                 last_known_ip: None,
@@ -23270,9 +23262,9 @@ mod tests {
         );
         let targets = resolve_remote_targets(
             path.as_path(),
-            &["debian-headless-1".to_string()],
+            &["debian-headless-1".to_owned()],
             false,
-            &["root@192.168.18.52".to_string()],
+            &["root@192.168.18.52".to_owned()],
         )
         .expect("targets should resolve");
         assert_eq!(targets.len(), 2);
@@ -23301,19 +23293,19 @@ mod tests {
             "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"debian-headless-1\" ]; then\n  printf '192.168.64.8\\n100.64.0.1\\n'\n  exit 0\nfi\nexit 1\n",
         );
         let entry = VmInventoryEntry {
-            alias: "debian-headless-1".to_string(),
-            ssh_target: "192.168.64.3".to_string(),
-            ssh_user: Some("debian".to_string()),
+            alias: "debian-headless-1".to_owned(),
+            ssh_target: "192.168.64.3".to_owned(),
+            ssh_user: Some("debian".to_owned()),
             ssh_password: None,
             include_in_all: Some(true),
             os: None,
-            last_known_ip: Some("192.168.64.3".to_string()),
+            last_known_ip: Some("192.168.64.3".to_owned()),
             parent_device: None,
             last_known_network: None,
             network_group: None,
             node_id: None,
             lab_role: None,
-            mesh_ip: Some("100.64.0.1".to_string()),
+            mesh_ip: Some("100.64.0.1".to_owned()),
             exit_capable: None,
             relay_capable: None,
             remote_temp_dir: None,
@@ -23324,7 +23316,7 @@ mod tests {
             guest_exec_mode: None,
             service_manager: None,
             controller: Some(super::VmController::LocalUtm {
-                utm_name: "debian-headless-1".to_string(),
+                utm_name: "debian-headless-1".to_owned(),
                 bundle_path: PathBuf::from("/tmp/debian-headless-1.utm"),
             }),
         };
@@ -23611,11 +23603,11 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "--cmd".to_string(),
-                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe".to_string(),
-                "-NoProfile".to_string(),
-                "-EncodedCommand".to_string(),
-                "QQA=".to_string()
+                "--cmd".to_owned(),
+                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe".to_owned(),
+                "-NoProfile".to_owned(),
+                "-EncodedCommand".to_owned(),
+                "QQA=".to_owned()
             ]
         );
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cmd").count(), 1);
@@ -23655,7 +23647,7 @@ mod tests {
             &target,
             r"C:\Rustynet",
             "rustynet",
-            &["status".to_string()],
+            &["status".to_owned()],
             false,
         )
         .expect("Windows PowerShell script should build");
@@ -23929,7 +23921,7 @@ mod tests {
         let rendered = super::format_windows_local_utm_result_pull_failure(
             "Windows SSH readiness probe",
             "Windows",
-            &Err("timed out after 30 seconds".to_string()),
+            &Err("timed out after 30 seconds".to_owned()),
             "result file pull failed",
         );
         assert!(rendered.contains("transport failed"));
@@ -24027,10 +24019,10 @@ mod tests {
         let script = super::build_windows_access_bootstrap_result_script(
             r"C:\ProgramData\Rustynet\vm-lab\Bootstrap-RustyNetWindows.ps1",
             &[
-                "-Phase".to_string(),
-                "prepare-transport".to_string(),
-                "-ResultPath".to_string(),
-                r"C:\ProgramData\Rustynet\vm-lab\prepare-transport.json".to_string(),
+                "-Phase".to_owned(),
+                "prepare-transport".to_owned(),
+                "-ResultPath".to_owned(),
+                r"C:\ProgramData\Rustynet\vm-lab\prepare-transport.json".to_owned(),
             ],
             r"C:\ProgramData\Rustynet\vm-lab\prepare-transport.json",
         )
@@ -24051,10 +24043,10 @@ mod tests {
         let script = super::build_windows_result_file_helper_invocation_script(
             r"C:\ProgramData\Rustynet\vm-lab\Smoke-RustyNetWindowsServiceHost.ps1",
             &[
-                "-RustyNetRoot".to_string(),
-                r"C:\Rustynet".to_string(),
-                "-OutputPath".to_string(),
-                r"C:\ProgramData\RustyNet\vm-lab\smoke.json".to_string(),
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
+                "-OutputPath".to_owned(),
+                r"C:\ProgramData\RustyNet\vm-lab\smoke.json".to_owned(),
             ],
             r"C:\ProgramData\RustyNet\vm-lab\smoke.json",
             "Windows service-host smoke helper",
@@ -24073,10 +24065,10 @@ mod tests {
         let script = super::build_windows_result_file_helper_invocation_script(
             r"C:\ProgramData\Rustynet\vm-lab\Verify-RustyNetWindowsBootstrap.ps1",
             &[
-                "-RustyNetRoot".to_string(),
-                r"C:\Rustynet".to_string(),
-                "-InstallRoot".to_string(),
-                r"C:\Program Files\RustyNet".to_string(),
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
+                "-InstallRoot".to_owned(),
+                r"C:\Program Files\RustyNet".to_owned(),
             ],
             r"C:\ProgramData\Rustynet\vm-lab\verify.json",
             "Windows verify helper",
@@ -24086,12 +24078,12 @@ mod tests {
         let expected_cmd = super::build_windows_helper_command(
             r"C:\ProgramData\Rustynet\vm-lab\Verify-RustyNetWindowsBootstrap.ps1",
             &[
-                "-RustyNetRoot".to_string(),
-                r"C:\Rustynet".to_string(),
-                "-InstallRoot".to_string(),
-                r"C:\Program Files\RustyNet".to_string(),
-                "-OutputPath".to_string(),
-                r"C:\ProgramData\Rustynet\vm-lab\verify.json".to_string(),
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
+                "-InstallRoot".to_owned(),
+                r"C:\Program Files\RustyNet".to_owned(),
+                "-OutputPath".to_owned(),
+                r"C:\ProgramData\Rustynet\vm-lab\verify.json".to_owned(),
             ],
         )
         .expect("expected cmd should build");
@@ -24118,12 +24110,12 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-Phase".to_string(),
-                "prepare-transport".to_string(),
-                "-AutomationPublicKey".to_string(),
-                "ssh-ed25519 AAAA example".to_string(),
-                "-ResultPath".to_string(),
-                r"C:\ProgramData\Rustynet\vm-lab\prepare-transport.json".to_string()
+                "-Phase".to_owned(),
+                "prepare-transport".to_owned(),
+                "-AutomationPublicKey".to_owned(),
+                "ssh-ed25519 AAAA example".to_owned(),
+                "-ResultPath".to_owned(),
+                r"C:\ProgramData\Rustynet\vm-lab\prepare-transport.json".to_owned()
             ]
         );
     }
@@ -24449,7 +24441,7 @@ mod tests {
             &ios_target,
             "/var/mobile",
             "rustynet",
-            &["status".to_string()],
+            &["status".to_owned()],
             false,
         )
         .expect_err("ios transport should remain unsupported");
@@ -24484,7 +24476,7 @@ mod tests {
     }}
   ]
 }}"#
-        .to_string();
+        .to_owned();
         let inventory = write_temp_inventory(inventory_body.as_str());
 
         let utmctl = write_temp_executable(
@@ -24566,7 +24558,7 @@ mod tests {
                 }
             ]
         });
-        let aliases = vec!["exit-vm".to_string(), "client-vm".to_string()];
+        let aliases = vec!["exit-vm".to_owned(), "client-vm".to_owned()];
         let summary = selected_local_utm_readiness_from_report(
             serde_json::to_string(&report)
                 .expect("discovery report should serialize")
@@ -24574,12 +24566,12 @@ mod tests {
             aliases.as_slice(),
         )
         .expect("selected readiness should parse");
-        assert_eq!(summary.ready_aliases, vec!["exit-vm".to_string()]);
+        assert_eq!(summary.ready_aliases, vec!["exit-vm".to_owned()]);
         assert_eq!(summary.unready_entries.len(), 1);
         assert_eq!(summary.unready_entries[0].alias, "client-vm");
         assert_eq!(
             summary.unready_entries[0].reason_codes,
-            vec!["ssh-auth-rejected".to_string()]
+            vec!["ssh-auth-rejected".to_owned()]
         );
     }
 
@@ -24603,11 +24595,11 @@ mod tests {
         assert_eq!(
             aliases,
             vec![
-                "exit-vm".to_string(),
-                "client-vm".to_string(),
-                "entry-vm".to_string(),
-                "aux-vm".to_string(),
-                "extra-vm".to_string()
+                "exit-vm".to_owned(),
+                "client-vm".to_owned(),
+                "entry-vm".to_owned(),
+                "aux-vm".to_owned(),
+                "extra-vm".to_owned()
             ]
         );
         cleanup_temp_inventory(inventory.as_path());
@@ -24638,7 +24630,7 @@ mod tests {
   ]
 }"#,
         );
-        let err = resolve_start_targets(path.as_path(), &["remote-debian-1".to_string()], false)
+        let err = resolve_start_targets(path.as_path(), &["remote-debian-1".to_owned()], false)
             .expect_err("remote-only entries must not start locally");
         assert!(err.contains("does not declare a local start controller"));
         cleanup_temp_inventory(path.as_path());
@@ -24664,7 +24656,7 @@ mod tests {
   ]
 }"#,
         );
-        let targets = resolve_start_targets(path.as_path(), &["windows-utm-1".to_string()], false)
+        let targets = resolve_start_targets(path.as_path(), &["windows-utm-1".to_owned()], false)
             .expect("windows start target should resolve");
         assert_eq!(targets.len(), 1);
         assert_eq!(
@@ -24705,12 +24697,12 @@ mod tests {
         let report = persist_local_utm_ready_states_to_inventory(
             path.as_path(),
             &[super::LocalUtmReadyState {
-                alias: "debian-headless-1".to_string(),
-                utm_name: "debian-headless-1".to_string(),
+                alias: "debian-headless-1".to_owned(),
+                utm_name: "debian-headless-1".to_owned(),
                 process_present: true,
-                live_ip: Some("192.168.64.8".to_string()),
-                ssh_port_status: "open".to_string(),
-                ssh_auth_status: "ok".to_string(),
+                live_ip: Some("192.168.64.8".to_owned()),
+                ssh_port_status: "open".to_owned(),
+                ssh_auth_status: "ok".to_owned(),
                 platform: super::VmGuestPlatform::Linux,
             }],
         )
@@ -24886,7 +24878,7 @@ directory = "vendor"
         let script = build_remote_argv_script(
             "/home/debian/Rustyfin",
             "cargo",
-            &["build".to_string(), "--release".to_string()],
+            &["build".to_owned(), "--release".to_owned()],
             true,
         )
         .expect("run script should build");
@@ -24899,7 +24891,7 @@ directory = "vendor"
         let err = build_remote_argv_script(
             "/home/debian/Rustyfin",
             "cargo",
-            &["bad\narg".to_string()],
+            &["bad\narg".to_owned()],
             false,
         )
         .expect_err("control characters must fail");
@@ -25005,9 +24997,9 @@ directory = "vendor"
         let result = execute_ops_vm_lab_write_live_lab_profile(VmLabWriteLiveLabProfileConfig {
             inventory_path: inventory.clone(),
             output_path: output.clone(),
-            exit_vm: Some("exit-vm".to_string()),
+            exit_vm: Some("exit-vm".to_owned()),
             exit_target: None,
-            client_vm: Some("client-vm".to_string()),
+            client_vm: Some("client-vm".to_owned()),
             client_target: None,
             entry_vm: None,
             entry_target: None,
@@ -25020,15 +25012,15 @@ directory = "vendor"
             require_same_network: true,
             ssh_identity_file: identity.clone(),
             ssh_known_hosts_file: Some(known_hosts.clone()),
-            ssh_allow_cidrs: Some("192.168.18.0/24".to_string()),
-            network_id: Some("vm-lab".to_string()),
+            ssh_allow_cidrs: Some("192.168.18.0/24".to_owned()),
+            network_id: Some("vm-lab".to_owned()),
             traversal_ttl_secs: Some(120),
             cross_network_nat_profiles: None,
             cross_network_required_nat_profiles: None,
             cross_network_impairment_profile: None,
-            backend: Some("linux-wireguard-userspace-shared".to_string()),
-            source_mode: Some("local-head".to_string()),
-            repo_ref: Some("HEAD".to_string()),
+            backend: Some("linux-wireguard-userspace-shared".to_owned()),
+            source_mode: Some("local-head".to_owned()),
+            repo_ref: Some("HEAD".to_owned()),
             report_dir: None,
         })
         .expect("profile should be written");
@@ -25069,7 +25061,7 @@ directory = "vendor"
             parse_vm_lab_iteration_validation_step_spec("check:rustynetd")
                 .expect("check package should parse"),
             VmLabIterationValidationStep::CargoCheckPackage {
-                package: "rustynetd".to_string()
+                package: "rustynetd".to_owned()
             }
         );
         assert_eq!(
@@ -25078,9 +25070,9 @@ directory = "vendor"
             )
             .expect("test bin should parse"),
             VmLabIterationValidationStep::CargoTestBin {
-                package: "rustynet-cli".to_string(),
-                bin: "live_linux_lan_toggle_test".to_string(),
-                filter: Some("lan_toggle".to_string())
+                package: "rustynet-cli".to_owned(),
+                bin: "live_linux_lan_toggle_test".to_owned(),
+                filter: Some("lan_toggle".to_owned())
             }
         );
     }
@@ -25181,7 +25173,7 @@ enforce_baseline_runtime\thard\tfail\t1\t{}/logs/enforce_baseline_runtime.log\te
         assert_eq!(
             summary,
             LiveLabStageSummary {
-                overall_status: "pass".to_string(),
+                overall_status: "pass".to_owned(),
                 first_failed_stage: None,
                 key_report_path: report_dir.join("failure_digest.md"),
                 key_log_path: None,
@@ -25249,12 +25241,12 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
         let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)
             .expect("summary should build");
         let stage_record = LiveLabStageRecord {
-            name: "validate_baseline_runtime".to_string(),
-            severity: "hard".to_string(),
-            status: "fail".to_string(),
-            rc: "1".to_string(),
+            name: "validate_baseline_runtime".to_owned(),
+            severity: "hard".to_owned(),
+            status: "fail".to_owned(),
+            rc: "1".to_owned(),
             log_path: stage_log.clone(),
-            description: "validate one-hop routing and no-plaintext-passphrase state".to_string(),
+            description: "validate one-hop routing and no-plaintext-passphrase state".to_owned(),
         };
         let bundle = collect_live_lab_stage_local_bundle(
             report_dir.as_path(),
@@ -25314,19 +25306,19 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
             worker_results_markdown_path: None,
         };
         let stage_record = LiveLabStageRecord {
-            name: "validate_baseline_runtime".to_string(),
-            severity: "hard".to_string(),
-            status: "fail".to_string(),
-            rc: "1".to_string(),
+            name: "validate_baseline_runtime".to_owned(),
+            severity: "hard".to_owned(),
+            status: "fail".to_owned(),
+            rc: "1".to_owned(),
             log_path: stage_log,
-            description: "validate one-hop routing and no-plaintext-passphrase state".to_string(),
+            description: "validate one-hop routing and no-plaintext-passphrase state".to_owned(),
         };
         let summary = LiveLabStageSummary {
-            overall_status: "fail".to_string(),
-            first_failed_stage: Some("validate_baseline_runtime".to_string()),
+            overall_status: "fail".to_owned(),
+            first_failed_stage: Some("validate_baseline_runtime".to_owned()),
             key_report_path: report_dir.join("failure_digest.md"),
             key_log_path: Some(report_dir.join("logs/validate_baseline_runtime.log")),
-            likely_reason: Some("error: route missing".to_string()),
+            likely_reason: Some("error: route missing".to_owned()),
             failed_log_tail: None,
         };
         let review = render_live_lab_stage_forensics_review(super::LiveLabStageReviewContext {
@@ -25341,7 +25333,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
                     .as_path(),
             ),
             notes: live_lab_stage_forensics_notes("validate_baseline_runtime").as_slice(),
-            warnings: &["warning example".to_string()],
+            warnings: &["warning example".to_owned()],
         });
         assert!(
             review
@@ -25360,13 +25352,13 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
             platform: VmGuestPlatform::Linux,
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Ok {
-                value: "192.168.64.3".to_string(),
+                value: "192.168.64.3".to_owned(),
             },
             ssh_port_state: &ProbeState::Ok {
                 value: PortStatus::Open,
             },
             ssh_auth_state: &ProbeState::Missing {
-                reason: "auth-probe-not-configured".to_string(),
+                reason: "auth-probe-not-configured".to_owned(),
             },
             authoritative_target_present: true,
             known_hosts_state: None,
@@ -25380,7 +25372,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
         assert!(
             readiness
                 .reason_codes
-                .contains(&"ssh-auth-not-ready".to_string())
+                .contains(&"ssh-auth-not-ready".to_owned())
         );
     }
 
@@ -25390,19 +25382,19 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
             platform: VmGuestPlatform::Windows,
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Fallback {
-                value: "192.168.64.14".to_string(),
-                reason: "utmctl-ip-address-unavailable".to_string(),
+                value: "192.168.64.14".to_owned(),
+                reason: "utmctl-ip-address-unavailable".to_owned(),
             },
             ssh_port_state: &ProbeState::Fallback {
                 value: PortStatus::TimedOut,
-                reason: "Operation timed out".to_string(),
+                reason: "Operation timed out".to_owned(),
             },
             ssh_auth_state: &ProbeState::Missing {
-                reason: "ssh-port-status=closed".to_string(),
+                reason: "ssh-port-status=closed".to_owned(),
             },
             authoritative_target_present: true,
             known_hosts_state: Some(&ProbeState::Missing {
-                reason: "known-hosts-entry-missing".to_string(),
+                reason: "known-hosts-entry-missing".to_owned(),
             }),
             windows_ssh_probe_state: Some(&ProbeState::Ok {
                 value: WindowsSshReadinessProbe {
@@ -25422,11 +25414,11 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
         assert_eq!(
             readiness.reason_codes,
             vec![
-                "live-ip-not-authoritative".to_string(),
-                "guest-agent-not-ready".to_string(),
-                "ssh-firewall-not-open".to_string(),
-                "ssh-listener-not-ready".to_string(),
-                "ssh-host-key-not-ready".to_string(),
+                "live-ip-not-authoritative".to_owned(),
+                "guest-agent-not-ready".to_owned(),
+                "ssh-firewall-not-open".to_owned(),
+                "ssh-listener-not-ready".to_owned(),
+                "ssh-host-key-not-ready".to_owned(),
             ]
         );
     }
@@ -25437,17 +25429,17 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
             platform: VmGuestPlatform::Windows,
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Ok {
-                value: "192.168.64.14".to_string(),
+                value: "192.168.64.14".to_owned(),
             },
             ssh_port_state: &ProbeState::Ok {
                 value: PortStatus::Open,
             },
             ssh_auth_state: &ProbeState::Error {
-                reason: "timed out after 15 seconds".to_string(),
+                reason: "timed out after 15 seconds".to_owned(),
             },
             authoritative_target_present: true,
             known_hosts_state: Some(&ProbeState::Missing {
-                reason: "known-hosts-entry-missing".to_string(),
+                reason: "known-hosts-entry-missing".to_owned(),
             }),
             windows_ssh_probe_state: Some(&ProbeState::Ok {
                 value: WindowsSshReadinessProbe {
@@ -25462,8 +25454,8 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
         assert_eq!(
             readiness.reason_codes,
             vec![
-                "ssh-host-key-not-ready".to_string(),
-                "ssh-auth-timeout".to_string(),
+                "ssh-host-key-not-ready".to_owned(),
+                "ssh-auth-timeout".to_owned(),
             ]
         );
     }
@@ -25696,8 +25688,8 @@ REPO_REF=\"HEAD\"\n",
         let summary =
             execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
                 profile_path: profile_path.clone(),
-                expected_backend: Some("linux-wireguard-userspace-shared".to_string()),
-                expected_source_mode: Some("local-head".to_string()),
+                expected_backend: Some("linux-wireguard-userspace-shared".to_owned()),
+                expected_source_mode: Some("local-head".to_owned()),
                 require_five_node: true,
             })
             .expect("validation should pass");
@@ -25854,7 +25846,7 @@ live_lan_toggle\thard\tfail\t1\t{}/logs/live_lan_toggle.log\trun LAN access togg
     fn resolve_iteration_source_selection_enforces_local_head_and_clean_tree() {
         let resolved = resolve_iteration_source_selection(None, None, false, true, false)
             .expect("local-head guard should resolve");
-        assert_eq!(resolved, ("local-head".to_string(), None));
+        assert_eq!(resolved, ("local-head".to_owned(), None));
 
         let resolved = resolve_iteration_source_selection(
             Some("working-tree"),
@@ -25864,12 +25856,12 @@ live_lan_toggle\thard\tfail\t1\t{}/logs/live_lan_toggle.log\trun LAN access togg
             false,
         )
         .expect("working-tree selection should ignore repo ref");
-        assert_eq!(resolved, ("working-tree".to_string(), None));
+        assert_eq!(resolved, ("working-tree".to_owned(), None));
 
         let resolved =
             resolve_iteration_source_selection(Some("ref"), Some("HEAD"), false, false, false)
                 .expect("ref selection should preserve repo ref");
-        assert_eq!(resolved, ("ref".to_string(), Some("HEAD".to_string())));
+        assert_eq!(resolved, ("ref".to_owned(), Some("HEAD".to_owned())));
 
         let err =
             resolve_iteration_source_selection(Some("working-tree"), None, false, true, false)
@@ -26193,7 +26185,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             "client-1",
             "client-1|192.168.1.20:51820|abcd;exit-1|192.168.1.10:51820|def0",
             "client-1|exit-1;exit-1|client-1",
-            Some("exit-1".to_string()),
+            Some("exit-1".to_owned()),
         )
         .expect("env should build");
         assert!(env.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-1\""));
@@ -26552,8 +26544,8 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 profile_path: profile_path.clone(),
                 script_path: script_path.clone(),
                 inventory_path: None,
-                source_mode: "archive".to_string(),
-                repo_ref: Some("HEAD".to_string()),
+                source_mode: "archive".to_owned(),
+                repo_ref: Some("HEAD".to_owned()),
                 require_same_network: Some(true),
                 dry_run: Some(false),
                 max_parallel_node_workers: None,
@@ -26619,7 +26611,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             script_path.as_path(),
             None,
         );
-        manifest.git.git_commit = "0000000000000000000000000000000000000000".to_string();
+        manifest.git.git_commit = "0000000000000000000000000000000000000000".to_owned();
         write_setup_only_report_state(report_dir.as_path(), &manifest);
 
         let err = super::resolve_run_setup_reuse(
@@ -26885,26 +26877,26 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     #[test]
     fn append_unique_stage_outcomes_collects_only_new_entries() {
         let mut outcomes = vec![VmLabStageOutcome {
-            stage: "discover_local_utm".to_string(),
+            stage: "discover_local_utm".to_owned(),
             status: VmLabStageStatus::Pass,
-            summary: "initial discovery passed".to_string(),
-            artifacts: vec!["/tmp/discover.json".to_string()],
+            summary: "initial discovery passed".to_owned(),
+            artifacts: vec!["/tmp/discover.json".to_owned()],
         }];
 
         let appended = append_unique_stage_outcomes_collect_new(
             &mut outcomes,
             &[
                 VmLabStageOutcome {
-                    stage: "discover_local_utm".to_string(),
+                    stage: "discover_local_utm".to_owned(),
                     status: VmLabStageStatus::Pass,
-                    summary: "duplicate".to_string(),
+                    summary: "duplicate".to_owned(),
                     artifacts: Vec::new(),
                 },
                 VmLabStageOutcome {
-                    stage: "vm_lab_setup_live_lab".to_string(),
+                    stage: "vm_lab_setup_live_lab".to_owned(),
                     status: VmLabStageStatus::Fail,
-                    summary: "setup failed".to_string(),
-                    artifacts: vec!["/tmp/setup.json".to_string()],
+                    summary: "setup failed".to_owned(),
+                    artifacts: vec!["/tmp/setup.json".to_owned()],
                 },
             ],
         );
@@ -26920,9 +26912,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let rendered = render_vm_lab_progress_outcome_line(
             "vm-lab-orchestrate-live-lab",
             &VmLabStageOutcome {
-                stage: "vm_lab_setup_live_lab".to_string(),
+                stage: "vm_lab_setup_live_lab".to_owned(),
                 status: VmLabStageStatus::Pass,
-                summary: "setup completed".to_string(),
+                summary: "setup completed".to_owned(),
                 artifacts: Vec::new(),
             },
         );
@@ -27046,20 +27038,20 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn build_release_gate_completeness_report_marks_subset_runs_not_requested() {
         let records = vec![
             LiveLabStageRecord {
-                name: "live_role_switch_matrix".to_string(),
-                severity: "hard".to_string(),
-                status: "pass".to_string(),
-                rc: "0".to_string(),
+                name: "live_role_switch_matrix".to_owned(),
+                severity: "hard".to_owned(),
+                status: "pass".to_owned(),
+                rc: "0".to_owned(),
                 log_path: PathBuf::from("/tmp/live_role_switch_matrix.log"),
-                description: "role switch".to_string(),
+                description: "role switch".to_owned(),
             },
             LiveLabStageRecord {
-                name: "live_two_hop".to_string(),
-                severity: "hard".to_string(),
-                status: "pass".to_string(),
-                rc: "0".to_string(),
+                name: "live_two_hop".to_owned(),
+                severity: "hard".to_owned(),
+                status: "pass".to_owned(),
+                rc: "0".to_owned(),
                 log_path: PathBuf::from("/tmp/live_two_hop.log"),
-                description: "two hop".to_string(),
+                description: "two hop".to_owned(),
             },
         ];
 
@@ -27076,12 +27068,12 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let report_dir = write_temp_report_dir();
         let report = super::build_release_gate_completeness_report(
             &[LiveLabStageRecord {
-                name: "live_role_switch_matrix".to_string(),
-                severity: "hard".to_string(),
-                status: "pass".to_string(),
-                rc: "0".to_string(),
+                name: "live_role_switch_matrix".to_owned(),
+                severity: "hard".to_owned(),
+                status: "pass".to_owned(),
+                rc: "0".to_owned(),
                 log_path: PathBuf::from("/tmp/live_role_switch_matrix.log"),
-                description: "role switch".to_string(),
+                description: "role switch".to_owned(),
             }],
             true,
         );
@@ -27113,10 +27105,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let records = super::FULL_RELEASE_GATE_REQUIRED_STAGES
             .iter()
             .map(|stage| LiveLabStageRecord {
-                name: (*stage).to_string(),
-                severity: "hard".to_string(),
-                status: "pass".to_string(),
-                rc: "0".to_string(),
+                name: (*stage).to_owned(),
+                severity: "hard".to_owned(),
+                status: "pass".to_owned(),
+                rc: "0".to_owned(),
                 log_path: PathBuf::from(format!("/tmp/{stage}.log")),
                 description: format!("{stage} stage"),
             })
@@ -28265,7 +28257,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         super::LiveLabRunInputs {
             profile_path: PathBuf::from("/tmp/profile.env"),
             report_dir: PathBuf::from("/tmp/report"),
-            source_mode: "local-head".to_string(),
+            source_mode: "local-head".to_owned(),
             repo_ref: None,
             timeout: Duration::from_secs(60),
             dry_run: false,
@@ -28427,12 +28419,12 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             args.first().map(String::as_str),
             Some("/usr/local/bin/orchestrator.sh")
         );
-        assert!(args.contains(&"--profile".to_string()));
-        assert!(args.contains(&"/tmp/profile.env".to_string()));
-        assert!(args.contains(&"--report-dir".to_string()));
-        assert!(args.contains(&"/tmp/report".to_string()));
-        assert!(args.contains(&"--source-mode".to_string()));
-        assert!(args.contains(&"local-head".to_string()));
+        assert!(args.contains(&"--profile".to_owned()));
+        assert!(args.contains(&"/tmp/profile.env".to_owned()));
+        assert!(args.contains(&"--report-dir".to_owned()));
+        assert!(args.contains(&"/tmp/report".to_owned()));
+        assert!(args.contains(&"--source-mode".to_owned()));
+        assert!(args.contains(&"local-head".to_owned()));
         // No optional flags should appear when defaults are used.
         for forbidden in [
             "--dry-run",
@@ -28444,7 +28436,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             "--repo-ref",
         ] {
             assert!(
-                !args.contains(&forbidden.to_string()),
+                !args.contains(&forbidden.to_owned()),
                 "default-build args must omit {forbidden}: {args:?}"
             );
         }
@@ -28469,7 +28461,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             "--skip-cross-network",
         ] {
             assert!(
-                args.contains(&required.to_string()),
+                args.contains(&required.to_owned()),
                 "all-skip args must include {required}: {args:?}"
             );
         }
@@ -28488,15 +28480,15 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         inputs.skip_setup = false;
         inputs.continue_from_setup = true;
         let args = collect_command_args(&orchestrator.build_command(&inputs));
-        assert!(args.contains(&"--skip-setup".to_string()));
-        assert!(args.contains(&"--preserve-report-state".to_string()));
+        assert!(args.contains(&"--skip-setup".to_owned()));
+        assert!(args.contains(&"--preserve-report-state".to_owned()));
     }
 
     #[test]
     fn linux_bash_orchestrator_emits_repo_ref_when_set() {
         let orchestrator = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
         let mut inputs = baseline_live_lab_run_inputs();
-        inputs.repo_ref = Some("v1.2.3".to_string());
+        inputs.repo_ref = Some("v1.2.3".to_owned());
         let args = collect_command_args(&orchestrator.build_command(&inputs));
         // Must appear as the pair "--repo-ref" "v1.2.3", not stuck together.
         let repo_index = args
@@ -28765,10 +28757,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             } => {
                 assert_eq!(script_basename, "Install-RustyNetWindowsService.ps1");
                 assert!(helper_label.contains("install"));
-                assert_eq!(
-                    args,
-                    vec!["-ServiceName".to_string(), "RustyNet".to_string()]
-                );
+                assert_eq!(args, vec!["-ServiceName".to_owned(), "RustyNet".to_owned()]);
             }
             other => panic!("expected HelperScript, got {other:?}"),
         }
@@ -28792,9 +28781,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                     );
                     assert!(combined.contains("RustyNet"));
                     assert!(argv[0] == "powershell.exe");
-                    assert!(argv.contains(&"-NoProfile".to_string()));
-                    assert!(argv.contains(&"-ExecutionPolicy".to_string()));
-                    assert!(argv.contains(&"Bypass".to_string()));
+                    assert!(argv.contains(&"-NoProfile".to_owned()));
+                    assert!(argv.contains(&"-ExecutionPolicy".to_owned()));
+                    assert!(argv.contains(&"Bypass".to_owned()));
                 }
                 other => panic!("expected Argv for {fragment}, got {other:?}"),
             }
@@ -28888,9 +28877,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .build_invocation(
                 "debian@192.168.64.10",
                 &[
-                    "systemctl".to_string(),
-                    "is-active".to_string(),
-                    "rustynetd".to_string(),
+                    "systemctl".to_owned(),
+                    "is-active".to_owned(),
+                    "rustynetd".to_owned(),
                 ],
             )
             .expect("posix invocation must build");
@@ -28907,7 +28896,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn posix_remote_exec_rejects_empty_target_and_argv() {
         let exec = super::PosixRemoteExec;
         let err1 = exec
-            .build_invocation("", &["x".to_string()])
+            .build_invocation("", &["x".to_owned()])
             .expect_err("empty target must reject");
         assert!(err1.contains("ssh_target"));
         let err2 = exec
@@ -28922,7 +28911,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let err = exec
             .build_invocation(
                 "debian@host",
-                &["bash".to_string(), "command\nwith\nnewlines".to_string()],
+                &["bash".to_owned(), "command\nwith\nnewlines".to_owned()],
             )
             .expect_err("control bytes must reject");
         assert!(
@@ -28939,9 +28928,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .build_invocation(
                 "windows@192.168.64.14",
                 &[
-                    r"C:\Program Files\RustyNet\rustynetd.exe".to_string(),
-                    "windows-runtime-acls-check".to_string(),
-                    "--no-fail-on-drift".to_string(),
+                    r"C:\Program Files\RustyNet\rustynetd.exe".to_owned(),
+                    "windows-runtime-acls-check".to_owned(),
+                    "--no-fail-on-drift".to_owned(),
                 ],
             )
             .expect("windows invocation must build");
@@ -28972,7 +28961,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let inv = exec
             .build_invocation(
                 "windows@host",
-                &["cmd.exe".to_string(), "O'Connor".to_string()],
+                &["cmd.exe".to_owned(), "O'Connor".to_owned()],
             )
             .expect("must build");
         match inv {
@@ -28997,7 +28986,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         ] {
             let label = stub.platform_label();
             let err = stub
-                .build_invocation("user@host", &["cmd".to_string()])
+                .build_invocation("user@host", &["cmd".to_owned()])
                 .expect_err(&format!("{label} stub must reject"));
             assert!(err.contains(label), "blocker must name platform: {err}");
         }
@@ -29107,9 +29096,9 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             assert_eq!(
                 argv,
                 vec![
-                    "/usr/local/bin/rustynetd".to_string(),
-                    expected_subcommand.to_string(),
-                    "--no-fail-on-drift".to_string(),
+                    "/usr/local/bin/rustynetd".to_owned(),
+                    expected_subcommand.to_owned(),
+                    "--no-fail-on-drift".to_owned(),
                 ]
             );
         }
@@ -29199,7 +29188,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         super::LiveLabRunInputs {
             profile_path: PathBuf::from("/tmp/profile.env"),
             report_dir: PathBuf::from("/tmp/report"),
-            source_mode: "local-head".to_string(),
+            source_mode: "local-head".to_owned(),
             repo_ref: None,
             timeout: Duration::from_secs(60),
             dry_run: false,
@@ -29343,8 +29332,8 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         // Sanity: the expected args are the same as the bash impl
         // would emit on its own — the parity contract.
         assert!(
-            expected_args.contains(&"--profile".to_string())
-                && expected_args.contains(&"--report-dir".to_string()),
+            expected_args.contains(&"--profile".to_owned())
+                && expected_args.contains(&"--report-dir".to_owned()),
             "bash orchestrator must still build the canonical argv shape: {expected_args:?}"
         );
     }
@@ -29464,7 +29453,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         std::fs::write(identity.as_path(), b"fake-key").expect("write key");
         let config = super::VmLabValidateWindowsSecurityConfig {
             inventory_path: inventory,
-            windows_vm: "windows-utm-1".to_string(),
+            windows_vm: "windows-utm-1".to_owned(),
             ssh_identity_file: identity,
             known_hosts_path: None,
             ssh_port: 22,
@@ -29523,7 +29512,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         std::fs::write(identity.as_path(), b"fake-key").expect("write key");
         let config = super::VmLabDistributeWindowsStateConfig {
             inventory_path: inventory,
-            windows_vm: "windows-utm-1".to_string(),
+            windows_vm: "windows-utm-1".to_owned(),
             ssh_identity_file: identity,
             known_hosts_path: None,
             report_dir: temp.path().to_path_buf(),
@@ -29569,7 +29558,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         std::fs::write(bundle_path.as_path(), b"fake-bundle").expect("write bundle");
         let config = super::VmLabDistributeWindowsStateConfig {
             inventory_path: inventory,
-            windows_vm: "windows-utm-1".to_string(),
+            windows_vm: "windows-utm-1".to_owned(),
             ssh_identity_file: identity,
             known_hosts_path: None,
             report_dir: report_dir.clone(),
@@ -29634,7 +29623,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         std::fs::write(identity.as_path(), b"fake-key").expect("write key");
         let config = super::VmLabPullWindowsStateFromLinuxExitConfig {
             inventory_path: inventory,
-            linux_exit_alias: "linux-exit".to_string(),
+            linux_exit_alias: "linux-exit".to_owned(),
             ssh_identity_file: identity,
             known_hosts_path: None,
             dest_dir: dest_dir.clone(),
@@ -29708,12 +29697,12 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             super::LINUX_RUSTYNETD_PATH,
             "linux-mesh-status-check",
             &[
-                "--state-path".to_string(),
-                "/var/lib/rustynet/rustynetd.state".to_string(),
-                "--expected-peer-id".to_string(),
-                "peer-a".to_string(),
-                "--max-age-seconds".to_string(),
-                "300".to_string(),
+                "--state-path".to_owned(),
+                "/var/lib/rustynet/rustynetd.state".to_owned(),
+                "--expected-peer-id".to_owned(),
+                "peer-a".to_owned(),
+                "--max-age-seconds".to_owned(),
+                "300".to_owned(),
             ],
         )
         .expect("well-formed extras must build");
@@ -29730,7 +29719,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let err = super::build_linux_daemon_check_invocation(
             super::LINUX_RUSTYNETD_PATH,
             "linux-mesh-status-check",
-            &["--state-path".to_string(), "/var/lib\nrm -rf /".to_string()],
+            &["--state-path".to_owned(), "/var/lib\nrm -rf /".to_owned()],
         )
         .expect_err("control chars in extras must reject");
         assert!(
@@ -29743,21 +29732,21 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn build_linux_mesh_status_extra_args_emits_canonical_arg_order() {
         let overrides = super::MeshStatusOverrides {
             state_path: Some(std::path::PathBuf::from("/tmp/state")),
-            expected_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
+            expected_peer_ids: vec!["peer-a".to_owned(), "peer-b".to_owned()],
             max_age_seconds: Some(600),
         };
         let extras = super::build_linux_mesh_status_extra_args(&overrides);
         assert_eq!(
             extras,
             vec![
-                "--state-path".to_string(),
-                "/tmp/state".to_string(),
-                "--expected-peer-id".to_string(),
-                "peer-a".to_string(),
-                "--expected-peer-id".to_string(),
-                "peer-b".to_string(),
-                "--max-age-seconds".to_string(),
-                "600".to_string(),
+                "--state-path".to_owned(),
+                "/tmp/state".to_owned(),
+                "--expected-peer-id".to_owned(),
+                "peer-a".to_owned(),
+                "--expected-peer-id".to_owned(),
+                "peer-b".to_owned(),
+                "--max-age-seconds".to_owned(),
+                "600".to_owned(),
             ]
         );
     }
@@ -30011,7 +30000,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .expect("write inventory");
         let identity = temp.path().join("id_ed25519");
         std::fs::write(identity.as_path(), b"fake-key").expect("write key");
-        let aliases = vec!["debian-utm-1".to_string(), "debian-utm-2".to_string()];
+        let aliases = vec!["debian-utm-1".to_owned(), "debian-utm-2".to_owned()];
         let outcomes = super::run_linux_daemon_validators_for_aliases(
             aliases.as_slice(),
             inventory.as_path(),
@@ -30111,7 +30100,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         std::fs::write(identity.as_path(), b"fake-key").expect("write key");
         let config = super::VmLabValidateLinuxSecurityConfig {
             inventory_path: inventory,
-            linux_vm: "debian-utm-1".to_string(),
+            linux_vm: "debian-utm-1".to_owned(),
             ssh_identity_file: identity,
             known_hosts_path: None,
             report_dir: report_dir.clone(),
@@ -30175,7 +30164,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         std::fs::write(identity.as_path(), b"fake-key").expect("write key");
         let config = super::VmLabPullWindowsStateFromLinuxExitConfig {
             inventory_path: inventory,
-            linux_exit_alias: "windows-utm-1".to_string(),
+            linux_exit_alias: "windows-utm-1".to_owned(),
             ssh_identity_file: identity,
             known_hosts_path: None,
             dest_dir: temp.path().join("staging"),
@@ -30229,8 +30218,8 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let script = super::build_windows_security_check_invocation(
             "windows-authenticode-check",
             &[
-                "--binary-path".to_string(),
-                "C:\\path\\with'apostrophe\\rustynetd.exe".to_string(),
+                "--binary-path".to_owned(),
+                "C:\\path\\with'apostrophe\\rustynetd.exe".to_owned(),
             ],
         )
         .expect("apostrophe arg must quote, not break out");
@@ -30253,7 +30242,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn build_windows_security_check_invocation_rejects_control_chars_in_args() {
         let err = super::build_windows_security_check_invocation(
             "windows-runtime-acls-check",
-            &["--binary-path".to_string(), "evil\nrm -rf".to_string()],
+            &["--binary-path".to_owned(), "evil\nrm -rf".to_owned()],
         )
         .expect_err("control-char arg must be rejected");
         assert!(
@@ -30266,7 +30255,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn build_windows_security_check_invocation_passes_long_flag_unquoted() {
         let script = super::build_windows_security_check_invocation(
             "windows-authenticode-check",
-            &["--no-fail-on-drift".to_string()],
+            &["--no-fail-on-drift".to_owned()],
         )
         .expect("well-formed long flag must build");
         // Long flag is emitted unquoted (no surrounding apostrophes around the
@@ -30281,7 +30270,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn build_windows_security_check_invocation_quotes_short_or_value_args() {
         let script = super::build_windows_security_check_invocation(
             "windows-authenticode-check",
-            &["positional-value".to_string()],
+            &["positional-value".to_owned()],
         )
         .expect("non-flag arg must quote");
         assert!(
@@ -30485,8 +30474,8 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     #[test]
     fn legacy_role_flags_deprecation_warnings_silent_when_node_set() {
         let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.exit_vm = Some("a".to_string());
-        cfg.client_vm = Some("b".to_string());
+        cfg.exit_vm = Some("a".to_owned());
+        cfg.client_vm = Some("b".to_owned());
         cfg.node_assignments =
             vec![super::orchestrator::role_assignment::parse_node_role_arg("a:exit").unwrap()];
         assert!(super::legacy_role_flags_deprecation_warnings(&cfg).is_empty());
@@ -30495,8 +30484,8 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     #[test]
     fn legacy_role_flags_deprecation_warnings_silent_when_legacy_flag_set() {
         let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.exit_vm = Some("a".to_string());
-        cfg.client_vm = Some("b".to_string());
+        cfg.exit_vm = Some("a".to_owned());
+        cfg.client_vm = Some("b".to_owned());
         cfg.legacy_bash_orchestrator = true;
         assert!(super::legacy_role_flags_deprecation_warnings(&cfg).is_empty());
     }
@@ -30510,8 +30499,8 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     #[test]
     fn legacy_role_flags_deprecation_warnings_fires_on_legacy_flags_only() {
         let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.exit_vm = Some("a".to_string());
-        cfg.client_vm = Some("b".to_string());
+        cfg.exit_vm = Some("a".to_owned());
+        cfg.client_vm = Some("b".to_owned());
         let warnings = super::legacy_role_flags_deprecation_warnings(&cfg);
         assert_eq!(
             warnings.len(),
@@ -30533,7 +30522,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     #[test]
     fn legacy_role_flags_deprecation_warnings_fires_on_windows_vm_only() {
         let mut cfg = empty_orchestrate_live_lab_config();
-        cfg.windows_vm = Some("win".to_string());
+        cfg.windows_vm = Some("win".to_owned());
         let warnings = super::legacy_role_flags_deprecation_warnings(&cfg);
         assert_eq!(warnings.len(), 2);
     }

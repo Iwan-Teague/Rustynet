@@ -62,7 +62,7 @@ const WINDOWS_BUILD_RELEASE_REPORT_PATH: &str =
 pub fn encode_ps_command(script: &str) -> Result<String, AdapterError> {
     if script.contains('\0') {
         return Err(AdapterError::Protocol {
-            message: "PowerShell script contains NUL byte".to_string(),
+            message: "PowerShell script contains NUL byte".to_owned(),
         });
     }
     let mut bytes = Vec::with_capacity(script.len() * 2);
@@ -222,7 +222,7 @@ pub fn install_daemon(
 
     Ok(InstallReport {
         daemon_path: WINDOWS_RUSTYNETD_PATH.into(),
-        service_name: WINDOWS_SERVICE_NAME.to_string(),
+        service_name: WINDOWS_SERVICE_NAME.to_owned(),
     })
 }
 
@@ -478,7 +478,7 @@ fn windows_bootstrap_native_helper_fragment() -> String {
          if ($null -eq $exitCode) { $exitCode = 0 }; \
          [pscustomobject]@{ ExitCode = $exitCode; Output = $output } \
      }"
-    .to_string()
+    .to_owned()
 }
 
 /// Wait for the rustynet0 WireGuard adapter to appear with an IPv4 address.
@@ -503,8 +503,7 @@ fn windows_tunnel_ip_readiness_fragment() -> Result<String, AdapterError> {
              }; \
              Start-Sleep -Seconds 2 \
          }; \
-         if (-not $wnRdy) { throw 'rustynet WireGuard adapter did not get an IPv4 address within 90s' }"
-        .to_string(),
+         if (-not $wnRdy) { throw 'rustynet WireGuard adapter did not get an IPv4 address within 90s' }".to_owned(),
     )
 }
 
@@ -738,7 +737,7 @@ fn validate_windows_path(path: &str) -> Result<(), AdapterError> {
     }
     if path.is_empty() {
         return Err(AdapterError::Protocol {
-            message: "Windows path argument must not be empty".to_string(),
+            message: "Windows path argument must not be empty".to_owned(),
         });
     }
     Ok(())

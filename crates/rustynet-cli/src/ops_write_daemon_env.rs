@@ -29,7 +29,7 @@ pub fn execute_ops_write_daemon_env(
         } else {
             "client"
         };
-        config.insert("NODE_ROLE".to_string(), default_role.to_string());
+        config.insert("NODE_ROLE".to_owned(), default_role.to_owned());
     }
 
     // Validate NODE_ROLE
@@ -39,13 +39,13 @@ pub fn execute_ops_write_daemon_env(
             "admin" | "client" | "blind_exit" => role.clone(),
             _ => {
                 eprintln!("[warn] Invalid NODE_ROLE='{role}', defaulting to 'client'.");
-                "client".to_string()
+                "client".to_owned()
             }
         }
     };
     // Re-insert normalized role if it was invalid
     if config.get("NODE_ROLE").unwrap() != &node_role {
-        config.insert("NODE_ROLE".to_string(), node_role.clone());
+        config.insert("NODE_ROLE".to_owned(), node_role.clone());
     }
 
     // enforce_role_policy_defaults logic
@@ -58,14 +58,14 @@ pub fn execute_ops_write_daemon_env(
                         "[warn] Launch profile '{profile}' is admin-only; forcing 'quick-connect' for client role."
                     );
                     config.insert(
-                        "DEFAULT_LAUNCH_PROFILE".to_string(),
-                        "quick-connect".to_string(),
+                        "DEFAULT_LAUNCH_PROFILE".to_owned(),
+                        "quick-connect".to_owned(),
                     );
                 }
                 _ => {}
             }
         }
-        config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
+        config.insert("AUTO_PORT_FORWARD_EXIT".to_owned(), "0".to_owned());
     } else if node_role == "blind_exit" {
         // Force settings for blind_exit
         if config
@@ -75,26 +75,26 @@ pub fn execute_ops_write_daemon_env(
         {
             eprintln!("[warn] blind_exit role enforces default launch profile 'quick-exit-node'.");
             config.insert(
-                "DEFAULT_LAUNCH_PROFILE".to_string(),
-                "quick-exit-node".to_string(),
+                "DEFAULT_LAUNCH_PROFILE".to_owned(),
+                "quick-exit-node".to_owned(),
             );
         }
-        config.insert("EXIT_CHAIN_HOPS".to_string(), "1".to_string());
+        config.insert("EXIT_CHAIN_HOPS".to_owned(), "1".to_owned());
         config.remove("EXIT_CHAIN_ENTRY_NODE_ID");
         config.remove("EXIT_CHAIN_FINAL_NODE_ID");
-        config.insert("AUTO_LAUNCH_ON_START".to_string(), "1".to_string());
+        config.insert("AUTO_LAUNCH_ON_START".to_owned(), "1".to_owned());
         config.remove("AUTO_LAUNCH_EXIT_NODE_ID");
-        config.insert("AUTO_LAUNCH_LAN_MODE".to_string(), "off".to_string());
-        config.insert("FAIL_CLOSED_SSH_ALLOW".to_string(), "0".to_string());
+        config.insert("AUTO_LAUNCH_LAN_MODE".to_owned(), "off".to_owned());
+        config.insert("FAIL_CLOSED_SSH_ALLOW".to_owned(), "0".to_owned());
         config.remove("FAIL_CLOSED_SSH_ALLOW_CIDRS");
     }
 
     // Manual peer override is disabled
-    config.insert("MANUAL_PEER_OVERRIDE".to_string(), "0".to_string());
+    config.insert("MANUAL_PEER_OVERRIDE".to_owned(), "0".to_owned());
 
     // enforce_backend_mode
     if !config.contains_key("BACKEND_MODE") {
-        config.insert("BACKEND_MODE".to_string(), "linux-wireguard".to_string());
+        config.insert("BACKEND_MODE".to_owned(), "linux-wireguard".to_owned());
     }
 
     // enforce_auto_tunnel_policy
@@ -106,7 +106,7 @@ pub fn execute_ops_write_daemon_env(
         eprintln!(
             "[warn] Unsigned/manual tunnel assignment is not allowed by default; forcing AUTO_TUNNEL_ENFORCE=1."
         );
-        config.insert("AUTO_TUNNEL_ENFORCE".to_string(), "1".to_string());
+        config.insert("AUTO_TUNNEL_ENFORCE".to_owned(), "1".to_owned());
     }
 
     // enforce_fail_closed_ssh_policy
@@ -115,7 +115,7 @@ pub fn execute_ops_write_daemon_env(
         .map(std::string::String::as_str)
         != Some("1")
     {
-        config.insert("FAIL_CLOSED_SSH_ALLOW".to_string(), "0".to_string());
+        config.insert("FAIL_CLOSED_SSH_ALLOW".to_owned(), "0".to_owned());
         config.remove("FAIL_CLOSED_SSH_ALLOW_CIDRS");
     } else if config
         .get("FAIL_CLOSED_SSH_ALLOW_CIDRS")
@@ -123,7 +123,7 @@ pub fn execute_ops_write_daemon_env(
         .is_empty()
     {
         return Err(
-            "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1".to_string(),
+            "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1".to_owned(),
         );
     }
 
@@ -148,7 +148,7 @@ pub fn execute_ops_write_daemon_env(
         .map(std::string::String::as_str)
         != Some("1")
     {
-        config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
+        config.insert("AUTO_PORT_FORWARD_EXIT".to_owned(), "0".to_owned());
     } else {
         // Check lease secs
         if let Some(lease) = config.get("AUTO_PORT_FORWARD_LEASE_SECS") {
@@ -169,13 +169,13 @@ pub fn execute_ops_write_daemon_env(
             eprintln!(
                 "[warn] Auto port-forward applies only to exit-serving roles. Forcing AUTO_PORT_FORWARD_EXIT=0 for role '{node_role}'."
             );
-            config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
+            config.insert("AUTO_PORT_FORWARD_EXIT".to_owned(), "0".to_owned());
         }
     }
 
     // 3. Override Egress Interface if provided
     if let Some(egress) = egress_interface {
-        config.insert("EGRESS_INTERFACE".to_string(), egress);
+        config.insert("EGRESS_INTERFACE".to_owned(), egress);
     }
 
     // 4. Invoke the single hardened install-systemd path with child-local env overrides.
@@ -195,15 +195,15 @@ pub fn execute_ops_write_daemon_env(
         .output()
         .map_err(|e| format!("failed to execute rustynet ops install-systemd: {e}"))?;
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if stdout.is_empty() {
-            Ok("systemd environment written and install-systemd completed".to_string())
+            Ok("systemd environment written and install-systemd completed".to_owned())
         } else {
             Ok(stdout)
         }
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let detail = if !stderr.is_empty() {
             stderr
         } else if !stdout.is_empty() {

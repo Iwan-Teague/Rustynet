@@ -185,7 +185,7 @@ impl RelaySessionTokenIssuer for PreissuedRelaySessionTokenIssuer {
             entries.push(path);
             if entries.len() > PREISSUED_RELAY_TOKEN_MAX_FILES {
                 return Err(RelayClientError::TokenSigning(
-                    "relay token spool contains too many token artifacts".to_string(),
+                    "relay token spool contains too many token artifacts".to_owned(),
                 ));
             }
         }
@@ -221,7 +221,7 @@ impl RelaySessionTokenIssuer for PreissuedRelaySessionTokenIssuer {
         }
 
         Err(RelayClientError::TokenSigning(
-            "no matching preissued relay session token available".to_string(),
+            "no matching preissued relay session token available".to_owned(),
         ))
     }
 }
@@ -515,8 +515,8 @@ impl RelayClient {
 
         // Build hello message
         let hello = RelayHello {
-            node_id: self.node_id.as_str().to_string(),
-            peer_node_id: peer_node_id.as_str().to_string(),
+            node_id: self.node_id.as_str().to_owned(),
+            peer_node_id: peer_node_id.as_str().to_owned(),
             session_token: token,
         };
 
@@ -532,7 +532,7 @@ impl RelayClient {
             Ok(ack) => {
                 if ack.allocated_port == relay_addr.port() {
                     return Err(RelayClientError::InvalidResponse(
-                        "relay ack allocated control port".to_string(),
+                        "relay ack allocated control port".to_owned(),
                     ));
                 }
                 let now = Instant::now();
@@ -825,19 +825,19 @@ fn validate_issued_relay_session_token(
         ))
     };
     if token.node_id != node_id.as_str() {
-        return Err(invalid("node_id mismatch".to_string()));
+        return Err(invalid("node_id mismatch".to_owned()));
     }
     if token.peer_node_id != peer_node_id.as_str() {
-        return Err(invalid("peer_node_id mismatch".to_string()));
+        return Err(invalid("peer_node_id mismatch".to_owned()));
     }
     if token.relay_id != relay_id {
-        return Err(invalid("relay_id mismatch".to_string()));
+        return Err(invalid("relay_id mismatch".to_owned()));
     }
     if token.scope != RELAY_TOKEN_SCOPE {
-        return Err(invalid("scope mismatch".to_string()));
+        return Err(invalid("scope mismatch".to_owned()));
     }
     if token.nonce == [0u8; 16] {
-        return Err(invalid("nonce must not be all zero".to_string()));
+        return Err(invalid("nonce must not be all zero".to_owned()));
     }
     let ttl_secs = token.ttl_secs();
     if ttl_secs == 0 || ttl_secs > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
@@ -846,13 +846,13 @@ fn validate_issued_relay_session_token(
         )));
     }
     if ttl_secs > requested_ttl_secs {
-        return Err(invalid("ttl exceeds requested ttl".to_string()));
+        return Err(invalid("ttl exceeds requested ttl".to_owned()));
     }
     if token.expires_at_unix <= now_unix {
-        return Err(invalid("token already expired".to_string()));
+        return Err(invalid("token already expired".to_owned()));
     }
     if token.issued_at_unix > now_unix.saturating_add(RELAY_SESSION_TOKEN_CLIENT_CLOCK_SKEW_SECS) {
-        return Err(invalid("issued_at_unix too far in the future".to_string()));
+        return Err(invalid("issued_at_unix too far in the future".to_owned()));
     }
     Ok(())
 }
@@ -860,7 +860,7 @@ fn validate_issued_relay_session_token(
 fn validate_preissued_token_spool_dir(path: &Path) -> Result<(), RelayClientError> {
     if !path.is_absolute() {
         return Err(RelayClientError::TokenSigning(
-            "relay token spool dir must be absolute".to_string(),
+            "relay token spool dir must be absolute".to_owned(),
         ));
     }
     let metadata = fs::symlink_metadata(path).map_err(|err| {
@@ -868,7 +868,7 @@ fn validate_preissued_token_spool_dir(path: &Path) -> Result<(), RelayClientErro
     })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(RelayClientError::TokenSigning(
-            "relay token spool dir must be a real directory".to_string(),
+            "relay token spool dir must be a real directory".to_owned(),
         ));
     }
     #[cfg(unix)]
@@ -889,12 +889,12 @@ fn read_preissued_relay_token(path: &Path) -> Result<RelaySessionToken, RelayCli
     })?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(RelayClientError::TokenSigning(
-            "relay token artifact must be a regular file".to_string(),
+            "relay token artifact must be a regular file".to_owned(),
         ));
     }
     if metadata.len() == 0 || metadata.len() > PREISSUED_RELAY_TOKEN_MAX_BYTES {
         return Err(RelayClientError::TokenSigning(
-            "relay token artifact size is invalid".to_string(),
+            "relay token artifact size is invalid".to_owned(),
         ));
     }
     #[cfg(unix)]
@@ -985,22 +985,22 @@ fn serialize_relay_token(token: &RelaySessionToken) -> Vec<u8> {
 /// Parses a RelayHelloAck from wire format.
 fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
     if data.is_empty() {
-        return Err("empty response".to_string());
+        return Err("empty response".to_owned());
     }
 
     match data[0] {
         RELAY_HELLO_ACK_MSG_TYPE => {
             if data.len() < 19 {
-                return Err("ack message too short".to_string());
+                return Err("ack message too short".to_owned());
             }
             if data.len() != 19 {
-                return Err("ack message has trailing bytes".to_string());
+                return Err("ack message has trailing bytes".to_owned());
             }
             // Session ID (16 bytes)
             let session_id_bytes: [u8; 16] =
                 data[1..17].try_into().map_err(|_| "invalid session id")?;
             if session_id_bytes == [0u8; 16] {
-                return Err("ack session id must not be all zero".to_string());
+                return Err("ack session id must not be all zero".to_owned());
             }
             let session_id = SessionId::from(session_id_bytes);
 
@@ -1008,7 +1008,7 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
             let port_bytes: [u8; 2] = data[17..19].try_into().map_err(|_| "invalid port")?;
             let allocated_port = u16::from_be_bytes(port_bytes);
             if allocated_port == 0 {
-                return Err("ack allocated port must not be 0".to_string());
+                return Err("ack allocated port must not be 0".to_owned());
             }
 
             Ok(RelayHelloAck {
@@ -1020,7 +1020,7 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
             let reason = if data.len() > 1 {
                 String::from_utf8_lossy(&data[1..]).to_string()
             } else {
-                "unknown".to_string()
+                "unknown".to_owned()
             };
             Err(reason)
         }
@@ -1034,7 +1034,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_node_id(value: &str) -> NodeId {
-        NodeId::new(value.to_string()).expect("test node id should parse")
+        NodeId::new(value.to_owned()).expect("test node id should parse")
     }
 
     #[test]
@@ -1101,8 +1101,8 @@ mod tests {
         let token = RelaySessionToken::sign(&signing_key, "node-a", "node-b", [0xAA; 16], 60);
 
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
 
@@ -1297,7 +1297,7 @@ mod tests {
             _ttl_secs: u64,
         ) -> Result<RelaySessionToken, RelayClientError> {
             Err(RelayClientError::TokenSigning(
-                "issuer unavailable".to_string(),
+                "issuer unavailable".to_owned(),
             ))
         }
     }
@@ -1352,7 +1352,7 @@ mod tests {
             current_unix(),
             60,
         );
-        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        token.scope = RELAY_TOKEN_SCOPE.to_owned();
         let peer_id = test_node_id("peer-b");
         let mut client = RelayClient::new_with_token_issuer(
             test_node_id("node-a"),
@@ -1485,7 +1485,7 @@ mod tests {
             current_unix(),
             60,
         );
-        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        token.scope = RELAY_TOKEN_SCOPE.to_owned();
         let peer_id = test_node_id("peer-b");
         let mut client = RelayClient::new_with_token_issuer(
             test_node_id("node-a"),
@@ -1524,7 +1524,7 @@ mod tests {
             current_unix(),
             60,
         );
-        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        token.scope = RELAY_TOKEN_SCOPE.to_owned();
         let peer_id = test_node_id("peer-b");
         let mut client = RelayClient::new_with_token_issuer(
             test_node_id("node-a"),
@@ -1563,7 +1563,7 @@ mod tests {
             current_unix(),
             60,
         );
-        token.scope = "rustynet.relay.OTHER_SCOPE".to_string();
+        token.scope = "rustynet.relay.OTHER_SCOPE".to_owned();
         let peer_id = test_node_id("peer-b");
         let mut client = RelayClient::new_with_token_issuer(
             test_node_id("node-a"),
@@ -1604,7 +1604,7 @@ mod tests {
         );
         // Force the nonce to all zeros after signing.
         token.nonce = [0u8; 16];
-        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        token.scope = RELAY_TOKEN_SCOPE.to_owned();
         let peer_id = test_node_id("peer-b");
         let mut client = RelayClient::new_with_token_issuer(
             test_node_id("node-a"),
@@ -1641,7 +1641,7 @@ mod tests {
             current_unix(),
             120, // token TTL = 120s
         );
-        token.scope = RELAY_TOKEN_SCOPE.to_string();
+        token.scope = RELAY_TOKEN_SCOPE.to_owned();
         let peer_id = test_node_id("peer-b");
         let mut client = RelayClient::new_with_token_issuer(
             test_node_id("node-a"),

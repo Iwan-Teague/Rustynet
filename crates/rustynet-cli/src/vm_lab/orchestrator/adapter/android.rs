@@ -44,7 +44,7 @@ an app-layer management channel reviewed against security minimum bar.";
 fn android_unsupported() -> AdapterError {
     AdapterError::UnsupportedPlatform {
         platform: VmGuestPlatform::Android,
-        message: ANDROID_UNSUPPORTED_MSG.to_string(),
+        message: ANDROID_UNSUPPORTED_MSG.to_owned(),
     }
 }
 
@@ -118,7 +118,7 @@ impl NodeAdapter for AndroidNodeAdapter {
         Err(android_unsupported())
     }
     fn endpoint(&self) -> String {
-        "0.0.0.0:0".to_string()
+        "0.0.0.0:0".to_owned()
     }
     fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
         Err(android_unsupported())

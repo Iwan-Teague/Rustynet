@@ -103,11 +103,11 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
         if let Err(err) = self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "private-key".to_string(),
+                "private-key".to_owned(),
                 self.private_key_path.clone(),
-                "listen-port".to_string(),
+                "listen-port".to_owned(),
                 self.listen_port.to_string(),
             ],
         ) {
@@ -119,11 +119,11 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
             "ifconfig",
             &[
                 self.interface_name.clone(),
-                "inet".to_string(),
+                "inet".to_owned(),
                 local_ip.clone(),
                 local_ip,
-                "netmask".to_string(),
-                "255.255.255.255".to_string(),
+                "netmask".to_owned(),
+                "255.255.255.255".to_owned(),
             ],
         ) {
             let _ = self.remove_interface();
@@ -132,7 +132,7 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
 
         if let Err(err) = self
             .runner
-            .run("ifconfig", &[self.interface_name.clone(), "up".to_string()])
+            .run("ifconfig", &[self.interface_name.clone(), "up".to_owned()])
         {
             let _ = self.remove_interface();
             return Err(err);
@@ -144,7 +144,7 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
     fn remove_interface(&mut self) -> Result<(), BackendError> {
         let _ = self.runner.run(
             "ifconfig",
-            &[self.interface_name.clone(), "down".to_string()],
+            &[self.interface_name.clone(), "down".to_owned()],
         );
         self.restore_default_route();
         self.endpoint_bypass_hosts.clear();
@@ -192,7 +192,7 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
             if let Some(value) = normalized.strip_prefix("gateway:") {
                 let gateway = value.trim();
                 if !gateway.is_empty() {
-                    return Ok(gateway.to_string());
+                    return Ok(gateway.to_owned());
                 }
             }
         }
@@ -219,13 +219,13 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
             self.runner.run(
                 "route",
                 &[
-                    "-n".to_string(),
-                    "add".to_string(),
-                    family.to_string(),
-                    "-host".to_string(),
+                    "-n".to_owned(),
+                    "add".to_owned(),
+                    family.to_owned(),
+                    "-host".to_owned(),
                     endpoint.clone(),
                     gateway.clone(),
-                    "-ifscope".to_string(),
+                    "-ifscope".to_owned(),
                     self.egress_interface.clone(),
                 ],
             )?;
@@ -241,10 +241,10 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
             let _ = self.runner.run(
                 "route",
                 &[
-                    "-n".to_string(),
-                    "delete".to_string(),
-                    family.to_string(),
-                    "-host".to_string(),
+                    "-n".to_owned(),
+                    "delete".to_owned(),
+                    family.to_owned(),
+                    "-host".to_owned(),
                     endpoint,
                 ],
             );
@@ -262,11 +262,11 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
             .run(
                 "route",
                 &[
-                    "-n".to_string(),
-                    "change".to_string(),
-                    "-inet".to_string(),
-                    "default".to_string(),
-                    "-interface".to_string(),
+                    "-n".to_owned(),
+                    "change".to_owned(),
+                    "-inet".to_owned(),
+                    "default".to_owned(),
+                    "-interface".to_owned(),
                     self.interface_name.clone(),
                 ],
             )
@@ -275,11 +275,11 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
             self.runner.run(
                 "route",
                 &[
-                    "-n".to_string(),
-                    "add".to_string(),
-                    "-inet".to_string(),
-                    "default".to_string(),
-                    "-interface".to_string(),
+                    "-n".to_owned(),
+                    "add".to_owned(),
+                    "-inet".to_owned(),
+                    "default".to_owned(),
+                    "-interface".to_owned(),
                     self.interface_name.clone(),
                 ],
             )?;
@@ -294,10 +294,10 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
         let _ = self.runner.run(
             "route",
             &[
-                "-n".to_string(),
-                "change".to_string(),
-                "-inet".to_string(),
-                "default".to_string(),
+                "-n".to_owned(),
+                "change".to_owned(),
+                "-inet".to_owned(),
+                "default".to_owned(),
                 gateway,
             ],
         );
@@ -309,7 +309,7 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
         for pid in find_wireguard_go_pids(&self.interface_name)? {
             if let Err(err) = self
                 .runner
-                .run("kill", &["-TERM".to_string(), pid.to_string()])
+                .run("kill", &["-TERM".to_owned(), pid.to_string()])
             {
                 last_error = Some(err);
             }
@@ -341,9 +341,9 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
         let output = self.runner.run_capture(
             "wg",
             &[
-                "show".to_string(),
+                "show".to_owned(),
                 self.interface_name.clone(),
-                "latest-handshakes".to_string(),
+                "latest-handshakes".to_owned(),
             ],
         )?;
         let public_key = encode_wg_public_key_base64(&peer.public_key);
@@ -396,13 +396,13 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
         self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_string(),
+                "endpoint".to_owned(),
                 endpoint,
-                "allowed-ips".to_string(),
+                "allowed-ips".to_owned(),
                 allowed_ips,
             ],
         )?;
@@ -424,11 +424,11 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
         self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_string(),
+                "endpoint".to_owned(),
                 endpoint_value,
             ],
         )?;
@@ -460,11 +460,11 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
         self.runner.run(
             "wg",
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.interface_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "remove".to_string(),
+                "remove".to_owned(),
             ],
         )
     }
@@ -493,7 +493,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
 
     fn transport_socket_identity_blocker(&self) -> Option<String> {
         Some(
-            "macos wireguard backend is a command-only adapter over wireguard-go and its OS-managed UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string(),
+            "macos wireguard backend is a command-only adapter over wireguard-go and its OS-managed UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_owned(),
         )
     }
 
@@ -544,7 +544,7 @@ fn extract_ip_from_cidr(cidr: &str) -> Result<String, BackendError> {
     if !prefix.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(BackendError::invalid_input("invalid cidr prefix"));
     }
-    Ok(ip.to_string())
+    Ok(ip.to_owned())
 }
 
 fn route_add_args(cidr: &str, interface_name: &str) -> Result<Vec<String>, BackendError> {
@@ -559,26 +559,26 @@ fn route_add_args(cidr: &str, interface_name: &str) -> Result<Vec<String>, Backe
             return Err(BackendError::invalid_input("invalid ipv6 prefix"));
         }
         return Ok(vec![
-            "-n".to_string(),
-            "add".to_string(),
-            "-inet6".to_string(),
-            "-net".to_string(),
-            cidr.to_string(),
-            "-interface".to_string(),
-            interface_name.to_string(),
+            "-n".to_owned(),
+            "add".to_owned(),
+            "-inet6".to_owned(),
+            "-net".to_owned(),
+            cidr.to_owned(),
+            "-interface".to_owned(),
+            interface_name.to_owned(),
         ]);
     }
     if prefix > 32 {
         return Err(BackendError::invalid_input("invalid ipv4 prefix"));
     }
     Ok(vec![
-        "-n".to_string(),
-        "add".to_string(),
-        "-inet".to_string(),
-        "-net".to_string(),
-        cidr.to_string(),
-        "-interface".to_string(),
-        interface_name.to_string(),
+        "-n".to_owned(),
+        "add".to_owned(),
+        "-inet".to_owned(),
+        "-net".to_owned(),
+        cidr.to_owned(),
+        "-interface".to_owned(),
+        interface_name.to_owned(),
     ])
 }
 
@@ -597,15 +597,15 @@ fn route_delete_args(cidr: &str) -> Result<Vec<String>, BackendError> {
         return Err(BackendError::invalid_input("invalid ipv4 prefix"));
     }
     Ok(vec![
-        "-n".to_string(),
-        "delete".to_string(),
+        "-n".to_owned(),
+        "delete".to_owned(),
         if is_ipv6 {
-            "-inet6".to_string()
+            "-inet6".to_owned()
         } else {
-            "-inet".to_string()
+            "-inet".to_owned()
         },
-        "-net".to_string(),
-        cidr.to_string(),
+        "-net".to_owned(),
+        cidr.to_owned(),
     ])
 }
 
@@ -687,9 +687,9 @@ mod tests {
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("local-node").expect("valid node id"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.1/32".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.1/32".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         }
     }
 
@@ -701,7 +701,7 @@ mod tests {
                 port: 51820,
             },
             public_key: [7; 32],
-            allowed_ips: vec!["100.64.1.0/24".to_string()],
+            allowed_ips: vec!["100.64.1.0/24".to_owned()],
         }
     }
 
@@ -759,7 +759,7 @@ mod tests {
             .expect("peer configure should work");
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "100.100.1.0/24".to_string(),
+                destination_cidr: "100.100.1.0/24".to_owned(),
                 via_node: NodeId::new("peer-a").expect("id should parse"),
                 kind: rustynet_backend_api::RouteKind::Mesh,
             }])

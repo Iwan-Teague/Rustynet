@@ -174,7 +174,7 @@ mod tests {
             id,
             name: "fail",
             deps,
-            outcome: StageOutcome::Failed("test failure".to_string()),
+            outcome: StageOutcome::Failed("test failure".to_owned()),
         })
     }
 
@@ -182,7 +182,7 @@ mod tests {
         OrchestrationContext::new(
             vec![],
             PathBuf::from("/tmp/test-report"),
-            "test-net".to_string(),
+            "test-net".to_owned(),
         )
     }
 

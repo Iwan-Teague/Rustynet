@@ -133,12 +133,12 @@ impl MembershipState {
         }
         if self.network_id.trim().is_empty() {
             return Err(MembershipError::InvalidFormat(
-                "network id must not be empty".to_string(),
+                "network id must not be empty".to_owned(),
             ));
         }
         if self.quorum_threshold == 0 {
             return Err(MembershipError::InvalidFormat(
-                "quorum threshold must be at least 1".to_string(),
+                "quorum threshold must be at least 1".to_owned(),
             ));
         }
 
@@ -146,7 +146,7 @@ impl MembershipState {
         for node in &self.nodes {
             if node.node_id.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(
-                    "node id must not be empty".to_string(),
+                    "node id must not be empty".to_owned(),
                 ));
             }
             if !node_ids.insert(node.node_id.clone()) {
@@ -173,7 +173,7 @@ impl MembershipState {
         for approver in &self.approver_set {
             if approver.approver_id.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(
-                    "approver id must not be empty".to_string(),
+                    "approver id must not be empty".to_owned(),
                 ));
             }
             if !approver_ids.insert(approver.approver_id.clone()) {
@@ -187,7 +187,7 @@ impl MembershipState {
 
         if active_approvers == 0 {
             return Err(MembershipError::InvalidFormat(
-                "at least one active approver is required".to_string(),
+                "at least one active approver is required".to_owned(),
             ));
         }
         if self.quorum_threshold > active_approvers {
@@ -360,17 +360,17 @@ impl MembershipUpdateRecord {
     pub fn canonical_payload(&self) -> Result<String, MembershipError> {
         if self.network_id.trim().is_empty() {
             return Err(MembershipError::InvalidFormat(
-                "membership update network id must not be empty".to_string(),
+                "membership update network id must not be empty".to_owned(),
             ));
         }
         if self.update_id.trim().is_empty() {
             return Err(MembershipError::InvalidFormat(
-                "membership update id must not be empty".to_string(),
+                "membership update id must not be empty".to_owned(),
             ));
         }
         if self.target.trim().is_empty() {
             return Err(MembershipError::InvalidFormat(
-                "membership update target must not be empty".to_string(),
+                "membership update target must not be empty".to_owned(),
             ));
         }
         if self.epoch_new != self.epoch_prev.saturating_add(1) {
@@ -380,8 +380,7 @@ impl MembershipUpdateRecord {
         }
         if self.created_at_unix >= self.expires_at_unix {
             return Err(MembershipError::InvalidFormat(
-                "membership update expires_at_unix must be greater than created_at_unix"
-                    .to_string(),
+                "membership update expires_at_unix must be greater than created_at_unix".to_owned(),
             ));
         }
 
@@ -499,7 +498,7 @@ impl MembershipReplayCache {
         if epoch_new <= self.max_epoch {
             return Err(MembershipError::ReplayDetected);
         }
-        self.seen_update_ids.insert(update_id.to_string());
+        self.seen_update_ids.insert(update_id.to_owned());
         self.max_epoch = epoch_new;
         Ok(())
     }
@@ -616,13 +615,13 @@ pub fn sign_update_record(
 ) -> Result<MembershipSignature, MembershipError> {
     if approver_id.trim().is_empty() {
         return Err(MembershipError::InvalidFormat(
-            "approver_id must not be empty".to_string(),
+            "approver_id must not be empty".to_owned(),
         ));
     }
     let payload = record.canonical_payload()?;
     let signature = signing_key.sign(payload.as_bytes());
     Ok(MembershipSignature {
-        approver_id: approver_id.to_string(),
+        approver_id: approver_id.to_owned(),
         signature_hex: hex_encode(&signature.to_bytes()),
     })
 }
@@ -703,7 +702,7 @@ pub fn load_membership_snapshot(
     }
     let payload_bytes = hex_decode(state_hex)?;
     let payload = String::from_utf8(payload_bytes)
-        .map_err(|_| MembershipError::InvalidFormat("snapshot payload is not utf8".to_string()))?;
+        .map_err(|_| MembershipError::InvalidFormat("snapshot payload is not utf8".to_owned()))?;
     let state = parse_membership_state_payload(&payload)?;
     state.validate()?;
     Ok(state)
@@ -722,7 +721,7 @@ pub fn append_membership_log_entry(
     let index = entries.len() as u64;
     let previous_hash = entries
         .last()
-        .map_or_else(|| "genesis".to_string(), |entry| entry.entry_hash.clone());
+        .map_or_else(|| "genesis".to_owned(), |entry| entry.entry_hash.clone());
     let encoded_update = signed_update.canonical_envelope()?;
     let encoded_update_hex = hex_encode(encoded_update.as_bytes());
     let entry_material = format!("{index}|{previous_hash}|{encoded_update_hex}");
@@ -747,20 +746,20 @@ pub fn load_membership_log(
     let mut lines = content.lines();
     let version_line = lines
         .next()
-        .ok_or_else(|| MembershipError::InvalidFormat("missing log version".to_string()))?;
+        .ok_or_else(|| MembershipError::InvalidFormat("missing log version".to_owned()))?;
     let Some((version_key, version_value)) = version_line.split_once('=') else {
         return Err(MembershipError::InvalidFormat(
-            "log version line missing separator".to_string(),
+            "log version line missing separator".to_owned(),
         ));
     };
     if version_key != "version" {
         return Err(MembershipError::InvalidFormat(
-            "log first line must be version".to_string(),
+            "log first line must be version".to_owned(),
         ));
     }
     let version = version_value
         .parse::<u8>()
-        .map_err(|_| MembershipError::InvalidFormat("invalid log version".to_string()))?;
+        .map_err(|_| MembershipError::InvalidFormat("invalid log version".to_owned()))?;
     if version != MEMBERSHIP_SCHEMA_VERSION {
         return Err(MembershipError::UnsupportedVersion(version));
     }
@@ -775,14 +774,14 @@ pub fn load_membership_log(
         let parts = encoded.split('|').collect::<Vec<_>>();
         if parts.len() != 4 {
             return Err(MembershipError::InvalidFormat(
-                "log entry field count mismatch".to_string(),
+                "log entry field count mismatch".to_owned(),
             ));
         }
         let index = parts[0]
             .parse::<u64>()
-            .map_err(|_| MembershipError::InvalidFormat("invalid log entry index".to_string()))?;
-        let previous_hash = parts[1].to_string();
-        let entry_hash = parts[2].to_string();
+            .map_err(|_| MembershipError::InvalidFormat("invalid log entry index".to_owned()))?;
+        let previous_hash = parts[1].to_owned();
+        let entry_hash = parts[2].to_owned();
         let encoded_update_hex = parts[3];
         let expected_hash =
             sha256_hex(format!("{index}|{previous_hash}|{encoded_update_hex}").as_bytes());
@@ -791,7 +790,7 @@ pub fn load_membership_log(
         }
         let encoded_update_raw = hex_decode(encoded_update_hex)?;
         let encoded_update = String::from_utf8(encoded_update_raw).map_err(|_| {
-            MembershipError::InvalidFormat("encoded update payload is not utf8".to_string())
+            MembershipError::InvalidFormat("encoded update payload is not utf8".to_owned())
         })?;
         let signed_update = parse_signed_update_envelope(&encoded_update)?;
         entries.push(MembershipLogEntry {
@@ -880,7 +879,7 @@ fn verify_membership_log_chain(entries: &[MembershipLogEntry]) -> Result<(), Mem
             return Err(MembershipError::IntegrityMismatch);
         }
         let expected_previous = if position == 0 {
-            "genesis".to_string()
+            "genesis".to_owned()
         } else {
             entries[position - 1].entry_hash.clone()
         };
@@ -909,7 +908,7 @@ fn verify_membership_signatures(
     for signature in &signed_update.approver_signatures {
         if !signer_ids.insert(signature.approver_id.clone()) {
             return Err(MembershipError::InvalidFormat(
-                "duplicate signer id in update signatures".to_string(),
+                "duplicate signer id in update signatures".to_owned(),
             ));
         }
     }
@@ -1035,10 +1034,10 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
     if version != MEMBERSHIP_SCHEMA_VERSION {
         return Err(MembershipError::UnsupportedVersion(version));
     }
-    let network_id = required_field(&fields, "network_id")?.to_string();
+    let network_id = required_field(&fields, "network_id")?.to_owned();
     let epoch = parse_u64_field(&fields, "epoch")?;
     let quorum_threshold = parse_u8_field(&fields, "quorum_threshold")?;
-    let metadata_hash_raw = required_field(&fields, "metadata_hash")?.to_string();
+    let metadata_hash_raw = required_field(&fields, "metadata_hash")?.to_owned();
     let metadata_hash = if metadata_hash_raw.is_empty() {
         None
     } else {
@@ -1048,10 +1047,10 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
     let mut nodes = Vec::with_capacity(node_count);
     for index in 0..node_count {
         let node = MembershipNode {
-            node_id: required_field(&fields, &format!("node.{index}.node_id"))?.to_string(),
+            node_id: required_field(&fields, &format!("node.{index}.node_id"))?.to_owned(),
             node_pubkey_hex: required_field(&fields, &format!("node.{index}.node_pubkey_hex"))?
-                .to_string(),
-            owner: required_field(&fields, &format!("node.{index}.owner"))?.to_string(),
+                .to_owned(),
+            owner: required_field(&fields, &format!("node.{index}.owner"))?.to_owned(),
             status: MembershipNodeStatus::parse(required_field(
                 &fields,
                 &format!("node.{index}.status"),
@@ -1067,12 +1066,12 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
     for index in 0..approver_count {
         let approver = MembershipApprover {
             approver_id: required_field(&fields, &format!("approver.{index}.approver_id"))?
-                .to_string(),
+                .to_owned(),
             approver_pubkey_hex: required_field(
                 &fields,
                 &format!("approver.{index}.approver_pubkey_hex"),
             )?
-            .to_string(),
+            .to_owned(),
             role: MembershipApproverRole::parse(required_field(
                 &fields,
                 &format!("approver.{index}.role"),
@@ -1105,16 +1104,16 @@ fn parse_signed_update_envelope(value: &str) -> Result<SignedMembershipUpdate, M
     let payload_hex = required_field(&fields, "payload_hex")?;
     let payload_raw = hex_decode(payload_hex)?;
     let payload = String::from_utf8(payload_raw)
-        .map_err(|_| MembershipError::InvalidFormat("update payload is not utf8".to_string()))?;
+        .map_err(|_| MembershipError::InvalidFormat("update payload is not utf8".to_owned()))?;
     let record = parse_membership_update_payload(&payload)?;
 
     let sig_count = parse_usize_field(&fields, "sig_count")?;
     let mut signatures = Vec::with_capacity(sig_count);
     for index in 0..sig_count {
         signatures.push(MembershipSignature {
-            approver_id: required_field(&fields, &format!("sig.{index}.approver_id"))?.to_string(),
+            approver_id: required_field(&fields, &format!("sig.{index}.approver_id"))?.to_owned(),
             signature_hex: required_field(&fields, &format!("sig.{index}.signature_hex"))?
-                .to_string(),
+                .to_owned(),
         });
     }
     Ok(SignedMembershipUpdate {
@@ -1134,30 +1133,30 @@ fn parse_membership_update_payload(
     let operation_name = required_field(&fields, "operation")?;
     let operation = match operation_name {
         "add_node" => MembershipOperation::AddNode(MembershipNode {
-            node_id: required_field(&fields, "op.node_id")?.to_string(),
-            node_pubkey_hex: required_field(&fields, "op.node_pubkey_hex")?.to_string(),
-            owner: required_field(&fields, "op.owner")?.to_string(),
+            node_id: required_field(&fields, "op.node_id")?.to_owned(),
+            node_pubkey_hex: required_field(&fields, "op.node_pubkey_hex")?.to_owned(),
+            owner: required_field(&fields, "op.owner")?.to_owned(),
             status: MembershipNodeStatus::parse(required_field(&fields, "op.status")?)?,
             roles: split_csv(required_field(&fields, "op.roles")?),
             joined_at_unix: parse_u64_field(&fields, "op.joined_at_unix")?,
             updated_at_unix: parse_u64_field(&fields, "op.updated_at_unix")?,
         }),
         "remove_node" => MembershipOperation::RemoveNode {
-            node_id: required_field(&fields, "op.node_id")?.to_string(),
+            node_id: required_field(&fields, "op.node_id")?.to_owned(),
         },
         "revoke_node" => MembershipOperation::RevokeNode {
-            node_id: required_field(&fields, "op.node_id")?.to_string(),
+            node_id: required_field(&fields, "op.node_id")?.to_owned(),
         },
         "restore_node" => MembershipOperation::RestoreNode {
-            node_id: required_field(&fields, "op.node_id")?.to_string(),
+            node_id: required_field(&fields, "op.node_id")?.to_owned(),
         },
         "rotate_node_key" => MembershipOperation::RotateNodeKey {
-            node_id: required_field(&fields, "op.node_id")?.to_string(),
-            new_pubkey_hex: required_field(&fields, "op.new_pubkey_hex")?.to_string(),
+            node_id: required_field(&fields, "op.node_id")?.to_owned(),
+            new_pubkey_hex: required_field(&fields, "op.new_pubkey_hex")?.to_owned(),
         },
         "rotate_approver" => MembershipOperation::RotateApprover(MembershipApprover {
-            approver_id: required_field(&fields, "op.approver_id")?.to_string(),
-            approver_pubkey_hex: required_field(&fields, "op.approver_pubkey_hex")?.to_string(),
+            approver_id: required_field(&fields, "op.approver_id")?.to_owned(),
+            approver_pubkey_hex: required_field(&fields, "op.approver_pubkey_hex")?.to_owned(),
             role: MembershipApproverRole::parse(required_field(&fields, "op.role")?)?,
             status: MembershipApproverStatus::parse(required_field(&fields, "op.status")?)?,
             created_at_unix: parse_u64_field(&fields, "op.created_at_unix")?,
@@ -1172,19 +1171,19 @@ fn parse_membership_update_payload(
         }
     };
 
-    let policy_context_raw = required_field(&fields, "policy_context")?.to_string();
+    let policy_context_raw = required_field(&fields, "policy_context")?.to_owned();
     Ok(MembershipUpdateRecord {
-        network_id: required_field(&fields, "network_id")?.to_string(),
-        update_id: required_field(&fields, "update_id")?.to_string(),
+        network_id: required_field(&fields, "network_id")?.to_owned(),
+        update_id: required_field(&fields, "update_id")?.to_owned(),
         operation,
-        target: required_field(&fields, "target")?.to_string(),
-        prev_state_root: required_field(&fields, "prev_state_root")?.to_string(),
-        new_state_root: required_field(&fields, "new_state_root")?.to_string(),
+        target: required_field(&fields, "target")?.to_owned(),
+        prev_state_root: required_field(&fields, "prev_state_root")?.to_owned(),
+        new_state_root: required_field(&fields, "new_state_root")?.to_owned(),
         epoch_prev: parse_u64_field(&fields, "epoch_prev")?,
         epoch_new: parse_u64_field(&fields, "epoch_new")?,
         created_at_unix: parse_u64_field(&fields, "created_at_unix")?,
         expires_at_unix: parse_u64_field(&fields, "expires_at_unix")?,
-        reason_code: required_field(&fields, "reason_code")?.to_string(),
+        reason_code: required_field(&fields, "reason_code")?.to_owned(),
         policy_context: if policy_context_raw.is_empty() {
             None
         } else {
@@ -1314,11 +1313,11 @@ fn parse_key_values(value: &str) -> Result<HashMap<String, String>, MembershipEr
         }
         let Some((key, field_value)) = line.split_once('=') else {
             return Err(MembershipError::InvalidFormat(
-                "line missing key/value separator".to_string(),
+                "line missing key/value separator".to_owned(),
             ));
         };
         if fields
-            .insert(key.to_string(), field_value.to_string())
+            .insert(key.to_owned(), field_value.to_owned())
             .is_some()
         {
             return Err(MembershipError::InvalidFormat(format!(
@@ -1371,7 +1370,7 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>, MembershipError> {
     let trimmed = encoded.trim();
     if (trimmed.len() & 1) != 0 {
         return Err(MembershipError::InvalidFormat(
-            "hex value has odd length".to_string(),
+            "hex value has odd length".to_owned(),
         ));
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
@@ -1406,7 +1405,7 @@ fn decode_hex_nibble(value: u8) -> Result<u8, MembershipError> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err(MembershipError::InvalidFormat(
-            "invalid hex character".to_string(),
+            "invalid hex character".to_owned(),
         )),
     }
 }
@@ -1439,7 +1438,7 @@ mod tests {
     fn approver(id: &str, key_byte: u8, role: MembershipApproverRole) -> MembershipApprover {
         let signing = SigningKey::from_bytes(&[key_byte; 32]);
         MembershipApprover {
-            approver_id: id.to_string(),
+            approver_id: id.to_owned(),
             approver_pubkey_hex: hex_encode(signing.verifying_key().as_bytes()),
             role,
             status: MembershipApproverStatus::Active,
@@ -1449,11 +1448,11 @@ mod tests {
 
     fn active_node(node_id: &str, pubkey_byte: u8) -> MembershipNode {
         MembershipNode {
-            node_id: node_id.to_string(),
+            node_id: node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[pubkey_byte; 32]),
-            owner: "owner@example.local".to_string(),
+            owner: "owner@example.local".to_owned(),
             status: MembershipNodeStatus::Active,
-            roles: vec!["tag:servers".to_string()],
+            roles: vec!["tag:servers".to_owned()],
             joined_at_unix: 100,
             updated_at_unix: 100,
         }
@@ -1462,7 +1461,7 @@ mod tests {
     fn base_state() -> MembershipState {
         MembershipState {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
-            network_id: "net-1".to_string(),
+            network_id: "net-1".to_owned(),
             epoch: 1,
             nodes: vec![active_node("node-a", 9)],
             approver_set: vec![
@@ -1508,16 +1507,16 @@ mod tests {
         let state = base_state();
         let record = MembershipUpdateRecord {
             network_id: state.network_id.clone(),
-            update_id: "update-1".to_string(),
+            update_id: "update-1".to_owned(),
             operation: MembershipOperation::SetQuorum { threshold: 2 },
-            target: "quorum".to_string(),
+            target: "quorum".to_owned(),
             prev_state_root: state.state_root_hex().expect("root"),
             new_state_root: state.state_root_hex().expect("root"),
             epoch_prev: state.epoch,
             epoch_new: state.epoch + 1,
             created_at_unix: 101,
             expires_at_unix: 400,
-            reason_code: "policy".to_string(),
+            reason_code: "policy".to_owned(),
             policy_context: None,
         };
 
@@ -1547,17 +1546,17 @@ mod tests {
         candidate.epoch += 1;
         let record = MembershipUpdateRecord {
             network_id: state.network_id.clone(),
-            update_id: "update-add-node".to_string(),
+            update_id: "update-add-node".to_owned(),
             operation: MembershipOperation::AddNode(new_node),
-            target: "node-b".to_string(),
+            target: "node-b".to_owned(),
             prev_state_root: state.state_root_hex().expect("root"),
             new_state_root: candidate.state_root_hex().expect("root"),
             epoch_prev: state.epoch,
             epoch_new: state.epoch + 1,
             created_at_unix: 120,
             expires_at_unix: 600,
-            reason_code: "join".to_string(),
-            policy_context: Some("enrollment".to_string()),
+            reason_code: "join".to_owned(),
+            policy_context: Some("enrollment".to_owned()),
         };
 
         let owner_key = SigningKey::from_bytes(&[1; 32]);
@@ -1587,16 +1586,16 @@ mod tests {
         candidate.epoch += 1;
         let record = MembershipUpdateRecord {
             network_id: state.network_id.clone(),
-            update_id: "update-replay".to_string(),
+            update_id: "update-replay".to_owned(),
             operation: MembershipOperation::AddNode(new_node),
-            target: "node-b".to_string(),
+            target: "node-b".to_owned(),
             prev_state_root: state.state_root_hex().expect("root"),
             new_state_root: candidate.state_root_hex().expect("root"),
             epoch_prev: state.epoch,
             epoch_new: state.epoch + 1,
             created_at_unix: 120,
             expires_at_unix: 600,
-            reason_code: "join".to_string(),
+            reason_code: "join".to_owned(),
             policy_context: None,
         };
         let owner_key = SigningKey::from_bytes(&[1; 32]);
@@ -1627,16 +1626,16 @@ mod tests {
         candidate.epoch += 1;
         let record = MembershipUpdateRecord {
             network_id: state.network_id.clone(),
-            update_id: "update-duplicate-signer".to_string(),
+            update_id: "update-duplicate-signer".to_owned(),
             operation: MembershipOperation::AddNode(new_node),
-            target: "node-b".to_string(),
+            target: "node-b".to_owned(),
             prev_state_root: state.state_root_hex().expect("root"),
             new_state_root: candidate.state_root_hex().expect("root"),
             epoch_prev: state.epoch,
             epoch_new: state.epoch + 1,
             created_at_unix: 120,
             expires_at_unix: 600,
-            reason_code: "join".to_string(),
+            reason_code: "join".to_owned(),
             policy_context: None,
         };
 
@@ -1656,7 +1655,7 @@ mod tests {
     fn owner_signature_required_for_rotate_approver() {
         let state = base_state();
         let replacement = MembershipApprover {
-            approver_id: "guardian-3".to_string(),
+            approver_id: "guardian-3".to_owned(),
             approver_pubkey_hex: hex_encode(
                 SigningKey::from_bytes(&[4; 32]).verifying_key().as_bytes(),
             ),
@@ -1670,16 +1669,16 @@ mod tests {
         candidate.epoch += 1;
         let record = MembershipUpdateRecord {
             network_id: state.network_id.clone(),
-            update_id: "update-rotate-approver".to_string(),
+            update_id: "update-rotate-approver".to_owned(),
             operation: MembershipOperation::RotateApprover(replacement),
-            target: "guardian-3".to_string(),
+            target: "guardian-3".to_owned(),
             prev_state_root: state.state_root_hex().expect("root"),
             new_state_root: candidate.state_root_hex().expect("root"),
             epoch_prev: state.epoch,
             epoch_new: state.epoch + 1,
             created_at_unix: 140,
             expires_at_unix: 640,
-            reason_code: "rotate".to_string(),
+            reason_code: "rotate".to_owned(),
             policy_context: None,
         };
         let guardian_one = SigningKey::from_bytes(&[2; 32]);
@@ -1707,16 +1706,16 @@ mod tests {
         candidate.epoch += 1;
         let base_record = MembershipUpdateRecord {
             network_id: state.network_id.clone(),
-            update_id: "update-retry".to_string(),
+            update_id: "update-retry".to_owned(),
             operation: MembershipOperation::AddNode(new_node.clone()),
-            target: "node-b".to_string(),
+            target: "node-b".to_owned(),
             prev_state_root: state.state_root_hex().expect("root"),
             new_state_root: candidate.state_root_hex().expect("root"),
             epoch_prev: state.epoch,
             epoch_new: state.epoch + 1,
             created_at_unix: 120,
             expires_at_unix: 600,
-            reason_code: "join".to_string(),
+            reason_code: "join".to_owned(),
             policy_context: None,
         };
 
@@ -1724,7 +1723,7 @@ mod tests {
         let guardian_key = SigningKey::from_bytes(&[2; 32]);
 
         let mut bad_record = base_record.clone();
-        bad_record.new_state_root = "deadbeef".to_string();
+        bad_record.new_state_root = "deadbeef".to_owned();
         let bad_signed = SignedMembershipUpdate {
             record: bad_record.clone(),
             approver_signatures: vec![
@@ -1794,7 +1793,7 @@ mod tests {
         let revoked = preview_next_state(
             &state,
             &MembershipOperation::RevokeNode {
-                node_id: "node-a".to_string(),
+                node_id: "node-a".to_owned(),
             },
         )
         .expect("revoke should succeed");
@@ -1809,7 +1808,7 @@ mod tests {
         let restored = preview_next_state(
             &revoked,
             &MembershipOperation::RestoreNode {
-                node_id: "node-a".to_string(),
+                node_id: "node-a".to_owned(),
             },
         )
         .expect("restore should succeed");
@@ -1851,16 +1850,16 @@ mod tests {
         candidate.epoch += 1;
         let record = MembershipUpdateRecord {
             network_id: state.network_id.clone(),
-            update_id: "update-log-1".to_string(),
+            update_id: "update-log-1".to_owned(),
             operation: MembershipOperation::AddNode(new_node),
-            target: "node-b".to_string(),
+            target: "node-b".to_owned(),
             prev_state_root: state.state_root_hex().expect("root"),
             new_state_root: candidate.state_root_hex().expect("root"),
             epoch_prev: state.epoch,
             epoch_new: state.epoch + 1,
             created_at_unix: 130,
             expires_at_unix: 700,
-            reason_code: "join".to_string(),
+            reason_code: "join".to_owned(),
             policy_context: None,
         };
         let owner_key = SigningKey::from_bytes(&[1; 32]);

@@ -46,10 +46,10 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
         env_path_q = ps_quote(&env_path)?
     );
     let output = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
-    let node_id = output.trim().to_string();
+    let node_id = output.trim().to_owned();
     if node_id.is_empty() {
         return Err(AdapterError::Protocol {
-            message: "node_id extracted from rustynetd.env is empty".to_string(),
+            message: "node_id extracted from rustynetd.env is empty".to_owned(),
         });
     }
     Ok(node_id)
@@ -230,10 +230,10 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     let iface_script = "$iface = Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*rustynet*' -or $_.Name -like '*rustynet*' } | Select-Object -First 1; \
          if ($iface) { (Get-NetIPAddress -InterfaceIndex $iface.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress } else { '' }";
     let ip = run_remote_ps(conn, iface_script, SHORT_TIMEOUT)?;
-    let ip = ip.trim().to_string();
+    let ip = ip.trim().to_owned();
     if ip.is_empty() {
         return Err(AdapterError::Protocol {
-            message: "mesh IP not found on rustynet* network interface (service not running or WireGuard tunnel not up)".to_string(),
+            message: "mesh IP not found on rustynet* network interface (service not running or WireGuard tunnel not up)".to_owned(),
         });
     }
     Ok(ip)
@@ -265,7 +265,7 @@ pub fn issue_bundles_to_dir(
         }
         crate::vm_lab::orchestrator::error::BundleKind::Membership => {
             return Err(AdapterError::Protocol {
-                message: "Membership bundles are issued via init_membership_snapshot".to_string(),
+                message: "Membership bundles are issued via init_membership_snapshot".to_owned(),
             });
         }
     };
@@ -384,7 +384,7 @@ fn base64_decode_simple(encoded: &[u8]) -> Result<Vec<u8>, String> {
         .filter(|b| !b.is_ascii_whitespace())
         .collect();
     if filtered.is_empty() {
-        return Err("empty base64 input".to_string());
+        return Err("empty base64 input".to_owned());
     }
     let mut table = [255u8; 256];
     for (i, ch) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -454,7 +454,7 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
             || lower.ends_with(".key")
         {
             return Err(AdapterError::KeyExclusionViolation {
-                path: entry.to_string(),
+                path: entry.to_owned(),
             });
         }
     }
@@ -512,7 +512,7 @@ mod tests {
         let conn = crate::vm_lab::orchestrator::connection::NodeConnection::ssh(
             "10.0.0.1",
             22,
-            Some("Administrator".to_string()),
+            Some("Administrator".to_owned()),
             std::path::PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
         )

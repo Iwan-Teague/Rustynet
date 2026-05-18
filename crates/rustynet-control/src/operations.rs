@@ -24,7 +24,7 @@ pub fn redact_fields(
     let mut out = BTreeMap::new();
     for (key, value) in input {
         if is_sensitive_key(key) || looks_sensitive_value(value) {
-            out.insert(key.clone(), "REDACTED".to_string());
+            out.insert(key.clone(), "REDACTED".to_owned());
         } else {
             out.insert(key.clone(), value.clone());
         }
@@ -164,14 +164,14 @@ impl TamperEvidentAuditLog {
         let previous_hash = self
             .entries
             .last()
-            .map_or_else(|| "genesis".to_string(), |entry| entry.entry_hash.clone());
+            .map_or_else(|| "genesis".to_owned(), |entry| entry.entry_hash.clone());
         let payload = format!("{index}|{timestamp_unix}|{actor}|{action}|{previous_hash}");
         let entry_hash = sha256_hex(payload.as_bytes());
         self.entries.push(AuditEntry {
             index,
             timestamp_unix,
-            actor: actor.to_string(),
-            action: action.to_string(),
+            actor: actor.to_owned(),
+            action: action.to_owned(),
             previous_hash,
             entry_hash,
         });
@@ -191,7 +191,7 @@ impl TamperEvidentAuditLog {
                 return false;
             }
             let expected_previous = if position == 0 {
-                "genesis".to_string()
+                "genesis".to_owned()
             } else {
                 self.entries[position - 1].entry_hash.clone()
             };
@@ -262,10 +262,10 @@ impl TamperEvidentAuditLog {
                     timestamp_unix: fields[1]
                         .parse::<u64>()
                         .map_err(|_| OperationsError::InvalidFormat)?,
-                    actor: fields[2].to_string(),
-                    action: fields[3].to_string(),
-                    previous_hash: fields[4].to_string(),
-                    entry_hash: fields[5].to_string(),
+                    actor: fields[2].to_owned(),
+                    action: fields[3].to_owned(),
+                    previous_hash: fields[4].to_owned(),
+                    entry_hash: fields[5].to_owned(),
                 };
                 entries.push(entry);
                 body_without_digest.push_str(line);
@@ -273,7 +273,7 @@ impl TamperEvidentAuditLog {
                 continue;
             }
             if let Some(value) = line.strip_prefix("digest=") {
-                digest = Some(value.to_string());
+                digest = Some(value.to_owned());
                 continue;
             }
             return Err(OperationsError::InvalidFormat);
@@ -318,9 +318,9 @@ mod tests {
     #[test]
     fn redaction_covers_all_ingestion_paths() {
         let mut payload = BTreeMap::new();
-        payload.insert("api_token".to_string(), "Bearer super-secret".to_string());
-        payload.insert("username".to_string(), "alice".to_string());
-        payload.insert("vault_ref".to_string(), "vault://path".to_string());
+        payload.insert("api_token".to_owned(), "Bearer super-secret".to_owned());
+        payload.insert("username".to_owned(), "alice".to_owned());
+        payload.insert("vault_ref".to_owned(), "vault://path".to_owned());
 
         for path in [
             IngestionPath::Mdm,
@@ -331,9 +331,9 @@ mod tests {
             IngestionPath::LogField,
         ] {
             let redacted = redact_fields(path, &payload);
-            assert_eq!(redacted.get("api_token"), Some(&"REDACTED".to_string()));
-            assert_eq!(redacted.get("vault_ref"), Some(&"REDACTED".to_string()));
-            assert_eq!(redacted.get("username"), Some(&"alice".to_string()));
+            assert_eq!(redacted.get("api_token"), Some(&"REDACTED".to_owned()));
+            assert_eq!(redacted.get("vault_ref"), Some(&"REDACTED".to_owned()));
+            assert_eq!(redacted.get("username"), Some(&"alice".to_owned()));
         }
     }
 
@@ -341,8 +341,8 @@ mod tests {
     fn structured_logger_never_writes_cleartext_secrets() {
         let logger = StructuredLogger::default();
         let mut payload = BTreeMap::new();
-        payload.insert("credential".to_string(), "super-secret".to_string());
-        payload.insert("status".to_string(), "ok".to_string());
+        payload.insert("credential".to_owned(), "super-secret".to_owned());
+        payload.insert("status".to_owned(), "ok".to_owned());
 
         logger
             .log(IngestionPath::ApiPayload, &payload)
@@ -389,15 +389,15 @@ mod tests {
         let summary = DiagnosticsSummary {
             components: vec![
                 HealthSnapshot {
-                    component: "control".to_string(),
+                    component: "control".to_owned(),
                     healthy: true,
-                    detail: "ok".to_string(),
+                    detail: "ok".to_owned(),
                     timestamp_unix: 100,
                 },
                 HealthSnapshot {
-                    component: "relay".to_string(),
+                    component: "relay".to_owned(),
                     healthy: true,
-                    detail: "ok".to_string(),
+                    detail: "ok".to_owned(),
                     timestamp_unix: 100,
                 },
             ],

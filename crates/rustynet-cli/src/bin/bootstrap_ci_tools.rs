@@ -65,7 +65,7 @@ fn run() -> Result<(), i32> {
     let security_toolchain = env::var("RUSTYNET_SECURITY_TOOLCHAIN")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_SECURITY_TOOLCHAIN.to_string());
+        .unwrap_or_else(|| DEFAULT_SECURITY_TOOLCHAIN.to_owned());
     run_command(
         "rustup",
         &[

@@ -54,7 +54,7 @@ fn classify_local_error(message: &str) -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     if !args.is_empty() {
-        return Err("test_validate_network_discovery_bundle does not accept options".to_string());
+        return Err("test_validate_network_discovery_bundle does not accept options".to_owned());
     }
 
     let root_dir = repo_root()?;

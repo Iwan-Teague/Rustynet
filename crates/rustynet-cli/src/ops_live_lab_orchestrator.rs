@@ -424,9 +424,9 @@ fn redact_forensics_line(line: &str) -> String {
     if upper.contains("PRIVATE KEY-----")
         || (upper.contains("BEGIN ") && upper.contains("PRIVATE KEY"))
     {
-        return "[REDACTED sensitive key material]".to_string();
+        return "[REDACTED sensitive key material]".to_owned();
     }
-    let mut out = line.to_string();
+    let mut out = line.to_owned();
     for keyword in ["passphrase", "password", "secret", "token"] {
         if let Some(updated) = redact_first_keyword_value(out.as_str(), keyword) {
             out = updated;
@@ -503,7 +503,7 @@ fn collected_at_utc_now() -> String {
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| text.trim().to_string())
+        .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| format!("unix:{}", unix_now()))
 }
@@ -586,7 +586,7 @@ fn expected_forensics_node_files() -> &'static [&'static str] {
 fn parse_pass_fail(value: &str, label: &str) -> Result<String, String> {
     let normalized = value.trim();
     if normalized == CHECK_PASS || normalized == CHECK_FAIL {
-        Ok(normalized.to_string())
+        Ok(normalized.to_owned())
     } else {
         Err(format!("{label} must be pass or fail (got: {value:?})"))
     }
@@ -595,7 +595,7 @@ fn parse_pass_fail(value: &str, label: &str) -> Result<String, String> {
 fn parse_pass_fail_skip(value: &str, label: &str) -> Result<String, String> {
     let normalized = value.trim();
     if normalized == CHECK_PASS || normalized == CHECK_FAIL || normalized == CHECK_SKIPPED {
-        Ok(normalized.to_string())
+        Ok(normalized.to_owned())
     } else {
         Err(format!(
             "{label} must be pass, fail, or skipped (got: {value:?})"
@@ -654,12 +654,12 @@ fn count_no_leak_cleartext_packets(lines: &[String]) -> u64 {
 }
 
 fn validate_dns_qname(raw: &str) -> Result<String, String> {
-    let qname = raw.trim().trim_end_matches('.').to_string();
+    let qname = raw.trim().trim_end_matches('.').to_owned();
     if qname.is_empty() {
-        return Err("qname must not be empty".to_string());
+        return Err("qname must not be empty".to_owned());
     }
     if qname.len() > 253 {
-        return Err("qname exceeds maximum DNS length".to_string());
+        return Err("qname exceeds maximum DNS length".to_owned());
     }
     for label in qname.split('.') {
         if label.is_empty() || label.len() > 63 {
@@ -699,12 +699,12 @@ fn skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize, String> {
     let mut labels_seen = 0usize;
     loop {
         if offset >= packet.len() {
-            return Err("dns response truncated while reading name".to_string());
+            return Err("dns response truncated while reading name".to_owned());
         }
         let len = packet[offset];
         if len & 0b1100_0000 == 0b1100_0000 {
             if offset + 1 >= packet.len() {
-                return Err("dns response truncated while reading compression pointer".to_string());
+                return Err("dns response truncated while reading compression pointer".to_owned());
             }
             return Ok(offset + 2);
         }
@@ -712,20 +712,20 @@ fn skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize, String> {
             return Ok(offset + 1);
         }
         if len & 0b1100_0000 != 0 {
-            return Err("dns response contains invalid label encoding".to_string());
+            return Err("dns response contains invalid label encoding".to_owned());
         }
         let label_len = len as usize;
         if label_len > 63 {
-            return Err("dns response contains oversized label".to_string());
+            return Err("dns response contains oversized label".to_owned());
         }
         offset += 1;
         if offset + label_len > packet.len() {
-            return Err("dns response truncated while reading label bytes".to_string());
+            return Err("dns response truncated while reading label bytes".to_owned());
         }
         offset += label_len;
         labels_seen += 1;
         if labels_seen > 128 {
-            return Err("dns response name parse exceeded label limit".to_string());
+            return Err("dns response name parse exceeded label limit".to_owned());
         }
     }
 }
@@ -736,12 +736,12 @@ fn decode_first_dns_answer(
     answer_count: u64,
 ) -> Result<(i64, u64, String, u64), String> {
     if response.len() < 12 {
-        return Err("dns response header is too short".to_string());
+        return Err("dns response header is too short".to_owned());
     }
     let mut offset = 12usize;
     offset = skip_dns_name(response, offset)?;
     if offset + 4 > response.len() {
-        return Err("dns response truncated in question tail".to_string());
+        return Err("dns response truncated in question tail".to_owned());
     }
     offset += 4;
 
@@ -750,7 +750,7 @@ fn decode_first_dns_answer(
     if answer_count > 0 {
         offset = skip_dns_name(response, offset)?;
         if offset + 10 > response.len() {
-            return Err("dns response truncated in answer header".to_string());
+            return Err("dns response truncated in answer header".to_owned());
         }
         let rr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
         let rr_class = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
@@ -763,7 +763,7 @@ fn decode_first_dns_answer(
         let rdlen = u16::from_be_bytes([response[offset + 8], response[offset + 9]]) as usize;
         offset += 10;
         if offset + rdlen > response.len() {
-            return Err("dns response truncated in answer payload".to_string());
+            return Err("dns response truncated in answer payload".to_owned());
         }
         if rr_type == 1 && rr_class == 1 && rdlen == 4 {
             let addr = Ipv4Addr::new(
@@ -806,8 +806,8 @@ impl LiveLabOrchestratorNoLeakReportView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("status".to_string(), Value::String(self.status));
-        m.insert("checks".to_string(), Value::Object(self.checks));
+        m.insert("status".to_owned(), Value::String(self.status));
+        m.insert("checks".to_owned(), Value::Object(self.checks));
         m
     }
 }
@@ -816,10 +816,10 @@ fn is_plaintext_no_leak_report(
     payload: &LiveLabOrchestratorNoLeakReportView,
 ) -> Result<(), String> {
     if payload.status != CHECK_PASS {
-        return Err("no-leak dataplane report status must be pass".to_string());
+        return Err("no-leak dataplane report status must be pass".to_owned());
     }
     if payload.checks.is_empty() {
-        return Err("no-leak dataplane report must contain non-empty checks".to_string());
+        return Err("no-leak dataplane report must contain non-empty checks".to_owned());
     }
     let failed = payload
         .checks
@@ -860,11 +860,11 @@ impl RunSummaryNodeView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("label".to_string(), Value::String(self.label));
-        m.insert("target".to_string(), Value::String(self.target));
-        m.insert("node_id".to_string(), Value::String(self.node_id));
+        m.insert("label".to_owned(), Value::String(self.label));
+        m.insert("target".to_owned(), Value::String(self.target));
+        m.insert("node_id".to_owned(), Value::String(self.node_id));
         m.insert(
-            "bootstrap_role".to_string(),
+            "bootstrap_role".to_owned(),
             Value::String(self.bootstrap_role),
         );
         m
@@ -899,28 +899,28 @@ impl RunSummaryWorkerView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("label".to_string(), Value::String(self.label));
-        m.insert("target".to_string(), Value::String(self.target));
-        m.insert("node_id".to_string(), Value::String(self.node_id));
-        m.insert("role".to_string(), Value::String(self.role));
-        m.insert("rc".to_string(), Value::Number(self.rc.into()));
-        m.insert("started_at".to_string(), Value::String(self.started_at));
-        m.insert("finished_at".to_string(), Value::String(self.finished_at));
-        m.insert("log_path".to_string(), Value::String(self.log_path));
+        m.insert("label".to_owned(), Value::String(self.label));
+        m.insert("target".to_owned(), Value::String(self.target));
+        m.insert("node_id".to_owned(), Value::String(self.node_id));
+        m.insert("role".to_owned(), Value::String(self.role));
+        m.insert("rc".to_owned(), Value::Number(self.rc.into()));
+        m.insert("started_at".to_owned(), Value::String(self.started_at));
+        m.insert("finished_at".to_owned(), Value::String(self.finished_at));
+        m.insert("log_path".to_owned(), Value::String(self.log_path));
         m.insert(
-            "snapshot_path".to_string(),
+            "snapshot_path".to_owned(),
             Value::String(self.snapshot_path),
         );
         m.insert(
-            "route_policy_path".to_string(),
+            "route_policy_path".to_owned(),
             Value::String(self.route_policy_path),
         );
         m.insert(
-            "dns_state_path".to_string(),
+            "dns_state_path".to_owned(),
             Value::String(self.dns_state_path),
         );
         m.insert(
-            "primary_failure_reason".to_string(),
+            "primary_failure_reason".to_owned(),
             Value::String(self.primary_failure_reason),
         );
         m
@@ -956,24 +956,24 @@ impl RunSummaryStageView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("stage".to_string(), Value::String(self.stage));
-        m.insert("severity".to_string(), Value::String(self.severity));
-        m.insert("status".to_string(), Value::String(self.status));
-        m.insert("rc".to_string(), Value::Number(self.rc.into()));
-        m.insert("log_path".to_string(), Value::String(self.log_path));
-        m.insert("message".to_string(), Value::String(self.message));
-        m.insert("started_at".to_string(), Value::String(self.started_at));
-        m.insert("finished_at".to_string(), Value::String(self.finished_at));
+        m.insert("stage".to_owned(), Value::String(self.stage));
+        m.insert("severity".to_owned(), Value::String(self.severity));
+        m.insert("status".to_owned(), Value::String(self.status));
+        m.insert("rc".to_owned(), Value::Number(self.rc.into()));
+        m.insert("log_path".to_owned(), Value::String(self.log_path));
+        m.insert("message".to_owned(), Value::String(self.message));
+        m.insert("started_at".to_owned(), Value::String(self.started_at));
+        m.insert("finished_at".to_owned(), Value::String(self.finished_at));
         m.insert(
-            "failed_worker_count".to_string(),
+            "failed_worker_count".to_owned(),
             Value::Number(self.failed_worker_count.into()),
         );
         m.insert(
-            "primary_failure_reason".to_string(),
+            "primary_failure_reason".to_owned(),
             Value::String(self.primary_failure_reason),
         );
         m.insert(
-            "worker_results".to_string(),
+            "worker_results".to_owned(),
             Value::Array(
                 self.worker_results
                     .into_iter()
@@ -1023,50 +1023,50 @@ impl LiveLabRunSummaryView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "schema_version".to_string(),
+            "schema_version".to_owned(),
             Value::Number(self.schema_version.into()),
         );
-        m.insert("run_id".to_string(), Value::String(self.run_id));
-        m.insert("network_id".to_string(), Value::String(self.network_id));
-        m.insert("report_dir".to_string(), Value::String(self.report_dir));
+        m.insert("run_id".to_owned(), Value::String(self.run_id));
+        m.insert("network_id".to_owned(), Value::String(self.network_id));
+        m.insert("report_dir".to_owned(), Value::String(self.report_dir));
         m.insert(
-            "overall_status".to_string(),
+            "overall_status".to_owned(),
             Value::String(self.overall_status),
         );
         m.insert(
-            "started_at_local".to_string(),
+            "started_at_local".to_owned(),
             Value::String(self.started_at_local),
         );
         m.insert(
-            "started_at_utc".to_string(),
+            "started_at_utc".to_owned(),
             Value::String(self.started_at_utc),
         );
         m.insert(
-            "started_at_unix".to_string(),
+            "started_at_unix".to_owned(),
             Value::Number(self.started_at_unix.into()),
         );
         m.insert(
-            "finished_at_local".to_string(),
+            "finished_at_local".to_owned(),
             Value::String(self.finished_at_local),
         );
         m.insert(
-            "finished_at_utc".to_string(),
+            "finished_at_utc".to_owned(),
             Value::String(self.finished_at_utc),
         );
         m.insert(
-            "finished_at_unix".to_string(),
+            "finished_at_unix".to_owned(),
             Value::Number(self.finished_at_unix.into()),
         );
         m.insert(
-            "elapsed_secs".to_string(),
+            "elapsed_secs".to_owned(),
             Value::Number(self.elapsed_secs.into()),
         );
         m.insert(
-            "elapsed_human".to_string(),
+            "elapsed_human".to_owned(),
             Value::String(self.elapsed_human),
         );
         m.insert(
-            "nodes".to_string(),
+            "nodes".to_owned(),
             Value::Array(
                 self.nodes
                     .into_iter()
@@ -1075,7 +1075,7 @@ impl LiveLabRunSummaryView {
             ),
         );
         m.insert(
-            "stages".to_string(),
+            "stages".to_owned(),
             Value::Array(
                 self.stages
                     .into_iter()
@@ -1121,10 +1121,10 @@ impl CrossNetworkForensicsManifestView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("mode".to_string(), Value::String(self.mode));
-        m.insert("stage".to_string(), Value::String(self.stage));
-        m.insert("bundle_dir".to_string(), Value::String(self.bundle_dir));
-        m.insert("nodes".to_string(), Value::Array(self.nodes));
+        m.insert("mode".to_owned(), Value::String(self.mode));
+        m.insert("stage".to_owned(), Value::String(self.stage));
+        m.insert("bundle_dir".to_owned(), Value::String(self.bundle_dir));
+        m.insert("nodes".to_owned(), Value::Array(self.nodes));
         m
     }
 }
@@ -1153,17 +1153,17 @@ impl CrossNetworkForensicsNodeReportView {
     #[allow(dead_code)]
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
-        m.insert("label".to_string(), Value::String(self.label));
-        m.insert("target".to_string(), Value::String(self.target));
-        m.insert("node_id".to_string(), Value::String(self.node_id));
-        m.insert("role".to_string(), Value::String(self.role));
-        m.insert("node_dir".to_string(), Value::String(self.node_dir));
+        m.insert("label".to_owned(), Value::String(self.label));
+        m.insert("target".to_owned(), Value::String(self.target));
+        m.insert("node_id".to_owned(), Value::String(self.node_id));
+        m.insert("role".to_owned(), Value::String(self.role));
+        m.insert("node_dir".to_owned(), Value::String(self.node_dir));
         m.insert(
-            "missing_files".to_string(),
+            "missing_files".to_owned(),
             Value::Array(self.missing_files.into_iter().map(Value::String).collect()),
         );
         m.insert(
-            "empty_files".to_string(),
+            "empty_files".to_owned(),
             Value::Array(self.empty_files.into_iter().map(Value::String).collect()),
         );
         m
@@ -1214,26 +1214,26 @@ impl CrossNetworkForensicsBundleValidationView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "schema_version".to_string(),
+            "schema_version".to_owned(),
             Value::Number(self.schema_version.into()),
         );
-        m.insert("mode".to_string(), Value::String(self.mode));
-        m.insert("stage_name".to_string(), Value::String(self.stage_name));
-        m.insert("stage_dir".to_string(), Value::String(self.stage_dir));
+        m.insert("mode".to_owned(), Value::String(self.mode));
+        m.insert("stage_name".to_owned(), Value::String(self.stage_name));
+        m.insert("stage_dir".to_owned(), Value::String(self.stage_dir));
         m.insert(
-            "collected_at_utc".to_string(),
+            "collected_at_utc".to_owned(),
             Value::String(self.collected_at_utc),
         );
         m.insert(
-            "bundle_status".to_string(),
+            "bundle_status".to_owned(),
             Value::String(self.bundle_status),
         );
         m.insert(
-            "node_count".to_string(),
+            "node_count".to_owned(),
             Value::Number(self.node_count.into()),
         );
         m.insert(
-            "required_stage_files".to_string(),
+            "required_stage_files".to_owned(),
             Value::Array(
                 self.required_stage_files
                     .into_iter()
@@ -1242,7 +1242,7 @@ impl CrossNetworkForensicsBundleValidationView {
             ),
         );
         m.insert(
-            "required_node_files".to_string(),
+            "required_node_files".to_owned(),
             Value::Array(
                 self.required_node_files
                     .into_iter()
@@ -1251,31 +1251,31 @@ impl CrossNetworkForensicsBundleValidationView {
             ),
         );
         m.insert(
-            "missing_file_count".to_string(),
+            "missing_file_count".to_owned(),
             Value::Number(self.missing_file_count.into()),
         );
         m.insert(
-            "empty_file_count".to_string(),
+            "empty_file_count".to_owned(),
             Value::Number(self.empty_file_count.into()),
         );
         m.insert(
-            "invalid_file_count".to_string(),
+            "invalid_file_count".to_owned(),
             Value::Number(self.invalid_file_count.into()),
         );
         m.insert(
-            "missing_files".to_string(),
+            "missing_files".to_owned(),
             Value::Array(self.missing_files.into_iter().map(Value::String).collect()),
         );
         m.insert(
-            "empty_files".to_string(),
+            "empty_files".to_owned(),
             Value::Array(self.empty_files.into_iter().map(Value::String).collect()),
         );
         m.insert(
-            "invalid_files".to_string(),
+            "invalid_files".to_owned(),
             Value::Array(self.invalid_files.into_iter().map(Value::String).collect()),
         );
         m.insert(
-            "nodes".to_string(),
+            "nodes".to_owned(),
             Value::Array(
                 self.nodes
                     .into_iter()
@@ -1399,9 +1399,9 @@ pub fn execute_ops_check_local_file_mode(
     }
     let mode = metadata.mode() & 0o777;
     let label = if config.label.trim().is_empty() {
-        "file".to_string()
+        "file".to_owned()
     } else {
-        config.label.trim().to_string()
+        config.label.trim().to_owned()
     };
     match parse_file_mode_policy(config.policy.as_str())? {
         FileModePolicy::OwnerOnly => {
@@ -1498,7 +1498,7 @@ pub fn execute_ops_write_live_lab_stage_artifact_index(
 ) -> Result<String, String> {
     let stage_name = config.stage_name.trim();
     if stage_name.is_empty() {
-        return Err("stage-name is required".to_string());
+        return Err("stage-name is required".to_owned());
     }
 
     let stage_dir = resolve_path(config.stage_dir.as_path())?;
@@ -1570,7 +1570,7 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
 ) -> Result<String, String> {
     let stage_name = config.stage_name.trim();
     if stage_name.is_empty() {
-        return Err("stage-name is required".to_string());
+        return Err("stage-name is required".to_owned());
     }
 
     let nodes_tsv = resolve_path(config.nodes_tsv.as_path())?;
@@ -1719,11 +1719,11 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
     let invalid_file_count = invalid_files.len() as u64;
     let payload_view = CrossNetworkForensicsBundleValidationView {
         schema_version: 1,
-        mode: "cross_network_forensics_bundle_validation".to_string(),
-        stage_name: stage_name.to_string(),
+        mode: "cross_network_forensics_bundle_validation".to_owned(),
+        stage_name: stage_name.to_owned(),
         stage_dir: stage_dir.display().to_string(),
         collected_at_utc: collected_at_utc_now(),
-        bundle_status: bundle_status.to_string(),
+        bundle_status: bundle_status.to_owned(),
         node_count,
         required_stage_files: required_stage_files
             .iter()
@@ -1745,7 +1745,7 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
     let payload = Value::Object(payload_view.into_value_map());
     write_json_pretty(output.as_path(), &payload)?;
     if bundle_status != CHECK_PASS {
-        return Err("cross-network forensics bundle validation failed".to_string());
+        return Err("cross-network forensics bundle validation failed".to_owned());
     }
     Ok(output.display().to_string())
 }
@@ -1866,16 +1866,16 @@ pub fn execute_ops_write_live_linux_reboot_recovery_report(
     {
         match line {
             "client_reboot_wait=fail" => {
-                failure_reasons.push("client reboot wait timed out".to_string())
+                failure_reasons.push("client reboot wait timed out".to_owned())
             }
             "exit_reboot_wait=fail" => {
-                failure_reasons.push("exit reboot wait timed out".to_string())
+                failure_reasons.push("exit reboot wait timed out".to_owned())
             }
             "exit_post=" => {
-                failure_reasons.push("exit post-reboot boot_id capture was empty".to_string())
+                failure_reasons.push("exit post-reboot boot_id capture was empty".to_owned())
             }
             "client_post=" => {
-                failure_reasons.push("client post-reboot boot_id capture was empty".to_string())
+                failure_reasons.push("client post-reboot boot_id capture was empty".to_owned())
             }
             _ => {}
         }
@@ -1902,7 +1902,7 @@ pub fn execute_ops_write_live_linux_reboot_recovery_report(
 
     write_json_pretty(report_path.as_path(), &payload)?;
     if status != CHECK_PASS {
-        return Err("live_linux_reboot_recovery report status is fail".to_string());
+        return Err("live_linux_reboot_recovery report status is fail".to_owned());
     }
     Ok(report_path.display().to_string())
 }
@@ -2029,7 +2029,7 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
     lines.push(format!("- finished_at_utc: `{}`", summary.finished_at_utc));
     lines.push(format!("- elapsed: `{}`", summary.elapsed_human));
     lines.push(String::new());
-    lines.push("## Nodes".to_string());
+    lines.push("## Nodes".to_owned());
     lines.push(String::new());
     for node in &summary.nodes {
         lines.push(format!(
@@ -2038,7 +2038,7 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
         ));
     }
     lines.push(String::new());
-    lines.push("## Stages".to_string());
+    lines.push("## Stages".to_owned());
     lines.push(String::new());
     for stage in &summary.stages {
         lines.push(format!(
@@ -2091,18 +2091,18 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
 
 pub fn execute_ops_scan_ipv4_port_range(config: ScanIpv4PortRangeConfig) -> Result<String, String> {
     if config.start_host == 0 {
-        return Err("--start-host must be between 1 and 254".to_string());
+        return Err("--start-host must be between 1 and 254".to_owned());
     }
     if config.end_host == 0 {
-        return Err("--end-host must be between 1 and 254".to_string());
+        return Err("--end-host must be between 1 and 254".to_owned());
     }
     if config.start_host > config.end_host {
-        return Err("--start-host must be <= --end-host".to_string());
+        return Err("--start-host must be <= --end-host".to_owned());
     }
     let prefix = parse_network_prefix(config.network_prefix.as_str())?;
     let timeout = Duration::from_millis(config.timeout_ms.max(1));
     let output_key = if config.output_key.trim().is_empty() {
-        "hosts=".to_string()
+        "hosts=".to_owned()
     } else {
         config.output_key
     };
@@ -2123,11 +2123,11 @@ pub fn execute_ops_update_role_switch_host_result(
     let hosts_json_path = resolve_path(config.hosts_json_path.as_path())?;
     let os_id = config.os_id.trim();
     if os_id.is_empty() {
-        return Err("--os-id must be non-empty".to_string());
+        return Err("--os-id must be non-empty".to_owned());
     }
     let temp_role = config.temp_role.trim();
     if temp_role.is_empty() {
-        return Err("--temp-role must be non-empty".to_string());
+        return Err("--temp-role must be non-empty".to_owned());
     }
     let switch_execution = parse_pass_fail(config.switch_execution.as_str(), "switch-execution")?;
     let post_switch_reconcile = parse_pass_fail(
@@ -2145,7 +2145,7 @@ pub fn execute_ops_update_role_switch_host_result(
 
     let mut payload = read_json_object_or_empty(hosts_json_path.as_path())?;
     payload.insert(
-        os_id.to_string(),
+        os_id.to_owned(),
         json!({
             "transition": {
                 "from_role": "client",
@@ -2172,7 +2172,7 @@ pub fn execute_ops_write_role_switch_matrix_report(
     let source_path = resolve_path(config.source_path.as_path())?;
     let git_commit = config.git_commit.trim().to_ascii_lowercase();
     if git_commit.is_empty() {
-        return Err("--git-commit must be non-empty".to_string());
+        return Err("--git-commit must be non-empty".to_owned());
     }
     let overall_status = config.overall_status.trim();
     if overall_status != CHECK_PASS && overall_status != CHECK_FAIL {
@@ -2277,7 +2277,7 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
     let captured_at = if config.captured_at_utc.trim().is_empty() {
         format!("{captured_at_unix}")
     } else {
-        config.captured_at_utc.trim().to_string()
+        config.captured_at_utc.trim().to_owned()
     };
 
     let mut allowed_networks = Vec::new();
@@ -2287,7 +2287,7 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
     {
-        allowed_networks.push((part.to_string(), parse_cidr(part)?));
+        allowed_networks.push((part.to_owned(), parse_cidr(part)?));
     }
 
     let internet_route_ok = config.client_internet_route.contains("dev rustynet0");
@@ -2317,7 +2317,7 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
             .iter()
             .any(|(_, allowed)| *allowed == parsed);
         if !allowed {
-            unexpected_bypass_routes.push(line.to_string());
+            unexpected_bypass_routes.push(line.to_owned());
         }
     }
 
@@ -2327,26 +2327,26 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
         } else {
             CHECK_FAIL
         }
-        .to_string(),
+        .to_owned(),
         probe_host_self_service_reachable: if probe_host_self_reachable {
             CHECK_PASS
         } else {
             CHECK_FAIL
         }
-        .to_string(),
+        .to_owned(),
         probe_endpoint_route_direct_not_tunnelled: if probe_route_direct {
             CHECK_PASS
         } else {
             CHECK_FAIL
         }
-        .to_string(),
+        .to_owned(),
         probe_service_blocked_from_client: probe_from_client_status,
         no_unexpected_bypass_routes: if unexpected_bypass_routes.is_empty() {
             CHECK_PASS
         } else {
             CHECK_FAIL
         }
-        .to_string(),
+        .to_owned(),
     };
     let overall = checks.overall_status();
 
@@ -2362,12 +2362,12 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
     };
 
     let report = LiveLinuxServerIpBypassReportView {
-        phase: "phase10".to_string(),
-        mode: "live_linux_server_ip_bypass".to_string(),
-        evidence_mode: "measured".to_string(),
+        phase: "phase10".to_owned(),
+        mode: "live_linux_server_ip_bypass".to_owned(),
+        evidence_mode: "measured".to_owned(),
         captured_at,
         captured_at_unix,
-        status: overall.to_string(),
+        status: overall.to_owned(),
         probe_host_ip: probe_ip.to_string(),
         probe_port: config.probe_port,
         checks,
@@ -2464,7 +2464,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
         ));
     }
     if config.host_labels.is_empty() {
-        return Err("at least one --host-label is required".to_string());
+        return Err("at least one --host-label is required".to_owned());
     }
 
     let Some((dns_host, dns_port)) = config.dns_bind_addr.rsplit_once(':') else {
@@ -2477,7 +2477,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
         .parse::<u16>()
         .map_err(|err| format!("invalid dns bind port {dns_port:?}: {err}"))?;
     if dns_host.trim().is_empty() {
-        return Err("dns bind host must not be empty".to_string());
+        return Err("dns bind host must not be empty".to_owned());
     }
     let allowed_udp = format!("{}:{}", dns_host.trim(), dns_port_num);
     let remote_dns_probe_status = parse_pass_fail_skip(
@@ -2492,11 +2492,11 @@ pub fn execute_ops_write_live_linux_control_surface_report(
     let captured_at = if config.captured_at_utc.trim().is_empty() {
         format!("{captured_at_unix}")
     } else {
-        config.captured_at_utc.trim().to_string()
+        config.captured_at_utc.trim().to_owned()
     };
 
     let mut typed_hosts: Vec<(String, LiveLinuxControlSurfaceHostResultView)> = Vec::new();
-    let mut overall = CHECK_PASS.to_string();
+    let mut overall = CHECK_PASS.to_owned();
     for label in &config.host_labels {
         let daemon_meta = fs::read_to_string(work_dir.join(format!("{label}.daemon_socket.txt")))
             .map_err(|err| format!("read {label} daemon metadata failed: {err}"))?;
@@ -2509,8 +2509,8 @@ pub fn execute_ops_write_live_linux_control_surface_report(
             fs::read_to_string(work_dir.join(format!("{label}.managed_dns_state.txt")))
                 .map_err(|err| format!("read {label} DNS service state failed: {err}"))?;
 
-        let daemon_meta_trimmed = daemon_meta.trim().to_string();
-        let helper_meta_trimmed = helper_meta.trim().to_string();
+        let daemon_meta_trimmed = daemon_meta.trim().to_owned();
+        let helper_meta_trimmed = helper_meta.trim().to_owned();
         let daemon_parts = daemon_meta_trimmed.split('|').collect::<Vec<_>>();
         let helper_parts = helper_meta_trimmed.split('|').collect::<Vec<_>>();
         let daemon_owner = daemon_parts.get(2).copied().unwrap_or_default();
@@ -2537,7 +2537,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
             if !line.contains("rustynetd") {
                 continue;
             }
-            rustynet_listener_lines.push(line.to_string());
+            rustynet_listener_lines.push(line.to_owned());
             let parts = line.split_whitespace().collect::<Vec<_>>();
             if parts.len() < 5 {
                 tcp_listener_ok = false;
@@ -2558,7 +2558,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
         }
 
         if !daemon_ok || !helper_ok || !tcp_listener_ok || !udp_listener_ok {
-            overall = CHECK_FAIL.to_string();
+            overall = CHECK_FAIL.to_owned();
         }
 
         typed_hosts.push((
@@ -2573,7 +2573,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
                 evidence: LiveLinuxControlSurfaceHostEvidenceView {
                     daemon_socket_meta: daemon_meta_trimmed,
                     helper_socket_meta: helper_meta_trimmed,
-                    managed_dns_service_state: dns_service_state.trim().to_string(),
+                    managed_dns_service_state: dns_service_state.trim().to_owned(),
                     rustynet_listener_lines,
                 },
             },
@@ -2581,7 +2581,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
     }
 
     if remote_dns_probe_status == CHECK_FAIL {
-        overall = CHECK_FAIL.to_string();
+        overall = CHECK_FAIL.to_owned();
     }
 
     let all_daemon_ok = typed_hosts
@@ -2606,9 +2606,9 @@ pub fn execute_ops_write_live_linux_control_surface_report(
     }
 
     let report = LiveLinuxControlSurfaceReportView {
-        phase: "phase10".to_string(),
-        mode: "live_linux_control_surface_exposure".to_string(),
-        evidence_mode: "measured".to_string(),
+        phase: "phase10".to_owned(),
+        mode: "live_linux_control_surface_exposure".to_owned(),
+        evidence_mode: "measured".to_owned(),
         captured_at,
         captured_at_unix,
         status: overall.clone(),
@@ -2634,7 +2634,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
 
 #[inline]
 fn pass_or_fail(ok: bool) -> String {
-    if ok { CHECK_PASS } else { CHECK_FAIL }.to_string()
+    if ok { CHECK_PASS } else { CHECK_FAIL }.to_owned()
 }
 
 pub fn execute_ops_rewrite_assignment_peer_endpoint_ip(
@@ -2680,7 +2680,7 @@ pub fn execute_ops_rewrite_assignment_peer_endpoint_ip(
     let mut replaced = 0usize;
     let mut updated = Vec::new();
     for line in body.lines() {
-        let mut line_out = line.to_string();
+        let mut line_out = line.to_owned();
         if let Some((key, value)) = line.split_once('=')
             && is_peer_endpoint_key(key.trim())
         {
@@ -2755,7 +2755,7 @@ pub fn execute_ops_rewrite_assignment_mesh_cidr(
     let mut rewritten = false;
     let mut updated = Vec::new();
     for line in body.lines() {
-        let mut line_out = line.to_string();
+        let mut line_out = line.to_owned();
         if let Some((key, _value)) = line.split_once('=')
             && key.trim() == "mesh_cidr"
         {
@@ -2868,7 +2868,7 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     let captured_at = if config.captured_at_utc.trim().is_empty() {
         format!("{captured_at_unix}")
     } else {
-        config.captured_at_utc.trim().to_string()
+        config.captured_at_utc.trim().to_owned()
     };
 
     let checks = LiveLinuxEndpointHijackChecksView {
@@ -2903,12 +2903,12 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
                 .contains(rogue_endpoint_ip.as_str()),
         ),
     };
-    let status = checks.overall_status().to_string();
+    let status = checks.overall_status().to_owned();
 
     let report = LiveLinuxEndpointHijackReportView {
-        phase: "phase10".to_string(),
-        mode: "live_linux_endpoint_hijack".to_string(),
-        evidence_mode: "measured".to_string(),
+        phase: "phase10".to_owned(),
+        mode: "live_linux_endpoint_hijack".to_owned(),
+        evidence_mode: "measured".to_owned(),
         captured_at,
         captured_at_unix,
         status,
@@ -2989,9 +2989,9 @@ pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
         parse_pass_fail(config.kill_switch_status.as_str(), "--kill-switch-status")?;
     let dns_down_status = parse_pass_fail(config.dns_down_status.as_str(), "--dns-down-status")?;
     let environment = if config.environment.trim().is_empty() {
-        "lab-netns".to_string()
+        "lab-netns".to_owned()
     } else {
-        config.environment.trim().to_string()
+        config.environment.trim().to_owned()
     };
     let captured_at_unix = if config.captured_at_unix == 0 {
         unix_now()
@@ -3001,7 +3001,7 @@ pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
     let captured_at = if config.captured_at_utc.trim().is_empty() {
         format!("{captured_at_unix}")
     } else {
-        config.captured_at_utc.trim().to_string()
+        config.captured_at_utc.trim().to_owned()
     };
 
     let checks = RealWireguardExitnodeE2eChecksView {
@@ -3012,12 +3012,12 @@ pub fn execute_ops_write_real_wireguard_exitnode_e2e_report(
         kill_switch_blocks_egress_when_tunnel_down: kill_switch_status,
         dns_fail_close_when_tunnel_down: dns_down_status,
     };
-    let status = checks.overall_status().to_string();
+    let status = checks.overall_status().to_owned();
 
     let report = RealWireguardExitnodeE2eReportView {
-        phase: "phase10".to_string(),
-        mode: "real_netns_wireguard".to_string(),
-        evidence_mode: "measured".to_string(),
+        phase: "phase10".to_owned(),
+        mode: "real_netns_wireguard".to_owned(),
+        evidence_mode: "measured".to_owned(),
         environment,
         captured_at,
         captured_at_unix,
@@ -3103,9 +3103,9 @@ pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
         "--tunnel-down-block-status",
     )?;
     let environment = if config.environment.trim().is_empty() {
-        "lab-netns".to_string()
+        "lab-netns".to_owned()
     } else {
-        config.environment.trim().to_string()
+        config.environment.trim().to_owned()
     };
     let captured_at_unix = if config.captured_at_unix == 0 {
         unix_now()
@@ -3115,7 +3115,7 @@ pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
     let captured_at = if config.captured_at_utc.trim().is_empty() {
         format!("{captured_at_unix}")
     } else {
-        config.captured_at_utc.trim().to_string()
+        config.captured_at_utc.trim().to_owned()
     };
 
     let load_lines = decode_tcpdump_lines(load_pcap.as_path())?;
@@ -3132,12 +3132,12 @@ pub fn execute_ops_write_real_wireguard_no_leak_under_load_report(
         tunnel_down_fail_closed: tunnel_down_block_status,
         no_underlay_cleartext_after_tunnel_down: pass_or_fail(down_cleartext_packets == 0),
     };
-    let status = checks.overall_status().to_string();
+    let status = checks.overall_status().to_owned();
 
     let report = RealWireguardNoLeakUnderLoadReportView {
-        phase: "phase10".to_string(),
-        mode: "real_netns_no_leak_under_load".to_string(),
-        evidence_mode: "measured".to_string(),
+        phase: "phase10".to_owned(),
+        mode: "real_netns_no_leak_under_load".to_owned(),
+        evidence_mode: "measured".to_owned(),
         environment,
         captured_at,
         captured_at_unix,
@@ -3174,7 +3174,7 @@ pub fn execute_ops_verify_no_leak_dataplane_report(
         )
     })?;
     if !raw.is_object() {
-        return Err("no-leak dataplane report must be a JSON object".to_string());
+        return Err("no-leak dataplane report must be a JSON object".to_owned());
     }
     let view: LiveLabOrchestratorNoLeakReportView = serde_json::from_value(raw).map_err(|err| {
         format!(
@@ -3183,7 +3183,7 @@ pub fn execute_ops_verify_no_leak_dataplane_report(
         )
     })?;
     is_plaintext_no_leak_report(&view)?;
-    Ok("No-leak dataplane gate: PASS".to_string())
+    Ok("No-leak dataplane gate: PASS".to_owned())
 }
 
 /// Typed view for the JSON shape `execute_ops_e2e_dns_query` emits.
@@ -3252,7 +3252,7 @@ pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, St
             .recv_from(&mut response)
             .map_err(|err| format!("dns query receive failed: {err}"))?;
         if size < 12 {
-            return Err("dns response too short".to_string());
+            return Err("dns response too short".to_owned());
         }
         let flags = u16::from_be_bytes([response[2], response[3]]);
         let rcode = i64::from(flags & 0x000F);
@@ -3299,7 +3299,7 @@ pub fn execute_ops_e2e_http_probe_server(
         .parse::<Ipv4Addr>()
         .map_err(|err| format!("invalid --bind-ip value {:?}: {err}", config.bind_ip))?;
     let response_body = if config.response_body.is_empty() {
-        "probe-ok".to_string()
+        "probe-ok".to_owned()
     } else {
         config.response_body
     };
@@ -3325,7 +3325,7 @@ pub fn execute_ops_e2e_http_probe_server(
         let _ = stream.write_all(body);
         let _ = stream.flush();
     }
-    Err("HTTP probe server listener terminated unexpectedly".to_string())
+    Err("HTTP probe server listener terminated unexpectedly".to_owned())
 }
 
 pub fn execute_ops_e2e_http_probe_client(
@@ -3360,7 +3360,7 @@ pub fn execute_ops_e2e_http_probe_client(
         .map_err(|err| format!("TCP probe read failed: {err}"))?;
     let response_text = String::from_utf8_lossy(&response[..read_size]).to_string();
     if !response_text.contains(config.expect_marker.as_str()) {
-        return Err("probe marker missing from response".to_string());
+        return Err("probe marker missing from response".to_owned());
     }
     Ok(config.expect_marker)
 }
@@ -3370,16 +3370,16 @@ pub fn execute_ops_read_json_field(config: ReadJsonFieldConfig) -> Result<String
         .map_err(|err| format!("parse --payload JSON failed: {err}"))?;
     let object = payload
         .as_object()
-        .ok_or_else(|| "--payload must be a JSON object".to_string())?;
+        .ok_or_else(|| "--payload must be a JSON object".to_owned())?;
     let value = object.get(config.field.as_str());
     match value {
         None => Ok(String::new()),
         Some(Value::Null) => Ok(String::new()),
         Some(Value::Bool(flag)) => {
             if *flag {
-                Ok("true".to_string())
+                Ok("true".to_owned())
             } else {
-                Ok("false".to_string())
+                Ok("false".to_owned())
             }
         }
         Some(Value::String(text)) => Ok(text.clone()),
@@ -3393,9 +3393,9 @@ pub fn execute_ops_read_json_field(config: ReadJsonFieldConfig) -> Result<String
 pub fn execute_ops_extract_managed_dns_expected_ip(
     config: ExtractManagedDnsExpectedIpConfig,
 ) -> Result<String, String> {
-    let fqdn = config.fqdn.trim().to_string();
+    let fqdn = config.fqdn.trim().to_owned();
     if fqdn.is_empty() {
-        return Err("--fqdn must be non-empty".to_string());
+        return Err("--fqdn must be non-empty".to_owned());
     }
     let fqdn_token = format!("fqdn={fqdn}");
     for line in config.inspect_output.lines() {
@@ -3403,7 +3403,7 @@ pub fn execute_ops_extract_managed_dns_expected_ip(
         if tokens.contains(&fqdn_token.as_str()) {
             for token in &tokens {
                 if let Some(value) = token.strip_prefix("expected_ip=") {
-                    return Ok(value.to_string());
+                    return Ok(value.to_owned());
                 }
             }
         }
@@ -3422,13 +3422,13 @@ pub fn execute_ops_extract_managed_dns_expected_ip(
             let expected_ip_prefix = format!("record.{record_index}.expected_ip=");
             for candidate in &tokens {
                 if let Some(value) = candidate.strip_prefix(expected_ip_prefix.as_str()) {
-                    return Ok(value.to_string());
+                    return Ok(value.to_owned());
                 }
             }
 
             for candidate in tokens.iter().skip(index + 1) {
                 if let Some(value) = candidate.strip_prefix("expected_ip=") {
-                    return Ok(value.to_string());
+                    return Ok(value.to_owned());
                 }
             }
         }
@@ -3521,7 +3521,7 @@ pub fn execute_ops_write_active_network_signed_state_tamper_report(
     let captured_at = if config.captured_at_utc.trim().is_empty() {
         format!("{captured_at_unix}")
     } else {
-        config.captured_at_utc.trim().to_string()
+        config.captured_at_utc.trim().to_owned()
     };
 
     let checks = ActiveNetworkSignedStateTamperChecksView {
@@ -3531,12 +3531,12 @@ pub fn execute_ops_write_active_network_signed_state_tamper_report(
         netcheck_reports_fail_closed: netcheck_fail_closed_status,
         recovery_restored_secure_runtime: recovery_status,
     };
-    let status = checks.overall_status().to_string();
+    let status = checks.overall_status().to_owned();
 
     let report = ActiveNetworkSignedStateTamperReportView {
-        phase: "phase10".to_string(),
-        mode: "active_network_signed_state_tamper".to_string(),
-        evidence_mode: "measured".to_string(),
+        phase: "phase10".to_owned(),
+        mode: "active_network_signed_state_tamper".to_owned(),
+        evidence_mode: "measured".to_owned(),
         captured_at,
         captured_at_unix,
         status,
@@ -3674,7 +3674,7 @@ pub fn execute_ops_write_active_network_rogue_path_hijack_report(
     let captured_at = if config.captured_at_utc.trim().is_empty() {
         format!("{captured_at_unix}")
     } else {
-        config.captured_at_utc.trim().to_string()
+        config.captured_at_utc.trim().to_owned()
     };
 
     let checks = ActiveNetworkRoguePathHijackChecksView {
@@ -3686,12 +3686,12 @@ pub fn execute_ops_write_active_network_rogue_path_hijack_report(
         recovery_restored_secure_runtime: recovery_status,
         recovery_keeps_rogue_endpoint_rejected: recovery_endpoint_status,
     };
-    let status = checks.overall_status().to_string();
+    let status = checks.overall_status().to_owned();
 
     let report = ActiveNetworkRoguePathHijackReportView {
-        phase: "phase10".to_string(),
-        mode: "active_network_rogue_path_hijack".to_string(),
-        evidence_mode: "measured".to_string(),
+        phase: "phase10".to_owned(),
+        mode: "active_network_rogue_path_hijack".to_owned(),
+        evidence_mode: "measured".to_owned(),
         captured_at,
         captured_at_unix,
         status,
@@ -3834,7 +3834,7 @@ mod tests {
         let view = E2eDnsQueryResultView {
             rcode: 0,
             answer_count: 1,
-            answer_ip: "100.64.0.1".to_string(),
+            answer_ip: "100.64.0.1".to_owned(),
             answer_ttl: 300,
             error: String::new(),
         };
@@ -3857,7 +3857,7 @@ mod tests {
             answer_count: 0,
             answer_ip: String::new(),
             answer_ttl: 0,
-            error: "dns query send failed: connection refused".to_string(),
+            error: "dns query send failed: connection refused".to_owned(),
         };
         let body = serde_json::to_string(&view).expect("serialize");
         let parsed: E2eDnsQueryResultView = serde_json::from_str(&body).expect("deserialize");
@@ -3873,8 +3873,8 @@ mod tests {
         // path would have silently accepted). Pin the i64 contract.
         let mut value = serde_json::to_value(E2eDnsQueryResultView::initial()).expect("to_value");
         value.as_object_mut().expect("object").insert(
-            "rcode".to_string(),
-            serde_json::Value::String("zero".to_string()),
+            "rcode".to_owned(),
+            serde_json::Value::String("zero".to_owned()),
         );
         let err = serde_json::from_value::<E2eDnsQueryResultView>(value)
             .expect_err("string rcode must fail closed");
@@ -3905,8 +3905,8 @@ mod tests {
         fs::set_permissions(path.as_path(), fs::Permissions::from_mode(0o640)).expect("set perms");
         let err = execute_ops_check_local_file_mode(CheckLocalFileModeConfig {
             path: path.clone(),
-            policy: "owner-only".to_string(),
-            label: "file".to_string(),
+            policy: "owner-only".to_owned(),
+            label: "file".to_owned(),
         })
         .expect_err("mode check should fail");
         assert!(err.contains("owner-only"));
@@ -3933,19 +3933,19 @@ mod tests {
             WriteLiveLinuxRebootRecoveryReportConfig {
                 report_path: report_path.clone(),
                 observations_path: observations_path.clone(),
-                exit_pre: "a".to_string(),
-                exit_post: "b".to_string(),
-                client_pre: "c".to_string(),
+                exit_pre: "a".to_owned(),
+                exit_post: "b".to_owned(),
+                client_pre: "c".to_owned(),
                 client_post: String::new(),
-                exit_return: "pass".to_string(),
-                exit_boot_change: "pass".to_string(),
-                post_exit_dns_refresh: "pass".to_string(),
-                post_exit_twohop: "pass".to_string(),
-                client_return: "fail".to_string(),
-                client_boot_change: "fail".to_string(),
-                post_client_dns_refresh: "skipped".to_string(),
-                post_client_twohop: "fail".to_string(),
-                salvage_twohop: "skipped".to_string(),
+                exit_return: "pass".to_owned(),
+                exit_boot_change: "pass".to_owned(),
+                post_exit_dns_refresh: "pass".to_owned(),
+                post_exit_twohop: "pass".to_owned(),
+                client_return: "fail".to_owned(),
+                client_boot_change: "fail".to_owned(),
+                post_client_dns_refresh: "skipped".to_owned(),
+                post_client_twohop: "fail".to_owned(),
+                salvage_twohop: "skipped".to_owned(),
             },
         )
         .expect_err("report should fail");
@@ -3967,19 +3967,19 @@ mod tests {
             WriteLiveLinuxRebootRecoveryReportConfig {
                 report_path: report_path.clone(),
                 observations_path: observations_path.clone(),
-                exit_pre: "a".to_string(),
-                exit_post: "b".to_string(),
-                client_pre: "c".to_string(),
-                client_post: "d".to_string(),
-                exit_return: "pass".to_string(),
-                exit_boot_change: "pass".to_string(),
-                post_exit_dns_refresh: "invalid".to_string(),
-                post_exit_twohop: "pass".to_string(),
-                client_return: "pass".to_string(),
-                client_boot_change: "pass".to_string(),
-                post_client_dns_refresh: "pass".to_string(),
-                post_client_twohop: "pass".to_string(),
-                salvage_twohop: "skipped".to_string(),
+                exit_pre: "a".to_owned(),
+                exit_post: "b".to_owned(),
+                client_pre: "c".to_owned(),
+                client_post: "d".to_owned(),
+                exit_return: "pass".to_owned(),
+                exit_boot_change: "pass".to_owned(),
+                post_exit_dns_refresh: "invalid".to_owned(),
+                post_exit_twohop: "pass".to_owned(),
+                client_return: "pass".to_owned(),
+                client_boot_change: "pass".to_owned(),
+                post_client_dns_refresh: "pass".to_owned(),
+                post_client_twohop: "pass".to_owned(),
+                salvage_twohop: "skipped".to_owned(),
             },
         )
         .expect_err("invalid check state should fail");
@@ -4021,18 +4021,18 @@ mod tests {
             stages_tsv: state_dir.join("stages.tsv"),
             summary_json: summary_json.clone(),
             summary_md: summary_md.clone(),
-            run_id: "run-1".to_string(),
-            network_id: "net-1".to_string(),
+            run_id: "run-1".to_owned(),
+            network_id: "net-1".to_owned(),
             report_dir: report_dir.display().to_string(),
-            overall_status: "fail".to_string(),
-            started_at_local: "2026-04-08 11:00:00 UTC".to_string(),
-            started_at_utc: "2026-04-08T10:00:00Z".to_string(),
+            overall_status: "fail".to_owned(),
+            started_at_local: "2026-04-08 11:00:00 UTC".to_owned(),
+            started_at_utc: "2026-04-08T10:00:00Z".to_owned(),
             started_at_unix: 1,
-            finished_at_local: "2026-04-08 11:00:10 UTC".to_string(),
-            finished_at_utc: "2026-04-08T10:00:10Z".to_string(),
+            finished_at_local: "2026-04-08 11:00:10 UTC".to_owned(),
+            finished_at_utc: "2026-04-08T10:00:10Z".to_owned(),
             finished_at_unix: 11,
             elapsed_secs: 10,
-            elapsed_human: "00m 10s".to_string(),
+            elapsed_human: "00m 10s".to_owned(),
         })
         .expect("summary should write");
 
@@ -4073,12 +4073,12 @@ mod tests {
         fs::write(hosts_path.as_path(), "{}\n").expect("write hosts");
         execute_ops_update_role_switch_host_result(UpdateRoleSwitchHostResultConfig {
             hosts_json_path: hosts_path.clone(),
-            os_id: "debian13".to_string(),
-            temp_role: "admin".to_string(),
-            switch_execution: "pass".to_string(),
-            post_switch_reconcile: "pass".to_string(),
-            policy_still_enforced: "pass".to_string(),
-            least_privilege_preserved: "pass".to_string(),
+            os_id: "debian13".to_owned(),
+            temp_role: "admin".to_owned(),
+            switch_execution: "pass".to_owned(),
+            post_switch_reconcile: "pass".to_owned(),
+            policy_still_enforced: "pass".to_owned(),
+            least_privilege_preserved: "pass".to_owned(),
         })
         .expect("update host result");
 
@@ -4104,9 +4104,9 @@ mod tests {
             hosts_json_path: hosts_path.clone(),
             report_path: report_path.clone(),
             source_path: source_path.clone(),
-            git_commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            git_commit: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
             captured_at_unix: 1_772_983_200,
-            overall_status: "pass".to_string(),
+            overall_status: "pass".to_owned(),
         })
         .expect("write report");
 
@@ -4126,18 +4126,18 @@ mod tests {
         let status = execute_ops_write_live_linux_server_ip_bypass_report(
             WriteLiveLinuxServerIpBypassReportConfig {
                 report_path: report_path.clone(),
-                allowed_management_cidrs: "192.168.1.0/24".to_string(),
-                probe_from_client_status: "pass".to_string(),
-                probe_ip: "192.168.1.10".to_string(),
+                allowed_management_cidrs: "192.168.1.0/24".to_owned(),
+                probe_from_client_status: "pass".to_owned(),
+                probe_ip: "192.168.1.10".to_owned(),
                 probe_port: 18080,
-                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
-                client_probe_route: "192.168.1.10 dev eth0".to_string(),
+                client_internet_route: "1.1.1.1 dev rustynet0".to_owned(),
+                client_probe_route: "192.168.1.10 dev eth0".to_owned(),
                 client_table_51820: "192.168.1.0/24 dev eth0\n10.0.0.0/8 dev rustynet0\n"
-                    .to_string(),
-                client_endpoints: "peer endpoints".to_string(),
-                probe_self_test: "probe-ok".to_string(),
-                probe_from_client_output: "blocked".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                    .to_owned(),
+                client_endpoints: "peer endpoints".to_owned(),
+                probe_self_test: "probe-ok".to_owned(),
+                probe_from_client_output: "blocked".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4150,30 +4150,30 @@ mod tests {
 
     fn baseline_server_ip_bypass_pass_view() -> LiveLinuxServerIpBypassReportView {
         LiveLinuxServerIpBypassReportView {
-            phase: "phase10".to_string(),
-            mode: "live_linux_server_ip_bypass".to_string(),
-            evidence_mode: "measured".to_string(),
-            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            phase: "phase10".to_owned(),
+            mode: "live_linux_server_ip_bypass".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            captured_at: "2026-03-21T10:00:00Z".to_owned(),
             captured_at_unix: 1_772_983_200,
-            status: "pass".to_string(),
-            probe_host_ip: "192.168.1.10".to_string(),
+            status: "pass".to_owned(),
+            probe_host_ip: "192.168.1.10".to_owned(),
             probe_port: 18080,
             checks: LiveLinuxServerIpBypassChecksView {
-                internet_route_via_rustynet0: "pass".to_string(),
-                probe_host_self_service_reachable: "pass".to_string(),
-                probe_endpoint_route_direct_not_tunnelled: "pass".to_string(),
-                probe_service_blocked_from_client: "pass".to_string(),
-                no_unexpected_bypass_routes: "pass".to_string(),
+                internet_route_via_rustynet0: "pass".to_owned(),
+                probe_host_self_service_reachable: "pass".to_owned(),
+                probe_endpoint_route_direct_not_tunnelled: "pass".to_owned(),
+                probe_service_blocked_from_client: "pass".to_owned(),
+                no_unexpected_bypass_routes: "pass".to_owned(),
             },
             evidence: LiveLinuxServerIpBypassEvidenceView {
-                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
-                client_probe_route: "192.168.1.10 dev eth0".to_string(),
-                client_table_51820: "192.168.1.0/24 dev eth0\n".to_string(),
-                client_endpoints: "peer endpoints".to_string(),
-                probe_self_test: "probe-ok".to_string(),
-                client_probe_output: "blocked".to_string(),
+                client_internet_route: "1.1.1.1 dev rustynet0".to_owned(),
+                client_probe_route: "192.168.1.10 dev eth0".to_owned(),
+                client_table_51820: "192.168.1.0/24 dev eth0\n".to_owned(),
+                client_endpoints: "peer endpoints".to_owned(),
+                probe_self_test: "probe-ok".to_owned(),
+                client_probe_output: "blocked".to_owned(),
                 unexpected_bypass_routes: Vec::new(),
-                allowed_management_cidrs: vec!["192.168.1.0/24".to_string()],
+                allowed_management_cidrs: vec!["192.168.1.0/24".to_owned()],
             },
         }
     }
@@ -4205,19 +4205,19 @@ mod tests {
         // trip the matching tweak case.
         for tweak in [
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.internet_route_via_rustynet0 = "fail".to_string()
+                c.internet_route_via_rustynet0 = "fail".to_owned()
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.probe_host_self_service_reachable = "fail".to_string()
+                c.probe_host_self_service_reachable = "fail".to_owned()
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.probe_endpoint_route_direct_not_tunnelled = "fail".to_string()
+                c.probe_endpoint_route_direct_not_tunnelled = "fail".to_owned()
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.probe_service_blocked_from_client = "fail".to_string()
+                c.probe_service_blocked_from_client = "fail".to_owned()
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.no_unexpected_bypass_routes = "fail".to_string()
+                c.no_unexpected_bypass_routes = "fail".to_owned()
             },
         ] {
             let mut checks = baseline.clone();
@@ -4249,7 +4249,7 @@ mod tests {
         value
             .as_object_mut()
             .expect("object")
-            .insert("probe_port".to_string(), Value::String("nope".to_string()));
+            .insert("probe_port".to_owned(), Value::String("nope".to_owned()));
         let err = serde_json::from_value::<LiveLinuxServerIpBypassReportView>(value)
             .expect_err("string probe_port must fail closed at the typed boundary");
         let message = err.to_string();
@@ -4269,18 +4269,18 @@ mod tests {
         let status = execute_ops_write_live_linux_server_ip_bypass_report(
             WriteLiveLinuxServerIpBypassReportConfig {
                 report_path: report_path.clone(),
-                allowed_management_cidrs: "192.168.1.0/24".to_string(),
-                probe_from_client_status: "pass".to_string(),
-                probe_ip: "192.168.1.10".to_string(),
+                allowed_management_cidrs: "192.168.1.0/24".to_owned(),
+                probe_from_client_status: "pass".to_owned(),
+                probe_ip: "192.168.1.10".to_owned(),
                 probe_port: 18080,
-                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
-                client_probe_route: "192.168.1.10 dev eth0".to_string(),
+                client_internet_route: "1.1.1.1 dev rustynet0".to_owned(),
+                client_probe_route: "192.168.1.10 dev eth0".to_owned(),
                 // 10.99.0.0/16 not in allowed_management_cidrs → unexpected bypass route
-                client_table_51820: "10.99.0.0/16 dev eth0\n10.0.0.0/8 dev rustynet0\n".to_string(),
-                client_endpoints: "peer endpoints".to_string(),
-                probe_self_test: "probe-ok".to_string(),
-                probe_from_client_output: "blocked".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                client_table_51820: "10.99.0.0/16 dev eth0\n10.0.0.0/8 dev rustynet0\n".to_owned(),
+                client_endpoints: "peer endpoints".to_owned(),
+                probe_self_test: "probe-ok".to_owned(),
+                probe_from_client_output: "blocked".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4293,7 +4293,7 @@ mod tests {
         assert_eq!(parsed.checks.no_unexpected_bypass_routes, "fail");
         assert_eq!(
             parsed.evidence.unexpected_bypass_routes,
-            vec!["10.99.0.0/16 dev eth0".to_string()]
+            vec!["10.99.0.0/16 dev eth0".to_owned()]
         );
         let _ = fs::remove_file(report_path.as_path());
     }
@@ -4304,18 +4304,18 @@ mod tests {
         let _ = execute_ops_write_live_linux_server_ip_bypass_report(
             WriteLiveLinuxServerIpBypassReportConfig {
                 report_path: report_path.clone(),
-                allowed_management_cidrs: "192.168.1.0/24".to_string(),
-                probe_from_client_status: "pass".to_string(),
-                probe_ip: "192.168.1.10".to_string(),
+                allowed_management_cidrs: "192.168.1.0/24".to_owned(),
+                probe_from_client_status: "pass".to_owned(),
+                probe_ip: "192.168.1.10".to_owned(),
                 probe_port: 18080,
-                client_internet_route: "1.1.1.1 dev rustynet0".to_string(),
-                client_probe_route: "192.168.1.10 dev eth0".to_string(),
+                client_internet_route: "1.1.1.1 dev rustynet0".to_owned(),
+                client_probe_route: "192.168.1.10 dev eth0".to_owned(),
                 client_table_51820: "192.168.1.0/24 dev eth0\n10.0.0.0/8 dev rustynet0\n"
-                    .to_string(),
-                client_endpoints: "peer endpoints".to_string(),
-                probe_self_test: "probe-ok".to_string(),
-                probe_from_client_output: "blocked".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                    .to_owned(),
+                client_endpoints: "peer endpoints".to_owned(),
+                probe_self_test: "probe-ok".to_owned(),
+                probe_from_client_output: "blocked".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4357,12 +4357,12 @@ mod tests {
         let status = execute_ops_write_live_linux_control_surface_report(
             WriteLiveLinuxControlSurfaceReportConfig {
                 report_path: report_path.clone(),
-                dns_bind_addr: "127.0.0.1:53535".to_string(),
-                remote_dns_probe_status: "pass".to_string(),
-                remote_dns_probe_output: "{}".to_string(),
+                dns_bind_addr: "127.0.0.1:53535".to_owned(),
+                remote_dns_probe_status: "pass".to_owned(),
+                remote_dns_probe_output: "{}".to_owned(),
                 work_dir: work_dir.clone(),
-                host_labels: vec!["client".to_string()],
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                host_labels: vec!["client".to_owned()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4403,12 +4403,12 @@ mod tests {
         let status = execute_ops_write_live_linux_control_surface_report(
             WriteLiveLinuxControlSurfaceReportConfig {
                 report_path: report_path.clone(),
-                dns_bind_addr: "127.0.0.1:53535".to_string(),
-                remote_dns_probe_status: "pass".to_string(),
-                remote_dns_probe_output: "{}".to_string(),
+                dns_bind_addr: "127.0.0.1:53535".to_owned(),
+                remote_dns_probe_status: "pass".to_owned(),
+                remote_dns_probe_output: "{}".to_owned(),
                 work_dir: work_dir.clone(),
-                host_labels: vec!["client".to_string()],
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                host_labels: vec!["client".to_owned()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4423,43 +4423,43 @@ mod tests {
         let mut hosts = serde_json::Map::new();
         let host = LiveLinuxControlSurfaceHostResultView {
             checks: LiveLinuxControlSurfaceHostChecksView {
-                daemon_socket_secure: "pass".to_string(),
-                helper_socket_secure: "pass".to_string(),
-                no_rustynet_tcp_listener: "pass".to_string(),
-                rustynet_udp_loopback_only: "pass".to_string(),
+                daemon_socket_secure: "pass".to_owned(),
+                helper_socket_secure: "pass".to_owned(),
+                no_rustynet_tcp_listener: "pass".to_owned(),
+                rustynet_udp_loopback_only: "pass".to_owned(),
             },
             evidence: LiveLinuxControlSurfaceHostEvidenceView {
-                daemon_socket_meta: "socket|600|root|root".to_string(),
-                helper_socket_meta: "socket|660|root|rustynetd".to_string(),
-                managed_dns_service_state: "active".to_string(),
+                daemon_socket_meta: "socket|600|root|root".to_owned(),
+                helper_socket_meta: "socket|660|root|rustynetd".to_owned(),
+                managed_dns_service_state: "active".to_owned(),
                 rustynet_listener_lines: vec![
                     "udp UNCONN 0 0 127.0.0.1:53535 0.0.0.0:* users:((\"rustynetd\",pid=1,fd=4))"
-                        .to_string(),
+                        .to_owned(),
                 ],
             },
         };
         hosts.insert(
-            "client".to_string(),
+            "client".to_owned(),
             serde_json::to_value(&host).expect("to_value"),
         );
         LiveLinuxControlSurfaceReportView {
-            phase: "phase10".to_string(),
-            mode: "live_linux_control_surface_exposure".to_string(),
-            evidence_mode: "measured".to_string(),
-            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            phase: "phase10".to_owned(),
+            mode: "live_linux_control_surface_exposure".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            captured_at: "2026-03-21T10:00:00Z".to_owned(),
             captured_at_unix: 1_772_983_200,
-            status: "pass".to_string(),
-            dns_bind_addr: "127.0.0.1:53535".to_string(),
+            status: "pass".to_owned(),
+            dns_bind_addr: "127.0.0.1:53535".to_owned(),
             checks: LiveLinuxControlSurfaceAggregateChecksView {
-                all_daemon_sockets_secure: "pass".to_string(),
-                all_helper_sockets_secure: "pass".to_string(),
-                no_rustynet_tcp_listeners: "pass".to_string(),
-                rustynet_udp_loopback_only: "pass".to_string(),
-                remote_underlay_dns_probe_blocked: "pass".to_string(),
+                all_daemon_sockets_secure: "pass".to_owned(),
+                all_helper_sockets_secure: "pass".to_owned(),
+                no_rustynet_tcp_listeners: "pass".to_owned(),
+                rustynet_udp_loopback_only: "pass".to_owned(),
+                remote_underlay_dns_probe_blocked: "pass".to_owned(),
             },
             hosts,
             evidence: LiveLinuxControlSurfaceEvidenceView {
-                remote_underlay_dns_probe_output: "{}".to_string(),
+                remote_underlay_dns_probe_output: "{}".to_owned(),
             },
         }
     }
@@ -4494,8 +4494,8 @@ mod tests {
         let mut value =
             serde_json::to_value(baseline_control_surface_pass_view()).expect("to_value");
         value.as_object_mut().expect("object").insert(
-            "captured_at_unix".to_string(),
-            Value::String("nope".to_string()),
+            "captured_at_unix".to_owned(),
+            Value::String("nope".to_owned()),
         );
         let err = serde_json::from_value::<LiveLinuxControlSurfaceReportView>(value)
             .expect_err("string captured_at_unix must fail closed at the typed boundary");
@@ -4510,15 +4510,15 @@ mod tests {
     fn control_surface_host_view_round_trips_through_serde() {
         let host = LiveLinuxControlSurfaceHostResultView {
             checks: LiveLinuxControlSurfaceHostChecksView {
-                daemon_socket_secure: "pass".to_string(),
-                helper_socket_secure: "fail".to_string(),
-                no_rustynet_tcp_listener: "pass".to_string(),
-                rustynet_udp_loopback_only: "pass".to_string(),
+                daemon_socket_secure: "pass".to_owned(),
+                helper_socket_secure: "fail".to_owned(),
+                no_rustynet_tcp_listener: "pass".to_owned(),
+                rustynet_udp_loopback_only: "pass".to_owned(),
             },
             evidence: LiveLinuxControlSurfaceHostEvidenceView {
-                daemon_socket_meta: "socket|600|root|root".to_string(),
-                helper_socket_meta: "socket|660|world|rustynetd".to_string(),
-                managed_dns_service_state: "active".to_string(),
+                daemon_socket_meta: "socket|600|root|root".to_owned(),
+                helper_socket_meta: "socket|660|world|rustynetd".to_owned(),
+                managed_dns_service_state: "active".to_owned(),
                 rustynet_listener_lines: Vec::new(),
             },
         };
@@ -4552,13 +4552,13 @@ mod tests {
         let status = execute_ops_write_live_linux_control_surface_report(
             WriteLiveLinuxControlSurfaceReportConfig {
                 report_path: report_path.clone(),
-                dns_bind_addr: "127.0.0.1:53535".to_string(),
+                dns_bind_addr: "127.0.0.1:53535".to_owned(),
                 // probe failed → overall must flip to fail even though per-host checks pass
-                remote_dns_probe_status: "fail".to_string(),
-                remote_dns_probe_output: "leak observed".to_string(),
+                remote_dns_probe_status: "fail".to_owned(),
+                remote_dns_probe_output: "leak observed".to_owned(),
                 work_dir: work_dir.clone(),
-                host_labels: vec!["client".to_string()],
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                host_labels: vec!["client".to_owned()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4614,12 +4614,12 @@ mod tests {
         let _ = execute_ops_write_live_linux_control_surface_report(
             WriteLiveLinuxControlSurfaceReportConfig {
                 report_path: report_path.clone(),
-                dns_bind_addr: "127.0.0.1:53535".to_string(),
-                remote_dns_probe_status: "pass".to_string(),
-                remote_dns_probe_output: "{}".to_string(),
+                dns_bind_addr: "127.0.0.1:53535".to_owned(),
+                remote_dns_probe_status: "pass".to_owned(),
+                remote_dns_probe_output: "{}".to_owned(),
                 work_dir: work_dir.clone(),
-                host_labels: vec!["zeta".to_string(), "alpha".to_string(), "mu".to_string()],
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                host_labels: vec!["zeta".to_owned(), "alpha".to_owned(), "mu".to_owned()],
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4630,7 +4630,7 @@ mod tests {
         let observed_labels: Vec<&String> = parsed.hosts.keys().collect();
         assert_eq!(
             observed_labels,
-            vec![&"zeta".to_string(), &"alpha".to_string(), &"mu".to_string(),],
+            vec![&"zeta".to_owned(), &"alpha".to_owned(), &"mu".to_owned(),],
             "host iteration order MUST follow caller-supplied host_labels"
         );
         for label in ["zeta", "alpha", "mu"] {
@@ -4654,7 +4654,7 @@ mod tests {
         let replaced = execute_ops_rewrite_assignment_peer_endpoint_ip(
             RewriteAssignmentPeerEndpointIpConfig {
                 assignment_path: assignment_path.clone(),
-                endpoint_ip: "203.0.113.10".to_string(),
+                endpoint_ip: "203.0.113.10".to_owned(),
             },
         )
         .expect("rewrite assignment");
@@ -4675,7 +4675,7 @@ mod tests {
         .expect("write assignment");
         let rewritten = execute_ops_rewrite_assignment_mesh_cidr(RewriteAssignmentMeshCidrConfig {
             assignment_path: assignment_path.clone(),
-            mesh_cidr: "100.128.0.0/10".to_string(),
+            mesh_cidr: "100.128.0.0/10".to_owned(),
         })
         .expect("rewrite mesh cidr");
         assert_eq!(rewritten, "100.128.0.0/10");
@@ -4690,16 +4690,16 @@ mod tests {
         let status = execute_ops_write_live_linux_endpoint_hijack_report(
             WriteLiveLinuxEndpointHijackReportConfig {
                 report_path: report_path.clone(),
-                rogue_endpoint_ip: "192.168.18.77".to_string(),
-                baseline_status: "state=ExitActive restricted_safe_mode=false".to_string(),
-                baseline_netcheck: "path_mode=direct_active".to_string(),
-                baseline_endpoints: "peer-a=192.168.18.51:51820".to_string(),
-                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_string(),
-                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
-                endpoints_after_hijack: "peer-a=192.168.18.77:51820".to_string(),
-                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_string(),
-                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                rogue_endpoint_ip: "192.168.18.77".to_owned(),
+                baseline_status: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                baseline_netcheck: "path_mode=direct_active".to_owned(),
+                baseline_endpoints: "peer-a=192.168.18.51:51820".to_owned(),
+                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_owned(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
+                endpoints_after_hijack: "peer-a=192.168.18.77:51820".to_owned(),
+                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4712,31 +4712,31 @@ mod tests {
 
     fn baseline_endpoint_hijack_pass_view() -> LiveLinuxEndpointHijackReportView {
         LiveLinuxEndpointHijackReportView {
-            phase: "phase10".to_string(),
-            mode: "live_linux_endpoint_hijack".to_string(),
-            evidence_mode: "measured".to_string(),
-            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            phase: "phase10".to_owned(),
+            mode: "live_linux_endpoint_hijack".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            captured_at: "2026-03-21T10:00:00Z".to_owned(),
             captured_at_unix: 1_772_983_200,
-            status: "pass".to_string(),
-            rogue_endpoint_ip: "192.168.18.77".to_string(),
+            status: "pass".to_owned(),
+            rogue_endpoint_ip: "192.168.18.77".to_owned(),
             checks: LiveLinuxEndpointHijackChecksView {
-                baseline_runtime_secure: "pass".to_string(),
-                hijack_drives_fail_closed: "pass".to_string(),
-                restricted_safe_mode_engaged: "pass".to_string(),
-                netcheck_reports_fail_closed: "pass".to_string(),
-                rogue_endpoint_not_adopted: "pass".to_string(),
-                recovery_restores_secure_runtime: "pass".to_string(),
-                recovery_keeps_rogue_endpoint_rejected: "pass".to_string(),
+                baseline_runtime_secure: "pass".to_owned(),
+                hijack_drives_fail_closed: "pass".to_owned(),
+                restricted_safe_mode_engaged: "pass".to_owned(),
+                netcheck_reports_fail_closed: "pass".to_owned(),
+                rogue_endpoint_not_adopted: "pass".to_owned(),
+                recovery_restores_secure_runtime: "pass".to_owned(),
+                recovery_keeps_rogue_endpoint_rejected: "pass".to_owned(),
             },
             evidence: LiveLinuxEndpointHijackEvidenceView {
-                baseline_status: "state=ExitActive restricted_safe_mode=false".to_string(),
-                baseline_netcheck: "path_mode=direct_active".to_string(),
-                baseline_endpoints: "peer-a=192.168.18.51:51820".to_string(),
-                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_string(),
-                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
-                endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_string(),
-                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_string(),
-                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_string(),
+                baseline_status: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                baseline_netcheck: "path_mode=direct_active".to_owned(),
+                baseline_endpoints: "peer-a=192.168.18.51:51820".to_owned(),
+                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_owned(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
+                endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_owned(),
+                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_owned(),
             },
         }
     }
@@ -4766,25 +4766,25 @@ mod tests {
         let baseline = baseline_endpoint_hijack_pass_view().checks;
         for tweak in [
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.baseline_runtime_secure = "fail".to_string()
+                c.baseline_runtime_secure = "fail".to_owned()
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.hijack_drives_fail_closed = "fail".to_string()
+                c.hijack_drives_fail_closed = "fail".to_owned()
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.restricted_safe_mode_engaged = "fail".to_string()
+                c.restricted_safe_mode_engaged = "fail".to_owned()
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.netcheck_reports_fail_closed = "fail".to_string()
+                c.netcheck_reports_fail_closed = "fail".to_owned()
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.rogue_endpoint_not_adopted = "fail".to_string()
+                c.rogue_endpoint_not_adopted = "fail".to_owned()
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.recovery_restores_secure_runtime = "fail".to_string()
+                c.recovery_restores_secure_runtime = "fail".to_owned()
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_string()
+                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_owned()
             },
         ] {
             let mut checks = baseline.clone();
@@ -4814,8 +4814,8 @@ mod tests {
         let mut value =
             serde_json::to_value(baseline_endpoint_hijack_pass_view()).expect("to_value");
         value.as_object_mut().expect("object").insert(
-            "captured_at_unix".to_string(),
-            Value::String("nope".to_string()),
+            "captured_at_unix".to_owned(),
+            Value::String("nope".to_owned()),
         );
         let err = serde_json::from_value::<LiveLinuxEndpointHijackReportView>(value)
             .expect_err("string captured_at_unix must fail closed at the typed boundary");
@@ -4832,16 +4832,16 @@ mod tests {
         let status = execute_ops_write_live_linux_endpoint_hijack_report(
             WriteLiveLinuxEndpointHijackReportConfig {
                 report_path: report_path.clone(),
-                rogue_endpoint_ip: "192.168.18.77".to_string(),
-                baseline_status: "state=ExitActive restricted_safe_mode=false".to_string(),
-                baseline_netcheck: "path_mode=direct_active".to_string(),
-                baseline_endpoints: "peer-a=192.168.18.51:51820".to_string(),
-                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_string(),
-                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
-                endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_string(),
-                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_string(),
-                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                rogue_endpoint_ip: "192.168.18.77".to_owned(),
+                baseline_status: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                baseline_netcheck: "path_mode=direct_active".to_owned(),
+                baseline_endpoints: "peer-a=192.168.18.51:51820".to_owned(),
+                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_owned(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
+                endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_owned(),
+                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -4867,14 +4867,14 @@ mod tests {
         let status = execute_ops_write_real_wireguard_exitnode_e2e_report(
             WriteRealWireguardExitnodeE2eReportConfig {
                 report_path: report_path.clone(),
-                exit_status: "pass".to_string(),
-                lan_off_status: "pass".to_string(),
-                lan_on_status: "pass".to_string(),
-                dns_up_status: "pass".to_string(),
-                kill_switch_status: "pass".to_string(),
-                dns_down_status: "fail".to_string(),
-                environment: "lab-netns".to_string(),
-                captured_at_utc: "2026-03-21T12:00:00Z".to_string(),
+                exit_status: "pass".to_owned(),
+                lan_off_status: "pass".to_owned(),
+                lan_on_status: "pass".to_owned(),
+                dns_up_status: "pass".to_owned(),
+                kill_switch_status: "pass".to_owned(),
+                dns_down_status: "fail".to_owned(),
+                environment: "lab-netns".to_owned(),
+                captured_at_utc: "2026-03-21T12:00:00Z".to_owned(),
                 captured_at_unix: 1_772_990_400,
             },
         )
@@ -4888,20 +4888,20 @@ mod tests {
 
     fn baseline_real_wireguard_exitnode_pass_view() -> RealWireguardExitnodeE2eReportView {
         RealWireguardExitnodeE2eReportView {
-            phase: "phase10".to_string(),
-            mode: "real_netns_wireguard".to_string(),
-            evidence_mode: "measured".to_string(),
-            environment: "lab-netns".to_string(),
-            captured_at: "2026-03-21T12:00:00Z".to_string(),
+            phase: "phase10".to_owned(),
+            mode: "real_netns_wireguard".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            environment: "lab-netns".to_owned(),
+            captured_at: "2026-03-21T12:00:00Z".to_owned(),
             captured_at_unix: 1_772_990_400,
-            status: "pass".to_string(),
+            status: "pass".to_owned(),
             checks: RealWireguardExitnodeE2eChecksView {
-                exit_node_routing: "pass".to_string(),
-                lan_toggle_off_blocks: "pass".to_string(),
-                lan_toggle_on_allows: "pass".to_string(),
-                dns_reaches_protected_path_when_tunnel_up: "pass".to_string(),
-                kill_switch_blocks_egress_when_tunnel_down: "pass".to_string(),
-                dns_fail_close_when_tunnel_down: "pass".to_string(),
+                exit_node_routing: "pass".to_owned(),
+                lan_toggle_off_blocks: "pass".to_owned(),
+                lan_toggle_on_allows: "pass".to_owned(),
+                dns_reaches_protected_path_when_tunnel_up: "pass".to_owned(),
+                kill_switch_blocks_egress_when_tunnel_down: "pass".to_owned(),
+                dns_fail_close_when_tunnel_down: "pass".to_owned(),
             },
         }
     }
@@ -4929,21 +4929,19 @@ mod tests {
     fn real_wireguard_exitnode_checks_view_overall_status_is_fail_per_slot() {
         let baseline = baseline_real_wireguard_exitnode_pass_view().checks;
         for tweak in [
-            |c: &mut RealWireguardExitnodeE2eChecksView| c.exit_node_routing = "fail".to_string(),
+            |c: &mut RealWireguardExitnodeE2eChecksView| c.exit_node_routing = "fail".to_owned(),
             |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.lan_toggle_off_blocks = "fail".to_string()
+                c.lan_toggle_off_blocks = "fail".to_owned()
+            },
+            |c: &mut RealWireguardExitnodeE2eChecksView| c.lan_toggle_on_allows = "fail".to_owned(),
+            |c: &mut RealWireguardExitnodeE2eChecksView| {
+                c.dns_reaches_protected_path_when_tunnel_up = "fail".to_owned()
             },
             |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.lan_toggle_on_allows = "fail".to_string()
+                c.kill_switch_blocks_egress_when_tunnel_down = "fail".to_owned()
             },
             |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.dns_reaches_protected_path_when_tunnel_up = "fail".to_string()
-            },
-            |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.kill_switch_blocks_egress_when_tunnel_down = "fail".to_string()
-            },
-            |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.dns_fail_close_when_tunnel_down = "fail".to_string()
+                c.dns_fail_close_when_tunnel_down = "fail".to_owned()
             },
         ] {
             let mut checks = baseline.clone();
@@ -4971,17 +4969,17 @@ mod tests {
         let _ = execute_ops_write_real_wireguard_exitnode_e2e_report(
             WriteRealWireguardExitnodeE2eReportConfig {
                 report_path: report_path.clone(),
-                exit_status: "pass".to_string(),
-                lan_off_status: "pass".to_string(),
-                lan_on_status: "pass".to_string(),
-                dns_up_status: "pass".to_string(),
-                kill_switch_status: "pass".to_string(),
-                dns_down_status: "pass".to_string(),
+                exit_status: "pass".to_owned(),
+                lan_off_status: "pass".to_owned(),
+                lan_on_status: "pass".to_owned(),
+                dns_up_status: "pass".to_owned(),
+                kill_switch_status: "pass".to_owned(),
+                dns_down_status: "pass".to_owned(),
                 // empty environment exercises the default lab-netns fallback;
                 // pin it through the typed view so a future schema bump that
                 // drops the default trips this test.
-                environment: "   ".to_string(),
-                captured_at_utc: "2026-03-21T12:00:00Z".to_string(),
+                environment: "   ".to_owned(),
+                captured_at_utc: "2026-03-21T12:00:00Z".to_owned(),
                 captured_at_unix: 1_772_990_400,
             },
         )
@@ -4998,27 +4996,27 @@ mod tests {
     fn baseline_real_wireguard_no_leak_under_load_pass_view()
     -> RealWireguardNoLeakUnderLoadReportView {
         RealWireguardNoLeakUnderLoadReportView {
-            phase: "phase10".to_string(),
-            mode: "real_netns_no_leak_under_load".to_string(),
-            evidence_mode: "measured".to_string(),
-            environment: "lab-netns".to_string(),
-            captured_at: "2026-03-21T12:00:00Z".to_string(),
+            phase: "phase10".to_owned(),
+            mode: "real_netns_no_leak_under_load".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            environment: "lab-netns".to_owned(),
+            captured_at: "2026-03-21T12:00:00Z".to_owned(),
             captured_at_unix: 1_772_990_400,
-            status: "pass".to_string(),
+            status: "pass".to_owned(),
             checks: RealWireguardNoLeakUnderLoadChecksView {
-                tunnel_up_connectivity: "pass".to_string(),
-                load_ping_success: "pass".to_string(),
-                tunnel_transport_observed_under_load: "pass".to_string(),
-                no_underlay_cleartext_during_load: "pass".to_string(),
-                tunnel_down_fail_closed: "pass".to_string(),
-                no_underlay_cleartext_after_tunnel_down: "pass".to_string(),
+                tunnel_up_connectivity: "pass".to_owned(),
+                load_ping_success: "pass".to_owned(),
+                tunnel_transport_observed_under_load: "pass".to_owned(),
+                no_underlay_cleartext_during_load: "pass".to_owned(),
+                tunnel_down_fail_closed: "pass".to_owned(),
+                no_underlay_cleartext_after_tunnel_down: "pass".to_owned(),
             },
             metrics: RealWireguardNoLeakUnderLoadMetricsView {
                 load_tunnel_packets: 12,
                 load_cleartext_packets: 0,
                 down_cleartext_packets: 0,
             },
-            source_artifacts: vec!["/tmp/load.pcap".to_string(), "/tmp/down.pcap".to_string()],
+            source_artifacts: vec!["/tmp/load.pcap".to_owned(), "/tmp/down.pcap".to_owned()],
         }
     }
 
@@ -5046,22 +5044,22 @@ mod tests {
         let baseline = baseline_real_wireguard_no_leak_under_load_pass_view().checks;
         for tweak in [
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.tunnel_up_connectivity = "fail".to_string()
+                c.tunnel_up_connectivity = "fail".to_owned()
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.load_ping_success = "fail".to_string()
+                c.load_ping_success = "fail".to_owned()
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.tunnel_transport_observed_under_load = "fail".to_string()
+                c.tunnel_transport_observed_under_load = "fail".to_owned()
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.no_underlay_cleartext_during_load = "fail".to_string()
+                c.no_underlay_cleartext_during_load = "fail".to_owned()
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.tunnel_down_fail_closed = "fail".to_string()
+                c.tunnel_down_fail_closed = "fail".to_owned()
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.no_underlay_cleartext_after_tunnel_down = "fail".to_string()
+                c.no_underlay_cleartext_after_tunnel_down = "fail".to_owned()
             },
         ] {
             let mut checks = baseline.clone();
@@ -5094,8 +5092,8 @@ mod tests {
             .and_then(Value::as_object_mut)
             .expect("metrics object");
         metrics.insert(
-            "load_tunnel_packets".to_string(),
-            Value::String("twelve".to_string()),
+            "load_tunnel_packets".to_owned(),
+            Value::String("twelve".to_owned()),
         );
         let err = serde_json::from_value::<RealWireguardNoLeakUnderLoadReportView>(value)
             .expect_err("string load_tunnel_packets must fail closed at the typed boundary");
@@ -5114,7 +5112,7 @@ mod tests {
         // numeric source_artifact would silently parse as Value::Number — but
         // the typed view pins Vec<String>, so this must fail closed.
         value.as_object_mut().expect("object").insert(
-            "source_artifacts".to_string(),
+            "source_artifacts".to_owned(),
             serde_json::json!([42, "/tmp/down.pcap"]),
         );
         let err = serde_json::from_value::<RealWireguardNoLeakUnderLoadReportView>(value)
@@ -5129,12 +5127,12 @@ mod tests {
     #[test]
     fn no_leak_packet_counters_detect_expected_patterns() {
         let load_lines = vec![
-            "IP 172.16.10.2.12345 > 172.16.10.1.51820: UDP, length 64".to_string(),
-            "IP 172.16.10.2.44444 > 198.18.0.1.53: UDP, length 32".to_string(),
+            "IP 172.16.10.2.12345 > 172.16.10.1.51820: UDP, length 64".to_owned(),
+            "IP 172.16.10.2.44444 > 198.18.0.1.53: UDP, length 32".to_owned(),
         ];
         let down_lines = vec![
-            "IP 172.16.10.2.55555 > 198.18.0.1.53: UDP, length 32".to_string(),
-            "IP 172.16.10.2.66666 > 172.16.10.1.51820: UDP, length 64".to_string(),
+            "IP 172.16.10.2.55555 > 198.18.0.1.53: UDP, length 32".to_owned(),
+            "IP 172.16.10.2.66666 > 172.16.10.1.51820: UDP, length 64".to_owned(),
         ];
         assert_eq!(count_no_leak_tunnel_packets(&load_lines), 1);
         assert_eq!(count_no_leak_cleartext_packets(&load_lines), 1);
@@ -5146,8 +5144,8 @@ mod tests {
         let output = "dns inspect: state=valid fqdn=exit.rustynet expected_ip=100.64.0.1";
         let expected =
             execute_ops_extract_managed_dns_expected_ip(ExtractManagedDnsExpectedIpConfig {
-                fqdn: "exit.rustynet".to_string(),
-                inspect_output: output.to_string(),
+                fqdn: "exit.rustynet".to_owned(),
+                inspect_output: output.to_owned(),
             })
             .expect("extract expected ip");
         assert_eq!(expected, "100.64.0.1");
@@ -5160,8 +5158,8 @@ record.0.fqdn=client.rustynet record.0.expected_ip=100.68.223.117 \
 record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let expected =
             execute_ops_extract_managed_dns_expected_ip(ExtractManagedDnsExpectedIpConfig {
-                fqdn: "exit.rustynet".to_string(),
-                inspect_output: output.to_string(),
+                fqdn: "exit.rustynet".to_owned(),
+                inspect_output: output.to_owned(),
             })
             .expect("extract expected ip");
         assert_eq!(expected, "100.109.33.213");
@@ -5173,17 +5171,17 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let status = execute_ops_write_active_network_signed_state_tamper_report(
             WriteActiveNetworkSignedStateTamperReportConfig {
                 report_path: report_path.clone(),
-                baseline_status: "pass".to_string(),
-                tamper_reject_status: "pass".to_string(),
-                fail_closed_status: "pass".to_string(),
-                netcheck_fail_closed_status: "pass".to_string(),
-                recovery_status: "pass".to_string(),
-                exit_host: "192.168.18.49".to_string(),
-                client_host: "192.168.18.50".to_string(),
-                status_after_tamper: "state=FailClosed".to_string(),
-                netcheck_after_tamper: "path_mode=fail_closed".to_string(),
-                status_after_recovery: "state=ExitActive".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                baseline_status: "pass".to_owned(),
+                tamper_reject_status: "pass".to_owned(),
+                fail_closed_status: "pass".to_owned(),
+                netcheck_fail_closed_status: "pass".to_owned(),
+                recovery_status: "pass".to_owned(),
+                exit_host: "192.168.18.49".to_owned(),
+                client_host: "192.168.18.50".to_owned(),
+                status_after_tamper: "state=FailClosed".to_owned(),
+                netcheck_after_tamper: "path_mode=fail_closed".to_owned(),
+                status_after_recovery: "state=ExitActive".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -5198,27 +5196,27 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
     fn baseline_active_network_signed_state_tamper_pass_view()
     -> ActiveNetworkSignedStateTamperReportView {
         ActiveNetworkSignedStateTamperReportView {
-            phase: "phase10".to_string(),
-            mode: "active_network_signed_state_tamper".to_string(),
-            evidence_mode: "measured".to_string(),
-            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            phase: "phase10".to_owned(),
+            mode: "active_network_signed_state_tamper".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            captured_at: "2026-03-21T10:00:00Z".to_owned(),
             captured_at_unix: 1_772_983_200,
-            status: "pass".to_string(),
+            status: "pass".to_owned(),
             hosts: ActiveNetworkSignedStateTamperHostsView {
-                exit_host: "192.168.18.49".to_string(),
-                client_host: "192.168.18.50".to_string(),
+                exit_host: "192.168.18.49".to_owned(),
+                client_host: "192.168.18.50".to_owned(),
             },
             checks: ActiveNetworkSignedStateTamperChecksView {
-                baseline_two_node_e2e: "pass".to_string(),
-                tampered_signed_assignment_rejected: "pass".to_string(),
-                fail_closed_engaged: "pass".to_string(),
-                netcheck_reports_fail_closed: "pass".to_string(),
-                recovery_restored_secure_runtime: "pass".to_string(),
+                baseline_two_node_e2e: "pass".to_owned(),
+                tampered_signed_assignment_rejected: "pass".to_owned(),
+                fail_closed_engaged: "pass".to_owned(),
+                netcheck_reports_fail_closed: "pass".to_owned(),
+                recovery_restored_secure_runtime: "pass".to_owned(),
             },
             evidence: ActiveNetworkSignedStateTamperEvidenceView {
-                status_after_tamper: "state=FailClosed".to_string(),
-                netcheck_after_tamper: "path_mode=fail_closed".to_string(),
-                status_after_recovery: "state=ExitActive".to_string(),
+                status_after_tamper: "state=FailClosed".to_owned(),
+                netcheck_after_tamper: "path_mode=fail_closed".to_owned(),
+                status_after_recovery: "state=ExitActive".to_owned(),
             },
         }
     }
@@ -5247,19 +5245,19 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let baseline = baseline_active_network_signed_state_tamper_pass_view().checks;
         for tweak in [
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.baseline_two_node_e2e = "fail".to_string()
+                c.baseline_two_node_e2e = "fail".to_owned()
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.tampered_signed_assignment_rejected = "fail".to_string()
+                c.tampered_signed_assignment_rejected = "fail".to_owned()
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.fail_closed_engaged = "fail".to_string()
+                c.fail_closed_engaged = "fail".to_owned()
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.netcheck_reports_fail_closed = "fail".to_string()
+                c.netcheck_reports_fail_closed = "fail".to_owned()
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.recovery_restored_secure_runtime = "fail".to_string()
+                c.recovery_restored_secure_runtime = "fail".to_owned()
             },
         ] {
             let mut checks = baseline.clone();
@@ -5291,7 +5289,7 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
             .get_mut("hosts")
             .and_then(Value::as_object_mut)
             .expect("hosts object");
-        hosts.insert("client_host".to_string(), Value::Bool(true));
+        hosts.insert("client_host".to_owned(), Value::Bool(true));
         let err = serde_json::from_value::<ActiveNetworkSignedStateTamperReportView>(value)
             .expect_err("bool client_host must fail closed at the typed boundary");
         let message = err.to_string();
@@ -5307,17 +5305,17 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let _ = execute_ops_write_active_network_signed_state_tamper_report(
             WriteActiveNetworkSignedStateTamperReportConfig {
                 report_path: report_path.clone(),
-                baseline_status: "pass".to_string(),
-                tamper_reject_status: "pass".to_string(),
-                fail_closed_status: "pass".to_string(),
-                netcheck_fail_closed_status: "pass".to_string(),
-                recovery_status: "pass".to_string(),
-                exit_host: "10.0.0.49".to_string(),
-                client_host: "10.0.0.50".to_string(),
-                status_after_tamper: "state=FailClosed".to_string(),
-                netcheck_after_tamper: "path_mode=fail_closed".to_string(),
-                status_after_recovery: "state=ExitActive".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                baseline_status: "pass".to_owned(),
+                tamper_reject_status: "pass".to_owned(),
+                fail_closed_status: "pass".to_owned(),
+                netcheck_fail_closed_status: "pass".to_owned(),
+                recovery_status: "pass".to_owned(),
+                exit_host: "10.0.0.49".to_owned(),
+                client_host: "10.0.0.50".to_owned(),
+                status_after_tamper: "state=FailClosed".to_owned(),
+                netcheck_after_tamper: "path_mode=fail_closed".to_owned(),
+                status_after_recovery: "state=ExitActive".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -5338,23 +5336,23 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let status = execute_ops_write_active_network_rogue_path_hijack_report(
             WriteActiveNetworkRoguePathHijackReportConfig {
                 report_path: report_path.clone(),
-                baseline_status: "pass".to_string(),
-                hijack_reject_status: "pass".to_string(),
-                fail_closed_status: "pass".to_string(),
-                netcheck_fail_closed_status: "pass".to_string(),
-                no_rogue_endpoint_status: "fail".to_string(),
-                recovery_status: "pass".to_string(),
-                recovery_endpoint_status: "pass".to_string(),
-                rogue_endpoint_ip: "203.0.113.10".to_string(),
-                exit_host: "192.168.18.49".to_string(),
-                client_host: "192.168.18.50".to_string(),
-                endpoints_before: "peer-a=192.168.18.49:51820".to_string(),
-                endpoints_after_hijack: "peer-a=203.0.113.10:51820".to_string(),
-                endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_string(),
-                status_after_hijack: "state=FailClosed".to_string(),
-                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
-                status_after_recovery: "state=ExitActive".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                baseline_status: "pass".to_owned(),
+                hijack_reject_status: "pass".to_owned(),
+                fail_closed_status: "pass".to_owned(),
+                netcheck_fail_closed_status: "pass".to_owned(),
+                no_rogue_endpoint_status: "fail".to_owned(),
+                recovery_status: "pass".to_owned(),
+                recovery_endpoint_status: "pass".to_owned(),
+                rogue_endpoint_ip: "203.0.113.10".to_owned(),
+                exit_host: "192.168.18.49".to_owned(),
+                client_host: "192.168.18.50".to_owned(),
+                endpoints_before: "peer-a=192.168.18.49:51820".to_owned(),
+                endpoints_after_hijack: "peer-a=203.0.113.10:51820".to_owned(),
+                endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_owned(),
+                status_after_hijack: "state=FailClosed".to_owned(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
+                status_after_recovery: "state=ExitActive".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -5369,33 +5367,33 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
     fn baseline_active_network_rogue_path_hijack_pass_view()
     -> ActiveNetworkRoguePathHijackReportView {
         ActiveNetworkRoguePathHijackReportView {
-            phase: "phase10".to_string(),
-            mode: "active_network_rogue_path_hijack".to_string(),
-            evidence_mode: "measured".to_string(),
-            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            phase: "phase10".to_owned(),
+            mode: "active_network_rogue_path_hijack".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            captured_at: "2026-03-21T10:00:00Z".to_owned(),
             captured_at_unix: 1_772_983_200,
-            status: "pass".to_string(),
+            status: "pass".to_owned(),
             hosts: ActiveNetworkRoguePathHijackHostsView {
-                exit_host: "192.168.18.49".to_string(),
-                client_host: "192.168.18.50".to_string(),
+                exit_host: "192.168.18.49".to_owned(),
+                client_host: "192.168.18.50".to_owned(),
             },
-            rogue_endpoint_ip: "203.0.113.10".to_string(),
+            rogue_endpoint_ip: "203.0.113.10".to_owned(),
             checks: ActiveNetworkRoguePathHijackChecksView {
-                baseline_two_node_e2e: "pass".to_string(),
-                forged_endpoint_assignment_rejected: "pass".to_string(),
-                fail_closed_engaged: "pass".to_string(),
-                netcheck_reports_fail_closed: "pass".to_string(),
-                rogue_endpoint_not_adopted: "pass".to_string(),
-                recovery_restored_secure_runtime: "pass".to_string(),
-                recovery_keeps_rogue_endpoint_rejected: "pass".to_string(),
+                baseline_two_node_e2e: "pass".to_owned(),
+                forged_endpoint_assignment_rejected: "pass".to_owned(),
+                fail_closed_engaged: "pass".to_owned(),
+                netcheck_reports_fail_closed: "pass".to_owned(),
+                rogue_endpoint_not_adopted: "pass".to_owned(),
+                recovery_restored_secure_runtime: "pass".to_owned(),
+                recovery_keeps_rogue_endpoint_rejected: "pass".to_owned(),
             },
             evidence: ActiveNetworkRoguePathHijackEvidenceView {
-                wg_endpoints_before: "peer-a=192.168.18.49:51820".to_string(),
-                wg_endpoints_after_hijack: "peer-a=192.168.18.49:51820".to_string(),
-                wg_endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_string(),
-                status_after_hijack: "state=FailClosed".to_string(),
-                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
-                status_after_recovery: "state=ExitActive".to_string(),
+                wg_endpoints_before: "peer-a=192.168.18.49:51820".to_owned(),
+                wg_endpoints_after_hijack: "peer-a=192.168.18.49:51820".to_owned(),
+                wg_endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_owned(),
+                status_after_hijack: "state=FailClosed".to_owned(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
+                status_after_recovery: "state=ExitActive".to_owned(),
             },
         }
     }
@@ -5424,25 +5422,25 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let baseline = baseline_active_network_rogue_path_hijack_pass_view().checks;
         for tweak in [
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.baseline_two_node_e2e = "fail".to_string()
+                c.baseline_two_node_e2e = "fail".to_owned()
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.forged_endpoint_assignment_rejected = "fail".to_string()
+                c.forged_endpoint_assignment_rejected = "fail".to_owned()
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.fail_closed_engaged = "fail".to_string()
+                c.fail_closed_engaged = "fail".to_owned()
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.netcheck_reports_fail_closed = "fail".to_string()
+                c.netcheck_reports_fail_closed = "fail".to_owned()
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.rogue_endpoint_not_adopted = "fail".to_string()
+                c.rogue_endpoint_not_adopted = "fail".to_owned()
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.recovery_restored_secure_runtime = "fail".to_string()
+                c.recovery_restored_secure_runtime = "fail".to_owned()
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_string()
+                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_owned()
             },
         ] {
             let mut checks = baseline.clone();
@@ -5473,23 +5471,23 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let _ = execute_ops_write_active_network_rogue_path_hijack_report(
             WriteActiveNetworkRoguePathHijackReportConfig {
                 report_path: report_path.clone(),
-                baseline_status: "pass".to_string(),
-                hijack_reject_status: "pass".to_string(),
-                fail_closed_status: "pass".to_string(),
-                netcheck_fail_closed_status: "pass".to_string(),
-                no_rogue_endpoint_status: "pass".to_string(),
-                recovery_status: "pass".to_string(),
-                recovery_endpoint_status: "pass".to_string(),
-                rogue_endpoint_ip: "203.0.113.10".to_string(),
-                exit_host: "192.168.18.49".to_string(),
-                client_host: "192.168.18.50".to_string(),
-                endpoints_before: "peer-a=192.168.18.49:51820".to_string(),
-                endpoints_after_hijack: "peer-a=192.168.18.49:51820".to_string(),
-                endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_string(),
-                status_after_hijack: "state=FailClosed".to_string(),
-                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
-                status_after_recovery: "state=ExitActive".to_string(),
-                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                baseline_status: "pass".to_owned(),
+                hijack_reject_status: "pass".to_owned(),
+                fail_closed_status: "pass".to_owned(),
+                netcheck_fail_closed_status: "pass".to_owned(),
+                no_rogue_endpoint_status: "pass".to_owned(),
+                recovery_status: "pass".to_owned(),
+                recovery_endpoint_status: "pass".to_owned(),
+                rogue_endpoint_ip: "203.0.113.10".to_owned(),
+                exit_host: "192.168.18.49".to_owned(),
+                client_host: "192.168.18.50".to_owned(),
+                endpoints_before: "peer-a=192.168.18.49:51820".to_owned(),
+                endpoints_after_hijack: "peer-a=192.168.18.49:51820".to_owned(),
+                endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_owned(),
+                status_after_hijack: "state=FailClosed".to_owned(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
+                status_after_recovery: "state=ExitActive".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
         )
@@ -5515,7 +5513,7 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
 
         let output = stage_dir.join("artifact_index.json");
         execute_ops_write_live_lab_stage_artifact_index(WriteLiveLabStageArtifactIndexConfig {
-            stage_name: "cross_network_direct_remote_exit".to_string(),
+            stage_name: "cross_network_direct_remote_exit".to_owned(),
             stage_dir: stage_dir.clone(),
             output: output.clone(),
         })
@@ -5582,7 +5580,7 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         execute_ops_validate_cross_network_forensics_bundle(
             ValidateCrossNetworkForensicsBundleConfig {
                 nodes_tsv: stage_dir.join("nodes.tsv"),
-                stage_name: "cross_network_direct_remote_exit".to_string(),
+                stage_name: "cross_network_direct_remote_exit".to_owned(),
                 stage_dir: stage_dir.clone(),
                 output: output.clone(),
             },
@@ -5651,7 +5649,7 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let err = execute_ops_validate_cross_network_forensics_bundle(
             ValidateCrossNetworkForensicsBundleConfig {
                 nodes_tsv: stage_dir.join("nodes.tsv"),
-                stage_name: "cross_network_direct_remote_exit".to_string(),
+                stage_name: "cross_network_direct_remote_exit".to_owned(),
                 stage_dir: stage_dir.clone(),
                 output: output.clone(),
             },
@@ -6391,8 +6389,8 @@ mod typed_parser_tests {
         assert_eq!(view.node_id, "client-1");
         assert_eq!(view.role, "client");
         assert_eq!(view.node_dir, "/tmp/bundle/client");
-        assert_eq!(view.missing_files, vec!["client/firewall.txt".to_string()]);
-        assert_eq!(view.empty_files, vec!["client/dns_state.txt".to_string()]);
+        assert_eq!(view.missing_files, vec!["client/firewall.txt".to_owned()]);
+        assert_eq!(view.empty_files, vec!["client/dns_state.txt".to_owned()]);
         assert_eq!(
             view.extra.get("extra_hint").and_then(Value::as_str),
             Some("future-field")
@@ -6469,8 +6467,8 @@ mod typed_parser_tests {
         assert_eq!(view.missing_file_count, 1);
         assert_eq!(view.empty_file_count, 1);
         assert_eq!(view.invalid_file_count, 0);
-        assert_eq!(view.missing_files, vec!["client/firewall.txt".to_string()]);
-        assert_eq!(view.empty_files, vec!["client/dns_state.txt".to_string()]);
+        assert_eq!(view.missing_files, vec!["client/firewall.txt".to_owned()]);
+        assert_eq!(view.empty_files, vec!["client/dns_state.txt".to_owned()]);
         assert!(view.invalid_files.is_empty());
         assert_eq!(view.nodes.len(), 1);
         assert_eq!(view.nodes[0].label, "client");

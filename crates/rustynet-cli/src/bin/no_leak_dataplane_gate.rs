@@ -95,7 +95,7 @@ fn run() -> Result<(), i32> {
 fn current_os() -> String {
     Command::new("uname").arg("-s").output().map_or_else(
         |_| String::new(),
-        |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
     )
 }
 

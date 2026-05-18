@@ -177,7 +177,7 @@ impl NodeAdapter for MacosNodeAdapter {
             crate::vm_lab::orchestrator::connection::NodeConnection::Ssh { host, .. } => {
                 format!("{host}:51820")
             }
-            _ => "0.0.0.0:51820".to_string(),
+            _ => "0.0.0.0:51820".to_owned(),
         }
     }
 
@@ -215,7 +215,7 @@ mod tests {
         let conn = NodeConnection::ssh(
             "10.0.0.1",
             22,
-            Some("admin".to_string()),
+            Some("admin".to_owned()),
             PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
         )
@@ -247,7 +247,7 @@ mod tests {
             f.path().to_path_buf(),
         )
         .unwrap();
-        let adapter = MacosNodeAdapter::new("mac", conn, Some("/Users/admin/rustynet".to_string()));
+        let adapter = MacosNodeAdapter::new("mac", conn, Some("/Users/admin/rustynet".to_owned()));
         assert_eq!(adapter.workdir.as_deref(), Some("/Users/admin/rustynet"));
     }
 }

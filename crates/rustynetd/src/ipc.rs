@@ -70,17 +70,17 @@ impl IpcCommand {
 
     pub fn as_wire(&self) -> String {
         match self {
-            IpcCommand::Status => "status".to_string(),
-            IpcCommand::Netcheck => "netcheck".to_string(),
-            IpcCommand::StateRefresh => "state refresh".to_string(),
+            IpcCommand::Status => "status".to_owned(),
+            IpcCommand::Netcheck => "netcheck".to_owned(),
+            IpcCommand::StateRefresh => "state refresh".to_owned(),
             IpcCommand::ExitNodeSelect(node) => format!("exit-node select {node}"),
-            IpcCommand::ExitNodeOff => "exit-node off".to_string(),
-            IpcCommand::LanAccessOn => "lan-access on".to_string(),
-            IpcCommand::LanAccessOff => "lan-access off".to_string(),
-            IpcCommand::DnsInspect => "dns inspect".to_string(),
+            IpcCommand::ExitNodeOff => "exit-node off".to_owned(),
+            IpcCommand::LanAccessOn => "lan-access on".to_owned(),
+            IpcCommand::LanAccessOff => "lan-access off".to_owned(),
+            IpcCommand::DnsInspect => "dns inspect".to_owned(),
             IpcCommand::RouteAdvertise(cidr) => format!("route advertise {cidr}"),
-            IpcCommand::KeyRotate => "key rotate".to_string(),
-            IpcCommand::KeyRevoke => "key revoke".to_string(),
+            IpcCommand::KeyRotate => "key rotate".to_owned(),
+            IpcCommand::KeyRevoke => "key revoke".to_owned(),
             IpcCommand::Unknown(raw) => raw.clone(),
         }
     }
@@ -116,7 +116,7 @@ impl IpcResponse {
         let trimmed = value.trim();
         let mut parts = trimmed.splitn(2, '|');
         let status = parts.next().unwrap_or("err");
-        let message = parts.next().unwrap_or("invalid response").to_string();
+        let message = parts.next().unwrap_or("invalid response").to_owned();
         Self {
             ok: status == "ok",
             message,
@@ -145,7 +145,7 @@ pub fn parse_command(raw: &str) -> IpcCommand {
         }
         [cmd, subcmd] if cmd == "key" && subcmd == "rotate" => IpcCommand::KeyRotate,
         [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => IpcCommand::KeyRevoke,
-        _ => IpcCommand::Unknown(raw.trim().to_string()),
+        _ => IpcCommand::Unknown(raw.trim().to_owned()),
     }
 }
 
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn parse_and_wire_roundtrip_for_mutating_command() {
         let command = parse_command("exit-node select mini-pc-1");
-        assert_eq!(command, IpcCommand::ExitNodeSelect("mini-pc-1".to_string()));
+        assert_eq!(command, IpcCommand::ExitNodeSelect("mini-pc-1".to_owned()));
         assert!(command.is_mutating());
         assert_eq!(command.as_wire(), "exit-node select mini-pc-1");
     }

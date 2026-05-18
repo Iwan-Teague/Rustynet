@@ -109,24 +109,24 @@ impl StateFetcher {
         let url = url.trim();
         if !url.starts_with("http://") {
             return Err(FetchError::Network(
-                "only http:// URLs are supported in this minimal fetcher".to_string(),
+                "only http:// URLs are supported in this minimal fetcher".to_owned(),
             ));
         }
         let without_proto = &url[7..];
         let parts: Vec<&str> = without_proto.splitn(2, '/').collect();
         let host_port = parts
             .first()
-            .ok_or_else(|| FetchError::Network("invalid url".to_string()))?;
+            .ok_or_else(|| FetchError::Network("invalid url".to_owned()))?;
         let path = format!("/{}", parts.get(1).unwrap_or(&""));
         let mut host = host_port.to_string();
         let mut port = 80u16;
         if host_port.contains(':') {
             let mut hp = host_port.splitn(2, ':');
-            host = hp.next().unwrap_or("").to_string();
+            host = hp.next().unwrap_or("").to_owned();
             if let Some(p) = hp.next() {
                 port = p
                     .parse::<u16>()
-                    .map_err(|_| FetchError::Network("invalid port in url".to_string()))?;
+                    .map_err(|_| FetchError::Network("invalid port in url".to_owned()))?;
             }
         }
         let addr = format!("{host}:{port}");
@@ -136,10 +136,10 @@ impl StateFetcher {
             .map_err(|e| FetchError::Network(format!("resolve failed: {e}")))?;
         let mut stream = match socket_addrs.into_iter().next() {
             Some(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(3))
-                .map_err(|_| FetchError::Network("network unreachable".to_string()))?,
+                .map_err(|_| FetchError::Network("network unreachable".to_owned()))?,
             None => {
                 return Err(FetchError::Network(
-                    "resolve returned no addresses".to_string(),
+                    "resolve returned no addresses".to_owned(),
                 ));
             }
         };
@@ -161,7 +161,7 @@ impl StateFetcher {
             Ok(buf.split_off(idx + 4))
         } else {
             Err(FetchError::InvalidResponse(
-                "malformed http response".to_string(),
+                "malformed http response".to_owned(),
             ))
         }
     }
@@ -211,8 +211,7 @@ pub struct SignedBundle {
 
 impl SignedBundle {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let text =
-            std::str::from_utf8(bytes).map_err(|_| "bundle is not valid utf8".to_string())?;
+        let text = std::str::from_utf8(bytes).map_err(|_| "bundle is not valid utf8".to_owned())?;
 
         let sig_marker = "signature=";
         let mut signature_bytes = [0u8; 64];
@@ -242,7 +241,7 @@ impl SignedBundle {
                 let hex_str = rest.trim();
                 let decoded = hex_decode(hex_str)?;
                 if decoded.len() != 64 {
-                    return Err("invalid signature length".to_string());
+                    return Err("invalid signature length".to_owned());
                 }
                 signature_bytes.copy_from_slice(&decoded);
                 found_sig = true;
@@ -265,7 +264,7 @@ impl SignedBundle {
         }
 
         if !found_sig {
-            return Err("missing signature".to_string());
+            return Err("missing signature".to_owned());
         }
 
         let sig_idx = text.rfind(sig_marker).ok_or("signature marker missing")?;
@@ -308,7 +307,7 @@ impl WatermarkStore {
         }
 
         self.watermarks
-            .insert(bundle_type.to_string(), new_watermark);
+            .insert(bundle_type.to_owned(), new_watermark);
         self.persist_to_disk()?;
 
         Ok(())
@@ -331,7 +330,7 @@ impl WatermarkStore {
             if parts.len() != 2 {
                 return Err(format!("malformed watermark line: {line}"));
             }
-            let key = parts[0].to_string();
+            let key = parts[0].to_owned();
             let value = parts[1]
                 .parse::<u64>()
                 .map_err(|e| format!("invalid watermark value: {e}"))?;
@@ -409,11 +408,11 @@ impl RefreshScheduler {
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
-        return Err("hex string has odd length".to_string());
+        return Err("hex string has odd length".to_owned());
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "invalid hex char".to_string()))
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "invalid hex char".to_owned()))
         .collect()
 }
 
@@ -656,7 +655,7 @@ mod tests {
         let wrong_key = SigningKey::from_bytes(&[2u8; 32]);
         let dir = tempfile::tempdir().unwrap();
         let mut fetcher = StateFetcher::new(
-            "http://unit.test".to_string(),
+            "http://unit.test".to_owned(),
             dir.path().join("watermark"),
             verifying_key,
         )
@@ -683,12 +682,9 @@ mod tests {
             store.advance("trust", 500).unwrap();
         }
 
-        let mut fetcher = StateFetcher::new(
-            "http://unit.test".to_string(),
-            watermark_path,
-            verifying_key,
-        )
-        .unwrap();
+        let mut fetcher =
+            StateFetcher::new("http://unit.test".to_owned(), watermark_path, verifying_key)
+                .unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -706,7 +702,7 @@ mod tests {
         let (signing_key, verifying_key) = make_test_keypair();
         let dir = tempfile::tempdir().unwrap();
         let mut fetcher = StateFetcher::new(
-            "http://unit.test".to_string(),
+            "http://unit.test".to_owned(),
             dir.path().join("watermark"),
             verifying_key,
         )
@@ -735,8 +731,7 @@ mod tests {
         // Use a random port that we don't bind.
         let url = "http://127.0.0.1:54321";
 
-        let mut fetcher =
-            StateFetcher::new(url.to_string(), watermark_path, verifying_key).unwrap();
+        let mut fetcher = StateFetcher::new(url.to_owned(), watermark_path, verifying_key).unwrap();
 
         match fetcher.fetch_trust() {
             Err(FetchError::Network(_)) => {}

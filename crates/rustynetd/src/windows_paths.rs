@@ -204,7 +204,7 @@ pub fn collect_windows_runtime_acl_report() -> WindowsRuntimeAclReport {
             let path = Path::new(path_str);
             let status = inspect_runtime_root_status(path, label);
             WindowsRuntimeAclRootEntry {
-                label: (*label).to_string(),
+                label: (*label).to_owned(),
                 path: path.display().to_string(),
                 status,
             }
@@ -774,8 +774,8 @@ mod tests {
     #[test]
     fn windows_runtime_acl_report_root_status_serializes_with_status_tag() {
         let entry_ok = WindowsRuntimeAclRootEntry {
-            label: "state root".to_string(),
-            path: r"C:\ProgramData\RustyNet".to_string(),
+            label: "state root".to_owned(),
+            path: r"C:\ProgramData\RustyNet".to_owned(),
             status: WindowsRuntimeAclRootStatus::Ok,
         };
         let json = serde_json::to_value(&entry_ok).expect("serialize ok entry");
@@ -784,10 +784,10 @@ mod tests {
         assert_eq!(json["path"], r"C:\ProgramData\RustyNet");
 
         let entry_drifted = WindowsRuntimeAclRootEntry {
-            label: "config root".to_string(),
-            path: r"C:\ProgramData\RustyNet\config".to_string(),
+            label: "config root".to_owned(),
+            path: r"C:\ProgramData\RustyNet\config".to_owned(),
             status: WindowsRuntimeAclRootStatus::Drifted {
-                reason: "config root ACL must grant LocalSystem access".to_string(),
+                reason: "config root ACL must grant LocalSystem access".to_owned(),
             },
         };
         let json = serde_json::to_value(&entry_drifted).expect("serialize drifted entry");
@@ -798,10 +798,10 @@ mod tests {
         );
 
         let entry_missing = WindowsRuntimeAclRootEntry {
-            label: "log root".to_string(),
-            path: r"C:\ProgramData\RustyNet\logs".to_string(),
+            label: "log root".to_owned(),
+            path: r"C:\ProgramData\RustyNet\logs".to_owned(),
             status: WindowsRuntimeAclRootStatus::Missing {
-                reason: "log root must be a real directory".to_string(),
+                reason: "log root must be a real directory".to_owned(),
             },
         };
         let json = serde_json::to_value(&entry_missing).expect("serialize missing entry");

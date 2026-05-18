@@ -57,7 +57,7 @@ impl OrchestrationStage for CollectPubkeysStage {
                         Err(format!("no adapter for '{alias}'")),
                         Err(format!("no adapter for '{alias}'")),
                         None,
-                        "0.0.0.0:51820".to_string(),
+                        "0.0.0.0:51820".to_owned(),
                     ),
                 };
                 NodeData {
@@ -113,7 +113,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

@@ -270,7 +270,7 @@ pub fn evaluate_nrpt_ipv6_sibling_coverage(snapshot: &WindowsDnsFailclosedSnapsh
             }
         }
         for ns in &rule.namespace {
-            let trimmed_ns = ns.trim().to_string();
+            let trimmed_ns = ns.trim().to_owned();
             if trimmed_ns.is_empty() {
                 continue;
             }
@@ -335,7 +335,7 @@ pub fn evaluate_router_advertisement_suppression(
                 "router_advertisement_observation is absent; \
                  RA suppression cannot be proven from a non-observation \
                  (fail-closed)"
-                    .to_string(),
+                    .to_owned(),
             ];
         }
     };
@@ -403,10 +403,10 @@ fn parse_dns_address(raw: &str, family: WindowsDnsAddressFamily) -> Result<IpAdd
         (IpAddr::V4(_), WindowsDnsAddressFamily::Ipv4) => Ok(addr),
         (IpAddr::V6(_), WindowsDnsAddressFamily::Ipv6) => Ok(addr),
         (IpAddr::V4(_), WindowsDnsAddressFamily::Ipv6) => {
-            Err("IPv4 address listed in an IPv6 server entry".to_string())
+            Err("IPv4 address listed in an IPv6 server entry".to_owned())
         }
         (IpAddr::V6(_), WindowsDnsAddressFamily::Ipv4) => {
-            Err("IPv6 address listed in an IPv4 server entry".to_string())
+            Err("IPv6 address listed in an IPv4 server entry".to_owned())
         }
     }
 }
@@ -481,7 +481,7 @@ pub fn collect_windows_dns_failclosed_snapshot() -> Result<WindowsDnsFailclosedS
 
 #[cfg(not(windows))]
 pub fn collect_windows_dns_failclosed_snapshot() -> Result<WindowsDnsFailclosedSnapshot, String> {
-    Err("windows-dns-failclosed-check requires a Windows runtime host".to_string())
+    Err("windows-dns-failclosed-check requires a Windows runtime host".to_owned())
 }
 
 /// Static PowerShell script body invoked by the Windows collector.
@@ -534,7 +534,7 @@ pub fn parse_windows_dns_probe_output(
 ) -> Result<WindowsDnsFailclosedSnapshot, String> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        return Err("powershell.exe DNS probe produced empty output".to_string());
+        return Err("powershell.exe DNS probe produced empty output".to_owned());
     }
     serde_json::from_str::<WindowsDnsFailclosedSnapshot>(trimmed)
         .map_err(|err| format!("failed to parse DNS probe JSON: {err}"))
@@ -549,28 +549,28 @@ mod tests {
             schema_version: 1,
             interfaces: vec![
                 WindowsInterfaceDnsEntry {
-                    interface_alias: "Ethernet".to_string(),
+                    interface_alias: "Ethernet".to_owned(),
                     interface_index: 12,
                     address_family: WindowsDnsAddressFamily::Ipv4,
-                    server_addresses: vec!["127.0.0.1".to_string()],
+                    server_addresses: vec!["127.0.0.1".to_owned()],
                 },
                 WindowsInterfaceDnsEntry {
-                    interface_alias: "Ethernet".to_string(),
+                    interface_alias: "Ethernet".to_owned(),
                     interface_index: 12,
                     address_family: WindowsDnsAddressFamily::Ipv6,
-                    server_addresses: vec!["::1".to_string()],
+                    server_addresses: vec!["::1".to_owned()],
                 },
                 WindowsInterfaceDnsEntry {
-                    interface_alias: "Loopback Pseudo-Interface 1".to_string(),
+                    interface_alias: "Loopback Pseudo-Interface 1".to_owned(),
                     interface_index: 1,
                     address_family: WindowsDnsAddressFamily::Ipv4,
                     server_addresses: vec![],
                 },
             ],
             nrpt_rules: vec![WindowsNrptRule {
-                name: "{rustynet-root-rule}".to_string(),
-                namespace: vec![".".to_string()],
-                name_servers: vec!["127.0.0.1".to_string()],
+                name: "{rustynet-root-rule}".to_owned(),
+                namespace: vec![".".to_owned()],
+                name_servers: vec!["127.0.0.1".to_owned()],
             }],
             router_advertisement_observation: None,
         }
@@ -587,8 +587,8 @@ mod tests {
         // Daemon may bind to any address inside 127.0.0.0/8; the
         // verifier must not lock to a single host within the prefix.
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[0].server_addresses = vec!["127.0.0.2".to_string()];
-        snapshot.nrpt_rules[0].name_servers = vec!["127.0.0.2".to_string()];
+        snapshot.interfaces[0].server_addresses = vec!["127.0.0.2".to_owned()];
+        snapshot.nrpt_rules[0].name_servers = vec!["127.0.0.2".to_owned()];
         evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect("any 127/8 host must be acceptable");
     }
@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_rogue_dns_server_on_interface() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[0].server_addresses = vec!["8.8.8.8".to_string()];
+        snapshot.interfaces[0].server_addresses = vec!["8.8.8.8".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("rogue interface DNS must fail closed");
         assert!(
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_rogue_ipv6_dns_server_on_interface() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[1].server_addresses = vec!["2606:4700:4700::1111".to_string()];
+        snapshot.interfaces[1].server_addresses = vec!["2606:4700:4700::1111".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("rogue IPv6 interface DNS must fail closed");
         assert!(
@@ -649,7 +649,7 @@ mod tests {
         let mut snapshot = reviewed_snapshot();
         // IPv6 entry that lists an IPv4 server is a misconfigured
         // fail-closed setup — the parser must surface the mismatch.
-        snapshot.interfaces[1].server_addresses = vec!["127.0.0.1".to_string()];
+        snapshot.interfaces[1].server_addresses = vec!["127.0.0.1".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("address-family mismatch must fail closed");
         assert!(
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_unparseable_dns_address() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[0].server_addresses = vec!["not-an-ip".to_string()];
+        snapshot.interfaces[0].server_addresses = vec!["not-an-ip".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("unparseable address must fail closed");
         assert!(
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_root_nrpt_rule_with_non_loopback_name_server() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["1.1.1.1".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["1.1.1.1".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("root NRPT pointing off-loopback must fail closed");
         // Two reasons surface: the per-rule address scan AND the
@@ -712,9 +712,9 @@ mod tests {
         // rule still covers `.` so the missing-root drift does NOT
         // surface — only the empty-namespace drift should.
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{stale-rule}".to_string(),
+            name: "{stale-rule}".to_owned(),
             namespace: vec![],
-            name_servers: vec!["127.0.0.1".to_string()],
+            name_servers: vec!["127.0.0.1".to_owned()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("empty-namespace rule must fail closed");
@@ -728,9 +728,9 @@ mod tests {
     fn evaluator_rejects_nrpt_rule_with_empty_namespace_entry() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{stale-rule}".to_string(),
+            name: "{stale-rule}".to_owned(),
             namespace: vec![String::new()],
-            name_servers: vec!["127.0.0.1".to_string()],
+            name_servers: vec!["127.0.0.1".to_owned()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("empty-namespace-entry rule must fail closed");
@@ -757,8 +757,8 @@ mod tests {
     #[test]
     fn evaluator_aggregates_multiple_drift_reasons() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[0].server_addresses = vec!["8.8.8.8".to_string()];
-        snapshot.nrpt_rules[0].name_servers = vec!["1.1.1.1".to_string()];
+        snapshot.interfaces[0].server_addresses = vec!["8.8.8.8".to_owned()];
+        snapshot.nrpt_rules[0].name_servers = vec!["1.1.1.1".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("compound drift must fail closed");
         // Three drift sources: rogue interface DNS, root rule
@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn build_report_surfaces_drift_for_rogue_interface_dns() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[0].server_addresses = vec!["8.8.8.8".to_string()];
+        snapshot.interfaces[0].server_addresses = vec!["8.8.8.8".to_owned()];
         let report = build_windows_dns_failclosed_report(snapshot);
         assert!(!report.overall_ok);
         assert!(report.drift_reasons.iter().any(|r| r.contains("8.8.8.8")));
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn evaluator_accepts_ipv6_loopback_only_root_nrpt_rule() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["::1".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["::1".to_owned()];
         evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect("IPv6 loopback ::1 must be acceptable as a root NRPT name server");
     }
@@ -847,7 +847,7 @@ mod tests {
     #[test]
     fn evaluator_accepts_ipv6_loopback_long_form_in_nrpt_rule() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["0:0:0:0:0:0:0:1".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["0:0:0:0:0:0:0:1".to_owned()];
         evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect("long-form IPv6 loopback must be acceptable in NRPT");
     }
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn evaluator_accepts_dual_stack_loopback_nrpt_rule() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["127.0.0.1".to_string(), "::1".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["127.0.0.1".to_owned(), "::1".to_owned()];
         evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect("dual-stack loopback NRPT must be acceptable");
     }
@@ -869,7 +869,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv6_link_local_nrpt_name_server() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["fe80::1".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["fe80::1".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv6 link-local NRPT name server must fail closed");
         assert!(
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv6_unspecified_nrpt_name_server() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["::".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["::".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv6 unspecified :: must fail closed");
         assert!(
@@ -907,7 +907,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv6_external_nrpt_name_server() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["2606:4700:4700::1111".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["2606:4700:4700::1111".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv6 external NRPT name server must fail closed");
         assert!(
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv6_multicast_nrpt_name_server() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["ff02::1".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["ff02::1".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv6 multicast NRPT name server must fail closed");
         assert!(
@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv4_mapped_external_nrpt_name_server() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["::ffff:8.8.8.8".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["::ffff:8.8.8.8".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv4-mapped external NRPT name server must fail closed");
         assert!(
@@ -957,7 +957,7 @@ mod tests {
     fn evaluator_rejects_mixed_loopback_plus_external_ipv6_in_nrpt_rule() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules[0].name_servers =
-            vec!["::1".to_string(), "2606:4700:4700::1111".to_string()];
+            vec!["::1".to_owned(), "2606:4700:4700::1111".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("mixed loopback+external IPv6 NRPT must fail closed");
         assert!(
@@ -981,9 +981,9 @@ mod tests {
     fn evaluator_rejects_secondary_ipv6_external_nrpt_rule_only_for_that_rule() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{rustynet-mesh-rule}".to_string(),
-            namespace: vec![".mesh.local".to_string()],
-            name_servers: vec!["2606:4700:4700::1111".to_string()],
+            name: "{rustynet-mesh-rule}".to_owned(),
+            namespace: vec![".mesh.local".to_owned()],
+            name_servers: vec!["2606:4700:4700::1111".to_owned()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("secondary IPv6 external rule must fail closed");
@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn evaluator_accepts_root_covered_by_ipv6_loopback_only() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers = vec!["::1".to_string()];
+        snapshot.nrpt_rules[0].name_servers = vec!["::1".to_owned()];
         // Root-coverage helper is exercised indirectly via the public
         // evaluator: a clean evaluation proves the rule still covers
         // the `.` namespace.
@@ -1022,7 +1022,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv4_link_local_interface_dns() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[0].server_addresses = vec!["169.254.169.254".to_string()];
+        snapshot.interfaces[0].server_addresses = vec!["169.254.169.254".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv4 link-local must reject");
         assert!(
@@ -1039,7 +1039,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv6_link_local_interface_dns() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[1].server_addresses = vec!["fe80::1".to_string()];
+        snapshot.interfaces[1].server_addresses = vec!["fe80::1".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv6 link-local must reject");
         assert!(
@@ -1055,7 +1055,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv4_unspecified_interface_dns() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[0].server_addresses = vec!["0.0.0.0".to_string()];
+        snapshot.interfaces[0].server_addresses = vec!["0.0.0.0".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv4 unspecified must reject");
         assert!(
@@ -1070,7 +1070,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv6_unspecified_interface_dns() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[1].server_addresses = vec!["::".to_string()];
+        snapshot.interfaces[1].server_addresses = vec!["::".to_owned()];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv6 unspecified must reject");
         assert!(
@@ -1086,9 +1086,9 @@ mod tests {
     fn evaluator_rejects_nrpt_rule_with_ipv6_link_local_name_server() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{ra-installed-rule}".to_string(),
-            namespace: vec![".lan".to_string()],
-            name_servers: vec!["fe80::1".to_string()],
+            name: "{ra-installed-rule}".to_owned(),
+            namespace: vec![".lan".to_owned()],
+            name_servers: vec!["fe80::1".to_owned()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv6 link-local NRPT rule must reject");
@@ -1107,9 +1107,9 @@ mod tests {
     fn evaluator_rejects_nrpt_rule_with_ipv4_mapped_external_name_server() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{mapped-external-rule}".to_string(),
-            namespace: vec![".mesh.test".to_string()],
-            name_servers: vec!["::ffff:8.8.8.8".to_string()],
+            name: "{mapped-external-rule}".to_owned(),
+            namespace: vec![".mesh.test".to_owned()],
+            name_servers: vec!["::ffff:8.8.8.8".to_owned()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("IPv4-mapped external IPv6 NRPT rule must reject");
@@ -1126,9 +1126,9 @@ mod tests {
     fn evaluator_rejects_nrpt_rule_with_zoneid_suffixed_link_local() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{zoneid-rule}".to_string(),
-            namespace: vec![".local".to_string()],
-            name_servers: vec!["fe80::1%6".to_string()],
+            name: "{zoneid-rule}".to_owned(),
+            namespace: vec![".local".to_owned()],
+            name_servers: vec!["fe80::1%6".to_owned()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("zoneid-suffixed must surface as parse failure");
@@ -1146,9 +1146,9 @@ mod tests {
     fn evaluator_rejects_nrpt_rule_with_bracketed_ipv6_name_server() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{bracketed-rule}".to_string(),
-            namespace: vec![".mesh".to_string()],
-            name_servers: vec!["[::1]".to_string()],
+            name: "{bracketed-rule}".to_owned(),
+            namespace: vec![".mesh".to_owned()],
+            name_servers: vec!["[::1]".to_owned()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("bracketed form must surface as parse failure");
@@ -1166,10 +1166,10 @@ mod tests {
     fn evaluator_aggregates_multiple_off_loopback_entries_on_one_interface() {
         let mut snapshot = reviewed_snapshot();
         snapshot.interfaces[0].server_addresses = vec![
-            "127.0.0.1".to_string(),   // ok
-            "8.8.8.8".to_string(),     // drift
-            "1.1.1.1".to_string(),     // drift
-            "192.168.1.1".to_string(), // drift
+            "127.0.0.1".to_owned(),   // ok
+            "8.8.8.8".to_owned(),     // drift
+            "1.1.1.1".to_owned(),     // drift
+            "192.168.1.1".to_owned(), // drift
         ];
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("mixed off-loopback must fail closed");
@@ -1210,9 +1210,9 @@ mod tests {
             schema_version: 1,
             interfaces: vec![],
             nrpt_rules: vec![WindowsNrptRule {
-                name: "{sub-only-rule}".to_string(),
-                namespace: vec![".lan".to_string()],
-                name_servers: vec!["127.0.0.1".to_string()],
+                name: "{sub-only-rule}".to_owned(),
+                namespace: vec![".lan".to_owned()],
+                name_servers: vec!["127.0.0.1".to_owned()],
             }],
             router_advertisement_observation: None,
         };
@@ -1232,9 +1232,9 @@ mod tests {
     fn evaluator_accepts_root_rule_plus_clean_sub_namespace_rule() {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
-            name: "{clean-sub-rule}".to_string(),
-            namespace: vec![".mesh.local".to_string()],
-            name_servers: vec!["127.0.0.1".to_string()],
+            name: "{clean-sub-rule}".to_owned(),
+            namespace: vec![".mesh.local".to_owned()],
+            name_servers: vec!["127.0.0.1".to_owned()],
         });
         evaluate_windows_dns_failclosed_snapshot(&snapshot).expect("root+clean sub rule must pass");
     }
@@ -1259,7 +1259,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_ipv6_family_carrying_ipv4_address() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.interfaces[1].server_addresses = vec!["127.0.0.1".to_string()];
+        snapshot.interfaces[1].server_addresses = vec!["127.0.0.1".to_owned()];
         // The interface is declared as Ipv6, the address is IPv4 —
         // the parser surfaces this as a family-mismatch reason.
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
@@ -1282,9 +1282,9 @@ mod tests {
             schema_version: 1,
             interfaces: vec![],
             nrpt_rules: vec![WindowsNrptRule {
-                name: "{rustynet-root-rule-v4}".to_string(),
-                namespace: vec![".".to_string()],
-                name_servers: vec!["127.0.0.1".to_string(), "::1".to_string()],
+                name: "{rustynet-root-rule-v4}".to_owned(),
+                namespace: vec![".".to_owned()],
+                name_servers: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
             }],
             router_advertisement_observation: None,
         }
@@ -1308,14 +1308,14 @@ mod tests {
             interfaces: vec![],
             nrpt_rules: vec![
                 WindowsNrptRule {
-                    name: "{root-v4}".to_string(),
-                    namespace: vec![".".to_string()],
-                    name_servers: vec!["127.0.0.1".to_string()],
+                    name: "{root-v4}".to_owned(),
+                    namespace: vec![".".to_owned()],
+                    name_servers: vec!["127.0.0.1".to_owned()],
                 },
                 WindowsNrptRule {
-                    name: "{root-v6}".to_string(),
-                    namespace: vec![".".to_string()],
-                    name_servers: vec!["::1".to_string()],
+                    name: "{root-v6}".to_owned(),
+                    namespace: vec![".".to_owned()],
+                    name_servers: vec!["::1".to_owned()],
                 },
             ],
             router_advertisement_observation: None,
@@ -1351,9 +1351,9 @@ mod tests {
             schema_version: 1,
             interfaces: vec![],
             nrpt_rules: vec![WindowsNrptRule {
-                name: "{root-v6-only}".to_string(),
-                namespace: vec![".".to_string()],
-                name_servers: vec!["::1".to_string()],
+                name: "{root-v6-only}".to_owned(),
+                namespace: vec![".".to_owned()],
+                name_servers: vec!["::1".to_owned()],
             }],
             router_advertisement_observation: None,
         };
@@ -1381,9 +1381,9 @@ mod tests {
             schema_version: 1,
             interfaces: vec![],
             nrpt_rules: vec![WindowsNrptRule {
-                name: "{no-loopback-rule}".to_string(),
-                namespace: vec![".mesh.local".to_string()],
-                name_servers: vec!["8.8.8.8".to_string(), "2606:4700:4700::1111".to_string()],
+                name: "{no-loopback-rule}".to_owned(),
+                namespace: vec![".mesh.local".to_owned()],
+                name_servers: vec!["8.8.8.8".to_owned(), "2606:4700:4700::1111".to_owned()],
             }],
             router_advertisement_observation: None,
         };
@@ -1404,14 +1404,14 @@ mod tests {
             interfaces: vec![],
             nrpt_rules: vec![
                 WindowsNrptRule {
-                    name: "{a-rule}".to_string(),
-                    namespace: vec![".zeta.local".to_string()],
-                    name_servers: vec!["127.0.0.1".to_string()],
+                    name: "{a-rule}".to_owned(),
+                    namespace: vec![".zeta.local".to_owned()],
+                    name_servers: vec!["127.0.0.1".to_owned()],
                 },
                 WindowsNrptRule {
-                    name: "{b-rule}".to_string(),
-                    namespace: vec![".alpha.local".to_string()],
-                    name_servers: vec!["127.0.0.1".to_string()],
+                    name: "{b-rule}".to_owned(),
+                    namespace: vec![".alpha.local".to_owned()],
+                    name_servers: vec!["127.0.0.1".to_owned()],
                 },
             ],
             router_advertisement_observation: None,
@@ -1439,9 +1439,9 @@ mod tests {
             schema_version: 1,
             interfaces: vec![],
             nrpt_rules: vec![WindowsNrptRule {
-                name: "{empty-ns-rule}".to_string(),
-                namespace: vec![String::new(), "  ".to_string()],
-                name_servers: vec!["127.0.0.1".to_string(), "::1".to_string()],
+                name: "{empty-ns-rule}".to_owned(),
+                namespace: vec![String::new(), "  ".to_owned()],
+                name_servers: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
             }],
             router_advertisement_observation: None,
         };
@@ -1496,14 +1496,14 @@ mod tests {
             interfaces: vec![],
             nrpt_rules: vec![
                 WindowsNrptRule {
-                    name: "{v4-mesh}".to_string(),
-                    namespace: vec![".mesh".to_string(), ".mesh.special".to_string()],
-                    name_servers: vec!["127.0.0.1".to_string()],
+                    name: "{v4-mesh}".to_owned(),
+                    namespace: vec![".mesh".to_owned(), ".mesh.special".to_owned()],
+                    name_servers: vec!["127.0.0.1".to_owned()],
                 },
                 WindowsNrptRule {
-                    name: "{v6-mesh}".to_string(),
-                    namespace: vec![".mesh".to_string()],
-                    name_servers: vec!["::1".to_string()],
+                    name: "{v6-mesh}".to_owned(),
+                    namespace: vec![".mesh".to_owned()],
+                    name_servers: vec!["::1".to_owned()],
                 },
             ],
             router_advertisement_observation: None,
@@ -1527,13 +1527,13 @@ mod tests {
             schema_version: 1,
             interfaces: vec![
                 WindowsInterfaceRaState {
-                    interface_alias: "Ethernet".to_string(),
+                    interface_alias: "Ethernet".to_owned(),
                     interface_index: 12,
                     router_discovery_enabled: false,
                     ipv6_default_route_sources: vec![],
                 },
                 WindowsInterfaceRaState {
-                    interface_alias: "Wi-Fi".to_string(),
+                    interface_alias: "Wi-Fi".to_owned(),
                     interface_index: 17,
                     router_discovery_enabled: false,
                     ipv6_default_route_sources: vec![],
@@ -1584,7 +1584,7 @@ mod tests {
         snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
             schema_version: 1,
             interfaces: vec![WindowsInterfaceRaState {
-                interface_alias: "Ethernet".to_string(),
+                interface_alias: "Ethernet".to_owned(),
                 interface_index: 12,
                 router_discovery_enabled: true,
                 ipv6_default_route_sources: vec![],
@@ -1610,10 +1610,10 @@ mod tests {
         snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
             schema_version: 1,
             interfaces: vec![WindowsInterfaceRaState {
-                interface_alias: "Wi-Fi".to_string(),
+                interface_alias: "Wi-Fi".to_owned(),
                 interface_index: 17,
                 router_discovery_enabled: false,
-                ipv6_default_route_sources: vec!["ra".to_string()],
+                ipv6_default_route_sources: vec!["ra".to_owned()],
             }],
         });
         let reasons = evaluate_router_advertisement_suppression(&snapshot);
@@ -1640,19 +1640,19 @@ mod tests {
             schema_version: 1,
             interfaces: vec![
                 WindowsInterfaceRaState {
-                    interface_alias: "zeta".to_string(),
+                    interface_alias: "zeta".to_owned(),
                     interface_index: 30,
                     router_discovery_enabled: true,
                     ipv6_default_route_sources: vec![],
                 },
                 WindowsInterfaceRaState {
-                    interface_alias: "alpha".to_string(),
+                    interface_alias: "alpha".to_owned(),
                     interface_index: 10,
                     router_discovery_enabled: false,
-                    ipv6_default_route_sources: vec!["ra".to_string()],
+                    ipv6_default_route_sources: vec!["ra".to_owned()],
                 },
                 WindowsInterfaceRaState {
-                    interface_alias: "middle".to_string(),
+                    interface_alias: "middle".to_owned(),
                     interface_index: 20,
                     router_discovery_enabled: false,
                     ipv6_default_route_sources: vec![],
@@ -1693,10 +1693,10 @@ mod tests {
         snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
             schema_version: 1,
             interfaces: vec![WindowsInterfaceRaState {
-                interface_alias: "Ethernet".to_string(),
+                interface_alias: "Ethernet".to_owned(),
                 interface_index: 12,
                 router_discovery_enabled: false,
-                ipv6_default_route_sources: vec!["manual".to_string()],
+                ipv6_default_route_sources: vec!["manual".to_owned()],
             }],
         });
         let reasons = evaluate_router_advertisement_suppression(&snapshot);
@@ -1712,10 +1712,10 @@ mod tests {
         snapshot.router_advertisement_observation = Some(WindowsRouterAdvertisementObservation {
             schema_version: 1,
             interfaces: vec![WindowsInterfaceRaState {
-                interface_alias: "Ethernet".to_string(),
+                interface_alias: "Ethernet".to_owned(),
                 interface_index: 12,
                 router_discovery_enabled: false,
-                ipv6_default_route_sources: vec!["manual".to_string(), "ra".to_string()],
+                ipv6_default_route_sources: vec!["manual".to_owned(), "ra".to_owned()],
             }],
         });
         let reasons = evaluate_router_advertisement_suppression(&snapshot);
@@ -1750,16 +1750,16 @@ mod tests {
             schema_version: 1,
             interfaces: vec![
                 WindowsInterfaceRaState {
-                    interface_alias: "Ethernet".to_string(),
+                    interface_alias: "Ethernet".to_owned(),
                     interface_index: 12,
                     router_discovery_enabled: false,
-                    ipv6_default_route_sources: vec!["manual".to_string()],
+                    ipv6_default_route_sources: vec!["manual".to_owned()],
                 },
                 WindowsInterfaceRaState {
-                    interface_alias: "Wi-Fi".to_string(),
+                    interface_alias: "Wi-Fi".to_owned(),
                     interface_index: 17,
                     router_discovery_enabled: true,
-                    ipv6_default_route_sources: vec!["ra".to_string(), "dhcp".to_string()],
+                    ipv6_default_route_sources: vec!["ra".to_owned(), "dhcp".to_owned()],
                 },
             ],
         };

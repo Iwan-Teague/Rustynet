@@ -156,9 +156,9 @@ mod tests {
     fn context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("stub-local").expect("node id should be valid"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.0/10".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         }
     }
 
@@ -170,7 +170,7 @@ mod tests {
                 port: 51820,
             },
             public_key: [9; 32],
-            allowed_ips: vec!["100.100.10.1/32".to_string()],
+            allowed_ips: vec!["100.100.10.1/32".to_owned()],
         }
     }
 
@@ -201,7 +201,7 @@ mod tests {
         );
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "0.0.0.0/0".to_string(),
+                destination_cidr: "0.0.0.0/0".to_owned(),
                 via_node: NodeId::new("peer-a").expect("node id should be valid"),
                 kind: RouteKind::ExitNodeDefault,
             }])

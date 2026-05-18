@@ -236,9 +236,9 @@ fn phase1_backend_contract_perf_report() {
     backend
         .start(RuntimeContext {
             local_node: NodeId::new("perf-local").expect("valid node id"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.0/10".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         })
         .expect("backend should start");
 
@@ -251,7 +251,7 @@ fn phase1_backend_contract_perf_report() {
                     port: 51820,
                 },
                 public_key: [9; 32],
-                allowed_ips: vec!["100.64.10.0/24".to_string()],
+                allowed_ips: vec!["100.64.10.0/24".to_owned()],
             })
             .expect("configure peer should succeed");
     });
@@ -259,7 +259,7 @@ fn phase1_backend_contract_perf_report() {
     let route_duration = measure(200, || {
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "0.0.0.0/0".to_string(),
+                destination_cidr: "0.0.0.0/0".to_owned(),
                 via_node: NodeId::new("peer-a").expect("valid node id"),
                 kind: RouteKind::ExitNodeDefault,
             }])

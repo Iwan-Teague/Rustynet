@@ -102,9 +102,9 @@ pub struct WebSecurityHeaders {
 #[cfg(test)]
 fn default_web_security_headers() -> WebSecurityHeaders {
     WebSecurityHeaders {
-        x_frame_options: "DENY".to_string(),
-        content_security_policy: "frame-ancestors 'none'".to_string(),
-        referrer_policy: "no-referrer".to_string(),
+        x_frame_options: "DENY".to_owned(),
+        content_security_policy: "frame-ancestors 'none'".to_owned(),
+        referrer_policy: "no-referrer".to_owned(),
     }
 }
 
@@ -265,8 +265,8 @@ fn contains_shell_meta(value: &str) -> bool {
 #[cfg(test)]
 fn policy_bootstrap_defaults() -> BTreeMap<String, String> {
     let mut defaults = BTreeMap::new();
-    defaults.insert("mode".to_string(), "default-deny".to_string());
-    defaults.insert("allow_all".to_string(), "false".to_string());
+    defaults.insert("mode".to_owned(), "default-deny".to_owned());
+    defaults.insert("allow_all".to_owned(), "false".to_owned());
     defaults
 }
 
@@ -283,7 +283,7 @@ mod tests {
             secure_cookie: true,
             http_only_cookie: true,
             same_site_strict: true,
-            csrf_token: "csrf-123".to_string(),
+            csrf_token: "csrf-123".to_owned(),
         }
     }
 
@@ -291,7 +291,7 @@ mod tests {
     fn rbac_is_deny_by_default_for_privileged_actions() {
         let mut api = AdminApiState::default();
         let viewer = AdminPrincipal {
-            user_id: "viewer".to_string(),
+            user_id: "viewer".to_owned(),
             role: Role::Viewer,
             mfa_verified: true,
         };
@@ -300,7 +300,7 @@ mod tests {
             &viewer,
             "csrf-123",
             &secure_session(),
-            "allow group:family -> tag:servers".to_string(),
+            "allow group:family -> tag:servers".to_owned(),
         );
         assert_eq!(result.err(), Some(AdminError::Unauthorized));
     }
@@ -309,7 +309,7 @@ mod tests {
     fn mfa_is_required_for_privileged_mutations() {
         let mut api = AdminApiState::default();
         let admin_without_mfa = AdminPrincipal {
-            user_id: "admin".to_string(),
+            user_id: "admin".to_owned(),
             role: Role::Admin,
             mfa_verified: false,
         };
@@ -318,7 +318,7 @@ mod tests {
             &admin_without_mfa,
             "csrf-123",
             &secure_session(),
-            "allow group:family -> tag:servers".to_string(),
+            "allow group:family -> tag:servers".to_owned(),
         );
         assert_eq!(result.err(), Some(AdminError::MfaRequired));
     }
@@ -328,7 +328,7 @@ mod tests {
         let mut api = AdminApiState::default();
         api.add_node("node-a");
         let admin = AdminPrincipal {
-            user_id: "admin".to_string(),
+            user_id: "admin".to_owned(),
             role: Role::Admin,
             mfa_verified: true,
         };
@@ -352,9 +352,9 @@ mod tests {
     #[test]
     fn privileged_helper_validation_rejects_shell_construction() {
         let invalid = PrivilegedCommand {
-            program: "ip".to_string(),
-            args: vec!["route".to_string(), "add;rm -rf /".to_string()],
-            run_as_user: "netadmin".to_string(),
+            program: "ip".to_owned(),
+            args: vec!["route".to_owned(), "add;rm -rf /".to_owned()],
+            run_as_user: "netadmin".to_owned(),
         };
         assert_eq!(
             validate_privileged_command(&invalid).err(),
@@ -365,15 +365,15 @@ mod tests {
     #[test]
     fn privileged_helper_validation_accepts_argv_only_commands() {
         let command = PrivilegedCommand {
-            program: "/sbin/ip".to_string(),
+            program: "/sbin/ip".to_owned(),
             args: vec![
-                "route".to_string(),
-                "replace".to_string(),
-                "100.64.0.0/10".to_string(),
-                "dev".to_string(),
-                "rustynet0".to_string(),
+                "route".to_owned(),
+                "replace".to_owned(),
+                "100.64.0.0/10".to_owned(),
+                "dev".to_owned(),
+                "rustynet0".to_owned(),
             ],
-            run_as_user: "netadmin".to_string(),
+            run_as_user: "netadmin".to_owned(),
         };
         let preview = command_preview(&command).expect("command should be accepted");
         assert!(preview.contains("/sbin/ip"));
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn policy_bootstrap_defaults_to_safe_values() {
         let defaults = policy_bootstrap_defaults();
-        assert_eq!(defaults.get("mode"), Some(&"default-deny".to_string()));
-        assert_eq!(defaults.get("allow_all"), Some(&"false".to_string()));
+        assert_eq!(defaults.get("mode"), Some(&"default-deny".to_owned()));
+        assert_eq!(defaults.get("allow_all"), Some(&"false".to_owned()));
     }
 }

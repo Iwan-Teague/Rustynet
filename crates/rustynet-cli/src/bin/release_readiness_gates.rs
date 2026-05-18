@@ -359,9 +359,9 @@ struct ReleaseGateStep {
 impl ReleaseGateStep {
     fn new(id: &str, description: &str, command: &[&str]) -> Self {
         Self {
-            id: id.to_string(),
-            description: description.to_string(),
-            command: command.iter().map(|item| (*item).to_string()).collect(),
+            id: id.to_owned(),
+            description: description.to_owned(),
+            command: command.iter().map(|item| (*item).to_owned()).collect(),
             expected_paths: Vec::new(),
             status: GateStepStatus::NotExecuted,
             exit_code: None,
@@ -370,7 +370,7 @@ impl ReleaseGateStep {
     }
 
     fn with_expected_paths(mut self, paths: &[&str]) -> Self {
-        self.expected_paths = paths.iter().map(|path| (*path).to_string()).collect();
+        self.expected_paths = paths.iter().map(|path| (*path).to_owned()).collect();
         self
     }
 }
@@ -392,19 +392,17 @@ impl ReleaseReadinessBundle {
     fn new(phase5_gate_report_path: &Path) -> Self {
         Self {
             schema_version: 2,
-            gate: "release_readiness_gates".to_string(),
+            gate: "release_readiness_gates".to_owned(),
             overall_status: GateRunStatus::ExecutedFailed,
             generated_at_unix: 0,
             summary_doc:
-                "documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md"
-                    .to_string(),
+                "documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md".to_owned(),
             checklist_doc:
-                "documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md"
-                    .to_string(),
+                "documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md".to_owned(),
             phase5_gate_report_path: phase5_gate_report_path.display().to_string(),
             required_phase5_step_ids: REQUIRED_PHASE5_STEP_IDS
                 .iter()
-                .map(|step| (*step).to_string())
+                .map(|step| (*step).to_owned())
                 .collect(),
             steps: vec![
                 ReleaseGateStep::new(
@@ -502,7 +500,7 @@ mod tests {
                 }
             }
 
-            Err("failed to create temp dir: exhausted unique path attempts".to_string())
+            Err("failed to create temp dir: exhausted unique path attempts".to_owned())
         }
 
         fn path(&self) -> &Path {

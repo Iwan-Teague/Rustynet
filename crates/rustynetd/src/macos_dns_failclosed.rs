@@ -66,17 +66,17 @@ pub fn parse_resolv_conf(body: &str) -> (Vec<String>, Vec<String>) {
             continue;
         }
         if let Some(rest) = line.strip_prefix("nameserver") {
-            let ns = rest.trim().to_string();
+            let ns = rest.trim().to_owned();
             if !ns.is_empty() {
                 nameservers.push(ns);
             }
         } else if let Some(rest) = line.strip_prefix("search") {
             for domain in rest.split_whitespace() {
-                search_domains.push(domain.to_string());
+                search_domains.push(domain.to_owned());
             }
         } else if let Some(rest) = line.strip_prefix("domain") {
             for domain in rest.split_whitespace() {
-                search_domains.push(domain.to_string());
+                search_domains.push(domain.to_owned());
             }
         }
     }
@@ -84,7 +84,7 @@ pub fn parse_resolv_conf(body: &str) -> (Vec<String>, Vec<String>) {
 }
 
 pub fn collect_macos_dns_failclosed_snapshot() -> MacosDnsFailclosedSnapshot {
-    let resolv_conf_path = REVIEWED_RESOLV_CONF_PATH.to_string();
+    let resolv_conf_path = REVIEWED_RESOLV_CONF_PATH.to_owned();
     match std::fs::read_to_string(REVIEWED_RESOLV_CONF_PATH) {
         Ok(body) => {
             let (nameservers, search_domains) = parse_resolv_conf(&body);
@@ -134,13 +134,13 @@ mod tests {
 
     #[test]
     fn evaluator_accepts_loopback_only() {
-        let ns = vec!["127.0.0.1".to_string(), "::1".to_string()];
+        let ns = vec!["127.0.0.1".to_owned(), "::1".to_owned()];
         assert!(evaluate_macos_dns_failclosed(&ns).is_empty());
     }
 
     #[test]
     fn evaluator_rejects_external_nameserver() {
-        let ns = vec!["8.8.8.8".to_string()];
+        let ns = vec!["8.8.8.8".to_owned()];
         let reasons = evaluate_macos_dns_failclosed(&ns);
         assert!(
             reasons.iter().any(|r| r.contains("8.8.8.8")),
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn evaluator_rejects_malformed_entry() {
-        let ns = vec!["not-an-ip".to_string()];
+        let ns = vec!["not-an-ip".to_owned()];
         let reasons = evaluate_macos_dns_failclosed(&ns);
         assert!(
             reasons.iter().any(|r| r.contains("not a valid IP")),
@@ -176,9 +176,9 @@ mod tests {
     #[test]
     fn report_serde_round_trips() {
         let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_string(),
+            resolv_conf_path: "/etc/resolv.conf".to_owned(),
             resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_string()],
+            nameservers: vec!["127.0.0.1".to_owned()],
             search_domains: vec![],
             loopback_resolver_advertised: true,
         };
@@ -191,9 +191,9 @@ mod tests {
     #[test]
     fn build_report_loopback_only_is_ok() {
         let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_string(),
+            resolv_conf_path: "/etc/resolv.conf".to_owned(),
             resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_string()],
+            nameservers: vec!["127.0.0.1".to_owned()],
             search_domains: vec![],
             loopback_resolver_advertised: true,
         };
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn build_report_missing_resolv_conf_is_drift() {
         let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_string(),
+            resolv_conf_path: "/etc/resolv.conf".to_owned(),
             resolv_conf_present: false,
             nameservers: vec![],
             search_domains: vec![],
@@ -228,9 +228,9 @@ mod tests {
     #[test]
     fn report_schema_version_pinned_at_one() {
         let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_string(),
+            resolv_conf_path: "/etc/resolv.conf".to_owned(),
             resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_string()],
+            nameservers: vec!["127.0.0.1".to_owned()],
             search_domains: Vec::new(),
             loopback_resolver_advertised: true,
         };
@@ -249,7 +249,7 @@ mod tests {
         // address. If the macOS resolver lists it, an exfiltration
         // path via DNS-tunneling-on-metadata is plausible. Pin the
         // mesh-only contract.
-        let ns = vec!["169.254.169.254".to_string()];
+        let ns = vec!["169.254.169.254".to_owned()];
         let reasons = evaluate_macos_dns_failclosed(&ns);
         assert!(
             reasons.iter().any(|r| r.contains("169.254.169.254")),
@@ -262,7 +262,7 @@ mod tests {
         // fe80::1 is the IPv6 link-local equivalent — typically an
         // RA-installed resolver. Pin its rejection so a future
         // "router-recommended" config doesn't silently leak.
-        let ns = vec!["fe80::1".to_string()];
+        let ns = vec!["fe80::1".to_owned()];
         let reasons = evaluate_macos_dns_failclosed(&ns);
         assert!(
             reasons.iter().any(|r| r.contains("fe80")),
@@ -276,7 +276,7 @@ mod tests {
         // resolver may surface either form depending on stack
         // configuration. Pin that the IPv4-mapped path is NOT
         // misclassified as loopback by IpAddr::is_loopback.
-        let ns = vec!["::ffff:8.8.8.8".to_string()];
+        let ns = vec!["::ffff:8.8.8.8".to_owned()];
         let reasons = evaluate_macos_dns_failclosed(&ns);
         assert!(
             !reasons.is_empty(),
@@ -290,9 +290,9 @@ mod tests {
         // pass. Pin the boundary 127.255.255.254 explicitly so a
         // future tightening to 127.0.0.1-only would trip this test.
         let ns = vec![
-            "127.0.0.1".to_string(),
-            "127.0.0.53".to_string(), // systemd-resolved stub on linux peers
-            "127.255.255.254".to_string(),
+            "127.0.0.1".to_owned(),
+            "127.0.0.53".to_owned(), // systemd-resolved stub on linux peers
+            "127.255.255.254".to_owned(),
         ];
         let reasons = evaluate_macos_dns_failclosed(&ns);
         assert!(
@@ -332,9 +332,9 @@ mod tests {
         // Two off-loopback nameservers must surface as two reasons,
         // not collapse to one. Pin the no-dedup contract.
         let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_string(),
+            resolv_conf_path: "/etc/resolv.conf".to_owned(),
             resolv_conf_present: true,
-            nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+            nameservers: vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()],
             search_domains: Vec::new(),
             loopback_resolver_advertised: false,
         };

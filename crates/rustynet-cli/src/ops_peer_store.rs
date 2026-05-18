@@ -71,7 +71,7 @@ fn normalize_filter(label: &str, value: Option<String>) -> Result<Option<String>
     let Some(value) = value else {
         return Ok(None);
     };
-    let trimmed = value.trim().to_string();
+    let trimmed = value.trim().to_owned();
     if trimmed.is_empty() {
         return Ok(None);
     }
@@ -270,7 +270,7 @@ fn load_peer_records(peers_file: &Path) -> Result<Vec<PeerRecord>, String> {
 
         let mut fields = vec![String::new(); 6];
         for (field_index, field_value) in parts.into_iter().enumerate() {
-            fields[field_index] = field_value.to_string();
+            fields[field_index] = field_value.to_owned();
         }
 
         ensure_peer_field_safe("name", fields[0].as_str(), Some(line_no))?;
@@ -403,7 +403,7 @@ mod tests {
         let admin = execute_ops_peer_store_list(
             config_dir.clone(),
             peers_file.clone(),
-            Some("admin".to_string()),
+            Some("admin".to_owned()),
             None,
         )
         .unwrap();
@@ -411,7 +411,7 @@ mod tests {
         assert!(!admin.contains("client-a|client-1"));
 
         let client =
-            execute_ops_peer_store_list(config_dir, peers_file, None, Some("client-1".to_string()))
+            execute_ops_peer_store_list(config_dir, peers_file, None, Some("client-1".to_owned()))
                 .unwrap();
         assert!(client.contains("client-a|client-1|pub2|10.0.0.2:51820|100.64.0.2/32|client"));
         assert!(!client.contains("exit-a|exit-1"));

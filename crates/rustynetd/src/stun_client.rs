@@ -237,7 +237,7 @@ impl StunClient {
 
     fn parse_binding_response(&self, buf: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
         if buf.len() < 20 {
-            return Err("response too short".to_string());
+            return Err("response too short".to_owned());
         }
         let type_ = u16::from_be_bytes([buf[0], buf[1]]);
         if type_ != STUN_BINDING_RESPONSE {
@@ -246,13 +246,13 @@ impl StunClient {
         let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
         let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         if cookie != STUN_MAGIC_COOKIE {
-            return Err("invalid magic cookie".to_string());
+            return Err("invalid magic cookie".to_owned());
         }
         if &buf[8..20] != tx_id {
-            return Err("transaction id mismatch".to_string());
+            return Err("transaction id mismatch".to_owned());
         }
         if buf.len() < 20 + length {
-            return Err("truncated response".to_string());
+            return Err("truncated response".to_owned());
         }
 
         let mut pos = 20;
@@ -265,7 +265,7 @@ impl StunClient {
             let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
             let attr_end = pos + 4 + attr_len;
             if attr_end > end {
-                return Err("stun attribute exceeds message boundary".to_string());
+                return Err("stun attribute exceeds message boundary".to_owned());
             }
             let attr_value = &buf[pos + 4..attr_end];
 
@@ -289,13 +289,13 @@ impl StunClient {
         } else if let Some(addr) = mapped_addr {
             Ok(addr)
         } else {
-            Err("no mapped address attribute found".to_string())
+            Err("no mapped address attribute found".to_owned())
         }
     }
 
     fn parse_xor_mapped_address(&self, val: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
         if val.len() < 8 {
-            return Err("xor mapped addr too short".to_string());
+            return Err("xor mapped addr too short".to_owned());
         }
         let _reserved = val[0];
         let family = val[1];
@@ -305,7 +305,7 @@ impl StunClient {
         if family == 0x01 {
             // IPv4
             if val.len() < 8 {
-                return Err("ipv4 too short".to_string());
+                return Err("ipv4 too short".to_owned());
             }
             let ip_xor = u32::from_be_bytes([val[4], val[5], val[6], val[7]]);
             let ip = ip_xor ^ STUN_MAGIC_COOKIE;
@@ -316,7 +316,7 @@ impl StunClient {
         } else if family == 0x02 {
             // IPv6
             if val.len() < 20 {
-                return Err("ipv6 too short".to_string());
+                return Err("ipv6 too short".to_owned());
             }
             let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
             let mut addr = [0u8; 16];
@@ -339,7 +339,7 @@ impl StunClient {
 
     fn parse_mapped_address(&self, val: &[u8]) -> Result<SocketAddr, String> {
         if val.len() < 8 {
-            return Err("mapped addr too short".to_string());
+            return Err("mapped addr too short".to_owned());
         }
         let _reserved = val[0];
         let family = val[1];
@@ -348,14 +348,14 @@ impl StunClient {
         if family == 0x01 {
             // IPv4
             if val.len() < 8 {
-                return Err("ipv4 too short".to_string());
+                return Err("ipv4 too short".to_owned());
             }
             let ip = std::net::Ipv4Addr::new(val[4], val[5], val[6], val[7]);
             Ok(SocketAddr::new(IpAddr::V4(ip), port))
         } else if family == 0x02 {
             // IPv6
             // Not supported
-            Err("ipv6 mapped addr not supported".to_string())
+            Err("ipv6 mapped addr not supported".to_owned())
         } else {
             Err(format!("unknown family: 0x{family:02x}"))
         }

@@ -127,22 +127,22 @@ impl Phase1MetricAccumulator {
             sample_count: self.sample_count,
             idle_cpu_percent: self
                 .idle_cpu_percent
-                .ok_or_else(|| "missing idle_cpu_percent metric".to_string())?,
+                .ok_or_else(|| "missing idle_cpu_percent metric".to_owned())?,
             idle_memory_mb: self
                 .idle_memory_mb
-                .ok_or_else(|| "missing idle_memory_mb metric".to_string())?,
+                .ok_or_else(|| "missing idle_memory_mb metric".to_owned())?,
             reconnect_seconds: self
                 .reconnect_seconds
-                .ok_or_else(|| "missing reconnect_seconds metric".to_string())?,
+                .ok_or_else(|| "missing reconnect_seconds metric".to_owned())?,
             route_policy_apply_p95_seconds: self
                 .route_policy_apply_p95_seconds
-                .ok_or_else(|| "missing route_policy_apply_p95_seconds metric".to_string())?,
+                .ok_or_else(|| "missing route_policy_apply_p95_seconds metric".to_owned())?,
             throughput_overhead_percent: self
                 .throughput_overhead_percent
-                .ok_or_else(|| "missing throughput_overhead_percent metric".to_string())?,
+                .ok_or_else(|| "missing throughput_overhead_percent metric".to_owned())?,
             backend_throughput_overhead_percent: self
                 .backend_throughput_overhead_percent
-                .ok_or_else(|| "missing backend_throughput_overhead_percent metric".to_string())?,
+                .ok_or_else(|| "missing backend_throughput_overhead_percent metric".to_owned())?,
         })
     }
 }
@@ -237,7 +237,7 @@ fn phase1_require_metric(
 fn phase1_resolve_path(raw_path: &str) -> Result<PathBuf, String> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
-        return Err("path must not be empty".to_string());
+        return Err("path must not be empty".to_owned());
     }
     let path = PathBuf::from(trimmed);
     if path.is_absolute() {
@@ -265,7 +265,7 @@ fn env_optional_string(key: &str) -> Result<Option<String>, String> {
 }
 
 fn phase1_path_from_env_or_default(key: &str, default: &str) -> Result<PathBuf, String> {
-    let raw = env_optional_string(key)?.unwrap_or_else(|| default.to_string());
+    let raw = env_optional_string(key)?.unwrap_or_else(|| default.to_owned());
     phase1_resolve_path(raw.as_str())
 }
 
@@ -278,7 +278,7 @@ fn parse_bool_value(key: &str, value: &str) -> Result<bool, String> {
 }
 
 fn parse_env_bool_with_default(key: &str, default: &str) -> Result<bool, String> {
-    let value = env_optional_string(key)?.unwrap_or_else(|| default.to_string());
+    let value = env_optional_string(key)?.unwrap_or_else(|| default.to_owned());
     parse_bool_value(key, value.as_str())
 }
 
@@ -423,8 +423,7 @@ fn resolve_phase1_measured_source_path() -> Result<PathBuf, String> {
         || {
             "missing required measured source path: RUSTYNET_PHASE1_PERF_SAMPLES_PATH\n\
              fallback source discovery is disabled for phase1 security gating.\n\
-             expected canonical source (default): artifacts/perf/phase1/source/performance_samples.ndjson"
-                .to_string()
+             expected canonical source (default): artifacts/perf/phase1/source/performance_samples.ndjson".to_owned()
         },
     )?;
     let resolved = phase1_resolve_path(configured_path.as_str())?;
@@ -530,7 +529,7 @@ fn phase1_collect_measured_input_from_source(
             let Some(value) = metric_object.get("value").and_then(phase1_value_as_number) else {
                 continue;
             };
-            flattened.insert(name.to_string(), json!(value));
+            flattened.insert(name.to_owned(), json!(value));
         }
         for key in [
             "idle_cpu_percent",
@@ -548,7 +547,7 @@ fn phase1_collect_measured_input_from_source(
             if !flattened.contains_key(key)
                 && let Some(value) = payload_object.get(key).and_then(phase1_value_as_number)
             {
-                flattened.insert(key.to_string(), json!(value));
+                flattened.insert(key.to_owned(), json!(value));
             }
         }
         accumulator.consume_object(&flattened, source_path.display().to_string().as_str())?;
@@ -732,7 +731,7 @@ fn phase1_parse_metric_env(
     missing_env: &mut Vec<String>,
 ) -> Result<Option<f64>, String> {
     let Some(raw) = env_optional_string(key)? else {
-        missing_env.push(key.to_string());
+        missing_env.push(key.to_owned());
         return Ok(None);
     };
     let value = raw
@@ -782,17 +781,17 @@ fn phase1_metrics_from_env(
         source_path,
         sample_count: 1,
         idle_cpu_percent: idle_cpu_percent
-            .ok_or_else(|| "missing RUSTYNET_PHASE1_IDLE_CPU_PERCENT".to_string())?,
+            .ok_or_else(|| "missing RUSTYNET_PHASE1_IDLE_CPU_PERCENT".to_owned())?,
         idle_memory_mb: idle_memory_mb
-            .ok_or_else(|| "missing RUSTYNET_PHASE1_IDLE_MEMORY_MB".to_string())?,
+            .ok_or_else(|| "missing RUSTYNET_PHASE1_IDLE_MEMORY_MB".to_owned())?,
         reconnect_seconds: reconnect_seconds
-            .ok_or_else(|| "missing RUSTYNET_PHASE1_RECONNECT_SECONDS".to_string())?,
+            .ok_or_else(|| "missing RUSTYNET_PHASE1_RECONNECT_SECONDS".to_owned())?,
         route_policy_apply_p95_seconds: route_policy_apply_p95_seconds
-            .ok_or_else(|| "missing RUSTYNET_PHASE1_ROUTE_POLICY_APPLY_P95_SECONDS".to_string())?,
+            .ok_or_else(|| "missing RUSTYNET_PHASE1_ROUTE_POLICY_APPLY_P95_SECONDS".to_owned())?,
         throughput_overhead_percent: throughput_overhead_percent
-            .ok_or_else(|| "missing RUSTYNET_PHASE1_THROUGHPUT_OVERHEAD_PERCENT".to_string())?,
+            .ok_or_else(|| "missing RUSTYNET_PHASE1_THROUGHPUT_OVERHEAD_PERCENT".to_owned())?,
         backend_throughput_overhead_percent: backend_throughput_overhead_percent.ok_or_else(
-            || "missing RUSTYNET_PHASE1_BACKEND_THROUGHPUT_OVERHEAD_PERCENT".to_string(),
+            || "missing RUSTYNET_PHASE1_BACKEND_THROUGHPUT_OVERHEAD_PERCENT".to_owned(),
         )?,
     }))
 }
@@ -976,7 +975,7 @@ fn phase1_validate_report(
                 report_path.display()
             ));
         }
-        present_metrics.insert(name.to_string(), true);
+        present_metrics.insert(name.to_owned(), true);
     }
 
     for required_metric_name in required_metric_names {
@@ -1351,7 +1350,7 @@ pub fn execute_ops_check_no_unsafe_rust_sources(
         ));
     }
 
-    Ok("Unsafe code checks: PASS".to_string())
+    Ok("Unsafe code checks: PASS".to_owned())
 }
 
 fn parse_two_digits(value: &str, field: &str) -> Result<u32, String> {
@@ -1527,7 +1526,7 @@ pub fn execute_ops_check_dependency_exceptions(
     for entry in exceptions {
         let exception = entry
             .as_object()
-            .ok_or_else(|| "dependency exception entry must be a JSON object".to_string())?;
+            .ok_or_else(|| "dependency exception entry must be a JSON object".to_owned())?;
         let present = exception
             .keys()
             .map(String::as_str)
@@ -1552,7 +1551,7 @@ pub fn execute_ops_check_dependency_exceptions(
         }
     }
 
-    Ok("Dependency exception policy check: PASS".to_string())
+    Ok("Dependency exception policy check: PASS".to_owned())
 }
 
 fn load_perf_metrics(path: &Path, label: &str) -> Result<HashMap<String, f64>, String> {
@@ -1620,7 +1619,7 @@ fn load_perf_metrics(path: &Path, label: &str) -> Result<HashMap<String, f64>, S
                 "{label} metric '{metric_name}' has failing status: {status}"
             ));
         }
-        values.insert(metric_name.to_string(), metric_value);
+        values.insert(metric_name.to_owned(), metric_value);
     }
 
     Ok(values)
@@ -1686,7 +1685,7 @@ pub fn execute_ops_check_perf_regression(
         ));
     }
 
-    Ok("Performance regression gate: PASS".to_string())
+    Ok("Performance regression gate: PASS".to_owned())
 }
 
 fn secrets_hygiene_error(summary: &str, details: &[String]) -> String {
@@ -1726,7 +1725,7 @@ fn parse_git_tracked_files(root: &Path) -> Result<Vec<PathBuf>, String> {
             continue;
         }
         let path_text = std::str::from_utf8(entry)
-            .map_err(|_| "git ls-files emitted non-utf8 path".to_string())?;
+            .map_err(|_| "git ls-files emitted non-utf8 path".to_owned())?;
         let relative = PathBuf::from(path_text);
         if relative.is_absolute() {
             return Err(format!(
@@ -1945,7 +1944,7 @@ fn parse_mktemp_secret_variable(line: &str) -> Option<String> {
     {
         return None;
     }
-    Some(variable.to_string())
+    Some(variable.to_owned())
 }
 
 pub fn execute_ops_check_secrets_hygiene(
@@ -2200,7 +2199,7 @@ pub fn execute_ops_check_secrets_hygiene(
         ));
     }
 
-    Ok("Secrets hygiene gate: PASS".to_string())
+    Ok("Secrets hygiene gate: PASS".to_owned())
 }
 
 fn unix_now() -> u64 {
@@ -2226,7 +2225,7 @@ pub fn execute_ops_run_phase1_baseline() -> Result<String, String> {
     let (metrics, collected_output_path) = if missing_env.is_empty() {
         (
             parsed_env_metrics
-                .ok_or_else(|| "phase1 metrics env parse produced no values".to_string())?,
+                .ok_or_else(|| "phase1 metrics env parse produced no values".to_owned())?,
             None,
         )
     } else if auto_collect {
@@ -2727,7 +2726,7 @@ mod tests {
     fn mktemp_secret_variable_parser_matches_expected_form() {
         assert_eq!(
             parse_mktemp_secret_variable("local signing_secret_tmp=$(mktemp)"),
-            Some("signing_secret_tmp".to_string())
+            Some("signing_secret_tmp".to_owned())
         );
         assert_eq!(parse_mktemp_secret_variable("tmp=$(mktemp)"), None);
     }

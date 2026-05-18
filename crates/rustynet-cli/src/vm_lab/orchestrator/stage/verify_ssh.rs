@@ -63,7 +63,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,
@@ -80,7 +80,7 @@ mod tests {
     fn missing_adapter_fails() {
         let mut ctx = OrchestrationContext {
             assignments: vec![NodeRoleAssignment {
-                alias: "exit-1".to_string(),
+                alias: "exit-1".to_owned(),
                 role: NodeRole::Exit,
             }],
             adapters: HashMap::new(),
@@ -88,7 +88,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

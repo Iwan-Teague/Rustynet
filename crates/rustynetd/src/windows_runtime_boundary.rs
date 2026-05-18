@@ -65,7 +65,7 @@ pub fn run_windows_runtime_boundary_check(
         store_passphrase_in_os_secure_store(secret_blob_path.as_path(), None)?;
         let passphrase = read_passphrase_file(secret_blob_path.as_path())?;
         if passphrase.trim() != SELF_CHECK_PASSPHRASE.trim() {
-            return Err("Windows DPAPI passphrase round-trip returned unexpected data".to_string());
+            return Err("Windows DPAPI passphrase round-trip returned unexpected data".to_owned());
         }
         secret_round_trip_ok = true;
 
@@ -108,7 +108,7 @@ pub fn run_windows_runtime_boundary_check(
                 )
             })?;
             server.join().map_err(|_| {
-                "Windows privileged self-check probe server thread panicked".to_string()
+                "Windows privileged self-check probe server thread panicked".to_owned()
             })??;
             ipc_probe_ok = true;
         }
@@ -162,7 +162,7 @@ pub fn run_windows_runtime_boundary_check(
                 )
             })?;
             server.join().map_err(|_| {
-                "Windows privileged self-check inspect server thread panicked".to_string()
+                "Windows privileged self-check inspect server thread panicked".to_owned()
             })??;
             response
         };

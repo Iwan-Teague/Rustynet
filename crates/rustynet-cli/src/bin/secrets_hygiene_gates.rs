@@ -117,7 +117,7 @@ fn find_root_dir() -> Result<PathBuf, String> {
             return Ok(dir);
         }
         if !dir.pop() {
-            return Err("failed to locate repository root from current executable".to_string());
+            return Err("failed to locate repository root from current executable".to_owned());
         }
     }
 }
@@ -329,7 +329,7 @@ impl TempOutputGuard {
             }
         }
 
-        Err("failed to create required test output file after exhausting unique paths".to_string())
+        Err("failed to create required test output file after exhausting unique paths".to_owned())
     }
 
     fn path(&self) -> &Path {

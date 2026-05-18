@@ -97,7 +97,7 @@ fn run() -> Result<String, String> {
                 parser.parse_u64_or_default("--nonce", generate_nonce())?,
             )
         }
-        _ => Err("usage: rustynet trust <keygen|export-verifier-key|issue> [options]".to_string()),
+        _ => Err("usage: rustynet trust <keygen|export-verifier-key|issue> [options]".to_owned()),
     }
 }
 
@@ -295,7 +295,7 @@ fn persist_encrypted_secret_material(
 fn load_signing_key(path: &Path, passphrase_path: &Path) -> Result<SigningKey, String> {
     let secret = load_encrypted_secret_material(path, passphrase_path, "signing key")?;
     if secret.len() != 32 {
-        return Err("decrypted signing key must be exactly 32 bytes".to_string());
+        return Err("decrypted signing key must be exactly 32 bytes".to_owned());
     }
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(secret.as_slice());

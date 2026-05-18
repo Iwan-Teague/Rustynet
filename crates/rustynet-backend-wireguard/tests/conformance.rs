@@ -18,9 +18,9 @@ use base64::prelude::*;
 fn runtime_context() -> RuntimeContext {
     RuntimeContext {
         local_node: NodeId::new("local-node").expect("valid node id"),
-        interface_name: "rustynet0".to_string(),
-        mesh_cidr: "100.64.0.0/10".to_string(),
-        local_cidr: "100.64.0.1/32".to_string(),
+        interface_name: "rustynet0".to_owned(),
+        mesh_cidr: "100.64.0.0/10".to_owned(),
+        local_cidr: "100.64.0.1/32".to_owned(),
     }
 }
 
@@ -32,7 +32,7 @@ fn sample_peer(name: &str) -> PeerConfig {
             port: 51820,
         },
         public_key: [7; 32],
-        allowed_ips: vec!["100.64.1.0/24".to_string()],
+        allowed_ips: vec!["100.64.1.0/24".to_owned()],
     }
 }
 
@@ -102,7 +102,7 @@ fn wireguard_backend_follows_lifecycle_contract() {
         .expect("exit mode switch should succeed");
     backend
         .apply_routes(vec![Route {
-            destination_cidr: "0.0.0.0/0".to_string(),
+            destination_cidr: "0.0.0.0/0".to_owned(),
             via_node: NodeId::new("peer-a").expect("valid node id"),
             kind: RouteKind::ExitNodeDefault,
         }])
@@ -203,7 +203,7 @@ fn linux_userspace_shared_backend_supports_route_and_exit_mode_lifecycle() {
         .expect("peer should configure");
     backend
         .apply_routes(vec![Route {
-            destination_cidr: "100.64.20.0/24".to_string(),
+            destination_cidr: "100.64.20.0/24".to_owned(),
             via_node: NodeId::new("peer-a").expect("valid node id"),
             kind: RouteKind::ExitNodeLan,
         }])
@@ -228,7 +228,7 @@ fn command_only_linux_backend_blocker_remains_unchanged() {
     assert_eq!(
         backend.transport_socket_identity_blocker(),
         Some(
-            "linux wireguard backend is a command-only adapter over an OS-managed WireGuard UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string()
+            "linux wireguard backend is a command-only adapter over an OS-managed WireGuard UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_owned()
         )
     );
 }
@@ -241,7 +241,7 @@ fn command_only_macos_backend_blocker_remains_unchanged() {
     assert_eq!(
         backend.transport_socket_identity_blocker(),
         Some(
-            "macos wireguard backend is a command-only adapter over wireguard-go and its OS-managed UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string()
+            "macos wireguard backend is a command-only adapter over wireguard-go and its OS-managed UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_owned()
         )
     );
 }
@@ -263,7 +263,7 @@ fn command_only_windows_backend_blocker_remains_explicit() {
     assert_eq!(
         backend.transport_socket_identity_blocker(),
         Some(
-            "windows wireguard backend is a command-only adapter over the official WireGuard for Windows tunnel service and its OS-managed WireGuardNT UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string()
+            "windows wireguard backend is a command-only adapter over the official WireGuard for Windows tunnel service and its OS-managed WireGuardNT UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_owned()
         )
     );
 }

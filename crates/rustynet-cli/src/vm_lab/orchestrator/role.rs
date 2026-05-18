@@ -81,9 +81,9 @@ impl NodeRole {
             other => {
                 if let Some(label) = other.strip_prefix("custom-") {
                     if label.is_empty() {
-                        return Err("custom role label must not be empty".to_string());
+                        return Err("custom role label must not be empty".to_owned());
                     }
-                    Ok(NodeRole::Custom(label.to_string()))
+                    Ok(NodeRole::Custom(label.to_owned()))
                 } else {
                     Err(format!(
                         "unknown role '{other}'; expected one of: exit, client, entry, aux, extra, custom-<label>"
@@ -111,7 +111,7 @@ mod tests {
         assert!(!NodeRole::Entry.is_unique_per_lab());
         assert!(!NodeRole::Aux.is_unique_per_lab());
         assert!(!NodeRole::Extra.is_unique_per_lab());
-        assert!(!NodeRole::Custom("foo".to_string()).is_unique_per_lab());
+        assert!(!NodeRole::Custom("foo".to_owned()).is_unique_per_lab());
     }
 
     #[test]
@@ -127,11 +127,11 @@ mod tests {
     fn parse_custom_role() {
         assert_eq!(
             NodeRole::parse("custom-foo").unwrap(),
-            NodeRole::Custom("foo".to_string())
+            NodeRole::Custom("foo".to_owned())
         );
         assert_eq!(
             NodeRole::parse("custom-relay-test").unwrap(),
-            NodeRole::Custom("relay-test".to_string())
+            NodeRole::Custom("relay-test".to_owned())
         );
     }
 

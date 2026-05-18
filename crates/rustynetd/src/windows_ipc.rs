@@ -178,10 +178,10 @@ pub fn build_named_pipe_security_sddl(
     let policy = default_security_policy(role);
     let mut aces = Vec::new();
     if policy.allow_local_system {
-        aces.push("(A;;GA;;;SY)".to_string());
+        aces.push("(A;;GA;;;SY)".to_owned());
     }
     if policy.allow_builtin_administrators {
-        aces.push("(A;;GA;;;BA)".to_string());
+        aces.push("(A;;GA;;;BA)".to_owned());
     }
     if policy.allow_service_identity
         && let Some(sid) = service_sid
@@ -204,7 +204,7 @@ pub fn validate_windows_privileged_request(
         }
         WindowsPrivilegedRequest::InspectRuntimePathAcl { path } => {
             if path.trim().is_empty() {
-                return Err("inspect-runtime-path-acl path must not be empty".to_string());
+                return Err("inspect-runtime-path-acl path must not be empty".to_owned());
             }
             validate_windows_runtime_file_path(Path::new(path), "inspect-runtime-path-acl path")?;
         }
@@ -397,9 +397,9 @@ pub fn windows_ipc_blocker_reason(role: WindowsLocalIpcRole) -> String {
             // Daemon control is now implemented via serve_windows_daemon_control_request_once /
             // call_windows_daemon_control_raw. This path is retained only as a fallback message
             // for callers that still reference the blocker API directly.
-            "daemon control pipe is implemented on Windows; use serve_windows_daemon_control_request_once and call_windows_daemon_control_raw instead of this legacy blocker path".to_string()
+            "daemon control pipe is implemented on Windows; use serve_windows_daemon_control_request_once and call_windows_daemon_control_raw instead of this legacy blocker path".to_owned()
         }
-        WindowsLocalIpcRole::PrivilegedHelper => "privileged helper shell-command execution remains blocked on Windows; use the reviewed named-pipe probe and ACL inspection request shapes only until a real Windows backend defines native privileged operations".to_string(),
+        WindowsLocalIpcRole::PrivilegedHelper => "privileged helper shell-command execution remains blocked on Windows; use the reviewed named-pipe probe and ACL inspection request shapes only until a real Windows backend defines native privileged operations".to_owned(),
     }
 }
 
@@ -504,7 +504,7 @@ mod tests {
     fn inspect_runtime_path_request_rejects_non_reviewed_roots() {
         let err =
             validate_windows_privileged_request(&WindowsPrivilegedRequest::InspectRuntimePathAcl {
-                path: r"C:\Temp\rustynetd.env".to_string(),
+                path: r"C:\Temp\rustynetd.env".to_owned(),
             })
             .expect_err("unreviewed runtime path should fail");
         assert!(err.contains("reviewed RustyNet Windows runtime roots"));

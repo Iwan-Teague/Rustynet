@@ -25,7 +25,7 @@ fn run() -> Result<(), i32> {
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "1".to_string());
+        .unwrap_or_else(|| "1".to_owned());
 
     run_command(
         "cargo",

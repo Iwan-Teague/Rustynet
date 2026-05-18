@@ -82,8 +82,8 @@ fn build_windows_bootstrap_build_release_result_script(
     remote_probe_path: &str,
 ) -> Result<String, String> {
     let mut helper_args = args.to_vec();
-    helper_args.push("-ResultPath".to_string());
-    helper_args.push(remote_manifest_path.to_string());
+    helper_args.push("-ResultPath".to_owned());
+    helper_args.push(remote_manifest_path.to_owned());
     let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
     Ok(format!(
         "Set-StrictMode -Version Latest; \
@@ -204,12 +204,12 @@ fn build_bootstrap_script_invocation(
     context: &BootstrapPhaseContext<'_>,
 ) -> Result<WindowsHelperScriptSpec, String> {
     let mut args = vec![
-        "-Phase".to_string(),
-        phase.as_str().to_string(),
-        "-RustyNetRoot".to_string(),
-        context.workdir.to_string(),
-        "-Branch".to_string(),
-        context.branch.to_string(),
+        "-Phase".to_owned(),
+        phase.as_str().to_owned(),
+        "-RustyNetRoot".to_owned(),
+        context.workdir.to_owned(),
+        "-Branch".to_owned(),
+        context.branch.to_owned(),
     ];
 
     match phase {
@@ -222,10 +222,10 @@ fn build_bootstrap_script_invocation(
                 )
             })?;
             ensure_no_control_chars("repo URL", repo_url)?;
-            args.push("-SourceMode".to_string());
-            args.push("git".to_string());
-            args.push("-RepoUrl".to_string());
-            args.push(repo_url.to_string());
+            args.push("-SourceMode".to_owned());
+            args.push("git".to_owned());
+            args.push("-RepoUrl".to_owned());
+            args.push(repo_url.to_owned());
         }
         BootstrapPhase::BuildRelease => {}
         BootstrapPhase::SmokeServiceHost => {
@@ -261,14 +261,14 @@ fn build_windows_service_install_invocation(
         helper_file_name: WINDOWS_SERVICE_INSTALL_HELPER_FILE,
         remote_file_name: WINDOWS_SERVICE_INSTALL_HELPER_FILE,
         args: vec![
-            "-RustyNetRoot".to_string(),
-            context.workdir.to_string(),
-            "-InstallRoot".to_string(),
-            WINDOWS_INSTALL_ROOT.to_string(),
-            "-StateRoot".to_string(),
-            WINDOWS_STATE_ROOT.to_string(),
-            "-ServiceName".to_string(),
-            WINDOWS_SERVICE_NAME.to_string(),
+            "-RustyNetRoot".to_owned(),
+            context.workdir.to_owned(),
+            "-InstallRoot".to_owned(),
+            WINDOWS_INSTALL_ROOT.to_owned(),
+            "-StateRoot".to_owned(),
+            WINDOWS_STATE_ROOT.to_owned(),
+            "-ServiceName".to_owned(),
+            WINDOWS_SERVICE_NAME.to_owned(),
         ],
     }
 }
@@ -280,12 +280,12 @@ fn build_windows_service_host_smoke_invocation(
         helper_file_name: WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE,
         remote_file_name: WINDOWS_SERVICE_HOST_SMOKE_HELPER_FILE,
         args: vec![
-            "-RustyNetRoot".to_string(),
-            context.workdir.to_string(),
-            "-StateRoot".to_string(),
-            WINDOWS_STATE_ROOT.to_string(),
-            "-ServiceName".to_string(),
-            "RustyNetSmoke".to_string(),
+            "-RustyNetRoot".to_owned(),
+            context.workdir.to_owned(),
+            "-StateRoot".to_owned(),
+            WINDOWS_STATE_ROOT.to_owned(),
+            "-ServiceName".to_owned(),
+            "RustyNetSmoke".to_owned(),
         ],
     }
 }
@@ -295,14 +295,14 @@ fn build_windows_verify_invocation(context: &BootstrapPhaseContext<'_>) -> Windo
         helper_file_name: WINDOWS_VERIFY_HELPER_FILE,
         remote_file_name: WINDOWS_VERIFY_HELPER_FILE,
         args: vec![
-            "-RustyNetRoot".to_string(),
-            context.workdir.to_string(),
-            "-InstallRoot".to_string(),
-            WINDOWS_INSTALL_ROOT.to_string(),
-            "-StateRoot".to_string(),
-            WINDOWS_STATE_ROOT.to_string(),
-            "-ServiceName".to_string(),
-            WINDOWS_SERVICE_NAME.to_string(),
+            "-RustyNetRoot".to_owned(),
+            context.workdir.to_owned(),
+            "-InstallRoot".to_owned(),
+            WINDOWS_INSTALL_ROOT.to_owned(),
+            "-StateRoot".to_owned(),
+            WINDOWS_STATE_ROOT.to_owned(),
+            "-ServiceName".to_owned(),
+            WINDOWS_SERVICE_NAME.to_owned(),
         ],
     }
 }
@@ -323,7 +323,7 @@ fn build_windows_diagnostics_invocation(
     Ok(WindowsHelperScriptSpec {
         helper_file_name: WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
         remote_file_name: WINDOWS_COLLECT_DIAGNOSTICS_HELPER_FILE,
-        args: vec!["-OutputRoot".to_string(), output_root],
+        args: vec!["-OutputRoot".to_owned(), output_root],
     })
 }
 
@@ -379,7 +379,7 @@ fn parse_windows_build_release_report_output(
         })?;
     let exit_code = parsed
         .get("exit_code")
-        .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string);
+        .map_or_else(|| "unknown".to_owned(), std::string::ToString::to_string);
     let stderr_tail = parsed
         .get("stderr_tail")
         .and_then(|value| value.as_str())
@@ -590,8 +590,8 @@ fn build_windows_service_host_smoke_validation_script(
     remote_result_path: &str,
 ) -> Result<String, String> {
     let mut helper_args = args.to_vec();
-    helper_args.push("-OutputPath".to_string());
-    helper_args.push(remote_result_path.to_string());
+    helper_args.push("-OutputPath".to_owned());
+    helper_args.push(remote_result_path.to_owned());
     let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
     Ok(format!(
         "Set-StrictMode -Version Latest; \
@@ -632,8 +632,8 @@ fn build_windows_runtime_report_validation_script(
 ) -> Result<String, String> {
     ensure_no_control_chars("Windows runtime helper label", helper_label)?;
     let mut helper_args = args.to_vec();
-    helper_args.push("-OutputPath".to_string());
-    helper_args.push(remote_result_path.to_string());
+    helper_args.push("-OutputPath".to_owned());
+    helper_args.push(remote_result_path.to_owned());
     let helper_command = build_windows_helper_command(remote_path, helper_args.as_slice())?;
     Ok(format!(
         "Set-StrictMode -Version Latest; \
@@ -725,8 +725,7 @@ impl WindowsDiagnosticsManifestView {
         }
         if view.status == "fail" && view.reason.trim().is_empty() {
             return Err(
-                "windows diagnostics manifest status=fail must carry a non-empty reason"
-                    .to_string(),
+                "windows diagnostics manifest status=fail must carry a non-empty reason".to_owned(),
             );
         }
         Ok(view)
@@ -885,7 +884,7 @@ impl WindowsInstallReportView {
         }
         if view.status == "fail" && view.reason.trim().is_empty() {
             return Err(
-                "windows install report status=fail must carry a non-empty reason".to_string(),
+                "windows install report status=fail must carry a non-empty reason".to_owned(),
             );
         }
         Ok(view)
@@ -942,13 +941,13 @@ impl WindowsPrepareTransportReportView {
         }
         if view.status == "fail" && view.reason.trim().is_empty() {
             return Err(
-                "windows prepare-transport status=fail must carry a non-empty reason".to_string(),
+                "windows prepare-transport status=fail must carry a non-empty reason".to_owned(),
             );
         }
         if view.host_key_present && view.host_key.trim().is_empty() {
             return Err(
                 "windows prepare-transport host_key_present=true requires a non-empty host_key"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         Ok(view)
@@ -1030,8 +1029,7 @@ impl WindowsBuildReleaseReportView {
         }
         if view.status == "fail" && view.reason.trim().is_empty() {
             return Err(
-                "windows build-release report status=fail must carry a non-empty reason"
-                    .to_string(),
+                "windows build-release report status=fail must carry a non-empty reason".to_owned(),
             );
         }
         match view.toolchain_scope.as_str() {
@@ -1044,8 +1042,7 @@ impl WindowsBuildReleaseReportView {
         }
         if view.status == "fail" && view.exit_code == 0 {
             return Err(
-                "windows build-release report status=fail with exit_code=0 is internally inconsistent"
-                    .to_string(),
+                "windows build-release report status=fail with exit_code=0 is internally inconsistent".to_owned(),
             );
         }
         Ok(view)
@@ -1360,7 +1357,7 @@ impl WindowsBootstrapProvider {
                     target.label, reason
                 ));
             }
-            return Ok(output_root.to_string());
+            return Ok(output_root.to_owned());
         }
         let invocation = build_windows_diagnostics_invocation(target, phase)?;
         let output =
@@ -1372,7 +1369,7 @@ impl WindowsBootstrapProvider {
                 target.label
             ));
         }
-        Ok(output_root.to_string())
+        Ok(output_root.to_owned())
     }
 
     fn with_failure_diagnostics<F>(
@@ -1810,14 +1807,14 @@ mod tests {
     #[test]
     fn windows_diagnostics_invocation_uses_remote_temp_root_and_phase() {
         let target = RemoteTarget {
-            label: "windows-utm-1".to_string(),
-            ssh_target: "192.168.64.20".to_string(),
-            ssh_user: Some("Administrator".to_string()),
+            label: "windows-utm-1".to_owned(),
+            ssh_target: "192.168.64.20".to_owned(),
+            ssh_user: Some("Administrator".to_owned()),
             controller: None,
             platform_profile: default_platform_profile(VmGuestPlatform::Windows),
-            rustynet_src_dir: Some(r"C:\Rustynet".to_string()),
-            remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_string()),
-            utm_staging_dir: Some(r"C:\Users\windows\rustynet-utm-stage".to_string()),
+            rustynet_src_dir: Some(r"C:\Rustynet".to_owned()),
+            remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_owned()),
+            utm_staging_dir: Some(r"C:\Users\windows\rustynet-utm-stage".to_owned()),
         };
         let invocation =
             build_windows_diagnostics_invocation(&target, BootstrapPhase::InstallRelease)
@@ -1851,17 +1848,17 @@ mod tests {
         // RestartRuntime, VerifyRuntime when the target is a Windows
         // local-UTM guest with a SYSTEM-writable staging directory.
         let target = RemoteTarget {
-            label: "windows-utm-1".to_string(),
-            ssh_target: "192.168.64.14".to_string(),
-            ssh_user: Some("Administrator".to_string()),
+            label: "windows-utm-1".to_owned(),
+            ssh_target: "192.168.64.14".to_owned(),
+            ssh_user: Some("Administrator".to_owned()),
             controller: Some(VmController::LocalUtm {
-                utm_name: "Windows".to_string(),
+                utm_name: "Windows".to_owned(),
                 bundle_path: std::path::PathBuf::from("/tmp/Windows.utm"),
             }),
             platform_profile: default_platform_profile(VmGuestPlatform::Windows),
-            rustynet_src_dir: Some(r"C:\Rustynet".to_string()),
-            remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_string()),
-            utm_staging_dir: Some(r"C:\Users\windows\rustynet-utm-stage".to_string()),
+            rustynet_src_dir: Some(r"C:\Rustynet".to_owned()),
+            remote_temp_dir: Some(r"C:\ProgramData\Rustynet\vm-lab".to_owned()),
+            utm_staging_dir: Some(r"C:\Users\windows\rustynet-utm-stage".to_owned()),
         };
 
         assert!(local_utm_result_file_supported_for_phase(
@@ -1887,10 +1884,10 @@ mod tests {
         let smoke_script = build_windows_service_host_smoke_validation_script(
             r"C:\ProgramData\RustyNet\vm-lab\Smoke-RustyNetWindowsServiceHost.ps1",
             &[
-                "-RustyNetRoot".to_string(),
-                r"C:\Rustynet".to_string(),
-                "-StateRoot".to_string(),
-                r"C:\ProgramData\RustyNet".to_string(),
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
+                "-StateRoot".to_owned(),
+                r"C:\ProgramData\RustyNet".to_owned(),
             ],
             r"C:\ProgramData\RustyNet\vm-lab\smoke.json",
         )
@@ -1900,10 +1897,10 @@ mod tests {
         let runtime_script = build_windows_runtime_report_validation_script(
             r"C:\ProgramData\RustyNet\vm-lab\Verify-RustyNetWindowsBootstrap.ps1",
             &[
-                "-RustyNetRoot".to_string(),
-                r"C:\Rustynet".to_string(),
-                "-StateRoot".to_string(),
-                r"C:\ProgramData\RustyNet".to_string(),
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
+                "-StateRoot".to_owned(),
+                r"C:\ProgramData\RustyNet".to_owned(),
             ],
             r"C:\ProgramData\RustyNet\vm-lab\verify.json",
             "Windows verify helper",
@@ -1915,8 +1912,8 @@ mod tests {
         let diagnostics_script = build_windows_diagnostics_validation_script(
             r"C:\ProgramData\RustyNet\vm-lab\Collect-RustyNetWindowsDiagnostics.ps1",
             &[
-                "-OutputRoot".to_string(),
-                r"C:\ProgramData\RustyNet\diag".to_string(),
+                "-OutputRoot".to_owned(),
+                r"C:\ProgramData\RustyNet\diag".to_owned(),
             ],
             r"C:\ProgramData\RustyNet\diag",
         )
@@ -1929,8 +1926,8 @@ mod tests {
         let script = build_windows_diagnostics_validation_script(
             r"C:\ProgramData\Rustynet\vm-lab\Collect-RustyNetWindowsDiagnostics.ps1",
             &[
-                "-OutputRoot".to_string(),
-                r"C:\ProgramData\Rustynet\vm-lab\diagnostics\run-1".to_string(),
+                "-OutputRoot".to_owned(),
+                r"C:\ProgramData\Rustynet\vm-lab\diagnostics\run-1".to_owned(),
             ],
             r"C:\ProgramData\Rustynet\vm-lab\diagnostics\run-1",
         )
@@ -2147,7 +2144,7 @@ mod tests {
         let view = WindowsVerifyReportView::parse(body).expect("must parse");
         assert_eq!(view.status, "fail");
         assert!(view.reason.contains("access denied"));
-        assert_eq!(view.notes, vec!["verify-helper-trap".to_string()]);
+        assert_eq!(view.notes, vec!["verify-helper-trap".to_owned()]);
     }
 
     #[test]
@@ -2336,7 +2333,7 @@ mod tests {
         let view = WindowsInstallReportView::parse(body).expect("must parse");
         assert_eq!(view.status, "fail");
         assert!(view.reason.contains("invalid service name"));
-        assert_eq!(view.notes, vec!["install-helper-trap".to_string()]);
+        assert_eq!(view.notes, vec!["install-helper-trap".to_owned()]);
     }
 
     #[test]
@@ -2838,10 +2835,10 @@ mod tests {
         let script = build_windows_bootstrap_build_release_result_script(
             r"C:\ProgramData\Rustynet\vm-lab\Bootstrap-RustyNetWindows.ps1",
             &[
-                "-Phase".to_string(),
-                "build-release".to_string(),
-                "-RustyNetRoot".to_string(),
-                r"C:\Rustynet".to_string(),
+                "-Phase".to_owned(),
+                "build-release".to_owned(),
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
             ],
             r"C:\ProgramData\Rustynet\vm-lab\build-release\run-1\manifest.json",
             r"C:\ProgramData\Rustynet\vm-lab\build-release\run-1\probe.json",
@@ -2878,10 +2875,10 @@ mod tests {
         let script = build_windows_runtime_report_validation_script(
             r"C:\ProgramData\Rustynet\vm-lab\Install-RustyNetWindowsService.ps1",
             &[
-                "-RustyNetRoot".to_string(),
-                r"C:\Rustynet".to_string(),
-                "-InstallRoot".to_string(),
-                r"C:\Program Files\RustyNet".to_string(),
+                "-RustyNetRoot".to_owned(),
+                r"C:\Rustynet".to_owned(),
+                "-InstallRoot".to_owned(),
+                r"C:\Program Files\RustyNet".to_owned(),
             ],
             r"C:\ProgramData\Rustynet\vm-lab\install-report.json",
             "Windows service install helper",
@@ -2913,7 +2910,7 @@ mod tests {
         let rendered = format_windows_phase_failure_with_diagnostics(
             "Windows phase verify-runtime requires proven access for windows-utm-1: ssh-access-not-ready: ssh-auth-rejected",
             "windows-utm-1",
-            Ok(r"C:\ProgramData\RustyNet\vm-lab\diagnostics\bootstrap-windows-utm-1-verify-runtime-1".to_string()),
+            Ok(r"C:\ProgramData\RustyNet\vm-lab\diagnostics\bootstrap-windows-utm-1-verify-runtime-1".to_owned()),
         );
         assert!(rendered.contains("diagnostics_output_root="));
         assert!(rendered.contains("windows-utm-1"));

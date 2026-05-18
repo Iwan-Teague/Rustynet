@@ -51,7 +51,7 @@ fn run() -> Result<(), i32> {
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "1".to_string());
+        .unwrap_or_else(|| "1".to_owned());
     let report_path = env::var_os("RUSTYNET_PHASE5_GATE_REPORT_PATH")
         .filter(|value| !value.is_empty())
         .map_or_else(|| root_dir.join(DEFAULT_REPORT_PATH), PathBuf::from);
@@ -409,9 +409,9 @@ struct GateStepReport {
 impl GateStepReport {
     fn new(id: &str, description: &str, command: &[&str]) -> Self {
         Self {
-            id: id.to_string(),
-            description: description.to_string(),
-            command: command.iter().map(|item| (*item).to_string()).collect(),
+            id: id.to_owned(),
+            description: description.to_owned(),
+            command: command.iter().map(|item| (*item).to_owned()).collect(),
             expected_paths: Vec::new(),
             status: GateStepStatus::NotExecuted,
             exit_code: None,
@@ -420,7 +420,7 @@ impl GateStepReport {
     }
 
     fn with_expected_paths(mut self, paths: &[&str]) -> Self {
-        self.expected_paths = paths.iter().map(|path| (*path).to_string()).collect();
+        self.expected_paths = paths.iter().map(|path| (*path).to_owned()).collect();
         self
     }
 }
@@ -439,12 +439,12 @@ impl GateExecutionReport {
     fn phase5() -> Self {
         Self {
             schema_version: 1,
-            gate: "phase5_ci_gates".to_string(),
+            gate: "phase5_ci_gates".to_owned(),
             overall_status: GateRunStatus::ExecutedFailed,
             generated_at_unix: 0,
             required_step_ids: REQUIRED_PHASE5_STEP_IDS
                 .iter()
-                .map(|step| (*step).to_string())
+                .map(|step| (*step).to_owned())
                 .collect(),
             steps: vec![
                 GateStepReport::new(
@@ -628,7 +628,7 @@ mod tests {
                 }
             }
 
-            Err("failed to create temp dir: exhausted unique path attempts".to_string())
+            Err("failed to create temp dir: exhausted unique path attempts".to_owned())
         }
 
         fn path(&self) -> &Path {
@@ -661,7 +661,7 @@ mod tests {
         report.step_mut("cargo_clippy").unwrap().status = GateStepStatus::ExecutedFailed;
         report.step_mut("cargo_clippy").unwrap().exit_code = Some(101);
         report.step_mut("cargo_clippy").unwrap().detail =
-            Some("command failed: cargo clippy".to_string());
+            Some("command failed: cargo clippy".to_owned());
         report.overall_status = GateRunStatus::ExecutedFailed;
 
         assert_eq!(
@@ -684,7 +684,7 @@ mod tests {
         report.step_mut("cargo_clippy").unwrap().status = GateStepStatus::ExecutedFailed;
         report.step_mut("cargo_clippy").unwrap().exit_code = Some(101);
         report.step_mut("cargo_clippy").unwrap().detail =
-            Some("command failed: cargo clippy".to_string());
+            Some("command failed: cargo clippy".to_owned());
         report.overall_status = GateRunStatus::ExecutedFailed;
 
         write_report(&report_path, &mut report).expect("write report");

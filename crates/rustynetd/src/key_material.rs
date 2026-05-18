@@ -150,7 +150,7 @@ fn parse_passphrase_bytes(
 ) -> Result<Zeroizing<String>, String> {
     if raw.len() > MAX_PASSPHRASE_BYTES {
         raw.zeroize();
-        return Err("passphrase exceeds maximum allowed size".to_string());
+        return Err("passphrase exceeds maximum allowed size".to_owned());
     }
     let decoded = match std::str::from_utf8(&raw) {
         Ok(value) => value,
@@ -162,9 +162,9 @@ fn parse_passphrase_bytes(
     let trimmed = decoded.trim();
     if trimmed.len() < 16 {
         raw.zeroize();
-        return Err("passphrase must be at least 16 characters".to_string());
+        return Err("passphrase must be at least 16 characters".to_owned());
     }
-    let value = Zeroizing::new(trimmed.to_string());
+    let value = Zeroizing::new(trimmed.to_owned());
     raw.zeroize();
     Ok(value)
 }
@@ -441,7 +441,7 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
             "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} contains invalid characters; allowed: [A-Za-z0-9._-]",
         ));
     }
-    Ok(account.to_string())
+    Ok(account.to_owned())
 }
 
 pub fn decrypt_private_key(
@@ -459,7 +459,7 @@ pub fn decrypt_private_key(
         .load_private_key(&key_id)
         .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
     if key.is_empty() {
-        return Err("decrypted key is empty".to_string());
+        return Err("decrypted key is empty".to_owned());
     }
     if !key.ends_with(b"\n") {
         key.push(b'\n');
@@ -492,7 +492,7 @@ pub fn encrypt_private_key_with_passphrase(
         .map_err(|err| format!("encrypt key failed: {err}"))?;
     let parent = encrypted_key_path
         .parent()
-        .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
+        .ok_or_else(|| "encrypted key path must include parent directory".to_owned())?;
     // Keep the configured encrypted-key path materialized on disk for service prechecks and
     // deterministic bootstrap across hosts, even when the custody backend also stores by key-id.
     write_encrypted_key_file(
@@ -512,7 +512,7 @@ fn key_custody_manager(
 ) -> Result<KeyCustodyManager<PlatformOsSecureStore>, String> {
     let parent = encrypted_key_path
         .parent()
-        .ok_or_else(|| "encrypted key path must include parent directory".to_string())?;
+        .ok_or_else(|| "encrypted key path must include parent directory".to_owned())?;
     let manager = KeyCustodyManager::new_zeroizing(
         PlatformOsSecureStore,
         parent.to_path_buf(),
@@ -683,14 +683,14 @@ fn key_custody_key_id(encrypted_key_path: &Path) -> String {
 
 pub fn write_runtime_private_key(path: &Path, private_key: &[u8]) -> Result<(), String> {
     if private_key.is_empty() {
-        return Err("private key must not be empty".to_string());
+        return Err("private key must not be empty".to_owned());
     }
     write_atomic(path, private_key, 0o600)
 }
 
 pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
     if public_key.trim().is_empty() {
-        return Err("public key must not be empty".to_string());
+        return Err("public key must not be empty".to_owned());
     }
     let value = format!("{}\n", public_key.trim());
     write_atomic(path, value.as_bytes(), 0o644)
@@ -707,7 +707,7 @@ pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
     }
     let mut private_key = private.stdout;
     if private_key.is_empty() {
-        return Err("wg genkey produced empty key".to_string());
+        return Err("wg genkey produced empty key".to_owned());
     }
     if !private_key.ends_with(b"\n") {
         private_key.push(b'\n');
@@ -853,7 +853,7 @@ pub fn initialize_encrypted_key_material(
             || public_key_path.exists())
     {
         return Err(
-            "key material already exists; use --force to overwrite existing files".to_string(),
+            "key material already exists; use --force to overwrite existing files".to_owned(),
         );
     }
 
@@ -897,7 +897,7 @@ pub fn migrate_existing_private_key_material(
     if !force && (encrypted_key_path.exists() || public_key_path.exists()) {
         return Err(
             "target key material already exists; use --force to overwrite existing files"
-                .to_string(),
+                .to_owned(),
         );
     }
 
@@ -908,7 +908,7 @@ pub fn migrate_existing_private_key_material(
         )
     })?;
     if private_key.is_empty() {
-        return Err("existing private key is empty".to_string());
+        return Err("existing private key is empty".to_owned());
     }
     if !private_key.ends_with(b"\n") {
         private_key.push(b'\n');
@@ -1064,10 +1064,10 @@ fn temp_path_for(path: &Path) -> PathBuf {
 
 fn validate_interface_name(value: &str) -> Result<(), String> {
     if value.is_empty() {
-        return Err("interface name must not be empty".to_string());
+        return Err("interface name must not be empty".to_owned());
     }
     if value.len() > 15 {
-        return Err("interface name must be <= 15 characters".to_string());
+        return Err("interface name must be <= 15 characters".to_owned());
     }
     if value
         .chars()
@@ -1075,7 +1075,7 @@ fn validate_interface_name(value: &str) -> Result<(), String> {
     {
         return Ok(());
     }
-    Err("interface name contains invalid characters".to_string())
+    Err("interface name contains invalid characters".to_owned())
 }
 
 fn resolve_wireguard_binary_path() -> Result<PathBuf, String> {
@@ -1166,7 +1166,7 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| "wg pubkey stdin unavailable".to_string())?;
+            .ok_or_else(|| "wg pubkey stdin unavailable".to_owned())?;
         stdin
             .write_all(private_key)
             .map_err(|err| format!("wg pubkey stdin write failed: {err}"))?;
@@ -1180,9 +1180,9 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
     let public_key = String::from_utf8(output.stdout)
         .map_err(|err| format!("wg pubkey produced non-utf8 output: {err}"))?
         .trim()
-        .to_string();
+        .to_owned();
     if public_key.is_empty() {
-        return Err("wg pubkey produced empty key".to_string());
+        return Err("wg pubkey produced empty key".to_owned());
     }
     Ok(public_key)
 }

@@ -210,13 +210,13 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 30,
-            peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
-            selected_exit_node: Some("peer-a".to_string()),
+            peer_ids: vec!["peer-a".to_owned(), "peer-b".to_owned()],
+            selected_exit_node: Some("peer-a".to_owned()),
             lan_access_enabled: false,
         };
         let reasons = evaluate_windows_mesh_status(
             &snap,
-            &["peer-a".to_string(), "peer-b".to_string()],
+            &["peer-a".to_owned(), "peer-b".to_owned()],
             Some(300),
         );
         assert!(reasons.is_empty(), "fresh snapshot must pass: {reasons:?}");
@@ -227,15 +227,12 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 30,
-            peer_ids: vec!["peer-a".to_string()],
+            peer_ids: vec!["peer-a".to_owned()],
             selected_exit_node: None,
             lan_access_enabled: false,
         };
-        let reasons = evaluate_windows_mesh_status(
-            &snap,
-            &["peer-a".to_string(), "peer-b".to_string()],
-            None,
-        );
+        let reasons =
+            evaluate_windows_mesh_status(&snap, &["peer-a".to_owned(), "peer-b".to_owned()], None);
         assert!(
             reasons.iter().any(|r| r.contains("expected peer peer-b")),
             "missing peer must surface: {reasons:?}"
@@ -279,11 +276,11 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 999_999,
-            peer_ids: vec!["peer-a".to_string()],
+            peer_ids: vec!["peer-a".to_owned()],
             selected_exit_node: None,
             lan_access_enabled: false,
         };
-        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_string()], None);
+        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_owned()], None);
         assert!(
             reasons.is_empty(),
             "freshness check must skip when threshold None: {reasons:?}"
@@ -293,7 +290,7 @@ mod tests {
     #[test]
     fn evaluator_surfaces_missing_state_load() {
         let snap = WindowsMeshSnapshotLoad::Missing {
-            reason: "no such file".to_string(),
+            reason: "no such file".to_owned(),
         };
         let reasons = evaluate_windows_mesh_status(&snap, &[], None);
         assert!(
@@ -305,7 +302,7 @@ mod tests {
     #[test]
     fn evaluator_surfaces_integrity_mismatch() {
         let snap = WindowsMeshSnapshotLoad::IntegrityMismatch {
-            reason: "checksum failed".to_string(),
+            reason: "checksum failed".to_owned(),
         };
         let reasons = evaluate_windows_mesh_status(&snap, &[], None);
         assert!(
@@ -317,7 +314,7 @@ mod tests {
     #[test]
     fn evaluator_surfaces_invalid_format() {
         let snap = WindowsMeshSnapshotLoad::InvalidFormat {
-            reason: "missing field".to_string(),
+            reason: "missing field".to_owned(),
         };
         let reasons = evaluate_windows_mesh_status(&snap, &[], None);
         assert!(
@@ -337,7 +334,7 @@ mod tests {
         };
         let reasons = evaluate_windows_mesh_status(
             &snap,
-            &["peer-a".to_string(), "peer-b".to_string()],
+            &["peer-a".to_owned(), "peer-b".to_owned()],
             Some(300),
         );
         assert!(
@@ -354,7 +351,7 @@ mod tests {
         let _ = fs::remove_file(bogus.as_path());
         let options = WindowsMeshStatusOptions {
             state_path: Some(bogus),
-            expected_peer_ids: vec!["peer-a".to_string()],
+            expected_peer_ids: vec!["peer-a".to_owned()],
             max_age_seconds: Some(300),
         };
         let report = collect_windows_mesh_status_report(&options);
@@ -428,16 +425,16 @@ mod tests {
     fn report_serializes_with_load_status_tag_and_round_trips() {
         let report = WindowsMeshStatusReport {
             schema_version: 1,
-            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_owned(),
             overall_ok: true,
             snapshot: WindowsMeshSnapshotLoad::Ok {
                 timestamp_unix: 1_700_000_000,
                 age_seconds: 30,
-                peer_ids: vec!["peer-a".to_string()],
-                selected_exit_node: Some("peer-a".to_string()),
+                peer_ids: vec!["peer-a".to_owned()],
+                selected_exit_node: Some("peer-a".to_owned()),
                 lan_access_enabled: false,
             },
-            expected_peer_ids: vec!["peer-a".to_string()],
+            expected_peer_ids: vec!["peer-a".to_owned()],
             max_age_seconds: Some(300),
             drift_reasons: vec![],
         };
@@ -452,14 +449,14 @@ mod tests {
     fn report_serializes_missing_load_with_status_tag() {
         let report = WindowsMeshStatusReport {
             schema_version: 1,
-            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::Missing {
-                reason: "no such file".to_string(),
+                reason: "no such file".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec!["state snapshot missing: no such file".to_string()],
+            drift_reasons: vec!["state snapshot missing: no such file".to_owned()],
         };
         let serialized = serde_json::to_string(&report).expect("serialize");
         assert!(serialized.contains("\"load_status\":\"missing\""));
@@ -477,10 +474,10 @@ mod tests {
         // test and forces a deliberate review.
         let report = WindowsMeshStatusReport {
             schema_version: 1,
-            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::Missing {
-                reason: "no such file".to_string(),
+                reason: "no such file".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
@@ -501,14 +498,14 @@ mod tests {
         // Round-trip the IntegrityMismatch shape explicitly.
         let report = WindowsMeshStatusReport {
             schema_version: 1,
-            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::IntegrityMismatch {
-                reason: "checksum mismatch".to_string(),
+                reason: "checksum mismatch".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec!["state snapshot integrity mismatch: checksum mismatch".to_string()],
+            drift_reasons: vec!["state snapshot integrity mismatch: checksum mismatch".to_owned()],
         };
         let body = serde_json::to_string(&report).expect("serialize");
         assert!(
@@ -523,16 +520,14 @@ mod tests {
     fn invalid_format_load_round_trips_through_serde() {
         let report = WindowsMeshStatusReport {
             schema_version: 1,
-            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::InvalidFormat {
-                reason: "missing required field".to_string(),
+                reason: "missing required field".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec![
-                "state snapshot invalid format: missing required field".to_string(),
-            ],
+            drift_reasons: vec!["state snapshot invalid format: missing required field".to_owned()],
         };
         let body = serde_json::to_string(&report).expect("serialize");
         assert!(
@@ -566,11 +561,11 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 300,
-            peer_ids: vec!["peer-a".to_string()],
+            peer_ids: vec!["peer-a".to_owned()],
             selected_exit_node: None,
             lan_access_enabled: false,
         };
-        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_string()], Some(300));
+        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_owned()], Some(300));
         assert!(
             reasons.is_empty(),
             "age == max_age must pass (strict >): {reasons:?}"
@@ -607,8 +602,8 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 999_999,
-            peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
-            selected_exit_node: Some("peer-a".to_string()),
+            peer_ids: vec!["peer-a".to_owned(), "peer-b".to_owned()],
+            selected_exit_node: Some("peer-a".to_owned()),
             lan_access_enabled: true,
         };
         let reasons = evaluate_windows_mesh_status(&snap, &[], None);
@@ -629,16 +624,16 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 30,
-            peer_ids: vec!["peer-x".to_string()],
+            peer_ids: vec!["peer-x".to_owned()],
             selected_exit_node: None,
             lan_access_enabled: false,
         };
         let reasons = evaluate_windows_mesh_status(
             &snap,
             &[
-                "peer-a".to_string(),
-                "peer-a".to_string(),
-                "peer-b".to_string(),
+                "peer-a".to_owned(),
+                "peer-a".to_owned(),
+                "peer-b".to_owned(),
             ],
             None,
         );
@@ -660,11 +655,11 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 30,
-            peer_ids: vec!["peer-a".to_string()],
+            peer_ids: vec!["peer-a".to_owned()],
             selected_exit_node: None, // no exit node selected
             lan_access_enabled: true, // LAN access enabled
         };
-        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_string()], Some(300));
+        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_owned()], Some(300));
         assert!(
             reasons.is_empty(),
             "selected_exit_node + lan_access_enabled must not affect drift today: {reasons:?}"

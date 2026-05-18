@@ -28,7 +28,7 @@ impl OrchestrationStage for DistributeMembershipStage {
             Some(d) => d.clone(),
             None => {
                 return StageOutcome::Failed(
-                    "no membership snapshot in context (MembershipInit must run first)".to_string(),
+                    "no membership snapshot in context (MembershipInit must run first)".to_owned(),
                 );
             }
         };
@@ -87,7 +87,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,
@@ -104,7 +104,7 @@ mod tests {
     fn no_non_exit_nodes_passes_trivially() {
         let mut ctx = OrchestrationContext {
             assignments: vec![NodeRoleAssignment {
-                alias: "exit-1".to_string(),
+                alias: "exit-1".to_owned(),
                 role: NodeRole::Exit,
             }],
             adapters: HashMap::new(),
@@ -112,7 +112,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: Some(vec![1, 2, 3]),

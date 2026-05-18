@@ -181,9 +181,9 @@ fn probe_required_dir(
         Ok(m) => m,
         Err(err) => {
             return MacosKeyCustodyEntry {
-                label: label.to_string(),
-                path: path.to_string(),
-                expected: "present".to_string(),
+                label: label.to_owned(),
+                path: path.to_owned(),
+                expected: "present".to_owned(),
                 status: MacosKeyCustodyEntryStatus::Missing {
                     reason: format!("{label} not found at {path}: {err}"),
                 },
@@ -202,9 +202,9 @@ fn probe_required_dir(
         || gid != expected_gid
     {
         return MacosKeyCustodyEntry {
-            label: label.to_string(),
-            path: path.to_string(),
-            expected: "present".to_string(),
+            label: label.to_owned(),
+            path: path.to_owned(),
+            expected: "present".to_owned(),
             status: MacosKeyCustodyEntryStatus::Invalid {
                 reason: format!(
                     "{label} mode/owner/type mismatch: mode=0o{actual_mode:o} uid={uid} gid={gid}"
@@ -216,9 +216,9 @@ fn probe_required_dir(
         };
     }
     MacosKeyCustodyEntry {
-        label: label.to_string(),
-        path: path.to_string(),
-        expected: "present".to_string(),
+        label: label.to_owned(),
+        path: path.to_owned(),
+        expected: "present".to_owned(),
         status: MacosKeyCustodyEntryStatus::Ok {
             mode: actual_mode,
             uid,
@@ -240,9 +240,9 @@ fn probe_required_file(
         Ok(m) => m,
         Err(err) => {
             return MacosKeyCustodyEntry {
-                label: label.to_string(),
-                path: path.to_string(),
-                expected: "present".to_string(),
+                label: label.to_owned(),
+                path: path.to_owned(),
+                expected: "present".to_owned(),
                 status: MacosKeyCustodyEntryStatus::Missing {
                     reason: format!("{label} not found at {path}: {err}"),
                 },
@@ -262,9 +262,9 @@ fn probe_required_file(
         || gid != expected_gid
     {
         return MacosKeyCustodyEntry {
-            label: label.to_string(),
-            path: path.to_string(),
-            expected: "present".to_string(),
+            label: label.to_owned(),
+            path: path.to_owned(),
+            expected: "present".to_owned(),
             status: MacosKeyCustodyEntryStatus::Invalid {
                 reason: format!(
                     "{label} mode/owner/type mismatch: mode=0o{actual_mode:o} uid={uid} gid={gid}"
@@ -276,9 +276,9 @@ fn probe_required_file(
         };
     }
     MacosKeyCustodyEntry {
-        label: label.to_string(),
-        path: path.to_string(),
-        expected: "present".to_string(),
+        label: label.to_owned(),
+        path: path.to_owned(),
+        expected: "present".to_owned(),
         status: MacosKeyCustodyEntryStatus::Ok {
             mode: actual_mode,
             uid,
@@ -291,15 +291,15 @@ fn probe_required_file(
 fn probe_forbidden_file(path: &'static str, label: &'static str) -> MacosKeyCustodyEntry {
     match std::fs::symlink_metadata(path) {
         Err(_) => MacosKeyCustodyEntry {
-            label: label.to_string(),
-            path: path.to_string(),
-            expected: "absent".to_string(),
+            label: label.to_owned(),
+            path: path.to_owned(),
+            expected: "absent".to_owned(),
             status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
         },
         Ok(_) => MacosKeyCustodyEntry {
-            label: label.to_string(),
-            path: path.to_string(),
-            expected: "absent".to_string(),
+            label: label.to_owned(),
+            path: path.to_owned(),
+            expected: "absent".to_owned(),
             status: MacosKeyCustodyEntryStatus::Forbidden {
                 reason: format!(
                     "plaintext private key at {path} must not exist at rest — \
@@ -320,9 +320,9 @@ mod tests {
             schema_version: 1,
             overall_ok: true,
             entries: vec![MacosKeyCustodyEntry {
-                label: "keys dir".to_string(),
-                path: MACOS_WG_KEYS_DIR.to_string(),
-                expected: "present".to_string(),
+                label: "keys dir".to_owned(),
+                path: MACOS_WG_KEYS_DIR.to_owned(),
+                expected: "present".to_owned(),
                 status: MacosKeyCustodyEntryStatus::Ok {
                     mode: 0o700,
                     uid: 500,
@@ -365,9 +365,9 @@ mod tests {
 
     fn keys_dir_entry() -> MacosKeyCustodyEntry {
         MacosKeyCustodyEntry {
-            label: "keys dir".to_string(),
-            path: MACOS_WG_KEYS_DIR.to_string(),
-            expected: "present".to_string(),
+            label: "keys dir".to_owned(),
+            path: MACOS_WG_KEYS_DIR.to_owned(),
+            expected: "present".to_owned(),
             status: MacosKeyCustodyEntryStatus::Ok {
                 mode: 0o700,
                 uid: 500,
@@ -439,11 +439,11 @@ mod tests {
     #[test]
     fn entry_status_missing_round_trips_through_serde() {
         let entry = MacosKeyCustodyEntry {
-            label: "keys dir".to_string(),
-            path: MACOS_WG_KEYS_DIR.to_string(),
-            expected: "present".to_string(),
+            label: "keys dir".to_owned(),
+            path: MACOS_WG_KEYS_DIR.to_owned(),
+            expected: "present".to_owned(),
             status: MacosKeyCustodyEntryStatus::Missing {
-                reason: "stat failed: ENOENT".to_string(),
+                reason: "stat failed: ENOENT".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -455,11 +455,11 @@ mod tests {
     #[test]
     fn entry_status_invalid_round_trips_through_serde() {
         let entry = MacosKeyCustodyEntry {
-            label: "encrypted private key".to_string(),
-            path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            expected: "present".to_string(),
+            label: "encrypted private key".to_owned(),
+            path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            expected: "present".to_owned(),
             status: MacosKeyCustodyEntryStatus::Invalid {
-                reason: "mode 0o644, expected 0o600".to_string(),
+                reason: "mode 0o644, expected 0o600".to_owned(),
                 mode: 0o100644,
                 uid: 500,
                 gid: 500,
@@ -474,11 +474,11 @@ mod tests {
     #[test]
     fn entry_status_forbidden_round_trips_through_serde() {
         let entry = MacosKeyCustodyEntry {
-            label: "plaintext private key (forbidden)".to_string(),
-            path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
-            expected: "absent".to_string(),
+            label: "plaintext private key (forbidden)".to_owned(),
+            path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_owned(),
+            expected: "absent".to_owned(),
             status: MacosKeyCustodyEntryStatus::Forbidden {
-                reason: "must not exist at rest after Phase E".to_string(),
+                reason: "must not exist at rest after Phase E".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -490,9 +490,9 @@ mod tests {
     #[test]
     fn entry_status_absent_as_expected_round_trips_through_serde() {
         let entry = MacosKeyCustodyEntry {
-            label: "plaintext private key (forbidden)".to_string(),
-            path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
-            expected: "absent".to_string(),
+            label: "plaintext private key (forbidden)".to_owned(),
+            path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_owned(),
+            expected: "absent".to_owned(),
             status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -529,11 +529,11 @@ mod tests {
             entries: vec![
                 keys_dir_entry(),
                 MacosKeyCustodyEntry {
-                    label: "encrypted private key".to_string(),
-                    path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-                    expected: "present".to_string(),
+                    label: "encrypted private key".to_owned(),
+                    path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+                    expected: "present".to_owned(),
                     status: MacosKeyCustodyEntryStatus::Invalid {
-                        reason: "mode drift".to_string(),
+                        reason: "mode drift".to_owned(),
                         mode: 0o100644,
                         uid: 500,
                         gid: 500,
@@ -566,9 +566,9 @@ mod tests {
             entries: vec![
                 keys_dir_entry(),
                 MacosKeyCustodyEntry {
-                    label: "plaintext private key (forbidden)".to_string(),
-                    path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
-                    expected: "absent".to_string(),
+                    label: "plaintext private key (forbidden)".to_owned(),
+                    path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_owned(),
+                    expected: "absent".to_owned(),
                     status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
                 },
             ],

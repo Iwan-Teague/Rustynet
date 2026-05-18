@@ -221,7 +221,7 @@ fn run() -> Result<(), String> {
 
     if ssh_identity_file.is_empty() {
         print_usage();
-        return Err("missing required argument: --ssh-identity-file".to_string());
+        return Err("missing required argument: --ssh-identity-file".to_owned());
     }
 
     if let Some(parent) = report_path.parent() {
@@ -401,7 +401,7 @@ fn run() -> Result<(), String> {
             &["mktemp", "/tmp/rn-lan-toggle-dns-passphrase.XXXXXX"],
         )?
         .trim()
-        .to_string();
+        .to_owned();
     ctx.run_root(
         &exit_host,
         &[
@@ -791,7 +791,7 @@ fn run() -> Result<(), String> {
         report_path.display()
     ))?;
     if overall != "pass" {
-        return Err("LAN toggle test overall status: fail".to_string());
+        return Err("LAN toggle test overall status: fail".to_owned());
     }
     Ok(())
 }
@@ -929,8 +929,8 @@ fn run_lan_access_command(
 }
 
 fn summarize_command_output(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() && !stdout.is_empty() {
         format!("{stderr} (stdout: {stdout})")
     } else if !stderr.is_empty() {
@@ -938,7 +938,7 @@ fn summarize_command_output(output: &Output) -> String {
     } else if !stdout.is_empty() {
         stdout
     } else {
-        "no output".to_string()
+        "no output".to_owned()
     }
 }
 
@@ -982,7 +982,7 @@ fn no_plaintext_passphrase_check(ctx: &LiveLabContext, target: &str) -> Result<S
     for check in checks {
         ctx.run_root(target, &["test", "!", "-e", check])?;
     }
-    Ok("no-plaintext-passphrase-files".to_string())
+    Ok("no-plaintext-passphrase-files".to_owned())
 }
 
 fn write_assignment_env(path: &Path, items: &[(&str, &str)]) -> Result<(), String> {
@@ -998,7 +998,7 @@ fn write_assignment_env(path: &Path, items: &[(&str, &str)]) -> Result<(), Strin
 
 fn quote_env_value(value: &str) -> Result<String, String> {
     if value.chars().any(|ch| ch == '\n' || ch == '\r') {
-        return Err("invalid path: env value contains newline characters".to_string());
+        return Err("invalid path: env value contains newline characters".to_owned());
     }
     let mut escaped = String::from("\"");
     for ch in value.chars() {
@@ -1038,7 +1038,7 @@ fn write_assignment_refresh_env(
     ];
     let exit_node_storage;
     if let Some(exit_node_id) = exit_node_id {
-        exit_node_storage = exit_node_id.to_string();
+        exit_node_storage = exit_node_id.to_owned();
         items.push(("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID", &exit_node_storage));
     }
     write_assignment_env(path, &items)
@@ -1612,20 +1612,20 @@ fn managed_dns_base_records(
 ) -> Vec<ManagedDnsRecordTemplate> {
     vec![
         ManagedDnsRecordTemplate {
-            label: "exit".to_string(),
-            target_node_id: exit_node_id.to_string(),
+            label: "exit".to_owned(),
+            target_node_id: exit_node_id.to_owned(),
             ttl_secs: 300,
-            aliases: vec!["gateway".to_string()],
+            aliases: vec!["gateway".to_owned()],
         },
         ManagedDnsRecordTemplate {
-            label: "client".to_string(),
-            target_node_id: client_node_id.to_string(),
+            label: "client".to_owned(),
+            target_node_id: client_node_id.to_owned(),
             ttl_secs: 300,
             aliases: Vec::new(),
         },
         ManagedDnsRecordTemplate {
-            label: "blind-exit".to_string(),
-            target_node_id: blind_exit_node_id.to_string(),
+            label: "blind-exit".to_owned(),
+            target_node_id: blind_exit_node_id.to_owned(),
             ttl_secs: 300,
             aliases: Vec::new(),
         },
@@ -1679,9 +1679,9 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
         if let Some(value) = line.strip_prefix("node_id=") {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                return Err("config: assignment bundle node_id must not be empty".to_string());
+                return Err("config: assignment bundle node_id must not be empty".to_owned());
             }
-            node_id = Some(trimmed.to_string());
+            node_id = Some(trimmed.to_owned());
             continue;
         }
         if let Some((prefix, value)) = line.split_once('=')
@@ -1694,7 +1694,7 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
                     "config: assignment bundle peer id must not be empty: {prefix}"
                 ));
             }
-            peer_node_ids.push(trimmed.to_string());
+            peer_node_ids.push(trimmed.to_owned());
         }
     }
     peer_node_ids.sort();
@@ -1704,7 +1704,7 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
             node_id,
             peer_node_ids,
         }),
-        None => Err("config schema: assignment bundle is missing node_id".to_string()),
+        None => Err("config schema: assignment bundle is missing node_id".to_owned()),
     }
 }
 
@@ -1720,7 +1720,7 @@ fn git_commit(root_dir: &Path) -> String {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .trim()
             .to_lowercase(),
-        _ => "unknown".to_string(),
+        _ => "unknown".to_owned(),
     }
 }
 
@@ -1737,7 +1737,7 @@ fn print_usage() {
 
 fn now_unix() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
-        |_| "0".to_string(),
+        |_| "0".to_owned(),
         |duration| duration.as_secs().to_string(),
     )
 }
@@ -1796,8 +1796,8 @@ mod tests {
         assert_eq!(
             scope,
             AssignmentAuthorityScope {
-                node_id: "client-1".to_string(),
-                peer_node_ids: vec!["client-3".to_string(), "exit-1".to_string()],
+                node_id: "client-1".to_owned(),
+                peer_node_ids: vec!["client-3".to_owned(), "exit-1".to_owned()],
             }
         );
     }
@@ -1806,14 +1806,14 @@ mod tests {
     fn managed_dns_records_manifest_filters_unauthorized_targets() {
         let mut records = managed_dns_base_records("exit-1", "client-1", "client-3");
         records.push(ManagedDnsRecordTemplate {
-            label: "blocked".to_string(),
-            target_node_id: "client-9".to_string(),
+            label: "blocked".to_owned(),
+            target_node_id: "client-9".to_owned(),
             ttl_secs: 300,
             aliases: Vec::new(),
         });
         let scope = AssignmentAuthorityScope {
-            node_id: "client-1".to_string(),
-            peer_node_ids: vec!["exit-1".to_string()],
+            node_id: "client-1".to_owned(),
+            peer_node_ids: vec!["exit-1".to_owned()],
         };
         let manifest = managed_dns_records_manifest_for_scope(&records, &scope)
             .expect("manifest should be filtered to authorized records");
