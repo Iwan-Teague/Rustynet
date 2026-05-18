@@ -114,7 +114,13 @@ MACOS_FLOORS=(
   # symlink + mode-drift first-fault precedence, and the
   # vacuous-truth documented behavior for empty-roots.
   "macos_runtime_acls:16"
-  "macos_service_hardening:9"
+  # Floor bumped 9→15 on X4 coverage parity sweep: 6 new tests
+  # covering reviewed-directives 6-entry snapshot, schema_version
+  # pin, all-6-directives-drift aggregation (no short-circuit),
+  # plist parser tolerance of dict/array values + inline XML
+  # comments, and the unprobed-with-no-reason default-message
+  # fallback path.
+  "macos_service_hardening:15"
   # Floor bumped 8→16 on X4 coverage parity sweep: 8 new tests
   # covering schema_version pin, IPv4 link-local (cloud metadata)
   # rejection, IPv6 link-local rejection, IPv4-mapped IPv6 external

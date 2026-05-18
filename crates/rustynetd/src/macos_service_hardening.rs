@@ -273,4 +273,111 @@ mod tests {
             "full sample plist must pass evaluator: {reasons:?}"
         );
     }
+
+    // ----- X4 coverage parity sweep ---------------------------------------
+
+    #[test]
+    fn reviewed_directives_snapshot_pins_six_entries_with_exact_values() {
+        // Pin REVIEWED_PLIST_DIRECTIVES: the canonical 6-entry shape.
+        // Any silent edit (e.g. swap RunAtLoad=true to false) has to
+        // update this snapshot alongside the constant.
+        let canonical = [
+            ("UserName", "rustynetd"),
+            ("GroupName", "rustynetd"),
+            ("RunAtLoad", "true"),
+            ("KeepAlive", "true"),
+            ("ProcessType", "Background"),
+            ("AbandonProcessGroup", "false"),
+        ];
+        assert_eq!(REVIEWED_PLIST_DIRECTIVES.len(), canonical.len());
+        for ((key, value), expected) in REVIEWED_PLIST_DIRECTIVES.iter().zip(canonical.iter()) {
+            assert_eq!(*key, expected.0);
+            assert_eq!(*value, expected.1);
+        }
+    }
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        let report = build_macos_service_hardening_report(true, None, reviewed_property_map());
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape: {body}"
+        );
+    }
+
+    #[test]
+    fn evaluator_aggregates_drift_across_every_reviewed_directive() {
+        // Pin the no-short-circuit contract: if every reviewed
+        // directive drifts, the evaluator surfaces 6 reasons (one
+        // per directive), NOT bail at the first miss.
+        let mut map = reviewed_property_map();
+        map.insert("UserName".to_string(), "root".to_string());
+        map.insert("GroupName".to_string(), "root".to_string());
+        map.insert("RunAtLoad".to_string(), "false".to_string());
+        map.insert("KeepAlive".to_string(), "false".to_string());
+        map.insert("ProcessType".to_string(), "Interactive".to_string());
+        map.insert("AbandonProcessGroup".to_string(), "true".to_string());
+        let reasons = evaluate_macos_service_hardening(&map);
+        assert_eq!(
+            reasons.len(),
+            REVIEWED_PLIST_DIRECTIVES.len(),
+            "all 6 directives must surface independently: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn parser_ignores_dict_or_array_value_after_key() {
+        // The parser handles flat key/scalar shapes only; a key
+        // followed by a <dict> or <array> opener must leave the
+        // key consumed but no value inserted. Pin so a future
+        // refactor that starts inserting placeholder values trips.
+        let xml = r#"<key>WatchPaths</key>
+<array>
+    <string>/var/whatever</string>
+</array>
+<key>UserName</key>
+<string>rustynetd</string>"#;
+        let map = parse_plist_scalars(xml);
+        assert!(
+            !map.contains_key("WatchPaths"),
+            "dict/array-shaped value must NOT be captured: {map:?}"
+        );
+        // The next valid scalar key must still land.
+        assert_eq!(map.get("UserName").map(String::as_str), Some("rustynetd"));
+    }
+
+    #[test]
+    fn parser_ignores_inline_comment_lines_between_pairs() {
+        // The parser splits on lines and only looks for <key> /
+        // <string> / <true|false/> shapes. Pin tolerance of XML
+        // comments and other unrelated tags between reviewed pairs.
+        let xml = r#"<!-- intro comment -->
+<key>UserName</key>
+<string>rustynetd</string>
+<!-- mid comment -->
+<key>RunAtLoad</key>
+<true/>"#;
+        let map = parse_plist_scalars(xml);
+        assert_eq!(map.get("UserName").map(String::as_str), Some("rustynetd"));
+        assert_eq!(map.get("RunAtLoad").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn build_report_unprobed_with_no_reason_uses_default_message() {
+        // build_macos_service_hardening_report(false, None, _)
+        // falls back to a hardcoded "plist was not read" reason.
+        // Pin the fallback so a future None-handling refactor trips.
+        let report = build_macos_service_hardening_report(false, None, BTreeMap::new());
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("plist was not read")),
+            "default fallback reason must surface: {:?}",
+            report.drift_reasons
+        );
+    }
 }
