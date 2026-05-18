@@ -892,6 +892,17 @@ inline. Cross-reference with:
   allowlist. Workspace sweep finds 0 unallowed hits today. Shell
   script shrunk from 56 lines to ~10. 6+ self-tests pin the
   scanner positive/negative shapes.
+* `[~]` X3 extension #3 — placeholder-token coverage widened
+  (commit 8935dfb). Adds `signing_seed` (raw Ed25519 32-byte
+  private-key seed) to FORBIDDEN_PLACEHOLDER_TOKENS. The list
+  previously covered 8 canonical names but missed the seed
+  shape used by phase9/release provenance signing
+  (`crates/rustynet-cli/src/ops_phase9.rs:456` /`:748`) and by
+  test-fixture signers in `daemon.rs`. 2 new self-tests pin
+  positive detection of `{signing_seed:?}` placeholder + silent
+  behavior on `signing_seed.hex` filename mentions. Workspace
+  sweep finds 0 unallowed hits. Shared regression floor bumped
+  35 → 37.
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 
