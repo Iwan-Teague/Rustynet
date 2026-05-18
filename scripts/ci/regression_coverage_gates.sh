@@ -110,7 +110,11 @@ MACOS_FLOORS=(
   "macos_runtime_acls:8"
   "macos_service_hardening:9"
   "macos_dns_failclosed:8"
-  "macos_mesh_status:3"
+  # Floor bumped 3→9 on X4 coverage parity sweep: 6 new tests
+  # covering schema_version pin, default-state-path fallback,
+  # custom state-path echo through the report, and per-variant
+  # serde round-trip on Ok + IntegrityMismatch + InvalidFormat.
+  "macos_mesh_status:9"
   # Floor bumped 2→11 on X4 coverage parity sweep: 8 new tests
   # covering schema_version pin, reviewed-entry-paths canonical
   # snapshot (off-macOS), per-variant serde round-trip on Missing/

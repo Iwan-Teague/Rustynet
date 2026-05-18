@@ -136,4 +136,128 @@ mod tests {
     fn default_state_path_is_under_state_root() {
         assert!(DEFAULT_MACOS_STATE_PATH.starts_with("/usr/local/var/rustynet"));
     }
+
+    // ----- X4 coverage parity sweep ---------------------------------------
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        // Pin the wire-format schema_version so an accidental bump
+        // forces a deliberate review.
+        let options = MacosMeshStatusOptions {
+            state_path: Some(PathBuf::from("/nonexistent/macos/rustynetd.state")),
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+        };
+        let report = collect_macos_mesh_status_report(&options);
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape must be int=1: {body}"
+        );
+    }
+
+    #[test]
+    fn collect_uses_default_state_path_when_options_state_path_is_none() {
+        // Pin the default-fallback path so a future change has to
+        // update this test deliberately + document why the macOS
+        // state location moved.
+        let options = MacosMeshStatusOptions {
+            state_path: None,
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+        };
+        let report = collect_macos_mesh_status_report(&options);
+        assert_eq!(report.state_path, DEFAULT_MACOS_STATE_PATH);
+    }
+
+    #[test]
+    fn collect_echoes_custom_state_path_in_report() {
+        // Pin that the custom path round-trips into the report
+        // (used by the orchestrator to confirm which file was
+        // probed against in the verbose drift block).
+        let custom = "/nonexistent/macos/custom-state.bin";
+        let options = MacosMeshStatusOptions {
+            state_path: Some(PathBuf::from(custom)),
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+        };
+        let report = collect_macos_mesh_status_report(&options);
+        assert_eq!(report.state_path, custom);
+    }
+
+    #[test]
+    fn report_ok_snapshot_round_trips_through_serde() {
+        // Pre-existing report_serde_round_trips covered Missing only;
+        // pin the Ok variant explicitly so a future field-shape
+        // change on WindowsMeshSnapshotLoad::Ok trips this test.
+        let report = MacosMeshStatusReport {
+            schema_version: 1,
+            state_path: DEFAULT_MACOS_STATE_PATH.to_string(),
+            overall_ok: true,
+            snapshot: WindowsMeshSnapshotLoad::Ok {
+                timestamp_unix: 1_700_000_000,
+                age_seconds: 30,
+                peer_ids: vec!["peer-a".to_string()],
+                selected_exit_node: Some("peer-a".to_string()),
+                lan_access_enabled: false,
+            },
+            expected_peer_ids: vec!["peer-a".to_string()],
+            max_age_seconds: Some(300),
+            drift_reasons: Vec::new(),
+        };
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"load_status\":\"ok\""),
+            "Ok variant tag shape: {body}"
+        );
+        let parsed: MacosMeshStatusReport = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn report_integrity_mismatch_snapshot_round_trips_through_serde() {
+        let report = MacosMeshStatusReport {
+            schema_version: 1,
+            state_path: DEFAULT_MACOS_STATE_PATH.to_string(),
+            overall_ok: false,
+            snapshot: WindowsMeshSnapshotLoad::IntegrityMismatch {
+                reason: "checksum mismatch".to_string(),
+            },
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+            drift_reasons: vec!["state snapshot integrity mismatch: checksum mismatch".to_string()],
+        };
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"load_status\":\"integrity_mismatch\""),
+            "IntegrityMismatch variant tag shape: {body}"
+        );
+        let parsed: MacosMeshStatusReport = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn report_invalid_format_snapshot_round_trips_through_serde() {
+        let report = MacosMeshStatusReport {
+            schema_version: 1,
+            state_path: DEFAULT_MACOS_STATE_PATH.to_string(),
+            overall_ok: false,
+            snapshot: WindowsMeshSnapshotLoad::InvalidFormat {
+                reason: "missing required field".to_string(),
+            },
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+            drift_reasons: vec![
+                "state snapshot invalid format: missing required field".to_string(),
+            ],
+        };
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"load_status\":\"invalid_format\""),
+            "InvalidFormat variant tag shape: {body}"
+        );
+        let parsed: MacosMeshStatusReport = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
 }
