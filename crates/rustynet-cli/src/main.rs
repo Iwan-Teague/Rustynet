@@ -9172,11 +9172,10 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
     }
 
     let bootstrap_result = (|| -> Result<String, String> {
-        let source_private_key_path = if config.runtime_private_key_path.exists() {
-            Some(config.runtime_private_key_path.clone())
-        } else {
-            None
-        };
+        let source_private_key_path = config
+            .runtime_private_key_path
+            .exists()
+            .then(|| config.runtime_private_key_path.clone());
 
         let operation = if let Some(source_private_key_path) = source_private_key_path {
             validate_private_key_source_file(
@@ -15984,7 +15983,7 @@ fn execute_node(command: NodeCommand) -> Result<String, String> {
                 "role": role,
                 "public_key": public_key,
                 "trust_evidence_age_secs": trust_evidence_age_secs,
-                "peer_count": if peers { Some(peer_count) } else { None },
+                "peer_count": peers.then_some(peer_count),
             });
             let mut human = format!(
                 "node_id: {node_id}\nrole: {role}\npublic_key: {public_key}\ntrust_evidence_age_secs: {}\n",

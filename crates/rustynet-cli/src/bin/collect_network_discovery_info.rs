@@ -592,11 +592,10 @@ fn read_wg_show(iface: &str) -> Option<String> {
             .output()
             .ok()
             .and_then(|output| {
-                if output.status.success() {
-                    Some(String::from_utf8_lossy(&output.stdout).to_string())
-                } else {
-                    None
-                }
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).to_string())
             })
     })
 }

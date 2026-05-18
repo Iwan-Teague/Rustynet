@@ -755,11 +755,7 @@ fn parse_private_probe_cidr_or_ip(value: &str) -> Option<String> {
 
 fn parse_private_probe_ipv4(value: &str) -> Option<String> {
     let octets = parse_ipv4_octets(value)?;
-    if is_private_or_mesh_ipv4(&octets) {
-        Some(value.to_owned())
-    } else {
-        None
-    }
+    is_private_or_mesh_ipv4(&octets).then(|| value.to_owned())
 }
 
 fn parse_ipv4_octets(value: &str) -> Option<[u8; 4]> {

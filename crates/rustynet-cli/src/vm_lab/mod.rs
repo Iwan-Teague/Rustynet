@@ -6257,18 +6257,16 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
                 .to_owned(),
         );
     }
-    let completeness_error = if release_gate_report.requested
-        && !release_gate_report.missing_or_non_pass_stages.is_empty()
-    {
+    let completeness_error = (release_gate_report.requested
+        && !release_gate_report.missing_or_non_pass_stages.is_empty())
+    .then(|| {
         let message = format!(
             "full release-gate mode requested, but required stages were missing or not pass: {}",
             release_gate_report.missing_or_non_pass_stages.join(", ")
         );
         warnings.push(message.clone());
-        Some(message)
-    } else {
-        None
-    };
+        message
+    });
     let run_passed = run_report.success && completeness_error.is_none();
     let full_release_evidence_complete =
         run_passed && release_gate_report.requested && release_gate_report.status == "complete";
