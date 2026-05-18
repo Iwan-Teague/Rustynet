@@ -5159,8 +5159,8 @@ fn set_unix_mode(path: &Path, mode: u32) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let permissions = fs::Permissions::from_mode(mode);
         fs::set_permissions(path, permissions)
-            .map_err(|err| format!("failed setting permissions on {}: {err}", path.display()))?;
-    }
+            .map_err(|err| format!("failed setting permissions on {}: {err}", path.display()))?
+    };
     Ok(())
 }
 

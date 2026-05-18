@@ -736,9 +736,7 @@ fn write_secure_staged_artifact(
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(not(windows))]
-        {
-            options.mode(0o600);
-        }
+        options.mode(0o600);
         match options.open(&candidate) {
             Ok(mut file) => {
                 file.write_all(body).map_err(|err| {
@@ -798,9 +796,7 @@ impl Default for DaemonBackendMode {
             return DaemonBackendMode::LinuxWireguard;
         }
         #[cfg(target_os = "macos")]
-        {
-            return DaemonBackendMode::MacosWireguard;
-        }
+        return DaemonBackendMode::MacosWireguard;
         #[cfg(windows)]
         {
             return DaemonBackendMode::WindowsUnsupported;
@@ -9370,8 +9366,8 @@ fn persist_trust_watermark(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut temp = options.open(&temp_path).map_err(|err| {
         TrustBootstrapError::Io(format!("create_temp({}): {}", temp_path.display(), err))
     })?;
@@ -9487,8 +9483,8 @@ fn persist_membership_watermark(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut temp = options.open(&temp_path).map_err(|err| err.to_string())?;
     if let Err(err) = temp.write_all(payload.as_bytes()) {
         let _ = fs::remove_file(&temp_path);
@@ -10020,8 +10016,8 @@ fn persist_auto_tunnel_watermark(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut temp = options
         .open(&temp_path)
         .map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
@@ -10238,8 +10234,8 @@ fn persist_dns_zone_watermark(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut temp = options
         .open(&temp_path)
         .map_err(|err| DnsZoneBootstrapError::Io(err.to_string()))?;
@@ -11522,8 +11518,8 @@ fn persist_traversal_watermark(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+        options.mode(0o600)
+    };
     let mut temp = options
         .open(&temp_path)
         .map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
@@ -11926,11 +11922,9 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
         target_os = "watchos",
         target_os = "visionos"
     ))]
-    {
-        return getsockopt(stream, LocalPeerCred)
-            .ok()
-            .map(|cred| cred.uid());
-    }
+    return getsockopt(stream, LocalPeerCred)
+        .ok()
+        .map(|cred| cred.uid());
 
     #[allow(unreachable_code)]
     None
@@ -12458,8 +12452,8 @@ mod tests {
                 &remote_ops_verifier_path,
                 std::fs::Permissions::from_mode(0o644),
             )
-            .expect("remote ops verifier key permissions should be secure");
-        }
+            .expect("remote ops verifier key permissions should be secure")
+        };
 
         let config = DaemonConfig {
             state_path,
@@ -12980,8 +12974,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&insecure_parent, std::fs::Permissions::from_mode(0o770))
-                .expect("insecure parent permissions should be set");
-        }
+                .expect("insecure parent permissions should be set")
+        };
 
         let secret_path = insecure_parent.join("secret.key");
         std::fs::write(&secret_path, b"secret\n").expect("secret file should be written");
@@ -12989,8 +12983,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
-                .expect("secret file permissions should be set");
-        }
+                .expect("secret file permissions should be set")
+        };
 
         let err = validate_file_security(&secret_path, "test secret", 0o077, false)
             .expect_err("group-writable parent directory must be rejected");
@@ -13019,8 +13013,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
-                .expect("secret file permissions should be set");
-        }
+                .expect("secret file permissions should be set")
+        };
 
         let err = validate_file_security(&secret_path, "test secret", 0o077, false)
             .expect_err("symlink parent directory must be rejected");
@@ -13117,8 +13111,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
-                .expect("verifier key permissions should be secure");
-        }
+                .expect("verifier key permissions should be secure")
+        };
         let body = trust_evidence_payload(&record);
         let signature = signing_key.sign(body.as_bytes());
         std::fs::write(
@@ -13151,8 +13145,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
-                .expect("auto tunnel verifier key permissions should be secure");
-        }
+                .expect("auto tunnel verifier key permissions should be secure")
+        };
 
         let generated = unix_now();
         let expires = generated.saturating_add(300);
@@ -13194,8 +13188,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
-                .expect("auto tunnel verifier key permissions should be secure");
-        }
+                .expect("auto tunnel verifier key permissions should be secure")
+        };
 
         let generated = unix_now();
         let expires = generated.saturating_add(300);
@@ -13237,8 +13231,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
-                .expect("auto tunnel verifier key permissions should be secure");
-        }
+                .expect("auto tunnel verifier key permissions should be secure")
+        };
 
         let generated = unix_now();
         let expires = generated.saturating_add(300);
@@ -13318,8 +13312,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
-                .expect("dns zone verifier key permissions should be secure");
-        }
+                .expect("dns zone verifier key permissions should be secure")
+        };
 
         let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
             &signing_key,
@@ -13886,8 +13880,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o600))
-                .expect("test private key permissions should be restrictive");
-        }
+                .expect("test private key permissions should be restrictive")
+        };
 
         let mut config = DaemonConfig {
             backend_mode: current_platform_production_backend_mode(),
@@ -13903,8 +13897,8 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             config.wg_interface = "utun9".to_owned();
-            config.egress_interface = "en0".to_owned();
-        }
+            config.egress_interface = "en0".to_owned()
+        };
 
         let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         (runtime, test_dir)
@@ -14136,8 +14130,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+            options.mode(0o600)
+        };
         let mut file = options
             .open(log_path)
             .expect("membership log should be opened");
@@ -14156,8 +14150,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .expect("secure test directory permissions should be set");
-        }
+                .expect("secure test directory permissions should be set")
+        };
         dir
     }
 
@@ -14222,8 +14216,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o600))
-                .expect("test private key permissions should be restrictive");
-        }
+                .expect("test private key permissions should be restrictive")
+        };
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::LinuxWireguardUserspaceShared,
             wg_private_key_path: Some(private_key_path),
@@ -14551,8 +14545,8 @@ mod tests {
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&runtime_key_path, std::fs::Permissions::from_mode(0o600))
-                    .expect("runtime key permissions should be restrictive");
-            }
+                    .expect("runtime key permissions should be restrictive")
+            };
 
             prepare_runtime_wireguard_key_material(
                 backend_mode,

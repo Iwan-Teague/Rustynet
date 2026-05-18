@@ -2257,6 +2257,7 @@ fn simulate_latency_test() -> f64 {
     start.elapsed().as_millis() as f64
 }
 
+#[allow(clippy::vec_init_then_push)]
 fn interface_stats_internal() -> Vec<InterfaceStats> {
     let mut stats = vec![];
 
@@ -2289,17 +2290,15 @@ fn interface_stats_internal() -> Vec<InterfaceStats> {
     }
 
     #[cfg(not(target_os = "linux"))]
-    {
-        stats.push(InterfaceStats {
-            name: "(detailed stats unavailable on this platform)".to_owned(),
-            bytes_in: 0,
-            bytes_out: 0,
-            packets_in: 0,
-            packets_out: 0,
-            errors: 0,
-            dropped: 0,
-        });
-    }
+    stats.push(InterfaceStats {
+        name: "(detailed stats unavailable on this platform)".to_owned(),
+        bytes_in: 0,
+        bytes_out: 0,
+        packets_in: 0,
+        packets_out: 0,
+        errors: 0,
+        dropped: 0,
+    });
 
     stats
 }

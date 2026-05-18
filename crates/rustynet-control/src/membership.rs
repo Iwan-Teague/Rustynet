@@ -1234,8 +1234,8 @@ fn atomic_write(path: &Path, body: &[u8], _mode: u32) -> Result<(), MembershipEr
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(_mode);
-    }
+        options.mode(_mode)
+    };
     let mut temp = options
         .open(&temp_path)
         .map_err(|err| MembershipError::Io(err.to_string()))?;
@@ -1770,8 +1770,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&log).unwrap().permissions();
             perms.set_mode(0o600);
-            std::fs::set_permissions(&log, perms).unwrap();
-        }
+            std::fs::set_permissions(&log, perms).unwrap()
+        };
 
         let entries = load_membership_log(&log).expect("empty log should load");
         assert!(entries.is_empty());

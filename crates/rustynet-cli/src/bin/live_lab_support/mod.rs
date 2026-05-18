@@ -315,8 +315,8 @@ fn set_path_mode(path: &Path, mode: u32) -> Result<(), String> {
         let mut permissions = metadata.permissions();
         permissions.set_mode(mode);
         fs::set_permissions(path, permissions)
-            .map_err(|err| format!("failed to secure {}: {err}", path.display()))?;
-    }
+            .map_err(|err| format!("failed to secure {}: {err}", path.display()))?
+    };
     #[cfg(not(unix))]
     {
         let _ = (path, mode);

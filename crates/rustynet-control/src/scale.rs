@@ -397,8 +397,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o700))
-                .expect("test directory permissions should be set");
-        }
+                .expect("test directory permissions should be set")
+        };
 
         let missing_path = test_dir.join("missing.state");
         let missing = authorize_trusted_key(&config, &missing_path, "ed25519:abc");

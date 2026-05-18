@@ -210,8 +210,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ResilienceError> {
     #[cfg(unix)]
     {
         let parent_dir = File::open(parent).map_err(|_| ResilienceError::Io)?;
-        parent_dir.sync_all().map_err(|_| ResilienceError::Io)?;
-    }
+        parent_dir.sync_all().map_err(|_| ResilienceError::Io)?
+    };
     Ok(())
 }
 
@@ -219,9 +219,7 @@ fn create_restricted_file(path: &Path) -> Result<File, ResilienceError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        options.mode(0o600);
-    }
+    options.mode(0o600);
     options.open(path).map_err(|_| ResilienceError::Io)
 }
 
@@ -234,9 +232,7 @@ fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
+        options.mode(0o600);
         match options.open(path) {
             Ok(mut handle) => {
                 let stamp = format!("pid={} ts={}\n", std::process::id(), unix_now());

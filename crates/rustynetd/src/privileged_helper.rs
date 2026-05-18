@@ -1628,11 +1628,9 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
         target_os = "watchos",
         target_os = "visionos"
     ))]
-    {
-        return getsockopt(stream, LocalPeerCred)
-            .ok()
-            .map(|cred| cred.uid());
-    }
+    return getsockopt(stream, LocalPeerCred)
+        .ok()
+        .map(|cred| cred.uid());
 
     #[allow(unreachable_code)]
     None

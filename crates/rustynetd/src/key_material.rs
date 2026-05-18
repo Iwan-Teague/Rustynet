@@ -1011,9 +1011,7 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        options.mode(mode);
-    }
+    options.mode(mode);
     let mut file = options
         .open(&temp)
         .map_err(|err| format!("create temp key file {} failed: {err}", temp.display()))?;
@@ -1047,8 +1045,8 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
             .map_err(|err| format!("open parent directory {} failed: {err}", parent.display()))?;
         parent_dir
             .sync_all()
-            .map_err(|err| format!("sync parent directory {} failed: {err}", parent.display()))?;
-    }
+            .map_err(|err| format!("sync parent directory {} failed: {err}", parent.display()))?
+    };
     Ok(())
 }
 

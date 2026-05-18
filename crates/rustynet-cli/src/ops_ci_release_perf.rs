@@ -2488,8 +2488,8 @@ fn set_mode_owner_only(path: &Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let permissions = fs::Permissions::from_mode(0o600);
         fs::set_permissions(path, permissions)
-            .map_err(|err| format!("failed to set mode 600 on {}: {err}", path.display()))?;
-    }
+            .map_err(|err| format!("failed to set mode 600 on {}: {err}", path.display()))?
+    };
     Ok(())
 }
 

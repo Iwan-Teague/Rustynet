@@ -358,8 +358,8 @@ impl WatermarkStore {
             let mut permissions = metadata.permissions();
             permissions.set_mode(0o600);
             fs::set_permissions(&self.path, permissions)
-                .map_err(|e| format!("failed to set watermark permissions: {e}"))?;
-        }
+                .map_err(|e| format!("failed to set watermark permissions: {e}"))?
+        };
 
         Ok(())
     }
@@ -455,8 +455,8 @@ mod tests {
         {
             let mut store = WatermarkStore::new(&watermark_path).unwrap();
             store.advance("assignment", 100).unwrap();
-            store.advance("traversal", 200).unwrap();
-        }
+            store.advance("traversal", 200).unwrap()
+        };
 
         // Load from disk
         let store = WatermarkStore::new(&watermark_path).unwrap();
@@ -679,8 +679,8 @@ mod tests {
         let watermark_path = dir.path().join("watermark");
         {
             let mut store = WatermarkStore::new(&watermark_path).unwrap();
-            store.advance("trust", 500).unwrap();
-        }
+            store.advance("trust", 500).unwrap()
+        };
 
         let mut fetcher =
             StateFetcher::new("http://unit.test".to_owned(), watermark_path, verifying_key)
