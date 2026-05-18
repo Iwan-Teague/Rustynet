@@ -909,6 +909,19 @@ inline. Cross-reference with:
   behavior on `signing_seed.hex` filename mentions. Workspace
   sweep finds 0 unallowed hits. Shared regression floor bumped
   35 → 37.
+* `[~]` X3 extension #4 — G2c shell grep migrated to a typed
+  Rust deprecated-crypto-import scanner (commit ca85269). New
+  `scan_source_for_deprecated_crypto_imports` covers
+  `use sha1` / `use md5` / `use md_5` / `use des` / `use des3`
+  / `use triple_des` plus a workspace-sweep test. Boundary-
+  terminator check rejects safe-name lookalikes
+  (`sha2` / `sha3` / `descriptor` / `md_hashlib`). 7 new self-
+  tests pin positive + negative shapes (path-form imports,
+  wildcard re-exports, bare `use des;`, comment-only mentions,
+  string-literal mentions). The shell G2c grep stays in place
+  as belt-and-suspenders but the Rust scanner is now the
+  source of truth. Workspace sweep finds 0 unallowed hits.
+  Shared regression floor bumped 37 → 45.
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 
