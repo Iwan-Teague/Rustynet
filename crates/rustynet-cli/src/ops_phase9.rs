@@ -1967,12 +1967,48 @@ fn phase10_validate_source_freshness(
     Ok(())
 }
 
+/// X2: typed view shared between the three small phase-10 status /
+/// checks validators (`phase10_require_status_pass`,
+/// `phase10_validate_checks_all_pass`,
+/// `phase10_require_named_checks_pass`). Pins:
+///
+/// * `status: Option<String>` — wrong-type fails at deserialise.
+/// * `checks: Option<Map<String, Value>>` — wrong-type-top fails
+///   here. The inner per-check value-level walk stays Map-based
+///   because the check names vary per caller (dynamic
+///   `required_checks` list or full-map sweep).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct Phase10StatusChecksView {
+    pub status: Option<String>,
+    pub checks: Option<Map<String, Value>>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+fn phase10_status_checks_view(
+    payload: &Map<String, Value>,
+    source_path: &Path,
+    label: &str,
+) -> Result<Phase10StatusChecksView, String> {
+    serde_json::from_value::<Phase10StatusChecksView>(Value::Object(payload.clone())).map_err(
+        |err| {
+            format!(
+                "{label} source has invalid field shape: {} ({err})",
+                source_path.display()
+            )
+        },
+    )
+}
+
 fn phase10_require_status_pass(
     payload: &Map<String, Value>,
     source_path: &Path,
     label: &str,
 ) -> Result<(), String> {
-    if payload.get("status").and_then(Value::as_str) != Some("pass") {
+    let typed = phase10_status_checks_view(payload, source_path, label)?;
+    if typed.status.as_deref() != Some("pass") {
         return Err(format!(
             "{label} source must report status=pass: {}",
             source_path.display()
@@ -1986,15 +2022,13 @@ fn phase10_validate_checks_all_pass(
     source_path: &Path,
     label: &str,
 ) -> Result<(), String> {
-    let checks = payload
-        .get("checks")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            format!(
-                "{label} source must include non-empty checks object: {}",
-                source_path.display()
-            )
-        })?;
+    let typed = phase10_status_checks_view(payload, source_path, label)?;
+    let checks = typed.checks.as_ref().ok_or_else(|| {
+        format!(
+            "{label} source must include non-empty checks object: {}",
+            source_path.display()
+        )
+    })?;
     if checks.is_empty() {
         return Err(format!(
             "{label} source must include non-empty checks object: {}",
@@ -2018,15 +2052,13 @@ fn phase10_require_named_checks_pass(
     label: &str,
     required_checks: &[&str],
 ) -> Result<(), String> {
-    let checks = payload
-        .get("checks")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            format!(
-                "{label} source must include non-empty checks object: {}",
-                source_path.display()
-            )
-        })?;
+    let typed = phase10_status_checks_view(payload, source_path, label)?;
+    let checks = typed.checks.as_ref().ok_or_else(|| {
+        format!(
+            "{label} source must include non-empty checks object: {}",
+            source_path.display()
+        )
+    })?;
     for check_name in required_checks {
         if checks.get(*check_name).and_then(Value::as_str) != Some("pass") {
             return Err(format!(
@@ -4951,11 +4983,11 @@ mod tests {
         MAX_PHASE10_JSON_SOURCE_BYTES, PHASE9_REQUIRED_ARTIFACTS,
         Phase6ParityAttestationBuildInputs, Phase6ParityAttestationVerifyInputs,
         Phase9EvidenceAttestationBuildInputs, Phase9EvidenceAttestationVerifyInputs,
-        Phase10PerfBudgetReportView, Phase10PerfMetricEntryView, ReleaseProvenanceBuildInputs,
-        ReleaseProvenanceVerifyInputs, WritePhase10Hp2TraversalReportsConfig,
-        WriteUnsignedReleaseProvenanceConfig, build_phase6_parity_attestation_document,
-        build_phase9_evidence_attestation_document, build_release_provenance_document,
-        contains_generation_marker, decode_hex_to_fixed,
+        Phase10PerfBudgetReportView, Phase10PerfMetricEntryView, Phase10StatusChecksView,
+        ReleaseProvenanceBuildInputs, ReleaseProvenanceVerifyInputs,
+        WritePhase10Hp2TraversalReportsConfig, WriteUnsignedReleaseProvenanceConfig,
+        build_phase6_parity_attestation_document, build_phase9_evidence_attestation_document,
+        build_release_provenance_document, contains_generation_marker, decode_hex_to_fixed,
         execute_ops_write_phase10_hp2_traversal_reports,
         execute_ops_write_unsigned_release_provenance, hex_encode, load_key_hex_from_secure_path,
         parse_required_test_output_total_passed, phase10_expected_provenance_entries,
@@ -5041,6 +5073,64 @@ mod tests {
             serde_json::from_value(payload).expect("typed view tolerates empty payload");
         assert!(view.soak_status.is_none());
         assert!(view.metrics.is_none());
+    }
+
+    // X2: Cycle 74 typed-view tests for the shared status/checks
+    // walker (`phase10_require_status_pass`,
+    // `phase10_validate_checks_all_pass`,
+    // `phase10_require_named_checks_pass`).
+
+    /// Clean fixture: `Phase10StatusChecksView` populates both
+    /// typed slots; the inner per-check Map walk stays generic
+    /// because check names vary per caller.
+    #[test]
+    fn phase10_status_checks_view_accepts_clean_payload() {
+        let payload = json!({
+            "status": "pass",
+            "checks": { "all_daemon_sockets_secure": "pass" },
+            "extra_field": "ride-through",
+        });
+        let view: Phase10StatusChecksView =
+            serde_json::from_value(payload).expect("typed view accepts clean payload");
+        assert_eq!(view.status.as_deref(), Some("pass"));
+        let checks = view.checks.expect("checks present");
+        assert_eq!(
+            checks
+                .get("all_daemon_sockets_secure")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert!(view.extra.contains_key("extra_field"));
+    }
+
+    /// Wrong-type `status` slot rejected. Previously silent via
+    /// `.and_then(Value::as_str) -> None`, surfacing as "must
+    /// report status=pass" — conflated with missing or non-pass.
+    #[test]
+    fn phase10_status_checks_view_rejects_wrong_type_status() {
+        let payload = json!({ "status": 42 });
+        let err = serde_json::from_value::<Phase10StatusChecksView>(payload)
+            .expect_err("integer status must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("status") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `checks` slot rejected. Previously silent via
+    /// `.and_then(Value::as_object) -> None`, surfacing as "must
+    /// include non-empty checks object" — conflated with missing.
+    #[test]
+    fn phase10_status_checks_view_rejects_wrong_type_checks() {
+        let payload = json!({ "checks": "not-an-object" });
+        let err = serde_json::from_value::<Phase10StatusChecksView>(payload)
+            .expect_err("string checks must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("checks") || message.contains("map") || message.contains("object"),
+            "error must point to the offending field or type: {message}"
+        );
     }
 
     #[test]
