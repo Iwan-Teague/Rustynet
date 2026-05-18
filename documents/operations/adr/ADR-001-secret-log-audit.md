@@ -145,11 +145,17 @@ from the live module; X3 backlog #2 + #3 + #4 extensions landed):
     (X3 extension #4, commit ca85269).
 - Forbidden-placeholder-tokens list grew from 8 → 9 with the
   addition of `signing_seed` (X3 extension #3, commit 8935dfb).
-- Workspace sweeps expanded — the secret-material-equality + the
-  deprecated-crypto-imports scanners both walk `crates/` workspace-
-  wide (broader than the original `crates/rustynetd/src` +
-  `crates/rustynet-cli/src` scope, because the patterns can leak
-  outside the daemon crate).
+- Workspace sweeps expanded with per-scanner scope:
+  - secret-material-equality walks `crates/rustynet-relay/src/`
+    + `crates/rustynet-control/src/` (the control-plane + relay
+    surfaces that handle session tokens / nonces / MACs, where
+    the `==`-vs-`ct_eq` distinction matters).
+  - deprecated-crypto-imports walks `crates/` workspace-wide
+    (any crate could accidentally `use sha1` or `use md5`).
+  - The original 5 scanners continue to walk only
+    `crates/rustynetd/src/` + `crates/rustynet-cli/src/` (the
+    daemon's own log surface, which is where format-string
+    leaks would originate).
 - Self-test count grew from ~22 to 45 (pinned by the
   `secret_log_audit:45` floor in the shared regression-coverage
   group; see ADR-002).
