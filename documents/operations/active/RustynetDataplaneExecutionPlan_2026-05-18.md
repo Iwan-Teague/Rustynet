@@ -192,10 +192,16 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 
 - **Scope.** On home-server startup, probe the local router for uPnP IGD support, NAT-PMP, and PCP (in that order — pick the first that succeeds). Request a UDP port mapping for the relay's bound port. Renew the lease before it expires. Fall back to the outbound-keepalive trick (decision 2.3) when no protocol is available.
 - **Files.** New `crates/rustynetd/src/port_mapper.rs`. Daemon wiring in `crates/rustynetd/src/daemon.rs`. CLI flag `--port-mapping-mode={auto,keepalive,disabled}`.
-- **Library choice.** `igd-next` for uPnP (well-maintained, MIT-licensed). NAT-PMP and PCP are simple enough to write by hand (~150 lines combined).
+- **Library choice.** Hand-rolled per-protocol clients to keep the supply-chain surface minimal (NAT-PMP and PCP are ~250 lines each with full RFC-pinned tests; uPnP IGD still TBD — `igd-next` remains the planned dep when that slice lands).
 - **Pass criterion.** Integration test against a mock IGD server confirms mapping is requested, registered with the correct port, and refreshed on cadence. Self-test against a real consumer router (one-off, results captured in `artifacts/cross_network/<commit>/port_mapping_probe.json`).
 - **Estimated cost.** 1–2 cycles.
 - **Depends on.** D2.
+- **Status (2026-05-18).** Partial — 4 of 6 sub-slices landed in the worktree branch (commits e0e9a96, 9062970, 5f76c8b, ab93726):
+  - NAT-PMP client (RFC 6886) — full wire-format encode/decode, RFC §3.1 retry/backoff, RFC §3.4 release semantics, 15 tests.
+  - PCP client (RFC 6887) — full MAP wire-format, IPv4-mapped IPv6 encoding, cryptographic Mapping Nonce per §11.2, ADDRESS_MISMATCH/NAT44 hint, 7 tests.
+  - `PortMappingProbe` orchestrator — PCP→NAT-PMP order, hard-refusal short-circuit, soft-failure fallthrough, 5 tests.
+  - `detect_default_gateway()` — Linux (`/proc/net/route` LE-hex parser) + macOS (`route -n get default` stdout parser), Windows stubbed, 8 parser tests.
+  - **Open.** uPnP IGD client (SSDP + SOAP, big chunk), daemon-startup wiring + `--port-mapping-mode` CLI flag, refresh-loop background task.
 
 ### D2.4 — IPv6 candidate gathering
 
