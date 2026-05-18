@@ -930,6 +930,13 @@ inline. Cross-reference with:
     mode-bit masking, symlink-before-dir-check ordering, symlink +
     mode drift first-fault precedence, vacuous-truth documented
     behavior on empty-roots). Floor bumped 19 → 27.
+  - `linux_key_custody` test count 15 → 24 (+9 named drift tests
+    covering schema_version pin, per-variant serde round-trip on
+    Ok/Invalid/Forbidden, unknown-status-tag rejection,
+    unknown-requirement-string rejection, multi-entry drift
+    aggregation (no short-circuit), Forbidden-on-required-entry
+    inverted shape, AbsentAsExpected-on-required-entry collector
+    bug shape). Floor bumped 15 → 24.
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
