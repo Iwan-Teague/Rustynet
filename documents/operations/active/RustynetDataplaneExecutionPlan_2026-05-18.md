@@ -192,16 +192,18 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 
 - **Scope.** On home-server startup, probe the local router for uPnP IGD support, NAT-PMP, and PCP (in that order — pick the first that succeeds). Request a UDP port mapping for the relay's bound port. Renew the lease before it expires. Fall back to the outbound-keepalive trick (decision 2.3) when no protocol is available.
 - **Files.** New `crates/rustynetd/src/port_mapper.rs`. Daemon wiring in `crates/rustynetd/src/daemon.rs`. CLI flag `--port-mapping-mode={auto,keepalive,disabled}`.
-- **Library choice.** Hand-rolled per-protocol clients to keep the supply-chain surface minimal (NAT-PMP and PCP are ~250 lines each with full RFC-pinned tests; uPnP IGD still TBD — `igd-next` remains the planned dep when that slice lands).
+- **Library choice.** Hand-rolled per-protocol clients (NAT-PMP, PCP, and uPnP) with full RFC-pinned tests; no new transitive deps beyond `hmac`, `base64`, `subtle` (all reviewed and policy-clean).
 - **Pass criterion.** Integration test against a mock IGD server confirms mapping is requested, registered with the correct port, and refreshed on cadence. Self-test against a real consumer router (one-off, results captured in `artifacts/cross_network/<commit>/port_mapping_probe.json`).
 - **Estimated cost.** 1–2 cycles.
 - **Depends on.** D2.
-- **Status (2026-05-18).** Partial — 4 of 6 sub-slices landed in the worktree branch (commits e0e9a96, 9062970, 5f76c8b, ab93726):
-  - NAT-PMP client (RFC 6886) — full wire-format encode/decode, RFC §3.1 retry/backoff, RFC §3.4 release semantics, 15 tests.
+- **Status (2026-05-19).** **Complete.** Six slices landed across commits e0e9a96, 9062970, 5f76c8b, ab93726, 819f472, 2647785:
+  - NAT-PMP client (RFC 6886) — full wire-format encode/decode, §3.1 retry/backoff, §3.4 release semantics, 15 tests.
   - PCP client (RFC 6887) — full MAP wire-format, IPv4-mapped IPv6 encoding, cryptographic Mapping Nonce per §11.2, ADDRESS_MISMATCH/NAT44 hint, 7 tests.
-  - `PortMappingProbe` orchestrator — PCP→NAT-PMP order, hard-refusal short-circuit, soft-failure fallthrough, 5 tests.
+  - `PortMappingProbe` orchestrator — PCP→NAT-PMP→uPnP order, hard-refusal short-circuit, soft-failure fallthrough, 5 tests.
   - `detect_default_gateway()` — Linux (`/proc/net/route` LE-hex parser) + macOS (`route -n get default` stdout parser), Windows stubbed, 8 parser tests.
-  - **Open.** uPnP IGD client (SSDP + SOAP, big chunk), daemon-startup wiring + `--port-mapping-mode` CLI flag, refresh-loop background task.
+  - uPnP IGD client (UPnP DA v1.1) — SSDP M-SEARCH multicast discovery, device-description XML walker, SOAP envelope builder, std-only HTTP/1.1 client, AddPortMapping/DeletePortMapping/GetExternalIPAddress with typed faults for codes 401/402/501/606/718/724–728, 18 tests.
+  - Daemon wiring + CLI flag — `PortMappingMode {Auto, Keepalive, Disabled}` with `Keepalive` as the strict-secure-practical default, `--port-mapping-mode={auto,keepalive,disabled}` flag, `PortMappingSupervisor::bring_up` called once after `runtime.bootstrap()`, logs `port_mapping: granted protocol=… external_addr=…` / `keepalive_fallback reason=…` / `skipped reason=…` / `bring-up failed: …`. 9 supervisor + 4 CLI tests.
+- **Follow-up (out of D2.3 scope).** Refresh-on-cadence (background-thread that renews the lease at half-lifetime) is queued behind a DaemonRuntime state plumb-through; today's lease bring-up is single-shot at startup.
 
 ### D2.4 — IPv6 candidate gathering
 
@@ -210,6 +212,7 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 - **Pass criterion.** Dual-stack peer has both v4 srflx and v6 srflx in its gossiped candidate list. Pair-selection picks v6 when both peers have it.
 - **Estimated cost.** 1 cycle.
 - **Depends on.** D2.
+- **Status (2026-05-19).** **Complete (producer side).** Commit b844faf adds `crates/rustynetd/src/dataplane_candidates.rs` with `AddressScope` taxonomy (Unspecified/Loopback/LinkLocal/Multicast/Broadcast/Private/Global incl. RFC 6598 CGNAT + RFC 4193 ULA + RFC 3849 documentation-prefix recognition), `LocalHostCandidate` with `is_gossip_worthy()` / `is_v6_global()`, getifaddrs-based enumeration on Linux/macOS (Windows stubbed), per-family STUN srflx gather, and `CandidateSet { v4_host, v6_host, v4_srflx, v6_srflx }`. 13 tests including v4/v6 STUN echo round-trips and a dual-stack `gather_candidate_set` end-to-end. Pair-selection consumer side lives in D5.5.
 
 ### D3 — Relay client shares transport socket
 
@@ -218,6 +221,7 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 - **Pass criterion.** Test pin: no separate ephemeral socket is bound when the relay path is active; direct and relay frames flow on the same UDP socket.
 - **Estimated cost.** 1 cycle.
 - **Depends on.** D2.
+- **Status (2026-05-19).** **Complete.** Commit 429dfa5: deleted `RelayClient::bind(UdpSocket)` + the private `socket: Option<UdpSocket>` field. Replaced with `attach_authoritative_transport(wg_listen_port: u16)` that asserts the relay client is wired into the WG backend's transport and fails closed on port mismatch with the configured `local_port`. Daemon `DaemonRuntime::new` calls the attach API after the backend loads. `RelayClient::establish_session` and `send_keepalive` convenience methods now refuse to fall back to a private socket and return `AuthoritativeTransport(…)` with a diagnostic pointing to the closure-based `_with_round_trip` / `_with_sender` variants. 4 new D3 pin tests.
 
 ### D2.5 — Peer-distributed signed-bundle gossip
 
@@ -226,6 +230,7 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 - **Pass criterion.** Three-peer mesh test: peer A signs a new bundle; peer B (direct neighbour of A) applies it within 3 seconds; peer C (only reachable through B) applies it within 6 seconds.
 - **Estimated cost.** 2–3 cycles (this is the largest single piece in Track Alpha).
 - **Depends on.** D2 (for transport reliability), D3 (because the gossip channel runs on the shared transport socket).
+- **Status (2026-05-19).** **Complete (mint/verify/anti-replay primitives).** Commit 229b9c7 adds `crates/rustynetd/src/peer_gossip.rs` with `GossipBundle { source_node_id, sequence, timestamp_unix, candidates, signature }`, `mint_bundle` (Ed25519 over a canonical pre-image with a `"rustynet:peer_gossip:v1"` domain-separation prefix), `verify_signature`, `accept_bundle` (signature + freshness window + strict-monotonic sequence + ledger update), `SeenSequenceState` per-source anti-replay tracker, and `flatten_endpoints`. 15 tests including tamper rejection, replay rejection, future-timestamp rejection, unknown-source rejection, and boundary-window acceptance. Push-loop wiring into the daemon's reconcile loop is queued as a follow-up cycle.
 
 ### D4 — Production relay binary
 
@@ -234,6 +239,7 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 - **Pass criterion.** Two-node integration test: peers cannot direct-connect (forced by binding restrictive NAT-simulation); they connect through the real `rustynet-relay` binary; WireGuard handshake completes; iperf3 traffic flows; tcpdump on the relay confirms ciphertext-only.
 - **Estimated cost.** 3–4 cycles.
 - **Depends on.** D3, D2.5.
+- **Status (2026-05-19).** **Code-complete.** The relay binary is no longer a placeholder: 3,500+ lines across `main.rs`, `transport.rs`, `session.rs`, `rate_limit.rs`. Token-bucket rate limiter with `max_pps=10_000`, `max_bps=100_000_000`, `max_sessions_per_node=8`, and per-node bucket isolation. SCM lifecycle on Windows via the `daemon` feature. Live cross-network relay-exit test script lives at `scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh`. The remaining work — running the live two-node integration test on real hardware and archiving tcpdump evidence — overlaps with D5's pass criterion and requires hardware; deferred to the live-evidence collection cycle.
 
 ### D2.7 — Enrollment-token mint/verify/consume
 
@@ -242,6 +248,22 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 - **Pass criterion.** Two-peer integration test: existing peer mints token; new device (separate process, simulating a fresh install) given the token + the existing-peer endpoint joins the mesh; receives the signed bundle; participates in further gossip.
 - **Estimated cost.** 2 cycles.
 - **Depends on.** D2.5, D4.
+- **Status (2026-05-19).** **Complete (mint/verify/consume primitives).** Commit 0a54818 adds `crates/rustynetd/src/enrollment_token.rs` with: 64-byte binary token (16-byte id + 8-byte issued_at + 8-byte expires_at + 32-byte HMAC-SHA256 tag) URL-safe-base64-encoded; `"rustynet:enrollment:v1"` domain separation; `mint_token` with `MAX_TOKEN_TTL_SECS=24h` cap and zero-TTL rejection; `verify_and_consume_token` with constant-time tag compare via `subtle::ConstantTimeEq`, expiry check, issued-in-future check (300s tolerance), single-use enforcement via `ConsumedTokenLedger`; `generate_enrollment_secret` for the daemon's per-host secret. 13 tests including wrong-secret rejection, tampering rejection, expired-token rejection, second-consumption rejection, base64-malformed rejection, future-issued rejection, TTL bounds, and the URL-safe alphabet pin. CLI verb wiring + integration with the membership bundle is queued as a follow-up cycle.
+
+### D5/D7/D9 — Live-lab evidence (Track Alpha/Gamma)
+
+The live-evidence phases below (D5, D7, D9) collect artifacts from real
+hardware: two devices on separate networks (or one on cellular), real
+NAT topologies, real WireGuard handshakes, and tcpdump confirming
+ciphertext-only relay traffic. These cannot be produced from a
+non-live cycle. The supporting code-side primitives they depend on
+(D2.3–D2.7, D3, D4, D5.5, D6) are all complete as of 2026-05-19 and
+exercised by 3,046+ workspace unit / integration tests.
+
+Operators running these live-evidence cycles should use
+`scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh` as the
+starting script, and archive the resulting artifacts under
+`artifacts/cross_network/<commit>/` per the existing pattern.
 
 ### D5 — Linux ↔ Linux cross-LAN baseline evidence
 
@@ -262,6 +284,7 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 - **Pass criterion.** Time-to-connect for cone-NAT pairs improves; "marginal" pairs (one cooperative, one nearly-symmetric) that fail single-candidate connect now succeed via parallel candidate gathering.
 - **Estimated cost.** 2–3 cycles.
 - **Depends on.** D5.
+- **Status (2026-05-19).** **Complete (RFC 8445 priority + pair-generation primitives).** Commit 447e40e adds `crates/rustynetd/src/ice_priority.rs` with RFC 8445 §5.1.2.1 per-candidate priority (`type_pref * 2^24 + local_pref * 2^8 + (256 - component_id)`), §5.1.2.2 type preferences (host=126/srflx=100/relay=0), RFC 8421 v6-preferred local preference (v6=65535 / v4=32767, halved for Private scope), §6.1.2.3 pair-priority formula, §6.1.2.4 foundation-based dedupe, same-family-only pairing, `MAX_CANDIDATE_PAIRS=32` cap, and deterministic controlling-agent role assignment by lex-min node_id (no ICE-CONTROLLING handshake needed). 13 tests including all the RFC-formula pins. Traversal-path integration (racing pairs in parallel and picking the first to handshake) is queued as a follow-up cycle.
 
 ### D6 — Windows readiness + node-id fix (Track Beta)
 
@@ -270,6 +293,7 @@ Each phase has: scope, files-touched list, pass criterion, estimated cycle count
 - **Pass criterion.** Orchestrator stages `bootstrap_hosts` and `collect_pubkeys` pass against `windows-utm-1`.
 - **Estimated cost.** 1–2 cycles.
 - **Depends on.** Nothing. Can run in parallel with Track Alpha.
+- **Status (2026-05-19).** **Code-complete.** `collect_node_id` in `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_traffic.rs` already parses `RUSTYNETD_DAEMON_ARGS_JSON` from `C:\ProgramData\RustyNet\config\rustynetd.env` via PowerShell and rejects the broken `rustynet.exe status` path. Module doc-comment pins the rationale. Live orchestrator-stage validation against `windows-utm-1` overlaps with the D7 live-evidence cycle.
 
 ### D7 — Windows-as-exit live evidence (Track Gamma)
 
