@@ -209,6 +209,14 @@ WINDOWS_FLOORS=(
   # validator coverage parity sweep. 46 baseline tests + 15 new
   # named drift tests = 61 total pinned.
   "windows_paths:61"
+  # `windows_ipc` is a security-sensitive Windows-platform module:
+  # named-pipe path validation against reviewed roots, SDDL security
+  # policy generation + client-authorization checks, length-prefixed
+  # privileged-request/response encode/decode with bounded message
+  # size (MAX_WINDOWS_PRIVILEGED_MESSAGE_BYTES). Same surface category
+  # as the other windows_* verifier modules; pinning here protects
+  # the 15 self-tests against silent removal during a refactor.
+  "windows_ipc:15"
 )
 
 run_module() {
