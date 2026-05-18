@@ -1314,7 +1314,8 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
     };
 
     let mut visited_reports = HashSet::new();
-    visited_reports.insert(fs::canonicalize(report_path.as_path()).unwrap_or(report_path.clone()));
+    visited_reports
+        .insert(fs::canonicalize(report_path.as_path()).unwrap_or_else(|_| report_path.clone()));
     // X2: bridge the typed view back to a Map for downstream walking.
     let payload = typed_report.into_value_map();
     let payload = &payload;
