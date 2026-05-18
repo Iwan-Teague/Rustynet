@@ -20,7 +20,8 @@ Use this order when deciding what is still open:
 5. `documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md`
 6. `documents/operations/active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md`
 7. `documents/operations/active/Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md`
-8. The owning subsystem plan for the specific area
+8. `documents/operations/active/PlatformImprovementBacklog_2026-05-14.md` (Debian + Windows + macOS platform-improvement items; the X1-X7 numbered cross-platform tracks are the cleanest current path for code-only quality work)
+9. The owning subsystem plan for the specific area
 
 ## Repository Snapshot
 
