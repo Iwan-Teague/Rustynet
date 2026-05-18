@@ -109,7 +109,15 @@ WINDOWS_FLOORS=(
   # tests pinning router-advertisement / IPv6-default-route
   # observation contract.
   "windows_dns_failclosed:67"
-  "windows_mesh_status:14"
+  # Floor bumped 14→23 on X4 coverage parity sweep: 9 new tests
+  # covering schema_version pin, per-variant serde round-trip on
+  # IntegrityMismatch + InvalidFormat, unknown-load_status-tag
+  # rejection, freshness boundary (age==max accepts, age=max+1
+  # rejects with both numbers in reason), no-expectations vacuous
+  # truth, no-dedup on duplicate expected_peer_ids, and confirmation
+  # that lan_access_enabled + selected_exit_node fields don't gate
+  # the drift verdict today.
+  "windows_mesh_status:23"
   "windows_key_custody:18"
   "windows_authenticode:38"
   # New module from W4: 17 tests pinning the registry-key ACL
