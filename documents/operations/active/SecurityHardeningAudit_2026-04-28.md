@@ -47,7 +47,7 @@ SHA or a "deferred — tracked under" pointer.
 
 #### A.2.1 [HIGH] DoS panic on signed-bundle freshness when host clock < UNIX_EPOCH
 
-**Where:** [crates/rustynetd/src/fetcher.rs:179](../../crates/rustynetd/src/fetcher.rs:179) (now line 184 post-fix), `SignedBundleFetcher::check_freshness`.
+**Where:** [crates/rustynetd/src/fetcher.rs:179](../../../crates/rustynetd/src/fetcher.rs:179) (now line 184 post-fix), `SignedBundleFetcher::check_freshness`.
 
 **Risk:** Every signed-bundle fetch (assignment, traversal, auto-tunnel,
 DNS-zone) called `SystemTime::now().duration_since(UNIX_EPOCH).unwrap()`.

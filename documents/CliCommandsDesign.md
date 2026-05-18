@@ -2,11 +2,25 @@
 
 ## Overview
 
-This document outlines CLI commands for Rustynet, split into two sections:
-1. **Completed (Phases 1-3)**: 21 commands fully implemented, tested, and deployed
-2. **Proposed Future (Phases 4+)**: New useful commands for node management, policy, analytics, and advanced diagnostics
+This document outlines the CLI command design for Rustynet, split into two sections:
+1. **Phase 1-3 design baseline**: The original 21 commands that established the
+   diagnostics, networking, security, and system-info surface. All are
+   implemented.
+2. **Proposed Future (Phase 4+)**: Additional commands for node management,
+   policy, analytics, and advanced diagnostics.
 
-All commands pull real live data via the `rustynet-sysinfo` crate and return actionable operational info.
+All commands pull real live data via the `rustynet-sysinfo` crate and return
+actionable operational info.
+
+> **Note on drift:** the actual CLI surface in
+> `crates/rustynet-cli/src/main.rs` has grown well beyond the Phase 1-3 design
+> baseline below. The runtime `CliCommand` enum now exposes ~130 distinct
+> command variants covering daemon, membership, signed-assignment, signed
+> DNS-zone, traversal, relay, exit-node, role/state, live-lab/UTM
+> orchestration, ops verification, performance, security, and platform-check
+> surfaces. The categories below remain the design rationale for the original
+> diagnostics surface; see `crates/rustynet-cli/src/main.rs` for the current
+> authoritative inventory.
 
 ---
 

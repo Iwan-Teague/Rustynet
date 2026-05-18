@@ -57,18 +57,20 @@ Supporting active execution ledger for Windows 11 exit-node and relay-node
 hardening:
 - [active/WindowsExitAndRelayDeltaPlan_2026-05-10.md](./active/WindowsExitAndRelayDeltaPlan_2026-05-10.md)
 
-Current phase-local hardening checklist:
-- [active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
-- [active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
-- [active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
+Current phase-local hardening checklists (only the still-open ones; the
+finished Phase 1/2/3/5 checklists are archived in
+[done/](./done/README.md)):
 - [active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md](./active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md)
-- [active/Phase5ReleaseReadinessChecklist_2026-04-12.md](./active/Phase5ReleaseReadinessChecklist_2026-04-12.md)
 - [active/Phase5ReleaseReadinessSummary_2026-04-12.md](./active/Phase5ReleaseReadinessSummary_2026-04-12.md)
 - [active/Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md](./active/Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md)
 - [active/VmLabCapabilityCookbook_2026-04-14.md](./active/VmLabCapabilityCookbook_2026-04-14.md)
 - [active/VmLabCapabilityReportingPlan_2026-04-14.md](./active/VmLabCapabilityReportingPlan_2026-04-14.md)
 - [active/VmLabCapabilitySources_2026-04-14.md](./active/VmLabCapabilitySources_2026-04-14.md)
 - [active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
+
+Cross-platform code-quality ledger:
+- [active/PlatformImprovementBacklog_2026-05-14.md](./active/PlatformImprovementBacklog_2026-05-14.md) — most recently updated cross-platform improvement backlog (X1-X7 numbered tracks are the cleanest current path for code-only quality work)
+- [active/SecurityHardeningAudit_2026-04-28.md](./active/SecurityHardeningAudit_2026-04-28.md) — current cross-platform security-hardening audit set
 
 ## High-Value Evergreen References
 
@@ -108,13 +110,23 @@ Current phase-local hardening checklist:
 - [VulnerabilityResponse.md](./VulnerabilityResponse.md)
 - [WindowsWorkingNodeBringUpRunbook.md](./WindowsWorkingNodeBringUpRunbook.md) — operator walk-through from fresh Windows 11 host to mesh-joined node on `windows-wireguard-nt`
 
-## Archived Reviews
+## Archived Reviews And Completed Checklists
 
-Historical operations reviews live under [done/](./done/):
+Historical operations reviews and completed implementation checklists live
+under [done/](./done/). See [done/README.md](./done/README.md) for the
+classification and per-document completion notes.
+
+Reviews and audits:
 - [done/ComparativeSecurityFlawAssessment_2026-03-06.md](./done/ComparativeSecurityFlawAssessment_2026-03-06.md)
 - [done/FallbackLogicAudit_2026-03-06.md](./done/FallbackLogicAudit_2026-03-06.md)
 - [done/RustynetAdversarialHardeningAudit_2026-03-14.md](./done/RustynetAdversarialHardeningAudit_2026-03-14.md)
 - [done/SecurityReview_2026-03-03.md](./done/SecurityReview_2026-03-03.md)
+
+Completed phase implementation checklists:
+- [done/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./done/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
+- [done/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./done/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
+- [done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
+- [done/Phase5ReleaseReadinessChecklist_2026-04-12.md](./done/Phase5ReleaseReadinessChecklist_2026-04-12.md)
 
 ## Documentation Rules
 
