@@ -467,4 +467,207 @@ mod tests {
             serde_json::from_str(serialized.as_str()).expect("deserialize");
         assert_eq!(restored, report);
     }
+
+    // ----- X4 coverage parity sweep ---------------------------------------
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        // Pin the wire-format schema_version so an accidental bump
+        // (e.g. as part of a typed-view rename refactor) trips this
+        // test and forces a deliberate review.
+        let report = WindowsMeshStatusReport {
+            schema_version: 1,
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            overall_ok: false,
+            snapshot: WindowsMeshSnapshotLoad::Missing {
+                reason: "no such file".to_string(),
+            },
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+            drift_reasons: Vec::new(),
+        };
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape must be int=1: {body}"
+        );
+    }
+
+    #[test]
+    fn integrity_mismatch_load_round_trips_through_serde() {
+        // Existing round-trips covered Ok + Missing variants; the
+        // IntegrityMismatch + InvalidFormat tail wasn't pinned.
+        // Round-trip the IntegrityMismatch shape explicitly.
+        let report = WindowsMeshStatusReport {
+            schema_version: 1,
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            overall_ok: false,
+            snapshot: WindowsMeshSnapshotLoad::IntegrityMismatch {
+                reason: "checksum mismatch".to_string(),
+            },
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+            drift_reasons: vec!["state snapshot integrity mismatch: checksum mismatch".to_string()],
+        };
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"load_status\":\"integrity_mismatch\""),
+            "tag shape: {body}"
+        );
+        let parsed: WindowsMeshStatusReport = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn invalid_format_load_round_trips_through_serde() {
+        let report = WindowsMeshStatusReport {
+            schema_version: 1,
+            state_path: r"C:\ProgramData\RustyNet\rustynetd.state".to_string(),
+            overall_ok: false,
+            snapshot: WindowsMeshSnapshotLoad::InvalidFormat {
+                reason: "missing required field".to_string(),
+            },
+            expected_peer_ids: vec![],
+            max_age_seconds: None,
+            drift_reasons: vec![
+                "state snapshot invalid format: missing required field".to_string(),
+            ],
+        };
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"load_status\":\"invalid_format\""),
+            "tag shape: {body}"
+        );
+        let parsed: WindowsMeshStatusReport = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn snapshot_load_rejects_unknown_load_status_tag() {
+        // The enum uses #[serde(tag="load_status", rename_all="snake_case")].
+        // An unknown tag must fail closed rather than silently parse to
+        // a default variant.
+        let body = r#"{"load_status":"observe_only","reason":"placeholder"}"#;
+        let err = serde_json::from_str::<WindowsMeshSnapshotLoad>(body)
+            .expect_err("unknown load_status must fail closed");
+        assert!(
+            err.to_string().contains("observe_only") || err.to_string().contains("unknown variant"),
+            "error must reference unknown tag or 'unknown variant': {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_accepts_age_equal_to_max_age_threshold() {
+        // The evaluator uses `> max_age` (strict greater-than) so a
+        // snapshot exactly at the threshold must pass. Pin this so a
+        // future `>=` typo (cheaper-looking but tightens the contract
+        // by 1 second) trips this test.
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 300,
+            peer_ids: vec!["peer-a".to_string()],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_string()], Some(300));
+        assert!(
+            reasons.is_empty(),
+            "age == max_age must pass (strict >): {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_age_one_second_above_max_threshold() {
+        // Boundary pin: age = max+1 must reject. Together with the
+        // age==max test above, the strict-greater contract is pinned
+        // from both sides.
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 301,
+            peer_ids: vec![],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &[], Some(300));
+        assert!(
+            reasons.iter().any(|r| r.contains("snapshot is stale")
+                && r.contains("age=301s")
+                && r.contains("max_age=300s")),
+            "age=301 vs max=300 must surface both numbers: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_passes_when_snapshot_ok_with_no_expectations() {
+        // No expected_peer_ids + no max_age_seconds → vacuous truth:
+        // the evaluator returns an empty reasons vec because there's
+        // nothing to check. Pin this so a future "require expectations"
+        // change has to update this test deliberately.
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 999_999,
+            peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
+            selected_exit_node: Some("peer-a".to_string()),
+            lan_access_enabled: true,
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &[], None);
+        assert!(
+            reasons.is_empty(),
+            "no expectations + no max_age must pass: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_surfaces_each_missing_peer_independently_without_dedup() {
+        // Pre-existing tests cover "1 missing peer" but don't pin the
+        // "no dedup" contract. If the caller asks for the same peer
+        // twice (orchestrator config bug or a future "list all peers"
+        // shape), each missing instance must surface independently.
+        // A future dedup refactor (e.g. via HashSet) would silently
+        // collapse the operator-facing reason count.
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 30,
+            peer_ids: vec!["peer-x".to_string()],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        let reasons = evaluate_windows_mesh_status(
+            &snap,
+            &[
+                "peer-a".to_string(),
+                "peer-a".to_string(),
+                "peer-b".to_string(),
+            ],
+            None,
+        );
+        // 3 missing reasons: peer-a (x2), peer-b (x1) — no dedup.
+        assert_eq!(
+            reasons.len(),
+            3,
+            "expected 3 reasons (no dedup of duplicate expected_peer_ids): {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_does_not_surface_drift_from_lan_or_selected_exit_node_fields() {
+        // selected_exit_node and lan_access_enabled are carried through
+        // the typed view but are NOT part of the drift contract today
+        // (only freshness + expected peers gate the verdict). Pin this
+        // so a future addition that starts gating on either field has
+        // to update this test deliberately and document the new gate.
+        let snap = WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: 30,
+            peer_ids: vec!["peer-a".to_string()],
+            selected_exit_node: None, // no exit node selected
+            lan_access_enabled: true, // LAN access enabled
+        };
+        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_string()], Some(300));
+        assert!(
+            reasons.is_empty(),
+            "selected_exit_node + lan_access_enabled must not affect drift today: {reasons:?}"
+        );
+    }
 }
