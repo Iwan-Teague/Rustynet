@@ -10,9 +10,9 @@ Use it to answer three questions quickly:
 ## Read Order
 
 Before touching code, read in this order:
-1. [AGENTS.md](/Users/iwanteague/Desktop/Rustynet/AGENTS.md)
-2. [CLAUDE.md](/Users/iwanteague/Desktop/Rustynet/CLAUDE.md)
-3. [README.md](/Users/iwanteague/Desktop/Rustynet/README.md)
+1. [AGENTS.md](../AGENTS.md)
+2. [CLAUDE.md](../CLAUDE.md)
+3. [README.md](../README.md)
 4. [Requirements.md](./Requirements.md)
 5. [SecurityMinimumBar.md](./SecurityMinimumBar.md)
 6. The active scope document for the task
