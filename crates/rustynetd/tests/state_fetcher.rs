@@ -62,6 +62,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         remote_ops_expected_subject: "admin".to_owned(),
         auto_port_forward_exit: false,
         auto_port_forward_lease_secs: std::num::NonZeroU32::new(3600).unwrap(),
+        port_mapping_mode: rustynetd::port_mapper::PortMappingMode::Keepalive,
         dataplane_mode: DaemonDataplaneMode::Shell,
         privileged_helper_socket_path: None,
         privileged_helper_timeout_ms: std::num::NonZeroU64::new(1000).unwrap(),
