@@ -1675,3 +1675,226 @@ fn dbg_scanner_flags_token_substring_inside_complex_expression() {
         "`dbg!(if cond {{ passphrase_bytes }} else …)` must fire on the forbidden branch: {hits:?}"
     );
 }
+
+// ---- Panic-macro placeholder scanner + self-tests -----------------
+//
+// `panic!`, `unreachable!`, `unimplemented!`, `todo!`, `assert!`,
+// `assert_eq!`, `assert_ne!`, `debug_assert!`, `debug_assert_eq!`,
+// `debug_assert_ne!` all accept a format string and print it to
+// stderr / panic output. Same leak shape as `eprintln!` but a
+// distinct family of macro names — the existing placeholder scanner
+// explicitly only walks `LOG_MACRO_NAMES`, none of which are
+// panic-shape macros. A `panic!("auth failed for user={passphrase_bytes:?}")`
+// would print the secret bytes to stderr + the panic backtrace +
+// any unwrap-handler logs.
+
+/// Panic-shape macro names — distinct family from `LOG_MACRO_NAMES`.
+/// Each one accepts a format string and prints to stderr / panic
+/// output, with the same `{token:?}` leak shape as log macros.
+const PANIC_MACRO_NAMES: &[&str] = &[
+    "panic",
+    "unreachable",
+    "unimplemented",
+    "todo",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+];
+
+/// Pure scan helper for panic-shape macro calls whose format string
+/// interpolates a forbidden secret-bearing identifier. Returns
+/// (line_number, matched_token, matched_macro_name) tuples.
+pub(crate) fn scan_source_for_panic_macro_placeholder_leaks(
+    body: &str,
+) -> Vec<(usize, String, String)> {
+    let mut hits: Vec<(usize, String, String)> = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        // Find any panic-shape macro signature on the line. Match
+        // exact name (so `assert_eq!` doesn't shadow the shorter
+        // `assert!` test). The longest-prefix rule means we check
+        // longer names first.
+        let mut found_macro: Option<&'static str> = None;
+        let mut found_macro_pos: Option<usize> = None;
+        for name in PANIC_MACRO_NAMES {
+            let pat = format!("{name}!(");
+            let pat_ws = format!("{name}! (");
+            if let Some(pos) = line.find(&pat).or_else(|| line.find(&pat_ws)) {
+                // Confirm the char before the macro name is NOT an
+                // identifier char (so `my_panic!(` isn't a match).
+                let preceding = &line[..pos];
+                let prev = preceding.chars().last();
+                let is_word =
+                    |c: Option<char>| c.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+                if is_word(prev) {
+                    continue;
+                }
+                // Keep the LONGEST matching macro name at the same
+                // position (so `assert_eq` wins over `assert`).
+                match found_macro_pos {
+                    None => {
+                        found_macro = Some(name);
+                        found_macro_pos = Some(pos);
+                    }
+                    Some(prev_pos) if pos == prev_pos => {
+                        if name.len() > found_macro.unwrap().len() {
+                            found_macro = Some(name);
+                        }
+                    }
+                    Some(prev_pos) if pos < prev_pos => {
+                        found_macro = Some(name);
+                        found_macro_pos = Some(pos);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some(macro_name) = found_macro else {
+            continue;
+        };
+        // Reject if the panic-shape macro lives inside a `// …` comment.
+        if let Some(comment_pos) = line.find("//")
+            && let Some(macro_pos) = found_macro_pos
+            && comment_pos < macro_pos
+        {
+            continue;
+        }
+        for token in FORBIDDEN_PLACEHOLDER_TOKENS {
+            let needle_eq = format!("{{{token}}}");
+            let needle_colon = format!("{{{token}:");
+            if line.contains(&needle_eq) || line.contains(&needle_colon) {
+                hits.push((idx + 1, (*token).to_string(), (*macro_name).to_string()));
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn no_panic_macro_placeholder_leaks_in_workspace() {
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let mut offenders: Vec<String> = Vec::new();
+    for source_root in audited_source_roots(&root) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(&source_root, &mut files);
+        for file in files {
+            let rel = workspace_relative(&file, &root);
+            if allowlist.contains(&rel) {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&file) else {
+                continue;
+            };
+            let label = rel.display().to_string();
+            for (line_no, token, macro_name) in scan_source_for_panic_macro_placeholder_leaks(&body)
+            {
+                offenders.push(format!(
+                    "{label}:{line_no}: `{macro_name}!` macro format string \
+                     interpolates secret-bearing identifier `{token}`. \
+                     Remove the format placeholder — panic-shape macros print to stderr \
+                     and the panic backtrace, bypassing the production logger's \
+                     redaction layer."
+                ));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        panic!(
+            "panic-macro placeholder-leak audit found {} offending site(s):\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn panic_scanner_flags_panic_macro_with_passphrase_placeholder() {
+    let body = r#"fn leak() { panic!("got {passphrase_bytes:?}"); }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.iter()
+            .any(|(_, t, m)| t == "passphrase_bytes" && m == "panic"),
+        "`panic!(\"…{{passphrase_bytes:?}}\")` must fire: {hits:?}"
+    );
+}
+
+#[test]
+fn panic_scanner_flags_assert_with_private_key_placeholder() {
+    let body = r#"fn leak() { assert!(check, "found {private_key_bytes}"); }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.iter()
+            .any(|(_, t, m)| t == "private_key_bytes" && m == "assert"),
+        "`assert!(check, \"…{{private_key_bytes}}\")` must fire: {hits:?}"
+    );
+}
+
+#[test]
+fn panic_scanner_flags_assert_eq_with_signing_seed_placeholder() {
+    let body = r#"fn leak() { assert_eq!(a, b, "mismatch: {signing_seed:?}"); }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.iter()
+            .any(|(_, t, m)| t == "signing_seed" && m == "assert_eq"),
+        "`assert_eq!(.., \"{{signing_seed:?}}\")` must fire on assert_eq macro: {hits:?}"
+    );
+}
+
+#[test]
+fn panic_scanner_flags_unreachable_with_wrapped_secret_placeholder() {
+    let body = r#"fn leak() { unreachable!("unexpected {wrapped_secret}") }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.iter()
+            .any(|(_, t, m)| t == "wrapped_secret" && m == "unreachable"),
+        "`unreachable!(…{{wrapped_secret}})` must fire: {hits:?}"
+    );
+}
+
+#[test]
+fn panic_scanner_flags_todo_with_plaintext_key_placeholder() {
+    let body = r#"fn leak() { todo!("implement handler for {plaintext_key:?}") }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.iter()
+            .any(|(_, t, m)| t == "plaintext_key" && m == "todo"),
+        "`todo!(…{{plaintext_key:?}})` must fire: {hits:?}"
+    );
+}
+
+#[test]
+fn panic_scanner_silent_on_panic_with_safe_message() {
+    let body = r#"fn safe() { panic!("expected condition violated"); }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.is_empty(),
+        "`panic!()` with no forbidden token must not fire: {hits:?}"
+    );
+}
+
+#[test]
+fn panic_scanner_silent_on_commented_panic_offender() {
+    let body = r#"fn safe() { let x = 1; // panic!("got {passphrase_bytes:?}"); }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.is_empty(),
+        "mid-line commented `panic!(…)` must not fire: {hits:?}"
+    );
+}
+
+#[test]
+fn panic_scanner_silent_on_safe_format_token() {
+    let body = r#"fn safe() { panic!("got {something_safe:?}"); }"#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert!(
+        hits.is_empty(),
+        "`panic!()` with non-forbidden token must not fire: {hits:?}"
+    );
+}
