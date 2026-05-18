@@ -109,7 +109,14 @@ LINUX_FLOORS=(
 MACOS_FLOORS=(
   "macos_runtime_acls:8"
   "macos_service_hardening:9"
-  "macos_dns_failclosed:8"
+  # Floor bumped 8→16 on X4 coverage parity sweep: 8 new tests
+  # covering schema_version pin, IPv4 link-local (cloud metadata)
+  # rejection, IPv6 link-local rejection, IPv4-mapped IPv6 external
+  # rejection, full 127.0.0.0/8 loopback range acceptance,
+  # multi-directive search/domain parser ordering, bare-nameserver
+  # parser tolerance, and no-dedup-across-nameservers in the
+  # aggregated drift_reasons output.
+  "macos_dns_failclosed:16"
   # Floor bumped 3→9 on X4 coverage parity sweep: 6 new tests
   # covering schema_version pin, default-state-path fallback,
   # custom state-path echo through the report, and per-variant

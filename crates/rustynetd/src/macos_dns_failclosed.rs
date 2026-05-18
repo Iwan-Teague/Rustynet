@@ -222,4 +222,134 @@ mod tests {
             report.drift_reasons
         );
     }
+
+    // ----- X4 coverage parity sweep ---------------------------------------
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        let snapshot = MacosDnsFailclosedSnapshot {
+            resolv_conf_path: "/etc/resolv.conf".to_string(),
+            resolv_conf_present: true,
+            nameservers: vec!["127.0.0.1".to_string()],
+            search_domains: Vec::new(),
+            loopback_resolver_advertised: true,
+        };
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape must be int=1: {body}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_ipv4_link_local_cloud_metadata_address() {
+        // 169.254.169.254 is the IMDS / cloud-metadata link-local
+        // address. If the macOS resolver lists it, an exfiltration
+        // path via DNS-tunneling-on-metadata is plausible. Pin the
+        // mesh-only contract.
+        let ns = vec!["169.254.169.254".to_string()];
+        let reasons = evaluate_macos_dns_failclosed(&ns);
+        assert!(
+            reasons.iter().any(|r| r.contains("169.254.169.254")),
+            "IPv4 link-local must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_ipv6_link_local_address() {
+        // fe80::1 is the IPv6 link-local equivalent — typically an
+        // RA-installed resolver. Pin its rejection so a future
+        // "router-recommended" config doesn't silently leak.
+        let ns = vec!["fe80::1".to_string()];
+        let reasons = evaluate_macos_dns_failclosed(&ns);
+        assert!(
+            reasons.iter().any(|r| r.contains("fe80")),
+            "IPv6 link-local must surface: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_ipv4_mapped_ipv6_external_address() {
+        // ::ffff:8.8.8.8 is an IPv4-mapped IPv6 address. macOS's
+        // resolver may surface either form depending on stack
+        // configuration. Pin that the IPv4-mapped path is NOT
+        // misclassified as loopback by IpAddr::is_loopback.
+        let ns = vec!["::ffff:8.8.8.8".to_string()];
+        let reasons = evaluate_macos_dns_failclosed(&ns);
+        assert!(
+            !reasons.is_empty(),
+            "IPv4-mapped IPv6 external must surface as drift, not silently pass: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_accepts_full_loopback_range() {
+        // 127.0.0.0/8 is a loopback range; any address in it must
+        // pass. Pin the boundary 127.255.255.254 explicitly so a
+        // future tightening to 127.0.0.1-only would trip this test.
+        let ns = vec![
+            "127.0.0.1".to_string(),
+            "127.0.0.53".to_string(), // systemd-resolved stub on linux peers
+            "127.255.255.254".to_string(),
+        ];
+        let reasons = evaluate_macos_dns_failclosed(&ns);
+        assert!(
+            reasons.is_empty(),
+            "full 127.0.0.0/8 loopback range must pass: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn parser_handles_multiple_search_and_domain_directives() {
+        // resolv.conf can carry multiple search directives or a
+        // domain directive — the parser appends both into a single
+        // search_domains list in source order. Pin so a future
+        // refactor that dedups or reorders surfaces a deliberate
+        // change.
+        let body = "search internal.example com.example\ndomain example.org\nnameserver 127.0.0.1\nsearch alpha\n";
+        let (ns, domains) = parse_resolv_conf(body);
+        assert_eq!(ns, vec!["127.0.0.1"]);
+        assert_eq!(
+            domains,
+            vec!["internal.example", "com.example", "example.org", "alpha"]
+        );
+    }
+
+    #[test]
+    fn parser_drops_bare_nameserver_directive_with_no_address() {
+        // `nameserver` with no following address is malformed; the
+        // parser must drop it silently (it's not a value the
+        // evaluator can validate). Pin the current behavior.
+        let body = "nameserver\nnameserver 127.0.0.1\n";
+        let (ns, _) = parse_resolv_conf(body);
+        assert_eq!(ns, vec!["127.0.0.1"]);
+    }
+
+    #[test]
+    fn build_report_aggregates_multiple_nameserver_drift_reasons() {
+        // Two off-loopback nameservers must surface as two reasons,
+        // not collapse to one. Pin the no-dedup contract.
+        let snapshot = MacosDnsFailclosedSnapshot {
+            resolv_conf_path: "/etc/resolv.conf".to_string(),
+            resolv_conf_present: true,
+            nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+            search_domains: Vec::new(),
+            loopback_resolver_advertised: false,
+        };
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(!report.overall_ok);
+        let off_loopback: Vec<&String> = report
+            .drift_reasons
+            .iter()
+            .filter(|r| r.contains("is not loopback"))
+            .collect();
+        assert_eq!(
+            off_loopback.len(),
+            2,
+            "expected 2 reasons (no dedup), got: {:?}",
+            report.drift_reasons
+        );
+    }
 }
