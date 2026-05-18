@@ -76,7 +76,7 @@ Reviewed contract in `rustynetd::exit_codes::ExitCode`:
 
 Aligned with BSD `sysexits.h` (`EX_USAGE`/`EX_DATAERR`/`EX_SOFTWARE`/`EX_CONFIG`) so existing CI wrappers and `systemd RestartPreventExitStatus=` lists work without Rustynet-specific knowledge.
 
-**Coverage**: 100% of bin/*.rs binaries under `crates/rustynet-cli/src/bin/` (~71 binaries) classify their failure shapes through the taxonomy. Security-critical verdicts (signature verification, attestation, drift, tampering, leak detection, perf regression, platform-mismatch) uniformly map to `PolicyReject(78)` so retry-only-on-70 CI loops never accidentally retry a fail-closed verdict.
+**Coverage**: 100% of bin/*.rs binaries under `crates/rustynet-cli/src/bin/` (70 binaries) classify their failure shapes through the taxonomy. Security-critical verdicts (signature verification, attestation, drift, tampering, leak detection, perf regression, platform-mismatch) uniformly map to `PolicyReject(78)` so retry-only-on-70 CI loops never accidentally retry a fail-closed verdict.
 
 Runbook: [`CliExitCodeTaxonomy.md`](./CliExitCodeTaxonomy.md).
 
