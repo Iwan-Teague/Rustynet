@@ -384,4 +384,160 @@ mod tests {
         let parsed: MacosRuntimeAclReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, report);
     }
+
+    // ----- X4 coverage parity sweep ---------------------------------------
+
+    #[test]
+    fn reviewed_roots_snapshot_pins_two_entries_with_exact_posture() {
+        // Pin MACOS_RUNTIME_ACL_ROOTS shape: any silent edit to a
+        // reviewed mode/owner/group has to update this snapshot
+        // alongside the constant.
+        let canonical = [
+            (
+                "/usr/local/var/rustynet",
+                "state root",
+                0o700_u32,
+                "rustynetd",
+                "rustynetd",
+            ),
+            (
+                "/usr/local/etc/rustynet",
+                "config root",
+                0o750_u32,
+                "root",
+                "rustynetd",
+            ),
+        ];
+        assert_eq!(
+            MACOS_RUNTIME_ACL_ROOTS.len(),
+            canonical.len(),
+            "reviewed roots list grew or shrank — update snapshot + security review together"
+        );
+        for ((path, label, mode, owner, group), expected) in
+            MACOS_RUNTIME_ACL_ROOTS.iter().zip(canonical.iter())
+        {
+            assert_eq!(*path, expected.0);
+            assert_eq!(*label, expected.1);
+            assert_eq!(*mode, expected.2);
+            assert_eq!(*owner, expected.3);
+            assert_eq!(*group, expected.4);
+        }
+    }
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        let report = MacosRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: false,
+            roots: Vec::new(),
+        };
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape: {body}"
+        );
+    }
+
+    #[test]
+    fn root_status_drifted_round_trips_through_serde() {
+        // Pre-existing report_serde_round_trips only covered Ok. Pin
+        // the Drifted variant so a future rename on `reason` trips.
+        let entry = MacosRuntimeAclRootEntry {
+            label: "state root".to_string(),
+            path: "/usr/local/var/rustynet".to_string(),
+            status: MacosRuntimeAclRootStatus::Drifted {
+                reason: "mode is 0o755, expected 0o700".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"drifted\""), "tag: {body}");
+        let parsed: MacosRuntimeAclRootEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn root_status_missing_round_trips_through_serde() {
+        let entry = MacosRuntimeAclRootEntry {
+            label: "state root".to_string(),
+            path: "/usr/local/var/rustynet".to_string(),
+            status: MacosRuntimeAclRootStatus::Missing {
+                reason: "off-macOS probe stub".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"missing\""), "tag: {body}");
+        let parsed: MacosRuntimeAclRootEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn root_status_rejects_unknown_status_tag() {
+        // Fail-closed parser: unknown tag must error rather than
+        // coerce.
+        let body = r#"{"label":"state root","path":"/usr/local/var/rustynet","status":"observe_only","reason":"placeholder"}"#;
+        let err = serde_json::from_str::<MacosRuntimeAclRootEntry>(body)
+            .expect_err("unknown tag must fail closed");
+        assert!(
+            err.to_string().contains("observe_only") || err.to_string().contains("unknown variant"),
+            "error must reference unknown tag: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_symlink_before_dir_check() {
+        // Symlink pointing at a real dir still must reject — pin the
+        // structural check order (symlink wins over is_dir).
+        let snap = MacosRuntimeAclSnapshot {
+            mode: 0o40700,
+            uid: 500,
+            gid: 500,
+            is_dir: true, // target is a dir; irrelevant
+            is_symlink: true,
+        };
+        let err = evaluate_macos_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("symlink must reject even with is_dir=true");
+        assert!(
+            err.contains("symlink") && !err.contains("file"),
+            "first reason must be symlink, not file-vs-dir: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_first_fault_is_symlink_before_mode_drift() {
+        // Symlink + mode drift simultaneously must surface symlink
+        // first — the structural check takes precedence over the
+        // logical drift.
+        let snap = MacosRuntimeAclSnapshot {
+            mode: 0o40755, // drifted
+            uid: 500,
+            gid: 500,
+            is_dir: false,
+            is_symlink: true,
+        };
+        let err = evaluate_macos_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("symlink + mode drift must reject");
+        assert!(
+            err.contains("symlink") && !err.contains("0o755"),
+            "first reason must be symlink, not mode: {err}"
+        );
+    }
+
+    #[test]
+    fn report_with_empty_roots_yields_vacuously_true_overall_ok() {
+        // Document the Iterator::all() vacuous-truth semantics on
+        // empty input. Production cannot hit this path (the collector
+        // iterates a 2-entry const array) but the test pins the
+        // current behavior.
+        let report = MacosRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: true,
+            roots: Vec::new(),
+        };
+        let derived = report
+            .roots
+            .iter()
+            .all(|entry| matches!(entry.status, MacosRuntimeAclRootStatus::Ok));
+        assert!(derived, "empty roots is vacuously all-Ok");
+    }
 }
