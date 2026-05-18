@@ -20,7 +20,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: regression_coverage_gates.sh [--platform <linux|windows|all>] [--verbose]
+usage: regression_coverage_gates.sh [--platform <linux|macos|windows|all>] [--verbose]
 
 Options:
   --platform   Restrict checks to one platform group. Default: all.
@@ -55,9 +55,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${PLATFORM}" in
-  all|linux|windows) ;;
+  all|linux|macos|windows) ;;
   *)
-    echo "regression_coverage_gates: --platform must be linux|windows|all (got ${PLATFORM})" >&2
+    echo "regression_coverage_gates: --platform must be linux|macos|windows|all (got ${PLATFORM})" >&2
     exit 64
     ;;
 esac
@@ -98,6 +98,21 @@ LINUX_FLOORS=(
   # New module from L8: 21 tests pinning the boot-time killswitch
   # invariant (evaluator + nft-ruleset parser + off-Linux blocker).
   "linux_killswitch_boot:21"
+)
+
+# macOS coverage floors. macOS is a control-plane platform today, not
+# a production dataplane host — the verifier surface is thinner than
+# Linux / Windows. These floors lock the current baseline so a refactor
+# that silently drops drift tests trips the gate. Future expansion of
+# any single module follows the same X4 coverage-parity pattern: add
+# named drift tests, bump the floor in the same commit.
+MACOS_FLOORS=(
+  "macos_runtime_acls:8"
+  "macos_service_hardening:9"
+  "macos_dns_failclosed:8"
+  "macos_mesh_status:3"
+  "macos_key_custody:2"
+  "macos_authenticode:2"
 )
 
 # Note: `windows_runtime_acls` is not a standalone module — Windows
@@ -189,6 +204,12 @@ OVERALL=0
 
 if [[ "${PLATFORM}" == "linux" || "${PLATFORM}" == "all" ]]; then
   if ! run_group "linux" "${LINUX_FLOORS[@]}"; then
+    OVERALL=1
+  fi
+fi
+
+if [[ "${PLATFORM}" == "macos" || "${PLATFORM}" == "all" ]]; then
+  if ! run_group "macos" "${MACOS_FLOORS[@]}"; then
     OVERALL=1
   fi
 fi
