@@ -83,7 +83,7 @@ ancillary binary:
   daemon's startup-error strings to the taxonomy.
 * `crates/rustynet-cli/src/main.rs` — `classify_cli_error` maps the
   `execute()` result strings.
-* All 72 binaries under `crates/rustynet-cli/src/bin/` — each imports
+* All 70 binaries under `crates/rustynet-cli/src/bin/` — each imports
   `rustynetd::exit_codes::ExitCode` and routes its failure shapes
   through the taxonomy. Phase-gate wrappers and cargo-spawn helpers
   map repo-root / argv failures to `ConfigError(65)` and subprocess
