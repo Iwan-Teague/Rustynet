@@ -302,6 +302,50 @@ struct EndpointCandidateView {
     extra: Map<String, Value>,
 }
 
+/// X2: typed view over a single entry inside the
+/// `rustynet_artifacts` keyed map. The 4 typed slots correspond to
+/// every `.get("...")` call the walker makes per artifact entry.
+///
+/// * `path: Option<Value>` stays `Value` because the downstream
+///   `validate_absolute_path(&Option<&Value>)` helper accepts any
+///   `Value` and rejects non-string/non-absolute at the helper
+///   level — the same boundary used by `daemon_status.socket_path`.
+/// * `exists: Option<bool>` — wrong-type slot now rejected at
+///   deserialise instead of slipping past
+///   `.and_then(Value::as_bool) -> None`.
+/// * `size_bytes` / `mtime_unix: Option<i64>` — likewise distinguish
+///   wrong-type from missing.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct RustynetArtifactEntryView {
+    pub path: Option<Value>,
+    pub exists: Option<bool>,
+    pub size_bytes: Option<i64>,
+    pub mtime_unix: Option<i64>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// X2: typed view over a single entry inside the `known_peers`
+/// array. The 2 typed slots correspond to every `.get("...")` call
+/// the walker makes per known-peer entry.
+///
+/// Per-entry deserialise (same pattern as `EndpointCandidateView`)
+/// preserves the legacy `known_peers[{index}]` per-index error
+/// granularity. The validator preserves the existing "must be a
+/// string" vs host:port-shape error split via the
+/// `view.endpoint.is_none()` check at the call site.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct KnownPeerView {
+    pub public_key: Option<String>,
+    pub endpoint: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
 /// X2: typed view over the `verifier_keys` sub-block. The 4 typed
 /// slots line up 1:1 with `PUBLIC_KEY_KEYS`. Wrong-type slots
 /// (e.g. an integer in any of the base64 fields) fail at the typed
@@ -621,20 +665,36 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 "dns_zone_bundle",
                 "trust_evidence",
             ] {
-                let Some(entry) = rustynet_artifacts.get(name).and_then(Value::as_object) else {
+                let Some(raw_entry) = rustynet_artifacts.get(name) else {
                     problems.push(format!("rustynet_artifacts.{name} must be an object"));
                     continue;
                 };
-                if !validate_absolute_path(entry.get("path")) {
+                let view =
+                    match serde_json::from_value::<RustynetArtifactEntryView>(raw_entry.clone()) {
+                        Ok(view) => view,
+                        Err(err) => {
+                            let msg = err.to_string();
+                            if msg.contains("expected a") && msg.contains("map") {
+                                problems
+                                    .push(format!("rustynet_artifacts.{name} must be an object"));
+                            } else {
+                                problems.push(format!(
+                                    "rustynet_artifacts.{name} has invalid field shape: {err}"
+                                ));
+                            }
+                            continue;
+                        }
+                    };
+                if !validate_absolute_path(view.path.as_ref()) {
                     problems.push(format!("rustynet_artifacts.{name}.path must be absolute"));
                 }
-                let exists = entry.get("exists").and_then(Value::as_bool);
+                let exists = view.exists;
                 if exists.is_none() {
                     problems.push(format!("rustynet_artifacts.{name}.exists must be boolean"));
                     continue;
                 }
-                let size = entry.get("size_bytes").and_then(Value::as_i64);
-                let mtime = entry.get("mtime_unix").and_then(Value::as_i64);
+                let size = view.size_bytes;
+                let mtime = view.mtime_unix;
                 if !matches!(size, Some(value) if value >= 0) {
                     problems.push(format!("rustynet_artifacts.{name}.size_bytes must be >= 0"));
                 }
@@ -691,13 +751,23 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
     match object.get("known_peers").and_then(Value::as_array) {
         Some(known_peers) => {
             for (index, peer) in known_peers.iter().enumerate() {
-                let Some(peer_object) = peer.as_object() else {
-                    problems.push(format!("known_peers[{index}] must be an object"));
-                    continue;
+                let view = match serde_json::from_value::<KnownPeerView>(peer.clone()) {
+                    Ok(view) => view,
+                    Err(err) => {
+                        let msg = err.to_string();
+                        if msg.contains("expected a") && msg.contains("map") {
+                            problems.push(format!("known_peers[{index}] must be an object"));
+                        } else {
+                            problems.push(format!(
+                                "known_peers[{index}] has invalid field shape: {err}"
+                            ));
+                        }
+                        continue;
+                    }
                 };
-                let pubkey_ok = peer_object
-                    .get("public_key")
-                    .and_then(Value::as_str)
+                let pubkey_ok = view
+                    .public_key
+                    .as_deref()
                     .map(str::trim)
                     .map(decode_b64_32)
                     .unwrap_or(false);
@@ -706,15 +776,8 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                         "known_peers[{index}].public_key must decode to 32 bytes"
                     ));
                 }
-                let endpoint = peer_object
-                    .get("endpoint")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if peer_object
-                    .get("endpoint")
-                    .and_then(Value::as_str)
-                    .is_none()
-                {
+                let endpoint = view.endpoint.as_deref().unwrap_or_default();
+                if view.endpoint.is_none() {
                     problems.push(format!("known_peers[{index}].endpoint must be a string"));
                 } else if !endpoint.is_empty() && !validate_host_endpoint(endpoint) {
                     problems.push(format!("known_peers[{index}].endpoint must be host:port"));
@@ -844,8 +907,9 @@ pub fn execute_ops_validate_network_discovery_bundle(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonStatusView, EndpointCandidateView, NatProfileView, NetworkDiscoveryBundleView,
-        NodeIdentityView, VerifierKeysView, WireguardView, deserialize_sub_block,
+        DaemonStatusView, EndpointCandidateView, KnownPeerView, NatProfileView,
+        NetworkDiscoveryBundleView, NodeIdentityView, RustynetArtifactEntryView, VerifierKeysView,
+        WireguardView, deserialize_sub_block,
     };
     use serde_json::{Map, Value, json};
 
@@ -1224,5 +1288,89 @@ mod tests {
         assert_eq!(view.kind.as_deref(), Some("host"));
         assert!(view.endpoint.is_none());
         assert!(view.priority.is_none());
+    }
+
+    /// Clean fixture: `RustynetArtifactEntryView` populates the 4
+    /// typed slots from a well-formed artifact entry.
+    #[test]
+    fn rustynet_artifact_entry_view_accepts_clean_entry() {
+        let entry = json!({
+            "path": "/var/lib/rustynet/assignment.json",
+            "exists": true,
+            "size_bytes": 4096,
+            "mtime_unix": 1_700_000_000,
+        });
+        let view: RustynetArtifactEntryView = serde_json::from_value(entry).expect("clean parse");
+        assert!(matches!(view.path, Some(Value::String(_))));
+        assert_eq!(view.exists, Some(true));
+        assert_eq!(view.size_bytes, Some(4096));
+        assert_eq!(view.mtime_unix, Some(1_700_000_000));
+    }
+
+    /// Wrong-type `exists` slot rejected at the typed layer.
+    /// Previously silent via `.and_then(Value::as_bool) -> None`,
+    /// surfacing as "must be boolean" (same as missing). Typed view
+    /// distinguishes the shape error.
+    #[test]
+    fn rustynet_artifact_entry_view_rejects_wrong_type_exists() {
+        let entry = json!({ "exists": "true" });
+        let err = serde_json::from_value::<RustynetArtifactEntryView>(entry)
+            .expect_err("string exists must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("exists") || message.contains("bool"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `size_bytes` slot rejected. Previously silent
+    /// via `.and_then(Value::as_i64) -> None`, surfacing as
+    /// "must be >= 0" (same as missing or negative).
+    #[test]
+    fn rustynet_artifact_entry_view_rejects_wrong_type_size_bytes() {
+        let entry = json!({ "size_bytes": "4096" });
+        let err = serde_json::from_value::<RustynetArtifactEntryView>(entry)
+            .expect_err("string size_bytes must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("size_bytes")
+                || message.contains("i64")
+                || message.contains("integer"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Clean fixture: `KnownPeerView` populates the 2 typed slots.
+    /// Per-entry deserialise preserves per-index error granularity.
+    #[test]
+    fn known_peer_view_accepts_clean_entry() {
+        let entry = json!({
+            "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "endpoint": "192.0.2.10:51820",
+            "extra": "ride",
+        });
+        let view: KnownPeerView = serde_json::from_value(entry).expect("clean parse");
+        assert!(view.public_key.is_some());
+        assert_eq!(view.endpoint.as_deref(), Some("192.0.2.10:51820"));
+        assert_eq!(
+            view.extra.get("extra").and_then(Value::as_str),
+            Some("ride")
+        );
+    }
+
+    /// Wrong-type `public_key` slot rejected. Previously silent via
+    /// `.and_then(Value::as_str) -> None`, surfacing as "must decode
+    /// to 32 bytes" — conflating wrong-type with empty / malformed
+    /// base64.
+    #[test]
+    fn known_peer_view_rejects_wrong_type_public_key() {
+        let entry = json!({ "public_key": 42 });
+        let err = serde_json::from_value::<KnownPeerView>(entry)
+            .expect_err("integer public_key must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("public_key") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
     }
 }
