@@ -37,6 +37,24 @@ wrappers = []
 name = "des3"
 wrappers = []
 
+# Additional deprecated cryptographic algorithms — RC4 has practical
+# bias / recovery attacks (RC4 NOMORE, Bar-Mitzvah); RFC 7465
+# prohibits it in TLS. MD4 has practical collisions (Wang 2005).
+# MD2 has practical preimage attacks (RFC 6149 historic). The X3
+# `scan_source_for_deprecated_crypto_imports` audit gates the
+# Rust source-import side; this deny entry gates Cargo.toml.
+[[bans.deny]]
+name = "rc4"
+wrappers = []
+
+[[bans.deny]]
+name = "md4"
+wrappers = []
+
+[[bans.deny]]
+name = "md2"
+wrappers = []
+
 [licenses]
 confidence-threshold = 0.8
 allow = [
