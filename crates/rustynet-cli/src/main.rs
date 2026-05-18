@@ -6141,6 +6141,26 @@ struct Phase6ProbeMetadata {
     is_fresh: bool,
 }
 
+/// X2: typed view over the 3 fields `phase6_load_probe_metadata`
+/// reads from a platform-parity probe payload. Wrong-type slots
+/// (e.g. `evidence_mode: 42`, `probe_time_unix: "now"`) fail at
+/// the typed deserialize with a precise serde error instead of
+/// slipping past the legacy `.and_then(Value::as_str)` /
+/// `.and_then(Value::as_u64)` walks. The original `Value` payload
+/// is preserved alongside the typed view in `Phase6ProbeMetadata`
+/// so downstream code that walks the payload generically keeps
+/// working.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct Phase6ProbeMetadataView {
+    pub evidence_mode: Option<String>,
+    pub platform: Option<String>,
+    pub probe_time_unix: Option<u64>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+}
+
 fn phase6_load_probe_metadata(
     path: &Path,
     platform: Phase6Platform,
@@ -6151,15 +6171,27 @@ fn phase6_load_probe_metadata(
     }
 
     let payload = read_json_value(path, "platform parity probe")?;
-    let payload_obj = payload.as_object().ok_or_else(|| {
-        format!(
+    if !payload.is_object() {
+        return Err(format!(
             "platform parity probe must be JSON object: {}",
             path.display()
-        )
-    })?;
-    if payload_obj
-        .get("evidence_mode")
-        .and_then(Value::as_str)
+        ));
+    }
+    // X2: deserialise the probe payload once. Wrong-type slots fail
+    // here with a precise field-shape error wrapped at the validator
+    // boundary so the existing per-field error messages still
+    // describe the contract while the underlying serde message
+    // pinpoints the offending field.
+    let typed: Phase6ProbeMetadataView =
+        serde_json::from_value(payload.clone()).map_err(|err| {
+            format!(
+                "platform parity probe has invalid field shape: {} ({err})",
+                path.display()
+            )
+        })?;
+    if typed
+        .evidence_mode
+        .as_deref()
         .is_none_or(|mode| mode != "measured")
     {
         return Err(format!(
@@ -6168,9 +6200,9 @@ fn phase6_load_probe_metadata(
         ));
     }
 
-    let payload_platform = payload_obj
-        .get("platform")
-        .and_then(Value::as_str)
+    let payload_platform = typed
+        .platform
+        .as_deref()
         .map(str::trim)
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -6187,15 +6219,12 @@ fn phase6_load_probe_metadata(
         ));
     }
 
-    let probe_time_unix = payload_obj
-        .get("probe_time_unix")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            format!(
-                "platform parity probe requires positive integer probe_time_unix: {}",
-                path.display()
-            )
-        })?;
+    let probe_time_unix = typed.probe_time_unix.ok_or_else(|| {
+        format!(
+            "platform parity probe requires positive integer probe_time_unix: {}",
+            path.display()
+        )
+    })?;
     if probe_time_unix == 0 {
         return Err(format!(
             "platform parity probe requires positive integer probe_time_unix: {}",
@@ -17064,12 +17093,12 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
 mod tests {
     use super::{
         CliCommand, MembershipEvidenceSummary, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform,
-        build_membership_audit_replay_json, build_membership_evidence_diff_json,
-        classify_cli_error, command_supports_json_render, contains_ip_rule_lookup_table,
-        detect_tampered_log, execute, extract_json_flag, help_text, is_interface_absent_detail,
-        launchd_xml_escape, load_dns_zone_records_manifest, load_signing_key,
-        managed_dns_resolver_server_arg, managed_dns_routing_already_absent, parse_bool_value,
-        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        Phase6ProbeMetadataView, build_membership_audit_replay_json,
+        build_membership_evidence_diff_json, classify_cli_error, command_supports_json_render,
+        contains_ip_rule_lookup_table, detect_tampered_log, execute, extract_json_flag, help_text,
+        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
+        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
+        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
         persist_encrypted_secret_material, phase6_stage_probe_from_source,
         phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
@@ -17589,6 +17618,80 @@ mod tests {
         assert!(!inbox_path.exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- X2: Phase6ProbeMetadataView typed-view migration ---------
+
+    /// Clean fixture: a well-formed probe payload deserialises into
+    /// every typed slot; ride-through fields flow into `extra`.
+    #[test]
+    fn phase6_probe_metadata_view_accepts_clean_payload() {
+        let payload = serde_json::json!({
+            "evidence_mode": "measured",
+            "platform": "linux",
+            "probe_time_unix": 1_700_000_000u64,
+            "extra_field": "ride-through",
+        });
+        let view: Phase6ProbeMetadataView =
+            serde_json::from_value(payload).expect("typed view accepts clean payload");
+        assert_eq!(view.evidence_mode.as_deref(), Some("measured"));
+        assert_eq!(view.platform.as_deref(), Some("linux"));
+        assert_eq!(view.probe_time_unix, Some(1_700_000_000));
+        assert_eq!(
+            view.extra
+                .get("extra_field")
+                .and_then(serde_json::Value::as_str),
+            Some("ride-through")
+        );
+    }
+
+    /// Missing optional slots deserialise to `None`. The validator's
+    /// per-field checks still produce the legacy error messages for
+    /// missing fields (e.g. "must set evidence_mode=measured").
+    #[test]
+    fn phase6_probe_metadata_view_accepts_missing_optional_slots() {
+        let payload = serde_json::json!({});
+        let view: Phase6ProbeMetadataView =
+            serde_json::from_value(payload).expect("typed view tolerates empty payload");
+        assert!(view.evidence_mode.is_none());
+        assert!(view.platform.is_none());
+        assert!(view.probe_time_unix.is_none());
+    }
+
+    /// Wrong-type `probe_time_unix` slot rejected. Was previously
+    /// silent via `.and_then(Value::as_u64) -> None`, surfacing as
+    /// the generic "requires positive integer" error which conflated
+    /// missing with wrong-type. Typed view now distinguishes them.
+    #[test]
+    fn phase6_probe_metadata_view_rejects_wrong_type_probe_time_unix() {
+        let payload = serde_json::json!({
+            "evidence_mode": "measured",
+            "platform": "linux",
+            "probe_time_unix": "1700000000",
+        });
+        let err = serde_json::from_value::<Phase6ProbeMetadataView>(payload)
+            .expect_err("string probe_time_unix must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("probe_time_unix") || message.contains("u64"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `evidence_mode` slot rejected at the typed layer.
+    /// Was silent via `.and_then(Value::as_str) -> None`, surfacing
+    /// as "must set evidence_mode=measured" (indistinguishable from
+    /// missing). Typed view now distinguishes them.
+    #[test]
+    fn phase6_probe_metadata_view_rejects_wrong_type_evidence_mode() {
+        let payload = serde_json::json!({ "evidence_mode": 42 });
+        let err = serde_json::from_value::<Phase6ProbeMetadataView>(payload)
+            .expect_err("integer evidence_mode must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("evidence_mode") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
     }
 
     #[test]
