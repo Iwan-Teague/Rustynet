@@ -958,6 +958,12 @@ inline. Cross-reference with:
     rejection, and the overall_ok={Ok|AbsentAsExpected only}
     contract from both sides). Floor bumped 2 → 11. (commit
     b7fcd71)
+  - `macos_authenticode` test count 2 → 7 (+5 named tests pinning
+    schema_version, the applicable=false posture as a future
+    codesign-verify trigger, the reason text shape (Authenticode +
+    Gatekeeper + launch-time mentions), deterministic output, and
+    the unknown-fields-tolerated serde behavior). Floor bumped
+    2 → 7. (commit d92640f)
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
