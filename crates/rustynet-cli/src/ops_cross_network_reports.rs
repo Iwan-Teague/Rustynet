@@ -2036,12 +2036,28 @@ fn validate_report_paths(
             Some(max_evidence_age_seconds),
             None,
         ));
+
+        // Re-parse the payload through the typed view to read the
+        // git_commit + status slots without re-walking the Value
+        // graph. The view's `suite` field is required but every
+        // caller pathway here has a parsed payload that already
+        // dispatched on suite, so the deserialize is expected to
+        // succeed. If it doesn't (unusual — payload was already
+        // validated as a JSON object upstream), surface the
+        // typed-boundary error and continue with the rest of the
+        // path list.
+        let typed: CrossNetworkReportPayloadView = match serde_json::from_value(payload.clone()) {
+            Ok(view) => view,
+            Err(err) => {
+                errors.push(format!(
+                    "{}: typed-view deserialize failed: {err}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
         if let Some(expected) = expected_git_commit {
-            let got = payload
-                .as_object()
-                .and_then(|value| value.get("git_commit"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let got = typed.git_commit.as_deref().unwrap_or_default();
             if got != expected {
                 errors.push(format!(
                     "{}: git_commit {:?} does not match expected {:?}",
@@ -2052,11 +2068,7 @@ fn validate_report_paths(
             }
         }
         if require_pass_status {
-            let status = payload
-                .as_object()
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let status = typed.status.as_deref().unwrap_or_default();
             if status != CHECK_PASS {
                 errors.push(format!(
                     "{}: status must be 'pass' for gate usage",
