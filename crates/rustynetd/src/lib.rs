@@ -5,6 +5,7 @@ pub mod dataplane;
 pub mod dataplane_candidates;
 pub mod exit_codes;
 pub mod fetcher;
+pub mod peer_gossip;
 
 pub mod ipc;
 pub mod key_material;
