@@ -435,10 +435,12 @@ impl RelayClient {
         let socket = self
             .socket
             .as_ref()
-            .ok_or(RelayClientError::Io(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "relay socket not bound",
-            )))?
+            .ok_or_else(|| {
+                RelayClientError::Io(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "relay socket not bound",
+                ))
+            })?
             .try_clone()?;
         self.establish_session_with_round_trip(
             peer_node_id,
@@ -660,10 +662,12 @@ impl RelayClient {
         let socket = self
             .socket
             .as_ref()
-            .ok_or(RelayClientError::Io(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "relay socket not bound",
-            )))?
+            .ok_or_else(|| {
+                RelayClientError::Io(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "relay socket not bound",
+                ))
+            })?
             .try_clone()?;
 
         // Keepalive is a minimal packet to the allocated port.

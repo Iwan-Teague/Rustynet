@@ -3210,7 +3210,7 @@ pub fn execute_ops_vm_lab_discover_local_utm(
             "platform": discovery_platform.as_str(),
             "live_ip": live_ip,
             "live_ip_source": live_ip_source,
-            "ssh_target": authoritative_ssh_target.clone().or(advisory_ssh_target.clone()),
+            "ssh_target": authoritative_ssh_target.clone().or_else(|| advisory_ssh_target.clone()),
             "authoritative_ssh_target": authoritative_ssh_target,
             "advisory_ssh_target": advisory_ssh_target,
             "ssh_target_source": ssh_target_source,
