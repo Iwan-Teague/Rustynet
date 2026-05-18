@@ -82,7 +82,7 @@ Runbook: [`CliExitCodeTaxonomy.md`](./CliExitCodeTaxonomy.md).
 
 ## 3. Static no-secret-leakage audit (X3)
 
-`crates/rustynetd/src/secret_log_audit.rs` is a `cargo test`-time static source-walk audit. Sweeps every `.rs` file under `crates/rustynetd/src/` + `crates/rustynet-cli/src/` (placeholder/Debug/hex/base64/Display scanners) and `crates/` workspace-wide (deprecated-crypto-imports + secret-material-equality scanners), and fails closed when any of these patterns appears:
+`crates/rustynetd/src/secret_log_audit.rs` is a `cargo test`-time static source-walk audit. Sweeps every `.rs` file under reviewed source roots per scanner — `crates/rustynetd/src/` + `crates/rustynet-cli/src/` for the placeholder / Debug / hex / base64 / Display scanners (the daemon's own log surface), `crates/rustynet-relay/src/` + `crates/rustynet-control/src/` for the secret-material-equality scanner (control-plane + relay surfaces that handle session tokens / nonces / MACs), and `crates/` workspace-wide for the deprecated-crypto-imports scanner — and fails closed when any of these patterns appears:
 
 1. **Forbidden placeholder tokens in log/print/format macros** — `{passphrase_bytes}`, `{private_key_bytes}`, `{signing_key_bytes}`, `{wrapped_secret}`, `{decrypted_secret}`, `{plaintext_key}`, `{raw_passphrase}`, `{secret_bytes}`, `{signing_seed}`. Matches `{token}`, `{token:?}`, `{token:x?}` shapes; ignores commented-out lines and path-only logs.
 
