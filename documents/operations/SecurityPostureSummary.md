@@ -152,7 +152,7 @@ Modules with typed views landed:
 
 Verified clean as of this refresh:
 - **Zero TODO / FIXME / XXX / HACK markers** in production code paths across all 14 workspace member crates (per CLAUDE.md "Do not defer in-scope requirements behind TODO/FIXME").
-- **101 `#[allow(dead_code)]` markers** as of 2026-05-18 end-of-run, all carrying justification comments (test-exposed parsers, enum variants used in tests, typed-view fields exercised via round-trip tests, `into_value_map()` bridge helpers retained for downstream Map-walking call sites).
+- **118 `#[allow(dead_code)]` markers** as of 2026-05-18 post-cycle-76, all carrying justification comments (test-exposed parsers, enum variants used in tests, typed-view fields exercised via round-trip tests, `into_value_map()` bridge helpers retained for downstream Map-walking call sites; the +17 net delta since the prior refresh is the typed-view `extra: Map<String, Value>` `#[serde(flatten)]` fields added across the cycle 63-74 X2 slices).
 - **Zero `unsafe` code** outside the `rustynet-windows-native` crate (enforced by `check_no_unsafe_code.rs` gate → `PolicyReject` on violation).
 
 ## 8. Known open items (not blocking)
