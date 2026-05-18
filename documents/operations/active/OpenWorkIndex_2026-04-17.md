@@ -106,7 +106,7 @@ At the current documented stage:
 
 **Primary docs:**
 - `documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md`
-- `documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md`
+- `documents/operations/done/Phase5ReleaseReadinessChecklist_2026-04-12.md` (archived; checklist scaffolding is complete)
 
 **What remains:**
 - Re-run `./scripts/ci/release_readiness_gates.sh` only after current clean-commit fresh-install evidence and canonical cross-network evidence exist.
@@ -247,7 +247,7 @@ At the current documented stage:
 
 **Primary docs:**
 - `documents/operations/active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`
-- `documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md`
+- `documents/operations/done/Phase5ReleaseReadinessChecklist_2026-04-12.md` (archived; checklist scaffolding is complete)
 
 **What is already proven:**
 - Windows VM execution through local UTM guest exec.
@@ -317,20 +317,26 @@ At the current documented stage:
 
 ## Work That Appears Closed Or Mostly Closed
 
-These areas do **not** currently look like the main missing work and should not be reopened casually without new evidence:
+These areas do **not** currently look like the main missing work and should not be reopened casually without new evidence.
 
-- `documents/operations/active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md`
-  - Core dataplane route-truth hardening is implemented.
-- `documents/operations/active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md`
-  - Setup reuse provenance/completeness checks are implemented.
-- `documents/operations/active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md`
-  - Dependency and policy blockers are closed, including audit/deny passing in that checklist.
+Phase checklists that finished and were archived to `documents/operations/done/`:
+
+- `documents/operations/done/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md`
+  - Core dataplane route-truth hardening is implemented (12/14 checked; the two unchecked items are environment-only `cargo audit` / `cargo deny` invocations, now run from the security gate scripts).
+- `documents/operations/done/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md`
+  - Setup reuse provenance/completeness checks are implemented (15/17 checked; same environment-only gate gap as Phase 1).
+- `documents/operations/done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md`
+  - Dependency and policy blockers are closed, including a green `cargo audit --deny warnings` and `cargo deny check advisories bans licenses sources` run inside the checklist environment.
+- `documents/operations/done/Phase5ReleaseReadinessChecklist_2026-04-12.md`
+  - The guardrails, summary, and bundle path exist; the open issue is evidence, not missing release-gate scaffolding. Operator-facing readiness picture stays in
+    `documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md`.
+
+Active plans that are mostly closed but still useful to keep in `active/`:
+
 - `documents/operations/active/SecurityHardeningBacklog_2026-03-09.md`
   - The current tracked backlog is marked complete.
 - `documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md`
   - The earlier reduced-live-lab route-truth blockers are no longer the active issue.
-- `documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md`
-  - The guardrails, summary, and bundle path exist; the open issue is evidence, not missing release-gate scaffolding.
 
 ## Documents To Treat Carefully Because Of Historical Drift
 

@@ -274,7 +274,7 @@ must regenerate the report state and validate the Phase 5 step set, including
 - current cross-network blocker ledger:
   - `/Users/iwan/Desktop/Rustynet/documents/operations/active/Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md`
 - Phase 3 policy outcome:
-  - `/Users/iwan/Desktop/Rustynet/documents/operations/active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md`
+  - `documents/operations/done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md`
 - Phase 4 local-gate evidence:
   - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/role_switch_matrix_report_12ebe96.json`
   - `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/20260412T_phase4_local_gates_worktree/live_linux_two_hop_report.json`

@@ -81,7 +81,7 @@ Out of scope:
     Closing window kills VM."
 
 ### 3.3 Why the bootstrap requires Interactive
-[Bootstrap-RustyNetWindows.ps1:1370-1378](../../scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1#L1370):
+[Bootstrap-RustyNetWindows.ps1:1370-1378](../../../scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1#L1370):
 
 ```powershell
 $systemScopedContext = (Test-SystemExecutionContext) -or
@@ -107,7 +107,7 @@ the interactive user. This exists because:
   Visual Studio detection paths assume a user profile.
 
 The bootstrap is structured to **prefer** SYSTEM execution
-([Bootstrap-RustyNetWindows.ps1:1379-1396](../../scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1#L1379)):
+([Bootstrap-RustyNetWindows.ps1:1379-1396](../../../scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1#L1379)):
 once tools are resolvable from machine-scoped paths, it short-circuits
 the Scheduled Task entirely. The Interactive Task is a fallback for
 the "tools live only in user profile" case, not a hard requirement.

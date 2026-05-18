@@ -66,35 +66,70 @@ These are the first active work documents to check for current status and remain
 ## Active Work Documents
 
 The active-work folder contains the current implementation and hardening plans.
+[`operations/active/README.md`](./operations/active/README.md) is the
+canonical index — this list is a shortcut to the active files grouped by
+purpose. Keep the two lists in sync when adding, removing, or moving
+documents.
 
+Entry point:
 - [operations/active/README.md](./operations/active/README.md)
-- [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md)
-- [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
-- [LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
-- [MagicDnsSignedZoneSchema_2026-03-09.md](./operations/active/MagicDnsSignedZoneSchema_2026-03-09.md)
-- [Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./operations/active/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
-- [Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./operations/active/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
-- [Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./operations/active/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
+
+Cross-platform improvement and security ledgers (most recently updated):
+- [PlatformImprovementBacklog_2026-05-14.md](./operations/active/PlatformImprovementBacklog_2026-05-14.md)
+- [SecurityHardeningAudit_2026-04-28.md](./operations/active/SecurityHardeningAudit_2026-04-28.md)
+- [SecurityHardeningBacklog_2026-03-09.md](./operations/active/SecurityHardeningBacklog_2026-03-09.md)
+- [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./operations/active/RustynetComparativeVpnExploitCoverage_2026-03-14.md)
+- [DiagnosticFunctionsRoadmap.md](./operations/active/DiagnosticFunctionsRoadmap.md)
+
+Open phase-local hardening checklists (finished Phase 1/2/3/5 are in
+[`operations/done/`](./operations/done/README.md)):
 - [Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md](./operations/active/Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md)
-- [Phase5ReleaseReadinessChecklist_2026-04-12.md](./operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md)
 - [Phase5ReleaseReadinessSummary_2026-04-12.md](./operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md)
+- [Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md](./operations/active/Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md)
+
+Live-lab + cross-network execution plans:
+- [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md)
+- [LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md](./operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md)
+- [HeterogeneousLiveLabEvidence_2026-04-28.md](./operations/active/HeterogeneousLiveLabEvidence_2026-04-28.md)
+- [VmLabCapabilityCookbook_2026-04-14.md](./operations/active/VmLabCapabilityCookbook_2026-04-14.md)
+- [VmLabCapabilityReportingPlan_2026-04-14.md](./operations/active/VmLabCapabilityReportingPlan_2026-04-14.md)
+- [VmLabCapabilitySources_2026-04-14.md](./operations/active/VmLabCapabilitySources_2026-04-14.md)
+- [UTMVirtualMachineInventory_2026-03-31.md](./operations/active/UTMVirtualMachineInventory_2026-03-31.md)
+
+Traversal, relay, and transport-owning backend plans:
 - [MasterWorkPlan_2026-03-22.md](./operations/active/MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./operations/active/ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
-- [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./operations/active/RustynetComparativeVpnExploitCoverage_2026-03-14.md)
-- [SecurityHardeningBacklog_2026-03-09.md](./operations/active/SecurityHardeningBacklog_2026-03-09.md)
-- [SerializationFormatHardeningPlan_2026-03-25.md](./operations/active/SerializationFormatHardeningPlan_2026-03-25.md)
-- [ShellToRustMigrationPlan_2026-03-06.md](./operations/active/ShellToRustMigrationPlan_2026-03-06.md)
-- [UTMVirtualMachineInventory_2026-03-31.md](./operations/active/UTMVirtualMachineInventory_2026-03-31.md)
 - [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](./operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
 - [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](./operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
 - [UdpHolePunchingImplementationBlueprint_2026-03-07.md](./operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
+
+Cross-platform orchestrator, Windows, and macOS plans:
+- [OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md](./operations/active/OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)
+- [RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md](./operations/active/RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md)
+- [MacosUserspaceSharedBackendPlan_2026-05-08.md](./operations/active/MacosUserspaceSharedBackendPlan_2026-05-08.md)
+- [WindowsExitAndRelayDeltaPlan_2026-05-10.md](./operations/active/WindowsExitAndRelayDeltaPlan_2026-05-10.md)
+- [WindowsLabVmStabilityAndSessionModel_2026-04-30.md](./operations/active/WindowsLabVmStabilityAndSessionModel_2026-04-30.md)
+- [WindowsUtmTransportArchitecture_2026-04-30.md](./operations/active/WindowsUtmTransportArchitecture_2026-04-30.md)
 - [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./operations/active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 - [WindowsWorkingNodePlan_2026-04-17.md](./operations/active/WindowsWorkingNodePlan_2026-04-17.md)
-- [WindowsExitAndRelayDeltaPlan_2026-05-10.md](./operations/active/WindowsExitAndRelayDeltaPlan_2026-05-10.md)
+- [RustyfinExtensionTrustPlan_2026-05-10.md](./operations/active/RustyfinExtensionTrustPlan_2026-05-10.md)
 
-Related active machine-readable lab asset:
+Cross-platform security/data-plane plans:
+- [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
+- [MagicDnsSignedZoneSchema_2026-03-09.md](./operations/active/MagicDnsSignedZoneSchema_2026-03-09.md)
+- [SerializationFormatHardeningPlan_2026-03-25.md](./operations/active/SerializationFormatHardeningPlan_2026-03-25.md)
+- [ShellToRustMigrationPlan_2026-03-06.md](./operations/active/ShellToRustMigrationPlan_2026-03-06.md)
+
+Open-work index (cross-cuts the above):
+- [OpenWorkIndex_2026-04-17.md](./operations/active/OpenWorkIndex_2026-04-17.md)
+
+Related active machine-readable lab assets:
 - `documents/operations/active/vm_lab_inventory.json`
+- `documents/operations/active/vm_lab_readiness_check_2026-04-28.json`
+- `documents/operations/active/windows_utm_1_runtime_acls_2026-04-28.json`
+- `documents/operations/active/windows_utm_1_service_hardening_2026-04-28.json`
+- `documents/operations/active/windows_utm_1_validate_2026-04-28.json`
 
 Rule:
 - use active ledgers and plans as the execution surface
@@ -120,9 +155,14 @@ Release-signoff guardrail:
 
 These folders are for evidence and retrospective reference, not live implementation truth.
 
-- [archive/README.md](./archive/README.md)
-- [archive/DownloadsResearchImportLedger_2026-04-17.md](./archive/DownloadsResearchImportLedger_2026-04-17.md)
-- [operations/done/README.md](./operations/done/README.md)
+- [archive/README.md](./archive/README.md) — top-level historical archive
+  (security reviews, simulation-era gap assessments, downloads-research
+  import ledger)
+- [operations/done/README.md](./operations/done/README.md) — completed
+  operations reviews + completed phase implementation checklists (Phase 1, 2,
+  3, 5)
+- [operations/adr/README.md](./operations/adr/README.md) — Architecture
+  Decision Records (immutable once accepted)
 
 Rule:
 - do not treat archived reviews as current status without re-validating them against present code and artifacts

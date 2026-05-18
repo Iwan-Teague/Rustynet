@@ -9,6 +9,17 @@ Start with these when you need current status, remaining work, or the public imp
 - [MasterWorkPlan_2026-03-22.md](./MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - [OpenWorkIndex_2026-04-17.md](./OpenWorkIndex_2026-04-17.md)
+- [PlatformImprovementBacklog_2026-05-14.md](./PlatformImprovementBacklog_2026-05-14.md) — most recently updated cross-platform improvement ledger; the X1-X7 numbered tracks are the cleanest current path for code-only quality work
+
+## Active Phase Checklists
+
+These are the phase-local hardening checklists that are still open. The
+phase checklists that finished (Phase 1, 2, 3, 5) have moved to
+[`../done/`](../done/README.md); see that index for the archived slices.
+
+- [Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md](./Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md) — still open on fresh-install + canonical cross-network evidence regeneration for a clean current `HEAD`
+- [Phase5ReleaseReadinessSummary_2026-04-12.md](./Phase5ReleaseReadinessSummary_2026-04-12.md) — the Phase 5 checklist itself is archived; this summary is kept active because it is the operator-facing readiness picture and still records remaining full release-gate blockers
+- [Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md](./Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md) — code-side cross-network/shared-transport hardening done; canonical cross-network + extended soak evidence still to regenerate
 
 ## Active Plans And Backlogs
 
@@ -20,13 +31,6 @@ Start with these when you need current status, remaining work, or the public imp
 - [MagicDnsSignedZoneSchema_2026-03-09.md](./MagicDnsSignedZoneSchema_2026-03-09.md)
 - [OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md](./OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)
 - [RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md](./RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md)
-- [Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
-- [Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
-- [Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
-- [Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md](./Phase4LiveLabEvidenceRefreshChecklist_2026-04-12.md)
-- [Phase5ReleaseReadinessChecklist_2026-04-12.md](./Phase5ReleaseReadinessChecklist_2026-04-12.md)
-- [Phase5ReleaseReadinessSummary_2026-04-12.md](./Phase5ReleaseReadinessSummary_2026-04-12.md)
-- [Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md](./Phase6CrossNetworkAndSharedTransportChecklist_2026-04-13.md)
 - [VmLabCapabilityCookbook_2026-04-14.md](./VmLabCapabilityCookbook_2026-04-14.md)
 - [VmLabCapabilityReportingPlan_2026-04-14.md](./VmLabCapabilityReportingPlan_2026-04-14.md)
 - [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md)
@@ -39,7 +43,6 @@ Start with these when you need current status, remaining work, or the public imp
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 - [RustyfinExtensionTrustPlan_2026-05-10.md](./RustyfinExtensionTrustPlan_2026-05-10.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)
-- [PlatformImprovementBacklog_2026-05-14.md](./PlatformImprovementBacklog_2026-05-14.md)
 - [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md)
 - [SecurityHardeningBacklog_2026-03-09.md](./SecurityHardeningBacklog_2026-03-09.md)
 - [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)

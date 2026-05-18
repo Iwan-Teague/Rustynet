@@ -896,7 +896,9 @@ conservatively.
       `NotEvaluated` if presence stage's pure-Rust parser rejects
       first). Real signed-binary evidence requires the production
       release-signing workflow to ship and is tracked separately
-      under `documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md`.
+      under `documents/operations/done/Phase5ReleaseReadinessChecklist_2026-04-12.md` (archived)
+      and the active operator-facing readiness picture in
+      `documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md`.
 - [x] W2.2 Service hardening profile verifier + stage
   - Changed files:
     - `crates/rustynetd/src/windows_service_hardening.rs` (new) — typed
