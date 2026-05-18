@@ -804,4 +804,222 @@ mod tests {
         // are correctly absent off-Linux too.
         assert_eq!(report.entries.len(), 8);
     }
+
+    // ----- L6 / X4 coverage parity sweep ----------------------------------
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        // schema_version bumps are cross-cutting; pin the current value
+        // so a stray edit trips this test and forces a deliberate
+        // commit-message rationale.
+        let report = build_linux_key_custody_report(canonical_clean_entries());
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape must be int=1: {body}"
+        );
+    }
+
+    #[test]
+    fn entry_status_ok_round_trips_through_serde() {
+        // Pre-existing tests only exercise the report-level round-trip
+        // and the Drifted/Missing variants on linux_runtime_acls. The
+        // Ok variant here carries 3 inner u32 fields; round-trip them
+        // explicitly so a future #[serde(rename)] on mode/uid/gid trips
+        // this test.
+        let entry = LinuxKeyCustodyEntry {
+            label: "encrypted WireGuard private key".to_string(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_string(),
+            status: LinuxKeyCustodyEntryStatus::Ok {
+                mode: 0o100600,
+                uid: 998,
+                gid: 998,
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"ok\""), "tag shape: {body}");
+        assert!(body.contains("\"mode\":33152"), "mode int shape: {body}");
+        let parsed: LinuxKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_invalid_round_trips_through_serde() {
+        // Invalid carries reason + mode + uid + gid; pin the full shape
+        // through serde.
+        let entry = LinuxKeyCustodyEntry {
+            label: "encrypted WireGuard private key".to_string(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_string(),
+            status: LinuxKeyCustodyEntryStatus::Invalid {
+                reason: "mode is 0o644, expected 0o600".to_string(),
+                mode: 0o100644,
+                uid: 998,
+                gid: 998,
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"invalid\""), "tag: {body}");
+        assert!(
+            body.contains("\"reason\":\"mode is 0o644"),
+            "reason text: {body}"
+        );
+        let parsed: LinuxKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_forbidden_round_trips_through_serde() {
+        let entry = LinuxKeyCustodyEntry {
+            label: "plaintext WireGuard private key (legacy)".to_string(),
+            path: LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
+            requirement: REQUIREMENT_ABSENT.to_string(),
+            status: LinuxKeyCustodyEntryStatus::Forbidden {
+                reason: "must not exist at rest after Phase E migration".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"forbidden\""), "tag: {body}");
+        let parsed: LinuxKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_rejects_unknown_tag() {
+        // #[serde(tag = "status", rename_all = "snake_case")] — an
+        // unknown tag must fail closed rather than silently coerce to a
+        // known variant.
+        let body = r#"{"label":"keys directory","path":"/var/lib/rustynet/keys","requirement":"present","status":"degraded","reason":"placeholder"}"#;
+        let err = serde_json::from_str::<LinuxKeyCustodyEntry>(body)
+            .expect_err("unknown tag must fail closed");
+        assert!(
+            err.to_string().contains("degraded") || err.to_string().contains("unknown variant"),
+            "error must reference the unknown tag or 'unknown variant': {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_unknown_requirement_string() {
+        // The requirement field is a String; only "present" or "absent"
+        // are reviewed. An unknown value (e.g. typo "absnet") must
+        // surface as a named drift reason rather than fall through
+        // silently.
+        let entries = vec![LinuxKeyCustodyEntry {
+            label: "encrypted WireGuard private key".to_string(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
+            requirement: "absnet".to_string(), // typo
+            status: LinuxKeyCustodyEntryStatus::Ok {
+                mode: 0o100600,
+                uid: 998,
+                gid: 998,
+            },
+        }];
+        let reasons =
+            evaluate_linux_key_custody(&entries).expect_err("unknown requirement must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("unknown requirement") && r.contains("absnet")),
+            "rejection must name the unknown requirement value: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_aggregates_multi_entry_drift_reasons() {
+        // A snapshot with multiple drifted entries should produce one
+        // reason per drift, NOT short-circuit on the first. Pin this so
+        // a future refactor that returns Err at the first reason
+        // (cheaper but worse for operators) trips this test.
+        let mut entries = canonical_clean_entries();
+        // Drift entry 1: encrypted private key invalid mode
+        for entry in entries.iter_mut() {
+            if entry.path == LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Invalid {
+                    reason: "mode is 0o644, expected 0o600".to_string(),
+                    mode: 0o100644,
+                    uid: 998,
+                    gid: 998,
+                };
+            }
+            if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Missing {
+                    reason: "ENOENT".to_string(),
+                };
+            }
+            if entry.path == LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH {
+                entry.status = LinuxKeyCustodyEntryStatus::Forbidden {
+                    reason: "must not exist at rest".to_string(),
+                };
+            }
+        }
+        let reasons =
+            evaluate_linux_key_custody(&entries).expect_err("3 drifted entries must reject");
+        // exactly three reasons surfaced, one per drift
+        assert_eq!(
+            reasons.len(),
+            3,
+            "expected one reason per drifted entry, got: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("invalid")),
+            "encrypted key invalid surfaced: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("missing")),
+            "passphrase credential missing surfaced: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("forbidden but present")),
+            "plaintext key forbidden surfaced: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_forbidden_status_on_required_entry() {
+        // Inverted shape: an entry marked requirement=present should
+        // never carry a Forbidden status. If it does (collector bug or
+        // hand-edited fixture), the evaluator must surface a named
+        // contradiction rather than silently accept the entry.
+        let entries = vec![LinuxKeyCustodyEntry {
+            label: "encrypted WireGuard private key".to_string(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_string(),
+            status: LinuxKeyCustodyEntryStatus::Forbidden {
+                reason: "spuriously marked forbidden".to_string(),
+            },
+        }];
+        let reasons = evaluate_linux_key_custody(&entries)
+            .expect_err("forbidden status on required entry must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("marked forbidden but requirement is present")),
+            "rejection must surface the inverted shape: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_absent_as_expected_status_on_required_entry() {
+        // The collector should never report AbsentAsExpected on an
+        // entry whose requirement is Present. If it does, the
+        // evaluator must surface a named contradiction so the
+        // collector bug is visible rather than silently flipping the
+        // verdict to pass.
+        let entries = vec![LinuxKeyCustodyEntry {
+            label: "encrypted WireGuard private key".to_string(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_string(),
+            status: LinuxKeyCustodyEntryStatus::AbsentAsExpected,
+        }];
+        let reasons = evaluate_linux_key_custody(&entries)
+            .expect_err("AbsentAsExpected on required entry must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("required but reported absent")),
+            "rejection must surface the collector-bug shape: {reasons:?}"
+        );
+    }
 }
