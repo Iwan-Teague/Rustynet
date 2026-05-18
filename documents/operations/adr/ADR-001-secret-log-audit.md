@@ -131,7 +131,7 @@ Composition at acceptance (2026-05-17):
 Composition as of 2026-05-18 (tracked here so the ADR doesn't drift
 from the live module; X3 backlog #2 + #3 + #4 extensions landed):
 
-- **7 scanners total**:
+- **9 scanners total**:
   - the original 5 above,
   - **`scan_source_for_secret_material_equality`** — raw `==`/`!=`
     on forbidden tokens (token / csrf / session_key / nonce / mac /
@@ -143,6 +143,20 @@ from the live module; X3 backlog #2 + #3 + #4 extensions landed):
     `use triple_des` with a boundary-terminator check that rejects
     safe-name lookalikes (`sha2`, `sha3`, `descriptor`, `md_hashlib`)
     (X3 extension #4, commit ca85269).
+  - **`scan_source_for_dbg_macro_on_secret_tokens`** — flags
+    `dbg!(<expr>)` macro calls whose expression contains a
+    forbidden secret-bearing identifier as a standalone
+    identifier (boundary check rejects token-substring inside
+    longer names). Closes the Debug-leak hole where
+    `dbg!(passphrase_bytes)` slipped past every other scanner
+    (X3 extension #5, commit 597e60c).
+  - **`scan_source_for_panic_macro_placeholder_leaks`** — flags
+    format-string placeholder leaks (`{token:?}` etc.) inside
+    panic-shape macros: `panic` / `unreachable` / `unimplemented`
+    / `todo` / `assert` / `assert_eq` / `assert_ne` /
+    `debug_assert{,_eq,_ne}`. Uses longest-prefix matching so
+    `assert_eq!` wins over plain `assert!` (X3 extension #6,
+    commit 48ba7af).
 - Forbidden-placeholder-tokens list grew from 8 → 9 with the
   addition of `signing_seed` (X3 extension #3, commit 8935dfb).
 - Workspace sweeps expanded with per-scanner scope:
@@ -156,11 +170,11 @@ from the live module; X3 backlog #2 + #3 + #4 extensions landed):
     `crates/rustynetd/src/` + `crates/rustynet-cli/src/` (the
     daemon's own log surface, which is where format-string
     leaks would originate).
-- Self-test count grew from ~22 to 45 (pinned by the
-  `secret_log_audit:45` floor in the shared regression-coverage
+- Self-test count grew from ~22 to 62 (pinned by the
+  `secret_log_audit:62` floor in the shared regression-coverage
   group; see ADR-002).
 
-Current tree: **0 offenders** across all 7 scanners.
+Current tree: **0 offenders** across all 9 scanners.
 
 The audit is reachable from `cargo test --lib secret_log_audit` for
 fast iteration when adding a new scanner or a new forbidden token.

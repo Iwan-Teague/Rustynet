@@ -50,15 +50,15 @@ named drift tests, the regression-coverage CI gate
 | `windows_paths`                 | 61    | SDDL grant/deny matcher (substring-match negative, exact ACE-type token); local-secret ACL evaluator forbidden-principal rejection; runtime-path validator UNC + user-temp reject + canonical ProgramData accept |
 | `windows_ipc`                   | 15    | Named-pipe path validation against reviewed roots; SDDL security-policy generation per role (DaemonControl / PrivilegedHelper); client-authorization checks against the reviewed allowlist; length-prefixed privileged-request/response encode/decode with bounded MAX_WINDOWS_PRIVILEGED_MESSAGE_BYTES |
 
-### Shared (platform-agnostic audit, 1 module, 45 pinned tests)
+### Shared (platform-agnostic audit, 1 module, 62 pinned tests)
 
 | Module                          | Floor | What it pins                                                                                             |
 |---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
-| `secret_log_audit`              | 45    | Forbidden placeholder tokens in log macros (passphrase_bytes / private_key_bytes / signing_key_bytes / wrapped_secret / decrypted_secret / plaintext_key / raw_passphrase / secret_bytes / signing_seed); Debug + Display + ToString deny on canonical secret-bearing types; hex + base64 encode wrappers around forbidden idents; secret-material equality (==/!=) without ct_eq with structured allowlist + per-entry justification; deprecated-crypto-imports (`use sha1` / `use md5` / `use md_5` / `use des` / `use des3` / `use triple_des`) with boundary-terminator check that rejects safe-name lookalikes (sha2 / sha3 / descriptor / md_hashlib) |
+| `secret_log_audit`              | 62    | Forbidden placeholder tokens in log macros (passphrase_bytes / private_key_bytes / signing_key_bytes / wrapped_secret / decrypted_secret / plaintext_key / raw_passphrase / secret_bytes / signing_seed); Debug + Display + ToString deny on canonical secret-bearing types; hex + base64 encode wrappers around forbidden idents; secret-material equality (==/!=) without ct_eq with structured allowlist + per-entry justification; deprecated-crypto-imports (`use sha1` / `use md5` / `use md_5` / `use des` / `use des3` / `use triple_des`) with boundary-terminator check that rejects safe-name lookalikes (sha2 / sha3 / descriptor / md_hashlib); `dbg!()` macro on secret tokens (closes the Debug-leak hole); panic-shape macros (panic / unreachable / unimplemented / todo / assert / assert_eq / assert_ne / debug_assert{,_eq,_ne}) on placeholder leaks |
 
 ### Aggregate
 
-- **22 verifier + audit modules** across 4 groups, **593 pinned tests** on the regression-coverage gate floor (sum of per-module floors: linux 196 + macos 74 + windows 278 + shared 45).
+- **22 verifier + audit modules** across 4 groups, **610 pinned tests** on the regression-coverage gate floor (sum of per-module floors: linux 196 + macos 74 + windows 278 + shared 62).
 - Every Linux verifier has a macOS + Windows analog (or equivalent surface). Every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls` / `windows_paths`).
 - Workspace test sweep: **2850 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends, measured 2026-05-18 post X4/X7 expansion + cycle 48 windows_ipc pin).
 
@@ -99,7 +99,11 @@ Runbook: [`CliExitCodeTaxonomy.md`](./CliExitCodeTaxonomy.md).
 
 7. **Deprecated-crypto-imports** — rejects `use sha1` / `use md5` / `use md_5` / `use des` / `use des3` / `use triple_des` (with boundary-terminator check to reject safe-name lookalikes like `sha2` / `sha3` / `descriptor` / `md_hashlib`).
 
-Workspace sweeps run on every `cargo test` invocation. Current tree: **0 offenders** across all 7 scanners. Allowlist scope is narrow (only the audit module itself, which necessarily mentions the forbidden tokens / forbidden crate names as constants).
+8. **`dbg!()` macro on secret tokens** — closes the hole where `dbg!(passphrase_bytes)` would slip past scanner #1 (which only walks format-string macros) and scanner #2 (which only catches Debug derive/impl, not call sites). The `dbg!()` macro internally stringifies the argument expression and prints its Debug repr to stderr.
+
+9. **Panic-shape macro placeholder leaks** — same `{token:?}` shape as scanner #1 but catches `panic!` / `unreachable!` / `unimplemented!` / `todo!` / `assert!` / `assert_eq!` / `assert_ne!` / `debug_assert!` / `debug_assert_eq!` / `debug_assert_ne!`. These print format strings to stderr + panic backtraces, bypassing the production logger's redaction layer.
+
+Workspace sweeps run on every `cargo test` invocation. Current tree: **0 offenders** across all 9 scanners. Allowlist scope is narrow (only the audit module itself, which necessarily mentions the forbidden tokens / forbidden crate names as constants).
 
 ## 4. Boot-time + ordering invariants
 
@@ -136,7 +140,7 @@ Modules with typed views landed:
 | `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2850 tests as of 2026-05-18 end-of-run)         |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
-| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 593 pinned tests)   |
+| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 610 pinned tests)   |
 | `scripts/ci/start_modularization_smoke.sh`         | bash module / dispatcher contract (32 checks)                                |
 | `scripts/ci/secrets_hygiene_gates.sh`              | structured secret-leak audit + required tests                                |
 | Per-phase gate scripts (`phase1_gates.sh` … `phase10_gates.sh`) | per-phase release-readiness pins                                |
