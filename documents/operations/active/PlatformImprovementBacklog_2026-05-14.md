@@ -801,10 +801,24 @@ inline. Cross-reference with:
   Removes 2 trailing `Value` walks. 6 new tests including a
   writer-integration test that re-parses output through the typed
   view to pin host-pair round-trip.
+* `[~]` Tenth X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit 8812b9d). Migrated
+  `execute_ops_write_active_network_rogue_path_hijack_report`
+  to FOUR typed views:
+  - `ActiveNetworkRoguePathHijackChecksView` (7 pass/fail slots
+    + `overall_status` helper)
+  - `ActiveNetworkRoguePathHijackHostsView` (typed exit/client
+    host pair, kept separate from the signed-state-tamper
+    siblings to keep experiment-specific evolution decoupled)
+  - `ActiveNetworkRoguePathHijackEvidenceView` (6 typed slots)
+  - `ActiveNetworkRoguePathHijackReportView` (10 typed top-level
+    fields including the rogue_endpoint_ip echo)
+  Removes 2 trailing `Value` walks. 5 new tests including a
+  writer-integration test that re-parses through the typed view.
+  Closes the writer side of the X2 Phase A list.
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (3 production walks across 1 unrelated report-writer fn +
-  1 helper + 1 intentional generic JSON-pointer reader):
-  - `write_active_network_rogue_path_hijack_report` (e2e writer)
+  (2 production walks across 1 helper + 1 intentional generic
+  JSON-pointer reader):
   - `e2e_dns_query` (helper)
   - `execute_ops_read_json_field` (intentional generic shape-agnostic
     JSON-pointer reader — must stay Value-walk)
