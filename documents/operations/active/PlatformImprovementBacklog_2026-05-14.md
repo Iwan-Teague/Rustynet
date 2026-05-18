@@ -956,6 +956,31 @@ inline. Cross-reference with:
   as belt-and-suspenders but the Rust scanner is now the
   source of truth. Workspace sweep finds 0 unallowed hits.
   Shared regression floor bumped 37 → 45.
+* `[~]` X3 extension #5 — `dbg!()` macro scanner landed
+  (commit 597e60c). `dbg!(passphrase_bytes)` would slip past
+  every existing X3 scanner because it has no format-string
+  placeholder and isn't Debug-derive. New
+  `scan_source_for_dbg_macro_on_secret_tokens` walks each
+  non-comment line, finds `dbg!(` or `dbg! (`, then scans the
+  remainder for any FORBIDDEN_PLACEHOLDER_TOKENS as a
+  standalone identifier. Mid-line `// dbg!(secret)` comments
+  rejected via comment-position check. 1 workspace sweep + 7
+  self-tests pin positive/negative shapes (canonical call,
+  reference form, rvalue form, complex expression, commented
+  offender, safe identifier, longer-identifier substring
+  rejection). Shared regression floor bumped 45 → 53.
+* `[~]` X3 extension #6 — panic-macro placeholder scanner
+  landed (commit 48ba7af). `panic!("…{passphrase_bytes:?}")`
+  prints to stderr + panic backtrace, bypassing the
+  production logger redaction layer. New
+  `scan_source_for_panic_macro_placeholder_leaks` covers 10
+  panic-shape macros (panic / unreachable / unimplemented /
+  todo / assert / assert_eq / assert_ne /
+  debug_assert{,_eq,_ne}). Longest-prefix matching at each
+  position (assert_eq wins over assert). 1 workspace sweep + 8
+  self-tests pin positive/negative shapes including the
+  longest-prefix rule + boundary check that rejects
+  `my_panic!` etc. Shared regression floor bumped 53 → 62.
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 
