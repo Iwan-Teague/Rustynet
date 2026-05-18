@@ -67,10 +67,10 @@ Pinned set as of 2026-05-18 (post platform-improvement-backlog
 X4/X7 expansions; tracked here so the ADR snapshot doesn't drift
 from the live gate while the script is the source of truth):
 
-- 21 modules at floor across 4 groups: linux (7) + macos (6) +
-  windows (7) + shared (1).
-- 578 pinned tests in aggregate (linux 196 + macos 74 +
-  windows 263 + shared 45).
+- 22 modules at floor across 4 groups: linux (7) + macos (6) +
+  windows (8) + shared (1).
+- 593 pinned tests in aggregate (linux 196 + macos 74 +
+  windows 278 + shared 45).
 - The `shared` group covers platform-agnostic audit modules
   (currently `secret_log_audit`); it was added when the X3 static
   scanner's self-tests warranted the same silent-removal
