@@ -223,6 +223,75 @@ impl NetworkDiscoveryBundleView {
     }
 }
 
+/// X2: typed view over the `node_identity` sub-block. 5 typed
+/// `Option<String>` slots match every `.get("...")` call the
+/// validator makes; `extra` flatten preserves any future fields.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct NodeIdentityView {
+    pub node_id: Option<String>,
+    pub hostname: Option<String>,
+    pub os: Option<String>,
+    pub kernel: Option<String>,
+    pub arch: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// X2: typed view over the `wireguard` sub-block. 4 typed slots —
+/// 3 strings + `listen_port: Option<u64>`. Wrong-type slots fail
+/// at the typed deserialize instead of slipping past the silent
+/// `.and_then(Value::as_*)` walks.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct WireguardView {
+    pub interface: Option<String>,
+    pub public_key: Option<String>,
+    pub listen_port: Option<u64>,
+    pub peer_stanza_template: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// X2: typed view over the `nat_profile` sub-block. 5 typed slots
+/// — `behind_nat: Option<bool>` + 4 strings. Wrong-type slots
+/// fail at deserialize.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct NatProfileView {
+    pub behind_nat: Option<bool>,
+    pub first_lan_ip: Option<String>,
+    pub detected_public_ip: Option<String>,
+    pub port_forwarded_hint: Option<String>,
+    pub recommended_traversal_strategy: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// Deserialise a sub-block from `object[key]` into a typed view.
+/// Returns:
+/// * `Ok(Some(view))` when the key is present and deserialises.
+/// * `Ok(None)` when the key is missing (caller decides whether to
+///   emit "must be an object" or treat as optional).
+/// * `Err(msg)` when the key is present but the typed deserialise
+///   fails (wrong-type slot, wrong outer shape, etc.). The error
+///   string is prefixed with `key has invalid field shape:` so the
+///   reviewer sees which sub-block is at fault.
+fn deserialize_sub_block<T>(object: &Map<String, Value>, key: &str) -> Result<Option<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match object.get(key).cloned() {
+        Some(v) => serde_json::from_value::<T>(v)
+            .map(Some)
+            .map_err(|err| format!("{key} has invalid field shape: {err}")),
+        None => Ok(None),
+    }
+}
+
 fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> Vec<String> {
     let mut problems = Vec::new();
 
@@ -270,16 +339,19 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
     let object = typed.into_value_map();
     let object = &object;
 
-    match object.get("node_identity").and_then(Value::as_object) {
-        Some(node_identity) => {
-            let node_id = node_identity.get("node_id").and_then(Value::as_str);
-            if !matches!(node_id, Some(value) if valid_node_id(value)) {
+    match deserialize_sub_block::<NodeIdentityView>(object, "node_identity") {
+        Ok(Some(view)) => {
+            if !matches!(view.node_id.as_deref(), Some(value) if valid_node_id(value)) {
                 problems.push("node_identity.node_id must match [A-Za-z0-9._-]+".to_string());
             }
-            for field in ["hostname", "os", "kernel", "arch"] {
-                let valid = node_identity
-                    .get(field)
-                    .and_then(Value::as_str)
+            for (field, slot) in [
+                ("hostname", &view.hostname),
+                ("os", &view.os),
+                ("kernel", &view.kernel),
+                ("arch", &view.arch),
+            ] {
+                let valid = slot
+                    .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .is_some();
@@ -288,14 +360,15 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        None => problems.push("node_identity must be an object".to_string()),
+        Ok(None) => problems.push("node_identity must be an object".to_string()),
+        Err(err) => problems.push(err),
     }
 
-    match object.get("wireguard").and_then(Value::as_object) {
-        Some(wireguard) => {
-            let interface = wireguard
-                .get("interface")
-                .and_then(Value::as_str)
+    match deserialize_sub_block::<WireguardView>(object, "wireguard") {
+        Ok(Some(view)) => {
+            let interface = view
+                .interface
+                .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .is_some();
@@ -303,9 +376,9 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 problems.push("wireguard.interface must be a non-empty string".to_string());
             }
 
-            let pubkey_ok = wireguard
-                .get("public_key")
-                .and_then(Value::as_str)
+            let pubkey_ok = view
+                .public_key
+                .as_deref()
                 .map(str::trim)
                 .map(decode_b64_32)
                 .unwrap_or(false);
@@ -314,14 +387,13 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                     .push("wireguard.public_key must be valid base64 for 32-byte key".to_string());
             }
 
-            let listen_port = wireguard.get("listen_port").and_then(Value::as_u64);
-            if !matches!(listen_port, Some(value) if (1..=65535).contains(&value)) {
+            if !matches!(view.listen_port, Some(value) if (1..=65535).contains(&value)) {
                 problems.push("wireguard.listen_port must be an integer in [1, 65535]".to_string());
             }
 
-            let stanza = wireguard
-                .get("peer_stanza_template")
-                .and_then(Value::as_str)
+            let stanza = view
+                .peer_stanza_template
+                .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .is_some();
@@ -330,7 +402,8 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                     .push("wireguard.peer_stanza_template must be a non-empty string".to_string());
             }
         }
-        None => problems.push("wireguard must be an object".to_string()),
+        Ok(None) => problems.push("wireguard must be an object".to_string()),
+        Err(err) => problems.push(err),
     }
 
     match object.get("endpoint_candidates").and_then(Value::as_array) {
@@ -397,27 +470,27 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
         _ => problems.push("endpoint_candidates must be a non-empty list".to_string()),
     }
 
-    match object.get("nat_profile").and_then(Value::as_object) {
-        Some(nat_profile) => {
-            if nat_profile
-                .get("behind_nat")
-                .and_then(Value::as_bool)
-                .is_none()
-            {
+    match deserialize_sub_block::<NatProfileView>(object, "nat_profile") {
+        Ok(Some(view)) => {
+            if view.behind_nat.is_none() {
                 problems.push("nat_profile.behind_nat must be boolean".to_string());
             }
-            for field in [
-                "first_lan_ip",
-                "detected_public_ip",
-                "port_forwarded_hint",
-                "recommended_traversal_strategy",
+            for (field, slot) in [
+                ("first_lan_ip", &view.first_lan_ip),
+                ("detected_public_ip", &view.detected_public_ip),
+                ("port_forwarded_hint", &view.port_forwarded_hint),
+                (
+                    "recommended_traversal_strategy",
+                    &view.recommended_traversal_strategy,
+                ),
             ] {
-                if nat_profile.get(field).and_then(Value::as_str).is_none() {
+                if slot.is_none() {
                     problems.push(format!("nat_profile.{field} must be a string"));
                 }
             }
         }
-        None => problems.push("nat_profile must be an object".to_string()),
+        Ok(None) => problems.push("nat_profile must be an object".to_string()),
+        Err(err) => problems.push(err),
     }
 
     match object.get("verifier_keys").and_then(Value::as_object) {
@@ -678,8 +751,11 @@ pub fn execute_ops_validate_network_discovery_bundle(
 
 #[cfg(test)]
 mod tests {
-    use super::NetworkDiscoveryBundleView;
-    use serde_json::{Value, json};
+    use super::{
+        NatProfileView, NetworkDiscoveryBundleView, NodeIdentityView, WireguardView,
+        deserialize_sub_block,
+    };
+    use serde_json::{Map, Value, json};
 
     /// Clean fixture: a well-formed top-level shape deserializes into
     /// the typed view, the typed fields land in their slots, and the
@@ -780,5 +856,136 @@ mod tests {
             Some("ride-through"),
             "scalar extras must be preserved"
         );
+    }
+
+    // ---- X2: sub-block typed views (node_identity / wireguard /
+    // nat_profile) --------------------------------------------------
+
+    /// Clean fixture: `NodeIdentityView` accepts a well-formed
+    /// sub-block; every typed slot populates; extra fields ride
+    /// through.
+    #[test]
+    fn node_identity_view_accepts_clean_block() {
+        let block = json!({
+            "node_id": "node-a",
+            "hostname": "host",
+            "os": "linux",
+            "kernel": "6.5",
+            "arch": "x86_64",
+            "extra": "ride",
+        });
+        let view: NodeIdentityView = serde_json::from_value(block).expect("clean parse");
+        assert_eq!(view.node_id.as_deref(), Some("node-a"));
+        assert_eq!(view.hostname.as_deref(), Some("host"));
+        assert_eq!(view.os.as_deref(), Some("linux"));
+        assert_eq!(view.kernel.as_deref(), Some("6.5"));
+        assert_eq!(view.arch.as_deref(), Some("x86_64"));
+        assert_eq!(
+            view.extra.get("extra").and_then(Value::as_str),
+            Some("ride")
+        );
+    }
+
+    /// Wrong-type `node_id` slot rejected at deserialize. Was
+    /// previously silent via `.and_then(Value::as_str)`.
+    #[test]
+    fn node_identity_view_rejects_wrong_type_slot() {
+        let block = json!({ "node_id": 42 });
+        let err = serde_json::from_value::<NodeIdentityView>(block)
+            .expect_err("integer node_id must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("node_id") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Clean fixture: `WireguardView` populates all 4 typed slots;
+    /// `listen_port: u64` accepts a positive integer.
+    #[test]
+    fn wireguard_view_accepts_clean_block() {
+        let block = json!({
+            "interface": "wg0",
+            "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "listen_port": 51820u64,
+            "peer_stanza_template": "[Peer]",
+        });
+        let view: WireguardView = serde_json::from_value(block).expect("clean parse");
+        assert_eq!(view.interface.as_deref(), Some("wg0"));
+        assert_eq!(view.listen_port, Some(51820));
+        assert_eq!(view.peer_stanza_template.as_deref(), Some("[Peer]"));
+    }
+
+    /// Wrong-type `listen_port` slot rejected. Previously silent
+    /// via `.and_then(Value::as_u64) -> None`.
+    #[test]
+    fn wireguard_view_rejects_wrong_type_listen_port() {
+        let block = json!({ "listen_port": "51820" });
+        let err = serde_json::from_value::<WireguardView>(block)
+            .expect_err("string listen_port must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("listen_port") || message.contains("u64"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Clean fixture: `NatProfileView` populates `behind_nat: bool`
+    /// plus 4 string slots.
+    #[test]
+    fn nat_profile_view_accepts_clean_block() {
+        let block = json!({
+            "behind_nat": true,
+            "first_lan_ip": "192.168.1.10",
+            "detected_public_ip": "203.0.113.5",
+            "port_forwarded_hint": "none",
+            "recommended_traversal_strategy": "direct_first",
+        });
+        let view: NatProfileView = serde_json::from_value(block).expect("clean parse");
+        assert_eq!(view.behind_nat, Some(true));
+        assert_eq!(view.first_lan_ip.as_deref(), Some("192.168.1.10"));
+        assert_eq!(view.detected_public_ip.as_deref(), Some("203.0.113.5"));
+    }
+
+    /// Wrong-type `behind_nat` slot rejected. Previously silent via
+    /// `.and_then(Value::as_bool) -> None`.
+    #[test]
+    fn nat_profile_view_rejects_wrong_type_behind_nat() {
+        let block = json!({ "behind_nat": "yes" });
+        let err = serde_json::from_value::<NatProfileView>(block)
+            .expect_err("string behind_nat must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("behind_nat") || message.contains("bool"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// `deserialize_sub_block` distinguishes missing (Ok(None)) from
+    /// wrong-type-top (Err) from valid (Ok(Some(view))). Each
+    /// branch produces the correct validator-facing message.
+    #[test]
+    fn deserialize_sub_block_distinguishes_missing_wrong_type_and_present() {
+        let mut object = Map::new();
+        let missing: Result<Option<NatProfileView>, String> =
+            deserialize_sub_block(&object, "nat_profile");
+        assert!(matches!(missing, Ok(None)));
+
+        object.insert("nat_profile".to_string(), Value::String("oops".to_string()));
+        let wrong: Result<Option<NatProfileView>, String> =
+            deserialize_sub_block(&object, "nat_profile");
+        let err = wrong.expect_err("string sub-block must surface invalid field shape");
+        assert!(
+            err.contains("nat_profile has invalid field shape"),
+            "error must prefix with sub-block key: {err}"
+        );
+
+        object.insert("nat_profile".to_string(), json!({ "behind_nat": false }));
+        let present: Result<Option<NatProfileView>, String> =
+            deserialize_sub_block(&object, "nat_profile");
+        let view = present
+            .expect("valid sub-block must succeed")
+            .expect("Ok(None) only for missing");
+        assert_eq!(view.behind_nat, Some(false));
     }
 }
