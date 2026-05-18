@@ -1039,6 +1039,137 @@ impl PortMapper for PcpClient {
     }
 }
 
+// ---- Probe orchestrator ----
+
+/// Outcome of probing the gateway for a UDP port mapping.
+///
+/// `Mapped` is the success case — the gateway granted a lease via one of
+/// the supported protocols. `NoGatewaySupport` is the soft-failure case —
+/// every protocol either timed out or replied "I don't speak that" — and
+/// the daemon should fall back to the outbound-keepalive trick
+/// (decision 2.3 in `RustynetDataplaneExecutionPlan_2026-05-18.md`).
+#[derive(Debug)]
+pub enum ProbeOutcome {
+    /// A protocol granted us a lease. Use `.protocol` to learn which.
+    Mapped(MappingLease),
+    /// No protocol responded. The home server should fall back to
+    /// outbound keepalives.
+    NoGatewaySupport,
+}
+
+/// Orchestrator that tries every implemented port-mapping protocol in
+/// order against a known gateway.
+///
+/// Order is **PCP → NAT-PMP** (uPnP IGD is a planned subsequent slice
+/// within D2.3; it will slot in as the final fall-through tier). The
+/// ordering is justified by RFC 6887 §1.1: a gateway that speaks PCP
+/// also speaks NAT-PMP, so probing PCP first is strictly more
+/// informative — we get the richer error taxonomy if the gateway
+/// supports PCP, and we fall through cheaply if it doesn't.
+///
+/// Classification of per-protocol outcomes:
+///
+/// * `Ok(lease)` → return `Mapped(lease)` immediately.
+/// * `ProtocolNotSupported` → fall through to the next protocol. This
+///   covers UNSUPP_VERSION (PCP) and unsupported-opcode (NAT-PMP).
+/// * `Timeout` → fall through. A silent gateway is indistinguishable
+///   from one that doesn't speak the protocol.
+/// * Any other error (e.g. `Refused`, `Io`, `InvalidResponse`,
+///   `NoGateway`) is surfaced to the caller. A `NOT_AUTHORIZED` from
+///   one protocol means the operator disabled port mapping in the
+///   router admin UI; the other protocol almost certainly does the
+///   same. Surfacing the error gets the operator a useful diagnostic
+///   instead of a silent fall-through to the keepalive fallback.
+pub struct PortMappingProbe {
+    /// The gateway socket address (IP + port). Production callers use
+    /// [`PortMappingProbe::new`], which fixes the port at 5351 — the
+    /// IANA assignment shared by PCP and NAT-PMP. Tests use
+    /// [`PortMappingProbe::new_for_test`] so they can point at an
+    /// in-process fake gateway on an ephemeral port.
+    gateway: SocketAddr,
+    initial_timeout: Duration,
+    max_attempts: u8,
+}
+
+impl PortMappingProbe {
+    /// Construct a probe targeting `gateway` on port 5351 (the IANA
+    /// port shared by PCP and NAT-PMP). Defaults match the per-protocol
+    /// practical retry settings (250 ms initial timeout).
+    pub fn new(gateway: IpAddr) -> Self {
+        Self {
+            gateway: SocketAddr::new(gateway, PCP_SERVER_PORT),
+            initial_timeout: PCP_DEFAULT_INITIAL_TIMEOUT,
+            max_attempts: PCP_DEFAULT_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Construct from an arbitrary `SocketAddr` for tests pointing at
+    /// an in-process fake gateway. Defaults match `new()`.
+    #[doc(hidden)]
+    pub fn new_for_test(gateway: SocketAddr) -> Self {
+        Self {
+            gateway,
+            initial_timeout: PCP_DEFAULT_INITIAL_TIMEOUT,
+            max_attempts: PCP_DEFAULT_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Builder: override the per-protocol initial timeout. Each protocol
+    /// applies its own backoff doubling on top of this value.
+    #[must_use]
+    pub fn with_initial_timeout(mut self, timeout: Duration) -> Self {
+        self.initial_timeout = timeout;
+        self
+    }
+
+    /// Builder: override the per-protocol attempt cap.
+    #[must_use]
+    pub fn with_max_attempts(mut self, max: u8) -> Self {
+        self.max_attempts = max.max(1);
+        self
+    }
+
+    /// Try every implemented protocol in order. See type docs for
+    /// classification rules.
+    pub fn probe_udp_mapping(
+        &self,
+        internal_port: u16,
+        lease_duration_secs: u32,
+    ) -> Result<ProbeOutcome, PortMapperError> {
+        // ---- PCP first ----
+        let pcp = PcpClient::new_for_test(self.gateway)
+            .with_initial_timeout(self.initial_timeout)
+            .with_max_attempts(self.max_attempts);
+        match pcp.request_udp_mapping(internal_port, lease_duration_secs) {
+            Ok(lease) => return Ok(ProbeOutcome::Mapped(lease)),
+            Err(PortMapperError::ProtocolNotSupported(_)) | Err(PortMapperError::Timeout) => {
+                // fall through to NAT-PMP.
+            }
+            Err(other) => return Err(other),
+        }
+
+        // ---- NAT-PMP second (IPv4 gateway only) ----
+        // RFC 6886 is IPv4-only; an IPv6 gateway address means PCP was
+        // the only available protocol and no further fall-through is
+        // possible. We surface `NoGatewaySupport` rather than an error
+        // because the daemon can still use the keepalive fallback.
+        if self.gateway.ip().is_ipv4() {
+            let nat_pmp = NatPmpClient::new_for_test(self.gateway)
+                .with_initial_timeout(self.initial_timeout)
+                .with_max_attempts(self.max_attempts);
+            match nat_pmp.request_udp_mapping(internal_port, lease_duration_secs) {
+                Ok(lease) => return Ok(ProbeOutcome::Mapped(lease)),
+                Err(PortMapperError::ProtocolNotSupported(_)) | Err(PortMapperError::Timeout) => {
+                    return Ok(ProbeOutcome::NoGatewaySupport);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        Ok(ProbeOutcome::NoGatewaySupport)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,5 +1917,306 @@ mod tests {
             IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
             "native IPv6 must surface as IpAddr::V6"
         );
+    }
+
+    // ---- Probe orchestrator tests ----
+
+    /// Spawn a dual-protocol fake gateway that handles N requests on a
+    /// single UDP socket. Each request is dispatched by inspecting
+    /// `byte[0]` (PCP=2, NAT-PMP=0) and responded to according to the
+    /// per-protocol handler closures. A handler returning `None` means
+    /// "drop the packet silently" (used to simulate a gateway that does
+    /// not speak that protocol). The orchestrator's PCP and NAT-PMP
+    /// clients share the gateway address by design — real routers
+    /// answer both protocols on port 5351 via version-byte demux.
+    type Responder = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + 'static>;
+
+    fn spawn_dual_protocol_gateway(
+        gateway_addr: SocketAddr,
+        pcp_responder: Option<Responder>,
+        nat_pmp_responder: Option<Responder>,
+        expected_request_count: usize,
+    ) -> JoinHandle<()> {
+        let socket = UdpSocket::bind(gateway_addr).expect("bind dual-protocol fake gateway");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set fake gateway read timeout");
+        std::thread::spawn(move || {
+            let mut count = 0usize;
+            while count < expected_request_count {
+                let mut buf = [0u8; 256];
+                let (len, src) = match socket.recv_from(&mut buf) {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let req = buf[..len].to_vec();
+                count += 1;
+                let version = req.first().copied().unwrap_or(0xff);
+                let response = match version {
+                    2 => pcp_responder.as_ref().map(|f| f(&req)),
+                    0 => nat_pmp_responder.as_ref().map(|f| f(&req)),
+                    _ => None,
+                };
+                if let Some(resp) = response {
+                    let _ = socket.send_to(&resp, src);
+                }
+                // None = drop silently (gateway that doesn't speak that protocol).
+            }
+        })
+    }
+
+    fn build_pcp_success_response(req: &[u8], ext_v4: Ipv4Addr, ext_port: u16) -> Vec<u8> {
+        let mut nonce = [0u8; PCP_NONCE_LEN];
+        nonce.copy_from_slice(&req[24..36]);
+        let echoed_internal = u16::from_be_bytes([req[40], req[41]]);
+        let mut resp = vec![0u8; PCP_MAP_RESPONSE_LEN];
+        resp[0] = PCP_VERSION;
+        resp[1] = PCP_R_BIT_RESPONSE_MASK | PCP_OPCODE_MAP;
+        resp[3] = PCP_RESULT_SUCCESS;
+        resp[4..8].copy_from_slice(&3600u32.to_be_bytes());
+        resp[8..12].copy_from_slice(&7u32.to_be_bytes());
+        resp[24..36].copy_from_slice(&nonce);
+        resp[36] = PCP_PROTOCOL_UDP;
+        resp[40..42].copy_from_slice(&echoed_internal.to_be_bytes());
+        resp[42..44].copy_from_slice(&ext_port.to_be_bytes());
+        resp[54] = 0xff;
+        resp[55] = 0xff;
+        resp[56..60].copy_from_slice(&ext_v4.octets());
+        resp
+    }
+
+    fn build_pcp_error_response(req: &[u8], result_code: u8) -> Vec<u8> {
+        let mut nonce = [0u8; PCP_NONCE_LEN];
+        nonce.copy_from_slice(&req[24..36]);
+        let mut resp = vec![0u8; PCP_MAP_RESPONSE_LEN];
+        resp[0] = PCP_VERSION;
+        resp[1] = PCP_R_BIT_RESPONSE_MASK | PCP_OPCODE_MAP;
+        resp[3] = result_code;
+        resp[24..36].copy_from_slice(&nonce);
+        resp[36] = PCP_PROTOCOL_UDP;
+        let echoed_internal = u16::from_be_bytes([req[40], req[41]]);
+        resp[40..42].copy_from_slice(&echoed_internal.to_be_bytes());
+        resp
+    }
+
+    fn build_nat_pmp_external_addr_response(ext_v4: Ipv4Addr) -> Vec<u8> {
+        let mut resp = vec![0u8; 12];
+        resp[0] = NAT_PMP_VERSION;
+        resp[1] = NAT_PMP_OP_RESPONSE_BIT | NAT_PMP_OP_EXTERNAL_ADDR;
+        resp[2..4].copy_from_slice(&NAT_PMP_RESULT_SUCCESS.to_be_bytes());
+        resp[4..8].copy_from_slice(&42u32.to_be_bytes());
+        resp[8..12].copy_from_slice(&ext_v4.octets());
+        resp
+    }
+
+    fn build_nat_pmp_map_response(req: &[u8], ext_port: u16, lifetime: u32) -> Vec<u8> {
+        let echoed_internal = u16::from_be_bytes([req[4], req[5]]);
+        let mut resp = vec![0u8; 16];
+        resp[0] = NAT_PMP_VERSION;
+        resp[1] = NAT_PMP_OP_RESPONSE_BIT | NAT_PMP_OP_MAP_UDP;
+        resp[2..4].copy_from_slice(&NAT_PMP_RESULT_SUCCESS.to_be_bytes());
+        resp[4..8].copy_from_slice(&42u32.to_be_bytes());
+        resp[8..10].copy_from_slice(&echoed_internal.to_be_bytes());
+        resp[10..12].copy_from_slice(&ext_port.to_be_bytes());
+        resp[12..16].copy_from_slice(&lifetime.to_be_bytes());
+        resp
+    }
+
+    fn make_probe_test(gateway_addr: SocketAddr) -> PortMappingProbe {
+        PortMappingProbe::new_for_test(gateway_addr)
+            .with_initial_timeout(Duration::from_millis(50))
+            .with_max_attempts(2)
+    }
+
+    fn probe_test_gateway_addr() -> SocketAddr {
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind probe gateway scout");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        addr
+    }
+
+    #[test]
+    fn probe_returns_mapped_when_pcp_succeeds() {
+        // Happy path: gateway speaks PCP, returns a lease.
+        // Probe must return Mapped(lease) with protocol=Pcp and not
+        // bother trying NAT-PMP.
+        let gateway = probe_test_gateway_addr();
+        let handle = spawn_dual_protocol_gateway(
+            gateway,
+            Some(Box::new(|req| {
+                build_pcp_success_response(req, Ipv4Addr::new(198, 51, 100, 7), 54321)
+            })),
+            None, // NAT-PMP responder unused
+            1,
+        );
+        let probe = make_probe_test(gateway);
+
+        let outcome = probe
+            .probe_udp_mapping(51820, 3600)
+            .expect("probe succeeds when PCP responds");
+
+        match outcome {
+            ProbeOutcome::Mapped(lease) => {
+                assert_eq!(lease.protocol, PortMappingProtocol::Pcp);
+                assert_eq!(lease.external_port, 54321);
+                assert_eq!(
+                    lease.external_addr,
+                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+                );
+            }
+            other => panic!("expected Mapped(Pcp), got {other:?}"),
+        }
+
+        handle.join().expect("gateway thread joins");
+    }
+
+    #[test]
+    fn probe_falls_through_to_nat_pmp_when_pcp_silent() {
+        // Realistic mid-tier router scenario: doesn't speak PCP at all
+        // (silent on version=2 packets), does speak NAT-PMP. Probe
+        // must time out on PCP and successfully fall through to
+        // NAT-PMP, returning Mapped(lease, protocol=NatPmp).
+        let gateway = probe_test_gateway_addr();
+        let handle = spawn_dual_protocol_gateway(
+            gateway,
+            None, // PCP silent — drops version=2 packets
+            Some(Box::new(|req| match req.get(1).copied() {
+                Some(NAT_PMP_OP_EXTERNAL_ADDR) => {
+                    build_nat_pmp_external_addr_response(Ipv4Addr::new(203, 0, 113, 9))
+                }
+                Some(NAT_PMP_OP_MAP_UDP) => build_nat_pmp_map_response(req, 12345, 3600),
+                _ => Vec::new(),
+            })),
+            // PCP probes 2 times (configured max_attempts) before
+            // giving up, then NAT-PMP gets 2 round-trips
+            // (external_addr + map) — but each round-trip may itself
+            // retry. We size the handler count to cover the realistic
+            // worst case: 2 PCP attempts silently dropped + 2 NAT-PMP
+            // round-trips.
+            4,
+        );
+        let probe = make_probe_test(gateway);
+
+        let outcome = probe
+            .probe_udp_mapping(51820, 3600)
+            .expect("probe succeeds when NAT-PMP responds");
+        match outcome {
+            ProbeOutcome::Mapped(lease) => {
+                assert_eq!(
+                    lease.protocol,
+                    PortMappingProtocol::NatPmp,
+                    "must fall through to NAT-PMP when PCP is silent"
+                );
+                assert_eq!(lease.external_port, 12345);
+            }
+            other => panic!("expected Mapped(NatPmp), got {other:?}"),
+        }
+        handle.join().expect("gateway thread joins");
+    }
+
+    #[test]
+    fn probe_returns_no_gateway_support_when_both_protocols_unresponsive() {
+        // Neither protocol responds (gateway is firewalled or doesn't
+        // run a port-mapping service at all). Probe must return
+        // NoGatewaySupport so the daemon can fall back to the
+        // outbound-keepalive trick.
+        let gateway = probe_test_gateway_addr();
+        // Bind the socket but never respond.
+        let socket = UdpSocket::bind(gateway).expect("bind silent gateway");
+        let handle = std::thread::spawn(move || {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("set read timeout");
+            // Drain a handful of packets and drop them — both probes will
+            // hit max_attempts.
+            for _ in 0..6 {
+                let mut buf = [0u8; 256];
+                if socket.recv_from(&mut buf).is_err() {
+                    return;
+                }
+            }
+        });
+        let probe = make_probe_test(gateway);
+
+        let outcome = probe
+            .probe_udp_mapping(51820, 3600)
+            .expect("probe returns Ok with NoGatewaySupport when both protocols silent");
+        assert!(
+            matches!(outcome, ProbeOutcome::NoGatewaySupport),
+            "expected NoGatewaySupport, got {outcome:?}"
+        );
+        handle.join().expect("silent gateway thread joins");
+    }
+
+    #[test]
+    fn probe_surfaces_hard_refusal_without_trying_second_protocol() {
+        // PCP returns NOT_AUTHORIZED (result code 2). This means the
+        // operator disabled port mapping in the router admin UI; NAT-PMP
+        // almost certainly does the same. The orchestrator must surface
+        // the error so the operator sees a useful diagnostic instead of
+        // silently falling back to keepalive.
+        //
+        // The fake gateway only handles the one PCP request — if the
+        // orchestrator wrongly falls through to NAT-PMP, the fake
+        // gateway thread won't service the NAT-PMP request and the test
+        // would still detect the wrong behaviour by inspecting the
+        // returned error variant.
+        let gateway = probe_test_gateway_addr();
+        let handle = spawn_dual_protocol_gateway(
+            gateway,
+            Some(Box::new(|req| {
+                build_pcp_error_response(req, PCP_RESULT_NOT_AUTHORIZED)
+            })),
+            None,
+            1,
+        );
+        let probe = make_probe_test(gateway);
+
+        let err = probe
+            .probe_udp_mapping(51820, 3600)
+            .expect_err("NOT_AUTHORIZED must surface as an error, not silent fall-through");
+        assert!(
+            matches!(err, PortMapperError::Refused(ref msg) if msg.to_lowercase().contains("not authorized")),
+            "expected Refused with 'not authorized' message, got: {err:?}"
+        );
+        handle.join().expect("gateway thread joins");
+    }
+
+    #[test]
+    fn probe_falls_through_on_unsupp_version_to_nat_pmp() {
+        // PCP returns UNSUPP_VERSION (result code 1) — meaning the
+        // gateway parsed our v2 packet enough to reject the version.
+        // This is rare (most non-PCP gateways just don't respond at
+        // all) but RFC 6887 §7.4 codifies it. The orchestrator must
+        // classify it as ProtocolNotSupported and fall through, not as
+        // a hard refusal.
+        let gateway = probe_test_gateway_addr();
+        let handle = spawn_dual_protocol_gateway(
+            gateway,
+            Some(Box::new(|req| {
+                build_pcp_error_response(req, PCP_RESULT_UNSUPP_VERSION)
+            })),
+            Some(Box::new(|req| match req.get(1).copied() {
+                Some(NAT_PMP_OP_EXTERNAL_ADDR) => {
+                    build_nat_pmp_external_addr_response(Ipv4Addr::new(203, 0, 113, 9))
+                }
+                Some(NAT_PMP_OP_MAP_UDP) => build_nat_pmp_map_response(req, 7777, 3600),
+                _ => Vec::new(),
+            })),
+            3,
+        );
+        let probe = make_probe_test(gateway);
+
+        let outcome = probe
+            .probe_udp_mapping(51820, 3600)
+            .expect("UNSUPP_VERSION must fall through to NAT-PMP cleanly");
+        match outcome {
+            ProbeOutcome::Mapped(lease) => {
+                assert_eq!(lease.protocol, PortMappingProtocol::NatPmp);
+                assert_eq!(lease.external_port, 7777);
+            }
+            other => panic!("expected Mapped(NatPmp), got {other:?}"),
+        }
+        handle.join().expect("gateway thread joins");
     }
 }
