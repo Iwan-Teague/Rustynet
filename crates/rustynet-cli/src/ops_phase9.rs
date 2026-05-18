@@ -2104,25 +2104,41 @@ fn phase10_validate_source_artifacts_entries(
     Ok(())
 }
 
+/// Bridge a `&Map<String, Value>` payload into the typed
+/// `Phase10PerfBudgetReportView`. Both phase-10 validators below
+/// share this entry point; wrong-type slots fail here with an
+/// "invalid field shape" error wrap.
+fn phase10_perf_budget_report_view(
+    payload: &Map<String, Value>,
+    source_path: &Path,
+) -> Result<Phase10PerfBudgetReportView, String> {
+    serde_json::from_value::<Phase10PerfBudgetReportView>(Value::Object(payload.clone())).map_err(
+        |err| {
+            format!(
+                "perf_budget_report has invalid field shape: {} ({err})",
+                source_path.display()
+            )
+        },
+    )
+}
+
 fn phase10_validate_perf_budget(
     payload: &Map<String, Value>,
     source_path: &Path,
 ) -> Result<(), String> {
-    if payload.get("soak_status").and_then(Value::as_str) != Some("pass") {
+    let typed = phase10_perf_budget_report_view(payload, source_path)?;
+    if typed.soak_status.as_deref() != Some("pass") {
         return Err(format!(
             "perf_budget_report source must report soak_status=pass: {}",
             source_path.display()
         ));
     }
-    let metrics = payload
-        .get("metrics")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "perf_budget_report source must include non-empty metrics list: {}",
-                source_path.display()
-            )
-        })?;
+    let metrics = typed.metrics.as_ref().ok_or_else(|| {
+        format!(
+            "perf_budget_report source must include non-empty metrics list: {}",
+            source_path.display()
+        )
+    })?;
     if metrics.is_empty() {
         return Err(format!(
             "perf_budget_report source must include non-empty metrics list: {}",
@@ -2130,13 +2146,7 @@ fn phase10_validate_perf_budget(
         ));
     }
     for metric in metrics {
-        let metric_object = metric.as_object().ok_or_else(|| {
-            format!(
-                "perf_budget_report metrics entries must be objects: {}",
-                source_path.display()
-            )
-        })?;
-        if metric_object.get("status").and_then(Value::as_str) != Some("pass") {
+        if metric.status.as_deref() != Some("pass") {
             return Err(format!(
                 "perf_budget_report source must not contain failing metrics: {}",
                 source_path.display()
@@ -2157,26 +2167,18 @@ fn phase10_validate_required_perf_metrics(
         "route_apply_p95_seconds",
         "throughput_overhead_percent",
     ];
-    let metrics = payload
-        .get("metrics")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "perf_budget_report source must include non-empty metrics list: {}",
-                source_path.display()
-            )
-        })?;
+    let typed = phase10_perf_budget_report_view(payload, source_path)?;
+    let metrics = typed.metrics.as_ref().ok_or_else(|| {
+        format!(
+            "perf_budget_report source must include non-empty metrics list: {}",
+            source_path.display()
+        )
+    })?;
     let mut seen = std::collections::BTreeSet::new();
     for metric in metrics {
-        let metric_object = metric.as_object().ok_or_else(|| {
-            format!(
-                "perf_budget_report metrics entries must be objects: {}",
-                source_path.display()
-            )
-        })?;
-        let name = metric_object
-            .get("name")
-            .and_then(Value::as_str)
+        let name = metric
+            .name
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
@@ -2185,7 +2187,7 @@ fn phase10_validate_required_perf_metrics(
                     source_path.display()
                 )
             })?;
-        if metric_object.get("status").and_then(Value::as_str) != Some("pass") {
+        if metric.status.as_deref() != Some("pass") {
             return Err(format!(
                 "perf_budget_report metric did not pass ({name}) in {}",
                 source_path.display()
@@ -3081,6 +3083,49 @@ fn phase9_require_measured_evidence_metadata(
     }
 
     phase9_validate_source_artifacts_field(document, label)
+}
+
+/// X2: typed view over a single entry inside a perf-budget
+/// report's `metrics` array. Used by both
+/// `phase10_validate_perf_budget` (status-must-be-pass) and
+/// `phase10_validate_required_perf_metrics` (status + name).
+///
+/// Field-shape rules:
+/// * `name: Option<String>` and `status: Option<String>` — wrong-
+///   type slots fail at the typed deserialise. The legacy
+///   `.and_then(Value::as_str)` walks silently mapped wrong-type to
+///   `None`, conflating missing with wrong-type when surfacing the
+///   downstream per-field error.
+/// * `#[serde(flatten)] extra` rides every other metric field
+///   (value, unit, threshold, etc.) through unchanged.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct Phase10PerfMetricEntryView {
+    pub name: Option<String>,
+    pub status: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// X2: typed view over the top-level shape of a phase-10 perf-budget
+/// report.
+///
+/// * `soak_status: Option<String>` — wrong-type slot rejected here.
+/// * `metrics: Option<Vec<Phase10PerfMetricEntryView>>` — present-
+///   but-wrong-type (e.g. `metrics: {}`) fails at deserialise; the
+///   validator-boundary error wraps the serde message in
+///   "invalid field shape".
+/// * `#[serde(flatten)] extra` preserves every other top-level
+///   field for downstream walks.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct Phase10PerfBudgetReportView {
+    pub soak_status: Option<String>,
+    pub metrics: Option<Vec<Phase10PerfMetricEntryView>>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 fn phase9_require_string(
@@ -4906,10 +4951,11 @@ mod tests {
         MAX_PHASE10_JSON_SOURCE_BYTES, PHASE9_REQUIRED_ARTIFACTS,
         Phase6ParityAttestationBuildInputs, Phase6ParityAttestationVerifyInputs,
         Phase9EvidenceAttestationBuildInputs, Phase9EvidenceAttestationVerifyInputs,
-        ReleaseProvenanceBuildInputs, ReleaseProvenanceVerifyInputs,
-        WritePhase10Hp2TraversalReportsConfig, WriteUnsignedReleaseProvenanceConfig,
-        build_phase6_parity_attestation_document, build_phase9_evidence_attestation_document,
-        build_release_provenance_document, contains_generation_marker, decode_hex_to_fixed,
+        Phase10PerfBudgetReportView, Phase10PerfMetricEntryView, ReleaseProvenanceBuildInputs,
+        ReleaseProvenanceVerifyInputs, WritePhase10Hp2TraversalReportsConfig,
+        WriteUnsignedReleaseProvenanceConfig, build_phase6_parity_attestation_document,
+        build_phase9_evidence_attestation_document, build_release_provenance_document,
+        contains_generation_marker, decode_hex_to_fixed,
         execute_ops_write_phase10_hp2_traversal_reports,
         execute_ops_write_unsigned_release_provenance, hex_encode, load_key_hex_from_secure_path,
         parse_required_test_output_total_passed, phase10_expected_provenance_entries,
@@ -4919,6 +4965,83 @@ mod tests {
         write_phase10_provenance_keypair,
     };
     use ed25519_dalek::SigningKey;
+
+    // X2: Cycle 73 typed view tests for Phase 10 perf-budget report
+    // shape. Same DRY pattern as Phase1MetricEntryView — one
+    // canonical contract shared between `phase10_validate_perf_budget`
+    // and `phase10_validate_required_perf_metrics`.
+
+    /// Clean fixture: a well-formed perf-budget report deserialises
+    /// every typed slot; ride-through fields land in `extra`.
+    #[test]
+    fn phase10_perf_budget_report_view_accepts_clean_payload() {
+        let payload = json!({
+            "soak_status": "pass",
+            "metrics": [
+                { "name": "idle_cpu_percent", "status": "pass", "value": 1.5 },
+                { "name": "idle_rss_mb", "status": "pass", "value": 64 },
+            ],
+            "extra_field": "ride-through",
+        });
+        let view: Phase10PerfBudgetReportView =
+            serde_json::from_value(payload).expect("typed view accepts clean payload");
+        assert_eq!(view.soak_status.as_deref(), Some("pass"));
+        let metrics = view.metrics.expect("metrics present");
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].name.as_deref(), Some("idle_cpu_percent"));
+        assert_eq!(metrics[0].status.as_deref(), Some("pass"));
+        assert_eq!(
+            view.extra
+                .get("extra_field")
+                .and_then(serde_json::Value::as_str),
+            Some("ride-through")
+        );
+    }
+
+    /// Wrong-type `metrics` slot rejected at the typed layer.
+    /// Was previously silent via `.and_then(Value::as_array) -> None`,
+    /// surfacing as "must include non-empty metrics list" — same as
+    /// missing.
+    #[test]
+    fn phase10_perf_budget_report_view_rejects_wrong_type_metrics() {
+        let payload = json!({ "soak_status": "pass", "metrics": "not-an-array" });
+        let err = serde_json::from_value::<Phase10PerfBudgetReportView>(payload)
+            .expect_err("string metrics must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("metrics") || message.contains("sequence"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `status` slot inside a perf-metric entry rejected.
+    /// Previously silent via `.and_then(Value::as_str) -> None`,
+    /// surfacing as "did not pass" or "must not contain failing
+    /// metrics" depending on the validator — both conflated wrong-
+    /// type with missing or "fail".
+    #[test]
+    fn phase10_perf_metric_entry_view_rejects_wrong_type_status() {
+        let payload = json!({ "name": "idle_cpu_percent", "status": 42 });
+        let err = serde_json::from_value::<Phase10PerfMetricEntryView>(payload)
+            .expect_err("integer status must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("status") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Missing optional slots deserialise to `None`. The validators
+    /// preserve the legacy per-field errors via downstream checks on
+    /// `view.soak_status`, `metric.name`, `metric.status`.
+    #[test]
+    fn phase10_perf_budget_report_view_accepts_missing_optional_slots() {
+        let payload = json!({});
+        let view: Phase10PerfBudgetReportView =
+            serde_json::from_value(payload).expect("typed view tolerates empty payload");
+        assert!(view.soak_status.is_none());
+        assert!(view.metrics.is_none());
+    }
 
     #[test]
     fn generation_marker_parser_accepts_valid_tokens() {
