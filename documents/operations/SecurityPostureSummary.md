@@ -144,7 +144,7 @@ Modules with typed views landed:
 ## 7. Operating-policy hygiene
 
 Verified clean as of this refresh:
-- **Zero TODO / FIXME / XXX / HACK markers** in production code paths across all 8 crates (per CLAUDE.md "Do not defer in-scope requirements behind TODO/FIXME").
+- **Zero TODO / FIXME / XXX / HACK markers** in production code paths across all 14 workspace member crates (per CLAUDE.md "Do not defer in-scope requirements behind TODO/FIXME").
 - **101 `#[allow(dead_code)]` markers** as of 2026-05-18 end-of-run, all carrying justification comments (test-exposed parsers, enum variants used in tests, typed-view fields exercised via round-trip tests, `into_value_map()` bridge helpers retained for downstream Map-walking call sites).
 - **Zero `unsafe` code** outside the `rustynet-windows-native` crate (enforced by `check_no_unsafe_code.rs` gate → `PolicyReject` on violation).
 
