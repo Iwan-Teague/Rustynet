@@ -40,8 +40,10 @@
 //!   address via STUN (D2) and treat that as authoritative.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
+
+use rand::RngCore;
 
 /// Wire protocols a `MappingLease` can be granted over.
 ///
@@ -92,6 +94,12 @@ pub struct MappingLease {
     /// daemon's refresh loop should aim for ~half this remaining lifetime
     /// to give itself a retry budget if the first refresh attempt fails.
     pub expires_at: Instant,
+    /// PCP Mapping Nonce (RFC 6887 §11.2). `None` for NAT-PMP and uPnP IGD
+    /// leases — they identify a mapping by `(internal_port, protocol)`
+    /// alone. `Some` for PCP leases — the 12-byte Mapping Nonce minted on
+    /// the original request, which MUST be echoed on refresh and delete
+    /// so the gateway recognises the mapping as belonging to this client.
+    pub pcp_nonce: Option<[u8; 12]>,
 }
 
 /// Structured failure shapes from a port-mapping request.
@@ -440,6 +448,7 @@ impl PortMapper for NatPmpClient {
             external_addr: IpAddr::V4(external_addr),
             protocol: PortMappingProtocol::NatPmp,
             expires_at: Instant::now() + Duration::from_secs(u64::from(lifetime_secs)),
+            pcp_nonce: None,
         })
     }
 
@@ -474,6 +483,7 @@ impl PortMapper for NatPmpClient {
             external_addr: IpAddr::V4(external_addr),
             protocol: PortMappingProtocol::NatPmp,
             expires_at: Instant::now() + Duration::from_secs(u64::from(granted_lifetime)),
+            pcp_nonce: None,
         })
     }
 
@@ -519,6 +529,513 @@ fn map_result_code(code: u16) -> PortMapperError {
             PortMapperError::ProtocolNotSupported("gateway reported unsupported opcode".to_owned())
         }
         other => PortMapperError::Refused(format!("unrecognised result code 0x{other:04x}")),
+    }
+}
+
+// ---- PCP (RFC 6887) ----
+
+/// Default PCP server port (RFC 6887 §19.1). Shares port 5351 with
+/// NAT-PMP — the gateway distinguishes the two by inspecting the
+/// version byte of incoming requests.
+pub const PCP_SERVER_PORT: u16 = 5351;
+
+/// PCP protocol version (RFC 6887 §7.1).
+const PCP_VERSION: u8 = 2;
+
+/// R-bit mask for the `R|Opcode` byte. R=1 in responses, R=0 in requests
+/// (RFC 6887 §7.1).
+const PCP_R_BIT_RESPONSE_MASK: u8 = 0x80;
+
+/// Opcode mask for the `R|Opcode` byte (RFC 6887 §7.1).
+const PCP_OPCODE_MASK: u8 = 0x7f;
+
+/// MAP opcode value (RFC 6887 §11).
+const PCP_OPCODE_MAP: u8 = 1;
+
+/// IANA protocol number for UDP (RFC 6887 §11.1 references the IANA
+/// "Protocol Numbers" registry).
+const PCP_PROTOCOL_UDP: u8 = 17;
+
+// Result codes (RFC 6887 §7.4).
+const PCP_RESULT_SUCCESS: u8 = 0;
+const PCP_RESULT_UNSUPP_VERSION: u8 = 1;
+const PCP_RESULT_NOT_AUTHORIZED: u8 = 2;
+const PCP_RESULT_MALFORMED_REQUEST: u8 = 3;
+const PCP_RESULT_UNSUPP_OPCODE: u8 = 4;
+const PCP_RESULT_UNSUPP_OPTION: u8 = 5;
+const PCP_RESULT_MALFORMED_OPTION: u8 = 6;
+const PCP_RESULT_NETWORK_FAILURE: u8 = 7;
+const PCP_RESULT_NO_RESOURCES: u8 = 8;
+const PCP_RESULT_UNSUPP_PROTOCOL: u8 = 9;
+const PCP_RESULT_USER_EX_QUOTA: u8 = 10;
+const PCP_RESULT_CANNOT_PROVIDE_EXTERNAL: u8 = 11;
+const PCP_RESULT_ADDRESS_MISMATCH: u8 = 12;
+const PCP_RESULT_EXCESSIVE_REMOTE_PEERS: u8 = 13;
+
+/// Total PCP MAP request length: 24-byte common header + 36-byte MAP
+/// opcode body (RFC 6887 §7.1 + §11.1).
+const PCP_MAP_REQUEST_LEN: usize = 60;
+/// Total PCP MAP response length: 24-byte common header + 36-byte MAP
+/// opcode body.
+const PCP_MAP_RESPONSE_LEN: usize = 60;
+/// Mapping Nonce length: 96 bits = 12 bytes (RFC 6887 §11.1).
+pub const PCP_NONCE_LEN: usize = 12;
+
+/// Practical PCP default initial timeout.
+///
+/// RFC 6887 §8.1.1 recommends IRT (Initial Retransmission Time) of
+/// 3 seconds with no fixed maximum on retransmissions (MRC=0). Those
+/// values are sized for general-purpose options that may take time to
+/// reach a distant relay. For an on-LAN gateway probing whether the
+/// router speaks PCP at all, sub-100ms RTTs are typical; we use 250 ms
+/// here so an unresponsive gateway can be diagnosed quickly and the
+/// orchestrator can fall through to the next protocol. We document the
+/// deviation; operators who need the RFC default can override via
+/// [`PcpClient::with_initial_timeout`].
+const PCP_DEFAULT_INITIAL_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Practical PCP default attempt cap.
+///
+/// RFC 6887 §8.1.1 specifies MRC=0 (no maximum). We cap at 5 (≈7.75 s
+/// cumulative at IRT=250 ms with doubling) for the same reason as
+/// `PCP_DEFAULT_INITIAL_TIMEOUT`: this is a fast probe, not an
+/// indefinite renewal.
+const PCP_DEFAULT_MAX_ATTEMPTS: u8 = 5;
+
+/// PCP client. UDP wire format per RFC 6887.
+///
+/// PCP is a superset of NAT-PMP with first-class IPv6 support; the
+/// daemon's port-mapping probe tries PCP before NAT-PMP because a PCP
+/// gateway also acts as a NAT-PMP gateway (RFC 6887 §1.1) and PCP gives
+/// us richer error reporting.
+///
+/// Like [`NatPmpClient`], this client is testable: it accepts an
+/// arbitrary `SocketAddr` so the test points it at an in-process fake
+/// gateway. Mapping Nonce values are cryptographically random via
+/// [`rand::rng`] per RFC 6887 §11.2 (the nonce is the authorisation
+/// token for renewing/deleting a mapping — predictable nonces would let
+/// off-path attackers tear down our mapping).
+///
+/// Retry behaviour deviates from RFC §8.1.1 (which targets distant
+/// relay servers); see the doc comments on
+/// [`PCP_DEFAULT_INITIAL_TIMEOUT`] / [`PCP_DEFAULT_MAX_ATTEMPTS`] for
+/// the rationale and the override mechanism.
+#[derive(Debug, Clone)]
+pub struct PcpClient {
+    gateway: SocketAddr,
+    initial_timeout: Duration,
+    max_attempts: u8,
+}
+
+impl PcpClient {
+    /// Construct a PCP client pointed at the given gateway IP.
+    /// Defaults to `PCP_SERVER_PORT` and the practical retry settings
+    /// (see module docs).
+    pub fn new(gateway: IpAddr) -> Self {
+        Self {
+            gateway: SocketAddr::new(gateway, PCP_SERVER_PORT),
+            initial_timeout: PCP_DEFAULT_INITIAL_TIMEOUT,
+            max_attempts: PCP_DEFAULT_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Builder: override the initial-attempt timeout.
+    #[must_use]
+    pub fn with_initial_timeout(mut self, timeout: Duration) -> Self {
+        self.initial_timeout = timeout;
+        self
+    }
+
+    /// Builder: override the maximum retry attempts.
+    #[must_use]
+    pub fn with_max_attempts(mut self, max: u8) -> Self {
+        self.max_attempts = max.max(1);
+        self
+    }
+
+    /// Construct from an arbitrary `SocketAddr` for tests pointing at an
+    /// in-process fake gateway. Defaults match `new()`.
+    #[doc(hidden)]
+    pub fn new_for_test(gateway: SocketAddr) -> Self {
+        Self {
+            gateway,
+            initial_timeout: PCP_DEFAULT_INITIAL_TIMEOUT,
+            max_attempts: PCP_DEFAULT_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Encode an IPv4 address as an IPv4-mapped IPv6 octet array per
+    /// RFC 4291 §2.5.5.2: `::ffff:0:0/96` prefix + 32-bit IPv4 suffix.
+    /// PCP carries every address as 128 bits; IPv4 mappings use the
+    /// mapped form so PCP gateways serving dual-stack hosts can use a
+    /// single Address field width (RFC 6887 §5).
+    fn embed_v4_as_v6(addr: Ipv4Addr) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[10] = 0xff;
+        buf[11] = 0xff;
+        buf[12..16].copy_from_slice(&addr.octets());
+        buf
+    }
+
+    /// Mint a fresh 12-byte Mapping Nonce. RFC 6887 §11.2: "The PCP
+    /// client SHOULD generate a unique, cryptographically random nonce"
+    /// — predictable nonces would let off-path attackers issue
+    /// `lifetime=0` deletes and tear down our mapping.
+    fn fresh_nonce() -> [u8; PCP_NONCE_LEN] {
+        let mut nonce = [0u8; PCP_NONCE_LEN];
+        rand::rng().fill_bytes(&mut nonce);
+        nonce
+    }
+
+    /// Encode a MAP request (60 bytes total).
+    ///
+    /// Layout (RFC 6887 §7.1 common header + §11.1 MAP body):
+    /// * `[0]` Version = 2
+    /// * `[1]` R(1)|Opcode(7) — R=0, Opcode=1
+    /// * `[2..4]` Reserved
+    /// * `[4..8]` Requested Lifetime (BE u32)
+    /// * `[8..24]` PCP Client IP (128 bits)
+    /// * `[24..36]` Mapping Nonce (96 bits)
+    /// * `[36]` Protocol (17 = UDP)
+    /// * `[37..40]` Reserved (24 bits)
+    /// * `[40..42]` Internal Port (BE u16)
+    /// * `[42..44]` Suggested External Port (BE u16)
+    /// * `[44..60]` Suggested External Address (128 bits)
+    fn encode_map_request(
+        client_ip: IpAddr,
+        lifetime_secs: u32,
+        nonce: [u8; PCP_NONCE_LEN],
+        internal_port: u16,
+        suggested_external_port: u16,
+        suggested_external_addr: IpAddr,
+    ) -> [u8; PCP_MAP_REQUEST_LEN] {
+        let mut buf = [0u8; PCP_MAP_REQUEST_LEN];
+        buf[0] = PCP_VERSION;
+        // R=0, Opcode=MAP=1.
+        buf[1] = PCP_OPCODE_MAP;
+        // bytes 2..4 reserved (zero).
+        buf[4..8].copy_from_slice(&lifetime_secs.to_be_bytes());
+        let client_octets = match client_ip {
+            IpAddr::V4(v4) => Self::embed_v4_as_v6(v4),
+            IpAddr::V6(v6) => v6.octets(),
+        };
+        buf[8..24].copy_from_slice(&client_octets);
+
+        buf[24..36].copy_from_slice(&nonce);
+        buf[36] = PCP_PROTOCOL_UDP;
+        // bytes 37..40 reserved (zero).
+        buf[40..42].copy_from_slice(&internal_port.to_be_bytes());
+        buf[42..44].copy_from_slice(&suggested_external_port.to_be_bytes());
+        let external_octets = match suggested_external_addr {
+            IpAddr::V4(v4) => Self::embed_v4_as_v6(v4),
+            IpAddr::V6(v6) => v6.octets(),
+        };
+        buf[44..60].copy_from_slice(&external_octets);
+        buf
+    }
+
+    /// Parse a MAP response (60 bytes minimum).
+    fn decode_map_response(
+        buf: &[u8],
+        sent_nonce: [u8; PCP_NONCE_LEN],
+        sent_internal_port: u16,
+    ) -> Result<PcpMapResponseFields, PortMapperError> {
+        if buf.len() < PCP_MAP_RESPONSE_LEN {
+            return Err(PortMapperError::InvalidResponse(format!(
+                "PCP MAP response too short: {} bytes (need {PCP_MAP_RESPONSE_LEN})",
+                buf.len()
+            )));
+        }
+        if buf[0] != PCP_VERSION {
+            return Err(PortMapperError::InvalidResponse(format!(
+                "PCP response version mismatch: got {}, expected {PCP_VERSION}",
+                buf[0]
+            )));
+        }
+        let r_bit = buf[1] & PCP_R_BIT_RESPONSE_MASK;
+        let opcode = buf[1] & PCP_OPCODE_MASK;
+        if r_bit == 0 {
+            return Err(PortMapperError::InvalidResponse(
+                "PCP response R-bit not set".to_owned(),
+            ));
+        }
+        if opcode != PCP_OPCODE_MAP {
+            return Err(PortMapperError::InvalidResponse(format!(
+                "PCP response opcode mismatch: got {opcode}, expected {PCP_OPCODE_MAP} (MAP)"
+            )));
+        }
+        // buf[2] is Reserved; buf[3] carries the result code.
+        let result_code = buf[3];
+        if result_code != PCP_RESULT_SUCCESS {
+            return Err(pcp_map_result_code(result_code));
+        }
+        let lifetime = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        let mut echoed_nonce = [0u8; PCP_NONCE_LEN];
+        echoed_nonce.copy_from_slice(&buf[24..36]);
+        if echoed_nonce != sent_nonce {
+            return Err(PortMapperError::InvalidResponse(
+                "PCP MAP response nonce did not match request nonce".to_owned(),
+            ));
+        }
+        let echoed_protocol = buf[36];
+        if echoed_protocol != PCP_PROTOCOL_UDP {
+            return Err(PortMapperError::InvalidResponse(format!(
+                "PCP MAP response protocol mismatch: got {echoed_protocol}, expected {PCP_PROTOCOL_UDP} (UDP)"
+            )));
+        }
+        let echoed_internal_port = u16::from_be_bytes([buf[40], buf[41]]);
+        if echoed_internal_port != sent_internal_port {
+            return Err(PortMapperError::InvalidResponse(format!(
+                "PCP MAP response echoed internal port {echoed_internal_port}, expected {sent_internal_port}"
+            )));
+        }
+        let external_port = u16::from_be_bytes([buf[42], buf[43]]);
+        let mut external_octets = [0u8; 16];
+        external_octets.copy_from_slice(&buf[44..60]);
+        let external_addr = parse_pcp_address(external_octets);
+
+        Ok(PcpMapResponseFields {
+            external_port,
+            external_addr,
+            granted_lifetime_secs: lifetime,
+        })
+    }
+
+    /// UDP round-trip with the practical retry/backoff documented at
+    /// `PCP_DEFAULT_INITIAL_TIMEOUT`.
+    fn round_trip(&self, request: &[u8]) -> Result<Vec<u8>, PortMapperError> {
+        let socket = match self.gateway.ip() {
+            IpAddr::V4(_) => UdpSocket::bind("0.0.0.0:0")?,
+            IpAddr::V6(_) => UdpSocket::bind("[::]:0")?,
+        };
+        socket.connect(self.gateway)?;
+        let mut current_timeout = self.initial_timeout;
+        for _attempt in 0..self.max_attempts {
+            socket.set_read_timeout(Some(current_timeout))?;
+            socket.send(request)?;
+            let mut buf = [0u8; PCP_MAP_RESPONSE_LEN + 64];
+            match socket.recv(&mut buf) {
+                Ok(len) => return Ok(buf[..len].to_vec()),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    current_timeout = current_timeout.saturating_mul(2);
+                    continue;
+                }
+                Err(err) => return Err(PortMapperError::Io(err.to_string())),
+            }
+        }
+        Err(PortMapperError::Timeout)
+    }
+
+    /// Discover the local IP the kernel routes to the gateway. PCP §8.1
+    /// requires the Client IP field to match the source address the
+    /// gateway sees, otherwise it replies `ADDRESS_MISMATCH`.
+    fn discover_local_addr(&self) -> Result<IpAddr, PortMapperError> {
+        let socket = match self.gateway.ip() {
+            IpAddr::V4(_) => UdpSocket::bind("0.0.0.0:0")?,
+            IpAddr::V6(_) => UdpSocket::bind("[::]:0")?,
+        };
+        socket.connect(self.gateway)?;
+        Ok(socket.local_addr()?.ip())
+    }
+}
+
+/// Parsed fields from a MAP response. Internal to the PCP impl.
+#[derive(Debug)]
+struct PcpMapResponseFields {
+    external_port: u16,
+    external_addr: IpAddr,
+    granted_lifetime_secs: u32,
+}
+
+/// Translate a 128-bit PCP address into an `IpAddr`, surfacing
+/// IPv4-mapped IPv6 (`::ffff:X.X.X.X`) as `IpAddr::V4` so callers do
+/// not need to know about the wire encoding.
+fn parse_pcp_address(octets: [u8; 16]) -> IpAddr {
+    const V4_MAPPED_PREFIX: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+    if octets[..12] == V4_MAPPED_PREFIX {
+        IpAddr::V4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(octets))
+    }
+}
+
+/// Translate a PCP MAP result code into a typed `PortMapperError`.
+/// Per RFC 6887 §7.4, unrecognised codes are treated as `Refused`.
+fn pcp_map_result_code(code: u8) -> PortMapperError {
+    match code {
+        PCP_RESULT_SUCCESS => PortMapperError::Refused(
+            "PCP result code 0 (success) reached error path — protocol invariant violated"
+                .to_owned(),
+        ),
+        PCP_RESULT_UNSUPP_VERSION => PortMapperError::ProtocolNotSupported(
+            "PCP gateway reported unsupported version".to_owned(),
+        ),
+        PCP_RESULT_NOT_AUTHORIZED => PortMapperError::Refused(
+            "PCP refused: not authorized (port mapping likely disabled in router admin UI)"
+                .to_owned(),
+        ),
+        PCP_RESULT_MALFORMED_REQUEST => PortMapperError::Refused(
+            "PCP refused: gateway reported malformed request (client-side bug)".to_owned(),
+        ),
+        PCP_RESULT_UNSUPP_OPCODE => PortMapperError::ProtocolNotSupported(
+            "PCP gateway does not support MAP opcode".to_owned(),
+        ),
+        PCP_RESULT_UNSUPP_OPTION => {
+            PortMapperError::Refused("PCP gateway reported unsupported option".to_owned())
+        }
+        PCP_RESULT_MALFORMED_OPTION => {
+            PortMapperError::Refused("PCP gateway reported malformed option".to_owned())
+        }
+        PCP_RESULT_NETWORK_FAILURE => PortMapperError::Refused(
+            "PCP gateway reported network failure (transient — retry may help)".to_owned(),
+        ),
+        PCP_RESULT_NO_RESOURCES => PortMapperError::Refused(
+            "PCP gateway out of resources (mapping table full)".to_owned(),
+        ),
+        PCP_RESULT_UNSUPP_PROTOCOL => PortMapperError::ProtocolNotSupported(
+            "PCP gateway does not support requested transport protocol".to_owned(),
+        ),
+        PCP_RESULT_USER_EX_QUOTA => {
+            PortMapperError::Refused("PCP gateway: user exceeded quota".to_owned())
+        }
+        PCP_RESULT_CANNOT_PROVIDE_EXTERNAL => PortMapperError::Refused(
+            "PCP gateway cannot honour requested external address/port".to_owned(),
+        ),
+        PCP_RESULT_ADDRESS_MISMATCH => PortMapperError::Refused(
+            "PCP gateway saw a source IP that did not match the embedded Client IP — likely a NAT44 layer in the path"
+                .to_owned(),
+        ),
+        PCP_RESULT_EXCESSIVE_REMOTE_PEERS => {
+            PortMapperError::Refused("PCP gateway: excessive remote peers".to_owned())
+        }
+        other => PortMapperError::Refused(format!("unrecognised PCP result code 0x{other:02x}")),
+    }
+}
+
+impl PortMapper for PcpClient {
+    fn request_udp_mapping(
+        &self,
+        internal_port: u16,
+        lease_duration_secs: u32,
+    ) -> Result<MappingLease, PortMapperError> {
+        if internal_port == 0 {
+            return Err(PortMapperError::InvalidResponse(
+                "internal_port must be non-zero for a fresh PCP mapping request".to_owned(),
+            ));
+        }
+        let client_ip = self.discover_local_addr()?;
+        let nonce = Self::fresh_nonce();
+        // Suggested external IP = all zeros — per RFC 6887 §11.1 this
+        // means "any address" and tells the gateway to pick whatever
+        // external IP it controls. We rely on STUN (D2) for the
+        // authoritative external IP.
+        let suggested_external = match client_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let request = Self::encode_map_request(
+            client_ip,
+            lease_duration_secs,
+            nonce,
+            internal_port,
+            internal_port,
+            suggested_external,
+        );
+        let response = self.round_trip(&request)?;
+        let fields = Self::decode_map_response(&response, nonce, internal_port)?;
+        Ok(MappingLease {
+            internal_port,
+            external_port: fields.external_port,
+            external_addr: fields.external_addr,
+            protocol: PortMappingProtocol::Pcp,
+            expires_at: Instant::now()
+                + Duration::from_secs(u64::from(fields.granted_lifetime_secs)),
+            pcp_nonce: Some(nonce),
+        })
+    }
+
+    fn refresh_mapping(&self, lease: &MappingLease) -> Result<MappingLease, PortMapperError> {
+        // RFC 6887 §11.2.1: a renewal is byte-identical to the original
+        // MAP request — same Mapping Nonce, same Internal Port, same
+        // Suggested External Port. The nonce is the credential the
+        // gateway uses to recognise this as the same client.
+        let nonce = lease.pcp_nonce.ok_or_else(|| {
+            PortMapperError::InvalidResponse(
+                "refresh of a PCP lease without a stored Mapping Nonce — lease was minted by a different protocol or the nonce was dropped".to_owned(),
+            )
+        })?;
+        let lifetime_secs = lease
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .max(60)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        let client_ip = self.discover_local_addr()?;
+        let suggested_external = match client_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let request = Self::encode_map_request(
+            client_ip,
+            lifetime_secs,
+            nonce,
+            lease.internal_port,
+            lease.external_port,
+            suggested_external,
+        );
+        let response = self.round_trip(&request)?;
+        let fields = Self::decode_map_response(&response, nonce, lease.internal_port)?;
+        Ok(MappingLease {
+            internal_port: lease.internal_port,
+            external_port: fields.external_port,
+            external_addr: fields.external_addr,
+            protocol: PortMappingProtocol::Pcp,
+            expires_at: Instant::now()
+                + Duration::from_secs(u64::from(fields.granted_lifetime_secs)),
+            pcp_nonce: Some(nonce),
+        })
+    }
+
+    fn release_mapping(&self, lease: &MappingLease) -> Result<(), PortMapperError> {
+        // RFC 6887 §15: send a MAP request with Requested Lifetime = 0
+        // and the stored Mapping Nonce. Without the matching nonce the
+        // gateway will refuse (NOT_AUTHORIZED) — which is the design,
+        // because a third party should not be able to delete our
+        // mapping by guessing the internal-port.
+        let nonce = lease.pcp_nonce.ok_or_else(|| {
+            PortMapperError::InvalidResponse(
+                "release of a PCP lease without a stored Mapping Nonce — cannot satisfy RFC 6887 §15"
+                    .to_owned(),
+            )
+        })?;
+        let client_ip = self.discover_local_addr()?;
+        let suggested_external = match client_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let request = Self::encode_map_request(
+            client_ip,
+            0, // lifetime = 0 → delete
+            nonce,
+            lease.internal_port,
+            0, // suggested external port — ignored for delete
+            suggested_external,
+        );
+        let response = self.round_trip(&request)?;
+        // Validate the response is well-formed; the lifetime/external
+        // port fields are not meaningful on a successful delete, but the
+        // result code is.
+        let _fields = Self::decode_map_response(&response, nonce, lease.internal_port)?;
+        Ok(())
     }
 }
 
@@ -800,6 +1317,7 @@ mod tests {
             external_addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
             protocol: PortMappingProtocol::NatPmp,
             expires_at: Instant::now() + Duration::from_secs(1800),
+            pcp_nonce: None,
         };
 
         let refreshed = client
@@ -877,6 +1395,7 @@ mod tests {
             external_addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
             protocol: PortMappingProtocol::NatPmp,
             expires_at: Instant::now() + Duration::from_secs(1800),
+            pcp_nonce: None,
         };
         client.release_mapping(&lease).expect("release succeeds");
 
@@ -942,5 +1461,330 @@ mod tests {
         );
 
         drop(listener);
+    }
+
+    // ---- PCP (RFC 6887) tests ----
+
+    fn make_pcp_test_client() -> (PcpClient, SocketAddr) {
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind fake PCP gateway socket");
+        let gateway_addr = listener.local_addr().expect("fake PCP gateway local_addr");
+        drop(listener);
+        let client = PcpClient::new_for_test(gateway_addr)
+            .with_initial_timeout(Duration::from_millis(50))
+            .with_max_attempts(3);
+        (client, gateway_addr)
+    }
+
+    /// Spawn a single-shot fake PCP gateway that responds to one MAP
+    /// request. Returns a join handle and a request observation channel.
+    /// `granted_lifetime_secs` is echoed back; on `result_code` non-zero
+    /// the response carries that code and the body fields are filled
+    /// with zeros (matching the RFC §7.2 expectation that error
+    /// responses still have valid byte layout).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_fake_pcp_gateway(
+        gateway_addr: SocketAddr,
+        external_ipv4: Ipv4Addr,
+        granted_external_port: u16,
+        granted_lifetime_secs: u32,
+        result_code: u8,
+        expected_request_count: usize,
+        override_response_nonce: Option<[u8; PCP_NONCE_LEN]>,
+    ) -> (JoinHandle<()>, Receiver<Vec<u8>>) {
+        let socket = UdpSocket::bind(gateway_addr).expect("bind fake PCP gateway");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set fake PCP gateway read timeout");
+        let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = channel();
+        let handle = std::thread::spawn(move || {
+            let mut count = 0usize;
+            while count < expected_request_count {
+                let mut buf = [0u8; 256];
+                let (len, src) = match socket.recv_from(&mut buf) {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let req = buf[..len].to_vec();
+                let _ = tx.send(req.clone());
+                if req.len() < PCP_MAP_REQUEST_LEN || req[1] != PCP_OPCODE_MAP {
+                    break;
+                }
+                let mut nonce = [0u8; PCP_NONCE_LEN];
+                nonce.copy_from_slice(&req[24..36]);
+                if let Some(forced) = override_response_nonce {
+                    nonce = forced;
+                }
+                let echoed_internal = u16::from_be_bytes([req[40], req[41]]);
+                let mut resp = vec![0u8; PCP_MAP_RESPONSE_LEN];
+                resp[0] = PCP_VERSION;
+                resp[1] = PCP_R_BIT_RESPONSE_MASK | PCP_OPCODE_MAP;
+                resp[2] = 0; // reserved
+                resp[3] = result_code;
+                resp[4..8].copy_from_slice(&granted_lifetime_secs.to_be_bytes());
+                resp[8..12].copy_from_slice(&123u32.to_be_bytes()); // Epoch — arbitrary.
+                // bytes 12..24 reserved (zero).
+                resp[24..36].copy_from_slice(&nonce);
+                resp[36] = PCP_PROTOCOL_UDP;
+                // bytes 37..40 reserved.
+                resp[40..42].copy_from_slice(&echoed_internal.to_be_bytes());
+                resp[42..44].copy_from_slice(&granted_external_port.to_be_bytes());
+                // External address: ::ffff:external_ipv4.
+                resp[54] = 0xff;
+                resp[55] = 0xff;
+                resp[56..60].copy_from_slice(&external_ipv4.octets());
+                let _ = socket.send_to(&resp, src);
+                count += 1;
+            }
+        });
+        (handle, rx)
+    }
+
+    #[test]
+    fn pcp_map_request_encoding_matches_rfc_6887_layout() {
+        // Pin the request wire format byte-by-byte against the layout
+        // documented in PcpClient::encode_map_request.
+        let nonce: [u8; PCP_NONCE_LEN] = [
+            0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac,
+        ];
+        let buf = PcpClient::encode_map_request(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
+            3600,
+            nonce,
+            51820,
+            51820,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        );
+        assert_eq!(buf.len(), PCP_MAP_REQUEST_LEN, "60-byte MAP request");
+        assert_eq!(buf[0], PCP_VERSION, "version=2");
+        assert_eq!(buf[1], PCP_OPCODE_MAP, "R=0, opcode=MAP=1");
+        assert_eq!(&buf[2..4], &[0, 0], "reserved=0");
+        assert_eq!(
+            u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            3600,
+            "lifetime"
+        );
+        // Client IP — IPv4-mapped IPv6.
+        assert_eq!(&buf[8..18], &[0u8; 10][..], "v4-mapped high 80 bits = 0");
+        assert_eq!(
+            &buf[18..20],
+            &[0xff, 0xff],
+            "v4-mapped mid 16 bits = 0xffff"
+        );
+        assert_eq!(&buf[20..24], &[192, 168, 1, 100], "client IPv4");
+        assert_eq!(&buf[24..36], &nonce, "nonce echoed in request");
+        assert_eq!(buf[36], PCP_PROTOCOL_UDP, "protocol=UDP=17");
+        assert_eq!(&buf[37..40], &[0, 0, 0], "reserved=0");
+        assert_eq!(
+            u16::from_be_bytes([buf[40], buf[41]]),
+            51820,
+            "internal port"
+        );
+        assert_eq!(
+            u16::from_be_bytes([buf[42], buf[43]]),
+            51820,
+            "suggested external port"
+        );
+        // Suggested external address = ::ffff:0.0.0.0 = ::ffff:0:0.
+        assert_eq!(
+            &buf[44..54],
+            &[0u8; 10][..],
+            "suggested external v4-mapped high 80 bits = 0"
+        );
+        assert_eq!(
+            &buf[54..56],
+            &[0xff, 0xff],
+            "suggested external v4-mapped mid 16 bits = 0xffff"
+        );
+        assert_eq!(
+            &buf[56..60],
+            &[0, 0, 0, 0],
+            "suggested external IPv4 = 0.0.0.0 (any)"
+        );
+    }
+
+    #[test]
+    fn pcp_request_udp_mapping_round_trip_against_fake_gateway() {
+        let (client, gateway_addr) = make_pcp_test_client();
+        let (handle, rx) = spawn_fake_pcp_gateway(
+            gateway_addr,
+            Ipv4Addr::new(198, 51, 100, 7),
+            53420,
+            7200,
+            PCP_RESULT_SUCCESS,
+            1,
+            None,
+        );
+
+        let lease = client
+            .request_udp_mapping(51820, 3600)
+            .expect("PCP MAP succeeds against fake gateway");
+        assert_eq!(lease.internal_port, 51820);
+        assert_eq!(lease.external_port, 53420);
+        assert_eq!(
+            lease.external_addr,
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+        );
+        assert_eq!(lease.protocol, PortMappingProtocol::Pcp);
+        assert!(
+            lease.pcp_nonce.is_some(),
+            "PCP lease must carry the Mapping Nonce for renewal/delete"
+        );
+
+        let req = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("request arrives");
+        assert_eq!(req[0], PCP_VERSION);
+        assert_eq!(req[1], PCP_OPCODE_MAP);
+        // Verify the nonce on the wire matches what's stored in the lease.
+        let mut wire_nonce = [0u8; PCP_NONCE_LEN];
+        wire_nonce.copy_from_slice(&req[24..36]);
+        assert_eq!(
+            lease.pcp_nonce.expect("nonce present"),
+            wire_nonce,
+            "lease must store the same nonce that was sent on the wire"
+        );
+
+        handle.join().expect("fake PCP gateway thread joins");
+    }
+
+    #[test]
+    fn pcp_response_nonce_mismatch_is_rejected_as_invalid_response() {
+        // RFC 6887 §11.2: a response carrying a Mapping Nonce different
+        // from the one in the request must be rejected — otherwise an
+        // off-path attacker who races our outgoing packet could
+        // substitute their own mapping. This test forces a wrong nonce
+        // in the fake gateway's response and pins that the client
+        // surfaces `InvalidResponse` rather than a successful lease.
+        let (client, gateway_addr) = make_pcp_test_client();
+        let wrong_nonce: [u8; PCP_NONCE_LEN] = [0xde; PCP_NONCE_LEN];
+        let (handle, _rx) = spawn_fake_pcp_gateway(
+            gateway_addr,
+            Ipv4Addr::new(198, 51, 100, 7),
+            53420,
+            7200,
+            PCP_RESULT_SUCCESS,
+            1,
+            Some(wrong_nonce),
+        );
+
+        let err = client
+            .request_udp_mapping(51820, 3600)
+            .expect_err("response with wrong nonce must fail");
+        assert!(
+            matches!(err, PortMapperError::InvalidResponse(ref msg) if msg.contains("nonce")),
+            "expected InvalidResponse mentioning nonce, got: {err:?}"
+        );
+
+        handle.join().expect("fake PCP gateway thread joins");
+    }
+
+    #[test]
+    fn pcp_result_code_address_mismatch_maps_to_refused_with_nat44_hint() {
+        // RFC 6887 §7.4: ADDRESS_MISMATCH (12) signals that the gateway
+        // saw a source IP different from the embedded Client IP — the
+        // classic symptom of a NAT44 layer between the host and the
+        // gateway. The error message should hint at this so an operator
+        // can diagnose the network topology.
+        let (client, gateway_addr) = make_pcp_test_client();
+        let (handle, _rx) = spawn_fake_pcp_gateway(
+            gateway_addr,
+            Ipv4Addr::UNSPECIFIED,
+            0,
+            0,
+            PCP_RESULT_ADDRESS_MISMATCH,
+            1,
+            None,
+        );
+
+        let err = client
+            .request_udp_mapping(51820, 3600)
+            .expect_err("ADDRESS_MISMATCH must surface as an error");
+        match err {
+            PortMapperError::Refused(msg) => {
+                assert!(
+                    msg.contains("NAT44") || msg.contains("address") || msg.contains("source"),
+                    "expected ADDRESS_MISMATCH error message to hint at the cause, got: {msg}"
+                );
+            }
+            other => panic!("expected Refused, got: {other:?}"),
+        }
+
+        handle.join().expect("fake PCP gateway thread joins");
+    }
+
+    #[test]
+    fn pcp_release_mapping_requires_stored_nonce() {
+        // RFC 6887 §15 + §11.2: the Mapping Nonce is the credential
+        // used to authorise a delete. A lease without a stored nonce
+        // (e.g. a lease minted by NAT-PMP that someone then tried to
+        // release via the PCP client) MUST be refused at the client —
+        // we should not send a partial PCP delete with a fresh random
+        // nonce, because the gateway will refuse it.
+        let pcp = PcpClient::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        let lease_without_nonce = MappingLease {
+            internal_port: 51820,
+            external_port: 51820,
+            external_addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+            protocol: PortMappingProtocol::NatPmp,
+            expires_at: Instant::now() + Duration::from_secs(1800),
+            pcp_nonce: None,
+        };
+        let err = pcp
+            .release_mapping(&lease_without_nonce)
+            .expect_err("release of nonce-less lease must fail closed");
+        assert!(
+            matches!(err, PortMapperError::InvalidResponse(ref msg) if msg.contains("Mapping Nonce")),
+            "expected InvalidResponse about missing nonce, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pcp_unsupp_version_maps_to_protocol_not_supported_for_orchestrator_fallthrough() {
+        // The probe orchestrator (follow-up slice in D2.3) uses
+        // `ProtocolNotSupported` as the signal to fall through to the
+        // next protocol. UNSUPP_VERSION (1) means "this gateway does
+        // not speak PCP v2"; it MUST classify as
+        // ProtocolNotSupported, not Refused.
+        let (client, gateway_addr) = make_pcp_test_client();
+        let (handle, _rx) = spawn_fake_pcp_gateway(
+            gateway_addr,
+            Ipv4Addr::UNSPECIFIED,
+            0,
+            0,
+            PCP_RESULT_UNSUPP_VERSION,
+            1,
+            None,
+        );
+
+        let err = client
+            .request_udp_mapping(51820, 3600)
+            .expect_err("UNSUPP_VERSION must error");
+        assert!(
+            matches!(err, PortMapperError::ProtocolNotSupported(_)),
+            "UNSUPP_VERSION must classify as ProtocolNotSupported for orchestrator fall-through, got: {err:?}"
+        );
+
+        handle.join().expect("fake PCP gateway thread joins");
+    }
+
+    #[test]
+    fn pcp_address_parser_round_trips_v4_mapped_and_native_v6() {
+        // ::ffff:1.2.3.4 → IpAddr::V4(1.2.3.4).
+        let mut v4_mapped = [0u8; 16];
+        v4_mapped[10] = 0xff;
+        v4_mapped[11] = 0xff;
+        v4_mapped[12..16].copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            parse_pcp_address(v4_mapped),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            "v4-mapped IPv6 must surface as IpAddr::V4"
+        );
+        // 2001:db8::1 → IpAddr::V6(2001:db8::1).
+        let v6_native = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(
+            parse_pcp_address(v6_native),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+            "native IPv6 must surface as IpAddr::V6"
+        );
     }
 }
