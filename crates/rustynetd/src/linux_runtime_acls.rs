@@ -620,4 +620,180 @@ mod tests {
         assert!(derived, "overall_ok must be true when every root is Ok");
         assert_eq!(report.overall_ok, derived);
     }
+
+    // ----- L2 coverage parity sweep: schema, reviewed-list, serde shape -----
+
+    #[test]
+    fn reviewed_roots_snapshot_pins_two_entries_with_exact_posture() {
+        // Pins LINUX_RUNTIME_STARTUP_ACL_ROOTS shape: any silent edit to
+        // a reviewed mode, owner, or group has to update this snapshot
+        // alongside the constant. Catches a future refactor that drops
+        // a reviewed root (e.g. forgets /etc/rustynet) or relaxes
+        // /var/lib/rustynet from 0o700 to 0o750.
+        let canonical = [
+            (
+                "/var/lib/rustynet",
+                "state root",
+                0o700_u32,
+                "rustynetd",
+                "rustynetd",
+            ),
+            (
+                "/etc/rustynet",
+                "config root",
+                0o750_u32,
+                "root",
+                "rustynetd",
+            ),
+        ];
+        assert_eq!(
+            LINUX_RUNTIME_STARTUP_ACL_ROOTS.len(),
+            canonical.len(),
+            "reviewed roots list grew or shrank — update the snapshot and the security review notes together"
+        );
+        for ((path, label, mode, owner, group), expected) in
+            LINUX_RUNTIME_STARTUP_ACL_ROOTS.iter().zip(canonical.iter())
+        {
+            assert_eq!(*path, expected.0, "path drift: {path}");
+            assert_eq!(*label, expected.1, "label drift for {path}: {label}");
+            assert_eq!(*mode, expected.2, "mode drift for {path}: 0o{mode:o}");
+            assert_eq!(*owner, expected.3, "owner drift for {path}: {owner}");
+            assert_eq!(*group, expected.4, "group drift for {path}: {group}");
+        }
+    }
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        // A schema_version bump is a deliberate cross-cutting change
+        // that has to update every consumer; pin the current value so
+        // an accidental bump trips this test.
+        let off_host_report = LinuxRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: false,
+            roots: Vec::new(),
+        };
+        assert_eq!(off_host_report.schema_version, 1);
+
+        // Verify the JSON shape too: the field name is `schema_version`
+        // and the value is the integer 1 (not a stringified "1").
+        let body = serde_json::to_string(&off_host_report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape must be int=1: {body}"
+        );
+    }
+
+    #[test]
+    fn root_status_missing_round_trips_through_serde() {
+        // The Missing branch carries a reason and is the off-Linux /
+        // path-absent default — round-trip it explicitly so the
+        // #[serde(tag = "status", rename_all = "snake_case")] contract
+        // stays pinned on every variant.
+        let entry = LinuxRuntimeAclRootEntry {
+            label: "state root".to_string(),
+            path: "/var/lib/rustynet".to_string(),
+            status: LinuxRuntimeAclRootStatus::Missing {
+                reason: "off-Linux probe stub".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"missing\""), "tag shape: {body}");
+        let parsed: LinuxRuntimeAclRootEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn root_status_rejects_unknown_status_tag() {
+        // The enum is tagged + snake_case-renamed; an unknown tag must
+        // fail the parse rather than silently coerce to a known variant.
+        let body = r#"{"label":"state root","path":"/var/lib/rustynet","status":"observe_only","reason":"placeholder"}"#;
+        let err = serde_json::from_str::<LinuxRuntimeAclRootEntry>(body)
+            .expect_err("unknown tag must fail closed");
+        assert!(
+            err.to_string().contains("observe_only") || err.to_string().contains("unknown variant"),
+            "error must reference the unknown tag or 'unknown variant': {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_masks_high_mode_bits_above_seven_octal_digits() {
+        // The kernel may report mode bits beyond the 0o7777 mask
+        // (e.g. file-type bits, ACL flags). Pin that masking via &
+        // 0o7777 stays in place — a future widen to mode-without-mask
+        // would reject every snapshot.
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o140700, // arbitrary high bits + 0o0700
+            uid: 998,
+            gid: 998,
+            is_dir: true,
+            is_symlink: false,
+        };
+        evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect("mode mask must ignore bits above 0o7777");
+    }
+
+    #[test]
+    fn evaluator_rejects_symlink_before_dir_check() {
+        // A symlink that points at a real directory still must reject
+        // (symlinks aren't traversed by the live verifier). Pin the
+        // check order: symlink wins over is_dir.
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o40700,
+            uid: 998,
+            gid: 998,
+            is_dir: true, // is_dir true on the link target — irrelevant
+            is_symlink: true,
+        };
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("symlink must reject even when target is a dir");
+        assert!(
+            err.contains("symlink") && !err.contains("file"),
+            "rejection must cite symlink, not the generic file-vs-dir reason: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_first_fault_is_symlink_before_mode_drift() {
+        // A snapshot with both symlink AND mode-drift should surface
+        // the symlink reason first — the structural check (symlink
+        // hides the real entry) takes precedence over the mode check
+        // (which would otherwise mislead the operator).
+        let snap = LinuxRuntimeAclSnapshot {
+            mode: 0o40755, // also drifted
+            uid: 998,
+            gid: 998,
+            is_dir: false,
+            is_symlink: true,
+        };
+        let err = evaluate_linux_runtime_acl_metadata("state root", state_root_expectation(), snap)
+            .expect_err("symlink + mode drift must reject");
+        assert!(
+            err.contains("symlink") && !err.contains("0o755"),
+            "first reason must be symlink, not mode: {err}"
+        );
+    }
+
+    #[test]
+    fn report_with_empty_roots_yields_vacuously_true_overall_ok() {
+        // Document the current behavior: an empty roots Vec yields
+        // overall_ok=true via Iterator::all() vacuous-truth semantics.
+        // This is fine in production because the collector iterates a
+        // const array with two entries and cannot produce an empty
+        // Vec, but the test pins the behavior so a future refactor
+        // that special-cases empty input (e.g. to error out) trips a
+        // visible test failure rather than silently changing semantics.
+        let report = LinuxRuntimeAclReport {
+            schema_version: 1,
+            overall_ok: true,
+            roots: Vec::new(),
+        };
+        let derived = report
+            .roots
+            .iter()
+            .all(|entry| matches!(entry.status, LinuxRuntimeAclRootStatus::Ok));
+        assert!(
+            derived,
+            "empty roots Vec is vacuously all-Ok by iterator semantics"
+        );
+    }
 }

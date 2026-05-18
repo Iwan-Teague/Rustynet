@@ -65,7 +65,13 @@ esac
 # Pinned floors. Each entry: <module>:<expected-min-passing>.
 # Updating a floor is a deliberate act — commit message must say why.
 LINUX_FLOORS=(
-  "linux_runtime_acls:19"
+  # Floor bumped 19→27 on X4 coverage parity sweep: 8 new tests
+  # covering the reviewed-roots-list snapshot, schema_version pin,
+  # Missing-variant serde round-trip, unknown-tag rejection, high
+  # mode-bit masking, symlink-before-dir-check ordering, symlink +
+  # mode drift first-fault precedence, and the vacuous-truth
+  # documented behavior for empty-roots.
+  "linux_runtime_acls:27"
   # Floor bumped 30→33 on L8 wire-up: 3 new pins on the reviewed
   # rustynetd.service unit (ExecStartPre killswitch-boot-check,
   # LoadCredentialEncrypted lines, MemoryDenyWriteExecute=true).
