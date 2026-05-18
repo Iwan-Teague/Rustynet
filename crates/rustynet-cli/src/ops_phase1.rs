@@ -155,6 +155,58 @@ fn phase1_update_max(current: &mut Option<f64>, value: f64) {
     *current = Some(next);
 }
 
+/// X2: typed view over a single entry in a Phase 1 report's
+/// `metrics` array, walked by `phase1_validate_report`.
+///
+/// Field-shape rules:
+/// * `name: String` and `status: String` are required. Missing or
+///   wrong-type fields fail at deserialize with a precise serde
+///   error; the validator wraps that error with the report label
+///   and path so reviewers see which file is at fault.
+/// * `value: Value` is left as `Value` on purpose. The downstream
+///   `phase1_value_as_number` helper performs a custom multi-shape
+///   coercion (rejects bools; accepts f64/i64/u64; requires
+///   finite + non-negative). Forcing a typed numeric here would
+///   change the contract — e.g. an integer-shaped `value: 5` would
+///   fail an `f64` typed slot. Keep the helper as the single source
+///   of truth and route the typed slot through it.
+/// * `reason: Option<String>` lets the validator distinguish
+///   absent-reason from present-string; a wrong-type slot fails at
+///   deserialize.
+/// * `#[serde(flatten)] extra` preserves any other metric fields
+///   the report shape may carry (forward-compat).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct Phase1MetricEntryView {
+    pub name: Option<String>,
+    pub value: Option<Value>,
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// X2: typed view over the top-level shape walked by
+/// `phase1_validate_report`. The validator only reads `metrics`,
+/// so the typed view exposes that one required-shape slot and rides
+/// every other field through `#[serde(flatten)] extra`.
+///
+/// `metrics: Option<Vec<Phase1MetricEntryView>>` is `Option<_>` so
+/// the validator can emit the legacy "missing metrics array" error
+/// message instead of bubbling a serde error. A present-but-wrong-
+/// type `metrics` field (e.g. `metrics: {}`) still fails at
+/// deserialize, with the precise serde error wrapped at the
+/// validator boundary.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct Phase1ValidateReportView {
+    pub metrics: Option<Vec<Phase1MetricEntryView>>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
 fn phase1_value_as_number(value: &Value) -> Option<f64> {
     if value.is_boolean() {
         return None;
@@ -840,21 +892,33 @@ fn phase1_validate_report(
     required_metric_names: &[&str],
 ) -> Result<(), String> {
     let payload = read_json_value(report_path, report_label)?;
-    let payload_object = payload.as_object().ok_or_else(|| {
-        format!(
+    if !payload.is_object() {
+        return Err(format!(
             "{report_label} must be a JSON object: {}",
+            report_path.display()
+        ));
+    }
+    // X2: deserialise the report payload once into the typed view.
+    // A present-but-wrong-type `metrics` field (e.g. `metrics: {}`)
+    // fails here with a precise serde error; a wrong-type slot
+    // inside a metric entry (e.g. `status: 42`) likewise fails here
+    // instead of slipping past the legacy
+    // `.and_then(Value::as_str)` walk. The legacy "missing metrics
+    // array" / "missing name" / "missing status" / "missing numeric
+    // value" messages are preserved at the validator boundary so the
+    // existing failing-report tests do not regress.
+    let typed: Phase1ValidateReportView = serde_json::from_value(payload).map_err(|err| {
+        format!(
+            "{report_label} has invalid field shape: {} ({err})",
             report_path.display()
         )
     })?;
-    let metrics = payload_object
-        .get("metrics")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{report_label} missing metrics array: {}",
-                report_path.display()
-            )
-        })?;
+    let metrics = typed.metrics.as_ref().ok_or_else(|| {
+        format!(
+            "{report_label} missing metrics array: {}",
+            report_path.display()
+        )
+    })?;
     if metrics.is_empty() {
         return Err(format!(
             "{report_label} metrics array is empty: {}",
@@ -864,23 +928,15 @@ fn phase1_validate_report(
 
     let mut present_metrics = HashMap::new();
     for metric in metrics {
-        let metric_object = metric.as_object().ok_or_else(|| {
+        let name = metric.name.as_deref().ok_or_else(|| {
             format!(
-                "{report_label} metric entry is not an object: {}",
+                "{report_label} metric entry missing name: {}",
                 report_path.display()
             )
         })?;
-        let name = metric_object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{report_label} metric entry missing name: {}",
-                    report_path.display()
-                )
-            })?;
-        let metric_value = metric_object
-            .get("value")
+        let metric_value = metric
+            .value
+            .as_ref()
             .and_then(phase1_value_as_number)
             .ok_or_else(|| {
                 format!(
@@ -894,15 +950,12 @@ fn phase1_validate_report(
                 report_path.display()
             ));
         }
-        let status = metric_object
-            .get("status")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{report_label} metric '{name}' missing status: {}",
-                    report_path.display()
-                )
-            })?;
+        let status = metric.status.as_deref().ok_or_else(|| {
+            format!(
+                "{report_label} metric '{name}' missing status: {}",
+                report_path.display()
+            )
+        })?;
         if status == "fail" {
             return Err(format!(
                 "{report_label} contains failing metric '{name}': {}",
@@ -915,13 +968,9 @@ fn phase1_validate_report(
                 report_path.display()
             ));
         }
-        if metric_object
-            .get("reason")
-            .and_then(Value::as_str)
-            .is_some_and(|reason| {
-                reason == "measurement_unavailable" || reason == "measurement_invalid"
-            })
-        {
+        if metric.reason.as_deref().is_some_and(|reason| {
+            reason == "measurement_unavailable" || reason == "measurement_invalid"
+        }) {
             return Err(format!(
                 "{report_label} contains unavailable/invalid measurement for metric '{name}': {}",
                 report_path.display()
@@ -2225,12 +2274,13 @@ pub fn execute_ops_run_phase1_baseline() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckDependencyExceptionsConfig, CheckPerfRegressionConfig,
-        execute_ops_check_dependency_exceptions, execute_ops_check_perf_regression,
-        extract_bearer_excerpt, extract_secret_assignment_excerpt,
-        line_contains_forbidden_inline_passphrase_flag, parse_bool_value,
-        parse_mktemp_secret_variable, parse_utc_to_unix, phase1_collect_measured_input_from_source,
-        phase1_validate_report, phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
+        CheckDependencyExceptionsConfig, CheckPerfRegressionConfig, Phase1MetricEntryView,
+        Phase1ValidateReportView, execute_ops_check_dependency_exceptions,
+        execute_ops_check_perf_regression, extract_bearer_excerpt,
+        extract_secret_assignment_excerpt, line_contains_forbidden_inline_passphrase_flag,
+        parse_bool_value, parse_mktemp_secret_variable, parse_utc_to_unix,
+        phase1_collect_measured_input_from_source, phase1_validate_report,
+        phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -2395,6 +2445,100 @@ mod tests {
                 .expect_err("report validation should fail");
         assert!(err.contains("non-measured metric"));
         let _ = std::fs::remove_file(report_path);
+    }
+
+    // ---- X2: Phase1ValidateReportView typed-view migration --------
+
+    /// Clean fixture: a well-formed report payload (single metric)
+    /// deserialises into the typed view; the metric entry's typed
+    /// slots populate; non-required keys ride through
+    /// `#[serde(flatten)] extra`.
+    #[test]
+    fn phase1_validate_report_view_accepts_clean_payload() {
+        let payload = serde_json::json!({
+            "phase": "phase1",
+            "suite": "runtime_baseline",
+            "metrics": [
+                {
+                    "name": "idle_cpu_percent",
+                    "value": 1.5,
+                    "status": "pass",
+                    "reason": "ok",
+                    "extra_field": "ride-through",
+                }
+            ],
+        });
+        let view: Phase1ValidateReportView =
+            serde_json::from_value(payload).expect("typed view accepts the clean phase1 fixture");
+        let metrics = view.metrics.expect("metrics array present");
+        assert_eq!(metrics.len(), 1);
+        let entry = &metrics[0];
+        assert_eq!(entry.name.as_deref(), Some("idle_cpu_percent"));
+        assert_eq!(entry.status.as_deref(), Some("pass"));
+        assert_eq!(entry.reason.as_deref(), Some("ok"));
+        assert!(entry.value.is_some(), "value slot must carry the Value");
+        assert_eq!(
+            entry
+                .extra
+                .get("extra_field")
+                .and_then(serde_json::Value::as_str),
+            Some("ride-through")
+        );
+    }
+
+    /// Wrong-type `metrics` slot rejected at the typed layer. The
+    /// legacy code path used `.and_then(Value::as_array)` which
+    /// silently returned `None` and surfaced as "missing metrics
+    /// array"; the typed deserialise instead produces a precise
+    /// "invalid field shape" error that names `metrics`.
+    #[test]
+    fn phase1_validate_report_view_rejects_wrong_type_metrics_slot() {
+        let payload = serde_json::json!({ "metrics": {} });
+        let err = serde_json::from_value::<Phase1ValidateReportView>(payload)
+            .expect_err("object metrics must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("metrics") || message.contains("sequence"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `status` slot inside a metric entry rejected. Was
+    /// previously silent: `.and_then(Value::as_str)` returning `None`
+    /// caused the legacy validator to bubble "missing status",
+    /// hiding the actual shape problem. Now the typed deserialize
+    /// surfaces the precise field-type error.
+    #[test]
+    fn phase1_metric_entry_view_rejects_wrong_type_status_slot() {
+        let payload = serde_json::json!({
+            "name": "idle_cpu_percent",
+            "value": 1.0,
+            "status": 42,
+        });
+        let err = serde_json::from_value::<Phase1MetricEntryView>(payload)
+            .expect_err("integer status must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("status") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Validator integration: a present-but-wrong-type `metrics`
+    /// field surfaces the new "invalid field shape" error wrapping
+    /// the precise serde message — confirming the typed layer
+    /// triggers before the legacy "missing metrics array" branch.
+    #[test]
+    fn phase1_validate_report_surfaces_typed_shape_error() {
+        let path = unique_temp_path("rustynet-phase1-shape-error", ".json");
+        std::fs::write(&path, br#"{"metrics": {}}"#).expect("write report");
+        let err = phase1_validate_report(&path, "phase1 runtime report", &["idle_cpu_percent"])
+            .expect_err("validator must surface the typed shape error");
+        assert!(
+            err.contains("invalid field shape"),
+            "validator must wrap the typed deserialise error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
