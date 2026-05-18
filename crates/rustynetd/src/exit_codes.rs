@@ -34,8 +34,8 @@
 //! * `GenericFailure` is `1` so existing `if !cmd; then …` checks
 //!   keep working. New code should prefer a narrower variant.
 //!
-//! See `documents/operations/runbooks/cli_exit_codes.md` for the
-//! operator-facing summary.
+//! See `documents/operations/CliExitCodeTaxonomy.md` for the
+//! operator-facing summary, and ADR-003 for the design rationale.
 
 /// CLI exit-code taxonomy. See module docs for the reviewed contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
