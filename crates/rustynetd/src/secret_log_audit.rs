@@ -393,7 +393,7 @@ pub(crate) fn scan_source_for_base64_encoded_secret_log_sites(
                 }
                 let arg = &line[start..i.min(bytes.len())];
                 if let Some(token) = arg_mentions_forbidden_token(arg) {
-                    let call = format!("{}{arg})", prefix);
+                    let call = format!("{prefix}{arg})");
                     hits.push((idx + 1, call, token.to_string()));
                 }
                 search_from = i.saturating_add(1);
