@@ -49,15 +49,15 @@ named drift tests, the regression-coverage CI gate
 | `windows_registry_acls`         | 17    | Reviewed HKLM RustyNet service-key paths + forbidden DACL principals (WD/AU/BU/AN); cross-platform stub collector emits Unobserved entries (real Win32 collector follow-up) |
 | `windows_paths`                 | 61    | SDDL grant/deny matcher (substring-match negative, exact ACE-type token); local-secret ACL evaluator forbidden-principal rejection; runtime-path validator UNC + user-temp reject + canonical ProgramData accept |
 
-### Shared (platform-agnostic audit, 1 module, 37 pinned tests)
+### Shared (platform-agnostic audit, 1 module, 45 pinned tests)
 
 | Module                          | Floor | What it pins                                                                                             |
 |---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
-| `secret_log_audit`              | 37    | Forbidden placeholder tokens in log macros (passphrase_bytes / private_key_bytes / signing_key_bytes / wrapped_secret / decrypted_secret / plaintext_key / raw_passphrase / secret_bytes / signing_seed); Debug + Display + ToString deny on canonical secret-bearing types; hex + base64 encode wrappers around forbidden idents; secret-material equality (==/!=) without ct_eq with structured allowlist + per-entry justification |
+| `secret_log_audit`              | 45    | Forbidden placeholder tokens in log macros (passphrase_bytes / private_key_bytes / signing_key_bytes / wrapped_secret / decrypted_secret / plaintext_key / raw_passphrase / secret_bytes / signing_seed); Debug + Display + ToString deny on canonical secret-bearing types; hex + base64 encode wrappers around forbidden idents; secret-material equality (==/!=) without ct_eq with structured allowlist + per-entry justification; deprecated-crypto-imports (`use sha1` / `use md5` / `use md_5` / `use des` / `use des3` / `use triple_des`) with boundary-terminator check that rejects safe-name lookalikes (sha2 / sha3 / descriptor / md_hashlib) |
 
 ### Aggregate
 
-- **21 verifier + audit modules** across 4 groups, **~570 pinned tests** on the regression-coverage gate floor.
+- **21 verifier + audit modules** across 4 groups, **578 pinned tests** on the regression-coverage gate floor (sum of per-module floors: linux 196 + macos 74 + windows 263 + shared 45).
 - Every Linux verifier has a macOS + Windows analog (or equivalent surface). Every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls` / `windows_paths`).
 - Workspace test sweep: **2786 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends, measured 2026-05-18 post X4/X7 expansion).
 
@@ -135,7 +135,7 @@ Modules with typed views landed:
 | `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2786 tests as of 2026-05-18)                   |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
-| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (21 modules across 4 groups, ~570 pinned tests)  |
+| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (21 modules across 4 groups, 578 pinned tests)   |
 | `scripts/ci/start_modularization_smoke.sh`         | bash module / dispatcher contract (32 checks)                                |
 | `scripts/ci/secrets_hygiene_gates.sh`              | structured secret-leak audit + required tests                                |
 | Per-phase gate scripts (`phase1_gates.sh` … `phase10_gates.sh`) | per-phase release-readiness pins                                |
