@@ -413,7 +413,7 @@ fn current_uid() -> Result<u32, String> {
 fn cargo_bin_dir_if_present() -> Option<PathBuf> {
     let home = env::var_os("HOME").filter(|value| !value.is_empty())?;
     let path = Path::new(&home).join(".cargo").join("bin");
-    if path.is_dir() { Some(path) } else { None }
+    path.is_dir().then_some(path)
 }
 
 fn command_exists(name: &str, path_prefix: Option<&Path>) -> bool {

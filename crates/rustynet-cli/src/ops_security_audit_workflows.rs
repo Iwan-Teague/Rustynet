@@ -1579,11 +1579,7 @@ fn non_empty_output(primary: Vec<u8>, secondary: Vec<u8>) -> Option<String> {
         return Some(primary);
     }
     let secondary = String::from_utf8_lossy(&secondary).trim().to_owned();
-    if !secondary.is_empty() {
-        Some(secondary)
-    } else {
-        None
-    }
+    (!secondary.is_empty()).then_some(secondary)
 }
 
 fn timestamp_for_path() -> String {

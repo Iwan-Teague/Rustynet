@@ -4057,11 +4057,7 @@ mod tests {
     fn payload_field(payload: &str, key: &str) -> Option<String> {
         payload.lines().find_map(|line| {
             let (line_key, value) = line.split_once('=')?;
-            if line_key == key {
-                Some(value.to_owned())
-            } else {
-                None
-            }
+            (line_key == key).then(|| value.to_owned())
         })
     }
 

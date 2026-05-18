@@ -2436,11 +2436,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_wg_pub = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "cat",
         &["/var/lib/rustynet/keys/wireguard.pub"],
         &[],
@@ -2451,11 +2447,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let client_wg_pub = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "cat",
         &["/var/lib/rustynet/keys/wireguard.pub"],
         &[],
@@ -2490,22 +2482,14 @@ pub fn execute_ops_run_debian_two_node_e2e(
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "/var/lib/rustynet/membership.snapshot",
         workspace.membership_snapshot_local.as_path(),
     )?;
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "/var/lib/rustynet/membership.log",
         workspace.membership_log_local.as_path(),
     )?;
@@ -2535,11 +2519,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     run_remote_program_checked(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "rm",
         &["-f", "/var/lib/rustynet/membership.watermark"],
         &[],
@@ -2592,66 +2572,42 @@ pub fn execute_ops_run_debian_two_node_e2e(
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         remote_assignment_pub.as_str(),
         workspace.assignment_pub_local.as_path(),
     )?;
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         remote_assignment_exit.as_str(),
         workspace.assignment_exit_local.as_path(),
     )?;
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         remote_assignment_client.as_str(),
         workspace.assignment_client_local.as_path(),
     )?;
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         remote_traversal_pub.as_str(),
         workspace.traversal_pub_local.as_path(),
     )?;
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         remote_traversal_exit.as_str(),
         workspace.traversal_exit_local.as_path(),
     )?;
     copy_remote_file_to_local(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         remote_traversal_client.as_str(),
         workspace.traversal_client_local.as_path(),
     )?;
@@ -2748,11 +2704,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     run_remote_program_checked(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "rm",
         &[
             "-f",
@@ -2764,11 +2716,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     run_remote_program_checked(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "rm",
         &["-rf", remote_artifact_dir.as_str()],
         &[],
@@ -2776,11 +2724,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     run_remote_program_checked(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "rm",
         &[
             "-f",
@@ -2884,11 +2828,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     retry_remote_program(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         RemoteRetryProgram {
             attempts: 20,
             sleep_secs: 2,
@@ -2900,11 +2840,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     retry_remote_program(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         RemoteRetryProgram {
             attempts: 20,
             sleep_secs: 2,
@@ -2916,11 +2852,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     retry_remote_program(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         RemoteRetryProgram {
             attempts: 10,
             sleep_secs: 2,
@@ -2935,11 +2867,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_status = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "rustynet",
         &["status"],
         &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
@@ -2948,11 +2876,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let client_status = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "rustynet",
         &["status"],
         &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
@@ -2961,11 +2885,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let client_route = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "ip",
         &["-4", "route", "get", "1.1.1.1"],
         &[],
@@ -2974,11 +2894,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_wg_show = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "wg",
         &["show", "rustynet0"],
         &[],
@@ -2987,11 +2903,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_nft_ruleset = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "nft",
         &["list", "ruleset"],
         &[],
@@ -3000,11 +2912,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_tunnel_addr_output = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "ip",
         &["-4", "-o", "addr", "show", "dev", "rustynet0"],
         &[],
@@ -3016,11 +2924,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_assignment_timer_state = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "systemctl",
         &["is-active", "rustynetd-assignment-refresh.timer"],
         &[],
@@ -3031,11 +2935,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let client_assignment_timer_state = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "systemctl",
         &["is-active", "rustynetd-assignment-refresh.timer"],
         &[],
@@ -3048,11 +2948,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
         run_remote_program_checked(
             ssh_opts.as_slice(),
             client_target.qualified.as_str(),
-            if needs_client_sudo {
-                Some(sudo_password.as_str())
-            } else {
-                None
-            },
+            needs_client_sudo.then_some(sudo_password.as_str()),
             "ping",
             &["-c", "2", "-W", "2", exit_tunnel_ip.as_str()],
             &[],
@@ -3062,11 +2958,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_handshakes = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "wg",
         &["show", "rustynet0", "latest-handshakes"],
         &[],
@@ -3076,11 +2968,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let client_plaintext_keys = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "ls",
         &[
             "-1",
@@ -3093,11 +2981,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_plaintext_keys = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "ls",
         &[
             "-1",
@@ -3110,101 +2994,61 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let client_cred_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/credentials/wg_key_passphrase.cred",
     )?;
     let exit_cred_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/credentials/wg_key_passphrase.cred",
     )?;
     let client_signing_cred_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/credentials/signing_key_passphrase.cred",
     )?;
     let exit_signing_cred_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/credentials/signing_key_passphrase.cred",
     )?;
     let client_key_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "/var/lib/rustynet/keys/wireguard.key.enc",
     )?;
     let exit_key_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "/var/lib/rustynet/keys/wireguard.key.enc",
     )?;
     let client_assignment_secret_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/assignment.signing.secret",
     )?;
     let exit_assignment_secret_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/assignment.signing.secret",
     )?;
     let client_trust_signer_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/trust-evidence.key",
     )?;
     let exit_trust_signer_mode = remote_stat_mode(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "/etc/rustynet/trust-evidence.key",
     )?;
 
@@ -3217,11 +3061,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let exit_status_after_refresh = capture_remote_program_output(
         ssh_opts.as_slice(),
         exit_target.qualified.as_str(),
-        if needs_exit_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_exit_sudo.then_some(sudo_password.as_str()),
         "rustynet",
         &["status"],
         &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
@@ -3230,11 +3070,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
     let client_status_after_refresh = capture_remote_program_output(
         ssh_opts.as_slice(),
         client_target.qualified.as_str(),
-        if needs_client_sudo {
-            Some(sudo_password.as_str())
-        } else {
-            None
-        },
+        needs_client_sudo.then_some(sudo_password.as_str()),
         "rustynet",
         &["status"],
         &[("RUSTYNET_DAEMON_SOCKET", "/run/rustynet/rustynetd.sock")],
@@ -4649,11 +4485,7 @@ fn copy_local_archive_to_host(
     remote_src_dir: &str,
 ) -> Result<(), String> {
     ensure_safe_remote_path(remote_src_dir)?;
-    let sudo = if needs_sudo {
-        Some(sudo_password)
-    } else {
-        None
-    };
+    let sudo = needs_sudo.then_some(sudo_password);
     run_remote_program_checked(options, host, sudo, "rm", &["-rf", remote_src_dir], &[])?;
     run_remote_program_checked(
         options,
@@ -5015,11 +4847,7 @@ fn run_remote_debian_bootstrap_host(
         "root",
         "0700",
     )?;
-    let sudo = if needs_sudo {
-        Some(sudo_password)
-    } else {
-        None
-    };
+    let sudo = needs_sudo.then_some(sudo_password);
     let result = run_remote_program_checked(
         options,
         host,
@@ -5209,11 +5037,7 @@ fn normalize_membership_permissions(
     needs_sudo: bool,
     sudo_password: &str,
 ) -> Result<(), String> {
-    let sudo = if needs_sudo {
-        Some(sudo_password)
-    } else {
-        None
-    };
+    let sudo = needs_sudo.then_some(sudo_password);
     run_remote_program_checked(
         options,
         host,

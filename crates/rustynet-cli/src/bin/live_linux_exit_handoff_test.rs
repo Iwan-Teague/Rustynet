@@ -796,11 +796,8 @@ fn run() -> Result<(), String> {
         if ts < switch_ts {
             return None;
         }
-        if line.contains(&format!("exit_node={}", config.exit_b_node_id)) {
-            Some(ts)
-        } else {
-            None
-        }
+        line.contains(&format!("exit_node={}", config.exit_b_node_id))
+            .then_some(ts)
     });
     let reconvergence_secs = first_switch_ts
         .and_then(|value| value.checked_sub(switch_ts))

@@ -11603,7 +11603,7 @@ fn parse_cidr(value: &str) -> Option<(std::net::IpAddr, u8)> {
         std::net::IpAddr::V4(_) => prefix <= 32,
         std::net::IpAddr::V6(_) => prefix <= 128,
     };
-    if valid { Some((ip, prefix)) } else { None }
+    valid.then_some((ip, prefix))
 }
 
 #[cfg(target_os = "linux")]

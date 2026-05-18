@@ -1414,13 +1414,7 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
         let tz_start = trimmed
             .char_indices()
             .rev()
-            .find_map(|(index, ch)| {
-                if index > 10 && (ch == '+' || ch == '-') {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
+            .find_map(|(index, ch)| (index > 10 && (ch == '+' || ch == '-')).then_some(index))
             .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
         let (base, zone) = trimmed.split_at(tz_start);
         if zone.len() != 6 {

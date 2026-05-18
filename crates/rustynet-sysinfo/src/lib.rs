@@ -1551,11 +1551,7 @@ fn get_daemon_uptime() -> Option<u64> {
             0
         };
 
-        return if total_secs > 0 {
-            Some(total_secs)
-        } else {
-            None
-        };
+        return (total_secs > 0).then_some(total_secs);
     }
     None
 }

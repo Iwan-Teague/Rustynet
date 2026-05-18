@@ -1804,13 +1804,8 @@ mod daemon {
     fn windows_relay_service_flag_values<'a>(argv_tail: &'a [String], flag: &str) -> Vec<&'a str> {
         argv_tail
             .windows(2)
-            .filter_map(|pair| {
-                if pair[0] == flag {
-                    Some(pair[1].as_str())
-                } else {
-                    None
-                }
-            })
+            .filter(|&pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
             .collect()
     }
 
