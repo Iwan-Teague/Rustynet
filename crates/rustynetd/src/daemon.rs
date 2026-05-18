@@ -3112,17 +3112,17 @@ impl DaemonRuntime {
             .map_err(|_| MembershipBootstrapError::InvalidRoot)?;
         let watermark = MembershipWatermark {
             epoch: replayed.epoch,
-            state_root: state_root.clone(),
+            state_root,
         };
         let previous = load_membership_watermark(&self.membership_watermark_path)
-            .map_err(|err| MembershipBootstrapError::Io(err.to_string()))?;
+            .map_err(MembershipBootstrapError::Io)?;
         if let Some(previous) = previous {
             if membership_watermark_is_replay(&watermark, &previous) {
                 return Err(MembershipBootstrapError::WatermarkReplay);
             }
         }
         persist_membership_watermark(&self.membership_watermark_path, &watermark)
-            .map_err(|err| MembershipBootstrapError::Io(err.to_string()))?;
+            .map_err(MembershipBootstrapError::Io)?;
 
         let local_active = replayed.nodes.iter().any(|node| {
             node.node_id == self.local_node_id && node.status == MembershipNodeStatus::Active
