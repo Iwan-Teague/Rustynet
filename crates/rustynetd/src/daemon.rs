@@ -9614,14 +9614,14 @@ fn load_auto_tunnel_bundle(
     let node_id = fields
         .get("node_id")
         .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing node_id".to_string()))?
-        .to_string();
+        .clone();
     NodeId::new(node_id.clone())
         .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
 
     let mesh_cidr = fields
         .get("mesh_cidr")
         .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing mesh_cidr".to_string()))?
-        .to_string();
+        .clone();
     if !is_valid_ipv4_or_ipv6_cidr(&mesh_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
             "invalid mesh_cidr".to_string(),
@@ -9633,7 +9633,7 @@ fn load_auto_tunnel_bundle(
         .ok_or_else(|| {
             AutoTunnelBootstrapError::InvalidFormat("missing assigned_cidr".to_string())
         })?
-        .to_string();
+        .clone();
     if !is_valid_ipv4_or_ipv6_cidr(&assigned_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
             "invalid assigned_cidr".to_string(),
@@ -10666,7 +10666,7 @@ fn parse_traversal_bundle_section(
         .ok_or_else(|| {
             TraversalBootstrapError::InvalidFormat("missing source_node_id".to_string())
         })?
-        .to_string();
+        .clone();
     NodeId::new(source_node_id.clone())
         .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
     let target_node_id = fields
@@ -10674,7 +10674,7 @@ fn parse_traversal_bundle_section(
         .ok_or_else(|| {
             TraversalBootstrapError::InvalidFormat("missing target_node_id".to_string())
         })?
-        .to_string();
+        .clone();
     NodeId::new(target_node_id.clone())
         .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
 

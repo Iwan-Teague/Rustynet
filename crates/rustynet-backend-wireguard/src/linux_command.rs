@@ -585,9 +585,9 @@ pub(crate) fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
     let mut output = String::with_capacity(44);
     let mut index = 0usize;
     while index + 3 <= value.len() {
-        let chunk = ((value[index] as u32) << 16)
-            | ((value[index + 1] as u32) << 8)
-            | (value[index + 2] as u32);
+        let chunk = (u32::from(value[index]) << 16)
+            | (u32::from(value[index + 1]) << 8)
+            | u32::from(value[index + 2]);
         output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
         output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
         output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);
@@ -597,7 +597,7 @@ pub(crate) fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
 
     let remaining = value.len() - index;
     if remaining == 2 {
-        let chunk = ((value[index] as u32) << 16) | ((value[index + 1] as u32) << 8);
+        let chunk = (u32::from(value[index]) << 16) | (u32::from(value[index + 1]) << 8);
         output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
         output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
         output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);

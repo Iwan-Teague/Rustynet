@@ -21580,7 +21580,7 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    let counter = u128::from(UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed));
     (now << 16) ^ counter
 }
 

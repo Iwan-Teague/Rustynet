@@ -5612,7 +5612,7 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
                     let used = parts[2].parse().unwrap_or(0);
                     let available = parts[3].parse().unwrap_or(0);
                     let percent_used = if total > 0 {
-                        (used as f64 / total as f64) * 100.0
+                        (f64::from(used) / f64::from(total)) * 100.0
                     } else {
                         0.0
                     };
