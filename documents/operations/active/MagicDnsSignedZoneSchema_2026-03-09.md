@@ -8,17 +8,17 @@ Scope: secure schema and runtime contract for Magic DNS-like naming
 
 ```text
 You are the implementation agent for the remaining work in this document.
-Repository root: /Users/iwanteague/Desktop/Rustynet
+Repository root: workspace root (the directory containing the top-level Cargo.toml)
 
 Mission:
 Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
 
 Mandatory reading order:
-1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
-2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
-3. /Users/iwanteague/Desktop/Rustynet/README.md
-4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
-5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+1. AGENTS.md
+2. CLAUDE.md
+3. README.md
+4. documents/Requirements.md
+5. documents/SecurityMinimumBar.md
 6. This document
 7. Directly linked scope/design docs and the code you will touch
 
