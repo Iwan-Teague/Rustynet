@@ -59,7 +59,7 @@ named drift tests, the regression-coverage CI gate
 
 - **21 verifier + audit modules** across 4 groups, **~570 pinned tests** on the regression-coverage gate floor.
 - Every Linux verifier has a macOS + Windows analog (or equivalent surface). Every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls` / `windows_paths`).
-- Workspace test sweep: post-X4/X7 expansion the workspace runs in the 2800+ test range across rustynetd + rustynet-cli + control + relay + policy + backends.
+- Workspace test sweep: **2786 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends, measured 2026-05-18 post X4/X7 expansion).
 
 ## 2. CLI exit-code taxonomy (X6)
 

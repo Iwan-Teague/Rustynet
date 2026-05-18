@@ -14,6 +14,17 @@ wrappers = []
 name = "md-5"
 wrappers = []
 
+# `md5` is a separate, standalone crates.io package (stainless-steel/md5,
+# 115M+ downloads) — distinct from the RustCrypto `md-5` crate banned
+# above. The G2c source-scan grep in scripts/ci/security_regression_gates.sh
+# already rejects `use md5;` import statements, but without this deny
+# entry a contributor could add `md5 = "0.8"` to a Cargo.toml without
+# tripping `cargo deny check bans`. Deny both names for parity with the
+# G2c grep coverage.
+[[bans.deny]]
+name = "md5"
+wrappers = []
+
 [[bans.deny]]
 name = "des"
 wrappers = []
