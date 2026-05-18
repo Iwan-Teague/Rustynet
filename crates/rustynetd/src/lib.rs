@@ -2,6 +2,7 @@
 
 pub mod daemon;
 pub mod dataplane;
+pub mod dataplane_candidates;
 pub mod exit_codes;
 pub mod fetcher;
 
