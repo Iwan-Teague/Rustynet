@@ -14,9 +14,11 @@ echo "Running security regression gates..."
 # now the single source of truth for that policy.
 cargo run --quiet -p rustynet-cli --bin security_regression_gates -- "$@"
 
-# G2a: Fail if sha1 or 3des appear in Cargo.lock (fast, no network)
+# G2a: Fail if a deprecated-crypto crate package name appears in
+# Cargo.lock (fast, no network). Names must stay in sync with the
+# [[bans.deny]] list in deny.toml (G2b leg).
 echo "Checking Cargo.lock for deprecated cryptographic algorithm packages..."
-if grep -iE '^name = "(sha1|md-5|des|des3|3des|triple-des)"' Cargo.lock 2>/dev/null; then
+if grep -iE '^name = "(sha1|md-5|md5|des|des3|3des|triple-des)"' Cargo.lock 2>/dev/null; then
   echo "FAIL: deprecated cryptographic algorithm crate found in Cargo.lock" >&2
   echo "FAIL: remove the dependency or disable the feature that pulls in sha1/3des/md5" >&2
   exit 1
