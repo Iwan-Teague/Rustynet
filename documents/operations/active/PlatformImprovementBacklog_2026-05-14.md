@@ -945,6 +945,12 @@ inline. Cross-reference with:
     expected_peer_ids, and confirmation that lan_access_enabled +
     selected_exit_node don't gate the verdict today). Floor bumped
     14 → 23. (commit e73ffee)
+  - `windows_key_custody` test count 18 → 24 (+6 named drift tests
+    covering schema_version pin, per-variant serde round-trip on
+    Missing + Invalid + AbsentAsExpected, unknown-status-tag
+    rejection, and the no-dedup-across-entries contract for
+    repeated-shape drift reasons). Floor bumped 18 → 24. (commit
+    f8e5712)
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
