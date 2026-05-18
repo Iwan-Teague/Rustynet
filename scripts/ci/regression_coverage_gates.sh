@@ -81,7 +81,14 @@ LINUX_FLOORS=(
   # covering freshness boundary, missing-peer aggregation, exotic
   # peer-id chars, schema_version pin, per-variant serde round-trip.
   "linux_mesh_status:24"
-  "linux_key_custody:15"
+  # Floor bumped 15→24 on X4 coverage parity sweep: 9 new tests
+  # covering schema_version pin, per-variant serde round-trip on
+  # Ok/Invalid/Forbidden, unknown-status-tag rejection, unknown-
+  # requirement-string rejection, multi-entry drift aggregation
+  # (no short-circuit), Forbidden status on required entry, and
+  # AbsentAsExpected status on required entry (collector-bug
+  # contradiction).
+  "linux_key_custody:24"
   # Floor bumped 3→22 on X4 coverage parity sweep: 19 new tests
   # covering applicability/reason invariants, schema pin,
   # determinism, serde round-trip + value-level round trip, drift
