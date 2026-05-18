@@ -862,15 +862,15 @@ inline. Cross-reference with:
   + the error-message extraction). 5 new tests pin sentinel
   rcode=-1, success-state + failure-state round-trips, and
   fail-closed type rejection (string vs i64).
-* `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (1 production walk across 1 intentional generic JSON-pointer
-  reader):
-  - `execute_ops_read_json_field` (intentional generic shape-agnostic
-    JSON-pointer reader — must stay Value-walk)
-
-  X2 writer-side Phase A list effectively closed: the only
-  remaining `Value` walk is the intentional generic JSON-pointer
-  reader that consumes externally-supplied shapes by design.
+* `[x]` X2 writer-side Phase A list CLOSED for
+  `ops_live_lab_orchestrator.rs`. The 1 remaining `Value` walk
+  is `execute_ops_read_json_field` — an intentional shape-
+  agnostic JSON-pointer reader that consumes externally-supplied
+  shapes by design (the caller passes a JSON pointer like
+  `/checks/foo` plus a path to a JSON file written by an
+  out-of-tree reporter; converting it to a typed view would
+  force every reporter shape into a single closed enum). Keep
+  as `Value`-walk; do not attempt to migrate.
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
