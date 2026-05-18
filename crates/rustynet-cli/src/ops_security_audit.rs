@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::security_audit_catalog::{
     ValidationSpec as LiveValidationSpec,
@@ -632,9 +632,54 @@ fn validate_report_paths(report_paths: &[PathBuf]) -> Result<Vec<String>, String
     Ok(errors)
 }
 
-fn validate_report_payload(path: &Path, payload: &serde_json::Map<String, Value>) -> Vec<String> {
+/// X2: typed view over a Phase-N security-audit report payload
+/// walked by `validate_report_payload` and (post-validation) by
+/// `evaluate_spec`.
+///
+/// Field-shape rules:
+/// * `mode: Option<String>` — required at the validator level (a
+///   missing mode short-circuits with "missing or invalid 'mode'").
+///   Kept `Option` so a wrong-type mode (`mode: 42`) fails at the
+///   typed deserialize with a precise field-shape error.
+/// * `evidence_mode/status: Option<String>` and
+///   `captured_at_unix: Option<u64>` — each previously read via a
+///   silent `.and_then(Value::as_*)` walk that returned `None` on
+///   wrong-type. Typed view fails those at deserialize.
+/// * `checks: Option<Map<String, Value>>` — preserves the existing
+///   per-check `get(name).and_then(Value::as_str)` walk for the
+///   dynamic `spec.required_check_keys` list (the check names vary
+///   per spec, so they can't be typed slots).
+/// * `#[serde(flatten)] extra` rides the rest of the payload
+///   through, including the dynamic `spec.required_report_fields`
+///   keys which the validator presence-checks via `contains_key`
+///   on the original map.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct SecurityAuditReportPayloadView {
+    pub mode: Option<String>,
+    pub evidence_mode: Option<String>,
+    pub status: Option<String>,
+    pub captured_at_unix: Option<u64>,
+    pub checks: Option<Map<String, Value>>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+fn validate_report_payload(path: &Path, payload: &Map<String, Value>) -> Vec<String> {
+    // X2: deserialise the payload once into the typed view. The
+    // `contains_key` presence loop below still walks the original
+    // map because the field names come from a per-spec dynamic list.
+    let typed: SecurityAuditReportPayloadView =
+        match serde_json::from_value(Value::Object(payload.clone())) {
+            Ok(view) => view,
+            Err(err) => {
+                return vec![format!("{}: invalid field shape: {err}", path.display())];
+            }
+        };
+
     let mut problems = Vec::new();
-    let Some(mode) = payload.get("mode").and_then(Value::as_str) else {
+    let Some(mode) = typed.mode.as_deref() else {
         return vec![format!(
             "{}: missing or invalid 'mode' field",
             path.display()
@@ -652,14 +697,14 @@ fn validate_report_payload(path: &Path, payload: &serde_json::Map<String, Value>
             ));
         }
     }
-    if payload.get("evidence_mode").and_then(Value::as_str) != Some(EVIDENCE_MODE_MEASURED) {
+    if typed.evidence_mode.as_deref() != Some(EVIDENCE_MODE_MEASURED) {
         problems.push(format!(
             "{}: field 'evidence_mode' must equal '{}'",
             path.display(),
             EVIDENCE_MODE_MEASURED
         ));
     }
-    let Some(checks) = payload.get("checks").and_then(Value::as_object) else {
+    let Some(checks) = typed.checks.as_ref() else {
         problems.push(format!(
             "{}: field 'checks' must be an object",
             path.display()
@@ -686,17 +731,14 @@ fn validate_report_payload(path: &Path, payload: &serde_json::Map<String, Value>
             Some(_) => {}
         }
     }
-    match payload.get("captured_at_unix").and_then(Value::as_u64) {
+    match typed.captured_at_unix {
         Some(value) if value > 0 => {}
         _ => problems.push(format!(
             "{}: field 'captured_at_unix' must be a positive integer",
             path.display()
         )),
     }
-    if !matches!(
-        payload.get("status").and_then(Value::as_str),
-        Some(STATUS_PASS | STATUS_FAIL)
-    ) {
+    if !matches!(typed.status.as_deref(), Some(STATUS_PASS | STATUS_FAIL)) {
         problems.push(format!(
             "{}: field 'status' must be 'pass' or 'fail'",
             path.display()
@@ -955,10 +997,11 @@ fn utc_timestamp() -> String {
 mod tests {
     use super::{
         EvaluateLiveCoveragePromotionConfig, GenerateAssessmentFromMatrixConfig,
-        GenerateAttackMatrixConfig, ValidateLiveLabReportsConfig, build_attack_rows,
-        execute_ops_evaluate_live_coverage_promotion, execute_ops_generate_assessment_from_matrix,
-        execute_ops_generate_attack_matrix, execute_ops_validate_live_lab_reports, parse_attacks,
-        parse_nodes, render_promotion_markdown, validate_report_payload,
+        GenerateAttackMatrixConfig, SecurityAuditReportPayloadView, ValidateLiveLabReportsConfig,
+        build_attack_rows, execute_ops_evaluate_live_coverage_promotion,
+        execute_ops_generate_assessment_from_matrix, execute_ops_generate_attack_matrix,
+        execute_ops_validate_live_lab_reports, parse_attacks, parse_nodes,
+        render_promotion_markdown, validate_report_payload,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1073,6 +1116,93 @@ mod tests {
         payload["status"] = json!("blocked");
         let errors = validate_report_payload(path.as_path(), payload.as_object().expect("object"));
         assert!(errors.iter().any(|error| error.contains("field 'status'")));
+    }
+
+    // ---- X2: SecurityAuditReportPayloadView typed-view migration ---
+
+    /// Clean fixture: a valid report payload deserialises into the
+    /// typed view; every typed slot populates; dynamic dependent
+    /// fields (phase, hosts, evidence, dns_bind_addr) ride through
+    /// `#[serde(flatten)] extra`.
+    #[test]
+    fn security_audit_report_payload_view_accepts_clean_payload() {
+        let payload = valid_report_payload();
+        let view: SecurityAuditReportPayloadView =
+            serde_json::from_value(payload).expect("typed view accepts clean fixture");
+        assert_eq!(
+            view.mode.as_deref(),
+            Some("live_linux_control_surface_exposure")
+        );
+        assert_eq!(view.evidence_mode.as_deref(), Some("measured"));
+        assert_eq!(view.status.as_deref(), Some("pass"));
+        assert_eq!(view.captured_at_unix, Some(1_777_420_800));
+        let checks = view.checks.expect("checks map present");
+        assert_eq!(
+            checks
+                .get("all_daemon_sockets_secure")
+                .and_then(serde_json::Value::as_str),
+            Some("pass")
+        );
+        assert!(
+            view.extra.contains_key("phase"),
+            "dynamic required fields ride through extra"
+        );
+        assert!(view.extra.contains_key("hosts"));
+        assert!(view.extra.contains_key("dns_bind_addr"));
+    }
+
+    /// Wrong-type `captured_at_unix` slot rejected at the typed
+    /// layer. Was previously silent: `.and_then(Value::as_u64)`
+    /// returning None surfaced as the generic "must be a positive
+    /// integer" message which conflated missing with wrong-type.
+    /// Typed view now surfaces the precise field-shape error first.
+    #[test]
+    fn security_audit_report_payload_view_rejects_wrong_type_captured_at_slot() {
+        let mut payload = valid_report_payload();
+        payload["captured_at_unix"] = json!("1777420800");
+        let err = serde_json::from_value::<SecurityAuditReportPayloadView>(payload)
+            .expect_err("string captured_at_unix must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("captured_at_unix") || message.contains("u64"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `checks` slot rejected. Was previously silent
+    /// (`.and_then(Value::as_object) -> None`) and surfaced as
+    /// "field 'checks' must be an object" — same message as missing.
+    /// Typed view now surfaces the precise field-shape error.
+    #[test]
+    fn security_audit_report_payload_view_rejects_wrong_type_checks_slot() {
+        let mut payload = valid_report_payload();
+        payload["checks"] = json!("not-an-object");
+        let err = serde_json::from_value::<SecurityAuditReportPayloadView>(payload)
+            .expect_err("string checks must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("checks") || message.contains("object") || message.contains("map"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Validator integration: a wrong-type payload (e.g. `mode: 42`)
+    /// surfaces the typed-layer "invalid field shape" message
+    /// instead of the legacy "missing or invalid 'mode' field"
+    /// message — confirming the typed deserialise triggers before
+    /// the legacy mode-presence branch.
+    #[test]
+    fn validate_report_payload_surfaces_typed_shape_error_for_wrong_type_mode() {
+        let path = PathBuf::from("/tmp/report.json");
+        let mut payload = valid_report_payload();
+        payload["mode"] = json!(42);
+        let errors = validate_report_payload(path.as_path(), payload.as_object().expect("object"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("invalid field shape")),
+            "validator must wrap the typed deserialise error: {errors:?}"
+        );
     }
 
     #[test]
