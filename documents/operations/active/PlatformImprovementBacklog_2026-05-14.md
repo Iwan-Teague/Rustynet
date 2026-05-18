@@ -674,11 +674,18 @@ inline. Cross-reference with:
   per-target scalars; plus `extra: HashMap<String, String>` ride-through).
   4 new tests pin clean parse, missing required field, wrong-type,
   into_key_value_map round-trip.
+* `[~]` Fourth X2 slice on `ops_cross_network_reports.rs` landed
+  (commit 88b7f6b). Migrated `validate_report_paths`'s
+  `git_commit` + `status` re-walks to typed slots on
+  `CrossNetworkReportPayloadView` (re-using the view that
+  already lives in the module). 2 trailing `Value` walks
+  replaced; aggregator stays "collect every error" walk; if
+  typed deserialize fails the function surfaces a typed-
+  boundary error and continues.
 * `[ ]` Remaining Phase A walks in
   `ops_cross_network_reports.rs` (future slices):
-  - the 5 helpers above (kept as `Value` walks intentionally — only
+  - the 5 helpers (kept as `Value` walks intentionally — only
     migrate if a future restructuring makes typed views worth it)
-  - `validate_report_paths` post-parse `git_commit`/`status` re-walk
   - nested `path_evidence` block walkers
 * `[x]` ops_live_lab_failure_digest.rs typed-view migration
   landed (commit b2f8b1c). Added 4 typed views
