@@ -1379,6 +1379,64 @@ struct CrossNetworkReportPayloadView {
     extra: Map<String, Value>,
 }
 
+/// X2: typed view over the `path_evidence` block inside a cross-
+/// network report payload. The 15 typed slots correspond to every
+/// `.get("...")` call the `validate_report_payload` walker makes
+/// against `path_evidence`; the `extra` flatten preserves any
+/// additional fields a future suite or reporter shape might add
+/// (forward-compat).
+///
+/// Field-shape rules:
+/// * String fields use `Option<String>`. A missing field deserialises
+///   to `None`; a present-but-empty string deserialises to
+///   `Some(String::new())`. The walker's call sites apply the
+///   `non_empty_trimmed_string` helper to fold empty/whitespace
+///   strings back to `None` (parity with the legacy
+///   `value_as_non_empty_string` helper).
+/// * Numeric/bool fields use `Option<u64>` / `Option<bool>`. A
+///   wrong-type value (e.g. string in a u64 slot) surfaces as a
+///   serde deserialisation error and the walker falls back to the
+///   legacy untyped walk for that path_evidence block, so a bad
+///   incoming report keeps producing the same domain-specific
+///   problem strings it always did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct CrossNetworkPathEvidenceView {
+    pub path_mode: Option<String>,
+    pub path_reason: Option<String>,
+    pub path_programmed_mode: Option<String>,
+    pub path_live_proven: Option<bool>,
+    pub path_latest_live_handshake_unix: Option<u64>,
+    pub relay_session_state: Option<String>,
+    pub traversal_alarm_state: Option<String>,
+    pub traversal_alarm_reason: Option<String>,
+    pub dns_alarm_state: Option<String>,
+    pub dns_alarm_reason: Option<String>,
+    pub traversal_error: Option<String>,
+    pub transport_socket_identity_state: Option<String>,
+    pub transport_socket_identity_error: Option<String>,
+    pub transport_socket_identity_label: Option<String>,
+    pub transport_socket_identity_local_addr: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// Fold an `Option<String>` from a typed-view slot through the same
+/// empty/whitespace filter the legacy `value_as_non_empty_string`
+/// helper applied. Returns `Some(trimmed)` only when the value is
+/// present and contains non-whitespace.
+fn non_empty_trimmed_string(opt: &Option<String>) -> Option<String> {
+    opt.as_deref().and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
 impl CrossNetworkReportPayloadView {
     /// Bridge the typed view back to a `Map<String, Value>` for any
     /// downstream helper that still walks the payload generically.
@@ -1695,34 +1753,75 @@ fn validate_report_payload(
         problems.push("path_evidence must be present for pass reports".to_string());
     }
     if let Some(path_evidence) = path_evidence {
-        let path_mode = value_as_non_empty_string(path_evidence.get("path_mode"));
-        let path_reason = value_as_non_empty_string(path_evidence.get("path_reason"));
-        let path_programmed_mode =
-            value_as_non_empty_string(path_evidence.get("path_programmed_mode"));
-        let path_live_proven = path_evidence
-            .get("path_live_proven")
-            .and_then(Value::as_bool);
-        let path_latest_live_handshake_unix = path_evidence
-            .get("path_latest_live_handshake_unix")
-            .and_then(Value::as_u64)
-            .filter(|value| *value > 0);
-        let relay_session_state =
-            value_as_non_empty_string(path_evidence.get("relay_session_state"));
-        let traversal_alarm_state =
-            value_as_non_empty_string(path_evidence.get("traversal_alarm_state"));
-        let traversal_alarm_reason =
-            value_as_non_empty_string(path_evidence.get("traversal_alarm_reason"));
-        let dns_alarm_state = value_as_non_empty_string(path_evidence.get("dns_alarm_state"));
-        let dns_alarm_reason = value_as_non_empty_string(path_evidence.get("dns_alarm_reason"));
-        let traversal_error = value_as_non_empty_string(path_evidence.get("traversal_error"));
-        let transport_socket_identity_state =
-            value_as_non_empty_string(path_evidence.get("transport_socket_identity_state"));
-        let transport_socket_identity_error =
-            value_as_non_empty_string(path_evidence.get("transport_socket_identity_error"));
-        let transport_socket_identity_label =
-            value_as_non_empty_string(path_evidence.get("transport_socket_identity_label"));
-        let transport_socket_identity_local_addr =
-            value_as_non_empty_string(path_evidence.get("transport_socket_identity_local_addr"));
+        // X2: deserialise the path_evidence map once into the typed
+        // view. If the deserialise fails (a wrong-type field
+        // anywhere in the block), fall back to the legacy untyped
+        // walk so the validator still surfaces the same per-field
+        // problem strings instead of cascading "missing" failures
+        // across the whole block.
+        let typed_path_evidence: Option<CrossNetworkPathEvidenceView> =
+            serde_json::from_value(Value::Object(path_evidence.clone())).ok();
+        let (
+            path_mode,
+            path_reason,
+            path_programmed_mode,
+            path_live_proven,
+            path_latest_live_handshake_unix,
+            relay_session_state,
+            traversal_alarm_state,
+            traversal_alarm_reason,
+            dns_alarm_state,
+            dns_alarm_reason,
+            traversal_error,
+            transport_socket_identity_state,
+            transport_socket_identity_error,
+            transport_socket_identity_label,
+            transport_socket_identity_local_addr,
+        ) = if let Some(view) = typed_path_evidence.as_ref() {
+            (
+                non_empty_trimmed_string(&view.path_mode),
+                non_empty_trimmed_string(&view.path_reason),
+                non_empty_trimmed_string(&view.path_programmed_mode),
+                view.path_live_proven,
+                view.path_latest_live_handshake_unix
+                    .filter(|value| *value > 0),
+                non_empty_trimmed_string(&view.relay_session_state),
+                non_empty_trimmed_string(&view.traversal_alarm_state),
+                non_empty_trimmed_string(&view.traversal_alarm_reason),
+                non_empty_trimmed_string(&view.dns_alarm_state),
+                non_empty_trimmed_string(&view.dns_alarm_reason),
+                non_empty_trimmed_string(&view.traversal_error),
+                non_empty_trimmed_string(&view.transport_socket_identity_state),
+                non_empty_trimmed_string(&view.transport_socket_identity_error),
+                non_empty_trimmed_string(&view.transport_socket_identity_label),
+                non_empty_trimmed_string(&view.transport_socket_identity_local_addr),
+            )
+        } else {
+            (
+                value_as_non_empty_string(path_evidence.get("path_mode")),
+                value_as_non_empty_string(path_evidence.get("path_reason")),
+                value_as_non_empty_string(path_evidence.get("path_programmed_mode")),
+                path_evidence
+                    .get("path_live_proven")
+                    .and_then(Value::as_bool),
+                path_evidence
+                    .get("path_latest_live_handshake_unix")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0),
+                value_as_non_empty_string(path_evidence.get("relay_session_state")),
+                value_as_non_empty_string(path_evidence.get("traversal_alarm_state")),
+                value_as_non_empty_string(path_evidence.get("traversal_alarm_reason")),
+                value_as_non_empty_string(path_evidence.get("dns_alarm_state")),
+                value_as_non_empty_string(path_evidence.get("dns_alarm_reason")),
+                value_as_non_empty_string(path_evidence.get("traversal_error")),
+                value_as_non_empty_string(path_evidence.get("transport_socket_identity_state")),
+                value_as_non_empty_string(path_evidence.get("transport_socket_identity_error")),
+                value_as_non_empty_string(path_evidence.get("transport_socket_identity_label")),
+                value_as_non_empty_string(
+                    path_evidence.get("transport_socket_identity_local_addr"),
+                ),
+            )
+        };
 
         if requires_live_path_evidence {
             if path_mode.is_none() {
@@ -3815,6 +3914,171 @@ mod tests {
             map.get("extra_field").and_then(Value::as_str),
             Some("ride-through"),
             "scalar extras must be preserved verbatim"
+        );
+    }
+
+    /// Helper: build a clean `path_evidence` map populated for a live
+    /// direct remote-exit pass report. Every typed slot is filled and
+    /// an extra ride-through key exercises `#[serde(flatten)] extra`.
+    fn clean_path_evidence_value() -> Value {
+        json!({
+            "path_mode": "direct_active",
+            "path_reason": "live_handshake_observed",
+            "path_programmed_mode": "direct",
+            "path_live_proven": true,
+            "path_latest_live_handshake_unix": 1_700_000_000u64,
+            "relay_session_state": "live",
+            "traversal_alarm_state": "ok",
+            "traversal_alarm_reason": "none",
+            "dns_alarm_state": "ok",
+            "dns_alarm_reason": "none",
+            "traversal_error": "none",
+            "transport_socket_identity_state": "authoritative_backend_shared_transport",
+            "transport_socket_identity_error": "none",
+            "transport_socket_identity_label": "wireguard_backend",
+            "transport_socket_identity_local_addr": "10.10.10.1:51820",
+            "extra_field": "ride-through",
+        })
+    }
+
+    /// Clean fixture: a well-formed `path_evidence` block deserializes
+    /// into `CrossNetworkPathEvidenceView`, every typed slot is filled,
+    /// and the ride-through key flows into `extra`.
+    #[test]
+    fn cross_network_path_evidence_view_accepts_clean_block() {
+        let block = clean_path_evidence_value();
+        let view: CrossNetworkPathEvidenceView = serde_json::from_value(block)
+            .expect("typed view accepts the clean path_evidence fixture");
+        assert_eq!(view.path_mode.as_deref(), Some("direct_active"));
+        assert_eq!(view.path_reason.as_deref(), Some("live_handshake_observed"));
+        assert_eq!(view.path_programmed_mode.as_deref(), Some("direct"));
+        assert_eq!(view.path_live_proven, Some(true));
+        assert_eq!(view.path_latest_live_handshake_unix, Some(1_700_000_000));
+        assert_eq!(view.relay_session_state.as_deref(), Some("live"));
+        assert_eq!(view.traversal_alarm_state.as_deref(), Some("ok"));
+        assert_eq!(view.traversal_alarm_reason.as_deref(), Some("none"));
+        assert_eq!(view.dns_alarm_state.as_deref(), Some("ok"));
+        assert_eq!(view.dns_alarm_reason.as_deref(), Some("none"));
+        assert_eq!(view.traversal_error.as_deref(), Some("none"));
+        assert_eq!(
+            view.transport_socket_identity_state.as_deref(),
+            Some("authoritative_backend_shared_transport")
+        );
+        assert_eq!(
+            view.transport_socket_identity_error.as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            view.transport_socket_identity_label.as_deref(),
+            Some("wireguard_backend")
+        );
+        assert_eq!(
+            view.transport_socket_identity_local_addr.as_deref(),
+            Some("10.10.10.1:51820")
+        );
+        assert_eq!(
+            view.extra.get("extra_field").and_then(Value::as_str),
+            Some("ride-through"),
+            "non-required keys must ride through #[serde(flatten)] extra"
+        );
+    }
+
+    /// Missing required typed slots deserialize to `None` because every
+    /// slot is `Option<...>` with `#[serde(default)]`. The walker's
+    /// `requires_live_path_evidence` branch surfaces the per-field
+    /// problem strings — verified at the validator level by the
+    /// existing `validate_report_payload_*` tests; this test pins the
+    /// typed-view contract that missing slots are `None`, not errors.
+    #[test]
+    fn cross_network_path_evidence_view_accepts_missing_optional_slots() {
+        let block = json!({
+            "path_mode": "direct_active",
+        });
+        let view: CrossNetworkPathEvidenceView =
+            serde_json::from_value(block).expect("typed view tolerates missing optional slots");
+        assert_eq!(view.path_mode.as_deref(), Some("direct_active"));
+        assert!(view.path_reason.is_none(), "missing slots must be None");
+        assert!(
+            view.path_live_proven.is_none(),
+            "missing bool slot must be None"
+        );
+        assert!(
+            view.path_latest_live_handshake_unix.is_none(),
+            "missing u64 slot must be None"
+        );
+    }
+
+    /// Wrong-type slot fails deserialize at the typed layer. The walker
+    /// catches the `Err(_)` and falls back to the legacy untyped walk
+    /// so a single bad field does not cascade "missing" failures across
+    /// every other slot in the block.
+    #[test]
+    fn cross_network_path_evidence_view_rejects_wrong_type_slot() {
+        let mut block = clean_path_evidence_value();
+        block
+            .as_object_mut()
+            .expect("path_evidence fixture is an object")
+            .insert(
+                "path_live_proven".to_string(),
+                Value::String("true".to_string()),
+            );
+        let err = serde_json::from_value::<CrossNetworkPathEvidenceView>(block)
+            .expect_err("string path_live_proven must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("path_live_proven") || message.contains("bool"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// `non_empty_trimmed_string` pins parity with the legacy
+    /// `value_as_non_empty_string` helper: `None`, empty, and
+    /// whitespace-only inputs all fold to `None`; non-whitespace
+    /// content is returned trimmed.
+    #[test]
+    fn non_empty_trimmed_string_folds_empty_and_whitespace_to_none() {
+        assert!(non_empty_trimmed_string(&None).is_none());
+        assert!(non_empty_trimmed_string(&Some(String::new())).is_none());
+        assert!(non_empty_trimmed_string(&Some("   ".to_string())).is_none());
+        assert!(non_empty_trimmed_string(&Some("\t\n  ".to_string())).is_none());
+        assert_eq!(
+            non_empty_trimmed_string(&Some("  direct_active  ".to_string())).as_deref(),
+            Some("direct_active"),
+            "non-whitespace content must be returned trimmed"
+        );
+    }
+
+    /// Walker integration: a wrong-type `path_live_proven` slot causes
+    /// the typed deserialize to fail; the walker's legacy-fallback walk
+    /// reads the remaining fields successfully so the validator emits
+    /// the specific "path_live_proven must be true" problem string
+    /// instead of cascading "missing" failures across every slot.
+    #[test]
+    fn validate_report_payload_falls_back_to_untyped_walk_on_wrong_type_slot() {
+        let mut payload = clean_report_payload_value();
+        let payload_map = payload.as_object_mut().expect("payload is an object");
+        payload_map.insert("path_evidence".to_string(), clean_path_evidence_value());
+        let path_evidence_map = payload_map
+            .get_mut("path_evidence")
+            .and_then(Value::as_object_mut)
+            .expect("path_evidence is an object");
+        path_evidence_map.insert(
+            "path_live_proven".to_string(),
+            Value::String("not_a_bool".to_string()),
+        );
+        let problems =
+            validate_report_payload(Path::new("/tmp/fake_report.json"), &payload, None, None);
+        assert!(
+            problems
+                .iter()
+                .any(|entry| entry.contains("path_live_proven must be true")),
+            "fallback walk must still emit the per-field problem string: {problems:?}"
+        );
+        assert!(
+            !problems
+                .iter()
+                .any(|entry| entry.contains("path_mode must be a non-empty string")),
+            "wrong-type slot must not cascade into other slot failures: {problems:?}"
         );
     }
 
