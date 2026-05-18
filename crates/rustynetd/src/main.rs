@@ -1165,7 +1165,7 @@ fn run_windows_killswitch_assert_command(args: &[String]) -> Result<(), String> 
         config.egress_interface,
         config.dns_resolver_bind_addr,
     )
-    .map_err(|e| format!("failed to initialize WindowsCommandSystem: {:?}", e))?;
+    .map_err(|e| format!("failed to initialize WindowsCommandSystem: {e:?}"))?;
 
     match system.assert_killswitch() {
         Ok(()) => {
@@ -1182,13 +1182,12 @@ fn run_windows_killswitch_assert_command(args: &[String]) -> Result<(), String> 
                 .unwrap()
             );
             if fail_on_drift {
-                return Err(format!("windows-killswitch-assert failed: {}", reason));
+                return Err(format!("windows-killswitch-assert failed: {reason}"));
             }
             Ok(())
         }
         Err(other) => Err(format!(
-            "windows-killswitch-assert unexpected error: {:?}",
-            other
+            "windows-killswitch-assert unexpected error: {other:?}"
         )),
     }
 }

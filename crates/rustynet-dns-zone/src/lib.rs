@@ -663,8 +663,7 @@ fn parse_expected_ip(
             // defense the signed-state contract can publish.
             if is_universally_inappropriate_mesh_ipv4(&ip) {
                 return Err(DnsZoneError::InvalidFormat(format!(
-                    "record {index} expected_ip {} is in a range that cannot host a mesh peer (loopback, link-local, or RFC 5737 documentation)",
-                    ip
+                    "record {index} expected_ip {ip} is in a range that cannot host a mesh peer (loopback, link-local, or RFC 5737 documentation)"
                 )));
             }
             Ok(ip.to_string())
