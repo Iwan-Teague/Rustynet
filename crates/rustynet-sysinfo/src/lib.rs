@@ -5102,7 +5102,7 @@ fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo 
             let strength_bits;
 
             for line in s.lines() {
-                if line.contains("Cipher") && !line.contains("#") {
+                if line.contains("Cipher") && !line.contains('#') {
                     if let Some(cipher) = line.split(':').nth(1) {
                         suite_name = cipher.trim().to_string();
                     }
@@ -5155,7 +5155,7 @@ fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo 
             let strength_bits;
 
             for line in s.lines() {
-                if line.contains("Cipher") && !line.contains("#") {
+                if line.contains("Cipher") && !line.contains('#') {
                     if let Some(cipher) = line.split(':').nth(1) {
                         suite_name = cipher.trim().to_string();
                     }
