@@ -3183,6 +3183,37 @@ pub fn execute_ops_verify_no_leak_dataplane_report(
     Ok("No-leak dataplane gate: PASS".to_string())
 }
 
+/// Typed view for the JSON shape `execute_ops_e2e_dns_query` emits.
+/// Replaces the prior `serde_json::json!({...})` literal + Value walks
+/// at the tail. Field order matches the on-disk JSON contract pinned
+/// by the round-trip tests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct E2eDnsQueryResultView {
+    /// DNS response RCODE. Sentinel `-1` means the query never
+    /// produced a parseable header (the orchestrator distinguishes
+    /// "no response" from "response with rcode=0").
+    pub rcode: i64,
+    pub answer_count: u64,
+    pub answer_ip: String,
+    pub answer_ttl: u64,
+    /// Empty when the query produced a parseable response; otherwise
+    /// carries the operator-facing failure reason. `fail_on_no_response`
+    /// inspects this slot directly.
+    pub error: String,
+}
+
+impl E2eDnsQueryResultView {
+    fn initial() -> Self {
+        Self {
+            rcode: -1,
+            answer_count: 0,
+            answer_ip: String::new(),
+            answer_ttl: 0,
+            error: String::new(),
+        }
+    }
+}
+
 pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, String> {
     let server = config
         .server
@@ -3207,13 +3238,7 @@ pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, St
 
     let packet = build_dns_query_packet(qname.as_str());
     let server_addr = SocketAddr::new(server, config.port);
-    let mut result = json!({
-        "rcode": -1,
-        "answer_count": 0,
-        "answer_ip": "",
-        "answer_ttl": 0,
-        "error": "",
-    });
+    let mut result = E2eDnsQueryResultView::initial();
 
     let query_outcome = (|| -> Result<(), String> {
         socket
@@ -3231,30 +3256,20 @@ pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, St
         let answer_count = u16::from_be_bytes([response[6], response[7]]) as u64;
         let (rcode, answer_count, answer_ip, answer_ttl) =
             decode_first_dns_answer(&response[..size], rcode, answer_count)?;
-        result["rcode"] = Value::from(rcode);
-        result["answer_count"] = Value::from(answer_count);
-        result["answer_ip"] = Value::from(answer_ip);
-        result["answer_ttl"] = Value::from(answer_ttl);
+        result.rcode = rcode;
+        result.answer_count = answer_count;
+        result.answer_ip = answer_ip;
+        result.answer_ttl = answer_ttl;
         Ok(())
     })();
 
     if let Err(err) = query_outcome {
-        result["error"] = Value::from(err);
+        result.error = err;
     }
     let output =
         serde_json::to_string(&result).map_err(|err| format!("serialize JSON failed: {err}"))?;
-    if config.fail_on_no_response
-        && result
-            .get("error")
-            .and_then(Value::as_str)
-            .map(|value| !value.is_empty())
-            .unwrap_or(false)
-    {
-        return Err(result
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("dns query failed")
-            .to_string());
+    if config.fail_on_no_response && !result.error.is_empty() {
+        return Err(result.error);
     }
     Ok(output)
 }
@@ -3707,7 +3722,7 @@ mod tests {
         ActiveNetworkRoguePathHijackHostsView, ActiveNetworkRoguePathHijackReportView,
         ActiveNetworkSignedStateTamperChecksView, ActiveNetworkSignedStateTamperEvidenceView,
         ActiveNetworkSignedStateTamperHostsView, ActiveNetworkSignedStateTamperReportView,
-        CheckLocalFileModeConfig, ExtractManagedDnsExpectedIpConfig,
+        CheckLocalFileModeConfig, E2eDnsQueryResultView, ExtractManagedDnsExpectedIpConfig,
         LiveLinuxControlSurfaceAggregateChecksView, LiveLinuxControlSurfaceEvidenceView,
         LiveLinuxControlSurfaceHostChecksView, LiveLinuxControlSurfaceHostEvidenceView,
         LiveLinuxControlSurfaceHostResultView, LiveLinuxControlSurfaceReportView,
@@ -3782,6 +3797,101 @@ mod tests {
         assert_eq!(
             dns_query_bind_addr(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        );
+    }
+
+    #[test]
+    fn e2e_dns_query_view_initial_pins_sentinel_rcode_minus_one() {
+        // The default-state result must distinguish "no parseable
+        // response" (rcode=-1, error possibly set) from "response
+        // with rcode=0" (rcode=0, error=""). Pin the sentinel so a
+        // future refactor that defaults rcode to 0 trips this test
+        // and forces a deliberate semantic change.
+        let init: E2eDnsQueryResultView = serde_json::from_value(serde_json::json!({
+            "rcode": -1,
+            "answer_count": 0,
+            "answer_ip": "",
+            "answer_ttl": 0,
+            "error": "",
+        }))
+        .expect("default state must deserialize");
+        assert_eq!(init.rcode, -1);
+        assert_eq!(init.answer_count, 0);
+        assert_eq!(init.answer_ip, "");
+        assert_eq!(init.answer_ttl, 0);
+        assert_eq!(init.error, "");
+    }
+
+    #[test]
+    fn e2e_dns_query_view_round_trips_clean_response() {
+        // A successful response carries rcode=0 + answer_count>=1 +
+        // resolved IP + TTL. Pin the typed shape on serialize +
+        // deserialize so a future #[serde(rename)] on any field
+        // trips this test.
+        let view = E2eDnsQueryResultView {
+            rcode: 0,
+            answer_count: 1,
+            answer_ip: "100.64.0.1".to_string(),
+            answer_ttl: 300,
+            error: String::new(),
+        };
+        let body = serde_json::to_string(&view).expect("serialize");
+        // Pin the JSON shape includes int rcode (not stringified) and
+        // empty error string (not omitted).
+        assert!(body.contains("\"rcode\":0"), "int rcode shape: {body}");
+        assert!(body.contains("\"error\":\"\""), "empty error: {body}");
+        let parsed: E2eDnsQueryResultView = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn e2e_dns_query_view_round_trips_failure_state() {
+        // Failure-shape result: sentinel rcode + non-empty error.
+        // Pin so a future refactor that drops the rcode slot on
+        // error paths trips this test.
+        let view = E2eDnsQueryResultView {
+            rcode: -1,
+            answer_count: 0,
+            answer_ip: String::new(),
+            answer_ttl: 0,
+            error: "dns query send failed: connection refused".to_string(),
+        };
+        let body = serde_json::to_string(&view).expect("serialize");
+        let parsed: E2eDnsQueryResultView = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, view);
+        assert_eq!(parsed.rcode, -1);
+        assert!(!parsed.error.is_empty());
+    }
+
+    #[test]
+    fn e2e_dns_query_view_rejects_wrong_type_for_rcode() {
+        // The typed-view boundary must reject a string rcode (which
+        // the previous untyped `result["rcode"] = Value::from(...)`
+        // path would have silently accepted). Pin the i64 contract.
+        let mut value = serde_json::to_value(E2eDnsQueryResultView::initial()).expect("to_value");
+        value.as_object_mut().expect("object").insert(
+            "rcode".to_string(),
+            serde_json::Value::String("zero".to_string()),
+        );
+        let err = serde_json::from_value::<E2eDnsQueryResultView>(value)
+            .expect_err("string rcode must fail closed");
+        assert!(
+            err.to_string().contains("i64"),
+            "error must reference the i64 expected type: {err}"
+        );
+    }
+
+    #[test]
+    fn e2e_dns_query_view_rejects_missing_required_field() {
+        // Missing `answer_ttl` must fail closed at the typed
+        // boundary rather than fall through with a default value.
+        let mut value = serde_json::to_value(E2eDnsQueryResultView::initial()).expect("to_value");
+        value.as_object_mut().expect("object").remove("answer_ttl");
+        let err = serde_json::from_value::<E2eDnsQueryResultView>(value)
+            .expect_err("missing answer_ttl must fail closed");
+        assert!(
+            err.to_string().contains("answer_ttl"),
+            "error must reference the missing field: {err}"
         );
     }
 
