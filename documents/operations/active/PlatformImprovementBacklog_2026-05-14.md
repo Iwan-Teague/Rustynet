@@ -991,6 +991,17 @@ inline. Cross-reference with:
     symlink-before-dir-check ordering, symlink + mode-drift
     first-fault precedence, and empty-roots vacuous-truth).
     Floor bumped 8 → 16. (commit 5dac179)
+  - `macos_service_hardening` test count 9 → 15 (+6 named tests
+    pinning reviewed-directives 6-entry snapshot, schema_version,
+    all-6-directives drift aggregation (no short-circuit), plist
+    parser tolerance of dict/array values + inline XML comments,
+    and the unprobed-with-no-reason default-message fallback
+    path). Floor bumped 9 → 15. (commit 4b58f2b)
+
+  X4 macOS sweep complete: all 6 macOS modules pinned at their
+  parity floors. macos_authenticode 2→7, macos_key_custody 3→11,
+  macos_mesh_status 3→9, macos_dns_failclosed 8→16,
+  macos_runtime_acls 8→16, macos_service_hardening 9→15.
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
