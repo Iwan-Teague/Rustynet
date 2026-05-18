@@ -151,12 +151,19 @@ inline. Cross-reference with:
   `evaluator_reviewed_directives_cover_complete_hardening_envelope`
   pins the exact 19-key shape of `REVIEWED_HARDENING_DIRECTIVES` so
   silent removal of a reviewed directive trips a named failure.
-* Note: production `scripts/systemd/rustynetd.service` does NOT
-  currently set `MemoryDenyWriteExecute=` — the evaluator already
-  flags this, but the orchestrator standard flow does not invoke
-  `linux-service-hardening-check`, so the lab pipeline does not catch
-  the drift today. Unit-file alignment + check wiring tracked as a
-  follow-up slice rather than rolled into the audit-only commit.
+* `[x]` Unit-file alignment + check wiring confirmed in
+  follow-up work:
+  - `scripts/systemd/rustynetd.service` line 97 sets
+    `MemoryDenyWriteExecute=true` — the L8 wire-up pin in the
+    regression-coverage gate (floor `linux_service_hardening:33`)
+    already enforces this.
+  - The orchestrator dispatches `linux-service-hardening-check`
+    through the `LinuxDaemonProbe` adapter
+    (`crates/rustynet-cli/src/vm_lab/mod.rs:5908`,
+    `:11622`) and the
+    `run_validate_linux_service_hardening_stage` callsite parses
+    the typed report. The lab pipeline now catches the directive
+    drift the evaluator flags.
 
 ### L4. `linux_dns_failclosed.rs` race + edge cases
 
