@@ -3591,7 +3591,7 @@ impl DaemonRuntime {
         if self.auto_tunnel_enforce {
             match self.state_fetcher.fetch_assignment() {
                 Ok(FetchDecision::Applied) => {
-                    eprintln!("statefetch: assignment applied during refresh")
+                    eprintln!("statefetch: assignment applied during refresh");
                 }
                 Ok(FetchDecision::Skipped) => {}
                 Err(e) => return Err(format!("remote assignment fetch failed: {e}")),
@@ -4141,13 +4141,13 @@ impl DaemonRuntime {
                         Some(max_candidate_priority.unwrap_or(0).max(candidate.priority));
                     match candidate.candidate_type {
                         TraversalCandidateType::Host => {
-                            host_candidates = host_candidates.saturating_add(1)
+                            host_candidates = host_candidates.saturating_add(1);
                         }
                         TraversalCandidateType::ServerReflexive => {
-                            srflx_candidates = srflx_candidates.saturating_add(1)
+                            srflx_candidates = srflx_candidates.saturating_add(1);
                         }
                         TraversalCandidateType::Relay => {
-                            relay_candidates = relay_candidates.saturating_add(1)
+                            relay_candidates = relay_candidates.saturating_add(1);
                         }
                     }
                 }
@@ -5323,7 +5323,7 @@ impl DaemonRuntime {
         }
         match self.state_fetcher.fetch_traversal() {
             Ok(FetchDecision::Applied) => {
-                eprintln!("statefetch: traversal applied before bootstrap")
+                eprintln!("statefetch: traversal applied before bootstrap");
             }
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
@@ -5337,7 +5337,7 @@ impl DaemonRuntime {
         if self.auto_tunnel_enforce {
             match self.state_fetcher.fetch_assignment() {
                 Ok(FetchDecision::Applied) => {
-                    eprintln!("statefetch: assignment applied before bootstrap")
+                    eprintln!("statefetch: assignment applied before bootstrap");
                 }
                 Ok(FetchDecision::Skipped) => {}
                 Err(e) => {
@@ -5377,7 +5377,7 @@ impl DaemonRuntime {
         };
         match self.state_fetcher.fetch_dns_zone(dns_context.as_ref()) {
             Ok(FetchDecision::Applied) => {
-                eprintln!("statefetch: dns zone applied before bootstrap")
+                eprintln!("statefetch: dns zone applied before bootstrap");
             }
             Ok(FetchDecision::Skipped) => {}
             Err(e) => {
@@ -10318,7 +10318,7 @@ fn load_traversal_bundle_set(
         match parse_traversal_bundle_section(section, &verifying_key, max_age_secs, trust_policy)? {
             TraversalSectionEnvelope::Bundle(bundle) => bundles.push(bundle),
             TraversalSectionEnvelope::Coordination(coordination) => {
-                coordinations.push(coordination)
+                coordinations.push(coordination);
             }
         }
     }

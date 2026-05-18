@@ -945,7 +945,7 @@ impl Config {
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--ssh-identity-file" => {
-                    config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?)
+                    config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?);
                 }
                 "--exit-a-host" => config.exit_a_host = next_value(&mut iter, &arg)?,
                 "--exit-b-host" => config.exit_b_host = next_value(&mut iter, &arg)?,
@@ -957,24 +957,24 @@ impl Config {
                 "--switch-iteration" => {
                     config.switch_iteration = next_value(&mut iter, &arg)?
                         .parse()
-                        .map_err(|_| "switch iteration must be a positive integer".to_owned())?
+                        .map_err(|_| "switch iteration must be a positive integer".to_owned())?;
                 }
                 "--monitor-iterations" => {
                     config.monitor_iterations = next_value(&mut iter, &arg)?
                         .parse()
-                        .map_err(|_| "monitor iterations must be a positive integer".to_owned())?
+                        .map_err(|_| "monitor iterations must be a positive integer".to_owned())?;
                 }
                 "--traversal-ttl-secs" => {
                     config.traversal_ttl_secs = next_value(&mut iter, &arg)?
                         .parse()
-                        .map_err(|_| "traversal ttl seconds must be an integer".to_owned())?
+                        .map_err(|_| "traversal ttl seconds must be an integer".to_owned())?;
                 }
                 "--report-path" => config.report_path = PathBuf::from(next_value(&mut iter, &arg)?),
                 "--log-path" => config.log_path = PathBuf::from(next_value(&mut iter, &arg)?),
                 "--monitor-log" => config.monitor_log = PathBuf::from(next_value(&mut iter, &arg)?),
                 "--known-hosts" => {
                     config.pinned_known_hosts_file =
-                        Some(PathBuf::from(next_value(&mut iter, &arg)?))
+                        Some(PathBuf::from(next_value(&mut iter, &arg)?));
                 }
                 "--git-commit" => config.git_commit = Some(next_value(&mut iter, &arg)?),
                 "-h" | "--help" => {

@@ -1090,7 +1090,7 @@ impl Config {
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--ssh-identity-file" => {
-                    config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?)
+                    config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?);
                 }
                 "--final-exit-host" => config.final_exit_host = next_value(&mut iter, &arg)?,
                 "--client-host" => config.client_host = next_value(&mut iter, &arg)?,
@@ -1100,14 +1100,14 @@ impl Config {
                 "--client-node-id" => config.client_node_id = next_value(&mut iter, &arg)?,
                 "--entry-node-id" => config.entry_node_id = next_value(&mut iter, &arg)?,
                 "--second-client-node-id" => {
-                    config.second_client_node_id = next_value(&mut iter, &arg)?
+                    config.second_client_node_id = next_value(&mut iter, &arg)?;
                 }
                 "--ssh-allow-cidrs" => config.ssh_allow_cidrs = next_value(&mut iter, &arg)?,
                 "--report-path" => config.report_path = PathBuf::from(next_value(&mut iter, &arg)?),
                 "--log-path" => config.log_path = PathBuf::from(next_value(&mut iter, &arg)?),
                 "--known-hosts" => {
                     config.pinned_known_hosts_file =
-                        Some(PathBuf::from(next_value(&mut iter, &arg)?))
+                        Some(PathBuf::from(next_value(&mut iter, &arg)?));
                 }
                 "--git-commit" => config.git_commit = Some(next_value(&mut iter, &arg)?),
                 "-h" | "--help" => {

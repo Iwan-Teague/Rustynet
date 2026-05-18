@@ -2521,7 +2521,7 @@ fn validate_setup_manifest(
     };
     match (&actual.inventory, &current_inventory_binding) {
         (Some(actual_binding), Some(current_binding)) => {
-            validate_file_binding("inventory", actual_binding, current_binding)?
+            validate_file_binding("inventory", actual_binding, current_binding)?;
         }
         (None, None) => {}
         (Some(_), None) | (None, Some(_)) => {
@@ -13649,7 +13649,7 @@ pub fn target_capabilities(profile: VmPlatformProfile) -> Vec<LiveLabStageCapabi
     match profile.service_manager {
         VmServiceManager::Systemd => caps.push(LiveLabStageCapability::Systemd),
         VmServiceManager::WindowsService => {
-            caps.push(LiveLabStageCapability::WindowsServiceManager)
+            caps.push(LiveLabStageCapability::WindowsServiceManager);
         }
         VmServiceManager::Launchd | VmServiceManager::Unsupported => {}
     }

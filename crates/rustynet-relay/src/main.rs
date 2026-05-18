@@ -2973,57 +2973,57 @@ mod daemon {
             for mutate in [
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| snapshot.schema_version = 99,
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.service_name = "RustyNet".to_owned()
+                    snapshot.service_name = "RustyNet".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.binary_image_argv[0] = r"C:\Tools\rustynet-relay.exe".to_owned()
+                    snapshot.binary_image_argv[0] = r"C:\Tools\rustynet-relay.exe".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.binary_image_argv[0] =
-                        format!("{}\\rustynetd.exe", super::DEFAULT_WINDOWS_INSTALL_ROOT)
+                        format!("{}\\rustynetd.exe", super::DEFAULT_WINDOWS_INSTALL_ROOT);
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot
                         .binary_image_argv
-                        .retain(|arg| arg != "--windows-service")
+                        .retain(|arg| arg != "--windows-service");
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.binary_image_argv.retain(|arg| arg != "--env-file")
+                    snapshot.binary_image_argv.retain(|arg| arg != "--env-file");
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.binary_image_argv.push("--verifier-key".to_owned())
+                    snapshot.binary_image_argv.push("--verifier-key".to_owned());
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.start_name = r".\Administrator".to_owned()
+                    snapshot.start_name = r".\Administrator".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.service_sid_type = "none".to_owned()
+                    snapshot.service_sid_type = "none".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.interactive_process = true
+                    snapshot.interactive_process = true;
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.failure_action_count = 0
+                    snapshot.failure_action_count = 0;
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.binary_path_acl_sddl = String::new()
+                    snapshot.binary_path_acl_sddl = String::new();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.binary_path_acl_sddl = "O:BAG:BAD:(A;;FA;;;WD)".to_owned()
+                    snapshot.binary_path_acl_sddl = "O:BAG:BAD:(A;;FA;;;WD)".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.env_file_acl_sddl = String::new()
+                    snapshot.env_file_acl_sddl = String::new();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_acl_sddl =
-                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_owned()
+                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
-                    snapshot.env_file_parent_acl_sddl = String::new()
+                    snapshot.env_file_parent_acl_sddl = String::new();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_parent_acl_sddl =
-                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_owned()
+                        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_owned();
                 },
                 |snapshot: &mut WindowsRelayServiceHardeningSnapshot| {
                     snapshot.env_file_runtime_args_valid = false;
