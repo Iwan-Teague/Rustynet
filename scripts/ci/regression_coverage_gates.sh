@@ -118,7 +118,12 @@ WINDOWS_FLOORS=(
   # that lan_access_enabled + selected_exit_node fields don't gate
   # the drift verdict today.
   "windows_mesh_status:23"
-  "windows_key_custody:18"
+  # Floor bumped 18→24 on X4 coverage parity sweep: 6 new tests
+  # covering schema_version pin, per-variant serde round-trip on
+  # Missing + Invalid + AbsentAsExpected, unknown-status-tag
+  # rejection, and the no-dedup-across-entries contract for
+  # repeated-shape drift reasons.
+  "windows_key_custody:24"
   "windows_authenticode:38"
   # New module from W4: 17 tests pinning the registry-key ACL
   # drift evaluator (forbidden principals, requirement

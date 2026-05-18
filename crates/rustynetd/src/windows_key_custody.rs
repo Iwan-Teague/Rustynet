@@ -792,4 +792,139 @@ mod tests {
             serde_json::from_str(serialized.as_str()).expect("deserialize");
         assert_eq!(restored, report);
     }
+
+    // ----- X4 coverage parity sweep ---------------------------------------
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        // Pin the wire-format schema_version so an accidental bump
+        // forces a deliberate code change + commit-message rationale.
+        let report = WindowsKeyCustodyReport {
+            schema_version: 1,
+            overall_ok: true,
+            entries: vec![ok_entry("wg key passphrase blob")],
+            drift_reasons: Vec::new(),
+        };
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape must be int=1: {body}"
+        );
+    }
+
+    #[test]
+    fn entry_status_missing_round_trips_through_serde() {
+        // Pre-existing snapshot_serializes_with_status_tag_and_round_trips
+        // only covered Ok + Forbidden together. Pin the Missing variant
+        // explicitly so a future #[serde(rename)] on reason trips this.
+        let entry = WindowsKeyCustodyEntry {
+            label: "wg key passphrase blob".to_string(),
+            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
+            requirement: REQUIREMENT_PRESENT.to_string(),
+            status: WindowsKeyCustodyEntryStatus::Missing {
+                reason: "file not found".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"missing\""), "tag: {body}");
+        assert!(
+            body.contains("\"reason\":\"file not found\""),
+            "reason: {body}"
+        );
+        let parsed: WindowsKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_invalid_round_trips_through_serde() {
+        // Invalid carries reason + acl_sddl; pin both through serde.
+        let entry = WindowsKeyCustodyEntry {
+            label: "wg encrypted private key".to_string(),
+            path: r"C:\ProgramData\RustyNet\secrets\wireguard.key.enc".to_string(),
+            requirement: REQUIREMENT_PRESENT.to_string(),
+            status: WindowsKeyCustodyEntryStatus::Invalid {
+                reason: "ACL drift".to_string(),
+                acl_sddl: "O:WDD:(A;;FA;;;WD)".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"invalid\""), "tag: {body}");
+        assert!(
+            body.contains("\"acl_sddl\":\"O:WDD:(A;;FA;;;WD)\""),
+            "acl shape: {body}"
+        );
+        let parsed: WindowsKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_absent_as_expected_round_trips_through_serde() {
+        // The forbidden-but-correctly-absent path; round-trip the
+        // unit variant explicitly so a future addition of a field
+        // (e.g. confirmed_at_unix) trips the test.
+        let entry = WindowsKeyCustodyEntry {
+            label: "wg plaintext runtime private key".to_string(),
+            path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_string(),
+            requirement: REQUIREMENT_ABSENT.to_string(),
+            status: WindowsKeyCustodyEntryStatus::AbsentAsExpected,
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            body.contains("\"status\":\"absent_as_expected\""),
+            "tag: {body}"
+        );
+        let parsed: WindowsKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_rejects_unknown_tag() {
+        // #[serde(tag = "status", rename_all = "snake_case")] — an
+        // unknown tag must fail closed.
+        let body = r#"{"label":"wg key passphrase blob","path":"C:\\ProgramData\\RustyNet\\secrets\\wireguard.passphrase.dpapi","requirement":"present","status":"rotating","reason":"placeholder"}"#;
+        let err = serde_json::from_str::<WindowsKeyCustodyEntry>(body)
+            .expect_err("unknown tag must fail closed");
+        assert!(
+            err.to_string().contains("rotating") || err.to_string().contains("unknown variant"),
+            "error must reference unknown tag or 'unknown variant': {err}"
+        );
+    }
+
+    #[test]
+    fn evaluator_does_not_dedupe_repeated_drift_reasons_across_entries() {
+        // Two entries with the same drift shape must surface as two
+        // reasons, not one. Pin so a future HashSet-based dedup
+        // refactor would silently collapse the operator-facing count.
+        let entries = vec![
+            WindowsKeyCustodyEntry {
+                label: "wg key passphrase blob".to_string(),
+                path: "p1".to_string(),
+                requirement: REQUIREMENT_PRESENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Missing {
+                    reason: "ENOENT".to_string(),
+                },
+            },
+            WindowsKeyCustodyEntry {
+                label: "wg encrypted private key".to_string(),
+                path: "p2".to_string(),
+                requirement: REQUIREMENT_PRESENT.to_string(),
+                status: WindowsKeyCustodyEntryStatus::Missing {
+                    reason: "ENOENT".to_string(),
+                },
+            },
+            ok_entry("wg public key"),
+            absent_forbidden_entry("wg plaintext runtime private key"),
+        ];
+        let reasons =
+            evaluate_windows_key_custody(&entries).expect_err("two missing entries must fail");
+        // exactly two reasons surfaced — one per missing entry, no dedup.
+        let missing_reasons: Vec<&String> =
+            reasons.iter().filter(|r| r.contains("missing")).collect();
+        assert_eq!(
+            missing_reasons.len(),
+            2,
+            "expected 2 missing reasons (no dedup), got: {reasons:?}"
+        );
+    }
 }
