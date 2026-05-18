@@ -40,7 +40,7 @@
 //!   address via STUN (D2) and treat that as authoritative.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
@@ -1182,6 +1182,772 @@ fn parse_route_get_default_output(stdout: &str) -> Result<IpAddr, PortMapperErro
     ))
 }
 
+// ---- uPnP IGD (SSDP discovery + HTTP/SOAP) ----
+
+/// SSDP multicast group address (UPnP Device Architecture v1.1 §1.2.2).
+pub const UPNP_SSDP_MULTICAST_IPV4: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+
+/// SSDP UDP port (UPnP Device Architecture v1.1 §1.2.2).
+pub const UPNP_SSDP_PORT: u16 = 1900;
+
+/// SSDP Search Target for the InternetGatewayDevice v1 root device.
+pub const UPNP_ST_IGD_V1: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
+
+/// SSDP Search Target for the InternetGatewayDevice v2 root device.
+pub const UPNP_ST_IGD_V2: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:2";
+
+/// Service type for WANIPConnection v1 (IGD:1).
+pub const UPNP_SERVICE_WANIPCONNECTION_V1: &str = "urn:schemas-upnp-org:service:WANIPConnection:1";
+
+/// Service type for WANIPConnection v2 (IGD:2).
+pub const UPNP_SERVICE_WANIPCONNECTION_V2: &str = "urn:schemas-upnp-org:service:WANIPConnection:2";
+
+/// Service type for WANPPPConnection (PPP-based WANs; rare on consumer
+/// gear but still legal). Same SOAP surface as WANIPConnection.
+pub const UPNP_SERVICE_WANPPPCONNECTION_V1: &str =
+    "urn:schemas-upnp-org:service:WANPPPConnection:1";
+
+/// Practical M-SEARCH MX header value (seconds). The UPnP spec says the
+/// device picks a random delay between 0 and MX before replying — we
+/// keep this short so a slow gateway does not pad the probe.
+const UPNP_MSEARCH_MX_SECS: u8 = 2;
+
+/// Practical SSDP discovery wait: how long we listen for responses.
+const UPNP_SSDP_DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Build an SSDP M-SEARCH HTTP-over-UDP request body for an IGD search.
+///
+/// Wire format (UPnP Device Architecture v1.1 §1.3.2):
+///
+/// ```text
+/// M-SEARCH * HTTP/1.1\r\n
+/// HOST: 239.255.255.250:1900\r\n
+/// MAN: "ssdp:discover"\r\n
+/// MX: <seconds>\r\n
+/// ST: <search-target>\r\n
+/// \r\n
+/// ```
+///
+/// CRLF line endings and the literal `MAN: "ssdp:discover"` value
+/// (quotes included) are mandatory.
+pub fn build_msearch_request(search_target: &str) -> Vec<u8> {
+    format!(
+        "M-SEARCH * HTTP/1.1\r\n\
+         HOST: {UPNP_SSDP_MULTICAST_IPV4}:{UPNP_SSDP_PORT}\r\n\
+         MAN: \"ssdp:discover\"\r\n\
+         MX: {UPNP_MSEARCH_MX_SECS}\r\n\
+         ST: {search_target}\r\n\
+         USER-AGENT: rustynetd/0 UPnP/1.1\r\n\
+         \r\n"
+    )
+    .into_bytes()
+}
+
+/// Parse an SSDP response, returning the LOCATION header value if
+/// present. The response is an HTTP-style document with `\r\n` line
+/// endings; headers are case-insensitive (UPnP DA §1.3.3).
+pub fn parse_ssdp_location(response: &str) -> Option<String> {
+    // Skip the status line; first line is e.g. "HTTP/1.1 200 OK".
+    for line in response.lines().skip(1) {
+        // RFC 7230: headers are name<colon>value; the case of the name
+        // does not matter. We split on the first colon and compare
+        // case-insensitively.
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("LOCATION")
+        {
+            return Some(value.trim().to_owned());
+        }
+    }
+    None
+}
+
+/// Crude single-pass XML walker that finds the `<controlURL>` text
+/// inside the first `<service>` block whose `<serviceType>` matches one
+/// of `target_service_types`.
+///
+/// We deliberately avoid pulling in a full XML parser dep — the IGD
+/// device description is well-formed and small (<10 KB), and the only
+/// element we care about is a sibling text node of a known type marker.
+/// The walker:
+///
+/// 1. Scans for `<service>` open tags.
+/// 2. Within each `<service>...</service>` span, extracts the
+///    `<serviceType>` and `<controlURL>` text.
+/// 3. Returns the first `controlURL` whose serviceType matches.
+///
+/// Resolves relative `controlURL` values against `base_url` per
+/// UPnP DA §1.6 (URL field rules).
+pub fn parse_device_description_for_control_url(
+    xml: &str,
+    target_service_types: &[&str],
+    base_url: &str,
+) -> Option<String> {
+    let mut cursor = 0;
+    while let Some(open) = find_subslice(xml, b"<service>", cursor) {
+        let close = find_subslice(xml, b"</service>", open).unwrap_or(xml.len());
+        let block = &xml[open..close];
+        let service_type = extract_inner_text(block, "serviceType")?;
+        if target_service_types
+            .iter()
+            .any(|wanted| service_type.trim() == *wanted)
+        {
+            let control = extract_inner_text(block, "controlURL")?;
+            let control_trimmed = control.trim();
+            return Some(resolve_url_against_base(control_trimmed, base_url));
+        }
+        cursor = close + b"</service>".len();
+    }
+    None
+}
+
+fn find_subslice(haystack: &str, needle: &[u8], from: usize) -> Option<usize> {
+    if from > haystack.len() {
+        return None;
+    }
+    let bytes = haystack.as_bytes();
+    bytes[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
+}
+
+fn extract_inner_text<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let open_idx = block.find(&open)? + open.len();
+    let close_idx = block[open_idx..].find(&close)? + open_idx;
+    Some(&block[open_idx..close_idx])
+}
+
+/// Resolve a `<controlURL>` value against the device description's
+/// LOCATION URL per UPnP DA §1.6 URL rules. Absolute URLs pass through;
+/// path-relative URLs are joined against the LOCATION's
+/// `scheme://host[:port]` prefix.
+fn resolve_url_against_base(url: &str, base: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return url.to_owned();
+    }
+    let scheme_end = match base.find("://") {
+        Some(i) => i + 3,
+        None => return url.to_owned(),
+    };
+    let path_start = base[scheme_end..]
+        .find('/')
+        .map(|i| i + scheme_end)
+        .unwrap_or(base.len());
+    let origin = &base[..path_start];
+    if url.starts_with('/') {
+        format!("{origin}{url}")
+    } else {
+        format!("{origin}/{url}")
+    }
+}
+
+/// Build a SOAP envelope for an UPnP IGD action.
+///
+/// Format (UPnP DA §2.5 SOAP messaging; mirroring miniupnpc's wire
+/// format which is the de-facto interoperable template):
+///
+/// ```xml
+/// <?xml version="1.0"?>
+/// <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+///             s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+///   <s:Body>
+///     <u:ActionName xmlns:u="<service-type-urn>">
+///       <ArgName1>val1</ArgName1>
+///       ...
+///     </u:ActionName>
+///   </s:Body>
+/// </s:Envelope>
+/// ```
+///
+/// `arguments` is a list of `(name, value)` pairs; values are XML-text
+/// escaped (`&`, `<`, `>`, `"`, `'`) before inlining.
+pub fn build_soap_envelope(
+    service_type: &str,
+    action: &str,
+    arguments: &[(&str, String)],
+) -> String {
+    let mut args_xml = String::new();
+    for (name, value) in arguments {
+        args_xml.push_str(&format!("<{name}>{}</{name}>", xml_escape(value)));
+    }
+    format!(
+        "<?xml version=\"1.0\"?>\r\n\
+         <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+         s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+         <s:Body>\
+         <u:{action} xmlns:u=\"{service_type}\">\
+         {args_xml}\
+         </u:{action}>\
+         </s:Body></s:Envelope>\r\n"
+    )
+}
+
+/// XML-text escape — covers the five named entities required by XML 1.0
+/// for character data.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Parse a SOAP response, returning either the inner action-response
+/// body text (success) or a `PortMapperError::Refused` with the SOAP
+/// fault code (failure).
+///
+/// UPnP IGD SOAP faults follow §2.5.16: a `<s:Fault>` element with a
+/// nested `<UPnPError><errorCode>NUM</errorCode></UPnPError>`. The
+/// well-known codes for AddPortMapping are 718 (ConflictInMappingEntry),
+/// 724 (SamePortValuesRequired), 725 (OnlyPermanentLeasesSupported),
+/// 726 (RemoteHostOnlySupportsWildcard), 727 (ExternalPortOnlySupportsWildcard),
+/// 728 (NoPortMapsAvailable).
+pub fn parse_soap_response(response: &str) -> Result<&str, PortMapperError> {
+    // Locate the body. Look for `<s:Body>` or `<SOAP-ENV:Body>` etc.;
+    // we treat the first `<Body` opening tag as the body delimiter.
+    let body_start = response
+        .find("<s:Body")
+        .or_else(|| response.find("<SOAP-ENV:Body"))
+        .or_else(|| response.find("<Body"))
+        .ok_or_else(|| {
+            PortMapperError::InvalidResponse("SOAP response missing Body element".to_owned())
+        })?;
+    let body = &response[body_start..];
+    if body.contains("<s:Fault") || body.contains("Fault>") {
+        // Try to extract UPnPError/errorCode for a structured message.
+        let code = extract_inner_text(body, "errorCode")
+            .unwrap_or("unknown")
+            .trim();
+        let description = extract_inner_text(body, "errorDescription")
+            .unwrap_or("(no errorDescription)")
+            .trim();
+        return Err(map_upnp_error_code(code, description));
+    }
+    Ok(body)
+}
+
+/// Translate an UPnP IGD SOAP error code (string) into a typed
+/// `PortMapperError`. Codes from UPnP-gw-WANIPConnection-v1-Service
+/// (Table 2-2). Unrecognised codes pass through as `Refused`.
+fn map_upnp_error_code(code: &str, description: &str) -> PortMapperError {
+    match code {
+        "401" => PortMapperError::Refused(format!("uPnP gateway: invalid action ({description})")),
+        "402" => {
+            PortMapperError::Refused(format!("uPnP gateway: invalid arguments ({description})"))
+        }
+        "501" => PortMapperError::Refused(format!("uPnP gateway: action failed ({description})")),
+        "606" => PortMapperError::Refused(format!(
+            "uPnP gateway: action not authorized ({description})"
+        )),
+        "718" => PortMapperError::Refused(format!(
+            "uPnP gateway: conflict — another client already holds this external port ({description})"
+        )),
+        "724" => PortMapperError::Refused(format!(
+            "uPnP gateway: requires same internal and external port ({description})"
+        )),
+        "725" => PortMapperError::Refused(format!(
+            "uPnP gateway: only permanent (zero-lifetime) leases supported ({description})"
+        )),
+        "726" => PortMapperError::Refused(format!(
+            "uPnP gateway: RemoteHost wildcard required ({description})"
+        )),
+        "727" => PortMapperError::Refused(format!(
+            "uPnP gateway: ExternalPort wildcard required ({description})"
+        )),
+        "728" => PortMapperError::Refused(format!(
+            "uPnP gateway: no port maps available ({description})"
+        )),
+        other => {
+            PortMapperError::Refused(format!("uPnP gateway: error code {other} ({description})"))
+        }
+    }
+}
+
+/// Minimal HTTP/1.1 client used by the uPnP code path. Implemented in
+/// terms of `std::net::TcpStream` only — no async runtime, no
+/// dependency on `hyper`/`reqwest`. Sufficient for short-lived,
+/// fixed-format SOAP requests against on-LAN gateways.
+///
+/// The client does NOT support:
+/// * Transfer-Encoding: chunked (well-behaved IGDs emit Content-Length).
+/// * Keep-Alive (one request per TCP connection).
+/// * TLS (uPnP IGD control points run plain HTTP).
+///
+/// If a future gateway emits a chunked response we degrade by reading
+/// until the connection is closed, which works for one-shot
+/// request/response.
+pub fn http_get(url: &str, timeout: Duration) -> Result<String, PortMapperError> {
+    let (host, port, path) = parse_http_url(url)?;
+    let addr_string = format!("{host}:{port}");
+    let stream = std::net::TcpStream::connect_timeout(
+        &addr_string
+            .to_socket_addrs()
+            .map_err(|e| PortMapperError::Io(format!("resolving {addr_string}: {e}")))?
+            .next()
+            .ok_or_else(|| PortMapperError::Io(format!("no address for {addr_string}")))?,
+        timeout,
+    )
+    .map_err(|e| PortMapperError::Io(format!("connecting to {addr_string}: {e}")))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(PortMapperError::from)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(PortMapperError::from)?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         HOST: {host}:{port}\r\n\
+         USER-AGENT: rustynetd/0 UPnP/1.1\r\n\
+         CONNECTION: close\r\n\
+         \r\n"
+    );
+    perform_http_round_trip(stream, request.as_bytes())
+}
+
+/// HTTP/1.1 POST helper used to issue SOAP actions. Adds `Content-Type:
+/// text/xml; charset="utf-8"` and the supplied `SOAPAction` header.
+pub fn http_soap_post(
+    url: &str,
+    soap_action: &str,
+    body: &str,
+    timeout: Duration,
+) -> Result<String, PortMapperError> {
+    let (host, port, path) = parse_http_url(url)?;
+    let addr_string = format!("{host}:{port}");
+    let stream = std::net::TcpStream::connect_timeout(
+        &addr_string
+            .to_socket_addrs()
+            .map_err(|e| PortMapperError::Io(format!("resolving {addr_string}: {e}")))?
+            .next()
+            .ok_or_else(|| PortMapperError::Io(format!("no address for {addr_string}")))?,
+        timeout,
+    )
+    .map_err(|e| PortMapperError::Io(format!("connecting to {addr_string}: {e}")))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(PortMapperError::from)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(PortMapperError::from)?;
+    let body_bytes = body.as_bytes();
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\n\
+         HOST: {host}:{port}\r\n\
+         CONTENT-TYPE: text/xml; charset=\"utf-8\"\r\n\
+         CONTENT-LENGTH: {}\r\n\
+         SOAPACTION: \"{soap_action}\"\r\n\
+         USER-AGENT: rustynetd/0 UPnP/1.1\r\n\
+         CONNECTION: close\r\n\
+         \r\n",
+        body_bytes.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body_bytes);
+    perform_http_round_trip(stream, &request)
+}
+
+fn perform_http_round_trip(
+    mut stream: std::net::TcpStream,
+    request: &[u8],
+) -> Result<String, PortMapperError> {
+    use std::io::{Read, Write};
+    stream
+        .write_all(request)
+        .map_err(|e| PortMapperError::Io(format!("HTTP write: {e}")))?;
+    let mut buf = Vec::with_capacity(4096);
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| PortMapperError::Io(format!("HTTP read: {e}")))?;
+    let body = String::from_utf8_lossy(&buf).into_owned();
+    let (status, body_text) = split_http_status_and_body(&body)?;
+    if !(200..=299).contains(&status) && status != 500 {
+        // 500 is acceptable here because SOAP faults are returned with
+        // HTTP 500 per W3C SOAP 1.1 §4.4; the SOAP parser will surface
+        // the fault details.
+        return Err(PortMapperError::Refused(format!(
+            "HTTP status {status} from gateway"
+        )));
+    }
+    Ok(body_text.to_owned())
+}
+
+/// Parse an HTTP/1.1 response into (status_code, body_text). Headers
+/// are not surfaced; the SOAP parser inspects the body string directly.
+fn split_http_status_and_body(response: &str) -> Result<(u16, &str), PortMapperError> {
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
+    let first_line = head
+        .lines()
+        .next()
+        .ok_or_else(|| PortMapperError::InvalidResponse("empty HTTP response".to_owned()))?;
+    // Status line: "HTTP/1.1 200 OK"
+    let mut parts = first_line.splitn(3, ' ');
+    let _version = parts.next();
+    let code = parts.next().unwrap_or("0");
+    let status = code.parse::<u16>().map_err(|e| {
+        PortMapperError::InvalidResponse(format!("could not parse HTTP status code {code}: {e}"))
+    })?;
+    Ok((status, body))
+}
+
+fn parse_http_url(url: &str) -> Result<(String, u16, String), PortMapperError> {
+    let stripped = url.strip_prefix("http://").ok_or_else(|| {
+        PortMapperError::InvalidResponse(format!(
+            "uPnP control URLs must be http:// (HTTPS not supported); got {url}"
+        ))
+    })?;
+    let (authority, path) = stripped
+        .split_once('/')
+        .map(|(a, p)| (a, format!("/{p}")))
+        .unwrap_or((stripped, "/".to_owned()));
+    let (host, port) = if let Some(idx) = authority.rfind(':') {
+        // Care: IPv6 literals like [::1]:80 contain colons inside [...].
+        // Cheap heuristic: if authority starts with '[' and the matching
+        // bracket exists before idx, treat the bracketed span as host.
+        if authority.starts_with('[') {
+            if let Some(bracket_end) = authority.find(']') {
+                let host = &authority[1..bracket_end];
+                let port_str = authority[bracket_end + 1..].trim_start_matches(':');
+                let port = port_str.parse::<u16>().unwrap_or(80);
+                (host.to_owned(), port)
+            } else {
+                return Err(PortMapperError::InvalidResponse(format!(
+                    "uPnP control URL has unmatched IPv6 bracket: {url}"
+                )));
+            }
+        } else {
+            let host = &authority[..idx];
+            let port = authority[idx + 1..].parse::<u16>().map_err(|e| {
+                PortMapperError::InvalidResponse(format!(
+                    "uPnP control URL has invalid port {}: {e}",
+                    &authority[idx + 1..]
+                ))
+            })?;
+            (host.to_owned(), port)
+        }
+    } else {
+        (authority.to_owned(), 80u16)
+    };
+    Ok((host, port, path))
+}
+
+/// One device discovered via SSDP M-SEARCH. Carries the LOCATION URL of
+/// the device description XML so the caller can fetch it and find the
+/// WANIPConnection control URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsdpDiscoveredDevice {
+    pub location_url: String,
+    pub server: String,
+    pub st: String,
+}
+
+/// Issue an SSDP M-SEARCH and collect responses for `wait_duration`.
+///
+/// `bind_address` is the local v4 address to bind to (use
+/// `Ipv4Addr::UNSPECIFIED` in production). Returns every distinct
+/// LOCATION header observed.
+pub fn ssdp_discover_igd(
+    bind_address: Ipv4Addr,
+    wait_duration: Duration,
+) -> Result<Vec<SsdpDiscoveredDevice>, PortMapperError> {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(bind_address), 0))?;
+    socket.set_read_timeout(Some(wait_duration))?;
+    // Set the multicast TTL low — we only want to reach the on-LAN
+    // gateway, never beyond.
+    socket
+        .set_multicast_ttl_v4(2)
+        .map_err(PortMapperError::from)?;
+    let multicast_dest = SocketAddr::new(IpAddr::V4(UPNP_SSDP_MULTICAST_IPV4), UPNP_SSDP_PORT);
+
+    // Send one M-SEARCH for IGD v2, then one for v1. Most gateways
+    // answer both with the same LOCATION; we send two queries so older
+    // IGD:1-only gateways still respond.
+    let v2_request = build_msearch_request(UPNP_ST_IGD_V2);
+    let v1_request = build_msearch_request(UPNP_ST_IGD_V1);
+    socket.send_to(&v2_request, multicast_dest)?;
+    socket.send_to(&v1_request, multicast_dest)?;
+
+    ssdp_collect_responses(&socket, wait_duration)
+}
+
+fn ssdp_collect_responses(
+    socket: &UdpSocket,
+    wait_duration: Duration,
+) -> Result<Vec<SsdpDiscoveredDevice>, PortMapperError> {
+    let mut devices: Vec<SsdpDiscoveredDevice> = Vec::new();
+    let deadline = Instant::now() + wait_duration;
+    let mut buf = [0u8; 2048];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        socket.set_read_timeout(Some(remaining))?;
+        match socket.recv_from(&mut buf) {
+            Ok((len, _src)) => {
+                let response = String::from_utf8_lossy(&buf[..len]);
+                let location = match parse_ssdp_location(&response) {
+                    Some(loc) => loc,
+                    None => continue,
+                };
+                let st = parse_ssdp_header(&response, "ST").unwrap_or_default();
+                let server = parse_ssdp_header(&response, "SERVER").unwrap_or_default();
+                if devices.iter().any(|d| d.location_url == location) {
+                    continue;
+                }
+                devices.push(SsdpDiscoveredDevice {
+                    location_url: location,
+                    server,
+                    st,
+                });
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(other) => return Err(PortMapperError::from(other)),
+        }
+    }
+    Ok(devices)
+}
+
+fn parse_ssdp_header(response: &str, name: &str) -> Option<String> {
+    for line in response.lines().skip(1) {
+        if let Some((n, v)) = line.split_once(':')
+            && n.trim().eq_ignore_ascii_case(name)
+        {
+            return Some(v.trim().to_owned());
+        }
+    }
+    None
+}
+
+/// uPnP IGD client. Implements the `PortMapper` trait against a
+/// known control URL + service type (typically discovered via SSDP +
+/// device-description fetch, but constructible directly for tests).
+#[derive(Debug, Clone)]
+pub struct UpnpIgdClient {
+    control_url: String,
+    service_type: String,
+    timeout: Duration,
+}
+
+/// Production HTTP timeout for an on-LAN gateway SOAP call.
+const UPNP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl UpnpIgdClient {
+    /// Construct from a known control URL + service type. Use this
+    /// when discovery has already happened (e.g. from a cached config
+    /// or via [`UpnpIgdClient::discover_one`]).
+    pub fn new(control_url: String, service_type: String) -> Self {
+        Self {
+            control_url,
+            service_type,
+            timeout: UPNP_DEFAULT_TIMEOUT,
+        }
+    }
+
+    /// Override the HTTP timeout. Tests use a short value so failure
+    /// paths trip quickly.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// One-shot discovery: do an SSDP M-SEARCH, fetch the first
+    /// gateway's device description, parse for a WANIPConnection
+    /// service, and return a ready-to-use client.
+    ///
+    /// Tries the v2 service first, then v1. The two are
+    /// wire-compatible for the AddPortMapping/DeletePortMapping
+    /// surface we use.
+    pub fn discover_one(
+        bind_address: Ipv4Addr,
+        wait_duration: Duration,
+    ) -> Result<Self, PortMapperError> {
+        let devices = ssdp_discover_igd(bind_address, wait_duration)?;
+        if devices.is_empty() {
+            return Err(PortMapperError::ProtocolNotSupported(
+                "no IGD responded to SSDP M-SEARCH within timeout".to_owned(),
+            ));
+        }
+        // Try each discovered device until one yields a parseable
+        // device description with a WANIPConnection service.
+        for device in &devices {
+            let description = match http_get(&device.location_url, UPNP_DEFAULT_TIMEOUT) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let candidates = [
+                UPNP_SERVICE_WANIPCONNECTION_V2,
+                UPNP_SERVICE_WANIPCONNECTION_V1,
+                UPNP_SERVICE_WANPPPCONNECTION_V1,
+            ];
+            for service_type in candidates {
+                if let Some(control_url) = parse_device_description_for_control_url(
+                    &description,
+                    &[service_type],
+                    &device.location_url,
+                ) {
+                    return Ok(Self::new(control_url, service_type.to_owned()));
+                }
+            }
+        }
+        Err(PortMapperError::ProtocolNotSupported(
+            "no IGD with WANIPConnection / WANPPPConnection found via SSDP".to_owned(),
+        ))
+    }
+
+    fn soap_action_header(&self, action: &str) -> String {
+        format!("{}#{action}", self.service_type)
+    }
+
+    /// Resolve the local IP the kernel routes to the gateway's
+    /// control URL. We embed this as `NewInternalClient` in
+    /// AddPortMapping so the gateway forwards inbound packets to the
+    /// right host.
+    ///
+    /// We use UDP `connect()` rather than TCP because UDP `connect`
+    /// only sets the kernel's per-socket default destination — it does
+    /// not require the peer to be listening on the gateway port. The
+    /// `local_addr()` after `connect()` returns the source IP the
+    /// kernel would actually use to reach the gateway. This avoids
+    /// burning an extra TCP accept slot on the gateway.
+    fn resolve_local_internal_client(&self) -> Result<IpAddr, PortMapperError> {
+        let (host, port, _) = parse_http_url(&self.control_url)?;
+        let addr = format!("{host}:{port}")
+            .to_socket_addrs()
+            .map_err(|e| PortMapperError::Io(format!("resolving control URL: {e}")))?
+            .next()
+            .ok_or_else(|| {
+                PortMapperError::Io("control URL resolved to no addresses".to_owned())
+            })?;
+        let bind = match addr {
+            SocketAddr::V4(_) => "0.0.0.0:0",
+            SocketAddr::V6(_) => "[::]:0",
+        };
+        let socket = UdpSocket::bind(bind)?;
+        socket.connect(addr)?;
+        Ok(socket.local_addr()?.ip())
+    }
+}
+
+impl PortMapper for UpnpIgdClient {
+    fn request_udp_mapping(
+        &self,
+        internal_port: u16,
+        lease_duration_secs: u32,
+    ) -> Result<MappingLease, PortMapperError> {
+        if internal_port == 0 {
+            return Err(PortMapperError::InvalidResponse(
+                "internal_port must be non-zero for an uPnP mapping request".to_owned(),
+            ));
+        }
+        let internal_client = self.resolve_local_internal_client()?;
+        // UPnP IGD §2.4 AddPortMapping argument list (in order).
+        let args: [(&str, String); 8] = [
+            ("NewRemoteHost", String::new()), // empty = wildcard
+            ("NewExternalPort", internal_port.to_string()),
+            ("NewProtocol", "UDP".to_owned()),
+            ("NewInternalPort", internal_port.to_string()),
+            ("NewInternalClient", internal_client.to_string()),
+            ("NewEnabled", "1".to_owned()),
+            ("NewPortMappingDescription", "rustynetd".to_owned()),
+            ("NewLeaseDuration", lease_duration_secs.to_string()),
+        ];
+        let body = build_soap_envelope(&self.service_type, "AddPortMapping", &args);
+        let response = http_soap_post(
+            &self.control_url,
+            &self.soap_action_header("AddPortMapping"),
+            &body,
+            self.timeout,
+        )?;
+        let _body = parse_soap_response(&response)?;
+        // Get the external IP via GetExternalIPAddress so we can
+        // surface a complete MappingLease. If this fails the mapping
+        // is still valid; we propagate the error because the lease's
+        // external_addr is part of its identity.
+        let external_addr = self.fetch_external_ip()?;
+        Ok(MappingLease {
+            internal_port,
+            external_port: internal_port,
+            external_addr,
+            protocol: PortMappingProtocol::UpnpIgd,
+            expires_at: Instant::now() + Duration::from_secs(u64::from(lease_duration_secs)),
+            pcp_nonce: None,
+        })
+    }
+
+    fn refresh_mapping(&self, lease: &MappingLease) -> Result<MappingLease, PortMapperError> {
+        // Refresh is just AddPortMapping again with the same external
+        // port and a new lease duration.
+        let lifetime_secs = lease
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .max(60)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        self.request_udp_mapping(lease.internal_port, lifetime_secs)
+    }
+
+    fn release_mapping(&self, lease: &MappingLease) -> Result<(), PortMapperError> {
+        // UPnP IGD §2.4 DeletePortMapping arguments.
+        let args: [(&str, String); 3] = [
+            ("NewRemoteHost", String::new()),
+            ("NewExternalPort", lease.external_port.to_string()),
+            ("NewProtocol", "UDP".to_owned()),
+        ];
+        let body = build_soap_envelope(&self.service_type, "DeletePortMapping", &args);
+        let response = http_soap_post(
+            &self.control_url,
+            &self.soap_action_header("DeletePortMapping"),
+            &body,
+            self.timeout,
+        )?;
+        let _body = parse_soap_response(&response)?;
+        Ok(())
+    }
+}
+
+impl UpnpIgdClient {
+    /// Issue a GetExternalIPAddress SOAP call. Returns the WAN-side
+    /// IP the gateway reports.
+    pub fn fetch_external_ip(&self) -> Result<IpAddr, PortMapperError> {
+        let body = build_soap_envelope(&self.service_type, "GetExternalIPAddress", &[]);
+        let response = http_soap_post(
+            &self.control_url,
+            &self.soap_action_header("GetExternalIPAddress"),
+            &body,
+            self.timeout,
+        )?;
+        let body_text = parse_soap_response(&response)?;
+        let ip = extract_inner_text(body_text, "NewExternalIPAddress")
+            .map(str::trim)
+            .ok_or_else(|| {
+                PortMapperError::InvalidResponse(
+                    "GetExternalIPAddress response did not contain NewExternalIPAddress".to_owned(),
+                )
+            })?;
+        ip.parse::<IpAddr>().map_err(|e| {
+            PortMapperError::InvalidResponse(format!("could not parse external IP {ip}: {e}"))
+        })
+    }
+}
+
 // ---- Probe orchestrator ----
 
 /// Outcome of probing the gateway for a UDP port mapping.
@@ -1232,6 +1998,13 @@ pub struct PortMappingProbe {
     gateway: SocketAddr,
     initial_timeout: Duration,
     max_attempts: u8,
+    /// If `Some`, the probe will attempt uPnP IGD as a third tier
+    /// after PCP and NAT-PMP both fall through. Discovery is local-LAN
+    /// multicast — the probe will issue SSDP M-SEARCH bound to the
+    /// host's default interface. Set via
+    /// [`PortMappingProbe::with_upnp_enabled`].
+    upnp_bind_address: Option<Ipv4Addr>,
+    upnp_wait: Duration,
 }
 
 impl PortMappingProbe {
@@ -1243,6 +2016,8 @@ impl PortMappingProbe {
             gateway: SocketAddr::new(gateway, PCP_SERVER_PORT),
             initial_timeout: PCP_DEFAULT_INITIAL_TIMEOUT,
             max_attempts: PCP_DEFAULT_MAX_ATTEMPTS,
+            upnp_bind_address: None,
+            upnp_wait: UPNP_SSDP_DEFAULT_DISCOVERY_TIMEOUT,
         }
     }
 
@@ -1254,7 +2029,22 @@ impl PortMappingProbe {
             gateway,
             initial_timeout: PCP_DEFAULT_INITIAL_TIMEOUT,
             max_attempts: PCP_DEFAULT_MAX_ATTEMPTS,
+            upnp_bind_address: None,
+            upnp_wait: UPNP_SSDP_DEFAULT_DISCOVERY_TIMEOUT,
         }
+    }
+
+    /// Enable uPnP IGD as a third-tier fallback after PCP and NAT-PMP.
+    /// `bind_address` should be a local IPv4 the host can use to send
+    /// the SSDP M-SEARCH multicast on (usually `Ipv4Addr::UNSPECIFIED`).
+    /// `wait` is how long to listen for SSDP responses; UPnP DA §1.3.2
+    /// says devices reply within MX seconds (default 2 s for our
+    /// probe) — wait_duration should be ≥ MX + a small slack.
+    #[must_use]
+    pub fn with_upnp_enabled(mut self, bind_address: Ipv4Addr, wait: Duration) -> Self {
+        self.upnp_bind_address = Some(bind_address);
+        self.upnp_wait = wait;
+        self
     }
 
     /// Builder: override the per-protocol initial timeout. Each protocol
@@ -1293,15 +2083,33 @@ impl PortMappingProbe {
 
         // ---- NAT-PMP second (IPv4 gateway only) ----
         // RFC 6886 is IPv4-only; an IPv6 gateway address means PCP was
-        // the only available protocol and no further fall-through is
-        // possible. We surface `NoGatewaySupport` rather than an error
-        // because the daemon can still use the keepalive fallback.
+        // the only available protocol at the IANA-5351 tier.
         if self.gateway.ip().is_ipv4() {
             let nat_pmp = NatPmpClient::new_for_test(self.gateway)
                 .with_initial_timeout(self.initial_timeout)
                 .with_max_attempts(self.max_attempts);
             match nat_pmp.request_udp_mapping(internal_port, lease_duration_secs) {
                 Ok(lease) => return Ok(ProbeOutcome::Mapped(lease)),
+                Err(PortMapperError::ProtocolNotSupported(_)) | Err(PortMapperError::Timeout) => {
+                    // fall through to uPnP if enabled.
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        // ---- uPnP IGD third (if enabled) ----
+        if let Some(bind) = self.upnp_bind_address {
+            match UpnpIgdClient::discover_one(bind, self.upnp_wait) {
+                Ok(client) => {
+                    match client.request_udp_mapping(internal_port, lease_duration_secs) {
+                        Ok(lease) => return Ok(ProbeOutcome::Mapped(lease)),
+                        Err(PortMapperError::ProtocolNotSupported(_))
+                        | Err(PortMapperError::Timeout) => {
+                            return Ok(ProbeOutcome::NoGatewaySupport);
+                        }
+                        Err(other) => return Err(other),
+                    }
+                }
                 Err(PortMapperError::ProtocolNotSupported(_)) | Err(PortMapperError::Timeout) => {
                     return Ok(ProbeOutcome::NoGatewaySupport);
                 }
@@ -2200,6 +3008,443 @@ destination: default
             matches!(err, PortMapperError::NoGateway(ref msg) if msg.contains("`gateway:` line")),
             "expected NoGateway with diagnostic message, got: {err:?}"
         );
+    }
+
+    // ---- uPnP IGD parser / wire-format tests ----
+
+    #[test]
+    fn upnp_msearch_request_has_required_headers_and_crlf() {
+        let buf = build_msearch_request(UPNP_ST_IGD_V2);
+        let text = std::str::from_utf8(&buf).expect("ascii");
+        assert!(text.starts_with("M-SEARCH * HTTP/1.1\r\n"));
+        assert!(text.contains("HOST: 239.255.255.250:1900\r\n"));
+        assert!(text.contains("MAN: \"ssdp:discover\"\r\n"));
+        assert!(text.contains("MX: 2\r\n"));
+        assert!(text.contains(&format!("ST: {UPNP_ST_IGD_V2}\r\n")));
+        assert!(text.ends_with("\r\n\r\n"), "M-SEARCH ends with blank line");
+    }
+
+    #[test]
+    fn upnp_parse_ssdp_location_is_case_insensitive() {
+        let response = "HTTP/1.1 200 OK\r\n\
+                        CACHE-CONTROL: max-age=120\r\n\
+                        location: http://192.168.1.1:49152/rootDesc.xml\r\n\
+                        ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\
+                        \r\n";
+        let loc = parse_ssdp_location(response).expect("location parsed");
+        assert_eq!(loc, "http://192.168.1.1:49152/rootDesc.xml");
+    }
+
+    #[test]
+    fn upnp_parse_ssdp_location_returns_none_when_absent() {
+        let response = "HTTP/1.1 200 OK\r\n\
+                        CACHE-CONTROL: max-age=120\r\n\
+                        ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\
+                        \r\n";
+        assert!(parse_ssdp_location(response).is_none());
+    }
+
+    fn sample_igd_device_description() -> &'static str {
+        // Hand-trimmed example matching the shape every consumer
+        // IGD emits — root InternetGatewayDevice → WANDevice →
+        // WANConnectionDevice → WANIPConnection service.
+        r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
+    <friendlyName>HomeRouter</friendlyName>
+    <deviceList>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:WANDevice:1</deviceType>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1</serviceType>
+            <controlURL>/upnp/control/WANCommonIFC1</controlURL>
+          </service>
+        </serviceList>
+        <deviceList>
+          <device>
+            <deviceType>urn:schemas-upnp-org:device:WANConnectionDevice:1</deviceType>
+            <serviceList>
+              <service>
+                <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+                <serviceId>urn:upnp-org:serviceId:WANIPConn1</serviceId>
+                <controlURL>/upnp/control/WANIPConn1</controlURL>
+                <eventSubURL>/upnp/event/WANIPConn1</eventSubURL>
+                <SCPDURL>/upnp/WANIPConn1.xml</SCPDURL>
+              </service>
+            </serviceList>
+          </device>
+        </deviceList>
+      </device>
+    </deviceList>
+  </device>
+</root>"#
+    }
+
+    #[test]
+    fn upnp_parse_device_description_returns_wan_ip_connection_control_url() {
+        let url = parse_device_description_for_control_url(
+            sample_igd_device_description(),
+            &[UPNP_SERVICE_WANIPCONNECTION_V1],
+            "http://192.168.1.1:49152/rootDesc.xml",
+        )
+        .expect("WANIPConnection control URL found");
+        // Relative paths must be resolved against the LOCATION's
+        // scheme://host[:port] prefix per UPnP DA §1.6.
+        assert_eq!(url, "http://192.168.1.1:49152/upnp/control/WANIPConn1");
+    }
+
+    #[test]
+    fn upnp_parse_device_description_passes_through_absolute_control_url() {
+        let xml = r#"<service>
+          <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+          <controlURL>http://gateway.local:49152/Control</controlURL>
+        </service>"#;
+        let url = parse_device_description_for_control_url(
+            xml,
+            &[UPNP_SERVICE_WANIPCONNECTION_V1],
+            "http://192.168.1.1:49152/rootDesc.xml",
+        )
+        .expect("absolute URL kept verbatim");
+        assert_eq!(url, "http://gateway.local:49152/Control");
+    }
+
+    #[test]
+    fn upnp_parse_device_description_skips_non_matching_services() {
+        // If we ask for WANIPConnection:2 in a doc that only exposes
+        // WANIPConnection:1, we must get None — not a false match on
+        // the v1 service URL.
+        let url = parse_device_description_for_control_url(
+            sample_igd_device_description(),
+            &[UPNP_SERVICE_WANIPCONNECTION_V2],
+            "http://192.168.1.1:49152/rootDesc.xml",
+        );
+        assert!(url.is_none(), "v2 must not match v1");
+    }
+
+    #[test]
+    fn upnp_build_soap_envelope_pins_namespaces_and_action() {
+        let body = build_soap_envelope(
+            "urn:schemas-upnp-org:service:WANIPConnection:1",
+            "AddPortMapping",
+            &[
+                ("NewRemoteHost", String::new()),
+                ("NewExternalPort", "51820".to_owned()),
+                ("NewProtocol", "UDP".to_owned()),
+            ],
+        );
+        assert!(body.contains("xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\""));
+        assert!(body.contains("<s:Body>"));
+        assert!(body.contains(
+            "<u:AddPortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">"
+        ));
+        assert!(body.contains("<NewRemoteHost></NewRemoteHost>"));
+        assert!(body.contains("<NewExternalPort>51820</NewExternalPort>"));
+        assert!(body.contains("<NewProtocol>UDP</NewProtocol>"));
+        assert!(body.contains("</u:AddPortMapping>"));
+        assert!(body.contains("</s:Envelope>"));
+    }
+
+    #[test]
+    fn upnp_soap_envelope_xml_escapes_special_characters() {
+        let body = build_soap_envelope("urn:test", "X", &[("Field", "a&b<c>d\"e'f".to_owned())]);
+        assert!(body.contains("a&amp;b&lt;c&gt;d&quot;e&apos;f"));
+    }
+
+    #[test]
+    fn upnp_parse_soap_response_extracts_action_body() {
+        let resp = r#"HTTP/1.1 200 OK
+Content-Type: text/xml
+
+<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>
+<u:AddPortMappingResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+</u:AddPortMappingResponse>
+</s:Body>
+</s:Envelope>"#;
+        let body = parse_soap_response(resp).expect("success body");
+        assert!(body.contains("AddPortMappingResponse"));
+    }
+
+    #[test]
+    fn upnp_parse_soap_response_returns_typed_error_for_conflict() {
+        // UPnP IGD §2.4.16 ConflictInMappingEntry = 718.
+        let resp = r#"HTTP/1.1 500 Internal Server Error
+Content-Type: text/xml
+
+<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>
+<s:Fault>
+<faultcode>s:Client</faultcode>
+<faultstring>UPnPError</faultstring>
+<detail>
+<UPnPError xmlns="urn:schemas-upnp-org:control-1-0">
+<errorCode>718</errorCode>
+<errorDescription>ConflictInMappingEntry</errorDescription>
+</UPnPError>
+</detail>
+</s:Fault>
+</s:Body>
+</s:Envelope>"#;
+        let err = parse_soap_response(resp).expect_err("must surface SOAP fault");
+        match err {
+            PortMapperError::Refused(msg) => {
+                assert!(
+                    msg.contains("718") || msg.to_lowercase().contains("conflict"),
+                    "error message should reference 718 or 'conflict', got: {msg}"
+                );
+            }
+            other => panic!("expected Refused, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upnp_parse_http_url_handles_typical_control_url() {
+        let (host, port, path) =
+            parse_http_url("http://192.168.1.1:49152/upnp/control/WANIPConn1").expect("parses");
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 49152);
+        assert_eq!(path, "/upnp/control/WANIPConn1");
+    }
+
+    #[test]
+    fn upnp_parse_http_url_defaults_port_when_absent() {
+        let (host, port, path) = parse_http_url("http://gateway.local/path").expect("parses");
+        assert_eq!(host, "gateway.local");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn upnp_parse_http_url_handles_ipv6_literal_with_port() {
+        let (host, port, path) = parse_http_url("http://[fe80::1]:49152/path").expect("parses");
+        assert_eq!(host, "fe80::1");
+        assert_eq!(port, 49152);
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn upnp_parse_http_url_rejects_https() {
+        // uPnP IGD control points are HTTP-only; we don't ship a TLS
+        // path. A gateway that hands us an https:// URL should produce
+        // a clear error, not a silent connect failure.
+        let err = parse_http_url("https://gateway.local/x").expect_err("https rejected");
+        assert!(
+            matches!(err, PortMapperError::InvalidResponse(ref msg) if msg.contains("http")),
+            "expected InvalidResponse mentioning http, got: {err:?}"
+        );
+    }
+
+    /// Spawn a TCP HTTP server that answers exactly one request, then
+    /// closes. The handler closure receives the raw request string and
+    /// returns the raw response bytes.
+    fn spawn_one_shot_http_server<F>(handler: F) -> (SocketAddr, JoinHandle<()>)
+    where
+        F: FnOnce(&str) -> Vec<u8> + Send + 'static,
+    {
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind one-shot HTTP server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _peer) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let response = handler(&request);
+            let _ = stream.write_all(&response);
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn upnp_http_get_round_trips_against_in_process_server() {
+        let (addr, handle) = spawn_one_shot_http_server(|_req| {
+            let body = "hello from gateway";
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .into_bytes()
+        });
+        let url = format!("http://{}/test", addr);
+        let body = http_get(&url, Duration::from_secs(2)).expect("GET succeeds");
+        assert!(body.contains("hello from gateway"), "body extracted");
+        handle.join().expect("server thread joins");
+    }
+
+    #[test]
+    fn upnp_soap_post_round_trips_against_in_process_server() {
+        let (addr, handle) = spawn_one_shot_http_server(|request| {
+            // Verify the request shape.
+            assert!(
+                request.contains("POST /Control HTTP/1.1"),
+                "POST to /Control"
+            );
+            assert!(
+                request.contains("SOAPACTION: \"urn:test#DoStuff\""),
+                "SOAPACTION header present"
+            );
+            assert!(
+                request.contains("CONTENT-TYPE: text/xml"),
+                "Content-Type set"
+            );
+            assert!(
+                request.contains("<u:DoStuff xmlns:u=\"urn:test\">"),
+                "envelope contains action"
+            );
+            let body = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>
+<u:DoStuffResponse xmlns:u="urn:test">
+<Result>OK</Result>
+</u:DoStuffResponse>
+</s:Body>
+</s:Envelope>"#;
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .into_bytes()
+        });
+        let url = format!("http://{}/Control", addr);
+        let body = build_soap_envelope("urn:test", "DoStuff", &[]);
+        let response = http_soap_post(&url, "urn:test#DoStuff", &body, Duration::from_secs(2))
+            .expect("SOAP POST succeeds");
+        let body_xml = parse_soap_response(&response).expect("SOAP success body");
+        assert!(body_xml.contains("<Result>OK</Result>"));
+        handle.join().expect("server thread joins");
+    }
+
+    #[test]
+    fn upnp_client_request_udp_mapping_against_in_process_gateway() {
+        // Spawn a TCP server that handles two SOAP requests in
+        // sequence: AddPortMapping followed by GetExternalIPAddress.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind in-process gateway");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _peer) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = if request.contains("AddPortMapping") {
+                    r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>
+<u:AddPortMappingResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+</u:AddPortMappingResponse>
+</s:Body>
+</s:Envelope>"#
+                } else {
+                    r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>
+<u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+<NewExternalIPAddress>198.51.100.42</NewExternalIPAddress>
+</u:GetExternalIPAddressResponse>
+</s:Body>
+</s:Envelope>"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+        let control_url = format!("http://{}/Control", addr);
+        let client = UpnpIgdClient::new(control_url, UPNP_SERVICE_WANIPCONNECTION_V1.to_owned())
+            .with_timeout(Duration::from_secs(2));
+        let lease = client
+            .request_udp_mapping(51820, 3600)
+            .expect("uPnP mapping succeeds against in-process gateway");
+        assert_eq!(lease.internal_port, 51820);
+        assert_eq!(lease.external_port, 51820);
+        assert_eq!(lease.protocol, PortMappingProtocol::UpnpIgd);
+        assert_eq!(
+            lease.external_addr,
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42))
+        );
+        handle.join().expect("gateway thread joins");
+    }
+
+    #[test]
+    fn upnp_client_release_mapping_against_in_process_gateway() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind in-process gateway");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _peer) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            assert!(
+                request.contains("DeletePortMapping"),
+                "DeletePortMapping action observed"
+            );
+            assert!(
+                request.contains("<NewExternalPort>51820</NewExternalPort>"),
+                "external port carried in body"
+            );
+            let body = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Body>
+<u:DeletePortMappingResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+</u:DeletePortMappingResponse>
+</s:Body>
+</s:Envelope>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+        let control_url = format!("http://{}/Control", addr);
+        let client = UpnpIgdClient::new(control_url, UPNP_SERVICE_WANIPCONNECTION_V1.to_owned())
+            .with_timeout(Duration::from_secs(2));
+        let lease = MappingLease {
+            internal_port: 51820,
+            external_port: 51820,
+            external_addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42)),
+            protocol: PortMappingProtocol::UpnpIgd,
+            expires_at: Instant::now() + Duration::from_secs(1800),
+            pcp_nonce: None,
+        };
+        client
+            .release_mapping(&lease)
+            .expect("uPnP release succeeds");
+        handle.join().expect("gateway thread joins");
     }
 
     // ---- Probe orchestrator tests ----
