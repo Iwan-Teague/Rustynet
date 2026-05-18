@@ -773,7 +773,7 @@ fn decode_first_dns_answer(
                 response[offset + 3],
             );
             answer_ip = addr.to_string();
-            answer_ttl = ttl as u64;
+            answer_ttl = u64::from(ttl);
         }
     }
     Ok((rcode, answer_count, answer_ip, answer_ttl))
@@ -2562,7 +2562,7 @@ pub fn execute_ops_write_live_linux_control_surface_report(
         }
 
         typed_hosts.push((
-            label.to_string(),
+            label.clone(),
             LiveLinuxControlSurfaceHostResultView {
                 checks: LiveLinuxControlSurfaceHostChecksView {
                     daemon_socket_secure: pass_or_fail(daemon_ok),
@@ -3255,8 +3255,8 @@ pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, St
             return Err("dns response too short".to_string());
         }
         let flags = u16::from_be_bytes([response[2], response[3]]);
-        let rcode = (flags & 0x000F) as i64;
-        let answer_count = u16::from_be_bytes([response[6], response[7]]) as u64;
+        let rcode = i64::from(flags & 0x000F);
+        let answer_count = u64::from(u16::from_be_bytes([response[6], response[7]]));
         let (rcode, answer_count, answer_ip, answer_ttl) =
             decode_first_dns_answer(&response[..size], rcode, answer_count)?;
         result.rcode = rcode;

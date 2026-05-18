@@ -12035,11 +12035,11 @@ pub(crate) fn build_membership_evidence_diff_json(
     let prior_state_root = prior.map(|p| p.state_root_hex.clone());
     let prior_captured_at = prior.map(|p| p.captured_at_unix);
 
-    let entries_delta = prior_entries.map(|p| (current.entries_count as i128) - (p as i128));
-    let active_delta = prior_active.map(|p| (current.active_node_count as i128) - (p as i128));
-    let epoch_delta = prior_epoch.map(|p| (current.epoch as i128) - (p as i128));
+    let entries_delta = prior_entries.map(|p| i128::from(current.entries_count) - i128::from(p));
+    let active_delta = prior_active.map(|p| i128::from(current.active_node_count) - i128::from(p));
+    let epoch_delta = prior_epoch.map(|p| i128::from(current.epoch) - i128::from(p));
     let captured_at_delta =
-        prior_captured_at.map(|p| (current.captured_at_unix as i128) - (p as i128));
+        prior_captured_at.map(|p| i128::from(current.captured_at_unix) - i128::from(p));
     let state_root_changed = prior_state_root
         .as_ref()
         .map(|p| p.as_str() != current.state_root_hex.as_str());
