@@ -4,7 +4,7 @@ Last updated:
 `2026-04-21T16:20:45Z`
 
 Repository root:
-`/Users/iwan/Desktop/Rustynet`
+`workspace root`
 
 Purpose:
 - keep a last-known local record of the UTM Debian headless lab VMs and the
@@ -13,7 +13,7 @@ Purpose:
 - record current SSH operator key material by path and fingerprint,
 - avoid storing private key contents in the document.
 - provide a human-readable companion to the machine-readable inventory at
-  `/Users/iwan/Desktop/Rustynet/documents/operations/active/vm_lab_inventory.json`
+  `documents/operations/active/vm_lab_inventory.json`
   used by `rustynet-cli ops vm-lab-*`.
 
 ## Parent Device
@@ -65,7 +65,7 @@ Security note:
 ## Machine-Readable Inventory Model
 
 The companion inventory file at
-`/Users/iwan/Desktop/Rustynet/documents/operations/active/vm_lab_inventory.json`
+`documents/operations/active/vm_lab_inventory.json`
 is now the operator-facing source for `rustynet-cli ops vm-lab-*`.
 
 Entry model:
