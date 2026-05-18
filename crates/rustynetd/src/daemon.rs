@@ -1077,6 +1077,7 @@ pub struct DaemonConfig {
     pub remote_ops_expected_subject: String,
     pub auto_port_forward_exit: bool,
     pub auto_port_forward_lease_secs: NonZeroU32,
+    pub port_mapping_mode: crate::port_mapper::PortMappingMode,
     pub dataplane_mode: DaemonDataplaneMode,
     pub privileged_helper_socket_path: Option<PathBuf>,
     pub privileged_helper_timeout_ms: NonZeroU64,
@@ -1206,6 +1207,7 @@ impl Default for DaemonConfig {
             auto_port_forward_exit: DEFAULT_AUTO_PORT_FORWARD_EXIT,
             auto_port_forward_lease_secs: NonZeroU32::new(DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS)
                 .expect("default auto port-forward lease must be non-zero"),
+            port_mapping_mode: crate::port_mapper::PortMappingMode::default(),
             dataplane_mode: DaemonDataplaneMode::default(),
             privileged_helper_socket_path: Some(PathBuf::from(DEFAULT_TRUSTED_HELPER_SOCKET_PATH)),
             privileged_helper_timeout_ms: NonZeroU64::new(DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS)
@@ -7259,6 +7261,61 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
     }
 }
 
+/// Best-effort port-mapping bring-up. Logs the outcome; never propagates
+/// an error to the caller because port mapping is purely additive (the
+/// daemon's outbound-keepalive fallback covers every case where the
+/// gateway probe fails). Called once on daemon startup. Refresh-on-
+/// cadence is a follow-up cycle (see D2.3 status in the dataplane
+/// execution plan).
+fn bootstrap_port_mapping(config: &DaemonConfig) {
+    use crate::port_mapper::{PortMappingMode, PortMappingSupervisor, SupervisorBringUp};
+
+    log::info!(
+        "port_mapping: mode={} wg_listen_port={} lease_secs={}",
+        config.port_mapping_mode.label(),
+        config.wg_listen_port,
+        config.auto_port_forward_lease_secs.get()
+    );
+    if matches!(config.port_mapping_mode, PortMappingMode::Disabled) {
+        log::info!("port_mapping: disabled by configuration; skipping probe and keepalive logging");
+        return;
+    }
+    if matches!(config.port_mapping_mode, PortMappingMode::Keepalive) {
+        log::info!(
+            "port_mapping: keepalive mode — relying on WireGuard PersistentKeepalive to maintain NAT bindings"
+        );
+        return;
+    }
+    let supervisor = PortMappingSupervisor::new(config.port_mapping_mode);
+    match supervisor.bring_up(
+        config.wg_listen_port,
+        config.auto_port_forward_lease_secs.get(),
+    ) {
+        Ok(SupervisorBringUp::Mapped { lease }) => {
+            log::info!(
+                "port_mapping: granted protocol={} external_addr={} external_port={} internal_port={} ttl_secs={}",
+                lease.protocol.label(),
+                lease.external_addr,
+                lease.external_port,
+                lease.internal_port,
+                lease
+                    .expires_at
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
+            );
+        }
+        Ok(SupervisorBringUp::KeepaliveFallback { reason }) => {
+            log::info!("port_mapping: keepalive_fallback reason={reason}");
+        }
+        Ok(SupervisorBringUp::Skipped { reason }) => {
+            log::info!("port_mapping: skipped reason={reason}");
+        }
+        Err(err) => {
+            log::warn!("port_mapping: bring-up failed (continuing with keepalive): {err}");
+        }
+    }
+}
+
 pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     let mut config = config;
     if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
@@ -7293,6 +7350,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     };
     runtime.bootstrap();
     scrub_runtime_wireguard_key_after_bootstrap(&config)?;
+    bootstrap_port_mapping(&config);
 
     #[cfg(windows)]
     {

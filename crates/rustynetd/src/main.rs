@@ -42,6 +42,7 @@ use rustynetd::macos_runtime_acls::collect_macos_runtime_acl_report;
 use rustynetd::macos_service_hardening::collect_macos_service_hardening_report;
 use rustynetd::perf;
 use rustynetd::phase10::ManagementCidr;
+use rustynetd::port_mapper::PortMappingMode;
 use rustynetd::privileged_helper::{PrivilegedHelperConfig, run_privileged_helper};
 use rustynetd::windows_authenticode::inspect_authenticode_signature;
 use rustynetd::windows_backend_gate::{
@@ -1917,6 +1918,13 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 };
                 index += 2;
             }
+            Some("--port-mapping-mode") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--port-mapping-mode requires a value".to_owned())?;
+                config.port_mapping_mode = PortMappingMode::parse(value.as_str())?;
+                index += 2;
+            }
             Some("--privileged-helper-socket") => {
                 let value = args
                     .get(index + 1)
@@ -2595,7 +2603,7 @@ fn help_text() -> String {
     [
         "rustynetd usage:",
         windows_service_help_line(),
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--port-mapping-mode <auto|keepalive|disabled>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
@@ -2711,6 +2719,7 @@ mod tests {
         DEFAULT_DNS_ZONE_WATERMARK_PATH, DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT, DaemonBackendMode,
     };
     use rustynetd::phase10::ManagementCidr;
+    use rustynetd::port_mapper::PortMappingMode;
     use rustynetd::windows_service::{
         HostEntrySelection, WindowsServiceOptions, select_host_entry,
     };
@@ -3285,6 +3294,43 @@ mod tests {
         let args = vec!["--auto-port-forward-lease-secs".to_owned(), "0".to_owned()];
         let err = parse_daemon_config(&args).expect_err("zero lease should fail parsing");
         assert!(err.contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_port_mapping_mode_auto() {
+        let args = vec!["--port-mapping-mode".to_owned(), "auto".to_owned()];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(config.port_mapping_mode, PortMappingMode::Auto);
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_port_mapping_mode_disabled() {
+        let args = vec!["--port-mapping-mode".to_owned(), "disabled".to_owned()];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(config.port_mapping_mode, PortMappingMode::Disabled);
+    }
+
+    #[test]
+    fn parse_daemon_config_default_port_mapping_mode_is_keepalive() {
+        // No --port-mapping-mode supplied → default to keepalive, the
+        // strict-secure-practical default (works on every cooperative
+        // cone NAT without any router probing).
+        let args: Vec<String> = vec![];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(config.port_mapping_mode, PortMappingMode::Keepalive);
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_port_mapping_mode_value() {
+        let args = vec![
+            "--port-mapping-mode".to_owned(),
+            "maximum-effort".to_owned(),
+        ];
+        let err = parse_daemon_config(&args).expect_err("unknown value rejected");
+        assert!(
+            err.contains("invalid"),
+            "error message should describe the failure, got: {err}"
+        );
     }
 
     #[test]

@@ -1948,6 +1948,250 @@ impl UpnpIgdClient {
     }
 }
 
+// ---- Daemon-side supervisor + mode flag ----
+
+/// Operator-selectable port-mapping mode. Surfaced as the
+/// `--port-mapping-mode={auto,keepalive,disabled}` daemon CLI flag.
+///
+/// * `Auto` — probe the gateway for PCP / NAT-PMP / uPnP on bring-up.
+///   Use the granted lease when one of them succeeds; fall back to
+///   keepalive when none do.
+/// * `Keepalive` — skip the probe entirely and rely on the
+///   outbound-keepalive trick (decision 2.3 in the dataplane plan):
+///   WireGuard's PersistentKeepalive keeps a NAT mapping open
+///   without any router cooperation. The right default for a home
+///   server behind a cooperative cone NAT.
+/// * `Disabled` — do not request a mapping and do not run keepalives.
+///   Suitable for hosts with an explicit static port-forward or a
+///   public IP address; running the probe would just waste a startup
+///   round-trip.
+///
+/// `Keepalive` is the strict-secure-practical default: it works on
+/// every cooperative cone NAT without any router probing. Operators
+/// who want the probe layer to lift pair-success from ~70% to ~95%
+/// switch to `Auto` explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PortMappingMode {
+    Auto,
+    #[default]
+    Keepalive,
+    Disabled,
+}
+
+impl PortMappingMode {
+    /// Stable string label for the CLI flag, environment variable
+    /// reporting, and the daemon's structured logs.
+    pub const fn label(self) -> &'static str {
+        match self {
+            PortMappingMode::Auto => "auto",
+            PortMappingMode::Keepalive => "keepalive",
+            PortMappingMode::Disabled => "disabled",
+        }
+    }
+
+    /// Parse a CLI/config-file value. Accepts the exact labels emitted
+    /// by `label()`; anything else returns an error string suitable for
+    /// the daemon's CLI parser to surface verbatim.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(PortMappingMode::Auto),
+            "keepalive" => Ok(PortMappingMode::Keepalive),
+            "disabled" => Ok(PortMappingMode::Disabled),
+            other => Err(format!(
+                "invalid port-mapping-mode value {other:?}: expected auto, keepalive, or disabled"
+            )),
+        }
+    }
+}
+
+/// Outcome of the daemon-side bring-up call. Carries enough info for
+/// structured logging and for the refresh loop to act on it.
+#[derive(Debug)]
+pub enum SupervisorBringUp {
+    /// The probe succeeded and we hold a lease.
+    Mapped { lease: MappingLease },
+    /// The probe ran but no protocol responded — fall back to the
+    /// outbound-keepalive trick. WireGuard's PersistentKeepalive
+    /// stays scheduled regardless of port-mapping; the daemon's
+    /// logging should surface `keepalive_fallback` so operators see
+    /// the degraded path.
+    KeepaliveFallback { reason: &'static str },
+    /// Auto probing was disabled by configuration; the daemon should
+    /// behave exactly as if no port-mapping had been attempted.
+    Skipped { reason: &'static str },
+}
+
+/// Single-shot port-mapping bring-up, intended to be called from the
+/// daemon's startup path. Encapsulates: gateway detection → probe
+/// orchestrator → mode-aware classification of the outcome.
+///
+/// The supervisor does NOT run a refresh loop itself; the daemon owns
+/// the timer infrastructure. Callers should reach back via
+/// [`PortMappingSupervisor::refresh_existing_lease`] when the lease's
+/// `expires_at - now()` falls below half the lifetime (the convention
+/// recommended by both RFC 6886 and RFC 6887).
+pub struct PortMappingSupervisor {
+    mode: PortMappingMode,
+    gateway_override: Option<IpAddr>,
+    upnp_enabled: bool,
+    upnp_bind_address: Ipv4Addr,
+    upnp_wait: Duration,
+}
+
+impl PortMappingSupervisor {
+    /// Construct a supervisor with the given mode and no overrides.
+    /// uPnP is OFF by default; enable it via
+    /// [`PortMappingSupervisor::with_upnp_enabled`] when the operator
+    /// has opted in to multicast SSDP discovery.
+    pub fn new(mode: PortMappingMode) -> Self {
+        Self {
+            mode,
+            gateway_override: None,
+            upnp_enabled: false,
+            upnp_bind_address: Ipv4Addr::UNSPECIFIED,
+            upnp_wait: UPNP_SSDP_DEFAULT_DISCOVERY_TIMEOUT,
+        }
+    }
+
+    /// Override the gateway. Used on Windows (where autodetection is
+    /// not yet implemented) and in tests pointing at an in-process
+    /// fake gateway.
+    #[must_use]
+    pub fn with_gateway(mut self, gateway: IpAddr) -> Self {
+        self.gateway_override = Some(gateway);
+        self
+    }
+
+    /// Opt in to uPnP IGD as the third-tier probe.
+    #[must_use]
+    pub fn with_upnp_enabled(mut self, bind_address: Ipv4Addr, wait: Duration) -> Self {
+        self.upnp_enabled = true;
+        self.upnp_bind_address = bind_address;
+        self.upnp_wait = wait;
+        self
+    }
+
+    /// Perform the one-shot bring-up.
+    pub fn bring_up(
+        &self,
+        internal_port: u16,
+        lease_duration_secs: u32,
+    ) -> Result<SupervisorBringUp, PortMapperError> {
+        match self.mode {
+            PortMappingMode::Disabled => Ok(SupervisorBringUp::Skipped {
+                reason: "port-mapping-mode=disabled",
+            }),
+            PortMappingMode::Keepalive => Ok(SupervisorBringUp::Skipped {
+                reason: "port-mapping-mode=keepalive (no probe; keepalive path active)",
+            }),
+            PortMappingMode::Auto => {
+                let gateway = match self.gateway_override {
+                    Some(addr) => addr,
+                    None => match detect_default_gateway() {
+                        Ok(addr) => addr,
+                        Err(_) => {
+                            // No autodetected gateway. We can still
+                            // try uPnP (which uses multicast and does
+                            // not need a gateway IP). If uPnP is
+                            // disabled, fall back to keepalive.
+                            if self.upnp_enabled {
+                                return self.try_upnp_only(internal_port, lease_duration_secs);
+                            }
+                            return Ok(SupervisorBringUp::KeepaliveFallback {
+                                reason: "default gateway not detected; falling back to keepalive",
+                            });
+                        }
+                    },
+                };
+                let mut probe = PortMappingProbe::new(gateway);
+                if self.upnp_enabled {
+                    probe = probe.with_upnp_enabled(self.upnp_bind_address, self.upnp_wait);
+                }
+                match probe.probe_udp_mapping(internal_port, lease_duration_secs)? {
+                    ProbeOutcome::Mapped(lease) => Ok(SupervisorBringUp::Mapped { lease }),
+                    ProbeOutcome::NoGatewaySupport => Ok(SupervisorBringUp::KeepaliveFallback {
+                        reason: "no gateway protocol responded; falling back to keepalive",
+                    }),
+                }
+            }
+        }
+    }
+
+    fn try_upnp_only(
+        &self,
+        internal_port: u16,
+        lease_duration_secs: u32,
+    ) -> Result<SupervisorBringUp, PortMapperError> {
+        match UpnpIgdClient::discover_one(self.upnp_bind_address, self.upnp_wait) {
+            Ok(client) => match client.request_udp_mapping(internal_port, lease_duration_secs) {
+                Ok(lease) => Ok(SupervisorBringUp::Mapped { lease }),
+                Err(PortMapperError::ProtocolNotSupported(_)) | Err(PortMapperError::Timeout) => {
+                    Ok(SupervisorBringUp::KeepaliveFallback {
+                        reason: "uPnP gateway did not honour the request; falling back to keepalive",
+                    })
+                }
+                Err(other) => Err(other),
+            },
+            Err(PortMapperError::ProtocolNotSupported(_)) | Err(PortMapperError::Timeout) => {
+                Ok(SupervisorBringUp::KeepaliveFallback {
+                    reason: "no uPnP IGD responded; falling back to keepalive",
+                })
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Refresh an existing lease in place. Returns a fresh lease with
+    /// an updated `expires_at`. The daemon should call this when
+    /// `lease.expires_at - now()` falls below ~half the lifetime.
+    pub fn refresh_existing_lease(
+        lease: &MappingLease,
+        gateway_for_pcp_natpmp: Option<IpAddr>,
+        upnp_control_url: Option<&str>,
+    ) -> Result<MappingLease, PortMapperError> {
+        match lease.protocol {
+            PortMappingProtocol::Pcp => {
+                let gateway = gateway_for_pcp_natpmp.ok_or_else(|| {
+                    PortMapperError::NoGateway(
+                        "PCP refresh needs a gateway IP; supply gateway_for_pcp_natpmp".to_owned(),
+                    )
+                })?;
+                PcpClient::new(gateway).refresh_mapping(lease)
+            }
+            PortMappingProtocol::NatPmp => {
+                let gateway = gateway_for_pcp_natpmp.ok_or_else(|| {
+                    PortMapperError::NoGateway(
+                        "NAT-PMP refresh needs a gateway IP; supply gateway_for_pcp_natpmp"
+                            .to_owned(),
+                    )
+                })?;
+                let v4 = match gateway {
+                    IpAddr::V4(v4) => v4,
+                    IpAddr::V6(_) => {
+                        return Err(PortMapperError::ProtocolNotSupported(
+                            "NAT-PMP requires an IPv4 gateway".to_owned(),
+                        ));
+                    }
+                };
+                NatPmpClient::new(v4).refresh_mapping(lease)
+            }
+            PortMappingProtocol::UpnpIgd => {
+                let control_url = upnp_control_url.ok_or_else(|| {
+                    PortMapperError::InvalidResponse(
+                        "uPnP refresh needs the original controlURL; supply upnp_control_url"
+                            .to_owned(),
+                    )
+                })?;
+                UpnpIgdClient::new(
+                    control_url.to_owned(),
+                    UPNP_SERVICE_WANIPCONNECTION_V1.to_owned(),
+                )
+                .refresh_mapping(lease)
+            }
+        }
+    }
+}
+
 // ---- Probe orchestrator ----
 
 /// Outcome of probing the gateway for a UDP port mapping.
@@ -3445,6 +3689,146 @@ Content-Type: text/xml
             .release_mapping(&lease)
             .expect("uPnP release succeeds");
         handle.join().expect("gateway thread joins");
+    }
+
+    // ---- Supervisor + mode tests ----
+
+    #[test]
+    fn port_mapping_mode_parse_round_trips_canonical_labels() {
+        assert_eq!(
+            PortMappingMode::parse("auto").unwrap(),
+            PortMappingMode::Auto
+        );
+        assert_eq!(
+            PortMappingMode::parse("keepalive").unwrap(),
+            PortMappingMode::Keepalive
+        );
+        assert_eq!(
+            PortMappingMode::parse("disabled").unwrap(),
+            PortMappingMode::Disabled
+        );
+        assert_eq!(PortMappingMode::Auto.label(), "auto");
+        assert_eq!(PortMappingMode::Keepalive.label(), "keepalive");
+        assert_eq!(PortMappingMode::Disabled.label(), "disabled");
+    }
+
+    #[test]
+    fn port_mapping_mode_parse_rejects_unknown_value() {
+        let err = PortMappingMode::parse("yes-please").expect_err("unknown value");
+        assert!(err.contains("invalid"));
+        assert!(err.contains("auto"));
+        assert!(err.contains("keepalive"));
+        assert!(err.contains("disabled"));
+    }
+
+    #[test]
+    fn port_mapping_mode_default_is_keepalive() {
+        // Keepalive must be the default because it works on every
+        // cooperative cone NAT without any router probing. Operators
+        // who want the probe layer to lift them from ~70% to ~95%
+        // pair-success switch to `auto` explicitly.
+        assert_eq!(PortMappingMode::default(), PortMappingMode::Keepalive);
+    }
+
+    #[test]
+    fn supervisor_disabled_returns_skipped_without_probing() {
+        // Skipped must short-circuit before any network IO. We use an
+        // unrouteable gateway IP — if the supervisor tries to probe
+        // it, the test will time out instead of returning Skipped.
+        let supervisor = PortMappingSupervisor::new(PortMappingMode::Disabled)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        let outcome = supervisor
+            .bring_up(51820, 3600)
+            .expect("Disabled returns Ok(Skipped) synchronously");
+        assert!(
+            matches!(outcome, SupervisorBringUp::Skipped { .. }),
+            "Disabled must produce Skipped, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_keepalive_returns_skipped_without_probing() {
+        let supervisor = PortMappingSupervisor::new(PortMappingMode::Keepalive)
+            .with_gateway(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        let outcome = supervisor.bring_up(51820, 3600).expect("synchronous");
+        assert!(
+            matches!(outcome, SupervisorBringUp::Skipped { reason } if reason.contains("keepalive")),
+            "Keepalive must produce Skipped(..keepalive..), got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_refresh_existing_lease_routes_by_protocol() {
+        // PCP lease with no stored nonce → refresh path rejects with
+        // InvalidResponse (validates that the supervisor dispatches
+        // to PcpClient::refresh which then checks the nonce, rather
+        // than falling through to NAT-PMP). We do not actually do any
+        // network IO here because the nonce check fires before send.
+        let lease = MappingLease {
+            internal_port: 51820,
+            external_port: 51820,
+            external_addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            protocol: PortMappingProtocol::Pcp,
+            expires_at: Instant::now() + Duration::from_secs(300),
+            pcp_nonce: None,
+        };
+        let err = PortMappingSupervisor::refresh_existing_lease(
+            &lease,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            None,
+        )
+        .expect_err("PCP refresh without nonce must fail");
+        assert!(
+            matches!(err, PortMapperError::InvalidResponse(ref msg) if msg.contains("Mapping Nonce")),
+            "expected nonce-missing InvalidResponse, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_refresh_existing_lease_requires_gateway_for_pcp_and_natpmp() {
+        let pcp_lease = MappingLease {
+            internal_port: 51820,
+            external_port: 51820,
+            external_addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            protocol: PortMappingProtocol::Pcp,
+            expires_at: Instant::now() + Duration::from_secs(300),
+            pcp_nonce: Some([0; PCP_NONCE_LEN]),
+        };
+        let err = PortMappingSupervisor::refresh_existing_lease(&pcp_lease, None, None)
+            .expect_err("missing gateway");
+        assert!(
+            matches!(err, PortMapperError::NoGateway(ref msg) if msg.contains("gateway")),
+            "expected NoGateway, got: {err:?}"
+        );
+
+        let natpmp_lease = MappingLease {
+            protocol: PortMappingProtocol::NatPmp,
+            ..pcp_lease
+        };
+        let err = PortMappingSupervisor::refresh_existing_lease(&natpmp_lease, None, None)
+            .expect_err("missing gateway");
+        assert!(
+            matches!(err, PortMapperError::NoGateway(_)),
+            "expected NoGateway, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_refresh_existing_lease_requires_control_url_for_upnp() {
+        let lease = MappingLease {
+            internal_port: 51820,
+            external_port: 51820,
+            external_addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            protocol: PortMappingProtocol::UpnpIgd,
+            expires_at: Instant::now() + Duration::from_secs(300),
+            pcp_nonce: None,
+        };
+        let err = PortMappingSupervisor::refresh_existing_lease(&lease, None, None)
+            .expect_err("missing control URL");
+        assert!(
+            matches!(err, PortMapperError::InvalidResponse(ref msg) if msg.contains("controlURL")),
+            "expected InvalidResponse mentioning controlURL, got: {err:?}"
+        );
     }
 
     // ---- Probe orchestrator tests ----
