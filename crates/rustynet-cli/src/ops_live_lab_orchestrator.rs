@@ -3541,6 +3541,78 @@ pub fn execute_ops_write_active_network_signed_state_tamper_report(
     Ok(report.status)
 }
 
+/// Typed view for the per-check verdicts inside the active-network
+/// rogue-path-hijack report. Seven pass/fail slots covering
+/// baseline → hijack → fail-closed → recovery transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkRoguePathHijackChecksView {
+    pub baseline_two_node_e2e: String,
+    pub forged_endpoint_assignment_rejected: String,
+    pub fail_closed_engaged: String,
+    pub netcheck_reports_fail_closed: String,
+    pub rogue_endpoint_not_adopted: String,
+    pub recovery_restored_secure_runtime: String,
+    pub recovery_keeps_rogue_endpoint_rejected: String,
+}
+
+impl ActiveNetworkRoguePathHijackChecksView {
+    fn overall_status(&self) -> &'static str {
+        let all_pass = [
+            self.baseline_two_node_e2e.as_str(),
+            self.forged_endpoint_assignment_rejected.as_str(),
+            self.fail_closed_engaged.as_str(),
+            self.netcheck_reports_fail_closed.as_str(),
+            self.rogue_endpoint_not_adopted.as_str(),
+            self.recovery_restored_secure_runtime.as_str(),
+            self.recovery_keeps_rogue_endpoint_rejected.as_str(),
+        ]
+        .iter()
+        .all(|value| *value == CHECK_PASS);
+        if all_pass { CHECK_PASS } else { CHECK_FAIL }
+    }
+}
+
+/// Typed view for the host pair the rogue-path-hijack experiment
+/// runs against. Reuses the same shape as the signed-state-tamper
+/// hosts block; we keep them as separate types so a future
+/// experiment-specific divergence (extra labels, swap order)
+/// doesn't ripple silently across modes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkRoguePathHijackHostsView {
+    pub exit_host: String,
+    pub client_host: String,
+}
+
+/// Typed view for the evidence block: 6 typed slots covering
+/// pre-hijack / post-hijack / post-recovery WireGuard endpoint
+/// captures plus the netcheck snapshot after hijack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkRoguePathHijackEvidenceView {
+    pub wg_endpoints_before: String,
+    pub wg_endpoints_after_hijack: String,
+    pub wg_endpoints_after_recovery: String,
+    pub status_after_hijack: String,
+    pub netcheck_after_hijack: String,
+    pub status_after_recovery: String,
+}
+
+/// Typed view for the full active-network rogue-path-hijack
+/// report. Replaces the previous `json!({...})` literal plus 2
+/// trailing `Value` walks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveNetworkRoguePathHijackReportView {
+    pub phase: String,
+    pub mode: String,
+    pub evidence_mode: String,
+    pub captured_at: String,
+    pub captured_at_unix: u64,
+    pub status: String,
+    pub hosts: ActiveNetworkRoguePathHijackHostsView,
+    pub rogue_endpoint_ip: String,
+    pub checks: ActiveNetworkRoguePathHijackChecksView,
+    pub evidence: ActiveNetworkRoguePathHijackEvidenceView,
+}
+
 pub fn execute_ops_write_active_network_rogue_path_hijack_report(
     config: WriteActiveNetworkRoguePathHijackReportConfig,
 ) -> Result<String, String> {
@@ -3587,61 +3659,52 @@ pub fn execute_ops_write_active_network_rogue_path_hijack_report(
         config.captured_at_utc.trim().to_string()
     };
 
-    let checks = json!({
-        "baseline_two_node_e2e": baseline_status,
-        "forged_endpoint_assignment_rejected": hijack_reject_status,
-        "fail_closed_engaged": fail_closed_status,
-        "netcheck_reports_fail_closed": netcheck_fail_closed_status,
-        "rogue_endpoint_not_adopted": no_rogue_endpoint_status,
-        "recovery_restored_secure_runtime": recovery_status,
-        "recovery_keeps_rogue_endpoint_rejected": recovery_endpoint_status,
-    });
-    let status = if checks
-        .as_object()
-        .map(|items| {
-            items
-                .values()
-                .all(|value| value.as_str() == Some(CHECK_PASS))
-        })
-        .unwrap_or(false)
-    {
-        CHECK_PASS
-    } else {
-        CHECK_FAIL
+    let checks = ActiveNetworkRoguePathHijackChecksView {
+        baseline_two_node_e2e: baseline_status,
+        forged_endpoint_assignment_rejected: hijack_reject_status,
+        fail_closed_engaged: fail_closed_status,
+        netcheck_reports_fail_closed: netcheck_fail_closed_status,
+        rogue_endpoint_not_adopted: no_rogue_endpoint_status,
+        recovery_restored_secure_runtime: recovery_status,
+        recovery_keeps_rogue_endpoint_rejected: recovery_endpoint_status,
     };
-    let payload = json!({
-        "phase": "phase10",
-        "mode": "active_network_rogue_path_hijack",
-        "evidence_mode": "measured",
-        "captured_at": captured_at,
-        "captured_at_unix": captured_at_unix,
-        "status": status,
-        "hosts": {
-            "exit_host": config.exit_host,
-            "client_host": config.client_host,
+    let status = checks.overall_status().to_string();
+
+    let report = ActiveNetworkRoguePathHijackReportView {
+        phase: "phase10".to_string(),
+        mode: "active_network_rogue_path_hijack".to_string(),
+        evidence_mode: "measured".to_string(),
+        captured_at,
+        captured_at_unix,
+        status,
+        hosts: ActiveNetworkRoguePathHijackHostsView {
+            exit_host: config.exit_host,
+            client_host: config.client_host,
         },
-        "rogue_endpoint_ip": rogue_endpoint_ip,
-        "checks": checks,
-        "evidence": {
-            "wg_endpoints_before": config.endpoints_before,
-            "wg_endpoints_after_hijack": config.endpoints_after_hijack,
-            "wg_endpoints_after_recovery": config.endpoints_after_recovery,
-            "status_after_hijack": config.status_after_hijack,
-            "netcheck_after_hijack": config.netcheck_after_hijack,
-            "status_after_recovery": config.status_after_recovery,
+        rogue_endpoint_ip,
+        checks,
+        evidence: ActiveNetworkRoguePathHijackEvidenceView {
+            wg_endpoints_before: config.endpoints_before,
+            wg_endpoints_after_hijack: config.endpoints_after_hijack,
+            wg_endpoints_after_recovery: config.endpoints_after_recovery,
+            status_after_hijack: config.status_after_hijack,
+            netcheck_after_hijack: config.netcheck_after_hijack,
+            status_after_recovery: config.status_after_recovery,
         },
-    });
+    };
+
+    let payload = serde_json::to_value(&report).map_err(|err| {
+        format!("serialize active-network-rogue-path-hijack report failed: {err}")
+    })?;
     write_json_pretty(report_path.as_path(), &payload)?;
-    Ok(payload
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or(CHECK_FAIL)
-        .to_string())
+    Ok(report.status)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
+        ActiveNetworkRoguePathHijackChecksView, ActiveNetworkRoguePathHijackEvidenceView,
+        ActiveNetworkRoguePathHijackHostsView, ActiveNetworkRoguePathHijackReportView,
         ActiveNetworkSignedStateTamperChecksView, ActiveNetworkSignedStateTamperEvidenceView,
         ActiveNetworkSignedStateTamperHostsView, ActiveNetworkSignedStateTamperReportView,
         CheckLocalFileModeConfig, ExtractManagedDnsExpectedIpConfig,
@@ -5187,6 +5250,144 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"mode\": \"active_network_rogue_path_hijack\""));
         assert!(body.contains("\"rogue_endpoint_not_adopted\": \"fail\""));
+        let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn baseline_active_network_rogue_path_hijack_pass_view()
+    -> ActiveNetworkRoguePathHijackReportView {
+        ActiveNetworkRoguePathHijackReportView {
+            phase: "phase10".to_string(),
+            mode: "active_network_rogue_path_hijack".to_string(),
+            evidence_mode: "measured".to_string(),
+            captured_at: "2026-03-21T10:00:00Z".to_string(),
+            captured_at_unix: 1_772_983_200,
+            status: "pass".to_string(),
+            hosts: ActiveNetworkRoguePathHijackHostsView {
+                exit_host: "192.168.18.49".to_string(),
+                client_host: "192.168.18.50".to_string(),
+            },
+            rogue_endpoint_ip: "203.0.113.10".to_string(),
+            checks: ActiveNetworkRoguePathHijackChecksView {
+                baseline_two_node_e2e: "pass".to_string(),
+                forged_endpoint_assignment_rejected: "pass".to_string(),
+                fail_closed_engaged: "pass".to_string(),
+                netcheck_reports_fail_closed: "pass".to_string(),
+                rogue_endpoint_not_adopted: "pass".to_string(),
+                recovery_restored_secure_runtime: "pass".to_string(),
+                recovery_keeps_rogue_endpoint_rejected: "pass".to_string(),
+            },
+            evidence: ActiveNetworkRoguePathHijackEvidenceView {
+                wg_endpoints_before: "peer-a=192.168.18.49:51820".to_string(),
+                wg_endpoints_after_hijack: "peer-a=192.168.18.49:51820".to_string(),
+                wg_endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_string(),
+                status_after_hijack: "state=FailClosed".to_string(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
+                status_after_recovery: "state=ExitActive".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn active_network_rogue_path_hijack_view_round_trips_through_serde() {
+        let view = baseline_active_network_rogue_path_hijack_pass_view();
+        let serialized = serde_json::to_string(&view).expect("serialize");
+        let parsed: ActiveNetworkRoguePathHijackReportView =
+            serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(parsed, view);
+    }
+
+    #[test]
+    fn active_network_rogue_path_hijack_checks_view_overall_status_is_pass_when_all_pass() {
+        assert_eq!(
+            baseline_active_network_rogue_path_hijack_pass_view()
+                .checks
+                .overall_status(),
+            "pass"
+        );
+    }
+
+    #[test]
+    fn active_network_rogue_path_hijack_checks_view_overall_status_is_fail_per_slot() {
+        let baseline = baseline_active_network_rogue_path_hijack_pass_view().checks;
+        for tweak in [
+            |c: &mut ActiveNetworkRoguePathHijackChecksView| {
+                c.baseline_two_node_e2e = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkRoguePathHijackChecksView| {
+                c.forged_endpoint_assignment_rejected = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkRoguePathHijackChecksView| {
+                c.fail_closed_engaged = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkRoguePathHijackChecksView| {
+                c.netcheck_reports_fail_closed = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkRoguePathHijackChecksView| {
+                c.rogue_endpoint_not_adopted = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkRoguePathHijackChecksView| {
+                c.recovery_restored_secure_runtime = "fail".to_string()
+            },
+            |c: &mut ActiveNetworkRoguePathHijackChecksView| {
+                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_string()
+            },
+        ] {
+            let mut checks = baseline.clone();
+            tweak(&mut checks);
+            assert_eq!(checks.overall_status(), "fail");
+        }
+    }
+
+    #[test]
+    fn active_network_rogue_path_hijack_view_rejects_missing_rogue_endpoint_ip() {
+        let mut value = serde_json::to_value(baseline_active_network_rogue_path_hijack_pass_view())
+            .expect("to_value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("rogue_endpoint_ip");
+        let err = serde_json::from_value::<ActiveNetworkRoguePathHijackReportView>(value)
+            .expect_err("missing rogue_endpoint_ip must fail closed at the typed boundary");
+        assert!(
+            err.to_string().contains("rogue_endpoint_ip"),
+            "error names missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn active_network_rogue_path_hijack_writer_emits_typed_shape_parseable_by_view() {
+        let report_path = temp_path("rogue-path-hijack-shape-parse");
+        let _ = execute_ops_write_active_network_rogue_path_hijack_report(
+            WriteActiveNetworkRoguePathHijackReportConfig {
+                report_path: report_path.clone(),
+                baseline_status: "pass".to_string(),
+                hijack_reject_status: "pass".to_string(),
+                fail_closed_status: "pass".to_string(),
+                netcheck_fail_closed_status: "pass".to_string(),
+                no_rogue_endpoint_status: "pass".to_string(),
+                recovery_status: "pass".to_string(),
+                recovery_endpoint_status: "pass".to_string(),
+                rogue_endpoint_ip: "203.0.113.10".to_string(),
+                exit_host: "192.168.18.49".to_string(),
+                client_host: "192.168.18.50".to_string(),
+                endpoints_before: "peer-a=192.168.18.49:51820".to_string(),
+                endpoints_after_hijack: "peer-a=192.168.18.49:51820".to_string(),
+                endpoints_after_recovery: "peer-a=192.168.18.49:51820".to_string(),
+                status_after_hijack: "state=FailClosed".to_string(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_string(),
+                status_after_recovery: "state=ExitActive".to_string(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_string(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let parsed: ActiveNetworkRoguePathHijackReportView =
+            serde_json::from_str(&body).expect("typed parse");
+        assert_eq!(parsed.rogue_endpoint_ip, "203.0.113.10");
+        assert_eq!(parsed.hosts.exit_host, "192.168.18.49");
+        assert_eq!(parsed.hosts.client_host, "192.168.18.50");
+        assert_eq!(parsed.checks.overall_status(), "pass");
         let _ = fs::remove_file(report_path.as_path());
     }
 
