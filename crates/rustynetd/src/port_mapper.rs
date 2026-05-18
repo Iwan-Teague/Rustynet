@@ -1039,6 +1039,149 @@ impl PortMapper for PcpClient {
     }
 }
 
+// ---- Default-gateway detection ----
+
+/// Detect the host's IPv4 default gateway, which is the address the
+/// probe orchestrator will point its PCP / NAT-PMP / uPnP clients at.
+///
+/// Per platform:
+/// * **Linux** parses `/proc/net/route` and finds the row whose
+///   `Destination` is `00000000` (the default route, RFC 4632 anycast
+///   prefix `0.0.0.0/0`). The `Gateway` field is a little-endian hex
+///   string for the IPv4 address.
+/// * **macOS** runs `route -n get default` and scans the stdout for
+///   the `gateway:` line.
+/// * **Windows** is not yet implemented in this slice; returns
+///   `NoGateway` with a marker string so the daemon's bring-up logic
+///   surfaces a clear "gateway autodetection unsupported on Windows
+///   — please supply --gateway-addr" message. Windows detection
+///   (GetIpForwardTable2 / `Get-NetRoute`) is a follow-up.
+///
+/// We do NOT trust ARP, DHCP-derived defaults, or per-interface link-local
+/// SLAAC routers as gateways — they may be present but are not the
+/// route the kernel uses for outbound traffic. The route table is the
+/// only authoritative source.
+pub fn detect_default_gateway() -> Result<IpAddr, PortMapperError> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/net/route")
+            .map_err(|e| PortMapperError::NoGateway(format!("reading /proc/net/route: {e}")))?;
+        parse_proc_net_route_for_default(&content)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/sbin/route")
+            .args(["-n", "get", "default"])
+            .output()
+            .map_err(|e| PortMapperError::NoGateway(format!("spawning /sbin/route: {e}")))?;
+        if !output.status.success() {
+            return Err(PortMapperError::NoGateway(format!(
+                "/sbin/route exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_route_get_default_output(&stdout)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Err(PortMapperError::NoGateway(
+            "Windows default-gateway autodetection is a follow-up slice; supply --gateway-addr explicitly"
+                .to_owned(),
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Err(PortMapperError::NoGateway(format!(
+            "default-gateway autodetection not implemented for {}",
+            std::env::consts::OS
+        )))
+    }
+}
+
+/// Pure parser for the `/proc/net/route` table. Public-in-module so the
+/// test module can exercise it with synthesised tables (real device
+/// route tables, malformed input, missing default route, etc.).
+///
+/// `/proc/net/route` format (tab/whitespace separated, header on line 0):
+///   Iface  Destination  Gateway  Flags  RefCnt  Use  Metric  Mask  MTU  Window  IRTT
+/// Both `Destination` and `Gateway` are 8-character lowercase hex
+/// strings in **little-endian** byte order: `0102030A` represents the
+/// address with bytes 0x0A, 0x03, 0x02, 0x01 → `10.3.2.1`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_proc_net_route_for_default(content: &str) -> Result<IpAddr, PortMapperError> {
+    for (idx, line) in content.lines().enumerate() {
+        if idx == 0 {
+            // Skip the header row.
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let destination = fields[1];
+        let gateway = fields[2];
+        // Default route: destination = 0x00000000.
+        if destination.eq_ignore_ascii_case("00000000") {
+            return parse_hex_le_ipv4(gateway).map(IpAddr::V4);
+        }
+    }
+    Err(PortMapperError::NoGateway(
+        "no default route in /proc/net/route".to_owned(),
+    ))
+}
+
+/// Parse an 8-character hex string in little-endian byte order into an
+/// `Ipv4Addr`. `/proc/net/route` stores all addresses this way.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_hex_le_ipv4(hex: &str) -> Result<Ipv4Addr, PortMapperError> {
+    if hex.len() != 8 {
+        return Err(PortMapperError::NoGateway(format!(
+            "expected 8-hex-char gateway, got {} chars: {hex}",
+            hex.len()
+        )));
+    }
+    let raw = u32::from_str_radix(hex, 16).map_err(|e| {
+        PortMapperError::NoGateway(format!("failed to parse hex gateway {hex} as u32: {e}"))
+    })?;
+    let bytes = raw.to_le_bytes();
+    Ok(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
+}
+
+/// Pure parser for `route -n get default` stdout on macOS.
+///
+/// Sample output:
+/// ```text
+///    route to: default
+/// destination: default
+///        mask: default
+///     gateway: 192.168.1.1
+///       interface: en0
+///       flags: <UP,GATEWAY,DONE,STATIC,PRCLONED>
+/// ```
+/// The parser scans for the line whose leading non-whitespace token is
+/// `gateway:` and parses the following whitespace-separated value as
+/// an IPv4 or IPv6 address.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_route_get_default_output(stdout: &str) -> Result<IpAddr, PortMapperError> {
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("gateway:") {
+            let value = rest.trim();
+            if value.is_empty() {
+                continue;
+            }
+            return value.parse::<IpAddr>().map_err(|e| {
+                PortMapperError::NoGateway(format!("could not parse gateway value {value}: {e}"))
+            });
+        }
+    }
+    Err(PortMapperError::NoGateway(
+        "no `gateway:` line in `route -n get default` output".to_owned(),
+    ))
+}
+
 // ---- Probe orchestrator ----
 
 /// Outcome of probing the gateway for a UDP port mapping.
@@ -1916,6 +2059,146 @@ mod tests {
             parse_pcp_address(v6_native),
             IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
             "native IPv6 must surface as IpAddr::V6"
+        );
+    }
+
+    // ---- Default-gateway parser tests ----
+
+    #[test]
+    fn parse_hex_le_ipv4_decodes_little_endian_correctly() {
+        // 0x0102030A in little-endian byte order = bytes 0x0A, 0x03,
+        // 0x02, 0x01 = 10.3.2.1.
+        assert_eq!(
+            parse_hex_le_ipv4("0102030A").expect("valid hex"),
+            Ipv4Addr::new(10, 3, 2, 1)
+        );
+        // 0x0101A8C0 = bytes 0xC0, 0xA8, 0x01, 0x01 = 192.168.1.1.
+        assert_eq!(
+            parse_hex_le_ipv4("0101A8C0").expect("valid hex"),
+            Ipv4Addr::new(192, 168, 1, 1)
+        );
+        // All zeros = 0.0.0.0 (default route destination).
+        assert_eq!(
+            parse_hex_le_ipv4("00000000").expect("valid hex"),
+            Ipv4Addr::UNSPECIFIED
+        );
+    }
+
+    #[test]
+    fn parse_hex_le_ipv4_rejects_wrong_length_and_non_hex() {
+        assert!(
+            parse_hex_le_ipv4("12345").is_err(),
+            "short string must be rejected"
+        );
+        assert!(
+            parse_hex_le_ipv4("ZZZZZZZZ").is_err(),
+            "non-hex characters must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_proc_net_route_finds_default_route_via_destination_zero() {
+        // Realistic /proc/net/route sample — two routes, the first is
+        // the default. Real entries are tab-separated.
+        let sample = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+ens3\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+ens3\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+";
+        let gateway = parse_proc_net_route_for_default(sample).expect("default route found");
+        assert_eq!(gateway, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn parse_proc_net_route_returns_no_gateway_when_default_missing() {
+        // No row with destination=00000000 — every interface is on
+        // its directly-attached subnet only, no default route.
+        let sample = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+ens3\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+";
+        let err = parse_proc_net_route_for_default(sample)
+            .expect_err("must error when default route is absent");
+        assert!(
+            matches!(err, PortMapperError::NoGateway(ref msg) if msg.contains("no default route")),
+            "expected NoGateway error mentioning the missing default route, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_proc_net_route_handles_blank_and_short_lines_without_panic() {
+        // Lines with <3 fields must not panic.
+        let sample = "\
+Iface\tDestination\tGateway\tFlags
+\t
+\t\t
+ens3\t00000000\t0101A8C0\t0003
+";
+        let gateway = parse_proc_net_route_for_default(sample).expect("default route found");
+        assert_eq!(gateway, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn parse_route_get_default_output_finds_ipv4_gateway() {
+        let sample = "\
+   route to: default
+destination: default
+       mask: default
+    gateway: 192.168.1.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONED>
+";
+        let gateway = parse_route_get_default_output(sample).expect("parses gateway line");
+        assert_eq!(gateway, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn parse_route_get_default_output_finds_ipv6_gateway() {
+        // macOS surfaces IPv6 gateways the same way; the parser must
+        // pass-through to IpAddr::parse and accept v6 too.
+        let sample = "\
+   route to: default
+destination: default
+       mask: default
+    gateway: fe80::1%en0
+";
+        // fe80::1%en0 — note the scope-id suffix is not parseable by
+        // std::net::IpAddr. The parser surfaces a NoGateway error
+        // here; the daemon will surface a clear diagnostic. We pin
+        // this behaviour so any change to scope-id handling trips
+        // this test rather than silently regressing.
+        let err = parse_route_get_default_output(sample)
+            .expect_err("scope-id-suffixed IPv6 must surface a clear parser error");
+        assert!(
+            matches!(err, PortMapperError::NoGateway(ref msg) if msg.contains("parse gateway")),
+            "expected NoGateway with parser context, got: {err:?}"
+        );
+
+        // Without the scope-id suffix, the parse succeeds.
+        let sample_no_scope = "    gateway: 2001:db8::1\n";
+        let gateway = parse_route_get_default_output(sample_no_scope).expect("v6 parses");
+        match gateway {
+            IpAddr::V6(_) => {}
+            other => panic!("expected IpAddr::V6, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_route_get_default_output_returns_no_gateway_when_line_missing() {
+        // Output that does not contain a `gateway:` line — e.g. host
+        // has no default route, or output format changed in a new
+        // macOS version.
+        let sample = "\
+   route to: default
+destination: default
+       mask: default
+  interface: en0
+";
+        let err =
+            parse_route_get_default_output(sample).expect_err("absent gateway line must error");
+        assert!(
+            matches!(err, PortMapperError::NoGateway(ref msg) if msg.contains("`gateway:` line")),
+            "expected NoGateway with diagnostic message, got: {err:?}"
         );
     }
 
