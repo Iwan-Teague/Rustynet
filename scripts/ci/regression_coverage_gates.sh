@@ -123,7 +123,12 @@ SHARED_FLOORS=(
   # (sha1 / md5 / md_5 / des / des3 / triple_des). The shell G2c
   # grep stays as belt-and-suspenders but the Rust scanner is now
   # the source of truth.
-  "secret_log_audit:45"
+  # Floor bumped 45→53 on `dbg!()` scanner extension: 1 workspace
+  # sweep + 7 self-tests pin scan_source_for_dbg_macro_on_secret_tokens.
+  # `dbg!(passphrase_bytes)` would slip past every other X3 scanner
+  # because it has no format-string placeholder and isn't Debug-derive;
+  # the new scanner closes that hole.
+  "secret_log_audit:53"
 )
 
 # macOS coverage floors. macOS is a control-plane platform today, not
