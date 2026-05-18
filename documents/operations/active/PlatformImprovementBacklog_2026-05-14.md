@@ -1187,6 +1187,12 @@ inline. Cross-reference with:
     `macos_mesh_status:3`, `macos_key_custody:2`,
     `macos_authenticode:2`. `--platform macos` and `--platform all`
     both runnable.
+  - Shared group added (commit 972dfa8) with `secret_log_audit:35`
+    pinned. Platform-agnostic audit modules now have a dedicated
+    group; the X3 static-scanner self-test suite gets the same
+    silent-removal protection the per-platform verifier modules
+    have. `--platform shared` runs the group; `--platform all`
+    runs every group sequentially.
   - Linux floors progressively bumped via X4 coverage-parity sweeps:
     `linux_runtime_acls` 19→27, `linux_mesh_status` 10→24,
     `linux_authenticode` 3→22, `linux_key_custody` 15→24.
