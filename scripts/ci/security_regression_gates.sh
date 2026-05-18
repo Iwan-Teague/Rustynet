@@ -33,15 +33,19 @@ if ! cargo deny check bans 2>&1; then
 fi
 echo "PASS: cargo deny bans check passed"
 
-# G2c: Source scan — reject any use statement importing deprecated crypto crates
-echo "Scanning source for imports of deprecated cryptographic crates..."
-if grep -rn --include="*.rs" -E \
-  '^[[:space:]]*(pub[[:space:]]+)?use[[:space:]]+(sha1|md5|md_5|des|des3|triple_des)(::|;| )' \
-  crates/ 2>/dev/null | grep -v "// EXCEPTION:"; then
-  echo "FAIL: use-import of deprecated crypto crate found in source" >&2
-  exit 1
-fi
-echo "PASS: no imports of deprecated crypto crates in source"
+# G2c: Source scan — historical grep-based check migrated to a typed
+# Rust scanner. `scan_source_for_deprecated_crypto_imports` in
+# `crates/rustynetd/src/secret_log_audit.rs` walks every `.rs` file
+# under `crates/` and rejects `use sha1` / `use md5` / `use md_5` /
+# `use des` / `use des3` / `use triple_des` with a boundary-terminator
+# check that correctly rejects safe-name lookalikes (sha2 / sha3 /
+# descriptor / md_hashlib). The Rust scanner runs as a regular
+# `#[test]` under every `cargo test -p rustynetd` invocation and is
+# pinned by the `secret_log_audit:45` floor in the shared
+# regression-coverage group, so silent removal of the scan trips a
+# named test failure. The shell grep is no longer the source of
+# truth — it lived here from before the X3 migration landed and the
+# Rust scanner duplicates its coverage with stronger guarantees.
 
 echo "All security regression gates passed."
 exit 0
