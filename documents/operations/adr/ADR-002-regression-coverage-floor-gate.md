@@ -58,11 +58,24 @@ security-tied module in the gated list, the script runs
 `>=` a pinned floor. The script fails closed (non-zero exit) on any
 shortfall, naming the module and the observed-vs-expected counts.
 
-Today's pinned set:
+Pinned set at acceptance (2026-05-17):
 
 - 14 modules at floor (7 Linux verifiers + 7 Windows verifiers).
 - 407 pinned tests in aggregate across those 14 modules.
-- Full per-module list in `SecurityPostureSummary.md` Section 1.
+
+Pinned set as of 2026-05-18 (post platform-improvement-backlog
+X4/X7 expansions; tracked here so the ADR snapshot doesn't drift
+from the live gate while the script is the source of truth):
+
+- 21 modules at floor across 4 groups: linux (7) + macos (6) +
+  windows (7) + shared (1).
+- ~570 pinned tests in aggregate.
+- The `shared` group covers platform-agnostic audit modules
+  (currently `secret_log_audit`); it was added when the X3 static
+  scanner's self-tests warranted the same silent-removal
+  protection the per-platform verifier modules already had.
+- Full per-module list in `SecurityPostureSummary.md` Section 1
+  and in `scripts/ci/regression_coverage_gates.sh`.
 
 The gate is part of every release-readiness check and runs alongside
 `cargo fmt`, `cargo clippy`, `cargo test`, `cargo audit`, and
@@ -117,10 +130,13 @@ Composition:
   the floor.
 - Fail-closed exit with a named, actionable error message on shortfall.
 
-The gated set today (14 modules, 407 tests) matches the verifier
-modules listed in `SecurityPostureSummary.md` Section 1. Adding a new
-verifier module to the gate is a deliberate two-line edit (the table
-row + the floor).
+The gated set at acceptance (14 modules, 407 tests) matched the
+verifier modules listed in `SecurityPostureSummary.md` Section 1.
+Adding a new verifier module to the gate is a deliberate two-line
+edit (the table row + the floor). The current gated set has grown
+to 21 modules across 4 groups as the X4 coverage-parity sweep
+expanded the matrix; see the snapshot under "Decision" above for
+the live count.
 
 ## Related
 

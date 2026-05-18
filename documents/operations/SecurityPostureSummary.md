@@ -14,35 +14,52 @@ catches silent test-suite shrinkage: if a refactor accidentally drops
 named drift tests, the regression-coverage CI gate
 (`scripts/ci/regression_coverage_gates.sh`) fails closed.
 
-### Linux verifiers (7 modules, 189 pinned tests)
+### Linux verifiers (7 modules, 196 pinned tests)
 
 | Module                          | Floor | What it pins                                                                                             |
 |---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
-| `linux_runtime_acls`            | 19    | `/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet` ownership + mode + reviewed roots; loop-based loop boundary checks |
+| `linux_runtime_acls`            | 27    | `/etc/rustynet`, `/var/lib/rustynet`, `/run/rustynet`, `/var/log/rustynet` ownership + mode + reviewed roots; reviewed-roots-list snapshot; symlink-before-dir + symlink+mode first-fault precedence |
 | `linux_service_hardening`       | 33    | systemd-unit hardening directives (`MemoryDenyWriteExecute`, `ProtectSystem`, `RestrictSUIDSGID`, etc.) + reviewed unit-file pin (`ExecStartPre` for killswitch-boot-check + `LoadCredentialEncrypted` lines) |
 | `linux_dns_failclosed`          | 45    | resolv.conf loopback-only invariant; systemd-resolved stub-race detection; NetworkManager `[main] dns=` precedence drift; IPv6 / link-local / mapped / zone-id / bracketed-form rejection |
 | `linux_mesh_status`             | 24    | Typed snapshot-load + freshness-boundary semantics (==max accepted, max+1 rejected); missing-peer aggregation; per-variant serde round-trip with `load_status` tag; forgiving-schema forward-compat |
-| `linux_key_custody`             | 15    | WG-key + systemd-encrypted-credential-store custody (`/etc/rustynet/credentials/wg_key_passphrase.cred` 0600 root:root); legacy-plaintext-passphrase forbidden-at-rest; 8-entry canonical-list snapshot |
+| `linux_key_custody`             | 24    | WG-key + systemd-encrypted-credential-store custody (`/etc/rustynet/credentials/wg_key_passphrase.cred` 0600 root:root); legacy-plaintext-passphrase forbidden-at-rest; 8-entry canonical-list snapshot; per-variant serde + multi-entry drift aggregation |
 | `linux_authenticode`            | 22    | Applicability invariant + reason text contract + schema_version pin + determinism + drift-mutation detection per field + canonical serialized snapshot |
 | `linux_killswitch_boot`         | 21    | Boot-time invariant: tunnel-iface present ⇒ killswitch table must be programmed; `inet rustynet` table + `killswitch` + `forward` chains + reviewed rule fragments; off-Linux blocker |
 
-### Windows verifiers (7 modules, 218 pinned tests)
+### macOS verifiers (6 modules, 74 pinned tests)
+
+| Module                          | Floor | What it pins                                                                                             |
+|---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
+| `macos_runtime_acls`            | 16    | `/usr/local/var/rustynet` + `/usr/local/etc/rustynet` ownership + mode + reviewed roots; symlink + first-fault precedence parity with linux_runtime_acls |
+| `macos_service_hardening`       | 15    | Reviewed launchd plist directives (`UserName`/`GroupName`/`RunAtLoad`/`KeepAlive`/`ProcessType`/`AbandonProcessGroup`); parser tolerance of dict/array values + inline XML comments |
+| `macos_dns_failclosed`          | 16    | resolv.conf loopback-only invariant + IPv4/IPv6 link-local + IPv4-mapped IPv6 + 127.0.0.0/8 boundary + multi-directive search/domain parser + no-dedup drift aggregation |
+| `macos_mesh_status`             | 9     | Default-state-path fallback + custom-path echo + per-variant serde on Ok / IntegrityMismatch / InvalidFormat (re-uses windows evaluator) |
+| `macos_key_custody`             | 11    | WG-key custody contract parity with linux_key_custody; per-variant serde matrix complete (Missing / Invalid / Forbidden / AbsentAsExpected); overall_ok = {Ok | AbsentAsExpected} contract from both sides |
+| `macos_authenticode`            | 7     | Applicability=false stub + reason-text content (Authenticode + Gatekeeper + launch-time mentions) + determinism + unknown-fields tolerance |
+
+### Windows verifiers (7 modules, 263 pinned tests)
 
 | Module                          | Floor | What it pins                                                                                             |
 |---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
 | `windows_service_hardening`     | 33    | SDDL deny-list (WD/AU/BU principals), missing-SY/BA reject, unreviewed-owner reject, service-SID owner accept, interactive+LocalSystem reject |
 | `windows_dns_failclosed`        | 67    | Loopback-only contract for interface DNS + NRPT rules (link-local / mapped / zone-id / bracketed-form reject); IPv6 NRPT sibling-coverage evaluator (union-semantics across rules); Router Advertisement suppression evaluator (RD-enabled + ra-sourced default-route fail-closed) |
-| `windows_mesh_status`           | 14    | Reviewed-root path validation (`%TEMP%`/UNC reject), typed snapshot-load + age + expected-peers contract |
-| `windows_key_custody`           | 18    | DPAPI custody invariants + rotation tests (world-writable / unreviewed-owner / partial-rotation / temp-suffix / DACL widened to AU) |
+| `windows_mesh_status`           | 23    | Reviewed-root path validation (`%TEMP%`/UNC reject), typed snapshot-load + age boundary (== accepted, +1 rejected) + expected-peers no-dedup + lan/exit-node fields don't gate verdict today |
+| `windows_key_custody`           | 24    | DPAPI custody invariants + rotation tests (world-writable / unreviewed-owner / partial-rotation / temp-suffix / DACL widened to AU); per-variant serde round-trip Missing + Invalid + AbsentAsExpected + no-dedup-across-entries |
 | `windows_authenticode`          | 38    | PE Certificate Table parse + WinVerifyTrust chain validation + reviewed thumbprint policy (allowlist + revocation denylist with denylist-takes-precedence) + Microsoft-cert-manager-format normalisation |
 | `windows_registry_acls`         | 17    | Reviewed HKLM RustyNet service-key paths + forbidden DACL principals (WD/AU/BU/AN); cross-platform stub collector emits Unobserved entries (real Win32 collector follow-up) |
 | `windows_paths`                 | 61    | SDDL grant/deny matcher (substring-match negative, exact ACE-type token); local-secret ACL evaluator forbidden-principal rejection; runtime-path validator UNC + user-temp reject + canonical ProgramData accept |
 
+### Shared (platform-agnostic audit, 1 module, 37 pinned tests)
+
+| Module                          | Floor | What it pins                                                                                             |
+|---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
+| `secret_log_audit`              | 37    | Forbidden placeholder tokens in log macros (passphrase_bytes / private_key_bytes / signing_key_bytes / wrapped_secret / decrypted_secret / plaintext_key / raw_passphrase / secret_bytes / signing_seed); Debug + Display + ToString deny on canonical secret-bearing types; hex + base64 encode wrappers around forbidden idents; secret-material equality (==/!=) without ct_eq with structured allowlist + per-entry justification |
+
 ### Aggregate
 
-- **14 verifier modules**, **407 pinned tests** on the regression-coverage gate floor.
-- Every Linux verifier has a Windows analog; every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls`).
-- Workspace test sweep: **2693 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends).
+- **21 verifier + audit modules** across 4 groups, **~570 pinned tests** on the regression-coverage gate floor.
+- Every Linux verifier has a macOS + Windows analog (or equivalent surface). Every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls` / `windows_paths`).
+- Workspace test sweep: post-X4/X7 expansion the workspace runs in the 2800+ test range across rustynetd + rustynet-cli + control + relay + policy + backends.
 
 ## 2. CLI exit-code taxonomy (X6)
 
@@ -114,7 +131,7 @@ Modules with typed views landed:
 | `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2693 tests)                                    |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
-| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (14 modules, 407 pinned tests)                   |
+| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (21 modules across 4 groups, ~570 pinned tests)  |
 | `scripts/ci/start_modularization_smoke.sh`         | bash module / dispatcher contract (32 checks)                                |
 | `scripts/ci/secrets_hygiene_gates.sh`              | structured secret-leak audit + required tests                                |
 | Per-phase gate scripts (`phase1_gates.sh` … `phase10_gates.sh`) | per-phase release-readiness pins                                |
