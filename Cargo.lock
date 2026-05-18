@@ -983,7 +983,9 @@ dependencies = [
 name = "rustynetd"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "ed25519-dalek",
+ "hmac",
  "log",
  "nix 0.29.0",
  "rand",
@@ -999,6 +1001,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "windows-service",
  "zeroize",
