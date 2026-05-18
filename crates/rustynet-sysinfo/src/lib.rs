@@ -1242,7 +1242,7 @@ fn service_status_internal(service_name: &str) -> ServiceStatus {
 
 fn system_info_internal() -> SystemInfo {
     let cpu_count = std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(1);
 
     SystemInfo {
@@ -2179,7 +2179,11 @@ fn log_tail_internal(lines: usize) -> Vec<String> {
             .ok()
             .and_then(|out| String::from_utf8(out.stdout).ok())
             .map(|stdout| {
-                result = stdout.lines().take(limit).map(|s| s.to_string()).collect();
+                result = stdout
+                    .lines()
+                    .take(limit)
+                    .map(std::string::ToString::to_string)
+                    .collect();
             });
     }
 
@@ -2220,7 +2224,11 @@ fn log_errors_internal() -> Vec<String> {
             .ok()
             .and_then(|out| String::from_utf8(out.stdout).ok())
             .map(|stdout| {
-                errors = stdout.lines().take(20).map(|s| s.to_string()).collect();
+                errors = stdout
+                    .lines()
+                    .take(20)
+                    .map(std::string::ToString::to_string)
+                    .collect();
             });
     }
 
@@ -3977,7 +3985,7 @@ fn interface_speed_internal() -> Vec<InterfaceSpeed> {
                         mtu,
                     });
                 }
-                current_iface = line.split(':').next().map(|s| s.to_string());
+                current_iface = line.split(':').next().map(std::string::ToString::to_string);
             } else if current_iface.is_some()
                 && line.contains("mtu")
                 && let Some(mtu_str) = line.split("mtu").nth(1)

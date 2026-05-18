@@ -96,7 +96,7 @@ pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, Adap
     let tunnels: Vec<String> = output
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
     Ok(TunnelsList { tunnels })
 }

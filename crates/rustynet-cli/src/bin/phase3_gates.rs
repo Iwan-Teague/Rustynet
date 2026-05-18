@@ -157,13 +157,15 @@ fn resolve_source_path(root_dir: &Path, raw: OsString) -> PathBuf {
 }
 
 fn path_to_utf8(path: &Path, label: &str) -> Result<String, i32> {
-    path.to_str().map(|value| value.to_string()).ok_or_else(|| {
-        report_error(
-            ExitCode::ConfigError,
-            &format!("{label} is not valid UTF-8: {}", path.display()),
-        );
-        ExitCode::ConfigError.as_i32()
-    })
+    path.to_str()
+        .map(std::string::ToString::to_string)
+        .ok_or_else(|| {
+            report_error(
+                ExitCode::ConfigError,
+                &format!("{label} is not valid UTF-8: {}", path.display()),
+            );
+            ExitCode::ConfigError.as_i32()
+        })
 }
 
 fn run_command(

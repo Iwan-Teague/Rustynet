@@ -1078,7 +1078,7 @@ mod typed_parser_tests {
         let view: DigestFailedWorkerView =
             serde_json::from_value(clean_failed_worker_value()).unwrap();
         let map = view.into_value_map();
-        assert_eq!(map.get("rc").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(map.get("rc").and_then(serde_json::Value::as_i64), Some(2));
         assert_eq!(
             map.get("snapshot_path").and_then(|v| v.as_str()),
             Some("/tmp/snap.tar")
@@ -1131,7 +1131,7 @@ mod typed_parser_tests {
             Some("validate_baseline_runtime")
         );
         assert_eq!(map.get("status").and_then(|v| v.as_str()), Some("fail"));
-        assert_eq!(map.get("rc").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(map.get("rc").and_then(serde_json::Value::as_i64), Some(1));
         let workers = map
             .get("failed_workers")
             .and_then(|v| v.as_array())
@@ -1195,11 +1195,19 @@ mod typed_parser_tests {
     fn live_lab_failure_digest_view_into_value_map_round_trips() {
         let view: LiveLabFailureDigestView = serde_json::from_value(clean_digest_value()).unwrap();
         let map = view.into_value_map();
-        assert_eq!(map.get("schema_version").and_then(|v| v.as_u64()), Some(1));
-        assert_eq!(map.get("run_id").and_then(|v| v.as_str()), Some("run-123"));
-        assert_eq!(map.get("node_count").and_then(|v| v.as_u64()), Some(1));
         assert_eq!(
-            map.get("failed_stage_count").and_then(|v| v.as_u64()),
+            map.get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(map.get("run_id").and_then(|v| v.as_str()), Some("run-123"));
+        assert_eq!(
+            map.get("node_count").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            map.get("failed_stage_count")
+                .and_then(serde_json::Value::as_u64),
             Some(1)
         );
         let nodes = map.get("nodes").and_then(|v| v.as_array()).unwrap();

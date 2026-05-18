@@ -3895,7 +3895,7 @@ impl DaemonRuntime {
             self.traversal_probe_config
                 .stun_servers
                 .iter()
-                .map(|addr| addr.to_string())
+                .map(std::string::ToString::to_string)
                 .collect(),
             Duration::from_millis(self.traversal_probe_config.stun_gather_timeout_ms),
         );
@@ -4213,7 +4213,7 @@ impl DaemonRuntime {
         } else {
             self.local_stun_candidates
                 .iter()
-                .map(|addr| addr.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",")
         };
@@ -4231,7 +4231,7 @@ impl DaemonRuntime {
                 .map(|(iface, addrs)| {
                     let ips = addrs
                         .iter()
-                        .map(|addr| addr.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(",");
                     format!("{iface}={ips}")
@@ -13408,7 +13408,10 @@ mod tests {
                 target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
                 expected_ip: expected_ip.to_string(),
                 ttl_secs: timing.ttl_secs,
-                aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+                aliases: aliases
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
             }],
         )
         .expect("dns zone bundle should be built");

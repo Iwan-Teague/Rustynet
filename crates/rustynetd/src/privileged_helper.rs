@@ -208,7 +208,7 @@ impl PrivilegedCommandClient {
                 program: program.as_str().to_string(),
                 args: args
                     .iter()
-                    .map(|value| value.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect::<Vec<_>>(),
             };
             write_request_frame(&mut stream, &request)?;

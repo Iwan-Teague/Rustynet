@@ -78,7 +78,7 @@ fn run() -> Result<(), i32> {
     }
     let phase1_source_path = phase1_source_path
         .to_str()
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| {
             report_error(
                 ExitCode::ConfigError,

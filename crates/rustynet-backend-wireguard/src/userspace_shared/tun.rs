@@ -1298,7 +1298,7 @@ mod tests {
                 && args
                     == ["rule", "del", "table", "51820"]
                         .iter()
-                        .map(|value| value.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect::<Vec<_>>();
             if is_delete_table {
                 return Err(BackendError::internal(

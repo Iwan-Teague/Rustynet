@@ -13189,7 +13189,7 @@ fn execute_info() -> Result<String, String> {
 
     if let Some(path_str) = std::env::current_exe()
         .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .and_then(|p| p.to_str().map(std::string::ToString::to_string))
     {
         lines.push(format!("binary: {path_str}"));
     }
@@ -13485,8 +13485,10 @@ fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
         0
     };
 
-    let mut filtered_lines: Vec<String> =
-        lines[start_idx..].iter().map(|s| s.to_string()).collect();
+    let mut filtered_lines: Vec<String> = lines[start_idx..]
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     if let Some(level_filter) = cmd.level {
         let level_lower = level_filter.to_lowercase();
@@ -16388,8 +16390,8 @@ fn execute_policy(command: PolicyCommand) -> Result<String, String> {
             let payload = json!({
                 "policy_file": policy_file.display().to_string(),
                 "dry_run": dry_run,
-                "added": added.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                "removed": removed.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "added": added.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+                "removed": removed.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
                 "applied": !dry_run,
             });
             let human = format!(
@@ -16576,7 +16578,7 @@ fn execute_cert(command: CertCommand) -> Result<String, String> {
                     "label": label,
                     "path": path,
                     "exists": metadata.is_some(),
-                    "size_bytes": metadata.as_ref().map(|m| m.len()),
+                    "size_bytes": metadata.as_ref().map(std::fs::Metadata::len),
                     "mtime_unix": mtime_secs,
                     "age_secs": age_secs,
                     "max_age_secs": max_age_secs,
@@ -16605,7 +16607,7 @@ fn execute_cert(command: CertCommand) -> Result<String, String> {
             for (label, path) in cert_files {
                 let metadata = std::fs::metadata(path).ok();
                 let exists = metadata.is_some();
-                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                let size = metadata.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
                 let ok = exists && size > 0;
                 findings.push(json!({
                     "label": label,
@@ -16650,7 +16652,10 @@ fn execute_trust_state(command: TrustStateCommand) -> Result<String, String> {
     let evidence_path = canonical_trust_evidence_path();
     let verifier_path = canonical_trust_verifier_key_path();
     let evidence_metadata = std::fs::metadata(evidence_path).ok();
-    let evidence_size = evidence_metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+    let evidence_size = evidence_metadata
+        .as_ref()
+        .map(std::fs::Metadata::len)
+        .unwrap_or(0);
     let evidence_age_secs = evidence_metadata
         .as_ref()
         .and_then(|m| m.modified().ok())
@@ -20901,7 +20906,7 @@ mod tests {
         assert_eq!(
             parsed
                 .get("prior_evidence_present")
-                .and_then(|v| v.as_bool()),
+                .and_then(serde_json::Value::as_bool),
             Some(false)
         );
     }
@@ -20924,13 +20929,20 @@ mod tests {
             parsed.get("artifact").and_then(|v| v.as_str()),
             Some("membership_audit_replay")
         );
-        assert_eq!(parsed.get("epoch").and_then(|v| v.as_u64()), Some(7));
         assert_eq!(
-            parsed.get("entries_count").and_then(|v| v.as_u64()),
+            parsed.get("epoch").and_then(serde_json::Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            parsed
+                .get("entries_count")
+                .and_then(serde_json::Value::as_u64),
             Some(12)
         );
         assert_eq!(
-            parsed.get("active_node_count").and_then(|v| v.as_u64()),
+            parsed
+                .get("active_node_count")
+                .and_then(serde_json::Value::as_u64),
             Some(11)
         );
         assert_eq!(

@@ -939,7 +939,7 @@ mod tests {
                 self.handshake_output.lock().expect("handshake").clone()
             } else if args.iter().any(|arg| arg == "transfer") {
                 self.transfer_output.lock().expect("transfer").clone()
-            } else if args.first().map(|a| a.as_str()) == Some("show") {
+            } else if args.first().map(std::string::String::as_str) == Some("show") {
                 // Plain `wg show <tunnel>` — the tunnel-readiness probe.
                 self.show_interface_output
                     .lock()
@@ -1502,7 +1502,9 @@ mod tests {
         let recorded = runner.recorded();
         let install = recorded
             .iter()
-            .find(|(_, args)| args.first().map(|a| a.as_str()) == Some("/installtunnelservice"))
+            .find(|(_, args)| {
+                args.first().map(std::string::String::as_str) == Some("/installtunnelservice")
+            })
             .expect("install command should be recorded");
         assert_eq!(install.0, wireguard_path.to_string_lossy());
         assert_eq!(install.1.len(), 2);

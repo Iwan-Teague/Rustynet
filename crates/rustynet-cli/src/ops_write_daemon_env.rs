@@ -22,7 +22,7 @@ pub fn execute_ops_write_daemon_env(
     // Default: NODE_ROLE
     let setup_complete = config
         .get("SETUP_COMPLETE")
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .unwrap_or("0");
     if !config.contains_key("NODE_ROLE") {
         let default_role = if setup_complete == "1" {
@@ -69,7 +69,11 @@ pub fn execute_ops_write_daemon_env(
         config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
     } else if node_role == "blind_exit" {
         // Force settings for blind_exit
-        if config.get("DEFAULT_LAUNCH_PROFILE").map(|s| s.as_str()) != Some("quick-exit-node") {
+        if config
+            .get("DEFAULT_LAUNCH_PROFILE")
+            .map(std::string::String::as_str)
+            != Some("quick-exit-node")
+        {
             eprintln!("[warn] blind_exit role enforces default launch profile 'quick-exit-node'.");
             config.insert(
                 "DEFAULT_LAUNCH_PROFILE".to_string(),
@@ -95,7 +99,11 @@ pub fn execute_ops_write_daemon_env(
     }
 
     // enforce_auto_tunnel_policy
-    if config.get("AUTO_TUNNEL_ENFORCE").map(|s| s.as_str()) != Some("1") {
+    if config
+        .get("AUTO_TUNNEL_ENFORCE")
+        .map(std::string::String::as_str)
+        != Some("1")
+    {
         eprintln!(
             "[warn] Unsigned/manual tunnel assignment is not allowed by default; forcing AUTO_TUNNEL_ENFORCE=1."
         );
@@ -103,7 +111,11 @@ pub fn execute_ops_write_daemon_env(
     }
 
     // enforce_fail_closed_ssh_policy
-    if config.get("FAIL_CLOSED_SSH_ALLOW").map(|s| s.as_str()) != Some("1") {
+    if config
+        .get("FAIL_CLOSED_SSH_ALLOW")
+        .map(std::string::String::as_str)
+        != Some("1")
+    {
         config.insert("FAIL_CLOSED_SSH_ALLOW".to_string(), "0".to_string());
         config.remove("FAIL_CLOSED_SSH_ALLOW_CIDRS");
     } else if config
@@ -133,7 +145,11 @@ pub fn execute_ops_write_daemon_env(
     }
 
     // enforce_auto_port_forward_policy
-    if config.get("AUTO_PORT_FORWARD_EXIT").map(|s| s.as_str()) != Some("1") {
+    if config
+        .get("AUTO_PORT_FORWARD_EXIT")
+        .map(std::string::String::as_str)
+        != Some("1")
+    {
         config.insert("AUTO_PORT_FORWARD_EXIT".to_string(), "0".to_string());
     } else {
         // Check lease secs

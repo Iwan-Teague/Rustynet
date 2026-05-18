@@ -1243,7 +1243,7 @@ fn collect_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
             .map_err(|err| format!("read directory failed ({}): {err}", dir.display()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("read directory entry failed ({}): {err}", dir.display()))?;
-        entries.sort_by_key(|entry| entry.path());
+        entries.sort_by_key(std::fs::DirEntry::path);
 
         for entry in entries {
             let path = entry.path();
@@ -1761,7 +1761,7 @@ fn collect_workspace_files(
             .map_err(|err| format!("read directory failed ({}): {err}", dir.display()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("read directory entry failed ({}): {err}", dir.display()))?;
-        entries.sort_by_key(|entry| entry.path());
+        entries.sort_by_key(std::fs::DirEntry::path);
 
         for entry in entries {
             let path = entry.path();

@@ -1460,7 +1460,7 @@ fn parse_first_route_interface(output: &str) -> Option<String> {
     output
         .lines()
         .find_map(parse_dev_interface_token)
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 fn parse_dev_interface_token(line: &str) -> Option<&str> {

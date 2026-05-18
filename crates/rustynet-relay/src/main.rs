@@ -543,7 +543,7 @@ mod daemon {
                         sockets.get(&port).map(|(s, _)| s.local_addr())
                     };
 
-                    let Some(Some(_)) = socket_result.map(|result| result.ok()) else {
+                    let Some(Some(_)) = socket_result.map(std::result::Result::ok) else {
                         // Socket no longer exists
                         break;
                     };

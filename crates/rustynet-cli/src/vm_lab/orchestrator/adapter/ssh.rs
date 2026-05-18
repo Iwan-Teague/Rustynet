@@ -346,16 +346,18 @@ pub fn parse_status_node_id(status_text: &str) -> Option<String> {
     status_text.split_whitespace().find_map(|field| {
         field
             .strip_prefix("node_id=")
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
     })
 }
 
 /// Parse any `key=<value>` field from a `rustynet status` space-separated output.
 pub fn parse_status_field(status_text: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
-    status_text
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix(prefix.as_str()).map(|v| v.to_string()))
+    status_text.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix(prefix.as_str())
+            .map(std::string::ToString::to_string)
+    })
 }
 
 // ── Build remote path for a host+user combination ────────────────────────────

@@ -2267,7 +2267,7 @@ fn parse_status_field(status: &str, key: &str) -> Option<String> {
     status.split_whitespace().find_map(|token| {
         token
             .strip_prefix(prefix.as_str())
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
     })
 }
 

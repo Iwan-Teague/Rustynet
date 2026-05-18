@@ -1570,7 +1570,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
     if crypto_schedule
         .get("entries")
         .and_then(Value::as_array)
-        .map(|entries| entries.is_empty())
+        .map(std::vec::Vec::is_empty)
         .unwrap_or(true)
     {
         return Err("crypto deprecation schedule requires non-empty entries".to_string());
@@ -6097,7 +6097,10 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             Some("measured")
         );
         assert_eq!(map.get("drill_id").and_then(|v| v.as_str()), Some("dr-1"));
-        assert_eq!(map.get("region_count").and_then(|v| v.as_i64()), Some(3));
+        assert_eq!(
+            map.get("region_count").and_then(serde_json::Value::as_i64),
+            Some(3)
+        );
     }
 
     /// into_value_map omits evidence_mode when the typed view's

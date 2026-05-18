@@ -308,7 +308,7 @@ fn ensure_peer_field_safe(label: &str, value: &str, line_no: Option<usize>) -> R
             line_no,
         ));
     }
-    if value.chars().any(|ch| ch.is_control()) {
+    if value.chars().any(char::is_control) {
         return Err(field_error(
             label,
             "contains forbidden control characters",
