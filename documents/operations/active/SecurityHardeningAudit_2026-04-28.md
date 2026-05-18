@@ -654,7 +654,7 @@ Sections that the comparison above grounds against:
 - Replay protection on signed bundles: `crates/rustynetd/src/fetcher.rs`
   watermark store (commit `de4c7ba` fix for clock-pre-EPOCH DoS).
 
-## 4) Agent Update Rules
+## 6) Agent Update Rules
 
 Same rules as the OS-agnostic delta plan:
 1. Update this document immediately after each materially

@@ -1417,7 +1417,7 @@ Rustynet can claim cross-network remote exit-node support only when all of the f
 2. All artifacts follow schema in CrossNetworkRemoteExitArtifactSchema_2026-03-16.md.
 3. Evidence is commit-bound, not stale, and reproducible.
 
-## 7. Gap Summary
+## 8B. Gap Summary
 The remaining work falls into four technical gaps:
 1. Candidate acquisition:
    - Rustynet needs real public/reflexive candidate discovery, not just signed endpoint hints carrying static or pre-known addresses.
@@ -1428,7 +1428,7 @@ The remaining work falls into four technical gaps:
 4. Cross-network exit-path validation:
    - Rustynet needs measured live evidence that full-tunnel routing and DNS remain secure across direct and relay paths.
 
-## 8. Implementation Phases
+## 8C. Implementation Phases
 ### Phase 0: Truth Lock and Threat Model Baseline
 Goal:
 - Align all remaining work under one current-state plan and stop overstating completion.
