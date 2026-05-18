@@ -131,9 +131,15 @@ inline. Cross-reference with:
   directory); 0o000 mode (would break daemon startup); first-fault
   ordering (mode > uid > gid); and the AND-of-statuses
   `overall_ok` invariant. (Commit a924229.)
-* nftables IPv6 parity + named-chain integrity work is now tracked
-  separately — promoting to its own backlog entry below or leaving
-  for `phase10.rs` future work.
+* `[ ]` Remaining scope (separate slice): nftables IPv6 parity +
+  named-chain integrity in `phase10.rs` / `privileged_helper.rs`
+  bring-up. Distinct from L7 (which scopes the exit-node `ip6`
+  NAT sibling table + `ipv6_parity_supported=true` flip); this
+  entry covers the runtime-ACL families (`inet rustynet` /
+  `ip rustynet`) and their named-chain wiring against silent
+  drift. Verifier evaluator extension lives in `phase10.rs`;
+  no test floor exists yet because the surface lives outside
+  the per-platform `linux_runtime_acls` module.
 
 ### L3. `linux_service_hardening.rs` systemd sandbox-flag pinning
 
