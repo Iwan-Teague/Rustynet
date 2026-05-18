@@ -52,7 +52,15 @@ Start with these when you need current status, remaining work, or the public imp
 
 - [UTMVirtualMachineInventory_2026-03-31.md](./UTMVirtualMachineInventory_2026-03-31.md)
 - [rustynet_blind_exit_pcb_report_2026-05-10.docx](./rustynet_blind_exit_pcb_report_2026-05-10.docx)
-- `vm_lab_inventory.json`
+- `vm_lab_inventory.json` — VM topology + role assignments
+- `vm_lab_readiness_check_2026-04-28.json` — dated VM lab readiness summary (schema_version=1)
+- `windows_utm_1_runtime_acls_2026-04-28.json` — windows-utm-1 runtime-ACL collector evidence
+- `windows_utm_1_service_hardening_2026-04-28.json` — windows-utm-1 service-hardening collector evidence
+- `windows_utm_1_validate_2026-04-28.json` — windows-utm-1 validate-bundle output
+
+Rule: these JSON evidence files are dated artifacts from specific lab runs.
+Add a new dated file when a new run produces fresh evidence; do not edit
+existing ones in place.
 
 ## Rules
 
