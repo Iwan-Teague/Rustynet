@@ -1338,6 +1338,8 @@ const FORBIDDEN_DEPRECATED_CRYPTO_CRATES: &[&str] = &[
     "md4",
     "md2",
     "rc4",
+    "rc2",
+    "blowfish",
     "des",
     "des3",
     "triple_des",
@@ -1533,6 +1535,33 @@ fn deprecated_crypto_import_scanner_flags_use_rc4() {
     assert!(
         hits.iter().any(|(_, c)| c == "rc4"),
         "`use rc4::Rc4` must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_rc2() {
+    // RC2 is a 64-bit-block cipher with practical related-key
+    // attacks (Knudsen 1997); RFC 8407 marks RC2 historic.
+    // Banned for parity with the deny.toml `rc2` entry.
+    let body = "use rc2::Rc2;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "rc2"),
+        "`use rc2::Rc2` must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_blowfish() {
+    // Blowfish is a 64-bit-block cipher → sweet32-class birthday
+    // attacks after ~32 GiB of ciphertext (CVE-2016-2183).
+    // Modern protocols use 128-bit-block ciphers (AES). Banned
+    // for parity with the deny.toml `blowfish` entry.
+    let body = "use blowfish::Blowfish;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "blowfish"),
+        "`use blowfish::Blowfish` must surface: {hits:?}"
     );
 }
 
