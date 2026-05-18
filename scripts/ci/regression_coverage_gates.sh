@@ -118,7 +118,13 @@ MACOS_FLOORS=(
   # rejection, and the overall_ok={Ok|AbsentAsExpected only}
   # contract from both sides.
   "macos_key_custody:11"
-  "macos_authenticode:2"
+  # Floor bumped 2→7 on X4 stub-coverage sweep: 5 new tests pinning
+  # schema_version, the applicable=false posture (must flip if a
+  # future codesign --verify probe lands), the reason-text shape
+  # (Authenticode / Gatekeeper / launch-time mentions), deterministic
+  # output across calls (no hidden state), and the current
+  # unknown-fields-tolerated serde behavior.
+  "macos_authenticode:7"
 )
 
 # Note: `windows_runtime_acls` is not a standalone module — Windows
