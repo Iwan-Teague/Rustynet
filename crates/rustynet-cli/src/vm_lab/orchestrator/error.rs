@@ -116,7 +116,7 @@ impl fmt::Display for AdapterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AdapterError::UnsupportedPlatform { platform, message } => {
-                write!(f, "platform {:?} not supported: {}", platform, message)
+                write!(f, "platform {platform:?} not supported: {message}")
             }
             AdapterError::ConnectionPlatformMismatch {
                 platform,
@@ -124,14 +124,13 @@ impl fmt::Display for AdapterError {
             } => {
                 write!(
                     f,
-                    "connection type '{connection_kind}' is not valid for platform {:?}",
-                    platform
+                    "connection type '{connection_kind}' is not valid for platform {platform:?}"
                 )
             }
             AdapterError::Ssh { message } => write!(f, "SSH error: {message}"),
             AdapterError::Io { message } => write!(f, "I/O error: {message}"),
             AdapterError::Command { exit_code, stderr } => {
-                write!(f, "remote command failed (exit {:?}): {stderr}", exit_code)
+                write!(f, "remote command failed (exit {exit_code:?}): {stderr}")
             }
             AdapterError::InvalidPath { path, reason } => {
                 write!(f, "invalid path '{}': {reason}", path.display())

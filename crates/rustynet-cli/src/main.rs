@@ -13191,14 +13191,14 @@ fn execute_info() -> Result<String, String> {
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
     {
-        lines.push(format!("binary: {}", path_str));
+        lines.push(format!("binary: {path_str}"));
     }
 
     lines.push(format!("target: {}", std::env::consts::OS));
     lines.push(format!("arch: {}", std::env::consts::ARCH));
 
     if let Some(rustc_str) = rustynet_sysinfo::rustc_version() {
-        lines.push(format!("rustc: {}", rustc_str));
+        lines.push(format!("rustc: {rustc_str}"));
     }
 
     if rustynet_sysinfo::git_version().is_some() {
@@ -13223,7 +13223,7 @@ fn execute_doctor() -> Result<String, String> {
             }
         }
         Err(e) => {
-            checks.push(format!("✗ cannot determine binary path: {}", e));
+            checks.push(format!("✗ cannot determine binary path: {e}"));
             all_pass = false;
         }
     }
@@ -13476,7 +13476,7 @@ fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
         return Err(format!("log file not found at {}", log_path.display()));
     }
 
-    let content = fs::read_to_string(&log_path).map_err(|e| format!("cannot read logs: {}", e))?;
+    let content = fs::read_to_string(&log_path).map_err(|e| format!("cannot read logs: {e}"))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let start_idx = if lines.len() > lines_to_show {
@@ -13504,48 +13504,41 @@ fn execute_config_show() -> Result<String, String> {
     let mut output = vec!["rustynet configuration:".to_string(), String::new()];
 
     output.push("Daemon settings:".to_string());
-    output.push(format!("  socket: {}", DEFAULT_SOCKET_PATH));
-    output.push(format!("  interface: {}", DEFAULT_WG_INTERFACE));
+    output.push(format!("  socket: {DEFAULT_SOCKET_PATH}"));
+    output.push(format!("  interface: {DEFAULT_WG_INTERFACE}"));
     output.push(String::new());
 
     output.push("Key and Trust Paths:".to_string());
-    output.push(format!("  wg public key: {}", DEFAULT_WG_PUBLIC_KEY_PATH));
+    output.push(format!("  wg public key: {DEFAULT_WG_PUBLIC_KEY_PATH}"));
     output.push(format!(
-        "  wg encrypted key: {}",
-        DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH
+        "  wg encrypted key: {DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH}"
     ));
     output.push(format!(
-        "  trust verifier: {}",
-        DEFAULT_TRUST_VERIFIER_KEY_PATH
+        "  trust verifier: {DEFAULT_TRUST_VERIFIER_KEY_PATH}"
     ));
     output.push(String::new());
 
     output.push("Membership and Assignment:".to_string());
     output.push(format!(
-        "  membership snapshot: {}",
-        DEFAULT_MEMBERSHIP_SNAPSHOT_PATH
+        "  membership snapshot: {DEFAULT_MEMBERSHIP_SNAPSHOT_PATH}"
     ));
-    output.push(format!("  membership log: {}", DEFAULT_MEMBERSHIP_LOG_PATH));
+    output.push(format!("  membership log: {DEFAULT_MEMBERSHIP_LOG_PATH}"));
     output.push(String::new());
 
     output.push("Traversal and DNS:".to_string());
     output.push(format!(
-        "  traversal bundle: {}",
-        DEFAULT_TRAVERSAL_BUNDLE_PATH
+        "  traversal bundle: {DEFAULT_TRAVERSAL_BUNDLE_PATH}"
     ));
     output.push(format!(
-        "  traversal verifier: {}",
-        DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH
+        "  traversal verifier: {DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH}"
     ));
     output.push(format!(
-        "  traversal watermark: {}",
-        DEFAULT_TRAVERSAL_WATERMARK_PATH
+        "  traversal watermark: {DEFAULT_TRAVERSAL_WATERMARK_PATH}"
     ));
     output.push(format!(
-        "  dns resolver bind: {}",
-        DEFAULT_DNS_RESOLVER_BIND_ADDR
+        "  dns resolver bind: {DEFAULT_DNS_RESOLVER_BIND_ADDR}"
     ));
-    output.push(format!("  dns zone name: {}", DEFAULT_DNS_ZONE_NAME));
+    output.push(format!("  dns zone name: {DEFAULT_DNS_ZONE_NAME}"));
     output.push(String::new());
 
     output.push("Environment variables:".to_string());
@@ -13560,7 +13553,7 @@ fn execute_config_show() -> Result<String, String> {
     ];
     for var in env_vars {
         if let Ok(value) = std::env::var(var) {
-            output.push(format!("  {}: {}", var, value));
+            output.push(format!("  {var}: {value}"));
         }
     }
 
@@ -13576,7 +13569,7 @@ fn execute_debug() -> Result<String, String> {
             output.push(info);
             output.push(String::new());
         }
-        Err(e) => output.push(format!("info error: {}\n", e)),
+        Err(e) => output.push(format!("info error: {e}\n")),
     }
 
     match execute_config_show() {
@@ -13585,7 +13578,7 @@ fn execute_debug() -> Result<String, String> {
             output.push(config);
             output.push(String::new());
         }
-        Err(e) => output.push(format!("config error: {}\n", e)),
+        Err(e) => output.push(format!("config error: {e}\n")),
     }
 
     let logs_cmd = LogsCommand {
@@ -13599,7 +13592,7 @@ fn execute_debug() -> Result<String, String> {
             output.push(logs);
             output.push(String::new());
         }
-        Err(e) => output.push(format!("logs warning: {}\n", e)),
+        Err(e) => output.push(format!("logs warning: {e}\n")),
     }
 
     output.push("=== End Debug Bundle ===".to_string());
@@ -13618,7 +13611,7 @@ fn execute_peer_list() -> Result<String, String> {
         output.push("  (no peers)".to_string());
     } else {
         for line in response.message.lines() {
-            output.push(format!("  {}", line));
+            output.push(format!("  {line}"));
         }
     }
 
@@ -13630,7 +13623,7 @@ fn execute_tunnel_info() -> Result<String, String> {
 
     let mut output = vec!["tunnel info:".to_string()];
 
-    output.push(format!("  interface: {}", DEFAULT_WG_INTERFACE));
+    output.push(format!("  interface: {DEFAULT_WG_INTERFACE}"));
     output.push("  listen port: 51820".to_string());
 
     let iface_info = rustynet_sysinfo::wireguard_interface_info(DEFAULT_WG_INTERFACE);
@@ -13655,7 +13648,7 @@ fn execute_sysinfo() -> Result<String, String> {
     output.push(format!("  arch: {}", info.arch));
     output.push(format!("  cpu count: {}", info.cpu_count));
     if let Some(version) = info.kernel_version {
-        output.push(format!("  kernel: {}", version));
+        output.push(format!("  kernel: {version}"));
     }
 
     Ok(output.join("\n"))
@@ -13689,7 +13682,7 @@ fn execute_network_info() -> Result<String, String> {
         ));
         if !iface.addresses.is_empty() {
             for addr in iface.addresses {
-                output.push(format!("    {}", addr));
+                output.push(format!("    {addr}"));
             }
         }
     }
@@ -13710,7 +13703,7 @@ fn execute_security_check() -> Result<String, String> {
     if !result.issues.is_empty() {
         output.push("  issues:".to_string());
         for issue in result.issues {
-            output.push(format!("    - {}", issue));
+            output.push(format!("    - {issue}"));
         }
     }
 
@@ -13750,7 +13743,7 @@ fn execute_dependency_check() -> Result<String, String> {
     if !deps.messages.is_empty() {
         output.push("  messages:".to_string());
         for msg in deps.messages {
-            output.push(format!("    - {}", msg));
+            output.push(format!("    - {msg}"));
         }
     }
 
@@ -13773,7 +13766,7 @@ fn execute_daemon_health() -> Result<String, String> {
     if let Some(uptime) = health.uptime_secs {
         let hours = uptime / 3600;
         let mins = (uptime % 3600) / 60;
-        output.push(format!("  uptime: {}h {}m", hours, mins));
+        output.push(format!("  uptime: {hours}h {mins}m"));
     }
     output.push(format!("  status: {}", health.status_message));
 
@@ -13793,7 +13786,7 @@ fn execute_config_validate() -> Result<String, String> {
     if !result.issues.is_empty() {
         output.push("  issues:".to_string());
         for issue in result.issues {
-            output.push(format!("    - {}", issue));
+            output.push(format!("    - {issue}"));
         }
     }
 
@@ -13810,7 +13803,7 @@ fn execute_wg_addresses() -> Result<String, String> {
         output.push("  (none found)".to_string());
     } else {
         for addr in addresses {
-            output.push(format!("  {}", addr));
+            output.push(format!("  {addr}"));
         }
     }
 
@@ -13851,7 +13844,7 @@ fn execute_key_expiry() -> Result<String, String> {
     if !expiry.key_details.is_empty() {
         output.push("  details:".to_string());
         for detail in expiry.key_details {
-            output.push(format!("    {}", detail));
+            output.push(format!("    {detail}"));
         }
     } else {
         output.push("  (no expiring keys detected)".to_string());
@@ -13869,7 +13862,7 @@ fn execute_tunnel_status() -> Result<String, String> {
     output.push(format!("  bytes sent: {}", status.bytes_sent));
     output.push(format!("  bytes received: {}", status.bytes_recv));
     if let Some(ago) = status.last_handshake_secs {
-        output.push(format!("  last handshake: {}s ago", ago));
+        output.push(format!("  last handshake: {ago}s ago"));
     }
 
     Ok(output.join("\n"))
@@ -13889,7 +13882,7 @@ fn execute_wg_peers() -> Result<String, String> {
             output.push(format!("    ip: {}", peer.ip));
             output.push(format!("    allowed: {}", peer.allowed_ips));
             if let Some(ago) = peer.last_handshake_ago {
-                output.push(format!("    handshake: {}s ago", ago));
+                output.push(format!("    handshake: {ago}s ago"));
             }
         }
     }
@@ -13905,12 +13898,12 @@ fn execute_uptime() -> Result<String, String> {
     let sys_mins = (info.system_uptime_secs % 3600) / 60;
 
     let mut output = vec!["uptime:".to_string()];
-    output.push(format!("  system: {}h {}m", sys_hours, sys_mins));
+    output.push(format!("  system: {sys_hours}h {sys_mins}m"));
 
     if let Some(daemon_secs) = info.daemon_uptime_secs {
         let daemon_hours = daemon_secs / 3600;
         let daemon_mins = (daemon_secs % 3600) / 60;
-        output.push(format!("  daemon: {}h {}m", daemon_hours, daemon_mins));
+        output.push(format!("  daemon: {daemon_hours}h {daemon_mins}m"));
     } else {
         output.push("  daemon: not running".to_string());
     }
@@ -13925,17 +13918,17 @@ fn execute_process_info() -> Result<String, String> {
     let mut output = vec!["daemon process:".to_string()];
 
     if let Some(pid) = info.pid {
-        output.push(format!("  pid: {}", pid));
+        output.push(format!("  pid: {pid}"));
     } else {
         output.push("  pid: not found".to_string());
     }
 
     if let Some(rss) = info.rss_mb {
-        output.push(format!("  memory: {} MB", rss));
+        output.push(format!("  memory: {rss} MB"));
     }
 
     if let Some(cpu) = info.cpu_percent {
-        output.push(format!("  cpu: {:.1}%", cpu));
+        output.push(format!("  cpu: {cpu:.1}%"));
     }
 
     Ok(output.join("\n"))
@@ -13984,7 +13977,7 @@ fn execute_log_tail(lines: usize) -> Result<String, String> {
         output.push("  (no logs found)".to_string());
     } else {
         for line in tail {
-            output.push(format!("  {}", line));
+            output.push(format!("  {line}"));
         }
     }
 
@@ -14000,7 +13993,7 @@ fn execute_log_errors() -> Result<String, String> {
         output.push("  (no errors found)".to_string());
     } else {
         for error in errors {
-            output.push(format!("  {}", error));
+            output.push(format!("  {error}"));
         }
     }
 
@@ -14084,7 +14077,7 @@ fn execute_health_check() -> Result<String, String> {
     if !health.issues.is_empty() {
         output.push("  issues:".to_string());
         for issue in health.issues {
-            output.push(format!("    - {}", issue));
+            output.push(format!("    - {issue}"));
         }
     }
 
@@ -14147,7 +14140,7 @@ fn execute_cpu_info() -> Result<String, String> {
     output.push(format!("  cores: {}", cpu.cores));
     output.push(format!("  model: {}", cpu.model));
     if let Some(freq) = cpu.freq_ghz {
-        output.push(format!("  freq:  {:.2} GHz", freq));
+        output.push(format!("  freq:  {freq:.2} GHz"));
     }
 
     Ok(output.join("\n"))
@@ -14176,7 +14169,7 @@ fn execute_env_validate() -> Result<String, String> {
         output.push("  all required variables set".to_string());
     } else {
         for issue in issues {
-            output.push(format!("  - {}", issue));
+            output.push(format!("  - {issue}"));
         }
     }
 
@@ -14218,7 +14211,7 @@ fn execute_iface_list() -> Result<String, String> {
                 if iface.up { "UP" } else { "DOWN" }
             ));
             if let Some(mac) = iface.mac_address {
-                output.push(format!("    MAC: {}", mac));
+                output.push(format!("    MAC: {mac}"));
             }
             if !iface.ip_addresses.is_empty() {
                 output.push(format!("    IPs: {}", iface.ip_addresses.join(", ")));
@@ -14246,14 +14239,14 @@ fn execute_dns_check() -> Result<String, String> {
     if !dns.resolvers.is_empty() {
         output.push("  resolvers:".to_string());
         for resolver in dns.resolvers {
-            output.push(format!("    {}", resolver));
+            output.push(format!("    {resolver}"));
         }
     }
 
     if !dns.test_results.is_empty() {
         output.push("  test results:".to_string());
         for result in dns.test_results {
-            output.push(format!("    {}", result));
+            output.push(format!("    {result}"));
         }
     }
 
@@ -14287,7 +14280,7 @@ fn execute_service_check() -> Result<String, String> {
     ));
     output.push(format!("  status: {}", svc.status));
     if let Some(uptime) = svc.uptime_seconds {
-        output.push(format!("  uptime: {} sec", uptime));
+        output.push(format!("  uptime: {uptime} sec"));
     }
 
     Ok(output.join("\n"))
@@ -14303,7 +14296,7 @@ fn execute_permission_check() -> Result<String, String> {
         output.push("  all permissions OK".to_string());
     } else {
         for issue in issues {
-            output.push(format!("  - {}", issue));
+            output.push(format!("  - {issue}"));
         }
     }
 
@@ -14336,7 +14329,7 @@ fn execute_tls_check() -> Result<String, String> {
     )];
 
     if let Some(version) = tls.tls_version {
-        output.push(format!("  version: {}", version));
+        output.push(format!("  version: {version}"));
     }
 
     output.push(format!(
@@ -14351,7 +14344,7 @@ fn execute_tls_check() -> Result<String, String> {
     if !tls.issues.is_empty() {
         output.push("  issues:".to_string());
         for issue in tls.issues {
-            output.push(format!("    - {}", issue));
+            output.push(format!("    - {issue}"));
         }
     }
 
@@ -14386,7 +14379,7 @@ fn execute_nat_detection() -> Result<String, String> {
     ));
     output.push(format!("  local IP: {}", nat.local_ip));
     if let Some(ip) = nat.public_ip {
-        output.push(format!("  public IP: {}", ip));
+        output.push(format!("  public IP: {ip}"));
     }
     output.push(format!("  method: {}", nat.detection_method));
 
@@ -14403,10 +14396,10 @@ fn execute_exit_node_status() -> Result<String, String> {
         if status.reachable { "yes" } else { "no" }
     ));
     if let Some(latency) = status.latency_ms {
-        output.push(format!("  latency: {:.1} ms", latency));
+        output.push(format!("  latency: {latency:.1} ms"));
     }
     if let Some(ip) = status.exit_ip {
-        output.push(format!("  IP: {}", ip));
+        output.push(format!("  IP: {ip}"));
     }
     output.push(format!("  status: {}", status.status));
 
@@ -14425,7 +14418,7 @@ fn execute_ipv6_support() -> Result<String, String> {
     if !ipv6.ipv6_addresses.is_empty() {
         output.push("  addresses:".to_string());
         for addr in ipv6.ipv6_addresses {
-            output.push(format!("    {}", addr));
+            output.push(format!("    {addr}"));
         }
     }
     output.push(format!(
@@ -14446,13 +14439,13 @@ fn execute_packet_loss() -> Result<String, String> {
     output.push(format!("  sent: {}", loss.packets_sent));
     output.push(format!("  received: {}", loss.packets_received));
     if let Some(min) = loss.min_latency_ms {
-        output.push(format!("  min latency: {:.1} ms", min));
+        output.push(format!("  min latency: {min:.1} ms"));
     }
     if let Some(avg) = loss.avg_latency_ms {
-        output.push(format!("  avg latency: {:.1} ms", avg));
+        output.push(format!("  avg latency: {avg:.1} ms"));
     }
     if let Some(max) = loss.max_latency_ms {
-        output.push(format!("  max latency: {:.1} ms", max));
+        output.push(format!("  max latency: {max:.1} ms"));
     }
 
     Ok(output.join("\n"))
@@ -14472,10 +14465,10 @@ fn execute_system_clock() -> Result<String, String> {
         if clock.ntp_active { "yes" } else { "no" }
     ));
     if let Some(offset) = clock.time_offset_ms {
-        output.push(format!("  offset: {} ms", offset));
+        output.push(format!("  offset: {offset} ms"));
     }
     if let Some(last_sync) = clock.last_sync_seconds_ago {
-        output.push(format!("  last sync: {} seconds ago", last_sync));
+        output.push(format!("  last sync: {last_sync} seconds ago"));
     }
     output.push(format!("  status: {}", clock.status));
 
@@ -14515,13 +14508,13 @@ fn execute_dns_resolver() -> Result<String, String> {
     } else {
         output.push("  resolvers:".to_string());
         for resolver in &dns.resolvers {
-            output.push(format!("    {}", resolver));
+            output.push(format!("    {resolver}"));
         }
     }
     if !dns.search_domains.is_empty() {
         output.push("  search domains:".to_string());
         for domain in &dns.search_domains {
-            output.push(format!("    {}", domain));
+            output.push(format!("    {domain}"));
         }
     }
 
@@ -14540,7 +14533,7 @@ fn execute_interface_speed() -> Result<String, String> {
     for iface in speeds {
         let speed_str = iface
             .speed_mbps
-            .map(|s| format!("{} Mbps", s))
+            .map(|s| format!("{s} Mbps"))
             .unwrap_or_else(|| "unknown".to_string());
         output.push(format!(
             "  {}: {} (MTU: {})",
@@ -14759,7 +14752,7 @@ fn execute_key_permissions() -> Result<String, String> {
         output.push(format!("  {}: {} ({})", check.path, status, check.owner));
         if !check.issues.is_empty() {
             for issue in check.issues.iter().take(2) {
-                output.push(format!("    - {}", issue));
+                output.push(format!("    - {issue}"));
             }
         }
     }
@@ -14794,7 +14787,7 @@ fn execute_sudoers_audit() -> Result<String, String> {
             audit.dangerous_rules.len()
         ));
         for rule in audit.dangerous_rules.iter().take(5) {
-            output.push(format!("    - {}", rule));
+            output.push(format!("    - {rule}"));
         }
     }
     output.push(format!("  nopasswd entries: {}", audit.nopasswd_entries));
@@ -14973,7 +14966,7 @@ fn execute_systemd_deps() -> Result<String, String> {
     for unit in graph.units.iter().take(10) {
         output.push(format!("  {}:", unit.name));
         for req in &unit.requires {
-            output.push(format!("    requires: {}", req));
+            output.push(format!("    requires: {req}"));
         }
     }
     Ok(output.join("\n"))
@@ -15034,7 +15027,7 @@ fn execute_dir_size(path: &str) -> Result<String, String> {
     use rustynet_sysinfo;
     let sizes = rustynet_sysinfo::directory_size_snapshot(&[path]);
     if sizes.is_empty() {
-        return Ok(format!("directory size: {} not found", path));
+        return Ok(format!("directory size: {path} not found"));
     }
     let dir = &sizes[0];
     Ok(format!(
@@ -15058,7 +15051,7 @@ fn execute_file_integrity(path: &str) -> Result<String, String> {
     use rustynet_sysinfo;
     let results = rustynet_sysinfo::file_integrity_check(&[path]);
     if results.is_empty() {
-        return Ok(format!("file integrity: {} not found", path));
+        return Ok(format!("file integrity: {path} not found"));
     }
     let result = &results[0];
     let status = if result.matches_baseline {
@@ -15085,7 +15078,7 @@ fn execute_acl_audit(path: &str) -> Result<String, String> {
     use rustynet_sysinfo;
     let results = rustynet_sysinfo::access_control_list_audit(&[path]);
     if results.is_empty() {
-        return Ok(format!("acl audit: {} not found", path));
+        return Ok(format!("acl audit: {path} not found"));
     }
     let acl = &results[0];
     let mut output = vec![format!(
@@ -15181,13 +15174,12 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
                 "client"
             };
 
-            Ok(format!("current role: {}", role))
+            Ok(format!("current role: {role}"))
         }
         RoleCommand::Set(new_role) => {
             if !["admin", "client", "blind_exit"].contains(&new_role.as_str()) {
                 return Err(format!(
-                    "invalid role '{}'. must be: admin, client, or blind_exit",
-                    new_role
+                    "invalid role '{new_role}'. must be: admin, client, or blind_exit"
                 ));
             }
 
@@ -15197,8 +15189,7 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
             }
 
             Ok(format!(
-                "role change requested: {} (restart daemon to apply)",
-                new_role
+                "role change requested: {new_role} (restart daemon to apply)"
             ))
         }
     }
@@ -15241,7 +15232,7 @@ fn test_connectivity(host: &str, port: u16) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    let addr = format!("{}:{}", host, port);
+    let addr = format!("{host}:{port}");
     TcpStream::connect_timeout(
         &addr
             .parse()
@@ -15327,7 +15318,7 @@ fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
 
     let domain_to_test = domain.as_deref().unwrap_or("example.com");
 
-    output.push(format!("  resolving: {}", domain_to_test));
+    output.push(format!("  resolving: {domain_to_test}"));
 
     let start = std::time::Instant::now();
 
@@ -15335,15 +15326,15 @@ fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
         Ok(addresses) => {
             let elapsed = start.elapsed().as_millis();
             if let Some(addr) = addresses.first() {
-                output.push(format!("  result:   {}", addr));
-                output.push(format!("  latency:  {}ms", elapsed));
+                output.push(format!("  result:   {addr}"));
+                output.push(format!("  latency:  {elapsed}ms"));
                 output.push("  status:   ✓ resolved through tunnel".to_string());
             } else {
                 output.push("  status:   ✗ no addresses returned".to_string());
             }
         }
         Err(e) => {
-            output.push(format!("  status:   ✗ resolution failed: {}", e));
+            output.push(format!("  status:   ✗ resolution failed: {e}"));
         }
     }
 
@@ -16954,8 +16945,7 @@ fn execute_export_keys(command: ExportKeysCommand) -> Result<String, String> {
             // the same payload so external tooling that expects PEM can
             // ingest it directly.
             format!(
-                "-----BEGIN WIREGUARD PUBLIC KEY-----\n{}\n-----END WIREGUARD PUBLIC KEY-----",
-                raw
+                "-----BEGIN WIREGUARD PUBLIC KEY-----\n{raw}\n-----END WIREGUARD PUBLIC KEY-----"
             )
         }
     };

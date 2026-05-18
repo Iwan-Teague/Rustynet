@@ -95,10 +95,8 @@ pub fn install_daemon(
     // not at install time — install_daemon only stages binaries + bootstrap state.
 
     let verify_script = format!(
-        "test -x {rustynetd} && test -x {rustynet} && \
+        "test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
          test -f {MACOS_KEYS_DIR}/wireguard.pub",
-        rustynetd = MACOS_RUSTYNETD_PATH,
-        rustynet = MACOS_RUSTYNET_PATH,
     );
     ssh::run_remote(conn, &verify_script, SHORT_TIMEOUT)?;
 
@@ -222,12 +220,9 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(
         conn,
         &format!(
-            "sudo rm -f {rustynetd} {rustynet} \
+            "sudo rm -f {MACOS_RUSTYNETD_PATH} {MACOS_RUSTYNET_PATH} \
              /Library/LaunchDaemons/com.rustynet.daemon.plist && \
-             sudo rm -rf {state_root} /usr/local/etc/rustynet /var/run/rustynet",
-            rustynetd = MACOS_RUSTYNETD_PATH,
-            rustynet = MACOS_RUSTYNET_PATH,
-            state_root = MACOS_STATE_ROOT,
+             sudo rm -rf {MACOS_STATE_ROOT} /usr/local/etc/rustynet /var/run/rustynet",
         ),
         timeout,
     )?;

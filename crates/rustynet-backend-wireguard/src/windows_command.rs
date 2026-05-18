@@ -862,8 +862,7 @@ mod tests {
             .expect_err("wg.exe missing should fail");
         assert!(
             err.to_string().contains("windows wg.exe binary"),
-            "Error must reference missing wg.exe binary prep: {}",
-            err
+            "Error must reference missing wg.exe binary prep: {err}"
         );
 
         std::fs::write(&wg_path, "dummy").expect("dummy file");
@@ -873,8 +872,7 @@ mod tests {
             .expect_err("wireguard.exe missing should fail");
         assert!(
             err2.to_string().contains("windows wireguard.exe binary"),
-            "Error must reference missing wireguard.exe binary prep: {}",
-            err2
+            "Error must reference missing wireguard.exe binary prep: {err2}"
         );
     }
 

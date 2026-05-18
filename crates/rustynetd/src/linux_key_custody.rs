@@ -747,8 +747,7 @@ mod tests {
             if entry.path == LINUX_WG_PLAINTEXT_PASSPHRASE_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Forbidden {
                     reason: format!(
-                        "must not exist at rest after Phase E migration; found {}",
-                        LINUX_WG_PLAINTEXT_PASSPHRASE_PATH
+                        "must not exist at rest after Phase E migration; found {LINUX_WG_PLAINTEXT_PASSPHRASE_PATH}"
                     ),
                 };
             }

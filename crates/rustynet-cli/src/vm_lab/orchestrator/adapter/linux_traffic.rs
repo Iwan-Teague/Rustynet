@@ -456,7 +456,7 @@ mod tests {
         // A valid 32-byte WireGuard public key in base64.
         let encoded = "6YIGkxJfmPNflshVeSPOc9LFNJrIcblSFQFGFhXqhg4=";
         let result = decode_wireguard_pubkey_to_hex(encoded);
-        assert!(result.is_ok(), "failed: {:?}", result);
+        assert!(result.is_ok(), "failed: {result:?}");
         assert_eq!(result.unwrap().len(), 64);
     }
 
