@@ -964,6 +964,11 @@ inline. Cross-reference with:
     Gatekeeper + launch-time mentions), deterministic output, and
     the unknown-fields-tolerated serde behavior). Floor bumped
     2 → 7. (commit d92640f)
+  - `macos_mesh_status` test count 3 → 9 (+6 named tests pinning
+    schema_version, default-state-path fallback,
+    custom-state-path echo through the report, and per-variant
+    serde round-trip on Ok + IntegrityMismatch + InvalidFormat).
+    Floor bumped 3 → 9. (commit e286ed9)
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
