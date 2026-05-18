@@ -984,6 +984,13 @@ inline. Cross-reference with:
     multi-directive search/domain parser ordering, bare-nameserver
     parser tolerance, and no-dedup-across-nameservers drift
     aggregation). Floor bumped 8 → 16. (commit c57a887)
+  - `macos_runtime_acls` test count 8 → 16 (+8 named tests
+    mirroring the linux_runtime_acls sweep: reviewed-roots-list
+    snapshot, schema_version pin, per-variant serde round-trip on
+    Drifted + Missing, unknown-status-tag rejection,
+    symlink-before-dir-check ordering, symlink + mode-drift
+    first-fault precedence, and empty-roots vacuous-truth).
+    Floor bumped 8 → 16. (commit 5dac179)
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
