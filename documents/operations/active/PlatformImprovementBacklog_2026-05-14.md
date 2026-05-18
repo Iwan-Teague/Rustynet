@@ -902,6 +902,69 @@ inline. Cross-reference with:
   as `Value`-walk; do not attempt to migrate.
 * Each is an incremental slice.
 
+#### X2 cycles 64-74 (2026-05-18 batch — validator-side slices)
+
+* `[x]` `ops_fresh_install_os_matrix.rs` child-report walker
+  migrated (commit 4ae96cf, cycle 64). Added
+  `FreshInstallMeasuredChildReportView` (6 typed slots + extra
+  flatten) over `validate_measured_child_report_for_verify`.
+  Primary win: wrong-type `status: 42` slot used to silently skip
+  the "must be pass" check entirely via the
+  `if let Some(...) = ...and_then(Value::as_str)` pattern; now
+  fails at the typed deserialise. +4 tests.
+* `[x]` `ops_phase1.rs` validator slice (commit 1e80c2b,
+  cycle 65). Added `Phase1ValidateReportView` +
+  `Phase1MetricEntryView`; `value: Option<Value>` slot kept so
+  the multi-shape `phase1_value_as_number` helper (rejects
+  bools, requires finite + non-negative) remains the canonical
+  numeric coercion. +4 tests.
+* `[x]` `ops_security_audit.rs` validator slice (commit 96c2196,
+  cycle 66). Added `SecurityAuditReportPayloadView` (5 typed
+  slots + extra flatten); `checks` kept as
+  `Option<Map<String, Value>>` because per-spec check names are
+  dynamic. +4 tests.
+* `[x]` `ops_network_discovery.rs` sub-block slices completed
+  the bundle validator surface (commits 1749bc7, 4787e65,
+  13e16f5, 0002d19, cycles 67/69/70/71). 8 sub-block views
+  total: `NodeIdentityView`, `WireguardView`, `NatProfileView`,
+  `VerifierKeysView` (+ `slot(key)` PUBLIC_KEY_KEYS lookup
+  helper), `DaemonStatusView`, `EndpointCandidateView`,
+  `RustynetArtifactEntryView`, `KnownPeerView`. Shared
+  `deserialize_sub_block::<T>` helper distinguishes missing
+  (`Ok(None)`) from wrong-type-top (`Err(...)`) from valid
+  (`Ok(Some(view))`). Per-entry list deserialise preserves
+  legacy per-index error granularity. +20 tests across the 4
+  cycles. `validate_no_secrets` stays generic by design
+  (recursive arbitrary-key/string scanner).
+* `[x]` `main.rs phase6_load_probe_metadata` slice (commit
+  bb2353c, cycle 68). Added `Phase6ProbeMetadataView` (3 typed
+  slots). Original `payload: Value` field on
+  `Phase6ProbeMetadata` is preserved so downstream code that
+  walks the payload generically keeps working. +4 tests.
+* `[x]` `ops_phase1.rs::load_perf_metrics` reuses cycle-65
+  typed views (commit 6ae9c4d, cycle 72). DRY consolidation —
+  both metric validators now share one canonical X2 contract.
+  +1 test.
+* `[x]` `ops_phase9.rs` phase10 perf-budget validator pair
+  (commit 6ff1e51, cycle 73). Added `Phase10PerfBudgetReportView`
+  + `Phase10PerfMetricEntryView`; shared
+  `phase10_perf_budget_report_view` bridge helper called from
+  both `phase10_validate_perf_budget` and
+  `phase10_validate_required_perf_metrics`. +4 tests.
+* `[x]` `ops_phase9.rs` phase10 status/checks validator trio
+  (commit c3ae5a8, cycle 74). Added `Phase10StatusChecksView`
+  with shared `phase10_status_checks_view` helper used by
+  3 validators (`phase10_require_status_pass`,
+  `phase10_validate_checks_all_pass`,
+  `phase10_require_named_checks_pass`). +3 tests.
+* `[~]` Remaining X2 candidates (cosmetic-only, not pursued):
+  `ops_phase9.rs` compatibility_policy / slo / hp2 sub-block
+  walks. Existing `phase9_require_*` helpers already fail-fast
+  on wrong-type with explicit messages, so the typed-layer win
+  is purely cosmetic (distinguishing wrong-type-top from
+  missing). Skip until a coupled refactor surfaces a real
+  validation win.
+
 ### X3. Logging hardening audit (no-secret-leakage sweep)
 
 * `[x]` `crates/rustynetd/src/secret_log_audit.rs` — static source-walk
