@@ -951,6 +951,13 @@ inline. Cross-reference with:
     rejection, and the no-dedup-across-entries contract for
     repeated-shape drift reasons). Floor bumped 18 → 24. (commit
     f8e5712)
+  - `macos_key_custody` test count 3 → 11 (+8 named drift tests
+    covering schema_version pin, reviewed-entry-paths canonical
+    snapshot (off-macOS), per-variant serde round-trip on
+    Missing/Invalid/Forbidden/AbsentAsExpected, unknown-status-tag
+    rejection, and the overall_ok={Ok|AbsentAsExpected only}
+    contract from both sides). Floor bumped 2 → 11. (commit
+    b7fcd71)
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
