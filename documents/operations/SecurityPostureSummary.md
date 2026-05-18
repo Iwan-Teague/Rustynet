@@ -152,8 +152,8 @@ Verified clean as of this refresh:
 Per `PlatformImprovementBacklog_2026-05-14.md`:
 
 - **L6 / L7 / L8 lab-side validation** — cross-boot passphrase stability, IPv6 NAT sibling table, netns reboot integration test. Need Linux lab fixtures.
-- **W1 / W4-collector / W5-collector / W7** — PowerShell helper JSON emit, Win32 `RegGetKeySecurity`, Win32 `CryptQueryObject` thumbprint extraction, Windows install-release runtime. Need Windows-native infra.
-- **L1 pfctl wrappers** — macOS `apply_managed_dns_routing` / `clear_managed_dns_routing` extraction to `macos.sh`.
-- **X2 remaining** — ~17 walks in `ops_live_lab_orchestrator.rs` (forensics-bundle validator next target), ~24 walks intentionally left in `ops_cross_network_reports.rs` helpers.
+- **W1 / W4-collector / W5-collector / W7** — PowerShell helper JSON emit (sync-source / install-release / restart-runtime / verify-runtime / collect-diagnostics sub-phases), Win32 `RegGetKeySecurity` collector, Win32 `CryptQueryObject` thumbprint extraction, Windows install-release real runtime. Need Windows-native infra.
+- **L2 nftables IPv6 parity + named-chain integrity** — runtime-ACL `inet rustynet` / `ip rustynet` family wiring inspection. Verifier extension lives in `phase10.rs`; no test floor yet because the surface is outside the per-platform `linux_runtime_acls` module.
+- **X2 remaining** — writer-side fully migrated on `ops_live_lab_orchestrator.rs` (only `execute_ops_read_json_field` retains a `Value` walk, intentional shape-agnostic JSON-pointer reader by design). `ops_cross_network_reports.rs` has 5 helper `Value` walks intentionally kept (path-evidence extractors over `&[Value]` / `Option<&Value>`) and nested `path_evidence` block walkers as a future slice.
 
 Each is incrementally landable when the relevant infra (lab / Windows host / Win32 bindings) is available.
