@@ -108,11 +108,16 @@ inline. Cross-reference with:
   wrappers in start.sh today. The original backlog entry was based
   on a wrong assumption — no migration is needed. Removed from
   remaining scope.
-* `[ ]` Remaining scope (separate slices): systemd-unit install +
-  launchd plist install paths already dispatch to Rust
-  (`rustynet ops write-daemon-env` etc.) so those big blocks are
-  NOT actually shell-to-Rust migrations. No further shell-only
-  blocks identified at this time.
+* `[x]` Remaining-scope audit: NO-OP confirmed. systemd-unit
+  install + launchd plist install paths already dispatch to Rust
+  (`rustynet ops install-systemd`,
+  `rustynet ops write-daemon-env`, etc.), so those large
+  start.sh blocks are NOT actually shell-to-Rust migrations —
+  they're thin dispatchers that hand work to existing Rust
+  subcommands. A grep over start.sh on 2026-05-18 (cycle 51
+  follow-up) found no remaining shell-only blocks that could be
+  migrated. L1 modularisation closed for now; re-open if a
+  future start.sh growth adds a new shell-only block.
 
 ### L2. `linux_runtime_acls.rs` security-relevant drift coverage
 
