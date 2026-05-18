@@ -730,7 +730,7 @@ mod tests {
         let mut snapshot = reviewed_snapshot();
         snapshot.nrpt_rules.push(WindowsNrptRule {
             name: "{stale-rule}".to_string(),
-            namespace: vec!["".to_string()],
+            namespace: vec![String::new()],
             name_servers: vec!["127.0.0.1".to_string()],
         });
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_nrpt_rule_with_empty_name_server() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.nrpt_rules[0].name_servers.push("".to_string());
+        snapshot.nrpt_rules[0].name_servers.push(String::new());
         let reasons = evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect_err("empty name-server entry must fail closed");
         assert!(
@@ -1441,7 +1441,7 @@ mod tests {
             interfaces: vec![],
             nrpt_rules: vec![WindowsNrptRule {
                 name: "{empty-ns-rule}".to_string(),
-                namespace: vec!["".to_string(), "  ".to_string()],
+                namespace: vec![String::new(), "  ".to_string()],
                 name_servers: vec!["127.0.0.1".to_string(), "::1".to_string()],
             }],
             router_advertisement_observation: None,

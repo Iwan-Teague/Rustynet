@@ -712,11 +712,7 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
         }
     }
 
-    lines.extend([
-        "".to_string(),
-        "## Failure Focus".to_string(),
-        "".to_string(),
-    ]);
+    lines.extend([String::new(), "## Failure Focus".to_string(), String::new()]);
     match first_failure {
         None => lines.push("- no failed stage recorded".to_string()),
         Some(first) => {

@@ -816,9 +816,9 @@ fn render_live_validation_summary(
 ) -> String {
     let mut lines = vec![
         "# Rustynet Live-Lab Validation Run".to_string(),
-        "".to_string(),
+        String::new(),
         "## Validator Commands".to_string(),
-        "".to_string(),
+        String::new(),
         "| Validation | Exit Code | Report Path |".to_string(),
         "| --- | --- | --- |".to_string(),
     ];
@@ -831,9 +831,9 @@ fn render_live_validation_summary(
         ));
     }
     lines.extend([
-        "".to_string(),
+        String::new(),
         "## Consolidated Outputs".to_string(),
-        "".to_string(),
+        String::new(),
         format!(
             "- Pinned SSH known_hosts file: `{}`",
             known_hosts_path.display()
@@ -847,12 +847,12 @@ fn render_live_validation_summary(
             promotion_output.display()
         ),
         format!("- Coverage promotion exit code: `{promotion_rc}`"),
-        "".to_string(),
+        String::new(),
     ]);
     for result in results {
         lines.extend([
             format!("### {}", result.validation_key),
-            "".to_string(),
+            String::new(),
             format!("- Command: `{}`", result.command.join(" ")),
             format!("- Exit code: `{}`", result.rc),
             "- stderr:".to_string(),
@@ -863,7 +863,7 @@ fn render_live_validation_summary(
                 result.stderr.clone()
             },
             "```".to_string(),
-            "".to_string(),
+            String::new(),
         ]);
     }
     lines.join("\n")
@@ -1131,18 +1131,18 @@ fn render_findings_markdown(
     });
     let mut lines = vec![
         "# Rustynet Live-Lab Security Findings".to_string(),
-        "".to_string(),
+        String::new(),
         format!("Generated: {}", utc_timestamp()),
-        "".to_string(),
+        String::new(),
         "## Summary".to_string(),
-        "".to_string(),
+        String::new(),
         format!("- Reports analyzed: {}", analyzed_reports.len()),
         format!("- Findings: {}", ordered_findings.len()),
         format!("- Passing checks recorded: {}", passes.len()),
         format!("- Schema problems: {}", schema_problems.len()),
-        "".to_string(),
+        String::new(),
         "## Reports".to_string(),
-        "".to_string(),
+        String::new(),
     ];
     for report in analyzed_reports {
         lines.push(format!("- `{}`", report.display()));
@@ -1151,12 +1151,12 @@ fn render_findings_markdown(
     if ordered_findings.is_empty() {
         lines.extend([
             "## Findings".to_string(),
-            "".to_string(),
+            String::new(),
             "No failing or skipped checks were found in the supplied reports.".to_string(),
-            "".to_string(),
+            String::new(),
         ]);
     } else {
-        lines.extend(["## Findings".to_string(), "".to_string()]);
+        lines.extend(["## Findings".to_string(), String::new()]);
         for finding in &ordered_findings {
             lines.extend([
                 format!(
@@ -1164,7 +1164,7 @@ fn render_findings_markdown(
                     finding.severity.to_uppercase(),
                     finding.title
                 ),
-                "".to_string(),
+                String::new(),
                 format!("- Exploit family: `{}`", finding.exploit_family),
                 format!("- Validation mode: {}", finding.mode_title),
                 format!("- Report: `{}`", finding.report_path),
@@ -1184,18 +1184,18 @@ fn render_findings_markdown(
                     }
                 ),
                 format!("- Evidence summary: {}", finding.evidence_summary),
-                "".to_string(),
+                String::new(),
             ]);
         }
     }
     if !schema_problems.is_empty() {
-        lines.extend(["## Schema Problems".to_string(), "".to_string()]);
+        lines.extend(["## Schema Problems".to_string(), String::new()]);
         for problem in schema_problems {
             lines.push(format!("- {problem}"));
         }
         lines.push(String::new());
     }
-    lines.extend(["## Passing Checks".to_string(), "".to_string()]);
+    lines.extend(["## Passing Checks".to_string(), String::new()]);
     if passes.is_empty() {
         lines.push("No passing checks were recorded.".to_string());
     } else {
@@ -1209,13 +1209,13 @@ fn render_findings_markdown(
         }
     }
     lines.extend([
-        "".to_string(),
+        String::new(),
         "## Next Actions".to_string(),
-        "".to_string(),
+        String::new(),
         "1. Fix every `critical` finding before treating the corresponding exploit class as covered.".to_string(),
         "2. Re-run the specific live validation report after each fix; do not rely on adjacent unit tests alone.".to_string(),
         "3. If a report had schema problems, repair the reporting path before trusting any pass/fail outcome from that validator.".to_string(),
-        "".to_string(),
+        String::new(),
     ]);
     lines.join("\n")
 }
@@ -1375,9 +1375,9 @@ fn render_comparative_markdown(
     });
     let mut lines = vec![
         "# Rustynet Comparative VPN Exploit Coverage".to_string(),
-        "".to_string(),
+        String::new(),
         "## Summary".to_string(),
-        "".to_string(),
+        String::new(),
         format!("- Covered: {}", counts.get("covered").copied().unwrap_or(0)),
         format!(
             "- Partially covered: {}",
@@ -1394,9 +1394,9 @@ fn render_comparative_markdown(
             "- Future surface gaps: {}",
             counts.get("future_surface_gap").copied().unwrap_or(0)
         ),
-        "".to_string(),
+        String::new(),
         "## Comparative Incident Matrix".to_string(),
-        "".to_string(),
+        String::new(),
         "| Project | Incident | Exploit Class | Rustynet Analog | Status | Sources |".to_string(),
         "| --- | --- | --- | --- | --- | --- |".to_string(),
     ];
@@ -1412,9 +1412,9 @@ fn render_comparative_markdown(
         ));
     }
     lines.extend([
-        "".to_string(),
+        String::new(),
         "## Detailed Mapping".to_string(),
-        "".to_string(),
+        String::new(),
     ]);
     for entry in entries {
         lines.extend([
@@ -1422,7 +1422,7 @@ fn render_comparative_markdown(
                 "### {} {}: {}",
                 entry.project, entry.incident, entry.exploit_class
             ),
-            "".to_string(),
+            String::new(),
             format!("- Attack family: `{}`", entry.attack_family),
             format!("- Historical issue: {}", entry.summary),
             format!("- Rustynet analog: {}", entry.rustynet_analog),
@@ -1447,7 +1447,7 @@ fn render_comparative_markdown(
     if let Some(command_results) = command_results {
         lines.extend([
             "## Local Verification Results".to_string(),
-            "".to_string(),
+            String::new(),
             "| Command | Result | Exit Code |".to_string(),
             "| --- | --- | --- |".to_string(),
         ]);
@@ -1463,7 +1463,7 @@ fn render_comparative_markdown(
         for result in command_results {
             lines.extend([
                 format!("### Command Result: {}", result.label),
-                "".to_string(),
+                String::new(),
                 format!("- Command: `{}`", result.argv.join(" ")),
                 format!("- Result: `{}`", result.status),
                 format!("- Exit code: `{}`", result.rc),
@@ -1475,17 +1475,17 @@ fn render_comparative_markdown(
                     result.output.clone()
                 },
                 "```".to_string(),
-                "".to_string(),
+                String::new(),
             ]);
         }
     }
     lines.extend([
         "## Immediate Priorities".to_string(),
-        "".to_string(),
+        String::new(),
         "1. Keep all `future_surface_gap` items blocked into design before the comparable feature ships.".to_string(),
         "2. Run the listed live validation scripts for every `partially_covered` item on an authorized lab before treating coverage as strong.".to_string(),
         "3. Re-run the mapped local commands whenever the corresponding trust boundary changes.".to_string(),
-        "".to_string(),
+        String::new(),
     ]);
     lines.join("\n")
 }

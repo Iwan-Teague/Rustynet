@@ -407,8 +407,8 @@ mod tests {
 
         let invalid = InsecureCompatibilityException {
             mode: "legacy-handshake".to_string(),
-            risk_acceptance_id: "".to_string(),
-            approved_by: "".to_string(),
+            risk_acceptance_id: String::new(),
+            approved_by: String::new(),
             created_at_unix: 100,
             expires_at_unix: 120,
             enabled: true,
