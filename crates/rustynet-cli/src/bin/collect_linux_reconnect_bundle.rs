@@ -1123,7 +1123,7 @@ fn collect_unix_timestamp() -> Result<u64, String> {
 fn default_output_path(collected_at_utc: &str) -> PathBuf {
     let safe_timestamp = collected_at_utc
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .collect::<String>();
     let filename = format!("{DEFAULT_OUTPUT_PREFIX}-{safe_timestamp}.md");
     match env::var_os("HOME") {

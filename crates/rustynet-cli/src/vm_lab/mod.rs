@@ -9329,7 +9329,7 @@ fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize,
     let skipped_count = report
         .get("skipped_reasons")
         .and_then(Value::as_array)
-        .map_or(0, |items| items.len());
+        .map_or(0, std::vec::Vec::len);
     Ok((written.len(), format!("{skipped_count} skipped reason(s)")))
 }
 
@@ -15033,7 +15033,7 @@ pub fn execute_ops_vm_lab_preflight(config: VmLabPreflightConfig) -> Result<Stri
     let required_commands = if config.require_commands.is_empty() {
         DEFAULT_PRECHECK_COMMANDS
             .iter()
-            .map(|value| value.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
     } else {
         config.require_commands.clone()
@@ -17209,7 +17209,7 @@ fn discover_local_utm_bundle_paths_recursive(
         })?
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
         let file_type = entry

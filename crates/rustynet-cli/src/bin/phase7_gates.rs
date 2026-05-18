@@ -113,7 +113,7 @@ fn run_required_test(
         package.to_string(),
         test_filter.to_string(),
     ];
-    args.extend(extra_args.iter().map(|value| value.to_string()));
+    args.extend(extra_args.iter().map(std::string::ToString::to_string));
     let status = Command::new("cargo")
         .current_dir(root_dir)
         .args(args)

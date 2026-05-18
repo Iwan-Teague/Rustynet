@@ -525,7 +525,7 @@ fn walk_stage_files_recursive(
         .map_err(|err| format!("read directory failed ({}): {err}", current.display()))?
         .filter_map(Result::ok)
         .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
         let resolved = resolve_path(path.as_path())?;
@@ -1449,7 +1449,7 @@ pub fn execute_ops_write_cross_network_forensics_manifest(
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
         .collect::<Vec<_>>();
-    node_dirs.sort_by_key(|entry| entry.file_name());
+    node_dirs.sort_by_key(std::fs::DirEntry::file_name);
 
     let mut nodes = Vec::new();
     for node_dir in node_dirs {
@@ -1725,10 +1725,13 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
         collected_at_utc: collected_at_utc_now(),
         bundle_status: bundle_status.to_string(),
         node_count,
-        required_stage_files: required_stage_files.iter().map(|s| s.to_string()).collect(),
+        required_stage_files: required_stage_files
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
         required_node_files: expected_forensics_node_files()
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
         missing_file_count,
         empty_file_count,

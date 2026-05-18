@@ -563,7 +563,7 @@ impl RelayClient {
     pub fn relay_endpoint_for_peer(&self, peer_node_id: &NodeId) -> Option<SocketEndpoint> {
         self.sessions
             .get(peer_node_id)
-            .map(|s| s.effective_endpoint())
+            .map(RelayClientSession::effective_endpoint)
     }
 
     /// Returns true if the peer's selected backend endpoint matches the active

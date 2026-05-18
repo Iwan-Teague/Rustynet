@@ -586,7 +586,7 @@ pub fn execute_ops_run_membership_ci_gates() -> Result<String, String> {
     if !audit_text.contains("index=") {
         let entries = conformance_json
             .get("entries")
-            .and_then(|value| value.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(u64::MAX);
         if !membership_bootstrap_state || entries != 0 {
             return Err("membership audit integrity log missing chain entries".to_string());
@@ -2567,7 +2567,7 @@ mod tests {
         let value = require_measured_pass_report(&path, true)
             .expect("well-formed pass artifact must accept");
         assert_eq!(
-            value.get("entries").and_then(|value| value.as_u64()),
+            value.get("entries").and_then(serde_json::Value::as_u64),
             Some(42)
         );
         let _ = fs::remove_file(&path);

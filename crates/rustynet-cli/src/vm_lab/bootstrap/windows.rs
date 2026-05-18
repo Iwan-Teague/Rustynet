@@ -379,7 +379,7 @@ fn parse_windows_build_release_report_output(
         })?;
     let exit_code = parsed
         .get("exit_code")
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
         .unwrap_or_else(|| "unknown".to_string());
     let stderr_tail = parsed
         .get("stderr_tail")
@@ -535,7 +535,7 @@ fn parse_windows_service_host_smoke_output(output: &str, target_label: &str) -> 
         .unwrap_or("");
     let host_surface_validated = parsed
         .get("host_surface_validated")
-        .and_then(|value| value.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let failure_step = parsed
         .get("failure_step")
