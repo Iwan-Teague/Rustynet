@@ -54,11 +54,11 @@ named drift tests, the regression-coverage CI gate
 
 | Module                          | Floor | What it pins                                                                                             |
 |---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
-| `secret_log_audit`              | 62    | Forbidden placeholder tokens in log macros (passphrase_bytes / private_key_bytes / signing_key_bytes / wrapped_secret / decrypted_secret / plaintext_key / raw_passphrase / secret_bytes / signing_seed); Debug + Display + ToString deny on canonical secret-bearing types; hex + base64 encode wrappers around forbidden idents; secret-material equality (==/!=) without ct_eq with structured allowlist + per-entry justification; deprecated-crypto-imports (`use sha1` / `use md5` / `use md_5` / `use des` / `use des3` / `use triple_des`) with boundary-terminator check that rejects safe-name lookalikes (sha2 / sha3 / descriptor / md_hashlib); `dbg!()` macro on secret tokens (closes the Debug-leak hole); panic-shape macros (panic / unreachable / unimplemented / todo / assert / assert_eq / assert_ne / debug_assert{,_eq,_ne}) on placeholder leaks |
+| `secret_log_audit`              | 65    | Forbidden placeholder tokens in log macros (passphrase_bytes / private_key_bytes / signing_key_bytes / wrapped_secret / decrypted_secret / plaintext_key / raw_passphrase / secret_bytes / signing_seed); Debug + Display + ToString deny on canonical secret-bearing types; hex + base64 encode wrappers around forbidden idents; secret-material equality (==/!=) without ct_eq with structured allowlist + per-entry justification; deprecated-crypto-imports (`use sha1` / `use md5` / `use md_5` / `use md4` / `use md2` / `use rc4` / `use des` / `use des3` / `use triple_des`) with boundary-terminator check that rejects safe-name lookalikes (sha2 / sha3 / descriptor / md_hashlib); `dbg!()` macro on secret tokens (closes the Debug-leak hole); panic-shape macros (panic / unreachable / unimplemented / todo / assert / assert_eq / assert_ne / debug_assert{,_eq,_ne}) on placeholder leaks |
 
 ### Aggregate
 
-- **22 verifier + audit modules** across 4 groups, **610 pinned tests** on the regression-coverage gate floor (sum of per-module floors: linux 196 + macos 74 + windows 278 + shared 62).
+- **22 verifier + audit modules** across 4 groups, **613 pinned tests** on the regression-coverage gate floor (sum of per-module floors: linux 196 + macos 74 + windows 278 + shared 65).
 - Every Linux verifier has a macOS + Windows analog (or equivalent surface). Every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls` / `windows_paths`).
 - Workspace test sweep: **2850 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends, measured 2026-05-18 post X4/X7 expansion + cycle 48 windows_ipc pin).
 
@@ -97,7 +97,7 @@ Runbook: [`CliExitCodeTaxonomy.md`](./CliExitCodeTaxonomy.md).
 
 6. **Secret-material equality compares (`==` / `!=`) without `ct_eq`** — flags raw equality on forbidden tokens (token / csrf / session_key / nonce / mac / hmac / session_id / signature). Suppressed by `ct_eq` on the same line OR a structured `(path, line, justification)` entry in `REVIEWED_SECRET_EQUALITY_EXCEPTIONS`.
 
-7. **Deprecated-crypto-imports** — rejects `use sha1` / `use md5` / `use md_5` / `use des` / `use des3` / `use triple_des` (with boundary-terminator check to reject safe-name lookalikes like `sha2` / `sha3` / `descriptor` / `md_hashlib`).
+7. **Deprecated-crypto-imports** — rejects `use sha1` / `use md5` / `use md_5` / `use md4` / `use md2` / `use rc4` / `use des` / `use des3` / `use triple_des` (with boundary-terminator check to reject safe-name lookalikes like `sha2` / `sha3` / `descriptor` / `md_hashlib`). Mirrored on the Cargo.toml side by `cargo deny check bans` so a contributor cannot add the dependency without tripping either gate.
 
 8. **`dbg!()` macro on secret tokens** — closes the hole where `dbg!(passphrase_bytes)` would slip past scanner #1 (which only walks format-string macros) and scanner #2 (which only catches Debug derive/impl, not call sites). The `dbg!()` macro internally stringifies the argument expression and prints its Debug repr to stderr.
 
@@ -143,7 +143,7 @@ Modules with typed views landed:
 | `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2916 tests as of 2026-05-18 post-cycle-74)      |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
-| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 610 pinned tests)   |
+| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 613 pinned tests)   |
 | `scripts/ci/start_modularization_smoke.sh`         | bash module / dispatcher contract (32 checks)                                |
 | `scripts/ci/secrets_hygiene_gates.sh`              | structured secret-leak audit + required tests                                |
 | Per-phase gate scripts (`phase1_gates.sh` … `phase10_gates.sh`) | per-phase release-readiness pins                                |
