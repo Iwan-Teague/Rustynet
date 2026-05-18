@@ -5361,7 +5361,7 @@ mod tests {
             (
                 vec![RelayFleetNodeDescriptor {
                     relay_id: "relay-eu-1".to_string(),
-                    region: "".to_string(),
+                    region: String::new(),
                     endpoint: "203.0.113.44:443".to_string(),
                     priority: 10,
                     capacity: 1,

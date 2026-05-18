@@ -3936,7 +3936,7 @@ mod tests {
                 exit_pre: "a".to_string(),
                 exit_post: "b".to_string(),
                 client_pre: "c".to_string(),
-                client_post: "".to_string(),
+                client_post: String::new(),
                 exit_return: "pass".to_string(),
                 exit_boot_change: "pass".to_string(),
                 post_exit_dns_refresh: "pass".to_string(),

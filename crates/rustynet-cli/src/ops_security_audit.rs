@@ -419,13 +419,13 @@ fn render_attack_matrix_markdown(rows: &[AttackRow], nodes: &[NodeSpec]) -> Stri
         .join(", ");
     let mut lines = vec![
         "# Attack Matrix".to_string(),
-        "".to_string(),
+        String::new(),
         "## Lab Nodes".to_string(),
-        "".to_string(),
+        String::new(),
         format!("- {node_summary}"),
-        "".to_string(),
+        String::new(),
         "## Planned Attacks".to_string(),
-        "".to_string(),
+        String::new(),
         "| Attack Family | Primary Nodes | Hypothesis | Expected Secure Behavior | Result | Evidence |".to_string(),
         "| --- | --- | --- | --- | --- | --- |".to_string(),
     ];
@@ -750,9 +750,9 @@ fn validate_report_payload(path: &Path, payload: &Map<String, Value>) -> Vec<Str
 fn render_validation_markdown(report_paths: &[PathBuf], errors: &[String]) -> String {
     let mut lines = vec![
         "# Rustynet Live-Lab Report Validation".to_string(),
-        "".to_string(),
+        String::new(),
         "## Reports".to_string(),
-        "".to_string(),
+        String::new(),
     ];
     for path in report_paths {
         lines.push(format!("- `{}`", path.display()));
@@ -761,12 +761,12 @@ fn render_validation_markdown(report_paths: &[PathBuf], errors: &[String]) -> St
     if errors.is_empty() {
         lines.extend([
             "## Result".to_string(),
-            "".to_string(),
+            String::new(),
             "All supplied reports matched the expected shared schema.".to_string(),
-            "".to_string(),
+            String::new(),
         ]);
     } else {
-        lines.extend(["## Errors".to_string(), "".to_string()]);
+        lines.extend(["## Errors".to_string(), String::new()]);
         for error in errors {
             lines.push(format!("- {error}"));
         }
@@ -905,7 +905,7 @@ fn evaluate_spec(
 fn render_promotion_markdown(rows: &[PromotionRow]) -> String {
     let mut lines = vec![
         "# Rustynet Live Coverage Promotion Gate".to_string(),
-        "".to_string(),
+        String::new(),
         "| Validation | Comparative Targets | Eligible | Reason | Report |".to_string(),
         "| --- | --- | --- | --- | --- |".to_string(),
     ];
