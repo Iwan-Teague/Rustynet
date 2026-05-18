@@ -107,7 +107,13 @@ LINUX_FLOORS=(
 # any single module follows the same X4 coverage-parity pattern: add
 # named drift tests, bump the floor in the same commit.
 MACOS_FLOORS=(
-  "macos_runtime_acls:8"
+  # Floor bumped 8→16 on X4 coverage parity sweep: 8 new tests
+  # covering reviewed-roots-list snapshot, schema_version pin,
+  # per-variant serde round-trip on Drifted + Missing, unknown-
+  # status-tag rejection, symlink-before-dir-check ordering,
+  # symlink + mode-drift first-fault precedence, and the
+  # vacuous-truth documented behavior for empty-roots.
+  "macos_runtime_acls:16"
   "macos_service_hardening:9"
   # Floor bumped 8→16 on X4 coverage parity sweep: 8 new tests
   # covering schema_version pin, IPv4 link-local (cloud metadata)
