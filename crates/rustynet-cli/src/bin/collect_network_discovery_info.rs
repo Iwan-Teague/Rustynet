@@ -754,8 +754,7 @@ fn artifact_entry(path: &str) -> Value {
                     .modified()
                     .ok()
                     .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or(0);
+                    .map_or(0, |duration| duration.as_secs());
                 (size, mtime)
             }
             Err(_) => (0, 0),
@@ -1041,8 +1040,7 @@ fn is_172_private(ip: &str) -> bool {
 fn status_text(status: ExitStatus) -> String {
     status
         .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "signal".to_string())
+        .map_or_else(|| "signal".to_string(), |code| code.to_string())
 }
 
 fn is_ipv4(value: &str) -> bool {

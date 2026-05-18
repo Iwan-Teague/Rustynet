@@ -666,8 +666,7 @@ fn preflight_pinned_host_entries(
 fn target_host(target: &str) -> String {
     target
         .split_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(target)
+        .map_or(target, |(_, host)| host)
         .to_string()
 }
 

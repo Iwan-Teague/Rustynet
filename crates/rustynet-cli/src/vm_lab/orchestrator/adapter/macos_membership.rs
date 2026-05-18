@@ -105,8 +105,7 @@ pub fn distribute_signed_bundle(
     ssh::scp_to(conn, bundle_path, &remote_tmp, MEDIUM_TIMEOUT)?;
     let install_dir = install_dst
         .rsplit_once('/')
-        .map(|(dir, _)| dir)
-        .unwrap_or(MACOS_STATE_ROOT);
+        .map_or(MACOS_STATE_ROOT, |(dir, _)| dir);
     let (mode, owner) = if matches!(kind, BundleKind::Membership) {
         ("0600", "rustynetd")
     } else {
@@ -133,10 +132,7 @@ pub fn distribute_verifier_key(
     let dst = macos_verifier_key_path(&kind);
     let remote_tmp = format!("{MACOS_STAGING_DIR}/rn-verifier-key.pub");
     ssh::scp_to(conn, pub_key_path, &remote_tmp, MEDIUM_TIMEOUT)?;
-    let dst_dir = dst
-        .rsplit_once('/')
-        .map(|(d, _)| d)
-        .unwrap_or(MACOS_STATE_ROOT);
+    let dst_dir = dst.rsplit_once('/').map_or(MACOS_STATE_ROOT, |(d, _)| d);
     ssh::run_remote(
         conn,
         &format!(

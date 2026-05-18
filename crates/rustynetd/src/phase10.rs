@@ -474,8 +474,7 @@ impl DryRunSystem {
         if self
             .fail_operation
             .as_ref()
-            .map(|candidate| candidate == operation)
-            .unwrap_or(false)
+            .is_some_and(|candidate| candidate == operation)
         {
             return Err(SystemError::RollbackFailed(operation.to_string()));
         }
@@ -1614,8 +1613,7 @@ impl DataplaneSystem for LinuxCommandSystem {
                 && (table == keep_firewall_target
                     || keep_firewall_active
                         .as_deref()
-                        .map(|active| active == table.as_str())
-                        .unwrap_or(false))
+                        .is_some_and(|active| active == table.as_str()))
             {
                 continue;
             }
@@ -1623,8 +1621,7 @@ impl DataplaneSystem for LinuxCommandSystem {
                 && (table == keep_nat_target
                     || keep_nat_active
                         .as_deref()
-                        .map(|active| active == table.as_str())
-                        .unwrap_or(false))
+                        .is_some_and(|active| active == table.as_str()))
             {
                 continue;
             }
@@ -4026,8 +4023,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         let advertised = self
             .advertised_lan_routes
             .get(exit_node)
-            .map(|routes| routes.contains(&request.cidr))
-            .unwrap_or(false);
+            .is_some_and(|routes| routes.contains(&request.cidr));
         if !advertised {
             return Err(Phase10Error::LanAccessDenied);
         }
@@ -4102,10 +4098,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         // Same candidate as before — check whether the stability window elapsed.
-        let elapsed = peer
-            .pending_since
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::ZERO);
+        let elapsed = peer.pending_since.map_or(Duration::ZERO, |t| t.elapsed());
         let required = match candidate {
             PathMode::Direct => Duration::from_millis(self.direct_stability_window_ms),
             PathMode::Relay => Duration::from_millis(self.relay_stability_window_ms),
@@ -4601,9 +4594,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 }
 
 fn handshake_is_fresh(value: Option<u64>, now_unix: u64, freshness_secs: u64) -> bool {
-    value
-        .map(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
-        .unwrap_or(false)
+    value.is_some_and(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
 }
 
 /// Gate peer provisioning on membership status (M4).

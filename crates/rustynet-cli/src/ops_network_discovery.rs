@@ -511,8 +511,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 .public_key
                 .as_deref()
                 .map(str::trim)
-                .map(decode_b64_32)
-                .unwrap_or(false);
+                .is_some_and(decode_b64_32);
             if !pubkey_ok {
                 problems
                     .push("wireguard.public_key must be valid base64 for 32-byte key".to_string());
@@ -769,8 +768,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                     .public_key
                     .as_deref()
                     .map(str::trim)
-                    .map(decode_b64_32)
-                    .unwrap_or(false);
+                    .is_some_and(decode_b64_32);
                 if !pubkey_ok {
                     problems.push(format!(
                         "known_peers[{index}].public_key must decode to 32 bytes"

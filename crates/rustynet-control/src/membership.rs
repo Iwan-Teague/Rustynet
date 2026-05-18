@@ -722,8 +722,7 @@ pub fn append_membership_log_entry(
     let index = entries.len() as u64;
     let previous_hash = entries
         .last()
-        .map(|entry| entry.entry_hash.clone())
-        .unwrap_or_else(|| "genesis".to_string());
+        .map_or_else(|| "genesis".to_string(), |entry| entry.entry_hash.clone());
     let encoded_update = signed_update.canonical_envelope()?;
     let encoded_update_hex = hex_encode(encoded_update.as_bytes());
     let entry_material = format!("{index}|{previous_hash}|{encoded_update_hex}");

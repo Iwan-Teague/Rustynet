@@ -575,8 +575,7 @@ impl RelayClient {
     ) -> bool {
         self.sessions
             .get(peer_node_id)
-            .map(|session| session.matches_selected_endpoint(endpoint))
-            .unwrap_or(false)
+            .is_some_and(|session| session.matches_selected_endpoint(endpoint))
     }
 
     /// Closes the session for a peer.

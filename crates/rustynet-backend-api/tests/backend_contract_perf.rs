@@ -189,16 +189,17 @@ fn metric_from_measured(
 }
 
 fn report_path() -> PathBuf {
-    std::env::var("RUSTYNET_PHASE1_BACKEND_PERF_REPORT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+    std::env::var("RUSTYNET_PHASE1_BACKEND_PERF_REPORT").map_or_else(
+        |_| {
             let mut path = std::env::temp_dir();
             path.push(format!(
                 "rustynet-backend-contract-perf-{}.json",
                 std::process::id()
             ));
             path
-        })
+        },
+        PathBuf::from,
+    )
 }
 
 fn measure<F>(iterations: usize, mut operation: F) -> Duration

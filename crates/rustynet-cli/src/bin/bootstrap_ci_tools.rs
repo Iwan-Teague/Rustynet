@@ -132,8 +132,7 @@ fn run() -> Result<(), i32> {
     })?;
     let audit_db_path = env::var_os("RUSTYNET_AUDIT_DB_PATH")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root_dir.join(".cargo-audit-db"));
+        .map_or_else(|| root_dir.join(".cargo-audit-db"), PathBuf::from);
     let audit_db = audit_db_path.to_str().ok_or_else(|| {
         eprintln!(
             "error [{}]: advisory db path is not valid UTF-8: {}",
@@ -166,8 +165,7 @@ fn run() -> Result<(), i32> {
 fn bootstrap_system_packages_enabled() -> bool {
     env::var("RUSTYNET_CI_BOOTSTRAP_SYSTEM")
         .ok()
-        .map(|value| value == "1")
-        .unwrap_or(true)
+        .is_none_or(|value| value == "1")
 }
 
 fn install_system_packages() -> Result<(), i32> {

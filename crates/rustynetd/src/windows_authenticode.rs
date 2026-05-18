@@ -330,8 +330,7 @@ pub fn inspect_authenticode_signature_with_thumbprint_policy(
 
     let mut drift_reasons = parse
         .as_ref()
-        .map(|p| p.drift_reasons.clone())
-        .unwrap_or_else(|err| vec![err.clone()]);
+        .map_or_else(|err| vec![err.clone()], |p| p.drift_reasons.clone());
     // Surface the chain-stage outcome in drift_reasons too so callers
     // that only check `drift_reasons` (e.g. early-cut tooling) still
     // see the reason.

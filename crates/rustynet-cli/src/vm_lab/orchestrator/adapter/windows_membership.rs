@@ -70,8 +70,7 @@ pub fn init_membership_snapshot(
     let exit_node_id = peers
         .iter()
         .find(|p| p.role == NodeRole::Exit)
-        .map(|p| p.node_id.as_str())
-        .unwrap_or("");
+        .map_or("", |p| p.node_id.as_str());
     let approver_id = format!("{exit_node_id}-owner");
 
     // Add each non-exit peer via `rustynetd membership add-peer`.
@@ -145,10 +144,10 @@ pub fn distribute_signed_bundle(
 ) -> Result<(), AdapterError> {
     let (remote_staging, remote_dst) = remote_bundle_paths(&kind);
 
-    let dst_parent = remote_dst
-        .rsplit_once('\\')
-        .map(|(dir, _)| dir.to_string())
-        .unwrap_or_else(|| WINDOWS_STATE_ROOT.to_string());
+    let dst_parent = remote_dst.rsplit_once('\\').map_or_else(
+        || WINDOWS_STATE_ROOT.to_string(),
+        |(dir, _)| dir.to_string(),
+    );
     let ensure_dirs_script = format!(
         "foreach ($d in @({staging_q}, {dst_parent_q})) {{ \
              if (-not (Test-Path -LiteralPath $d)) {{ \
@@ -191,8 +190,7 @@ pub fn distribute_verifier_key(
     let (remote_staging, remote_dst) = windows_verifier_key_paths(&kind);
     let dst_parent = remote_dst
         .rsplit_once('\\')
-        .map(|(d, _)| d.to_string())
-        .unwrap_or_else(|| WINDOWS_STATE_ROOT.to_string());
+        .map_or_else(|| WINDOWS_STATE_ROOT.to_string(), |(d, _)| d.to_string());
     let ensure_dir_script = format!(
         "if (-not (Test-Path -LiteralPath {dst_q})) {{ \
              New-Item -ItemType Directory -Force -Path {dst_q} | Out-Null \

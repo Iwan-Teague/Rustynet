@@ -952,8 +952,7 @@ fn append_command_section(report: &mut String, title: &str, record: &CommandReco
         "- exit_code: {}",
         record
             .exit_code
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "launch_error".to_string())
+            .map_or_else(|| "launch_error".to_string(), |value| value.to_string())
     )
     .unwrap();
     writeln!(
@@ -1175,10 +1174,10 @@ fn write_private_file(_path: &Path, _contents: &[u8]) -> io::Result<()> {
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| DEFAULT_OUTPUT_PREFIX.to_string());
+    let file_name = path.file_name().map_or_else(
+        || DEFAULT_OUTPUT_PREFIX.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()))
 }
 

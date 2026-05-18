@@ -3452,8 +3452,7 @@ pub fn execute_ops_run_debian_two_node_e2e(
 
     if exit_assignment_generated_before
         .zip(exit_assignment_generated_after)
-        .map(|(before, after)| after > before)
-        .unwrap_or(false)
+        .is_some_and(|(before, after)| after > before)
     {
         report.add(
             "exit-assignment-refresh-rotation",
@@ -3471,19 +3470,16 @@ pub fn execute_ops_run_debian_two_node_e2e(
             format!(
                 "generated_at before={} after={}",
                 exit_assignment_generated_before
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
+                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 exit_assignment_generated_after
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                    .map_or_else(|| "none".to_string(), |value| value.to_string())
             ),
         );
     }
 
     if client_assignment_generated_before
         .zip(client_assignment_generated_after)
-        .map(|(before, after)| after > before)
-        .unwrap_or(false)
+        .is_some_and(|(before, after)| after > before)
     {
         report.add(
             "client-assignment-refresh-rotation",
@@ -3501,11 +3497,9 @@ pub fn execute_ops_run_debian_two_node_e2e(
             format!(
                 "generated_at before={} after={}",
                 client_assignment_generated_before
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
+                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 client_assignment_generated_after
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                    .map_or_else(|| "none".to_string(), |value| value.to_string())
             ),
         );
     }
@@ -4126,8 +4120,7 @@ fn rust_toolchain_channel(repo_root: &Path) -> Result<String, String> {
 fn rustup_proxy_path(tool: &str) -> Result<PathBuf, String> {
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/root"));
+        .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
     let path = home.join(".cargo").join("bin").join(tool);
     if is_executable(path.as_path()) {
         return Ok(path);

@@ -648,8 +648,7 @@ mod tests {
             if self
                 .fail_program
                 .as_ref()
-                .map(|candidate| candidate == program)
-                .unwrap_or(false)
+                .is_some_and(|candidate| candidate == program)
             {
                 return Err(BackendError::internal("injected failure"));
             }

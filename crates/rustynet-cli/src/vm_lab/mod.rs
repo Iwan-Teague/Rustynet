@@ -2001,15 +2001,13 @@ pub fn default_live_lab_report_root() -> PathBuf {
 
 pub fn default_known_hosts_path() -> PathBuf {
     std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
         .join(".ssh/known_hosts")
 }
 
 pub fn default_lab_ssh_identity_path() -> PathBuf {
     std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
         .join(".ssh/rustynet_lab_ed25519")
 }
 
@@ -2563,8 +2561,7 @@ fn validate_setup_manifest(
             actual
                 .setup_flags
                 .require_same_network
-                .map(|flag| flag.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .map_or_else(|| "none".to_string(), |flag| flag.to_string())
         ));
     }
     if let Some(value) = expected.dry_run
@@ -2583,8 +2580,7 @@ fn validate_setup_manifest(
             actual
                 .setup_flags
                 .max_parallel_node_workers
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .map_or_else(|| "none".to_string(), |v| v.to_string())
         ));
     }
     Ok(())
@@ -2833,13 +2829,9 @@ pub fn execute_ops_vm_lab_list(config: VmLabListConfig) -> Result<String, String
             entry.lab_role.unwrap_or_else(|| "<unset>".to_string()),
             entry.mesh_ip.unwrap_or_else(|| "<unset>".to_string()),
             entry
-                .exit_capable
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<unset>".to_string()),
+                .exit_capable.map_or_else(|| "<unset>".to_string(), |value| value.to_string()),
             entry
-                .relay_capable
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<unset>".to_string()),
+                .relay_capable.map_or_else(|| "<unset>".to_string(), |value| value.to_string()),
             entry
                 .rustynet_src_dir
                 .unwrap_or_else(|| "<unset>".to_string()),
@@ -4240,8 +4232,7 @@ fn default_inventory_alias_for_lab_roles(
             entry
                 .lab_role
                 .as_deref()
-                .map(|value| role_labels.contains(&value))
-                .unwrap_or(false)
+                .is_some_and(|value| role_labels.contains(&value))
         })
         .map(|entry| entry.alias)
         .collect::<Vec<_>>();
@@ -6201,12 +6192,10 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
 
     let report_dir = match config.report_dir.clone() {
         Some(path) => path,
-        None => profile
-            .optional("REPORT_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                default_live_lab_report_root().join(format!("run_{}", unique_suffix()))
-            }),
+        None => profile.optional("REPORT_DIR").map_or_else(
+            || default_live_lab_report_root().join(format!("run_{}", unique_suffix())),
+            PathBuf::from,
+        ),
     };
     let report_dir = resolve_absolute_path(report_dir.as_path())?;
     let can_continue_from_setup = resolve_run_setup_reuse(
@@ -14161,8 +14150,7 @@ fn render_live_lab_iteration_summary(
             summary
                 .key_log_path
                 .as_deref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "none".to_string())
+                .map_or_else(|| "none".to_string(), |path| path.display().to_string())
         ),
     ];
     if let Some(reason) = summary.likely_reason.as_deref() {
@@ -14772,9 +14760,10 @@ fn maybe_write_report_artifact(
 }
 
 fn report_dir_label(report_dir: Option<&Path>, fallback: &Path) -> String {
-    report_dir
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| fallback.display().to_string())
+    report_dir.map_or_else(
+        || fallback.display().to_string(),
+        |path| path.display().to_string(),
+    )
 }
 
 fn validate_live_lab_run_artifacts(report_dir: &Path) -> Result<(), String> {
@@ -14831,8 +14820,7 @@ fn live_lab_profile_has_full_release_gate_topology(profile: &LiveLabProfile) -> 
         .all(|key| {
             profile
                 .optional(key)
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false)
+                .is_some_and(|value| !value.trim().is_empty())
         })
 }
 
@@ -14937,8 +14925,7 @@ fn live_lab_setup_complete(report_dir: &Path) -> Result<bool, String> {
     Ok(records
         .iter()
         .find(|record| record.name == "validate_baseline_runtime")
-        .map(|record| record.status == "pass")
-        .unwrap_or(false))
+        .is_some_and(|record| record.status == "pass"))
 }
 
 fn live_lab_report_has_non_setup_stage_records(report_dir: &Path) -> Result<bool, String> {
@@ -15546,8 +15533,10 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
                 vec![format!(
                     "Inspect {} for the service restart failure",
                     report_dir
-                        .map(|path| path.join("vm_lab_restart_service.txt"))
-                        .unwrap_or_else(|| fallback_report_dir.join("vm_lab_restart_service.txt"))
+                        .map_or_else(
+                            || fallback_report_dir.join("vm_lab_restart_service.txt"),
+                            |path| path.join("vm_lab_restart_service.txt")
+                        )
                         .display()
                 )]
             },
@@ -16630,8 +16619,7 @@ fn observe_local_utm_target_ready(
     } else {
         match live_ip.as_deref() {
             Some(ip) => probe_tcp_port_status(ip, ssh_port, timeout)
-                .map(|(status, _)| status)
-                .unwrap_or_else(|_| "unknown".to_string()),
+                .map_or_else(|_| "unknown".to_string(), |(status, _)| status),
             None => "unavailable".to_string(),
         }
     };
@@ -17086,9 +17074,10 @@ fn resolved_inventory_ssh_target_with_utmctl(
     entry: &VmInventoryEntry,
     utmctl_path: &Path,
 ) -> String {
-    resolve_local_utm_live_host(entry, utmctl_path)
-        .map(|host| rewrite_ssh_target_host(entry.ssh_target.as_str(), host.as_str()))
-        .unwrap_or_else(|| entry.ssh_target.clone())
+    resolve_local_utm_live_host(entry, utmctl_path).map_or_else(
+        || entry.ssh_target.clone(),
+        |host| rewrite_ssh_target_host(entry.ssh_target.as_str(), host.as_str()),
+    )
 }
 
 fn resolve_local_utm_live_host(entry: &VmInventoryEntry, utmctl_path: &Path) -> Option<String> {
@@ -21451,9 +21440,10 @@ fn classify_windows_ssh_access_probe_failure(detail: &str, status: Option<ExitSt
     let normalized_detail = detail.trim();
     let lowered = normalized_detail.to_ascii_lowercase();
     let status_detail = status.map(status_code);
-    let fallback_detail = status_detail
-        .map(|code| format!("remote command exited with status {code}"))
-        .unwrap_or_else(|| "remote command failed".to_string());
+    let fallback_detail = status_detail.map_or_else(
+        || "remote command failed".to_string(),
+        |code| format!("remote command exited with status {code}"),
+    );
     let rendered_detail = if normalized_detail.is_empty() {
         fallback_detail
     } else {
@@ -21611,10 +21601,7 @@ fn sanitize_label_for_path(value: &str) -> String {
 }
 
 fn ssh_target_host(value: &str) -> String {
-    let without_user = value
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(value);
+    let without_user = value.rsplit_once('@').map_or(value, |(_, host)| host);
     without_user
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
@@ -22002,10 +21989,7 @@ fn ensure_distinct_topology_networks(nodes: &[&VmLabTopologyNode]) -> Result<(),
         if !seen.insert(node.network_id.clone()) {
             return Err(format!(
                 "suite {} requires distinct network_id values but duplicate network {} was found",
-                nodes
-                    .first()
-                    .map(|_| "cross-network")
-                    .unwrap_or("cross-network"),
+                nodes.first().map_or("cross-network", |_| "cross-network"),
                 node.network_id
             ));
         }

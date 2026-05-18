@@ -804,8 +804,7 @@ fn run() -> Result<(), String> {
     });
     let reconvergence_secs = first_switch_ts
         .and_then(|value| value.checked_sub(switch_ts))
-        .map(|value| value as i64)
-        .unwrap_or(-1);
+        .map_or(-1, |value| value as i64);
 
     let check_handoff_reconvergence = if (0..=30).contains(&reconvergence_secs) {
         "pass"

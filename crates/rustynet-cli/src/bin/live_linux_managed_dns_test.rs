@@ -885,17 +885,16 @@ impl Config {
     }
 
     fn dns_server(&self) -> String {
-        self.dns_bind_addr
-            .split_once(':')
-            .map(|(server, _)| server.to_string())
-            .unwrap_or_else(|| self.dns_bind_addr.clone())
+        self.dns_bind_addr.split_once(':').map_or_else(
+            || self.dns_bind_addr.clone(),
+            |(server, _)| server.to_string(),
+        )
     }
 
     fn dns_port(&self) -> String {
         self.dns_bind_addr
             .split_once(':')
-            .map(|(_, port)| port.to_string())
-            .unwrap_or_else(|| "53535".to_string())
+            .map_or_else(|| "53535".to_string(), |(_, port)| port.to_string())
     }
 }
 

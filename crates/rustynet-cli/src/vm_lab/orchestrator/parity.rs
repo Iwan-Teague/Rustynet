@@ -76,11 +76,10 @@ pub fn build_live_lab_run_report(
 
     let mut node_statuses: HashMap<String, NodeStatus> = HashMap::new();
     for assignment in &ctx.assignments {
-        let platform = ctx
-            .adapters
-            .get(&assignment.alias)
-            .map(|a| format!("{:?}", a.platform()).to_lowercase())
-            .unwrap_or_else(|| "unknown".to_string());
+        let platform = ctx.adapters.get(&assignment.alias).map_or_else(
+            || "unknown".to_string(),
+            |a| format!("{:?}", a.platform()).to_lowercase(),
+        );
         node_statuses.insert(
             assignment.alias.clone(),
             NodeStatus {

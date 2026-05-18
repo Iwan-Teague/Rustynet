@@ -598,14 +598,16 @@ impl StateFetcher {
                         verifier_path,
                         self.assignment_bundle_path
                             .as_deref()
-                            .map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
-                            .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
+                            .map_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, |_| {
+                                DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS
+                            }),
                         TrustPolicy {
                             max_signed_data_age_secs: self
                                 .assignment_bundle_path
                                 .as_deref()
-                                .map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
-                                .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
+                                .map_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, |_| {
+                                    DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS
+                                }),
                             max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
                         },
                         previous_watermark,
@@ -3378,16 +3380,14 @@ impl DaemonRuntime {
         } else {
             "absent"
         };
-        let record_count = self
-            .dns_zone
-            .as_ref()
-            .map(|envelope| envelope.bundle.records.len().to_string())
-            .unwrap_or_else(|| "0".to_string());
+        let record_count = self.dns_zone.as_ref().map_or_else(
+            || "0".to_string(),
+            |envelope| envelope.bundle.records.len().to_string(),
+        );
         let error = self
             .dns_zone_error
             .as_deref()
-            .map(sanitize_netcheck_value)
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
         (state.to_string(), record_count, error)
     }
 
@@ -3961,15 +3961,19 @@ impl DaemonRuntime {
     fn transport_socket_identity_label(&self) -> String {
         self.controller
             .authoritative_transport_identity()
-            .map(|identity| sanitize_netcheck_value(&identity.label))
-            .unwrap_or_else(|| "none".to_string())
+            .map_or_else(
+                || "none".to_string(),
+                |identity| sanitize_netcheck_value(&identity.label),
+            )
     }
 
     fn transport_socket_identity_local_addr(&self) -> String {
         self.controller
             .authoritative_transport_identity()
-            .map(|identity| sanitize_netcheck_value(&identity.local_addr.to_string()))
-            .unwrap_or_else(|| "none".to_string())
+            .map_or_else(
+                || "none".to_string(),
+                |identity| sanitize_netcheck_value(&identity.local_addr.to_string()),
+            )
     }
 
     fn selected_exit_peer_endpoint_summary(&self) -> (String, String) {
@@ -4052,8 +4056,7 @@ impl DaemonRuntime {
         };
         let path_latest_live_handshake_unix = path_state
             .latest_live_handshake_unix
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
         let relay_session_configured = if path_state.relay_session_configured {
             "true"
         } else {
@@ -4061,8 +4064,7 @@ impl DaemonRuntime {
         };
         let relay_session_next_expiry_unix = path_state
             .relay_session_next_expiry_unix
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
         let traversal_authority = self.traversal_authority_mode().as_str();
         let (
             probe_result,
@@ -4082,13 +4084,11 @@ impl DaemonRuntime {
                 let generated = envelope
                     .bundles
                     .first()
-                    .map(|bundle| bundle.bundle.generated_at_unix)
-                    .unwrap_or(0);
+                    .map_or(0, |bundle| bundle.bundle.generated_at_unix);
                 let expires = envelope
                     .bundles
                     .first()
-                    .map(|bundle| bundle.bundle.expires_at_unix)
-                    .unwrap_or(0);
+                    .map_or(0, |bundle| bundle.bundle.expires_at_unix);
                 let age = now.saturating_sub(generated);
                 let remaining = expires.saturating_sub(now);
                 let mut sources = BTreeSet::new();
@@ -4144,8 +4144,7 @@ impl DaemonRuntime {
         let traversal_peer_count = self
             .traversal_hints
             .as_ref()
-            .map(|envelope| envelope.bundles.len())
-            .unwrap_or(0);
+            .map_or(0, |envelope| envelope.bundles.len());
         if let Some(envelope) = self.traversal_hints.as_ref() {
             for bundle in &envelope.bundles {
                 candidate_count = candidate_count.saturating_add(bundle.bundle.candidates.len());
@@ -4170,8 +4169,7 @@ impl DaemonRuntime {
         let traversal_error = self
             .traversal_hint_error
             .as_deref()
-            .map(sanitize_netcheck_value)
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
         let traversal_probe_max_candidates = self.traversal_probe_config.max_candidates;
         let traversal_probe_max_pairs = self.traversal_probe_config.max_probe_pairs;
         let traversal_probe_rounds = self.traversal_probe_config.simultaneous_open_rounds;
@@ -4181,14 +4179,12 @@ impl DaemonRuntime {
         let traversal_probe_handshake_freshness_secs =
             self.traversal_probe_handshake_freshness_secs;
         let traversal_probe_reprobe_interval_secs = self.traversal_probe_reprobe_interval_secs;
-        let max_candidate_priority = max_candidate_priority
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
+        let max_candidate_priority =
+            max_candidate_priority.map_or_else(|| "none".to_string(), |value| value.to_string());
         let traversal_preexpiry_refresh_events = self.traversal_preexpiry_refresh_events;
         let traversal_last_preexpiry_refresh_unix = self
             .traversal_last_preexpiry_refresh_unix
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
         let traversal_stale_rejections = self.traversal_stale_rejections;
         let traversal_replay_rejections = self.traversal_replay_rejections;
         let traversal_future_dated_rejections = self.traversal_future_dated_rejections;
@@ -4196,15 +4192,13 @@ impl DaemonRuntime {
         let traversal_endpoint_fingerprint = self
             .traversal_last_endpoint_fingerprint
             .as_deref()
-            .map(sanitize_netcheck_value)
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
         let (traversal_alarm_state, traversal_alarm_reason) = self.traversal_alarm_state(now);
         let (dns_alarm_state, dns_alarm_reason) = self.dns_zone_alarm_state(now);
         let dns_preexpiry_refresh_events = self.dns_zone_preexpiry_refresh_events;
         let dns_last_preexpiry_refresh_unix = self
             .dns_zone_last_preexpiry_refresh_unix
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), |value| value.to_string());
         let dns_stale_rejections = self.dns_zone_stale_rejections;
         let dns_replay_rejections = self.dns_zone_replay_rejections;
         let dns_future_dated_rejections = self.dns_zone_future_dated_rejections;
@@ -4315,10 +4309,9 @@ impl DaemonRuntime {
                 .iter()
                 .filter(|(_node_id, status)| {
                     status.decision == TraversalProbeDecision::Relay
-                        && status
-                            .latest_handshake_unix
-                            .map(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
-                            .unwrap_or(false)
+                        && status.latest_handshake_unix.is_some_and(|timestamp| {
+                            now_unix.saturating_sub(timestamp) <= freshness_secs
+                        })
                 })
                 .map(|(node_id, _status)| node_id.clone())
                 .collect::<Vec<_>>();
@@ -4593,14 +4586,12 @@ impl DaemonRuntime {
 
         match current.path {
             Some(PathMode::Direct) => {
-                let current_endpoint_is_direct_candidate = current
-                    .endpoint
-                    .map(|endpoint| {
+                let current_endpoint_is_direct_candidate =
+                    current.endpoint.is_some_and(|endpoint| {
                         direct_candidates
                             .iter()
                             .any(|candidate| candidate.endpoint == endpoint)
-                    })
-                    .unwrap_or(false);
+                    });
                 !current_endpoint_is_direct_candidate
                     || !self.traversal_handshake_is_fresh(
                         current
@@ -4609,10 +4600,7 @@ impl DaemonRuntime {
                         now_unix,
                     )
             }
-            Some(PathMode::Relay) => status
-                .next_reprobe_unix
-                .map(|next| now_unix >= next)
-                .unwrap_or(true),
+            Some(PathMode::Relay) => status.next_reprobe_unix.is_none_or(|next| now_unix >= next),
             None => true,
         }
     }
@@ -4705,11 +4693,9 @@ impl DaemonRuntime {
     }
 
     fn traversal_handshake_is_fresh(&self, value: Option<u64>, now_unix: u64) -> bool {
-        value
-            .map(|timestamp| {
-                now_unix.saturating_sub(timestamp) <= self.traversal_probe_handshake_freshness_secs
-            })
-            .unwrap_or(false)
+        value.is_some_and(|timestamp| {
+            now_unix.saturating_sub(timestamp) <= self.traversal_probe_handshake_freshness_secs
+        })
     }
 
     fn traversal_authority_mode(&self) -> TraversalAuthorityMode {
@@ -4937,12 +4923,10 @@ impl DaemonRuntime {
                 )),
                 status
                     .latest_handshake_unix
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
+                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 status
                     .next_reprobe_unix
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
+                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 1,
                 direct_peers,
                 relay_peers,
@@ -5103,8 +5087,7 @@ impl DaemonRuntime {
                         relay_session_established_peers =
                             relay_session_established_peers.saturating_add(1);
                         let selected_endpoint_matches = current_endpoint
-                            .map(|endpoint| session.matches_selected_endpoint(endpoint))
-                            .unwrap_or(false);
+                            .is_some_and(|endpoint| session.matches_selected_endpoint(endpoint));
                         if selected_endpoint_matches {
                             relay_session_selected_endpoint_peers =
                                 relay_session_selected_endpoint_peers.saturating_add(1);
@@ -5714,26 +5697,23 @@ impl DaemonRuntime {
         match command {
             IpcCommand::Status => {
                 self.refresh_traversal_hint_state(false);
-                let last_assignment = self
-                    .last_applied_assignment
-                    .map(|watermark| format!("{}:{}", watermark.generated_at_unix, watermark.nonce))
-                    .unwrap_or_else(|| "none".to_string());
+                let last_assignment = self.last_applied_assignment.map_or_else(
+                    || "none".to_string(),
+                    |watermark| format!("{}:{}", watermark.generated_at_unix, watermark.nonce),
+                );
                 let membership_epoch = self
                     .membership_state
                     .as_ref()
-                    .map(|state| state.epoch.to_string())
-                    .unwrap_or_else(|| "none".to_string());
-                let membership_active_nodes = self
-                    .membership_state
-                    .as_ref()
-                    .map(|state| state.active_nodes().len().to_string())
-                    .unwrap_or_else(|| "none".to_string());
+                    .map_or_else(|| "none".to_string(), |state| state.epoch.to_string());
+                let membership_active_nodes = self.membership_state.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |state| state.active_nodes().len().to_string(),
+                );
                 let (dns_zone_state, dns_zone_record_count, dns_zone_error) =
                     self.dns_zone_status_summary();
                 let port_forward_external_port = self
                     .exit_port_forward_external_port()
-                    .map(|port| port.to_string())
-                    .unwrap_or_else(|| "none".to_string());
+                    .map_or_else(|| "none".to_string(), |port| port.to_string());
                 let port_forward_error = self
                     .exit_port_forward_last_error
                     .as_deref()
@@ -5754,11 +5734,10 @@ impl DaemonRuntime {
                 } else {
                     "false"
                 };
-                let traversal_peer_count = self
-                    .traversal_hints
-                    .as_ref()
-                    .map(|envelope| envelope.bundles.len().to_string())
-                    .unwrap_or_else(|| "0".to_string());
+                let traversal_peer_count = self.traversal_hints.as_ref().map_or_else(
+                    || "0".to_string(),
+                    |envelope| envelope.bundles.len().to_string(),
+                );
                 let traversal_probe_max_candidates =
                     self.traversal_probe_config.max_candidates.to_string();
                 let traversal_probe_max_pairs =
@@ -5781,8 +5760,7 @@ impl DaemonRuntime {
                     self.traversal_preexpiry_refresh_events.to_string();
                 let traversal_last_preexpiry_refresh_unix = self
                     .traversal_last_preexpiry_refresh_unix
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string());
+                    .map_or_else(|| "none".to_string(), |value| value.to_string());
                 let traversal_stale_rejections = self.traversal_stale_rejections.to_string();
                 let traversal_replay_rejections = self.traversal_replay_rejections.to_string();
                 let traversal_future_dated_rejections =
@@ -5792,8 +5770,7 @@ impl DaemonRuntime {
                 let traversal_endpoint_fingerprint = self
                     .traversal_last_endpoint_fingerprint
                     .as_deref()
-                    .map(sanitize_netcheck_value)
-                    .unwrap_or_else(|| "none".to_string());
+                    .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
                 let (traversal_alarm_state, traversal_alarm_reason) =
                     self.traversal_alarm_state(unix_now());
                 let (dns_alarm_state, dns_alarm_reason) = self.dns_zone_alarm_state(unix_now());
@@ -5801,8 +5778,7 @@ impl DaemonRuntime {
                     self.dns_zone_preexpiry_refresh_events.to_string();
                 let dns_last_preexpiry_refresh_unix = self
                     .dns_zone_last_preexpiry_refresh_unix
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string());
+                    .map_or_else(|| "none".to_string(), |value| value.to_string());
                 let dns_stale_rejections = self.dns_zone_stale_rejections.to_string();
                 let dns_replay_rejections = self.dns_zone_replay_rejections.to_string();
                 let dns_future_dated_rejections = self.dns_zone_future_dated_rejections.to_string();
@@ -5825,8 +5801,7 @@ impl DaemonRuntime {
                 };
                 let path_latest_live_handshake_unix = path_state
                     .latest_live_handshake_unix
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string());
+                    .map_or_else(|| "none".to_string(), |value| value.to_string());
                 let relay_session_configured = if path_state.relay_session_configured {
                     "true"
                 } else {
@@ -5834,8 +5809,7 @@ impl DaemonRuntime {
                 };
                 let relay_session_next_expiry_unix = path_state
                     .relay_session_next_expiry_unix
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string());
+                    .map_or_else(|| "none".to_string(), |value| value.to_string());
                 IpcResponse::ok(format!(
                     "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
@@ -5859,8 +5833,7 @@ impl DaemonRuntime {
                     self.reconcile_attempts,
                     self.reconcile_failures,
                     self.last_reconcile_unix
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "none".to_string()),
+                        .map_or_else(|| "none".to_string(), |value| value.to_string()),
                     self.last_reconcile_error.as_deref().unwrap_or("none"),
                     if self.wg_encrypted_private_key_path.is_some() {
                         "true"
@@ -6414,8 +6387,9 @@ impl DaemonRuntime {
             verifier_path,
             self.auto_tunnel_bundle_path
                 .as_deref()
-                .map(|_| DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS)
-                .unwrap_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS),
+                .map_or(DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, |_| {
+                    DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS
+                }),
             TrustPolicy {
                 max_signed_data_age_secs: DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
                 max_clock_skew_secs: DEFAULT_SIGNED_STATE_MAX_CLOCK_SKEW_SECS,
@@ -6513,13 +6487,11 @@ impl DaemonRuntime {
 
         let assignment_changed = auto_bundle
             .as_ref()
-            .map(|envelope| Some(envelope.watermark) != self.last_applied_assignment)
-            .unwrap_or(false);
+            .is_some_and(|envelope| Some(envelope.watermark) != self.last_applied_assignment);
         let membership_changed = self
             .membership_state
             .as_ref()
-            .map(|current| current.epoch != membership_state.epoch)
-            .unwrap_or(true);
+            .is_none_or(|current| current.epoch != membership_state.epoch);
 
         self.last_reconcile_error = None;
         let now_unix = unix_now();
@@ -7677,8 +7649,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
             if config
                 .max_requests
-                .map(|max| processed >= max.get())
-                .unwrap_or(false)
+                .is_some_and(|max| processed >= max.get())
             {
                 break;
             }
@@ -7723,13 +7694,11 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
     let fallback_id = request
         .get(0..2)
         .and_then(|value| value.try_into().ok())
-        .map(u16::from_be_bytes)
-        .unwrap_or(0);
+        .map_or(0, u16::from_be_bytes);
     let fallback_flags = request
         .get(2..4)
         .and_then(|value| value.try_into().ok())
-        .map(u16::from_be_bytes)
-        .unwrap_or(0);
+        .map_or(0, u16::from_be_bytes);
     let query = match parse_dns_question(request) {
         Ok(query) => query,
         Err(_) => {
@@ -7849,8 +7818,7 @@ fn dns_name_in_managed_zone(qname: &str, zone_name: &str) -> bool {
     qname == zone_name
         || qname
             .strip_suffix(zone_name)
-            .map(|prefix| prefix.ends_with('.'))
-            .unwrap_or(false)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn render_dns_error_response(id: u16, request_flags: u16, rcode: u16) -> Vec<u8> {
@@ -8794,8 +8762,7 @@ fn validate_passphrase_permissions(path: &Path) -> Result<(), DaemonError> {
     {
         if std::env::var("RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT")
             .ok()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
+            .is_some_and(|value| !value.trim().is_empty())
         {
             read_passphrase_file(path).map_err(|err| {
                 DaemonError::InvalidConfig(format!(

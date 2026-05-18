@@ -1066,16 +1066,16 @@ fn wireguard_interface_info_internal(interface: &str) -> InterfaceInfo {
         .output();
 
     match output {
-        Ok(out) if out.status.success() => String::from_utf8(out.stdout)
-            .ok()
-            .map(|stdout| InterfaceInfo {
-                exists: true,
-                is_up: stdout.contains("UP") && !stdout.contains("DOWN"),
-            })
-            .unwrap_or_else(|| InterfaceInfo {
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout).ok().map_or_else(
+            || InterfaceInfo {
                 exists: false,
                 is_up: false,
-            }),
+            },
+            |stdout| InterfaceInfo {
+                exists: true,
+                is_up: stdout.contains("UP") && !stdout.contains("DOWN"),
+            },
+        ),
         _ => InterfaceInfo {
             exists: false,
             is_up: false,
@@ -1435,9 +1435,7 @@ fn check_dependencies_internal() -> DependencyCheck {
 
 #[cfg(target_os = "macos")]
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
 }
 
 fn daemon_health_internal() -> DaemonHealth {
@@ -2405,10 +2403,7 @@ fn system_load_internal() -> SystemLoad {
     }
 
     let mem_percent = memory_info_internal().percent;
-    let disk_percent = disk_info_internal()
-        .first()
-        .map(|d| d.percent)
-        .unwrap_or(0.0);
+    let disk_percent = disk_info_internal().first().map_or(0.0, |d| d.percent);
 
     SystemLoad {
         cpu_load_1min: load_1,

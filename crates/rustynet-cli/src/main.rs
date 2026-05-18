@@ -1700,8 +1700,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 config: ops_security_audit_workflows::GenerateComparativeExploitCoverageConfig {
                     workspace: parser
                         .value("--workspace")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from(".")),
+                        .map_or_else(|| PathBuf::from("."), PathBuf::from),
                     output: parser.required_path("--output")?,
                     format: parser.value("--format").unwrap_or_else(|| {
                         ops_security_audit_workflows::default_comparative_format().to_string()
@@ -1759,46 +1758,38 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         }),
         "check-no-unsafe-rust-sources" => Ok(OpsCommand::CheckNoUnsafeRustSources {
             config: ops_phase1::CheckNoUnsafeRustSourcesConfig {
-                root: parser
-                    .value("--root")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(ops_phase1::DEFAULT_UNSAFE_SCAN_ROOT_PATH)),
+                root: parser.value("--root").map_or_else(
+                    || PathBuf::from(ops_phase1::DEFAULT_UNSAFE_SCAN_ROOT_PATH),
+                    PathBuf::from,
+                ),
             },
         }),
         "check-dependency-exceptions" => Ok(OpsCommand::CheckDependencyExceptions {
             config: ops_phase1::CheckDependencyExceptionsConfig {
-                path: parser
-                    .value("--path")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(ops_phase1::DEFAULT_DEPENDENCY_EXCEPTIONS_PATH)
-                    }),
+                path: parser.value("--path").map_or_else(
+                    || PathBuf::from(ops_phase1::DEFAULT_DEPENDENCY_EXCEPTIONS_PATH),
+                    PathBuf::from,
+                ),
             },
         }),
         "check-perf-regression" => Ok(OpsCommand::CheckPerfRegression {
             config: ops_phase1::CheckPerfRegressionConfig {
-                phase1_report_path: parser
-                    .value("--phase1-report")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(ops_phase1::DEFAULT_PHASE1_PERF_REGRESSION_PHASE1_REPORT_PATH)
-                    }),
-                phase3_report_path: parser
-                    .value("--phase3-report")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(ops_phase1::DEFAULT_PHASE1_PERF_REGRESSION_PHASE3_REPORT_PATH)
-                    }),
+                phase1_report_path: parser.value("--phase1-report").map_or_else(
+                    || PathBuf::from(ops_phase1::DEFAULT_PHASE1_PERF_REGRESSION_PHASE1_REPORT_PATH),
+                    PathBuf::from,
+                ),
+                phase3_report_path: parser.value("--phase3-report").map_or_else(
+                    || PathBuf::from(ops_phase1::DEFAULT_PHASE1_PERF_REGRESSION_PHASE3_REPORT_PATH),
+                    PathBuf::from,
+                ),
             },
         }),
         "check-secrets-hygiene" => Ok(OpsCommand::CheckSecretsHygiene {
             config: ops_phase1::CheckSecretsHygieneConfig {
-                root: parser
-                    .value("--root")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        PathBuf::from(ops_phase1::DEFAULT_SECRETS_HYGIENE_SCAN_ROOT_PATH)
-                    }),
+                root: parser.value("--root").map_or_else(
+                    || PathBuf::from(ops_phase1::DEFAULT_SECRETS_HYGIENE_SCAN_ROOT_PATH),
+                    PathBuf::from,
+                ),
             },
         }),
         "collect-phase9-raw-evidence" => {
@@ -1948,8 +1939,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 .collect::<Vec<_>>();
             let required_nat_profiles = parser
                 .value("--required-nat-profiles")
-                .map(split_csv)
-                .unwrap_or_else(|| split_csv("baseline_lan".to_string()));
+                .map_or_else(|| split_csv("baseline_lan".to_string()), split_csv);
             Ok(OpsCommand::ValidateCrossNetworkNatMatrix {
                 config: ops_cross_network_reports::ValidateCrossNetworkNatMatrixConfig {
                     reports,
@@ -3866,8 +3856,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             let owner = parser.required("--owner")?;
             let roles = parser
                 .value("--roles")
-                .map(split_csv)
-                .unwrap_or_else(|| vec!["tag:members".to_string()]);
+                .map_or_else(|| vec!["tag:members".to_string()], split_csv);
             let operation = MembershipOperation::AddNode(MembershipNode {
                 node_id: node_id.clone(),
                 node_pubkey_hex,
@@ -4451,10 +4440,10 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                 output_path.display(),
                 bundle.generated_at_unix,
                 bundle.expires_at_unix,
-                verifier_key_output_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<not_written>".to_string())
+                verifier_key_output_path.as_ref().map_or_else(
+                    || "<not_written>".to_string(),
+                    |path| path.display().to_string()
+                )
             ))
         }
         AssignmentCommand::Verify(command) => execute_assignment_verify(command),
@@ -4568,10 +4557,10 @@ fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String
         bundle.generated_at_unix,
         bundle.expires_at_unix,
         bundle.records.len(),
-        verifier_key_output_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<not_written>".to_string())
+        verifier_key_output_path.as_ref().map_or_else(
+            || "<not_written>".to_string(),
+            |path| path.display().to_string()
+        )
     ))
 }
 
@@ -4655,10 +4644,10 @@ fn execute_traversal_issue(command: TraversalIssueCommand) -> Result<String, Str
         output_path.display(),
         bundle.generated_at_unix,
         bundle.expires_at_unix,
-        verifier_key_output_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<not_written>".to_string())
+        verifier_key_output_path.as_ref().map_or_else(
+            || "<not_written>".to_string(),
+            |path| path.display().to_string()
+        )
     ))
 }
 
@@ -7797,8 +7786,7 @@ fn execute_ops_restart_runtime_service_macos() -> Result<String, String> {
 
     let helper_group = Group::from_name("wheel")
         .map_err(|err| format!("resolve group wheel failed: {err}"))?
-        .map(|group| group.gid)
-        .unwrap_or_else(|| Gid::from_raw(0));
+        .map_or_else(|| Gid::from_raw(0), |group| group.gid);
 
     write_launchd_plist(
         config.service.helper_plist_path.as_path(),
@@ -12952,21 +12940,19 @@ impl OptionParser {
     }
 
     fn path_or_default(&self, key: &str, default: PathBuf) -> PathBuf {
-        self.values.get(key).map(PathBuf::from).unwrap_or(default)
+        self.values.get(key).map_or(default, PathBuf::from)
     }
 
     fn membership_paths(&self) -> MembershipPaths {
         MembershipPaths {
-            snapshot_path: self
-                .values
-                .get("--snapshot")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_MEMBERSHIP_SNAPSHOT_PATH)),
+            snapshot_path: self.values.get("--snapshot").map_or_else(
+                || PathBuf::from(DEFAULT_MEMBERSHIP_SNAPSHOT_PATH),
+                PathBuf::from,
+            ),
             log_path: self
                 .values
                 .get("--log")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH)),
+                .map_or_else(|| PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH), PathBuf::from),
         }
     }
 }
@@ -13109,8 +13095,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
 
 fn daemon_socket_path() -> PathBuf {
     std::env::var("RUSTYNET_DAEMON_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH))
+        .map_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH), PathBuf::from)
 }
 
 fn rustynetd_service_uid_for_socket(path: &Path) -> Option<u32> {
@@ -13463,9 +13448,10 @@ fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
     let log_path = if cfg!(target_os = "linux") {
         PathBuf::from("/var/log/rustynet/rustynetd.log")
     } else if cfg!(target_os = "macos") {
-        std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Logs/rustynet/rustynetd.log"))
-            .unwrap_or_else(|_| PathBuf::from("/tmp/rustynetd.log"))
+        std::env::var("HOME").map_or_else(
+            |_| PathBuf::from("/tmp/rustynetd.log"),
+            |h| PathBuf::from(h).join("Library/Logs/rustynet/rustynetd.log"),
+        )
     } else {
         PathBuf::from("/tmp/rustynetd.log")
     };
@@ -14535,8 +14521,7 @@ fn execute_interface_speed() -> Result<String, String> {
     for iface in speeds {
         let speed_str = iface
             .speed_mbps
-            .map(|s| format!("{s} Mbps"))
-            .unwrap_or_else(|| "unknown".to_string());
+            .map_or_else(|| "unknown".to_string(), |s| format!("{s} Mbps"));
         output.push(format!(
             "  {}: {} (MTU: {})",
             iface.name, speed_str, iface.mtu
@@ -15639,7 +15624,7 @@ fn parse_optional_u32(args: &[String], key: &str) -> Result<Option<u32>, String>
 }
 
 fn parse_node_command(args: &[String]) -> Result<NodeCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let json = args_have_flag(args, "--json");
     match sub {
         "info" => Ok(NodeCommand::Info {
@@ -15670,7 +15655,7 @@ fn parse_node_command(args: &[String]) -> Result<NodeCommand, String> {
 }
 
 fn parse_policy_command(args: &[String]) -> Result<PolicyCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let json = args_have_flag(args, "--json");
     match sub {
         "list" => Ok(PolicyCommand::List {
@@ -15713,7 +15698,7 @@ fn parse_policy_command(args: &[String]) -> Result<PolicyCommand, String> {
 }
 
 fn parse_relay_command(args: &[String]) -> Result<RelayCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let json = args_have_flag(args, "--json");
     match sub {
         "list" => Ok(RelayCommand::List {
@@ -15744,7 +15729,7 @@ fn parse_relay_command(args: &[String]) -> Result<RelayCommand, String> {
 }
 
 fn parse_cert_command(args: &[String]) -> Result<CertCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let json = args_have_flag(args, "--json");
     match sub {
         "list" => Ok(CertCommand::List {
@@ -15761,7 +15746,7 @@ fn parse_cert_command(args: &[String]) -> Result<CertCommand, String> {
 }
 
 fn parse_trust_state_command(args: &[String]) -> Result<TrustStateCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     if sub != "show" {
         return Err(format!("unknown trust-state subcommand: {sub}"));
     }
@@ -15772,7 +15757,7 @@ fn parse_trust_state_command(args: &[String]) -> Result<TrustStateCommand, Strin
 }
 
 fn parse_analytics_command(args: &[String]) -> Result<AnalyticsCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let json = args_have_flag(args, "--json");
     match sub {
         "peers" => Ok(AnalyticsCommand::Peers {
@@ -15795,13 +15780,12 @@ fn parse_analytics_command(args: &[String]) -> Result<AnalyticsCommand, String> 
 }
 
 fn parse_backup_command(args: &[String]) -> Result<BackupCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     if sub != "state" {
         return Err(format!("unknown backup subcommand: {sub}"));
     }
     let out_dir = parse_optional_kv(args, "--path")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/rustynet-backup"));
+        .map_or_else(|| PathBuf::from("/tmp/rustynet-backup"), PathBuf::from);
     Ok(BackupCommand {
         out_dir,
         compress: args_have_flag(args, "--compress"),
@@ -15812,7 +15796,7 @@ fn parse_backup_command(args: &[String]) -> Result<BackupCommand, String> {
 }
 
 fn parse_restore_command(args: &[String]) -> Result<RestoreStateCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     if sub != "state" {
         return Err(format!("unknown restore subcommand: {sub}"));
     }
@@ -15846,7 +15830,7 @@ fn parse_export_keys_command(args: &[String]) -> Result<ExportKeysCommand, Strin
 }
 
 fn parse_config_subcommand(args: &[String]) -> Result<ConfigSubCommand, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let json = args_have_flag(args, "--json");
     match sub {
         "show" => Ok(ConfigSubCommand::Show {
@@ -16018,9 +16002,7 @@ fn execute_node(command: NodeCommand) -> Result<String, String> {
             });
             let mut human = format!(
                 "node_id: {node_id}\nrole: {role}\npublic_key: {public_key}\ntrust_evidence_age_secs: {}\n",
-                trust_evidence_age_secs
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string()),
+                trust_evidence_age_secs.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
             );
             if peers {
                 human.push_str(&format!("peer_count: {peer_count}\n"));
@@ -16507,15 +16489,15 @@ fn execute_relay(command: RelayCommand) -> Result<String, String> {
         }
         RelayCommand::Health { relay_id, json } => {
             let endpoint = lookup_node_endpoint(&relay_id);
-            let probe = endpoint
-                .as_deref()
-                .map(probe_icmp)
-                .unwrap_or_else(|| NodeProbeResult {
+            let probe = endpoint.as_deref().map_or_else(
+                || NodeProbeResult {
                     transport: "icmp",
                     reachable: false,
                     latency_ms: None,
                     error: Some(format!("no endpoint mapping for relay {relay_id}")),
-                });
+                },
+                probe_icmp,
+            );
             let payload = json!({
                 "relay_id": relay_id,
                 "endpoint": endpoint,
@@ -16607,7 +16589,7 @@ fn execute_cert(command: CertCommand) -> Result<String, String> {
             for (label, path) in cert_files {
                 let metadata = std::fs::metadata(path).ok();
                 let exists = metadata.is_some();
-                let size = metadata.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
+                let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
                 let ok = exists && size > 0;
                 findings.push(json!({
                     "label": label,
@@ -16652,10 +16634,7 @@ fn execute_trust_state(command: TrustStateCommand) -> Result<String, String> {
     let evidence_path = canonical_trust_evidence_path();
     let verifier_path = canonical_trust_verifier_key_path();
     let evidence_metadata = std::fs::metadata(evidence_path).ok();
-    let evidence_size = evidence_metadata
-        .as_ref()
-        .map(std::fs::Metadata::len)
-        .unwrap_or(0);
+    let evidence_size = evidence_metadata.as_ref().map_or(0, std::fs::Metadata::len);
     let evidence_age_secs = evidence_metadata
         .as_ref()
         .and_then(|m| m.modified().ok())
@@ -16673,9 +16652,7 @@ fn execute_trust_state(command: TrustStateCommand) -> Result<String, String> {
     });
     let human = format!(
         "verifier_key_path: {verifier_path}\nverifier_key: {verifier_pubkey}\nevidence_path: {evidence_path}\nevidence_size_bytes: {evidence_size}\nevidence_age_secs: {}",
-        evidence_age_secs
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "<unknown>".to_string()),
+        evidence_age_secs.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
     );
     Ok(cli_human_or_json(command.json, payload, human))
 }
@@ -16781,12 +16758,15 @@ fn execute_analytics(command: AnalyticsCommand) -> Result<String, String> {
                     .get("endpoint")
                     .and_then(|v| v.as_str())
                     .or_else(|| n.get("last_known_ip").and_then(|v| v.as_str()));
-                let probe = endpoint.map(probe_icmp).unwrap_or_else(|| NodeProbeResult {
-                    transport: "icmp",
-                    reachable: false,
-                    latency_ms: None,
-                    error: Some("no endpoint".to_string()),
-                });
+                let probe = endpoint.map_or_else(
+                    || NodeProbeResult {
+                        transport: "icmp",
+                        reachable: false,
+                        latency_ms: None,
+                        error: Some("no endpoint".to_string()),
+                    },
+                    probe_icmp,
+                );
                 entries.push(json!({
                     "node_id": id,
                     "role": role,
@@ -16805,8 +16785,7 @@ fn execute_analytics(command: AnalyticsCommand) -> Result<String, String> {
                         e["role"].as_str().unwrap_or("?"),
                         e["latency_ms"]
                             .as_u64()
-                            .map(|m| m.to_string())
-                            .unwrap_or_else(|| "<unreachable>".to_string()),
+                            .map_or_else(|| "<unreachable>".to_string(), |m| m.to_string()),
                     )
                 })
                 .collect::<Vec<_>>()

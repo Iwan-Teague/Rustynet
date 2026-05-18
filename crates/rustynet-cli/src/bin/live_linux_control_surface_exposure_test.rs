@@ -227,8 +227,7 @@ fn run() -> Result<(), String> {
         let client_addr = LiveLabContext::resolved_target_address(&client_host)?;
         let dns_port = dns_bind_addr
             .rsplit_once(':')
-            .map(|(_, port)| port.to_string())
-            .unwrap_or_else(|| "53535".to_string());
+            .map_or_else(|| "53535".to_string(), |(_, port)| port.to_string());
         remote_dns_probe_output = ctx.capture_root_allow_failure(
             &probe_host,
             &[
@@ -344,10 +343,10 @@ fn write_block(path: &PathBuf, contents: &str) -> Result<(), String> {
 }
 
 fn now_unix() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+        |_| "0".to_string(),
+        |duration| duration.as_secs().to_string(),
+    )
 }
 
 fn now_utc() -> String {

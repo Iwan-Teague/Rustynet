@@ -49,8 +49,7 @@ impl StateMachineRunner {
                 blocked.contains(dep)
                     || ctx
                         .outcome_of(dep)
-                        .map(super::error::StageOutcome::is_blocking)
-                        .unwrap_or(false)
+                        .is_some_and(super::error::StageOutcome::is_blocking)
             });
 
             if dep_blocked {
