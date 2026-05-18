@@ -271,6 +271,37 @@ struct NatProfileView {
     extra: Map<String, Value>,
 }
 
+/// X2: typed view over a single entry inside the
+/// `endpoint_candidates` array.
+///
+/// * `kind` is the JSON `type` field (renamed because `type` is a
+///   Rust keyword). The validator still applies the
+///   `host` / `server_reflexive` / `relay` value-level check
+///   downstream.
+/// * `endpoint: Option<String>` lets the validator distinguish
+///   absent-endpoint (`None` → "must be a string") from
+///   present-empty-string (`Some("")` → fails the host:port check
+///   downstream). A wrong-type slot fails at the typed deserialise.
+/// * `priority: Option<i64>` was previously silent via
+///   `.and_then(Value::as_i64) -> None`, conflating missing with
+///   wrong-type. Typed view now distinguishes.
+///
+/// Per-entry deserialise (rather than `Vec<EndpointCandidateView>`)
+/// preserves the legacy per-entry granular error messages —
+/// `endpoint_candidates[{index}]` keeps pointing at the exact
+/// offending row instead of the whole array short-circuiting.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct EndpointCandidateView {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<i64>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
 /// X2: typed view over the `verifier_keys` sub-block. The 4 typed
 /// slots line up 1:1 with `PUBLIC_KEY_KEYS`. Wrong-type slots
 /// (e.g. an integer in any of the base64 fields) fail at the typed
@@ -466,29 +497,39 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
         Some(candidates) if !candidates.is_empty() => {
             let mut seen = HashSet::new();
             for (index, candidate) in candidates.iter().enumerate() {
-                let Some(candidate_object) = candidate.as_object() else {
-                    problems.push(format!("endpoint_candidates[{index}] must be an object"));
-                    continue;
+                // X2: per-entry typed deserialise. Object-shape and
+                // each typed slot are checked here; the
+                // value-level checks (allowed `kind`, host:port
+                // shape, duplicate detection) stay below as
+                // domain-specific validation.
+                let view = match serde_json::from_value::<EndpointCandidateView>(candidate.clone())
+                {
+                    Ok(view) => view,
+                    Err(err) => {
+                        let msg = err.to_string();
+                        if msg.contains("expected a") && msg.contains("map") {
+                            // serde error for non-object entries — preserve the
+                            // legacy "must be an object" message so the existing
+                            // contract reads cleanly.
+                            problems
+                                .push(format!("endpoint_candidates[{index}] must be an object"));
+                        } else {
+                            problems.push(format!(
+                                "endpoint_candidates[{index}] has invalid field shape: {err}"
+                            ));
+                        }
+                        continue;
+                    }
                 };
-                let candidate_type = candidate_object
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let endpoint = candidate_object
-                    .get("endpoint")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let candidate_type = view.kind.as_deref().unwrap_or_default();
+                let endpoint = view.endpoint.as_deref().unwrap_or_default();
                 if !matches!(candidate_type, "host" | "server_reflexive" | "relay") {
                     problems.push(format!(
                         "endpoint_candidates[{index}].type must be host/server_reflexive/relay"
                     ));
                     continue;
                 }
-                if candidate_object
-                    .get("endpoint")
-                    .and_then(Value::as_str)
-                    .is_none()
-                {
+                if view.endpoint.is_none() {
                     problems.push(format!(
                         "endpoint_candidates[{index}].endpoint must be a string"
                     ));
@@ -505,11 +546,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                         "endpoint_candidates[{index}].endpoint must be empty or host:port for relay"
                     ));
                 }
-                if candidate_object
-                    .get("priority")
-                    .and_then(Value::as_i64)
-                    .is_none()
-                {
+                if view.priority.is_none() {
                     problems.push(format!(
                         "endpoint_candidates[{index}].priority must be an integer"
                     ));
@@ -807,8 +844,8 @@ pub fn execute_ops_validate_network_discovery_bundle(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonStatusView, NatProfileView, NetworkDiscoveryBundleView, NodeIdentityView,
-        VerifierKeysView, WireguardView, deserialize_sub_block,
+        DaemonStatusView, EndpointCandidateView, NatProfileView, NetworkDiscoveryBundleView,
+        NodeIdentityView, VerifierKeysView, WireguardView, deserialize_sub_block,
     };
     use serde_json::{Map, Value, json};
 
@@ -1116,5 +1153,76 @@ mod tests {
             message.contains("socket_present") || message.contains("bool"),
             "error must point to the offending field or type: {message}"
         );
+    }
+
+    /// Clean fixture: `EndpointCandidateView` accepts a well-formed
+    /// per-entry payload. The JSON `type` key renames to `kind` via
+    /// `#[serde(rename = "type")]` because `type` is a Rust keyword.
+    #[test]
+    fn endpoint_candidate_view_accepts_clean_entry() {
+        let entry = json!({
+            "type": "host",
+            "endpoint": "192.0.2.10:51820",
+            "priority": 100,
+            "extra": "ride",
+        });
+        let view: EndpointCandidateView = serde_json::from_value(entry).expect("clean parse");
+        assert_eq!(view.kind.as_deref(), Some("host"));
+        assert_eq!(view.endpoint.as_deref(), Some("192.0.2.10:51820"));
+        assert_eq!(view.priority, Some(100));
+        assert_eq!(
+            view.extra.get("extra").and_then(Value::as_str),
+            Some("ride")
+        );
+    }
+
+    /// Wrong-type `priority` slot rejected at the typed layer.
+    /// Previously silent via `.and_then(Value::as_i64) -> None`,
+    /// surfacing as "must be an integer" (same as missing). Typed
+    /// view now distinguishes them.
+    #[test]
+    fn endpoint_candidate_view_rejects_wrong_type_priority() {
+        let entry = json!({
+            "type": "host",
+            "endpoint": "192.0.2.10:51820",
+            "priority": "high",
+        });
+        let err = serde_json::from_value::<EndpointCandidateView>(entry)
+            .expect_err("string priority must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("priority") || message.contains("i64") || message.contains("integer"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `type` slot rejected. Previously the silent
+    /// `.unwrap_or_default()` returned empty string, surfacing as
+    /// "type must be host/server_reflexive/relay" — conflated with
+    /// missing or wrong-type. Typed view catches wrong-type first.
+    #[test]
+    fn endpoint_candidate_view_rejects_wrong_type_kind() {
+        let entry = json!({ "type": 42 });
+        let err = serde_json::from_value::<EndpointCandidateView>(entry)
+            .expect_err("integer type must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("type") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Missing optional slots deserialise to `None`. The validator
+    /// keeps emitting the legacy per-field errors (e.g.
+    /// "endpoint_candidates[i].endpoint must be a string") via the
+    /// downstream check on `view.endpoint.is_none()`.
+    #[test]
+    fn endpoint_candidate_view_accepts_missing_optional_slots() {
+        let entry = json!({ "type": "host" });
+        let view: EndpointCandidateView =
+            serde_json::from_value(entry).expect("typed view tolerates missing slots");
+        assert_eq!(view.kind.as_deref(), Some("host"));
+        assert!(view.endpoint.is_none());
+        assert!(view.priority.is_none());
     }
 }
