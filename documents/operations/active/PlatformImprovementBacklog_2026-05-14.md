@@ -699,11 +699,21 @@ inline. Cross-reference with:
   replaced; aggregator stays "collect every error" walk; if
   typed deserialize fails the function surfaces a typed-
   boundary error and continues.
+* `[x]` 5 helper `Value` walks in `ops_cross_network_reports.rs`
+  intentionally kept (`path_evidence_from_status_line`,
+  `path_evidence_from_report`, `artifact_list_has_basename`,
+  `resolve_optional_path_evidence`, `value_as_non_empty_string`).
+  Each is a 1-line generic helper over `&[Value]` /
+  `Option<&Value>`; converting to typed views would force a
+  closed enum across every reporter shape these helpers see.
+  Keep as `Value`-walk by design.
 * `[ ]` Remaining Phase A walks in
-  `ops_cross_network_reports.rs` (future slices):
-  - the 5 helpers (kept as `Value` walks intentionally — only
-    migrate if a future restructuring makes typed views worth it)
-  - nested `path_evidence` block walkers
+  `ops_cross_network_reports.rs` (future slice): nested
+  `path_evidence` block walkers (the
+  `validate_report_payload`-callees that drill into
+  `path_evidence` Map<String, Value> children). Migration is a
+  larger refactor because the block shapes vary per suite —
+  defer until the suite enum is itself typed end-to-end.
 * `[x]` ops_live_lab_failure_digest.rs typed-view migration
   landed (commit b2f8b1c). Added 4 typed views
   (`DigestNodeView`, `DigestFailedWorkerView` with 13 typed fields,
