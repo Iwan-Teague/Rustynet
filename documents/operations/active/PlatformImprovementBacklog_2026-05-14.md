@@ -937,6 +937,14 @@ inline. Cross-reference with:
     aggregation (no short-circuit), Forbidden-on-required-entry
     inverted shape, AbsentAsExpected-on-required-entry collector
     bug shape). Floor bumped 15 → 24.
+  - `windows_mesh_status` test count 14 → 23 (+9 named drift
+    tests covering schema_version pin, per-variant serde round-trip
+    on IntegrityMismatch + InvalidFormat, unknown-load_status-tag
+    rejection, freshness boundary (age==max accepts, age=max+1
+    rejects), no-expectations vacuous truth, no-dedup on duplicate
+    expected_peer_ids, and confirmation that lan_access_enabled +
+    selected_exit_node don't gate the verdict today). Floor bumped
+    14 → 23. (commit e73ffee)
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
