@@ -628,7 +628,7 @@ sudo -E ./scripts/ci/no_leak_dataplane_gate.sh
 
 Security gate toolchain note:
 - phase gate scripts require the pinned Rust security toolchain (`RUSTYNET_SECURITY_TOOLCHAIN`, default `1.88.0-<host-triple>`) to be installed; ambient cargo toolchain fallback is disabled.
-- interactive/operator bootstrap now follows the same provenance rule: install `rustup` from the host package manager, then install/use the pinned workspace toolchain declared in [`rust-toolchain.toml`](/Users/iwanteague/Desktop/Rustynet/rust-toolchain.toml).
+- interactive/operator bootstrap now follows the same provenance rule: install `rustup` from the host package manager, then install/use the pinned workspace toolchain declared in [`rust-toolchain.toml`](./rust-toolchain.toml).
 
 ## Phase 1 Measured Baseline Inputs
 
