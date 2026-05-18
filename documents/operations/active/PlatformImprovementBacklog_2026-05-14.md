@@ -1379,25 +1379,35 @@ inline. Cross-reference with:
   - X4 sweep added `windows_paths:61` (SDDL matcher + path
     validator coverage parity).
   - macOS group added (commit b868820) with 6 modules pinned at
-    their current baselines: `macos_runtime_acls:8`,
-    `macos_service_hardening:9`, `macos_dns_failclosed:8`,
-    `macos_mesh_status:3`, `macos_key_custody:2`,
-    `macos_authenticode:2`. `--platform macos` and `--platform all`
-    both runnable.
+    their initial baselines. macOS X4 coverage-parity sweeps then
+    bumped each floor to match the live evaluator surface:
+    `macos_runtime_acls` 8→16, `macos_service_hardening` 9→15,
+    `macos_dns_failclosed` 8→16, `macos_mesh_status` 3→9,
+    `macos_key_custody` 2→11, `macos_authenticode` 2→7.
+    `--platform macos` and `--platform all` both runnable.
   - Shared group added (commit 972dfa8) with `secret_log_audit:35`
     pinned. Platform-agnostic audit modules now have a dedicated
     group; the X3 static-scanner self-test suite gets the same
     silent-removal protection the per-platform verifier modules
     have. `--platform shared` runs the group; `--platform all`
-    runs every group sequentially.
+    runs every group sequentially. Floor subsequently bumped via
+    X3 extensions: 35 → 37 (signing_seed placeholder, cycle 27)
+    → 45 (G2c deprecated-crypto migration, cycle 34) → 53 (dbg!
+    scanner, cycle 60) → 62 (panic-macro scanner, cycle 61)
+    → 65 (rc4/md4/md2 bans, cycle 78) → 67 (rc2/blowfish bans,
+    cycle 80).
   - Linux floors progressively bumped via X4 coverage-parity sweeps:
     `linux_runtime_acls` 19→27, `linux_mesh_status` 10→24,
     `linux_authenticode` 3→22, `linux_key_custody` 15→24.
   - Windows floors progressively bumped via X4 coverage-parity
     sweeps: `windows_mesh_status` 14→23, `windows_key_custody`
-    18→24, `windows_dns_failclosed` 56→67.
-  Current coverage: 20 modules pinned across linux (7) + macos (6)
-  + windows (7).
+    18→24, `windows_dns_failclosed` 56→67. `windows_ipc:15`
+    pinned (commit 5c43347) — named-pipe path validation + SDDL
+    security-policy generation + privileged-request/response
+    encode/decode bounded-byte ceiling.
+  Current coverage: 22 modules pinned across linux (7) + macos (6)
+  + windows (8) + shared (1); aggregate 615 pinned tests
+  (linux 196 + macos 74 + windows 278 + shared 67).
 
 ---
 
