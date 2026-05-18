@@ -707,13 +707,32 @@ inline. Cross-reference with:
   `Option<&Value>`; converting to typed views would force a
   closed enum across every reporter shape these helpers see.
   Keep as `Value`-walk by design.
-* `[ ]` Remaining Phase A walks in
-  `ops_cross_network_reports.rs` (future slice): nested
-  `path_evidence` block walkers (the
-  `validate_report_payload`-callees that drill into
-  `path_evidence` Map<String, Value> children). Migration is a
-  larger refactor because the block shapes vary per suite —
-  defer until the suite enum is itself typed end-to-end.
+* `[x]` Nested `path_evidence` block walker in
+  `ops_cross_network_reports.rs` migrated (commit 2cec421).
+  Added `CrossNetworkPathEvidenceView` with 15 typed
+  `Option<...>` slots (`path_mode`, `path_reason`,
+  `path_programmed_mode`, `path_live_proven: bool`,
+  `path_latest_live_handshake_unix: u64`, `relay_session_state`,
+  `traversal_alarm_state`, `traversal_alarm_reason`,
+  `dns_alarm_state`, `dns_alarm_reason`, `traversal_error`,
+  `transport_socket_identity_state`,
+  `transport_socket_identity_error`,
+  `transport_socket_identity_label`,
+  `transport_socket_identity_local_addr`) plus
+  `#[serde(flatten)] extra: Map<String, Value>` for forward
+  compat. New `non_empty_trimmed_string` helper preserves
+  parity with the legacy `value_as_non_empty_string`
+  empty/whitespace-as-None contract. Walker inside
+  `validate_report_payload` now deserialises path_evidence once
+  at the top of the `if let Some(...)` branch; on wrong-type
+  failure it falls back to the legacy untyped walk so a single
+  bad slot does not cascade "missing" failures across the rest
+  of the block. 5 new tests pin: clean block round-trip, missing
+  optional slots accepted, wrong-type slot rejected at the
+  typed layer, `non_empty_trimmed_string` empty/whitespace
+  parity, and the walker's legacy-fallback integration
+  (`validate_report_payload_falls_back_to_untyped_walk_on_wrong_type_slot`).
+  ops_cross_network_reports test count grew 23 → 28.
 * `[x]` ops_live_lab_failure_digest.rs typed-view migration
   landed (commit b2f8b1c). Added 4 typed views
   (`DigestNodeView`, `DigestFailedWorkerView` with 13 typed fields,
