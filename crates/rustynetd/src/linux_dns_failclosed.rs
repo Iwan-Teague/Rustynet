@@ -165,19 +165,17 @@ fn evaluate_network_manager_precedence(
         "none" | "systemd-resolved" | "dnsmasq" => {}
         "default" | "" => {
             reasons.push(format!(
-                "NetworkManager [main] dns={mode:?} mode at {} writes /etc/resolv.conf \
-                 directly and can reintroduce off-loopback nameservers on any link \
-                 change; set dns=none (or dns=systemd-resolved / dns=dnsmasq) to keep \
-                 the resolver loopback-only",
-                NETWORK_MANAGER_CONF_PATH
+                "NetworkManager [main] dns={mode:?} mode at {NETWORK_MANAGER_CONF_PATH} writes \
+                 /etc/resolv.conf directly and can reintroduce off-loopback nameservers on \
+                 any link change; set dns=none (or dns=systemd-resolved / dns=dnsmasq) to \
+                 keep the resolver loopback-only"
             ));
         }
         other => {
             reasons.push(format!(
-                "NetworkManager [main] dns={other:?} mode at {} is not on the reviewed \
-                 fail-closed list (none|systemd-resolved|dnsmasq); cannot confirm \
-                 resolver stays loopback-only",
-                NETWORK_MANAGER_CONF_PATH
+                "NetworkManager [main] dns={other:?} mode at {NETWORK_MANAGER_CONF_PATH} is \
+                 not on the reviewed fail-closed list (none|systemd-resolved|dnsmasq); \
+                 cannot confirm resolver stays loopback-only"
             ));
         }
     }

@@ -1376,7 +1376,7 @@ fn security_checks_internal(_config_path: &str) -> SecurityCheckResult {
 
         for key_path in &key_paths {
             if fs::metadata(key_path).is_err() {
-                issues.push(format!("{} not found or accessible", key_path));
+                issues.push(format!("{key_path} not found or accessible"));
             }
         }
     }
@@ -1390,7 +1390,7 @@ fn security_checks_internal(_config_path: &str) -> SecurityCheckResult {
 
         for key_path in &key_paths {
             if fs::metadata(key_path).is_err() {
-                issues.push(format!("{} not found or accessible", key_path));
+                issues.push(format!("{key_path} not found or accessible"));
             }
         }
     }
@@ -1799,7 +1799,7 @@ fn key_expiry_internal() -> KeyExpiry {
             let days_old = (now - since_epoch) / 86400;
             if days_old > 365 {
                 expiring_soon = true;
-                key_details.push(format!("~/.rustynet/keys: {} days old (>1yr)", days_old));
+                key_details.push(format!("~/.rustynet/keys: {days_old} days old (>1yr)"));
             }
         }
     }
@@ -2132,18 +2132,18 @@ fn test_tcp_connection(host: &str, port: u16) -> Result<(), String> {
     use std::time::Duration;
 
     match TcpStream::connect_timeout(
-        &format!("{}:{}", host, port)
+        &format!("{host}:{port}")
             .parse()
-            .map_err(|e| format!("{}", e))?,
+            .map_err(|e| format!("{e}"))?,
         Duration::from_secs(3),
     ) {
         Ok(_) => Ok(()),
-        Err(e) => Err(format!("{}", e)),
+        Err(e) => Err(format!("{e}")),
     }
 }
 
 fn test_dns_resolution(domain: &str) -> Option<String> {
-    std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:53", domain))
+    std::net::ToSocketAddrs::to_socket_addrs(&format!("{domain}:53"))
         .ok()?
         .next()
         .map(|addr| addr.to_string())
@@ -2849,7 +2849,7 @@ fn env_validate_internal() -> Vec<String> {
     let mut issues = Vec::new();
     for var in required {
         if std::env::var(var).is_err() {
-            issues.push(format!("missing: {}", var));
+            issues.push(format!("missing: {var}"));
         }
     }
 
@@ -2863,7 +2863,7 @@ fn env_validate_internal() -> Vec<String> {
     let mut issues = Vec::new();
     for var in required {
         if std::env::var(var).is_err() {
-            issues.push(format!("missing: {}", var));
+            issues.push(format!("missing: {var}"));
         }
     }
 
@@ -2877,7 +2877,7 @@ fn env_validate_internal() -> Vec<String> {
     let mut issues = Vec::new();
     for var in required {
         if std::env::var(var).is_err() {
-            issues.push(format!("missing: {}", var));
+            issues.push(format!("missing: {var}"));
         }
     }
 
@@ -3194,11 +3194,11 @@ fn permission_check_internal() -> Vec<String> {
             Ok(meta) => {
                 let mode = meta.permissions();
                 if mode.readonly() {
-                    issues.push(format!("{}: read-only", path));
+                    issues.push(format!("{path}: read-only"));
                 }
             }
             Err(_) => {
-                issues.push(format!("{}: not found", path));
+                issues.push(format!("{path}: not found"));
             }
         }
     }
@@ -3220,11 +3220,11 @@ fn permission_check_internal() -> Vec<String> {
             Ok(meta) => {
                 let mode = meta.permissions();
                 if mode.readonly() {
-                    issues.push(format!("{}: read-only", path));
+                    issues.push(format!("{path}: read-only"));
                 }
             }
             Err(_) => {
-                issues.push(format!("{}: not found", path));
+                issues.push(format!("{path}: not found"));
             }
         }
     }
@@ -5143,7 +5143,7 @@ fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo 
 
 #[cfg(target_os = "macos")]
 fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo {
-    let target = format!("{}:{}", host, port);
+    let target = format!("{host}:{port}");
 
     if let Ok(output) = std::process::Command::new("openssl")
         .args(["s_client", "-connect", &target, "-servername", host])
@@ -5241,15 +5241,15 @@ fn sudoers_configuration_audit_internal() -> SudoersAudit {
 
             if trimmed.contains("NOPASSWD") {
                 nopasswd_entries += 1;
-                dangerous_rules.push(format!("NOPASSWD rule: {}", trimmed));
+                dangerous_rules.push(format!("NOPASSWD rule: {trimmed}"));
             }
 
             if trimmed.contains("ALL=(ALL)") || trimmed.contains("ALL = (ALL)") {
-                dangerous_rules.push(format!("Full sudo rule: {}", trimmed));
+                dangerous_rules.push(format!("Full sudo rule: {trimmed}"));
             }
 
             if trimmed.contains("!authenticate") {
-                dangerous_rules.push(format!("No auth required: {}", trimmed));
+                dangerous_rules.push(format!("No auth required: {trimmed}"));
             }
         }
     }
@@ -5278,15 +5278,15 @@ fn sudoers_configuration_audit_internal() -> SudoersAudit {
 
             if trimmed.contains("NOPASSWD") {
                 nopasswd_entries += 1;
-                dangerous_rules.push(format!("NOPASSWD rule: {}", trimmed));
+                dangerous_rules.push(format!("NOPASSWD rule: {trimmed}"));
             }
 
             if trimmed.contains("ALL=(ALL)") || trimmed.contains("ALL = (ALL)") {
-                dangerous_rules.push(format!("Full sudo rule: {}", trimmed));
+                dangerous_rules.push(format!("Full sudo rule: {trimmed}"));
             }
 
             if trimmed.contains("!authenticate") {
-                dangerous_rules.push(format!("No auth required: {}", trimmed));
+                dangerous_rules.push(format!("No auth required: {trimmed}"));
             }
         }
     }

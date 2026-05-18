@@ -123,13 +123,12 @@ pub fn evaluate_linux_killswitch_boot_snapshot(
     // present, interface absent) is fine — that's the cold-boot
     // pre-up window the gate is designed to allow.
     if snapshot.tunnel_interface_present && !snapshot.table_present {
+        let iface = &snapshot.tunnel_interface_name;
         reasons.push(format!(
             "tunnel interface {iface} is present in /sys/class/net but reviewed killswitch \
-             table {family}/{table} is missing — host has a live tunnel without a programmed \
-             killswitch, traffic can leak to the underlay",
-            iface = snapshot.tunnel_interface_name,
-            family = REVIEWED_KILLSWITCH_FAMILY,
-            table = REVIEWED_KILLSWITCH_TABLE,
+             table {REVIEWED_KILLSWITCH_FAMILY}/{REVIEWED_KILLSWITCH_TABLE} is missing — host \
+             has a live tunnel without a programmed killswitch, traffic can leak to the \
+             underlay"
         ));
     }
 
@@ -142,9 +141,8 @@ pub fn evaluate_linux_killswitch_boot_snapshot(
     for required in REVIEWED_REQUIRED_CHAINS {
         if !snapshot.chains_present.iter().any(|c| c == required) {
             reasons.push(format!(
-                "reviewed chain `{required}` missing from {family}/{table}",
-                family = REVIEWED_KILLSWITCH_FAMILY,
-                table = REVIEWED_KILLSWITCH_TABLE,
+                "reviewed chain `{required}` missing from \
+                 {REVIEWED_KILLSWITCH_FAMILY}/{REVIEWED_KILLSWITCH_TABLE}"
             ));
         }
     }
@@ -158,9 +156,7 @@ pub fn evaluate_linux_killswitch_boot_snapshot(
             {
                 reasons.push(format!(
                     "reviewed killswitch rule fragment {required:?} missing from \
-                     {family}/{table} killswitch chain",
-                    family = REVIEWED_KILLSWITCH_FAMILY,
-                    table = REVIEWED_KILLSWITCH_TABLE,
+                     {REVIEWED_KILLSWITCH_FAMILY}/{REVIEWED_KILLSWITCH_TABLE} killswitch chain"
                 ));
             }
         }
@@ -189,11 +185,7 @@ pub fn build_linux_killswitch_boot_report(
 /// tests can pin the parser without shelling out to `nft`.
 #[allow(dead_code)]
 pub(crate) fn parse_nft_ruleset_for_killswitch(body: &str) -> (bool, Vec<String>, Vec<String>) {
-    let table_header = format!(
-        "table {family} {table} {{",
-        family = REVIEWED_KILLSWITCH_FAMILY,
-        table = REVIEWED_KILLSWITCH_TABLE,
-    );
+    let table_header = format!("table {REVIEWED_KILLSWITCH_FAMILY} {REVIEWED_KILLSWITCH_TABLE} {{");
     let mut in_table = false;
     let mut in_killswitch_chain = false;
     let mut brace_depth: i32 = 0;
