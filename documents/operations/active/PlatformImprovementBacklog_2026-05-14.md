@@ -1063,6 +1063,24 @@ inline. Cross-reference with:
   self-tests pin positive/negative shapes including the
   longest-prefix rule + boundary check that rejects
   `my_panic!` etc. Shared regression floor bumped 53 → 62.
+* `[~]` X3 extension #7 — additional deprecated-crypto bans
+  (commit db72c4b, cycle 78). Extended
+  `FORBIDDEN_DEPRECATED_CRYPTO_CRATES` with `rc4` (RC4 NOMORE /
+  Bar-Mitzvah; RFC 7465 forbids in TLS), `md4` (Wang 2005
+  practical collisions), `md2` (RFC 6149 historic; practical
+  preimage attacks). Each entry has a parallel `deny.toml`
+  ban so a contributor cannot smuggle the crate via Cargo.toml
+  either. 3 new scanner self-tests. Shared regression floor
+  bumped 62 → 65.
+* `[~]` X3 extension #8 — 64-bit-block cipher bans (commit
+  c99cd2a, cycle 80). Extended scanner with `rc2` (Knudsen 1997
+  related-key; RFC 8407 historic) and `blowfish` (CVE-2016-2183
+  sweet32 — 64-bit-block birthday attacks). Modern protocols
+  use 128-bit-block ciphers (AES). Parallel `deny.toml` bans.
+  2 new scanner self-tests. Shared regression floor bumped
+  65 → 67. After cycles 78+80, deprecated-crypto coverage
+  spans 11 crate names with parallel Rust-source-import and
+  Cargo.toml gates.
 
 ### X4. Test coverage gaps in `*_runtime_acls.rs` / `*_service_hardening.rs` / `*_dns_failclosed.rs`
 
