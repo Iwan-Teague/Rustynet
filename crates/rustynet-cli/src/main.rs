@@ -13205,9 +13205,7 @@ fn execute_doctor() -> Result<String, String> {
     }
 
     #[cfg(target_os = "macos")]
-    {
-        check_macos_doctor(&mut checks, &mut all_pass);
-    }
+    check_macos_doctor(&mut checks, &mut all_pass);
 
     #[cfg(target_os = "windows")]
     {

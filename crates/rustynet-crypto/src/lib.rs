@@ -952,8 +952,8 @@ pub fn write_encrypted_key_file(
             file,
             std::fs::Permissions::from_mode(policy.required_file_mode),
         )
-        .map_err(|_| CryptoError::Io)?;
-    }
+        .map_err(|_| CryptoError::Io)?
+    };
     validate_key_custody_permissions(directory, file, policy)?;
     Ok(())
 }
@@ -974,8 +974,8 @@ fn write_atomic_encrypted_key_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(_mode);
-    }
+        options.mode(_mode)
+    };
 
     let mut file = options.open(&temp).map_err(|_| CryptoError::Io)?;
     if file.write_all(bytes).is_err() {
@@ -997,8 +997,8 @@ fn write_atomic_encrypted_key_file(
     #[cfg(unix)]
     {
         let parent_dir = std::fs::File::open(parent).map_err(|_| CryptoError::Io)?;
-        parent_dir.sync_all().map_err(|_| CryptoError::Io)?;
-    }
+        parent_dir.sync_all().map_err(|_| CryptoError::Io)?
+    };
     Ok(())
 }
 

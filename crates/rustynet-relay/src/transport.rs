@@ -880,9 +880,7 @@ fn persist_nonce_map(path: &Path, nonces: &HashMap<[u8; 16], u64>) -> Result<(),
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    {
-        options.mode(0o600);
-    }
+    options.mode(0o600);
     let mut file = options
         .open(&tmp_path)
         .map_err(|err| format!("open replay store tmp: {err}"))?;
@@ -1228,8 +1226,8 @@ mod tests {
                     55_070,
                 ),
                 RelayHelloResponse::Accepted(_)
-            ));
-        }
+            ))
+        };
 
         let mut restarted = RelayTransport::new_with_replay_store_path(
             TEST_RELAY_ID,

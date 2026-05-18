@@ -2439,7 +2439,7 @@ impl DataplaneSystem for MacosCommandSystem {
             self.run(PrivilegedCommandProgram::Ifconfig, &["-l"])?;
             self.run(PrivilegedCommandProgram::Route, &["-n", "get", "default"])?;
             return Ok(());
-        }
+        };
         #[allow(unreachable_code)]
         Err(SystemError::PrerequisiteCheckFailed(
             "macos command system is only supported on macos".to_owned(),

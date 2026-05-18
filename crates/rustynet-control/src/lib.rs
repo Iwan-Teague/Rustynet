@@ -1192,10 +1192,8 @@ fn ensure_secure_parent_directory(path: &Path) -> Result<(), TrustStateError> {
     }
     fs::create_dir_all(parent).map_err(|_| TrustStateError::PersistFailure)?;
     #[cfg(unix)]
-    {
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|_| TrustStateError::PersistFailure)?;
-    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|_| TrustStateError::PersistFailure)?;
     Ok(())
 }
 
@@ -1222,9 +1220,7 @@ fn atomic_write_secure(
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        options.mode(mode);
-    }
+    options.mode(mode);
     let mut temp = options
         .open(&temp_path)
         .map_err(|_| TrustStateError::PersistFailure)?;
@@ -4260,8 +4256,8 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&test_dir, std::fs::Permissions::from_mode(0o700))
-                .expect("test directory permissions should be set");
-        }
+                .expect("test directory permissions should be set")
+        };
         let path = test_dir.join("trust.state");
 
         let state = TrustState {
