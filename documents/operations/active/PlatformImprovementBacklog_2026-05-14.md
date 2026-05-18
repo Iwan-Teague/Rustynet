@@ -913,7 +913,7 @@ inline. Cross-reference with:
   canonical ProgramData accept). `windows_paths` test count
   46 → 61; new regression-coverage floor `windows_paths:61` added.
 * `[~]` Linux-side coverage expansion sweep (commits 2d2e963,
-  1c8be79):
+  1c8be79, 22e38b4):
   - `linux_authenticode` test count 3 → 22 (+19 named drift tests
     covering applicability/reason invariants, schema_version pin,
     determinism, serde round-trip + value-level round trip, drift
@@ -924,6 +924,12 @@ inline. Cross-reference with:
     missing-peer aggregation, exotic peer-id chars, schema_version
     pin, per-variant serde round-trip with `load_status` tag,
     forgiving-schema forward-compat). Floor bumped 10 → 24.
+  - `linux_runtime_acls` test count 19 → 27 (+8 named drift tests
+    covering reviewed-roots-list snapshot, schema_version pin,
+    Missing-variant serde round-trip, unknown-tag rejection, high
+    mode-bit masking, symlink-before-dir-check ordering, symlink +
+    mode drift first-fault precedence, vacuous-truth documented
+    behavior on empty-roots). Floor bumped 19 → 27.
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
