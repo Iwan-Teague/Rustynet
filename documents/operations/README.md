@@ -73,6 +73,7 @@ Current phase-local hardening checklist:
 ## High-Value Evergreen References
 
 - [BackendAgilityValidation.md](./BackendAgilityValidation.md)
+- [CliExitCodeTaxonomy.md](./CliExitCodeTaxonomy.md) — shared CLI exit-code taxonomy (sysexits.h-aligned ExitCode enum) + operator decision rules; ADR-003 holds the design rationale
 - [CompatibilitySupportPolicy.md](./CompatibilitySupportPolicy.md)
 - [ComplianceControlMap.md](./ComplianceControlMap.md)
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
@@ -102,6 +103,7 @@ Current phase-local hardening checklist:
 - [RustynetdServiceHardening.md](./RustynetdServiceHardening.md)
 - [SecretRedactionCoverage.md](./SecretRedactionCoverage.md)
 - [SecurityAssuranceProgram.md](./SecurityAssuranceProgram.md)
+- [SecurityPostureSummary.md](./SecurityPostureSummary.md) — reviewer-facing snapshot of every fail-closed verifier module, audit-gate floor pin, X2/X3 typed-view and audit-scanner inventory, dependency-deny posture, and known-open-items list
 - [SecurityRegressionLessons_2026-03-07.md](./SecurityRegressionLessons_2026-03-07.md)
 - [VulnerabilityResponse.md](./VulnerabilityResponse.md)
 - [WindowsWorkingNodeBringUpRunbook.md](./WindowsWorkingNodeBringUpRunbook.md) — operator walk-through from fresh Windows 11 host to mesh-joined node on `windows-wireguard-nt`
