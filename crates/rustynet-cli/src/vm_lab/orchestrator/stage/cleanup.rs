@@ -25,19 +25,16 @@ impl OrchestrationStage for CleanupHostsStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
-        let results: Vec<(String, Result<(), String>)> = aliases
+        let errors: Vec<String> = aliases
             .iter()
-            .map(|alias| {
-                let r = match ctx.adapters.get(alias.as_str()) {
+            .filter_map(|alias| {
+                match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
                     None => Ok(()), // no adapter = nothing to clean
-                };
-                (alias.clone(), r)
+                }
+                .err()
+                .map(|e| format!("{alias}: {e}"))
             })
-            .collect();
-        let errors: Vec<String> = results
-            .into_iter()
-            .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
             .collect();
         if errors.is_empty() {
             StageOutcome::Passed
