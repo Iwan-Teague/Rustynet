@@ -115,7 +115,10 @@ SHARED_FLOORS=(
   # module's tests pin the scanner's positive + negative shapes;
   # silently dropping any of them would let a real secret-leak
   # pattern slip past the audit on a future workspace sweep.
-  "secret_log_audit:35"
+  # Floor bumped 35→37 on signing_seed token extension: 2 new tests
+  # pin positive detection of {signing_seed:?} placeholder + silent
+  # behavior on filename mentions.
+  "secret_log_audit:37"
 )
 
 # macOS coverage floors. macOS is a control-plane platform today, not

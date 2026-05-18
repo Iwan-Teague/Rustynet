@@ -47,6 +47,13 @@ const FORBIDDEN_PLACEHOLDER_TOKENS: &[&str] = &[
     "plaintext_key",
     "raw_passphrase",
     "secret_bytes",
+    // Ed25519 raw signing-key seed material. `signing_seed: [u8; 32]`
+    // IS the private key — leaking the 32 bytes via Debug or a
+    // `{signing_seed:?}` placeholder gives the recipient the full
+    // signer identity. A workspace sweep on 2026-05-18 confirmed zero
+    // current log-macro placeholders against this token; adding the
+    // forbidden entry locks the contract forward.
+    "signing_seed",
 ];
 
 /// Format-macro names whose body we want to inspect. The audit walks
@@ -579,6 +586,42 @@ fn placeholder_scanner_flags_signing_key_bytes_inside_warn_macro() {
     assert!(
         hits.iter().any(|(_, t)| t == "signing_key_bytes"),
         "signing_key_bytes leak must be detected: {hits:?}"
+    );
+}
+
+#[test]
+fn placeholder_scanner_flags_signing_seed_inside_eprintln() {
+    // signing_seed: [u8; 32] is the raw Ed25519 private-key seed. A
+    // {signing_seed:?} placeholder leaks the entire signer identity.
+    let body = r#"
+        fn leaky() {
+            let signing_seed = [0u8; 32];
+            eprintln!("derived key from {signing_seed:?}");
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert!(
+        hits.iter().any(|(_, t)| t == "signing_seed"),
+        "signing_seed leak must be detected: {hits:?}"
+    );
+}
+
+#[test]
+fn placeholder_scanner_silent_on_signing_seed_path_string() {
+    // `signing_seed.hex` is the on-disk artifact filename used by the
+    // phase9 provenance helpers. Mentioning the FILENAME in a log
+    // line is fine — the audit must only flag the placeholder form,
+    // not bare substring mentions.
+    let body = r#"
+        fn safe() {
+            let path = "artifacts/signing_seed.hex";
+            eprintln!("provenance bundle written to {path}");
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert!(
+        hits.is_empty(),
+        "filename mention must not be flagged: {hits:?}"
     );
 }
 
