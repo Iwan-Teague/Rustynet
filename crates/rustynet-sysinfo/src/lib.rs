@@ -5826,7 +5826,7 @@ fn rustynetd_goroutine_count_internal() -> GoroutineCount {
         if let Ok(s) = String::from_utf8(output.stdout) {
             if let Some(pid_str) = s.lines().next() {
                 if let Ok(pid) = pid_str.parse::<u32>() {
-                    if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
+                    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
                         for line in status.lines() {
                             if line.starts_with("Threads:") {
                                 if let Some(threads) = line.split_whitespace().nth(1) {
