@@ -270,31 +270,19 @@ What this does **not** prove:
 ## 8. Critical Current Defects That Must Be Fixed First
 These are not optional improvements. They are correctness bugs or architectural gaps.
 
-### 8.1 STUN Candidate Port Is Currently Guessed, Not Discovered
+### 8.1 STUN Candidate Port Is Currently Guessed, Not Discovered — RESOLVED (D2, 2026-05-18)
 **Files:**
 - [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs)
 - [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
 
-**Current behavior:**
-- `StunClient::query_stun_server(...)` binds `0.0.0.0:0`, i.e. an ephemeral port.
-- `gather_public_ips()` returns only `IpAddr`, not full mapped `SocketAddr`.
-- `poll_stun_results()` later reconstructs srflx candidates by attaching `self.wg_listen_port` to the discovered public IP.
+**Status: closed by D2 of `RustynetDataplaneExecutionPlan_2026-05-18.md`.**
 
-**Why this is wrong:**
-- the NAT mapping observed by STUN is for the ephemeral STUN socket, not necessarily the WireGuard socket,
-- the NAT may not preserve the local port,
-- attaching `wg_listen_port` to the public IP is a guess, not a measured mapped endpoint,
-- this can produce false srflx candidates and failed direct probes.
+The fix landed in two parts. The first part (the typed `StunResult{mapped_endpoint, server, local_addr}` API + `gather_mapped_endpoints_with_round_trip`) landed earlier, replacing the IP-only `gather_public_ips` callers with mapped-endpoint-returning ones throughout `poll_stun_results` and the daemon runtime. D2 finished the job by:
 
-**Required fix:**
-- STUN gathering must return the full mapped public `SocketAddr`, not just IP,
-- the STUN probe must use the same UDP socket or the same bound local port that later carries peer traffic,
-- candidate publication must stop assuming the public port equals `wg_listen_port`.
+- deleting the dead deprecated `gather_public_ips()` and its internal `query_stun_server()` (the ephemeral-socket footgun — no callers, so removing it doesn't change behaviour but eliminates the ability for future code to silently regress),
+- adding two integration tests (`d2_stun_v4_discovered_port_equals_bound_socket_port`, `d2_stun_v6_discovered_port_equals_bound_socket_port`) that spawn an in-process STUN echo server on loopback, bind a real `UdpSocket` on a kernel-assigned port, run the STUN query through it, and assert byte-identical equality of `result.mapped_endpoint` with the bound socket's `local_addr()` for both IPv4 and IPv6. Loopback has no NAT, so the discovered port must equal the bound port — if these tests ever fail, the regression is the one this section originally reported.
 
-**Minimum implementation direction:**
-1. redesign [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs) to return `Vec<SocketAddr>` or richer candidate structs,
-2. stop using `SocketAddr::new(ip, self.wg_listen_port)` in daemon runtime,
-3. tie candidate discovery to the active transport socket semantics.
+The "candidate port must come from the measured mapped endpoint, never from `wg_listen_port`" contract is therefore enforced both by removing the API that returned the wrong shape and by tests that fail closed if anyone reintroduces the guess.
 
 ### 8.2 Relay Client Binds a Separate Ephemeral Socket Despite Its Own Security Comment
 **Files:**
