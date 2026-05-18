@@ -1,12 +1,12 @@
-//! TunnelBackend conformance suite run against UserspaceBackend.
+//! `TunnelBackend` conformance suite run against `UserspaceBackend`.
 //!
-//! On Linux, UserspaceBackend delegates to LinuxUserspaceSharedBackend which
+//! On Linux, `UserspaceBackend` delegates to `LinuxUserspaceSharedBackend` which
 //! requires a real TUN device and a valid private key file. Tests that need a
 //! live engine are gated behind a well-known env var
-//! (RUSTYNET_USERSPACE_CONFORMANCE_KEY) so they can be skipped in CI
+//! (`RUSTYNET_USERSPACE_CONFORMANCE_KEY`) so they can be skipped in CI
 //! environments without TUN capability.
 //!
-//! On macOS, UserspaceBackend delegates to MacosUserspaceSharedBackend (Phase 1
+//! On macOS, `UserspaceBackend` delegates to `MacosUserspaceSharedBackend` (Phase 1
 //! scaffolding): construction succeeds but all operational methods return an
 //! internal error. Platform invariant tests verify this Phase 1 contract.
 //!

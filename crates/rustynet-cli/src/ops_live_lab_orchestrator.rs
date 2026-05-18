@@ -3602,7 +3602,7 @@ pub(crate) struct ActiveNetworkRoguePathHijackHostsView {
 }
 
 /// Typed view for the evidence block: 6 typed slots covering
-/// pre-hijack / post-hijack / post-recovery WireGuard endpoint
+/// pre-hijack / post-hijack / post-recovery `WireGuard` endpoint
 /// captures plus the netcheck snapshot after hijack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ActiveNetworkRoguePathHijackEvidenceView {

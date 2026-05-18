@@ -1,8 +1,8 @@
-//! Boringtun userspace WireGuard backend for Rustynet.
+//! Boringtun userspace `WireGuard` backend for Rustynet.
 //!
-//! Provides [`UserspaceBackend`], a second non-kernel TunnelBackend
-//! implementation that drives WireGuard entirely in userspace via the
-//! vendored boringtun noise engine. The kernel WireGuard module is not
+//! Provides [`UserspaceBackend`], a second non-kernel `TunnelBackend`
+//! implementation that drives `WireGuard` entirely in userspace via the
+//! vendored boringtun noise engine. The kernel `WireGuard` module is not
 //! required; this backend can run on hosts where wg(8) is unavailable.
 //!
 //! On Linux this wraps [`LinuxUserspaceSharedBackend`] from
@@ -26,7 +26,7 @@ use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 #[cfg(target_os = "macos")]
 use rustynet_backend_wireguard::MacosUserspaceSharedBackend;
 
-/// A boringtun-driven userspace WireGuard backend.
+/// A boringtun-driven userspace `WireGuard` backend.
 ///
 /// On Linux this delegates all operations to [`LinuxUserspaceSharedBackend`].
 /// On macOS this delegates to [`MacosUserspaceSharedBackend`] (Phase 1
@@ -44,11 +44,11 @@ pub struct UserspaceBackend {
 }
 
 impl UserspaceBackend {
-    /// Construct a userspace backend for the given WireGuard interface.
+    /// Construct a userspace backend for the given `WireGuard` interface.
     ///
     /// # Arguments
     /// * `interface_name` – TUN interface name (e.g. `"rustynet0"`).
-    /// * `private_key_path` – Path to a base64-encoded WireGuard private key.
+    /// * `private_key_path` – Path to a base64-encoded `WireGuard` private key.
     /// * `listen_port` – UDP port the userspace engine should bind.
     ///
     /// Returns an error if the platform does not support this backend or if

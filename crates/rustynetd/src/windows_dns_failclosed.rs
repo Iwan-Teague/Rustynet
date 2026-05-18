@@ -4,7 +4,7 @@
 //!
 //! Captures the live Windows DNS state — per-interface DNS server
 //! addresses plus NRPT (Name Resolution Policy Table) rules — and
-//! evaluates it against the reviewed RustyNet contract:
+//! evaluates it against the reviewed `RustyNet` contract:
 //!
 //! * every network interface is configured with either an empty DNS
 //!   server list or with loopback servers only (`127.0.0.0/8` for IPv4,
@@ -18,8 +18,8 @@
 //!
 //! The pure `evaluate_windows_dns_failclosed_snapshot` aggregator
 //! returns every drift reason in one pass; the `cfg(windows)`
-//! collector queries the Windows DnsClient cmdlets via a static
-//! PowerShell invocation (no runtime-data interpolation crosses the
+//! collector queries the Windows `DnsClient` cmdlets via a static
+//! `PowerShell` invocation (no runtime-data interpolation crosses the
 //! shell boundary — the script body is a hardcoded constant) and
 //! parses the typed JSON output. Off-Windows hosts return a clear
 //! blocker error so the verifier still fails closed without
@@ -52,7 +52,7 @@ pub const REVIEWED_WINDOWS_DNS_LOOPBACK_V6: &str = "::1";
 pub const REVIEWED_WINDOWS_NRPT_ROOT_NAMESPACE: &str = ".";
 
 /// Address family captured for a per-interface DNS entry. Mirrors the
-/// PowerShell `Get-DnsClientServerAddress` enum (2 = IPv4, 23 = IPv6).
+/// `PowerShell` `Get-DnsClientServerAddress` enum (2 = IPv4, 23 = IPv6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WindowsDnsAddressFamily {
@@ -110,7 +110,7 @@ pub struct WindowsInterfaceRaState {
     pub interface_alias: String,
     pub interface_index: u32,
     /// True iff the interface accepts IPv6 Router Advertisements
-    /// from upstream (Net*IPv6Interface -RouterDiscovery=Enabled).
+    /// from upstream (Net*`IPv6Interface` -RouterDiscovery=Enabled).
     /// Reviewed posture for mesh-protected interfaces: false.
     pub router_discovery_enabled: bool,
     /// IPv6 default routes installed on this interface, source-tagged.
@@ -311,10 +311,10 @@ pub fn evaluate_nrpt_ipv6_sibling_coverage(snapshot: &WindowsDnsFailclosedSnapsh
 ///     (a non-observation cannot prove suppression)
 ///   - any interface with `router_discovery_enabled = true` → drift
 ///   - any interface with an `ra`-sourced IPv6 default route → drift
-///   - observation schema_version mismatch → drift
+///   - observation `schema_version` mismatch → drift
 ///
 /// Returns drift reasons; empty = ok. Stable interface order via
-/// BTreeMap so operators can diff outputs.
+/// `BTreeMap` so operators can diff outputs.
 pub fn evaluate_router_advertisement_suppression(
     snapshot: &WindowsDnsFailclosedSnapshot,
 ) -> Vec<String> {
@@ -1033,7 +1033,7 @@ mod tests {
         );
     }
 
-    /// IPv6 link-local (fe80::/10) as interface DNS — same leak shape
+    /// IPv6 link-local (`fe80::/10`) as interface DNS — same leak shape
     /// as IPv4 link-local but for Router-Advertisement-installed
     /// resolvers.
     #[test]
@@ -1081,7 +1081,7 @@ mod tests {
 
     /// NRPT rule forwarding to a link-local IPv6 address — a real
     /// shape that an attacker on the LAN could install via a hostile
-    /// DHCPv6 / RA response.
+    /// `DHCPv6` / RA response.
     #[test]
     fn evaluator_rejects_nrpt_rule_with_ipv6_link_local_name_server() {
         let mut snapshot = reviewed_snapshot();

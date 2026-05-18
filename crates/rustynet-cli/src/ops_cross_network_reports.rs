@@ -646,10 +646,10 @@ fn parse_key_value_artifact(path: &Path) -> Result<HashMap<String, String>, Stri
 /// `parse_key_value_artifact`. The typed view is therefore populated
 /// field-by-field from the parsed `HashMap<String, String>` rather than
 /// via `serde_json::from_value`, but the contract goal is identical:
-/// pin every required scalar (schema_version, the two pinned-known-
-/// hosts fields, the two all-targets flags, target_count) and every
-/// per-target scalar (target, configured_transport, checked_candidates,
-/// matched_candidate, host_key_status, passwordless_sudo_status) into a
+/// pin every required scalar (`schema_version`, the two pinned-known-
+/// hosts fields, the two all-targets flags, `target_count`) and every
+/// per-target scalar (target, `configured_transport`, `checked_candidates`,
+/// `matched_candidate`, `host_key_status`, `passwordless_sudo_status`) into a
 /// typed slot so downstream walkers no longer rely on raw `HashMap`
 /// lookups by stringly-typed keys.
 ///
@@ -690,10 +690,10 @@ struct CrossNetworkSshTrustTargetView {
 }
 
 impl CrossNetworkSshTrustSummaryView {
-    /// Populate the typed view from the raw key=value HashMap. Each
+    /// Populate the typed view from the raw key=value `HashMap`. Each
     /// required scalar is moved into its typed slot; per-target fields
     /// are pulled by `target[N].<field>` until `target_count` slots are
-    /// filled. Anything left in the HashMap that wasn't consumed flows
+    /// filled. Anything left in the `HashMap` that wasn't consumed flows
     /// into `extra` so downstream walkers see forward-compatible keys.
     ///
     /// Empty strings are treated as `None` so the validator can emit
@@ -1395,7 +1395,7 @@ struct CrossNetworkReportPayloadView {
 /// * Numeric/bool fields use `Option<u64>` / `Option<bool>`. A
 ///   wrong-type value (e.g. string in a u64 slot) surfaces as a
 ///   serde deserialisation error and the walker falls back to the
-///   legacy untyped walk for that path_evidence block, so a bad
+///   legacy untyped walk for that `path_evidence` block, so a bad
 ///   incoming report keeps producing the same domain-specific
 ///   problem strings it always did.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -4026,7 +4026,7 @@ mod tests {
     /// Walker integration: a wrong-type `path_live_proven` slot causes
     /// the typed deserialize to fail; the walker's legacy-fallback walk
     /// reads the remaining fields successfully so the validator emits
-    /// the specific "path_live_proven must be true" problem string
+    /// the specific "`path_live_proven` must be true" problem string
     /// instead of cascading "missing" failures across every slot.
     #[test]
     fn validate_report_payload_falls_back_to_untyped_walk_on_wrong_type_slot() {
@@ -4149,7 +4149,7 @@ mod tests {
     /// `None` into the typed slot and the validator surfaces the
     /// existing "must be a non-empty string" message — verifying that
     /// missing scalars are caught at the typed layer rather than via a
-    /// raw HashMap lookup deep in the validator.
+    /// raw `HashMap` lookup deep in the validator.
     #[test]
     fn cross_network_ssh_trust_summary_view_rejects_missing_required_field() {
         let mut map = clean_ssh_trust_summary_map();

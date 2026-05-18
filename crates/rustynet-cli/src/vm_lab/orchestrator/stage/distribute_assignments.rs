@@ -123,7 +123,7 @@ pub(crate) fn build_bundle_env(
     Ok(lines.join("\n") + "\n")
 }
 
-/// Shared bundle distribution logic used by Assignment, Traversal, and DnsZone stages.
+/// Shared bundle distribution logic used by Assignment, Traversal, and `DnsZone` stages.
 pub(crate) fn distribute_bundle_kind(
     ctx: &mut OrchestrationContext,
     kind: BundleKind,

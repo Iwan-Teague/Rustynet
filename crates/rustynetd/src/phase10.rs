@@ -2895,7 +2895,7 @@ const WINDOWS_KS_RULE_LOOPBACK: &str = "RustyNetKS-AllowLoopback";
 const WINDOWS_KS_RULE_TUNNEL: &str = "RustyNetKS-AllowTunnel";
 const WINDOWS_KS_RULE_EGRESS: &str = "RustyNetKS-AllowEgress";
 /// Block UDP/53 outbound on non-tunnel (LAN) interfaces.  Forces DNS through the
-/// WireGuard tunnel — equivalent to the Linux nft rule
+/// `WireGuard` tunnel — equivalent to the Linux nft rule
 /// `udp dport 53 oifname != $tunnel drop`.
 const WINDOWS_DNS_RULE_BLOCK_LAN_UDP: &str = "RustyNetDNS-BlockLanUdp";
 /// Block TCP/53 outbound on non-tunnel (LAN) interfaces.  Symmetric to the UDP
@@ -2911,16 +2911,16 @@ const WINDOWS_PS_ASSERT_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPrefe
 const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
 /// Verify the OS still has every reviewed killswitch rule in place AND the
 /// global default outbound policy is still `Block`.  Each rule name and the
-/// expected attributes are passed as PowerShell parameters so no value is
+/// expected attributes are passed as `PowerShell` parameters so no value is
 /// interpolated into the script body.  Throws on the first drift detected.
 const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $TunnelName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($LoopbackName, $TunnelName, $EgressName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Allow') { throw \"rule $displayName action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
 /// Create an outbound allow rule scoped to a specific Windows network interface
-/// by alias using `New-NetFirewallRule -InterfaceAlias`.  Used for the WireGuard
-/// tunnel interface whose MediaType is `IP` / Virtual — wintun-based adapters do
+/// by alias using `New-NetFirewallRule -InterfaceAlias`.  Used for the `WireGuard`
+/// tunnel interface whose `MediaType` is `IP` / Virtual — wintun-based adapters do
 /// NOT match the `ras` or `lan` interface-type categories recognised by
 /// `netsh advfirewall`, so `interfacetype=` cannot scope the rule correctly.
-/// PowerShell's `-InterfaceAlias` parameter binds by adapter name regardless of
+/// `PowerShell`'s `-InterfaceAlias` parameter binds by adapter name regardless of
 /// how Windows classifies the underlying adapter type.
 const WINDOWS_PS_ADD_KS_TUNNEL_RULE: &str = "& { param($RuleName, $InterfaceAlias) $ErrorActionPreference = 'Stop'; New-NetFirewallRule -DisplayName $RuleName -Direction Outbound -Action Allow -InterfaceAlias $InterfaceAlias -ErrorAction Stop | Out-Null }";
 
@@ -4927,7 +4927,7 @@ fn windows_firewall_allow_loopback_args(rule_name: &str) -> Vec<String> {
 }
 
 /// Build the netsh argv that adds an outbound allow rule for a Windows
-/// interface type — `ras` for the WireGuard tunnel (Remote Access Service
+/// interface type — `ras` for the `WireGuard` tunnel (Remote Access Service
 /// adapters) or `lan` for the physical underlay.  These rules carve specific
 /// holes in the global outbound block; they are intentionally narrow because
 /// any leak past one of them would bypass the killswitch.
@@ -4947,7 +4947,7 @@ fn windows_firewall_allow_interfacetype_args(rule_name: &str, iface_type: &str) 
 /// Build the netsh argv that adds an outbound block rule for the given protocol
 /// (`udp` or `tcp`) and remote port 53 on `interfacetype=lan`.  The rule blocks
 /// DNS traffic on every non-tunnel interface so all DNS is forced through the
-/// WireGuard tunnel — equivalent to the Linux nft rule
+/// `WireGuard` tunnel — equivalent to the Linux nft rule
 /// `<proto> dport 53 oifname != $tunnel drop`.
 fn windows_dns_block_lan_args(rule_name: &str, protocol: &str) -> Vec<String> {
     vec![
@@ -4979,7 +4979,7 @@ fn windows_firewall_delete_rule_args(rule_name: &str) -> Vec<String> {
 
 /// Build the netsh argv that disables IPv6 router-discovery and advertise on the
 /// underlay egress adapter so SLAAC cannot auto-configure a global IPv6 address
-/// behind the daemon's back while the killswitch + WireGuard tunnel are active.
+/// behind the daemon's back while the killswitch + `WireGuard` tunnel are active.
 ///
 /// The egress alias is passed as a positional `interface` parameter (its own
 /// argv element) so spaces inside common Windows aliases like "Ethernet 2" are
@@ -9890,7 +9890,7 @@ mod tests {
     // each committed path change — the ACL rule set must never be in a
     // more-permissive state after a transition than it was before.
 
-    /// Helper: build a Phase10Controller in DataplaneApplied state with one
+    /// Helper: build a `Phase10Controller` in `DataplaneApplied` state with one
     /// managed peer (node-b) that has both direct and relay endpoints
     /// configured.  Stability windows are set to 0 so the second consecutive
     /// call to `consider_path_change_for_peer` always commits immediately.

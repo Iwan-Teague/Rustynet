@@ -2,7 +2,7 @@
 
 //! Control-plane state fetcher with signature verification and watermark anti-replay.
 //!
-//! This module implements StateFetcher for pull-based signed bundle retrieval
+//! This module implements `StateFetcher` for pull-based signed bundle retrieval
 //! with strict verification order and fail-closed semantics.
 
 use std::fs;

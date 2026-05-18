@@ -589,7 +589,7 @@ pub struct PulledLinuxExitBundles {
 /// Pull the four signed bundles from a Linux exit guest down to a
 /// local staging directory. Writes a typed JSON report under
 /// `<report_dir>/windows_state_pull_from_linux_exit.json` with one
-/// entry per bundle (name + status + local_path + summary). On Pass
+/// entry per bundle (name + status + `local_path` + summary). On Pass
 /// the local paths are returned in `PulledLinuxExitBundles`. On Fail
 /// the function returns an `Err` with the report path so operators
 /// can see exactly which bundle's SCP failed and why.
@@ -5144,7 +5144,7 @@ pub enum RuntimePathRole {
     Trust,
     /// Where signed membership snapshot + log + watermark live.
     Membership,
-    /// Where WireGuard / mesh keys live.
+    /// Where `WireGuard` / mesh keys live.
     Keys,
     /// Where DPAPI / encrypted-at-rest secrets live.
     Secrets,
@@ -5168,7 +5168,7 @@ impl RuntimePathRole {
     }
 }
 
-/// Adapter over the canonical runtime path roots a RustyNet host
+/// Adapter over the canonical runtime path roots a `RustyNet` host
 /// publishes to the orchestrator. Implementations are platform-
 /// specific; macOS / iOS / Android are intentionally `Unsupported`
 /// stubs that fail closed per CLAUDE.md §3 ("Fail closed when
@@ -5267,7 +5267,7 @@ impl RuntimePaths for WindowsRuntimePaths {
 /// `RuntimePaths` stub that fails every lookup with a typed blocker
 /// reason. Used for OS variants the orchestrator must still
 /// instantiate (so callers do not silently fabricate a host-shaped
-/// answer for an unsupported platform) but for which RustyNet has
+/// answer for an unsupported platform) but for which `RustyNet` has
 /// not yet defined a reviewed runtime layout. Per CLAUDE.md §3
 /// ("Fail closed when trust/security state is missing") the stub
 /// MUST reject every method with a clear blocker reason — never a
@@ -5341,9 +5341,9 @@ fn runtime_paths_for(platform: VmGuestPlatform) -> Box<dyn RuntimePaths> {
 /// than embedding them in a string the caller would need to parse.
 ///
 /// Install, enable, and uninstall on Windows go through the reviewed
-/// PowerShell helpers under `scripts/bootstrap/windows/`; the adapter
+/// `PowerShell` helpers under `scripts/bootstrap/windows/`; the adapter
 /// returns a `HelperScript` invocation referring to the helper's
-/// canonical install location on the guest, never inline PowerShell.
+/// canonical install location on the guest, never inline `PowerShell`.
 /// On Linux these operations are systemd argv (no helper scripts
 /// required).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5406,7 +5406,7 @@ fn validate_service_name(service_name: &str) -> Result<(), String> {
 }
 
 /// Linux systemd-backed service manager. Install / enable / uninstall
-/// are direct `systemctl` invocations; on most reviewed RustyNet
+/// are direct `systemctl` invocations; on most reviewed `RustyNet`
 /// installs the unit file ships under `/etc/systemd/system` already, so
 /// the install op is `systemctl daemon-reload` followed by
 /// `systemctl enable`. The orchestrator dispatches each step
@@ -5480,10 +5480,10 @@ impl ServiceManager for LinuxServiceManager {
 }
 
 /// Windows SCM-backed service manager. Install / enable / uninstall go
-/// through the reviewed PowerShell helpers under
+/// through the reviewed `PowerShell` helpers under
 /// `scripts/bootstrap/windows/` (already audited W2.3 + this slice's
 /// `Install-RustyNetWindowsService.ps1` patches). Start / stop /
-/// status / restart are PowerShell cmdlet argv invocations — the
+/// status / restart are `PowerShell` cmdlet argv invocations — the
 /// PS5.1 `sc.exe binPath= …` quoting bug only triggers on values that
 /// embed both spaces and quotes (the install-helper's binPath
 /// construction); pure cmdlet invocations like `Start-Service -Name X`
@@ -5647,7 +5647,7 @@ fn service_manager_for(platform: VmGuestPlatform) -> Box<dyn ServiceManager> {
 /// One unit of remote dispatch. Two kinds: a Linux POSIX SSH `argv`
 /// invocation (where the SSH client itself receives `argv` and the
 /// remote shell never sees a constructed string), and a Windows SSH
-/// `EncodedCommand` invocation (where the PowerShell script body is
+/// `EncodedCommand` invocation (where the `PowerShell` script body is
 /// base64-encoded so SSH transport is oblivious to PS quoting). Both
 /// preserve the W2.3 argv-only contract end-to-end.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5658,7 +5658,7 @@ pub enum RemoteInvocation {
         ssh_target: String,
         argv: Vec<String>,
     },
-    /// Windows SSH: PowerShell script body base64-wrapped via
+    /// Windows SSH: `PowerShell` script body base64-wrapped via
     /// `-EncodedCommand`. The body itself is delivered untouched to
     /// the remote PS interpreter.
     WindowsSshEncodedPowerShell {
@@ -5714,9 +5714,9 @@ impl RemoteExec for PosixRemoteExec {
     }
 }
 
-/// Windows SSH + PowerShell adapter. The argv list is rendered as a
+/// Windows SSH + `PowerShell` adapter. The argv list is rendered as a
 /// `Start-Process` call with `-ArgumentList @('a','b',…)` so the
-/// remote PowerShell interpreter receives the args as a typed array
+/// remote `PowerShell` interpreter receives the args as a typed array
 /// rather than a re-parsed string — matches the
 /// `build_ssh_powershell_encoded_invocation` path the existing
 /// per-stage helpers already use, and inherits the same single-quoted
@@ -7508,7 +7508,7 @@ fn run_windows_orchestration_stages(
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WindowsOrchestrationOptions {
     /// Skip the UTM-result-file access bootstrap step. Use when SSH +
-    /// authorized_keys are already set up on the guest, and utmctl is
+    /// `authorized_keys` are already set up on the guest, and utmctl is
     /// unavailable in the calling shell. Subsequent SSH-based stages still
     /// run unchanged.
     pub skip_access_bootstrap: bool,
@@ -7523,7 +7523,7 @@ pub struct WindowsOrchestrationOptions {
     pub no_fail_on_authenticode: bool,
     /// Local path to a signed-membership snapshot to push to the
     /// Windows guest's canonical membership path. `None` skips the
-    /// distribute_windows_membership stage.
+    /// `distribute_windows_membership` stage.
     pub distribute_windows_membership_bundle: Option<PathBuf>,
     /// Local path to a signed-assignment bundle.
     pub distribute_windows_assignment_bundle: Option<PathBuf>,
@@ -7537,7 +7537,7 @@ pub struct WindowsOrchestrationOptions {
     /// signed assignment bundle on ingest. Without it the daemon
     /// rejects every distributed assignment as
     /// "read verifier key failed" and stays in restricted-safe.
-    /// `None` skips the distribute_windows_assignment_verifier_key
+    /// `None` skips the `distribute_windows_assignment_verifier_key`
     /// stage.
     pub distribute_windows_assignment_verifier_key: Option<PathBuf>,
     /// Local path to the mesh's traversal-bundle verifier public key.
@@ -8994,12 +8994,12 @@ fn windows_exit_evidence_artifact_specs() -> &'static [WindowsExitEvidenceArtifa
     ]
 }
 
-/// Build the PowerShell script body that invokes one of the security-check
+/// Build the `PowerShell` script body that invokes one of the security-check
 /// subcommands on the live Windows guest. Centralizes argv-only discipline so
 /// every stage helper goes through the same audited path: the binary path and
 /// every additional argument is quoted via `powershell_quote`, the subcommand
 /// name and well-formed flags pass through unquoted, and any value carrying a
-/// PowerShell metacharacter or control byte is rejected at construction.
+/// `PowerShell` metacharacter or control byte is rejected at construction.
 fn build_windows_security_check_invocation(
     subcommand: &str,
     extra_args: &[String],
@@ -10365,7 +10365,7 @@ fn evaluate_windows_mesh_join_report(
 
 /// Reviewed Windows-side bundle distribution contract — the path
 /// triple every signed bundle's distribution helper needs (canonical
-/// landing path, watermark path the daemon's WatermarkStore reads,
+/// landing path, watermark path the daemon's `WatermarkStore` reads,
 /// staging directory for in-flight uploads, filename prefix for the
 /// per-run unique staging file).
 ///
@@ -10384,7 +10384,7 @@ struct WindowsBundleDistributionContract {
     /// Canonical landing path on the Windows guest. The daemon's
     /// fetcher reads this on every refresh tick.
     canonical_path: &'static str,
-    /// Watermark-store path the daemon's WatermarkStore reads.
+    /// Watermark-store path the daemon's `WatermarkStore` reads.
     /// Deleting this file forces the daemon to re-ingest the new
     /// bundle on next refresh — same semantics as
     /// `root rm -f /var/lib/rustynet/<bundle>.watermark` on the
@@ -10483,10 +10483,10 @@ const WINDOWS_BUNDLE_DNS_ZONE_VERIFIER_KEY: WindowsBundleDistributionContract =
         staging_prefix: "dns-zone.pub",
     };
 
-/// Build the PowerShell script body that ensures the staging
+/// Build the `PowerShell` script body that ensures the staging
 /// directory exists. `New-Item -Force` is idempotent. The path is
 /// a hard-coded reviewed constant so no untrusted value crosses the
-/// PowerShell boundary; we still wrap through `powershell_quote`
+/// `PowerShell` boundary; we still wrap through `powershell_quote`
 /// for argv-only consistency with the rest of the orchestrator's
 /// PS construction.
 #[allow(dead_code)]
@@ -10499,7 +10499,7 @@ fn build_windows_bundle_ensure_staging_dir_script(
     ))
 }
 
-/// Build the atomic install + watermark-clear PowerShell body. The
+/// Build the atomic install + watermark-clear `PowerShell` body. The
 /// staging filename is filtered to ASCII alphanumeric + `-` `_` `.`
 /// only — defense-in-depth against a future caller who feeds an
 /// operator-controlled value into the staging-name parameter and
@@ -10870,7 +10870,7 @@ fn validate_mesh_node_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates that `addr` is safe for use as an endpoint address in NODES_SPEC:
+/// Validates that `addr` is safe for use as an endpoint address in `NODES_SPEC`:
 /// ASCII alphanumeric + dot + colon + hyphen, rejecting the `|` and `;`
 /// separators used in the spec format.
 fn validate_mesh_endpoint_address(addr: &str) -> Result<(), String> {
@@ -10909,7 +10909,7 @@ fn extract_env_var_from_text(text: &str, key: &str) -> Option<String> {
 /// Adds `windows_alias` to the Linux mesh membership on `exit_alias` and
 /// fetches the updated `membership.snapshot`.
 ///
-/// Collects the Windows WireGuard pubkey via PowerShell, runs
+/// Collects the Windows `WireGuard` pubkey via `PowerShell`, runs
 /// `rustynet ops e2e-membership-add` on the exit node, then captures the
 /// updated snapshot to `<report_dir>/state/windows-membership.snapshot`.
 ///
@@ -13613,7 +13613,7 @@ pub enum LiveLabStageCapability {
     /// protected-mode DNS path (security-bar for the W1.3 verifier
     /// + W1.4 stage).
     WindowsNrptDns,
-    /// PowerShell SSH dispatch over the encoded-command channel.
+    /// `PowerShell` SSH dispatch over the encoded-command channel.
     WindowsPowershellShell,
 }
 
@@ -15124,13 +15124,13 @@ pub fn execute_ops_vm_lab_preflight(config: VmLabPreflightConfig) -> Result<Stri
 ///
 /// For each selected alias:
 ///   1. Resolve the SSH target IP from the inventory.
-///   2. Probe TCP/<ssh_port> with a short timeout to confirm the VM
+///   2. Probe TCP/<`ssh_port`> with a short timeout to confirm the VM
 ///      is up + SSH server is listening.
 ///   3. If TCP open, run a minimal identity probe over SSH (`whoami`
-///      on POSIX, `whoami` via PowerShell on Windows) to confirm
+///      on POSIX, `whoami` via `PowerShell` on Windows) to confirm
 ///      authentication + the right user identity.
-///   4. Record alias / ssh_target / platform / port_open / auth_ok
-///      / observed_user / blocker.
+///   4. Record alias / `ssh_target` / platform / `port_open` / `auth_ok`
+///      / `observed_user` / blocker.
 ///
 /// Continues across aliases so the operator sees the full set of
 /// blockers in one report. Returns the report JSON on success
@@ -20540,9 +20540,9 @@ fn append_utmctl_windows_exec_command(command: &mut Command, args: &[&str]) {
     }
 }
 
-/// Remove PowerShell CLIXML serialization payloads from a stderr buffer.
+/// Remove `PowerShell` CLIXML serialization payloads from a stderr buffer.
 ///
-/// PowerShell, when invoked as a child process with `-OutputFormat Text`,
+/// `PowerShell`, when invoked as a child process with `-OutputFormat Text`,
 /// still emits its non-stdout streams (Progress, Verbose, Information,
 /// sometimes Error and Warning records) as a CLIXML envelope on stderr
 /// the first time the host runspace initializes after a cold boot or a
@@ -20554,7 +20554,7 @@ fn append_utmctl_windows_exec_command(command: &mut Command, args: &[&str]) {
 /// The CLIXML payload always begins with the literal `#< CLIXML` marker
 /// followed by an XML envelope.  This helper drops that marker and any
 /// XML-like lines, returning whatever else is left.  Real utmctl host
-/// failures (Apple Events errors, OSStatus codes, "Access is denied"
+/// failures (Apple Events errors, `OSStatus` codes, "Access is denied"
 /// from the guest agent) are plain text and pass through untouched.
 fn strip_powershell_clixml_noise(stderr: &str) -> String {
     let mut kept = Vec::new();
@@ -20597,7 +20597,7 @@ fn format_remote_capture_exit_error(rc: i32, output: &str) -> String {
     }
 }
 
-/// Build a PowerShell wrapper script that runs `powershell_script` and
+/// Build a `PowerShell` wrapper script that runs `powershell_script` and
 /// writes its captured output and exit code to two files in the staging
 /// directory. utmctl exec exposes only the guest exit code (no stdout
 /// or stderr capture), so we redirect the inner script's combined
@@ -20653,8 +20653,8 @@ fn build_utm_windows_result_file_wrapper_script(
     ))
 }
 
-/// Execute a PowerShell script on a Windows UTM guest via the guest agent
-/// (network-independent) and return its (exit_code, captured_output).
+/// Execute a `PowerShell` script on a Windows UTM guest via the guest agent
+/// (network-independent) and return its (`exit_code`, `captured_output`).
 ///
 /// Mechanism:
 /// 1. Wrap the script so it writes output and rc to two files in
@@ -20664,7 +20664,7 @@ fn build_utm_windows_result_file_wrapper_script(
 /// 3. `utmctl file pull` the rc and output files back.
 /// 4. Best-effort remove the remote files.
 ///
-/// This survives mid-orchestration network changes (e.g. WireGuard
+/// This survives mid-orchestration network changes (e.g. `WireGuard`
 /// interface coming up and reordering routes) because it never touches
 /// SSH. It is the primary control channel for Windows UTM guests; SSH
 /// is the fallback when utmctl itself errors.

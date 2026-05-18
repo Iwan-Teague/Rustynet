@@ -735,12 +735,12 @@ pub fn execute_ops_verify_membership_phase10_report(
 /// Read + typed-parse the membership phase10 report at `report_path` and
 /// fail closed with a precise reason when:
 ///
-/// * the file does not exist — ConfigError: "schema validation" path missing
-/// * the file is not valid UTF-8 — ConfigError: "malformed"
-/// * the file is not valid JSON — ConfigError: "parse error"
-/// * a required schema field is missing or has the wrong type — ConfigError:
+/// * the file does not exist — `ConfigError`: "schema validation" path missing
+/// * the file is not valid UTF-8 — `ConfigError`: "malformed"
+/// * the file is not valid JSON — `ConfigError`: "parse error"
+/// * a required schema field is missing or has the wrong type — `ConfigError`:
 ///   "schema validation"
-/// * `status != "pass"` — PolicyReject: "fail-closed"
+/// * `status != "pass"` — `PolicyReject`: "fail-closed"
 fn verify_membership_phase10_report(report_path: &Path) -> Result<String, String> {
     if !report_path.exists() {
         return Err(format!(

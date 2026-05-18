@@ -18,7 +18,7 @@
 //! resolv.conf check stays as the floor.
 //!
 //! The pure evaluator takes a parsed list of nameserver addresses
-//! and confirms every one is loopback (127.0.0.0/8 for IPv4, ::1/128
+//! and confirms every one is loopback (127.0.0.0/8 for IPv4, `::1/128`
 //! for IPv6). Off-loopback nameservers count as drift.
 //!
 //! Wired through the CLI as `rustynetd linux-dns-failclosed-check`.
@@ -33,7 +33,7 @@ pub const REVIEWED_RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 /// (127.0.0.53:53) is active. Reading the file does not require
 /// systemctl / dbus and is cheap to probe.
 pub const SYSTEMD_RESOLVED_STUB_FILE: &str = "/run/systemd/resolve/stub-resolv.conf";
-/// NetworkManager configuration file. The `[main] dns=` key selects
+/// `NetworkManager` configuration file. The `[main] dns=` key selects
 /// whether NM writes `/etc/resolv.conf` directly (`default`), defers
 /// to dnsmasq on loopback (`dnsmasq`), defers to systemd-resolved
 /// (`systemd-resolved`), or stays out of resolver management
@@ -61,8 +61,8 @@ pub struct LinuxDnsFailclosedSnapshot {
     /// before the daemon's bind attempt fails.
     #[serde(default)]
     pub systemd_resolved_stub_present: bool,
-    /// L4 race-shape coverage: NetworkManager `[main] dns=` value, or
-    /// `None` if NetworkManager isn't configured on this host. The
+    /// L4 race-shape coverage: `NetworkManager` `[main] dns=` value, or
+    /// `None` if `NetworkManager` isn't configured on this host. The
     /// evaluator flags `default` (NM writes resolv.conf directly) as
     /// precedence drift because NM can overwrite /etc/resolv.conf at
     /// any link change and reintroduce off-loopback nameservers.
@@ -148,7 +148,7 @@ fn evaluate_systemd_resolved_race(
     }
 }
 
-/// L4 race coverage: surface NetworkManager precedence drift. The
+/// L4 race coverage: surface `NetworkManager` precedence drift. The
 /// only modes that are fail-closed compatible are `none` (NM stays
 /// out of resolver state) and `systemd-resolved` / `dnsmasq` (both
 /// keep the resolver on loopback). `default` means NM writes
@@ -563,7 +563,7 @@ domain example.lan
         );
     }
 
-    /// IPv6 link-local fe80::/10 — NetworkManager / RA-installed
+    /// IPv6 link-local `fe80::/10` — `NetworkManager` / RA-installed
     /// resolver case. Off-loopback, must drift.
     #[test]
     fn evaluator_rejects_ipv6_link_local_nameserver() {
@@ -578,7 +578,7 @@ domain example.lan
         );
     }
 
-    /// IPv4-mapped IPv6 (::ffff:8.8.8.8) — same wire address as 8.8.8.8
+    /// IPv4-mapped IPv6 (`::ffff:8.8.8.8`) — same wire address as 8.8.8.8
     /// but written as v6. Must not be treated as loopback.
     #[test]
     fn evaluator_rejects_ipv4_mapped_external_nameserver() {
@@ -622,7 +622,7 @@ domain example.lan
     }
 
     /// One loopback + one external → external is flagged, loopback is
-    /// not. Race shape: NetworkManager appended a public resolver after
+    /// not. Race shape: `NetworkManager` appended a public resolver after
     /// systemd-resolved's stub line during precedence resolution.
     #[test]
     fn evaluator_flags_only_off_loopback_entry_when_mixed() {
@@ -640,8 +640,8 @@ domain example.lan
         );
     }
 
-    /// IPv6 link-local with zone-id (fe80::1%eth0) is not a parseable
-    /// IpAddr in Rust std — confirm the evaluator surfaces it as a
+    /// IPv6 link-local with zone-id (`fe80::1%eth0`) is not a parseable
+    /// `IpAddr` in Rust std — confirm the evaluator surfaces it as a
     /// parse failure rather than silently accepting.
     #[test]
     fn evaluator_rejects_zoneid_suffixed_link_local() {
@@ -735,7 +735,7 @@ nameserver 127.0.0.1
         );
     }
 
-    /// Snapshot test: pin schema_version on report builds. Bumping it
+    /// Snapshot test: pin `schema_version` on report builds. Bumping it
     /// must be a deliberate change with a paired migration test, not a
     /// silent drift.
     #[test]
@@ -804,7 +804,7 @@ nameserver 127.0.0.1
 
     // ---- L4 race coverage: NetworkManager precedence -----------------
 
-    /// `dns=none` is fail-closed-compatible: NetworkManager stays out
+    /// `dns=none` is fail-closed-compatible: `NetworkManager` stays out
     /// of resolver state, so rustynet's loopback resolver is safe.
     #[test]
     fn evaluator_accepts_network_manager_dns_none() {
@@ -838,7 +838,7 @@ nameserver 127.0.0.1
         assert!(reasons.is_empty(), "dns=dnsmasq must pass: {reasons:?}");
     }
 
-    /// `dns=default` lets NetworkManager rewrite `/etc/resolv.conf`
+    /// `dns=default` lets `NetworkManager` rewrite `/etc/resolv.conf`
     /// directly on every link change — that can reintroduce
     /// off-loopback nameservers at runtime. Flag as drift.
     #[test]

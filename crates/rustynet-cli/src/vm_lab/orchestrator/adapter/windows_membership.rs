@@ -17,7 +17,7 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read the membership owner public key from a Windows exit node.
-/// Reads `WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH` via PowerShell `Get-Content`.
+/// Reads `WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH` via `PowerShell` `Get-Content`.
 pub fn issue_membership_owner_key(
     conn: &NodeConnection,
 ) -> Result<MembershipOwnerKey, AdapterError> {
@@ -50,7 +50,7 @@ pub fn issue_membership_owner_key(
 /// The initial membership snapshot was already created by `rustynetd membership init`
 /// during `bootstrap_hosts`.  This function adds each non-exit peer by calling
 /// `rustynetd membership add-peer` (backed by the owner signing key stored in
-/// `WINDOWS_MEMBERSHIP_OWNER_KEY_PATH`, encrypted with the WireGuard passphrase DPAPI
+/// `WINDOWS_MEMBERSHIP_OWNER_KEY_PATH`, encrypted with the `WireGuard` passphrase DPAPI
 /// blob).  Finally it reads back the updated snapshot bytes.
 ///
 /// The `rustynet-windows-trust-cli` binary (`rustynet.exe`) only supports `trust`
@@ -136,7 +136,7 @@ pub fn init_membership_snapshot(
 
 /// Distribute a signed bundle to a Windows client node.
 /// Stages the bundle in `WINDOWS_STAGING_DIR`, SCPs it, then uses
-/// PowerShell `Move-Item` to install atomically to the final path.
+/// `PowerShell` `Move-Item` to install atomically to the final path.
 pub fn distribute_signed_bundle(
     conn: &NodeConnection,
     kind: BundleKind,

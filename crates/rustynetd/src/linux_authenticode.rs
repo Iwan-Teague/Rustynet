@@ -3,7 +3,7 @@
 //! Linux authenticode-equivalent stub.
 //!
 //! Authenticode is a Windows-specific binary signature mechanism
-//! (`WinVerifyTrust` + the WINTRUST_ACTION_GENERIC_VERIFY_V2 chain).
+//! (`WinVerifyTrust` + the `WINTRUST_ACTION_GENERIC_VERIFY_V2` chain).
 //! Linux does not enforce binary signatures at runtime — package
 //! signature verification happens at install time via dpkg / rpm /
 //! apt-secure / dnf-gpgcheck, not as a runtime binary attestation.

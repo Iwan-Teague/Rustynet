@@ -36,7 +36,7 @@ pub struct LinuxServiceHardeningReport {
     pub drift_reasons: Vec<String>,
     /// The full parsed property map (sorted) so an operator can
     /// see exactly what `systemctl show` reported. Useful for
-    /// post-mortem when drift_reasons is non-empty.
+    /// post-mortem when `drift_reasons` is non-empty.
     pub observed: BTreeMap<String, String>,
 }
 

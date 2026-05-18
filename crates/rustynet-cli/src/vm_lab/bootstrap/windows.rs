@@ -779,7 +779,7 @@ impl WindowsVerifyReportView {
     /// when shape drift is detected:
     /// - invalid JSON
     /// - missing/wrong type on any required field
-    /// - schema_version other than 3 (the contract the helper emits today)
+    /// - `schema_version` other than 3 (the contract the helper emits today)
     /// - status not in {pass, fail, blocked}
     /// - status=fail or status=blocked with empty reason
     #[allow(dead_code)]
@@ -817,12 +817,12 @@ impl WindowsVerifyReportView {
 /// trap (compact failure report from `New-FailClosedInstallReport`).
 ///
 /// Both branches share the documented required fields below.
-/// Success-only fields (cli_optional, start_attempted, start_error,
-/// daemon_present, cli_present, config_present, log_root_present,
-/// trust_root_present, secrets_root_present, service_sid_configured,
-/// runtime_acl_applied, service_state, service_start_mode,
-/// service_exit_code, service_process_id, service_image_path*,
-/// runtime_flags_present, wireguard_driver*, dns_failclosed_posture)
+/// Success-only fields (`cli_optional`, `start_attempted`, `start_error`,
+/// `daemon_present`, `cli_present`, `config_present`, `log_root_present`,
+/// `trust_root_present`, `secrets_root_present`, `service_sid_configured`,
+/// `runtime_acl_applied`, `service_state`, `service_start_mode`,
+/// `service_exit_code`, `service_process_id`, `service_image_path`*,
+/// `runtime_flags_present`, `wireguard_driver`*, `dns_failclosed_posture`)
 /// are accepted via `#[serde(default)]` so a typed consumer can
 /// deserialize either branch through this view. Unlike the Verify
 /// helper, Install never emits the `blocked` status — the runtime
@@ -861,7 +861,7 @@ impl WindowsInstallReportView {
     /// when shape drift is detected:
     /// - invalid JSON
     /// - missing/wrong type on any required field
-    /// - schema_version other than 1 (the contract the helper emits today)
+    /// - `schema_version` other than 1 (the contract the helper emits today)
     /// - status not in {pass, fail}
     /// - status=fail with empty reason
     #[allow(dead_code)]
@@ -924,9 +924,9 @@ impl WindowsPrepareTransportReportView {
     /// - missing/wrong type on any field (every field is required)
     /// - status not in {pass, fail}
     /// - status=fail with empty reason
-    /// - status=pass with host_key_present=true but empty host_key
+    /// - status=pass with `host_key_present=true` but empty `host_key`
     ///   (the success contract documented at line 1042-1047 of the
-    ///   helper is: host_key_present implies a non-empty host_key)
+    ///   helper is: `host_key_present` implies a non-empty `host_key`)
     #[allow(dead_code)]
     pub(crate) fn parse(body: &str) -> Result<Self, String> {
         let view: WindowsPrepareTransportReportView = serde_json::from_str(body)
@@ -996,12 +996,12 @@ impl WindowsBuildReleaseReportView {
     /// Fails closed on shape drift:
     /// - invalid JSON
     /// - missing/wrong type on any required field
-    /// - schema_version other than 2 (helper contract today)
+    /// - `schema_version` other than 2 (helper contract today)
     /// - phase != "build-release"
     /// - status not in {pass, fail}
     /// - status=fail with empty/whitespace reason
-    /// - toolchain_scope not in {"", machine, user, unknown}
-    /// - exit_code=0 with status=fail (the helper invariant: a zero
+    /// - `toolchain_scope` not in {"", machine, user, unknown}
+    /// - `exit_code=0` with status=fail (the helper invariant: a zero
     ///   exit cannot coexist with a failure)
     #[allow(dead_code)]
     pub(crate) fn parse(body: &str) -> Result<Self, String> {

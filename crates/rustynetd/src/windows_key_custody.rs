@@ -5,13 +5,13 @@
 //! Validates that the on-disk key material on a Windows runtime host matches
 //! the reviewed custody contract:
 //!
-//! * the WireGuard runtime passphrase is stored as a DPAPI-protected blob at
+//! * the `WireGuard` runtime passphrase is stored as a DPAPI-protected blob at
 //!   the reviewed `.dpapi` path and is ACL-locked;
-//! * the encrypted WireGuard private key file exists at the reviewed path
+//! * the encrypted `WireGuard` private key file exists at the reviewed path
 //!   and is ACL-locked;
-//! * the plaintext WireGuard private key file is absent at rest (Phase E
+//! * the plaintext `WireGuard` private key file is absent at rest (Phase E
 //!   migrated runtime key custody to encrypted-at-rest);
-//! * the WireGuard public key file exists at the reviewed path and is
+//! * the `WireGuard` public key file exists at the reviewed path and is
 //!   ACL-locked.
 //!
 //! The pure `evaluate_windows_key_custody` aggregator returns every drift
@@ -537,7 +537,7 @@ mod tests {
     // ---- W6: DPAPI LocalMachine rotation tests ----------------------
 
     /// Helper: produce a reviewed DPAPI blob ACL — service-SID owner,
-    /// LocalSystem and BUILTIN\Administrators granted, protected DACL.
+    /// `LocalSystem` and BUILTIN\Administrators granted, protected DACL.
     fn reviewed_dpapi_sddl() -> &'static str {
         "O:S-1-5-80-1234567890D:P(A;;FA;;;SY)(A;;FA;;;BA)"
     }
@@ -731,7 +731,7 @@ mod tests {
         );
     }
 
-    /// LocalMachine scope marker: a reviewed DPAPI-protected blob's
+    /// `LocalMachine` scope marker: a reviewed DPAPI-protected blob's
     /// SDDL exposes ONLY service-SID + SY + BA principals. If a future
     /// refactor accidentally widens the DACL to include
     /// Authenticated Users (AU), the verifier must catch it — that

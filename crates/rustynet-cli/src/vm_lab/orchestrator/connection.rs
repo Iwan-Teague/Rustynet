@@ -21,7 +21,7 @@ pub enum NodeConnection {
     },
     /// Android Debug Bridge — lab-only, not a production path.
     Adb { device_serial: String },
-    /// Apple MDM / Network Extension management channel — future IosNodeAdapter.
+    /// Apple MDM / Network Extension management channel — future `IosNodeAdapter`.
     Mdm { enrollment_id: String },
 }
 

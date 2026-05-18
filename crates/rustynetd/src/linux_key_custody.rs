@@ -6,15 +6,15 @@
 //! key material on a Linux runtime host matches the reviewed custody
 //! contract:
 //!
-//! * the encrypted WireGuard private key exists at
+//! * the encrypted `WireGuard` private key exists at
 //!   `/var/lib/rustynet/keys/wireguard.key.enc`, owned by
 //!   `rustynetd:rustynetd`, mode `0600`;
-//! * the WireGuard public key exists at
+//! * the `WireGuard` public key exists at
 //!   `/var/lib/rustynet/keys/wireguard.pub`, owned by
 //!   `rustynetd:rustynetd`, mode `0640` or `0600`;
 //! * the keys directory `/var/lib/rustynet/keys/` is a real directory
 //!   owned by `rustynetd:rustynetd`, mode `0700`;
-//! * the plaintext WireGuard private key (the legacy unencrypted path)
+//! * the plaintext `WireGuard` private key (the legacy unencrypted path)
 //!   is absent at rest — Phase E migrated runtime key custody to
 //!   encrypted-at-rest.
 //!
@@ -37,7 +37,7 @@ pub const LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH: &str = "/var/lib/rustynet/keys/wi
 /// directory must be 0700 root:root so only systemd (running as root)
 /// can read the encrypted blobs at unit-start time.
 pub const LINUX_CREDENTIALS_DIR: &str = "/etc/rustynet/credentials";
-/// Encrypted credential file holding the WireGuard runtime passphrase.
+/// Encrypted credential file holding the `WireGuard` runtime passphrase.
 /// Reviewed: 0600 root:root.
 pub const LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH: &str =
     "/etc/rustynet/credentials/wg_key_passphrase.cred";
@@ -610,7 +610,7 @@ mod tests {
 
     // ---- L6: passphrase + credential custody pinning ------------------
 
-    /// Missing wg_key_passphrase.cred is a hard fail-closed condition:
+    /// Missing `wg_key_passphrase.cred` is a hard fail-closed condition:
     /// without the encrypted credential, systemd cannot load the
     /// passphrase and the daemon cannot unwrap the runtime WG private
     /// key. Pin it as a required Present entry.
@@ -634,7 +634,7 @@ mod tests {
         );
     }
 
-    /// Missing signing_key_passphrase.cred is a hard fail: without it,
+    /// Missing `signing_key_passphrase.cred` is a hard fail: without it,
     /// the membership-owner cannot issue signed bundles. Pin Present.
     #[test]
     fn evaluator_rejects_missing_signing_key_passphrase_credential() {

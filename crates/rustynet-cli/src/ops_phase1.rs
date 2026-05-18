@@ -1282,7 +1282,7 @@ fn collect_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
 /// see. Rustynet's general policy is `#![forbid(unsafe_code)]` across
 /// every workspace crate, but a small set of crates wrap unavoidable
 /// platform FFI (Windows-sys, DPAPI, named-pipe SDDL inspection,
-/// WinVerifyTrust, etc.) where every Win32 call is itself an `unsafe`
+/// `WinVerifyTrust`, etc.) where every Win32 call is itself an `unsafe`
 /// extern "system" function. Routing those through a single audited
 /// FFI crate keeps the rest of the workspace genuinely unsafe-free
 /// while still letting the daemon talk to the OS.

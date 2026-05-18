@@ -1724,7 +1724,7 @@ fn generate_ephemeral_signing_secret() -> Result<Vec<u8>, String> {
 
 /// Issue assignment bundles locally on the orchestrator process.
 ///
-/// Used by the vm_lab Windows exit adapter in place of SSH-ing to the remote
+/// Used by the `vm_lab` Windows exit adapter in place of SSH-ing to the remote
 /// node and invoking `rustynet.exe ops e2e-issue-assignment-bundles-from-env`,
 /// which fails because the Windows trust CLI does not support `ops` subcommands.
 /// An ephemeral signing key is generated for each invocation.

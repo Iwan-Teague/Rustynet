@@ -24,7 +24,7 @@ const VALIDATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 pub struct MacosNodeAdapter {
     conn: NodeConnection,
     alias: String,
-    /// Path to the RustyNet source tree on the remote macOS host.
+    /// Path to the `RustyNet` source tree on the remote macOS host.
     /// When present, `install_daemon` builds from this workdir instead
     /// of transferring a source archive.
     workdir: Option<String>,

@@ -4,7 +4,7 @@
 //!
 //! This module provides the client-side relay session management that enables
 //! the daemon to establish authenticated sessions with relay servers and
-//! forward encrypted WireGuard packets when direct connectivity is unavailable.
+//! forward encrypted `WireGuard` packets when direct connectivity is unavailable.
 //!
 //! # Security model
 //!
@@ -15,8 +15,8 @@
 //! - **Fail-closed**: if token issuance, relay connection, or session
 //!   establishment fails, the relay path remains unavailable.
 //! - **Replay protection**: token nonces prevent replay attacks.
-//! - **Session binding**: tokens are bound to specific (node_id, peer_node_id,
-//!   relay_id) tuples.
+//! - **Session binding**: tokens are bound to specific (`node_id`, `peer_node_id`,
+//!   `relay_id`) tuples.
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -313,7 +313,7 @@ impl From<io::Error> for RelayClientError {
 /// Manages relay client sessions for the daemon.
 ///
 /// The `RelayClient` handles session establishment, keepalive, and cleanup
-/// for all active relay paths. It integrates with the Phase10Controller to
+/// for all active relay paths. It integrates with the `Phase10Controller` to
 /// provide relay endpoints when direct connectivity fails.
 pub struct RelayClient {
     /// Our node ID.
@@ -921,7 +921,7 @@ fn current_unix() -> u64 {
         .as_secs()
 }
 
-/// Serializes a RelayHello message for wire transmission.
+/// Serializes a `RelayHello` message for wire transmission.
 fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
     buf.push(RELAY_HELLO_MSG_TYPE);
@@ -944,7 +944,7 @@ fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
     buf
 }
 
-/// Serializes a RelaySessionToken for wire transmission.
+/// Serializes a `RelaySessionToken` for wire transmission.
 fn serialize_relay_token(token: &RelaySessionToken) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
@@ -982,7 +982,7 @@ fn serialize_relay_token(token: &RelaySessionToken) -> Vec<u8> {
     buf
 }
 
-/// Parses a RelayHelloAck from wire format.
+/// Parses a `RelayHelloAck` from wire format.
 fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
     if data.is_empty() {
         return Err("empty response".to_owned());
@@ -2412,7 +2412,7 @@ mod tests {
         assert!(!refresh_peers.contains(&healthy_peer));
     }
 
-    /// Verifies that remove_session correctly removes a specific session,
+    /// Verifies that `remove_session` correctly removes a specific session,
     /// supporting clean failover transitions.
     #[test]
     fn relay_client_remove_session_supports_clean_failover() {

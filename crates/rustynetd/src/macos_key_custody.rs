@@ -5,10 +5,10 @@
 //! macOS parity for `linux_key_custody`. Validates that on-disk key
 //! material on a macOS runtime host matches the reviewed custody contract:
 //!
-//! * the encrypted WireGuard private key exists at
+//! * the encrypted `WireGuard` private key exists at
 //!   `/usr/local/var/rustynet/keys/wireguard.key.enc`, owned by
 //!   `rustynetd:rustynetd`, mode `0600`;
-//! * the WireGuard public key exists at
+//! * the `WireGuard` public key exists at
 //!   `/usr/local/var/rustynet/keys/wireguard.pub`, owned by
 //!   `rustynetd:rustynetd`, mode `0640` or `0600`;
 //! * the keys directory is a real directory owned by `rustynetd:rustynetd`,

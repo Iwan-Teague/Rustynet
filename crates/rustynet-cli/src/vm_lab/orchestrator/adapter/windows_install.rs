@@ -58,7 +58,7 @@ const WINDOWS_BUILD_RELEASE_REPORT_PATH: &str =
 
 // ── PowerShell encoding helpers ───────────────────────────────────────────────
 
-/// Encode a PowerShell script as UTF-16LE + base64 for `-EncodedCommand`.
+/// Encode a `PowerShell` script as UTF-16LE + base64 for `-EncodedCommand`.
 pub fn encode_ps_command(script: &str) -> Result<String, AdapterError> {
     if script.contains('\0') {
         return Err(AdapterError::Protocol {
@@ -72,7 +72,7 @@ pub fn encode_ps_command(script: &str) -> Result<String, AdapterError> {
     Ok(BASE64_STANDARD.encode(bytes))
 }
 
-/// Build the SSH command string that invokes PowerShell with an encoded script.
+/// Build the SSH command string that invokes `PowerShell` with an encoded script.
 pub fn build_ps_invocation(script: &str) -> Result<String, AdapterError> {
     let encoded = encode_ps_command(script)?;
     Ok(format!(
@@ -98,7 +98,7 @@ pub fn ps_quote(value: &str) -> Result<String, AdapterError> {
 
 // ── Remote PS execution ───────────────────────────────────────────────────────
 
-/// Run a PowerShell script over SSH. The script is base64-encoded so it
+/// Run a `PowerShell` script over SSH. The script is base64-encoded so it
 /// survives the SSH quoting layer. Returns trimmed stdout on success.
 pub fn run_remote_ps(
     conn: &NodeConnection,
@@ -109,7 +109,7 @@ pub fn run_remote_ps(
     ssh::run_remote(conn, &invocation, timeout)
 }
 
-/// Run a PowerShell script over SSH. Returns `true` if exit code is 0.
+/// Run a `PowerShell` script over SSH. Returns `true` if exit code is 0.
 pub fn run_remote_ps_check(
     conn: &NodeConnection,
     script: &str,
@@ -124,7 +124,7 @@ pub fn run_remote_ps_check(
 /// Bootstrap the daemon on a Windows host. Extracts `source` into `workdir`
 /// via tar.exe, then runs Bootstrap-RustyNetWindows.ps1 -Phase build-release,
 /// Install-RustyNetWindowsService.ps1, and runs the e2e bootstrap sequence to
-/// generate WireGuard keys, membership state, and trust evidence.
+/// generate `WireGuard` keys, membership state, and trust evidence.
 pub fn install_daemon(
     conn: &NodeConnection,
     alias: &str,
@@ -234,7 +234,7 @@ pub fn install_daemon(
 /// bundles are distributed, `EnforceBaselineRuntime` calls this function to
 /// patch the daemon env file to `--auto-tunnel-enforce true` and restart the
 /// service.  The daemon then applies the assignment bundle and brings up
-/// WireGuard tunnels on the next reconcile tick.
+/// `WireGuard` tunnels on the next reconcile tick.
 pub fn enforce_daemon(
     conn: &NodeConnection,
     _alias: &str,
@@ -300,11 +300,11 @@ pub fn enforce_daemon(
     Ok(())
 }
 
-/// Start the RustyNet SCM service and wait for it to reach Running state.
+/// Start the `RustyNet` SCM service and wait for it to reach Running state.
 ///
 /// Uses `windows_service_start_probe_fragment` which handles the already-running
 /// case (sc.exe exit 1056) and polls for SCM Running state.  This is called from
-/// EnforceBaselineRuntime AFTER verifier keys have been distributed, so the
+/// `EnforceBaselineRuntime` AFTER verifier keys have been distributed, so the
 /// daemon has all required keys to start successfully.
 pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     let service_probe = windows_service_start_probe_fragment(WINDOWS_SERVICE_NAME)?;
@@ -321,12 +321,12 @@ pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Stop the RustyNet SCM service.
+/// Stop the `RustyNet` SCM service.
 pub fn stop_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     run_service_action(conn, "Stop-Service -Force -ErrorAction SilentlyContinue")
 }
 
-/// Restart the RustyNet SCM service.
+/// Restart the `RustyNet` SCM service.
 pub fn restart_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     run_service_action(conn, "Restart-Service -Force")
 }
@@ -481,10 +481,10 @@ fn windows_bootstrap_native_helper_fragment() -> String {
     .to_owned()
 }
 
-/// Wait for the rustynet0 WireGuard adapter to appear with an IPv4 address.
+/// Wait for the rustynet0 `WireGuard` adapter to appear with an IPv4 address.
 ///
 /// Called from `enforce_daemon` after the SCM confirms Running.  The daemon
-/// sets SCM Running before the daemon thread begins; WireGuard tunnel setup
+/// sets SCM Running before the daemon thread begins; `WireGuard` tunnel setup
 /// happens inside the daemon's first reconcile tick (~1 s after thread start).
 /// Without this probe the orchestrator proceeds to `validate_baseline_runtime`
 /// before the IP is assigned, causing `collect_mesh_ip` to fail.
@@ -508,7 +508,7 @@ fn windows_tunnel_ip_readiness_fragment() -> Result<String, AdapterError> {
 }
 
 /// Readiness probe: wait for SCM Running state AND for the reviewed env-file
-/// and WireGuard public-key file to exist.
+/// and `WireGuard` public-key file to exist.
 ///
 /// The Windows trust CLI (`rustynet.exe`) installed in Program Files is NOT the
 /// daemon-control CLI and does not support a `status` sub-command — invoking it
@@ -518,7 +518,7 @@ fn windows_tunnel_ip_readiness_fragment() -> Result<String, AdapterError> {
 /// 1. SCM reports the service as `Running`.
 /// 2. The reviewed env-file (`rustynetd.env`) is present — written by the
 ///    orchestrator before service start.
-/// 3. The WireGuard public-key file (`wireguard.pub`) is present — generated
+/// 3. The `WireGuard` public-key file (`wireguard.pub`) is present — generated
 ///    during the e2e bootstrap key step.
 ///
 /// These three conditions together confirm the daemon completed its startup
@@ -557,9 +557,9 @@ fn windows_lab_node_id(alias: &str, ctx: &OrchestrationContext) -> String {
         .unwrap_or_else(|| format!("{alias}-bootstrap"))
 }
 
-/// Generate WireGuard keys, membership state, and trust evidence for a Windows host.
+/// Generate `WireGuard` keys, membership state, and trust evidence for a Windows host.
 /// Trust keys are generated locally on the orchestrator (rustynet-cli cannot compile
-/// on Windows due to std::os::unix::* imports) and SCP'd to the remote host.
+/// on Windows due to `std::os::unix::`* imports) and SCP'd to the remote host.
 /// Called from `install_daemon` after the service binaries are installed.
 fn run_windows_e2e_bootstrap(
     conn: &NodeConnection,

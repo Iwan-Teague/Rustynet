@@ -6952,8 +6952,8 @@ fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr
 }
 
 /// Collect current routable addresses per interface using `getifaddrs(2)`.
-/// Returns a map of interface-name → Vec<IpAddr> for use with EndpointMonitor.
-/// Loopback and link-local addresses are included as-is; EndpointMonitor
+/// Returns a map of interface-name → Vec<IpAddr> for use with `EndpointMonitor`.
+/// Loopback and link-local addresses are included as-is; `EndpointMonitor`
 /// applies its own filtering via the `ignored_prefixes` list.
 fn interface_name_is_usable_for_traversal_host_candidate(interface: &str) -> bool {
     interface != "lo" && !interface.starts_with(DEFAULT_WG_INTERFACE)
@@ -8332,7 +8332,7 @@ where
 /// Parse and validate the raw interface alias string from Windows egress interface detection.
 ///
 /// Fails closed when the output is empty, contains invalid characters, or the detected alias
-/// equals the WireGuard tunnel alias (which means the tunnel itself is the default route,
+/// equals the `WireGuard` tunnel alias (which means the tunnel itself is the default route,
 /// e.g. after a daemon crash with stale tunnel routes still in the routing table).
 ///
 /// This is a pure function so it can be unit-tested on any host platform.
@@ -9409,11 +9409,11 @@ fn persist_trust_watermark(
 ///
 /// Replay rules for membership snapshots:
 /// - strictly older epoch → replay (rolling back the membership view)
-/// - same epoch but different state_root → replay (forging an alternative
+/// - same epoch but different `state_root` → replay (forging an alternative
 ///   history at the same epoch — only one canonical state can exist per epoch)
 ///
-/// Equal epoch + same state_root is NOT a replay (idempotent re-load is fine).
-/// Strictly newer epoch is NOT a replay regardless of state_root (progress).
+/// Equal epoch + same `state_root` is NOT a replay (idempotent re-load is fine).
+/// Strictly newer epoch is NOT a replay regardless of `state_root` (progress).
 fn membership_watermark_is_replay(
     incoming: &MembershipWatermark,
     previous: &MembershipWatermark,
@@ -22578,12 +22578,12 @@ mod tests {
         assert!(fetcher.dns_zone_url.is_none());
     }
 
-    /// Verify that a successful reconcile() writes the state file so that
+    /// Verify that a successful `reconcile()` writes the state file so that
     /// external validators (e.g. windows-mesh-status-check) can observe a
     /// current snapshot without requiring an explicit operator command.
     ///
-    /// Prior to the fix, persist_state() was only called from explicit command
-    /// handlers (exit-select, route-advertise, etc.) and never from reconcile(),
+    /// Prior to the fix, `persist_state()` was only called from explicit command
+    /// handlers (exit-select, route-advertise, etc.) and never from `reconcile()`,
     /// so the state file was never written for Windows nodes whose only active
     /// driver is the periodic reconcile loop.
     #[test]

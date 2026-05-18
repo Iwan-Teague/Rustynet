@@ -13,7 +13,7 @@ use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, Tunnel
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Read the WireGuard public key from `C:\ProgramData\RustyNet\keys\wireguard.pub`.
+/// Read the `WireGuard` public key from `C:\ProgramData\RustyNet\keys\wireguard.pub`.
 /// Returns the base64-encoded key decoded to hex (32-byte key → 64-char hex).
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
     let key_path = format!(r"{WINDOWS_STATE_ROOT}\keys\wireguard.pub");
@@ -27,7 +27,7 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
     Ok(hex)
 }
 
-/// Read the local node_id from `rustynetd.env` (`RUSTYNETD_DAEMON_ARGS_JSON`).
+/// Read the local `node_id` from `rustynetd.env` (`RUSTYNETD_DAEMON_ARGS_JSON`).
 ///
 /// The Windows trust CLI installed at `C:\Program Files\RustyNet\rustynet.exe`
 /// is not the daemon-control CLI and does not accept a `status` sub-command.
@@ -99,7 +99,7 @@ pub fn probe_denied_peer(
     }
 }
 
-/// Collect active WireGuard tunnels via `wireguard.exe` show.
+/// Collect active `WireGuard` tunnels via `wireguard.exe` show.
 pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, AdapterError> {
     let script = "if (Get-Command 'wireguard.exe' -ErrorAction SilentlyContinue) { \
          & 'wireguard.exe' /show } else { Write-Output 'wg-not-installed' }";
@@ -218,7 +218,7 @@ pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Collect the WireGuard mesh IP from the running network interface.
+/// Collect the `WireGuard` mesh IP from the running network interface.
 ///
 /// Queries `Get-NetAdapter` for an interface named or described as `rustynet*`
 /// and returns its first IPv4 address.  Returns an error if the interface is
@@ -498,7 +498,7 @@ mod tests {
         assert!(result.unwrap_err().contains("32-byte"));
     }
 
-    /// Verify that the collect_node_id PowerShell script reads from rustynetd.env
+    /// Verify that the `collect_node_id` `PowerShell` script reads from rustynetd.env
     /// and does NOT invoke rustynet.exe status (which is the trust CLI on Windows
     /// and does not support the status sub-command).
     #[test]
