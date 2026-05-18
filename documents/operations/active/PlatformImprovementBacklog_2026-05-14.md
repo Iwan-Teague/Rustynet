@@ -440,10 +440,22 @@ inline. Cross-reference with:
   drift. 11 new tests including BTreeMap-stable interface order +
   forward-compat with legacy JSON. `windows_dns_failclosed`
   coverage floor: 56 → 67.
-* `[ ]` Remaining scope (separate slice): CLI subcommand wire-up
-  (`--enforce-ra-suppression` flag mirroring
-  `--enforce-ipv6-sibling-rules`) + PowerShell collector that
-  surfaces the RA / default-route state.
+* `[~]` CLI wire-up landed (commit 527d14f). The
+  `rustynetd windows-dns-failclosed-check` subcommand accepts
+  `--enforce-ra-suppression` mirroring
+  `--enforce-ipv6-sibling-rules`; flag parsing pinned by
+  `run_windows_dns_failclosed_check_command_accepts_enforce_ra_suppression_flag`
+  in `crates/rustynetd/src/main.rs`. Help text on line 2629
+  advertises both `--enforce-ipv6-sibling-rules` and
+  `--enforce-ra-suppression`. The W3 RA-suppression evaluator
+  in `windows_dns_failclosed.rs` is driven by this flag.
+* `[ ]` Remaining scope (separate slice): PowerShell collector
+  that surfaces the RA / default-route state into the snapshot.
+  Needs Windows-native infra (`Get-NetIPInterface` /
+  `Get-NetRoute -RoutePolicyStore ActiveStore` per-interface
+  walk to populate `WindowsRouterAdvertisementObservation`).
+  Until that lands, the evaluator's RA-suppression pass runs
+  on a fail-closed `None` observation when the flag is set.
 
 ### W4. `windows_runtime_acls.rs` registry + service ACL drift extension
 
