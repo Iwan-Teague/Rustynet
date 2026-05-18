@@ -55,6 +55,18 @@ wrappers = []
 name = "md2"
 wrappers = []
 
+# RC2 — 64-bit-block cipher with practical related-key attacks
+# (Knudsen 1997); RFC 8407 historic. Blowfish — 64-bit-block →
+# sweet32-class birthday attacks after ~32 GiB ciphertext
+# (CVE-2016-2183). Modern protocols use 128-bit-block ciphers.
+[[bans.deny]]
+name = "rc2"
+wrappers = []
+
+[[bans.deny]]
+name = "blowfish"
+wrappers = []
+
 [licenses]
 confidence-threshold = 0.8
 allow = [

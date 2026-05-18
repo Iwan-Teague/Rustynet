@@ -140,12 +140,14 @@ from the live module; X3 backlog #2 + #3 + #4 extensions landed):
     (X3 extension #2, commit 8bc02ce).
   - **`scan_source_for_deprecated_crypto_imports`** — rejects
     `use sha1` / `use md5` / `use md_5` / `use md4` / `use md2` /
-    `use rc4` / `use des` / `use des3` / `use triple_des` with a
-    boundary-terminator check that rejects safe-name lookalikes
-    (`sha2`, `sha3`, `descriptor`, `md_hashlib`) (X3 extension #4,
-    commit ca85269; rc4/md4/md2 added in cycle 78, commit db72c4b
-    with parallel `deny.toml` ban entries citing RC4 NOMORE /
-    Wang 2005 MD4 / RFC 6149 MD2 attacks).
+    `use rc4` / `use rc2` / `use blowfish` / `use des` / `use des3`
+    / `use triple_des` with a boundary-terminator check that
+    rejects safe-name lookalikes (`sha2`, `sha3`, `descriptor`,
+    `md_hashlib`) (X3 extension #4, commit ca85269; rc4/md4/md2
+    added in cycle 78, commit db72c4b citing RC4 NOMORE /
+    Wang 2005 MD4 / RFC 6149 MD2; rc2/blowfish added in cycle 80
+    citing Knudsen 1997 RC2 / CVE-2016-2183 sweet32 — both are
+    64-bit-block ciphers).
   - **`scan_source_for_dbg_macro_on_secret_tokens`** — flags
     `dbg!(<expr>)` macro calls whose expression contains a
     forbidden secret-bearing identifier as a standalone
@@ -173,10 +175,11 @@ from the live module; X3 backlog #2 + #3 + #4 extensions landed):
     `crates/rustynetd/src/` + `crates/rustynet-cli/src/` (the
     daemon's own log surface, which is where format-string
     leaks would originate).
-- Self-test count grew from ~22 to 65 (pinned by the
-  `secret_log_audit:65` floor in the shared regression-coverage
-  group; see ADR-002). The +3 since the prior addendum is the
-  rc4 / md4 / md2 scanner self-tests added in cycle 78.
+- Self-test count grew from ~22 to 67 (pinned by the
+  `secret_log_audit:67` floor in the shared regression-coverage
+  group; see ADR-002). The +5 since the original addendum is the
+  rc4 / md4 / md2 scanner self-tests added in cycle 78 (+3) and
+  the rc2 / blowfish scanner self-tests added in cycle 80 (+2).
 
 Current tree: **0 offenders** across all 9 scanners.
 

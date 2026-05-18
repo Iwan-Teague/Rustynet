@@ -19,6 +19,8 @@ Rustynet only allows production cryptographic primitives that satisfy the approv
 | `md4` | Wang 2005 practical collisions | `deny.toml` + X3 `scan_source_for_deprecated_crypto_imports` |
 | `md2` | RFC 6149 historic; practical preimage attacks | `deny.toml` + X3 `scan_source_for_deprecated_crypto_imports` |
 | `rc4` | RC4 NOMORE / Bar-Mitzvah bias and recovery attacks; RFC 7465 forbids in TLS | `deny.toml` + X3 `scan_source_for_deprecated_crypto_imports` |
+| `rc2` | Knudsen 1997 related-key attacks; RFC 8407 historic; 64-bit block | `deny.toml` + X3 scanner |
+| `blowfish` | 64-bit-block cipher → sweet32-class birthday attacks (CVE-2016-2183) | `deny.toml` + X3 scanner |
 | `md5`/`md-5` | Practical collisions (Wang 2004) | `deny.toml` + X3 scanner |
 | `des`/`des3`/`triple_des` | 56-bit DES key; 3DES sweet32 (CVE-2016-2183) | `deny.toml` + X3 scanner |
 

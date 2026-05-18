@@ -69,8 +69,8 @@ from the live gate while the script is the source of truth):
 
 - 22 modules at floor across 4 groups: linux (7) + macos (6) +
   windows (8) + shared (1).
-- 613 pinned tests in aggregate (linux 196 + macos 74 +
-  windows 278 + shared 65).
+- 615 pinned tests in aggregate (linux 196 + macos 74 +
+  windows 278 + shared 67).
 - The `shared` group covers platform-agnostic audit modules
   (currently `secret_log_audit`); it was added when the X3 static
   scanner's self-tests warranted the same silent-removal

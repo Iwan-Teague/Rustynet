@@ -137,7 +137,10 @@ SHARED_FLOORS=(
   # Floor bumped 62→65 on adding rc4 / md4 / md2 to
   # FORBIDDEN_DEPRECATED_CRYPTO_CRATES (3 new self-tests; deny.toml
   # gains parallel rc4 / md4 / md2 bans for Cargo.toml-side coverage).
-  "secret_log_audit:65"
+  # Floor bumped 65→67 on adding rc2 / blowfish (2 new self-tests;
+  # deny.toml parallel bans). 64-bit-block ciphers → sweet32-class
+  # birthday attacks.
+  "secret_log_audit:67"
 )
 
 # macOS coverage floors. macOS is a control-plane platform today, not
