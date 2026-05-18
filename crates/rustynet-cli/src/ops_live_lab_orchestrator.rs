@@ -1866,16 +1866,16 @@ pub fn execute_ops_write_live_linux_reboot_recovery_report(
     {
         match line {
             "client_reboot_wait=fail" => {
-                failure_reasons.push("client reboot wait timed out".to_owned())
+                failure_reasons.push("client reboot wait timed out".to_owned());
             }
             "exit_reboot_wait=fail" => {
-                failure_reasons.push("exit reboot wait timed out".to_owned())
+                failure_reasons.push("exit reboot wait timed out".to_owned());
             }
             "exit_post=" => {
-                failure_reasons.push("exit post-reboot boot_id capture was empty".to_owned())
+                failure_reasons.push("exit post-reboot boot_id capture was empty".to_owned());
             }
             "client_post=" => {
-                failure_reasons.push("client post-reboot boot_id capture was empty".to_owned())
+                failure_reasons.push("client post-reboot boot_id capture was empty".to_owned());
             }
             _ => {}
         }
@@ -4205,19 +4205,19 @@ mod tests {
         // trip the matching tweak case.
         for tweak in [
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.internet_route_via_rustynet0 = "fail".to_owned()
+                c.internet_route_via_rustynet0 = "fail".to_owned();
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.probe_host_self_service_reachable = "fail".to_owned()
+                c.probe_host_self_service_reachable = "fail".to_owned();
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.probe_endpoint_route_direct_not_tunnelled = "fail".to_owned()
+                c.probe_endpoint_route_direct_not_tunnelled = "fail".to_owned();
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.probe_service_blocked_from_client = "fail".to_owned()
+                c.probe_service_blocked_from_client = "fail".to_owned();
             },
             |c: &mut LiveLinuxServerIpBypassChecksView| {
-                c.no_unexpected_bypass_routes = "fail".to_owned()
+                c.no_unexpected_bypass_routes = "fail".to_owned();
             },
         ] {
             let mut checks = baseline.clone();
@@ -4766,25 +4766,25 @@ mod tests {
         let baseline = baseline_endpoint_hijack_pass_view().checks;
         for tweak in [
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.baseline_runtime_secure = "fail".to_owned()
+                c.baseline_runtime_secure = "fail".to_owned();
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.hijack_drives_fail_closed = "fail".to_owned()
+                c.hijack_drives_fail_closed = "fail".to_owned();
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.restricted_safe_mode_engaged = "fail".to_owned()
+                c.restricted_safe_mode_engaged = "fail".to_owned();
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.netcheck_reports_fail_closed = "fail".to_owned()
+                c.netcheck_reports_fail_closed = "fail".to_owned();
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.rogue_endpoint_not_adopted = "fail".to_owned()
+                c.rogue_endpoint_not_adopted = "fail".to_owned();
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.recovery_restores_secure_runtime = "fail".to_owned()
+                c.recovery_restores_secure_runtime = "fail".to_owned();
             },
             |c: &mut LiveLinuxEndpointHijackChecksView| {
-                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_owned()
+                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_owned();
             },
         ] {
             let mut checks = baseline.clone();
@@ -4931,17 +4931,17 @@ mod tests {
         for tweak in [
             |c: &mut RealWireguardExitnodeE2eChecksView| c.exit_node_routing = "fail".to_owned(),
             |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.lan_toggle_off_blocks = "fail".to_owned()
+                c.lan_toggle_off_blocks = "fail".to_owned();
             },
             |c: &mut RealWireguardExitnodeE2eChecksView| c.lan_toggle_on_allows = "fail".to_owned(),
             |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.dns_reaches_protected_path_when_tunnel_up = "fail".to_owned()
+                c.dns_reaches_protected_path_when_tunnel_up = "fail".to_owned();
             },
             |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.kill_switch_blocks_egress_when_tunnel_down = "fail".to_owned()
+                c.kill_switch_blocks_egress_when_tunnel_down = "fail".to_owned();
             },
             |c: &mut RealWireguardExitnodeE2eChecksView| {
-                c.dns_fail_close_when_tunnel_down = "fail".to_owned()
+                c.dns_fail_close_when_tunnel_down = "fail".to_owned();
             },
         ] {
             let mut checks = baseline.clone();
@@ -5044,22 +5044,22 @@ mod tests {
         let baseline = baseline_real_wireguard_no_leak_under_load_pass_view().checks;
         for tweak in [
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.tunnel_up_connectivity = "fail".to_owned()
+                c.tunnel_up_connectivity = "fail".to_owned();
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.load_ping_success = "fail".to_owned()
+                c.load_ping_success = "fail".to_owned();
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.tunnel_transport_observed_under_load = "fail".to_owned()
+                c.tunnel_transport_observed_under_load = "fail".to_owned();
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.no_underlay_cleartext_during_load = "fail".to_owned()
+                c.no_underlay_cleartext_during_load = "fail".to_owned();
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.tunnel_down_fail_closed = "fail".to_owned()
+                c.tunnel_down_fail_closed = "fail".to_owned();
             },
             |c: &mut RealWireguardNoLeakUnderLoadChecksView| {
-                c.no_underlay_cleartext_after_tunnel_down = "fail".to_owned()
+                c.no_underlay_cleartext_after_tunnel_down = "fail".to_owned();
             },
         ] {
             let mut checks = baseline.clone();
@@ -5245,19 +5245,19 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let baseline = baseline_active_network_signed_state_tamper_pass_view().checks;
         for tweak in [
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.baseline_two_node_e2e = "fail".to_owned()
+                c.baseline_two_node_e2e = "fail".to_owned();
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.tampered_signed_assignment_rejected = "fail".to_owned()
+                c.tampered_signed_assignment_rejected = "fail".to_owned();
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.fail_closed_engaged = "fail".to_owned()
+                c.fail_closed_engaged = "fail".to_owned();
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.netcheck_reports_fail_closed = "fail".to_owned()
+                c.netcheck_reports_fail_closed = "fail".to_owned();
             },
             |c: &mut ActiveNetworkSignedStateTamperChecksView| {
-                c.recovery_restored_secure_runtime = "fail".to_owned()
+                c.recovery_restored_secure_runtime = "fail".to_owned();
             },
         ] {
             let mut checks = baseline.clone();
@@ -5422,25 +5422,25 @@ record.1.fqdn=exit.rustynet record.1.expected_ip=100.109.33.213";
         let baseline = baseline_active_network_rogue_path_hijack_pass_view().checks;
         for tweak in [
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.baseline_two_node_e2e = "fail".to_owned()
+                c.baseline_two_node_e2e = "fail".to_owned();
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.forged_endpoint_assignment_rejected = "fail".to_owned()
+                c.forged_endpoint_assignment_rejected = "fail".to_owned();
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.fail_closed_engaged = "fail".to_owned()
+                c.fail_closed_engaged = "fail".to_owned();
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.netcheck_reports_fail_closed = "fail".to_owned()
+                c.netcheck_reports_fail_closed = "fail".to_owned();
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.rogue_endpoint_not_adopted = "fail".to_owned()
+                c.rogue_endpoint_not_adopted = "fail".to_owned();
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.recovery_restored_secure_runtime = "fail".to_owned()
+                c.recovery_restored_secure_runtime = "fail".to_owned();
             },
             |c: &mut ActiveNetworkRoguePathHijackChecksView| {
-                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_owned()
+                c.recovery_keeps_rogue_endpoint_rejected = "fail".to_owned();
             },
         ] {
             let mut checks = baseline.clone();

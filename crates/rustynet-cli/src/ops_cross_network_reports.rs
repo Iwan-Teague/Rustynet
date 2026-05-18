@@ -1970,7 +1970,7 @@ fn validate_report_payload(
             {
                 match resolve_artifact_by_basename(report_path, entries, basename) {
                     Ok(Some(path)) => {
-                        problems.extend(validate_ssh_trust_summary_artifact(path.as_path()))
+                        problems.extend(validate_ssh_trust_summary_artifact(path.as_path()));
                     }
                     Ok(None) => {}
                     Err(err) => problems.push(err),
@@ -1983,7 +1983,7 @@ fn validate_report_payload(
                     "cross_network_remote_exit_soak_monitor_summary.json",
                 ) {
                     Ok(Some(path)) => {
-                        problems.extend(validate_soak_monitor_summary_artifact(path.as_path()))
+                        problems.extend(validate_soak_monitor_summary_artifact(path.as_path()));
                     }
                     Ok(None) => {}
                     Err(err) => problems.push(err),

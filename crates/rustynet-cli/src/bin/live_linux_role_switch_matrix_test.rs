@@ -318,7 +318,7 @@ impl Config {
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--ssh-identity-file" => {
-                    config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?)
+                    config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?);
                 }
                 "--exit-host" => config.exit_host = next_value(&mut iter, &arg)?,
                 "--exit-node-id" => config.exit_node_id = next_value(&mut iter, &arg)?,
@@ -336,14 +336,14 @@ impl Config {
                 "--log-path" => config.log_path = PathBuf::from(next_value(&mut iter, &arg)?),
                 "--known-hosts" => {
                     config.pinned_known_hosts_file =
-                        Some(PathBuf::from(next_value(&mut iter, &arg)?))
+                        Some(PathBuf::from(next_value(&mut iter, &arg)?));
                 }
                 "--git-commit" => config.git_commit = Some(next_value(&mut iter, &arg)?),
                 "--traversal-env-file" => {
-                    config.traversal_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?))
+                    config.traversal_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?));
                 }
                 "--dns-zone-env-file" => {
-                    config.dns_zone_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?))
+                    config.dns_zone_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?));
                 }
                 "-h" | "--help" => {
                     print_usage();

@@ -521,7 +521,7 @@ fn extract_extended_soak_reason(report_dir: &Path) -> Option<String> {
             "exit_reboot_wait=fail" => reasons.push("exit reboot wait timed out".to_owned()),
             "exit_post=" => reasons.push("exit post-reboot boot_id capture was empty".to_owned()),
             "client_post=" => {
-                reasons.push("client post-reboot boot_id capture was empty".to_owned())
+                reasons.push("client post-reboot boot_id capture was empty".to_owned());
             }
             _ if line.starts_with("ssh_port22_hosts=") => reasons.push(line.to_owned()),
             _ => {}
