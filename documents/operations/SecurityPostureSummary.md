@@ -118,7 +118,7 @@ Modules with typed views landed:
 - `ops_fresh_install_os_matrix.rs` — `FreshInstallOsMatrixReportView`
 - `ops_cross_network_reports.rs` — 3 views (`CrossNetworkSoakMonitorSummaryView`, `CrossNetworkReportPayloadView`, `CrossNetworkSshTrustSummaryView` + `CrossNetworkSshTrustTargetView` substruct)
 - `ops_live_lab_failure_digest.rs` — 4 views (full module migration, 5/5 walks eliminated)
-- `ops_live_lab_orchestrator.rs` — 5 views (`LiveLabOrchestratorNoLeakReportView`, `RunSummaryNodeView`, `RunSummaryWorkerView`, `RunSummaryStageView`, `LiveLabRunSummaryView`); ~17 walks remain documented
+- `ops_live_lab_orchestrator.rs` — writer side fully migrated. Typed views (in landing order): `LiveLabOrchestratorNoLeakReportView`, `RunSummaryNodeView`/`RunSummaryWorkerView`/`RunSummaryStageView`/`LiveLabRunSummaryView`, `CrossNetworkForensicsManifestView`/`NodeReportView`/`BundleValidationView`, plus the 2026-05-18 batch: `LiveLinuxServerIpBypassReportView` (+ Checks/Evidence), `LiveLinuxControlSurfaceReportView` (+ 5 nested views), `LiveLinuxEndpointHijackReportView` (+ Checks/Evidence), `RealWireguardExitnodeE2eReportView` (+ Checks), `RealWireguardNoLeakUnderLoadReportView` (+ Checks/Metrics), `ActiveNetworkSignedStateTamperReportView` (+ Checks/Hosts/Evidence), `ActiveNetworkRoguePathHijackReportView` (+ Checks/Hosts/Evidence), `E2eDnsQueryResultView`. Only `execute_ops_read_json_field` retains a `Value` walk — intentional shape-agnostic JSON-pointer reader.
 
 **Pattern**: every required-string + required-u64 field becomes a typed field with serde required-field semantics. A missing or wrong-type value now fails at parse time with a precise per-line error including the file label, instead of surfacing later as an `ok_or_else` on a stale `Value::as_str()` result.
 
@@ -128,7 +128,7 @@ Modules with typed views landed:
 |---------------------------------------------------|------------------------------------------------------------------------------|
 | `cargo fmt --all -- --check`                       | format consistency                                                           |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | lint cleanliness with warnings-as-errors                  |
-| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2693 tests)                                    |
+| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2786 tests as of 2026-05-18)                   |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
 | `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (21 modules across 4 groups, ~570 pinned tests)  |
