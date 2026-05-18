@@ -7,17 +7,17 @@ Scope: Rustynet install/runtime/dataplane parity hardening across Debian 13 and 
 
 ```text
 You are the implementation agent for the remaining work in this document.
-Repository root: /Users/iwanteague/Desktop/Rustynet
+Repository root: workspace root
 
 Mission:
 Complete the remaining in-scope work in this file in one uninterrupted execution if feasible. Security is the top priority. Do not stop at planning if you can still write, test, and verify code safely.
 
 Mandatory reading order:
-1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
-2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
-3. /Users/iwanteague/Desktop/Rustynet/README.md
-4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
-5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
+1. AGENTS.md
+2. CLAUDE.md
+3. README.md
+4. documents/Requirements.md
+5. documents/SecurityMinimumBar.md
 6. This document
 7. Directly linked scope/design docs and the code you will touch
 
@@ -124,49 +124,49 @@ Status update (verified against current tree on 2026-03-05):
 - Prefer built-in OS security primitives on macOS over custom mechanisms.
 
 Relevant baseline docs:
-- [Requirements.md](/Users/iwanteague/Desktop/Rustynet/documents/Requirements.md)
-- [SecurityMinimumBar.md](/Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md)
-- [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md)
+- [Requirements.md](../../../documents/Requirements.md)
+- [SecurityMinimumBar.md](../../../documents/SecurityMinimumBar.md)
+- [phase10.md](../../../documents/phase10.md)
 
 ## 3) Current Split Quality (Assessment)
 
 ### 3.1 What is already clean
 - Host profile detection and explicit storage segregation are present in `start.sh`:
-  - [start.sh:96](/Users/iwanteague/Desktop/Rustynet/start.sh:96)
-  - [start.sh:158](/Users/iwanteague/Desktop/Rustynet/start.sh:158)
+  - [start.sh:96](../../../start.sh:96)
+  - [start.sh:158](../../../start.sh:158)
 - Backend mode is forced by host profile:
-  - [start.sh:359](/Users/iwanteague/Desktop/Rustynet/start.sh:359)
+  - [start.sh:359](../../../start.sh:359)
 - macOS runtime path exists (daemon + helper process path, PF anchor model):
-  - [start.sh:1987](/Users/iwanteague/Desktop/Rustynet/start.sh:1987)
-  - [start.sh:2011](/Users/iwanteague/Desktop/Rustynet/start.sh:2011)
-  - [phase10.rs:1093](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs:1093)
+  - [start.sh:1987](../../../start.sh:1987)
+  - [start.sh:2011](../../../start.sh:2011)
+  - [phase10.rs:1093](../../../crates/rustynetd/src/phase10.rs:1093)
 - Privileged command execution uses argv-only commands with strict token validation:
-  - [privileged_helper.rs:449](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/privileged_helper.rs:449)
+  - [privileged_helper.rs:449](../../../crates/rustynetd/src/privileged_helper.rs:449)
 
 ### 3.2 Where split remains Linux-first
 - Phase 10 scope and real E2E gates are explicitly Linux-only:
-  - [phase10.md:14](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md:14)
-  - [phase10_gates.sh:121](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_gates.sh:121)
-  - [real_wireguard_exitnode_e2e.sh:15](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/real_wireguard_exitnode_e2e.sh:15)
+  - [phase10.md:14](../../../documents/phase10.md:14)
+  - [phase10_gates.sh:121](../../../scripts/ci/phase10_gates.sh:121)
+  - [real_wireguard_exitnode_e2e.sh:15](../../../scripts/e2e/real_wireguard_exitnode_e2e.sh:15)
 - Linux service path is hardened systemd; macOS lifecycle is now launchd-managed:
-  - [rustynetd.service:47](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd.service:47)
-  - [start.sh:2126](/Users/iwanteague/Desktop/Rustynet/start.sh:2126)
-  - [start.sh:2134](/Users/iwanteague/Desktop/Rustynet/start.sh:2134)
+  - [rustynetd.service:47](../../../scripts/systemd/rustynetd.service:47)
+  - [start.sh:2126](../../../start.sh:2126)
+  - [start.sh:2134](../../../start.sh:2134)
 - Several admin dataplane actions are still Linux-only in menu layer:
-  - [start.sh:2558](/Users/iwanteague/Desktop/Rustynet/start.sh:2558)
-  - [start.sh:2590](/Users/iwanteague/Desktop/Rustynet/start.sh:2590)
-  - [start.sh:2626](/Users/iwanteague/Desktop/Rustynet/start.sh:2626)
+  - [start.sh:2558](../../../start.sh:2558)
+  - [start.sh:2590](../../../start.sh:2590)
+  - [start.sh:2626](../../../start.sh:2626)
 
 ## 4) Gap Register
 
 ## GAP-01 (Critical, Remediated 2026-03-05; regression-critical): macOS passphrase-source runtime mismatch
 - Where:
   - Runtime requires explicit passphrase source contract (`RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH` or `CREDENTIALS_DIRECTORY`):
-    - [key_material.rs:193](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/key_material.rs:193)
-    - [key_material.rs:228](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/key_material.rs:228)
+    - [key_material.rs:193](../../../crates/rustynetd/src/key_material.rs:193)
+    - [key_material.rs:228](../../../crates/rustynetd/src/key_material.rs:228)
   - macOS launchd wiring now sets explicit env var:
-    - [start.sh:2182](/Users/iwanteague/Desktop/Rustynet/start.sh:2182)
-    - [start.sh:2183](/Users/iwanteague/Desktop/Rustynet/start.sh:2183)
+    - [start.sh:2182](../../../start.sh:2182)
+    - [start.sh:2183](../../../start.sh:2183)
 - Security risk truth:
   - If this contract regresses, operators are likely to reintroduce unsafe fallback behavior under outage pressure.
 - Residual action:
@@ -175,13 +175,13 @@ Relevant baseline docs:
 ## GAP-02 (High, Remediated 2026-03-05; regression-critical): non-admin macOS fallback conflicts with root-owned privileged binary policy
 - Current enforcement:
   - Non-admin path is blocked with fail-closed error:
-    - [start.sh:1076](/Users/iwanteague/Desktop/Rustynet/start.sh:1076)
-    - [start.sh:1079](/Users/iwanteague/Desktop/Rustynet/start.sh:1079)
+    - [start.sh:1076](../../../start.sh:1076)
+    - [start.sh:1079](../../../start.sh:1079)
   - Runtime/startup enforces root-owned privileged binaries:
-    - [start.sh:1956](/Users/iwanteague/Desktop/Rustynet/start.sh:1956)
-    - [start.sh:1957](/Users/iwanteague/Desktop/Rustynet/start.sh:1957)
+    - [start.sh:1956](../../../start.sh:1956)
+    - [start.sh:1957](../../../start.sh:1957)
   - User guidance aligned:
-    - [README.md:32](/Users/iwanteague/Desktop/Rustynet/README.md:32)
+    - [README.md:32](../../../README.md:32)
 - Security risk truth:
   - If this regresses, attacker-controlled user-space binaries can be executed in privileged networking paths.
 - Residual action:
@@ -190,14 +190,14 @@ Relevant baseline docs:
 ## GAP-03 (Critical, Remediated 2026-03-05; regression-critical): macOS DNS fail-closed implementation
 - Current enforcement:
   - DNS protection toggles PF-backed rules in macOS dataplane system:
-    - [phase10.rs:1422](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs:1422)
-    - [phase10.rs:1431](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs:1431)
+    - [phase10.rs:1422](../../../crates/rustynetd/src/phase10.rs:1422)
+    - [phase10.rs:1431](../../../crates/rustynetd/src/phase10.rs:1431)
   - Kill-switch assertions verify DNS allow/block rules when DNS protection is active:
-    - [phase10.rs:1468](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs:1468)
-    - [phase10.rs:1489](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs:1489)
+    - [phase10.rs:1468](../../../crates/rustynetd/src/phase10.rs:1468)
+    - [phase10.rs:1489](../../../crates/rustynetd/src/phase10.rs:1489)
   - CI executes targeted macOS DNS fail-closed tests:
-    - [macos_dataplane_smoke.sh:44](/Users/iwanteague/Desktop/Rustynet/scripts/ci/macos_dataplane_smoke.sh:44)
-    - [macos_dataplane_smoke.sh:45](/Users/iwanteague/Desktop/Rustynet/scripts/ci/macos_dataplane_smoke.sh:45)
+    - [macos_dataplane_smoke.sh:44](../../../scripts/ci/macos_dataplane_smoke.sh:44)
+    - [macos_dataplane_smoke.sh:45](../../../scripts/ci/macos_dataplane_smoke.sh:45)
 - Security risk truth:
   - If this regresses, DNS can leak off-tunnel and bypass policy/privacy guarantees.
 - Residual action:
@@ -206,11 +206,11 @@ Relevant baseline docs:
 ## GAP-04 (High, Short-Term Remediated 2026-03-05): macOS IPv6 capability signaling and behavior
 - Current enforcement:
   - macOS backend now reports `supports_ipv6: false` to match current capabilities:
-    - [lib.rs:775](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs:775)
-    - [lib.rs:780](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs:780)
+    - [lib.rs:775](../../../crates/rustynet-backend-wireguard/src/lib.rs:775)
+    - [lib.rs:780](../../../crates/rustynet-backend-wireguard/src/lib.rs:780)
   - macOS PF path supports explicit IPv6 egress hard-disable toggles:
-    - [phase10.rs:1437](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs:1437)
-    - [phase10.rs:1443](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs:1443)
+    - [phase10.rs:1437](../../../crates/rustynetd/src/phase10.rs:1437)
+    - [phase10.rs:1443](../../../crates/rustynetd/src/phase10.rs:1443)
 - Security risk truth:
   - True dual-stack parity is still pending; if future capability flags are loosened without matching enforcement, IPv6 leak paths can reappear.
 - Residual action:
@@ -219,11 +219,11 @@ Relevant baseline docs:
 ## GAP-05 (High, Largely Remediated 2026-03-05; regression-critical): service-management hardening parity is weaker on macOS than Linux
 - Where:
   - Linux hardened systemd profile:
-    - [rustynetd.service:11](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd.service:11)
+    - [rustynetd.service:11](../../../scripts/systemd/rustynetd.service:11)
   - macOS helper/daemon launchd lifecycle wiring:
-    - [start.sh:2126](/Users/iwanteague/Desktop/Rustynet/start.sh:2126)
-    - [start.sh:2134](/Users/iwanteague/Desktop/Rustynet/start.sh:2134)
-    - [MacosLaunchdServiceManagement.md:1](/Users/iwanteague/Desktop/Rustynet/documents/operations/MacosLaunchdServiceManagement.md:1)
+    - [start.sh:2126](../../../start.sh:2126)
+    - [start.sh:2134](../../../start.sh:2134)
+    - [MacosLaunchdServiceManagement.md:1](../../../documents/operations/MacosLaunchdServiceManagement.md:1)
 - Security risk truth:
   - If launchd wiring or plist hardening drifts, privileged process lifecycle can become non-deterministic and weaken fail-closed posture.
 - Residual action:
@@ -232,9 +232,9 @@ Relevant baseline docs:
 ## GAP-06 (Medium): break-glass/manual peer admin flows are Linux-only
 - Where:
   - Linux-only guards on manual peer operations:
-    - [start.sh:2558](/Users/iwanteague/Desktop/Rustynet/start.sh:2558)
-    - [start.sh:2590](/Users/iwanteague/Desktop/Rustynet/start.sh:2590)
-    - [start.sh:2626](/Users/iwanteague/Desktop/Rustynet/start.sh:2626)
+    - [start.sh:2558](../../../start.sh:2558)
+    - [start.sh:2590](../../../start.sh:2590)
+    - [start.sh:2626](../../../start.sh:2626)
 - Why this is a gap:
   - Operational inconsistency and increased chance of unsafe ad-hoc commands on macOS.
 - Fix:
@@ -246,11 +246,11 @@ Relevant baseline docs:
 ## GAP-07 (High, Partially Remediated 2026-03-05): macOS dataplane security evidence in CI
 - Current enforcement:
   - macOS CI now includes dataplane smoke gates:
-    - [cross-platform-ci.yml:21](/Users/iwanteague/Desktop/Rustynet/.github/workflows/cross-platform-ci.yml:21)
-    - [cross-platform-ci.yml:24](/Users/iwanteague/Desktop/Rustynet/.github/workflows/cross-platform-ci.yml:24)
+    - [cross-platform-ci.yml:21](../../../.github/workflows/cross-platform-ci.yml:21)
+    - [cross-platform-ci.yml:24](../../../.github/workflows/cross-platform-ci.yml:24)
   - Smoke script validates launch/path contracts and runs targeted dataplane tests:
-    - [macos_dataplane_smoke.sh:7](/Users/iwanteague/Desktop/Rustynet/scripts/ci/macos_dataplane_smoke.sh:7)
-    - [macos_dataplane_smoke.sh:44](/Users/iwanteague/Desktop/Rustynet/scripts/ci/macos_dataplane_smoke.sh:44)
+    - [macos_dataplane_smoke.sh:7](../../../scripts/ci/macos_dataplane_smoke.sh:7)
+    - [macos_dataplane_smoke.sh:44](../../../scripts/ci/macos_dataplane_smoke.sh:44)
 - Security risk truth:
   - Residual risk remains because Linux-only real WireGuard netns E2E has no macOS equivalent yet; deep runtime regressions could still escape smoke coverage.
 - Residual action:
@@ -259,9 +259,9 @@ Relevant baseline docs:
 ## GAP-08 (Medium): phase-scope/docs and runtime reality are mismatched
 - Where:
   - Phase 10 says non-Linux dataplane out of scope:
-    - [phase10.md:23](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md:23)
+    - [phase10.md:23](../../../documents/phase10.md:23)
   - README describes macOS runtime dataplane support:
-    - [README.md:30](/Users/iwanteague/Desktop/Rustynet/README.md:30)
+    - [README.md:30](../../../README.md:30)
 - Why this is a gap:
   - Confuses operational guarantees and security expectations.
 - Fix:
@@ -273,15 +273,15 @@ Relevant baseline docs:
 ## GAP-09 (High, Mostly Remediated 2026-03-05; regression-critical): macOS key custody and passphrase source
 - Current enforcement:
   - Keychain-backed custody path is wired in setup/runtime:
-    - [start.sh:1533](/Users/iwanteague/Desktop/Rustynet/start.sh:1533)
-    - [start.sh:1612](/Users/iwanteague/Desktop/Rustynet/start.sh:1612)
-    - [start.sh:2178](/Users/iwanteague/Desktop/Rustynet/start.sh:2178)
+    - [start.sh:1533](../../../start.sh:1533)
+    - [start.sh:1612](../../../start.sh:1612)
+    - [start.sh:2178](../../../start.sh:2178)
   - Persistent plaintext passphrase files are explicitly rejected in macOS checks:
-    - [start.sh:1378](/Users/iwanteague/Desktop/Rustynet/start.sh:1378)
-    - [start.sh:1907](/Users/iwanteague/Desktop/Rustynet/start.sh:1907)
+    - [start.sh:1378](../../../start.sh:1378)
+    - [start.sh:1907](../../../start.sh:1907)
   - File fallback is disabled by default and only available via explicit emergency override:
-    - [key_material.rs:337](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/key_material.rs:337)
-    - [key_material.rs:339](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/key_material.rs:339)
+    - [key_material.rs:337](../../../crates/rustynetd/src/key_material.rs:337)
+    - [key_material.rs:339](../../../crates/rustynetd/src/key_material.rs:339)
 - Security risk truth:
   - Remaining risk is operational misuse of emergency fallback override; if enabled without strict control, sensitive material handling posture weakens.
 - Residual action:
@@ -290,7 +290,7 @@ Relevant baseline docs:
 ## GAP-10 (Medium): monolithic `start.sh` increases cross-OS regression risk
 - Where:
   - Single large mixed script with many host branches:
-    - [start.sh:1](/Users/iwanteague/Desktop/Rustynet/start.sh)
+    - [start.sh:1](../../../start.sh)
 - Why this is a gap:
   - High chance of accidental Linux regression while editing macOS paths.
 - Fix:
@@ -462,8 +462,8 @@ Status note:
 
 ### 11.1 GAP-01 implementation plan (Completed 2026-03-05)
 - Files to change:
-  - [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh)
-  - [key_material.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/key_material.rs) (only if startup diagnostics need improved errors)
+  - [start.sh](../../../start.sh)
+  - [key_material.rs](../../../crates/rustynetd/src/key_material.rs) (only if startup diagnostics need improved errors)
 - Changes:
   1. In macOS daemon launch/export section, set `RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH` explicitly from resolved secure path.
   2. Add preflight validation in macOS branch to fail before daemon start if missing/unreadable.
@@ -478,8 +478,8 @@ Status note:
 
 ### 11.2 GAP-02 implementation plan (Completed 2026-03-05)
 - Files to change:
-  - [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh)
-  - [README.md](/Users/iwanteague/Desktop/Rustynet/README.md)
+  - [start.sh](../../../start.sh)
+  - [README.md](../../../README.md)
 - Changes:
   1. Remove non-admin local install fallback for `wg`/`wireguard-go`.
   2. Enforce root-owned, non-writable-by-group-or-other checks at startup.
@@ -494,7 +494,7 @@ Status note:
 
 ### 11.3 GAP-03 implementation plan (Completed 2026-03-05)
 - Files to change:
-  - [phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
+  - [phase10.rs](../../../crates/rustynetd/src/phase10.rs)
   - macOS-specific test module in rustynetd crate
 - Changes:
   1. Implement PF DNS block rules in protected mode.
@@ -512,8 +512,8 @@ Status note:
 
 ### 11.4 GAP-04 implementation plan (Completed short-term 2026-03-05)
 - Files to change:
-  - [lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs)
-  - [phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs) for policy alignment if needed
+  - [lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs)
+  - [phase10.rs](../../../crates/rustynetd/src/phase10.rs) for policy alignment if needed
 - Changes:
   1. Immediate safe mode: set macOS capability reporting to `supports_ipv6=false` until full parity is complete.
   2. Confirm PF policy blocks IPv6 egress in protected mode.
@@ -525,7 +525,7 @@ Status note:
 ### 11.5 GAP-05 implementation plan (Completed baseline 2026-03-05)
 - Files to add/change:
   - `scripts/launchd/*.plist` (new)
-  - [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh) (install/load/unload wrappers)
+  - [start.sh](../../../start.sh) (install/load/unload wrappers)
   - docs for service management
 - Changes:
   1. Define LaunchDaemon for privileged helper.
@@ -539,7 +539,7 @@ Status note:
 
 ### 11.6 GAP-06 implementation plan
 - Files to change:
-  - [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh)
+  - [start.sh](../../../start.sh)
   - daemon IPC handlers if missing for mac parity
 - Changes:
   1. Port Linux-only peer admin menu actions to common IPC-driven actions.
@@ -551,7 +551,7 @@ Status note:
 
 ### 11.7 GAP-07 implementation plan (Partially completed 2026-03-05)
 - Files to change:
-  - [cross-platform-ci.yml](/Users/iwanteague/Desktop/Rustynet/.github/workflows/cross-platform-ci.yml)
+  - [cross-platform-ci.yml](../../../.github/workflows/cross-platform-ci.yml)
   - `scripts/ci/*mac*` (new)
 - Changes:
   1. Add macOS dataplane smoke gate.
@@ -563,8 +563,8 @@ Status note:
 
 ### 11.8 GAP-08 implementation plan
 - Files to change:
-  - [README.md](/Users/iwanteague/Desktop/Rustynet/README.md)
-  - [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md)
+  - [README.md](../../../README.md)
+  - [phase10.md](../../../documents/phase10.md)
   - new support matrix doc under `documents/operations/`
 - Changes:
   1. Publish feature/support/security-evidence matrix by OS.
@@ -576,9 +576,9 @@ Status note:
 
 ### 11.9 GAP-09 implementation plan
 - Files to change:
-  - [key_material.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/key_material.rs)
-  - [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh)
-  - [rustynet-crypto/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-crypto/src/lib.rs)
+  - [key_material.rs](../../../crates/rustynetd/src/key_material.rs)
+  - [start.sh](../../../start.sh)
+  - [rustynet-crypto/lib.rs](../../../crates/rustynet-crypto/src/lib.rs)
 - Changes:
   1. Move macOS passphrase retrieval to Keychain by default.
   2. Eliminate persistent plaintext passphrase file creation on macOS paths.
@@ -594,7 +594,7 @@ Status note:
   - `scripts/start/common.sh` (new)
   - `scripts/start/linux.sh` (new)
   - `scripts/start/macos.sh` (new)
-  - [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh) (thin dispatcher)
+  - [start.sh](../../../start.sh) (thin dispatcher)
 - Changes:
   1. Extract OS-specific branches into separate modules.
   2. Keep shared validation and policy defaults in common module.

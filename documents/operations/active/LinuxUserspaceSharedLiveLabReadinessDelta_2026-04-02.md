@@ -1,6 +1,6 @@
 # Linux Userspace-Shared Live-Lab Readiness Delta
 **Generated:** 2026-04-03  
-**Repository Root:** `/Users/iwanteague/Desktop/Rustynet`  
+**Repository Root:** `workspace root`  
 **Status:** Active narrow delta document for the remaining work before an honest reduced Linux live-lab completion attempt  
 **Owning Ledger:** [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)  
 **Related Supporting Plan:** [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
@@ -131,11 +131,11 @@ So the current first blocker is no longer endpoint visibility. It is the second-
 
 ### 1.3 The Exact Remaining Gap After Baseline Runtime
 Delta Phase 1 and Delta Phase 2 are now real-host-proven for the reduced baseline-runtime slice:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs): `apply_routes(...)` is now real for `linux-wireguard-userspace-shared`
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs): `set_exit_mode(...)` is now real for `linux-wireguard-userspace-shared`, and backend capabilities now truthfully advertise Linux userspace-shared route and exit-node support
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs): the runtime worker now owns both route reconciliation state and current exit-mode state, and clears exit-mode state during shutdown before runtime teardown
-- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs): non-default route reconcile/rollback and backend exit-mode rule reconcile/rollback are now implemented for direct, helper-backed, and test TUN lifecycles
-- [scripts/e2e/live_linux_lab_orchestrator.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_lab_orchestrator.sh): baseline enforcement now refreshes freshly issued signed traversal bundles before exit-route advertisement so the 30-second signed coordination window is not consumed by earlier stages
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs): `apply_routes(...)` is now real for `linux-wireguard-userspace-shared`
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs): `set_exit_mode(...)` is now real for `linux-wireguard-userspace-shared`, and backend capabilities now truthfully advertise Linux userspace-shared route and exit-node support
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs): the runtime worker now owns both route reconciliation state and current exit-mode state, and clears exit-mode state during shutdown before runtime teardown
+- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs): non-default route reconcile/rollback and backend exit-mode rule reconcile/rollback are now implemented for direct, helper-backed, and test TUN lifecycles
+- [scripts/e2e/live_linux_lab_orchestrator.sh](../../../scripts/e2e/live_linux_lab_orchestrator.sh): baseline enforcement now refreshes freshly issued signed traversal bundles before exit-route advertisement so the 30-second signed coordination window is not consumed by earlier stages
 
 The remaining delta is no longer a backend route/exit-mode runtime gap, a baseline traversal-runtime instability, or a handoff/runtime-worker-liveness gap. The next step is:
 - keep the now-fixed baseline-runtime, role-switch, exit-handoff, and two-hop endpoint-visibility slices intact
@@ -144,7 +144,7 @@ The remaining delta is no longer a backend route/exit-mode runtime gap, a baseli
 
 ## 2. Why This Gap Mattered And Why The Next Step Is Operational Proof
 Phase 10 relies on backend route and exit-mode programming during baseline enforcement in:
-- [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
+- [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
 
 Current apply order:
 1. configure peers
@@ -180,7 +180,7 @@ Current status:
 
 #### Parity target
 The reference behavior is already present in the Linux command backend:
-- [crates/rustynet-backend-wireguard/src/linux_command.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/linux_command.rs)
+- [crates/rustynet-backend-wireguard/src/linux_command.rs](../../../crates/rustynet-backend-wireguard/src/linux_command.rs)
 
 That reference currently does two important things:
 - route reconciliation:
@@ -203,20 +203,20 @@ The Linux userspace-shared backend must implement the same behavior honestly wit
 - do **not** move socket, engine, or long-lived forwarding authority into the helper
 - do **not** create a second transport authority path
 - do **not** silently downgrade to the command-only backend
-- do **not** shift backend-owned route obligations into `RuntimeSystem::apply_routes(...)` as a shortcut; backend and system layers already have distinct responsibilities in [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
+- do **not** shift backend-owned route obligations into `RuntimeSystem::apply_routes(...)` as a shortcut; backend and system layers already have distinct responsibilities in [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
 - do **not** turn `set_exit_mode(...)` into a no-op that relies on later system stages to hide the missing backend state
 
 #### Minimum code surfaces
 Primary implementation surfaces:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs)
 
 Helper / daemon touch only if required by privilege boundaries:
-- [crates/rustynetd/src/privileged_helper.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/privileged_helper.rs)
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
-- [scripts/systemd/rustynetd-privileged-helper.service](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd-privileged-helper.service)
-- [crates/rustynet-cli/src/ops_install_systemd.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_install_systemd.rs)
+- [crates/rustynetd/src/privileged_helper.rs](../../../crates/rustynetd/src/privileged_helper.rs)
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
+- [scripts/systemd/rustynetd-privileged-helper.service](../../../scripts/systemd/rustynetd-privileged-helper.service)
+- [crates/rustynet-cli/src/ops_install_systemd.rs](../../../crates/rustynet-cli/src/ops_install_systemd.rs)
 
 #### Required validation for Bucket A
 Current local proof now includes:
@@ -298,9 +298,9 @@ Status:
 - Live-proven on 2026-04-04 via the successful reduced five-node rerun
 
 Required code focus:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs)
 - helper or daemon surfaces only if Linux privilege boundaries require them
 
 Required behavior:
@@ -335,15 +335,15 @@ Status:
 - Live-proven on 2026-04-04 via the successful reduced five-node rerun
 
 Required code focus:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
 - helper boundary only if Linux policy-rule mutation requires it
 
 Required behavior:
 - mirror the Linux command backend table/rule behavior for `ExitMode::Off` and `ExitMode::FullTunnel`
 - clear stale rule state before re-applying
 - keep backend/runtime state consistent with actual host programming
-- keep exit-mode rollback idempotent because [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs) already calls backend rollback on failure paths and shutdown paths
+- keep exit-mode rollback idempotent because [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs) already calls backend rollback on failure paths and shutdown paths
 - fail closed on partial apply, rollback failure, or privilege/setup failure
 
 Required proof before advancing:
@@ -422,7 +422,7 @@ Stop condition:
 ## 6. Exact Execution Order
 Follow this order for the remaining work:
 
-1. Preserve the now-proven route, exit-mode, and traversal-refresh timing slices in [mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs), [runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs), [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs), and [live_linux_lab_orchestrator.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_lab_orchestrator.sh).
+1. Preserve the now-proven route, exit-mode, and traversal-refresh timing slices in [mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs), [runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs), [tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs), and [live_linux_lab_orchestrator.sh](../../../scripts/e2e/live_linux_lab_orchestrator.sh).
 2. Preserve the now-landed Rust live-lab endpoint resolver fix so signed topology specs continue using effective SSH-resolved underlay hosts instead of raw aliases.
 3. Preserve the current backend-local runtime recovery path so a dead userspace-shared worker is rebuilt from runtime-owned desired state instead of leaving the daemon permanently fail-closed after restart.
 4. Re-run the reduced five-node helper lab on the current committed tree through `live_exit_handoff` with the local backend recovery fix.
@@ -473,7 +473,7 @@ The remaining implementation must be written to satisfy the gates Rustynet alrea
 
 ### 8.1 Phase 10 HP2 Traversal Gates
 Current gate entrypoint:
-- [scripts/ci/phase10_hp2_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_hp2_gates.sh)
+- [scripts/ci/phase10_hp2_gates.sh](../../../scripts/ci/phase10_hp2_gates.sh)
 
 Current gate implementation runs:
 - traversal authority and probe-selection tests in `rustynetd`
@@ -488,15 +488,15 @@ Implementation consequence:
 
 ### 8.2 Phase 10 CI Gates
 Current gate entrypoint:
-- [scripts/ci/phase10_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_gates.sh)
+- [scripts/ci/phase10_gates.sh](../../../scripts/ci/phase10_gates.sh)
 
-Current gate implementation in [ops_ci_release_perf.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_ci_release_perf.rs) runs:
+Current gate implementation in [ops_ci_release_perf.rs](../../../crates/rustynet-cli/src/ops_ci_release_perf.rs) runs:
 - fresh-install readiness scripts
 - workspace `fmt`, `clippy`, `check`, and `test`
 - `cargo audit --deny warnings`
 - `cargo deny check bans licenses sources advisories`
 - Phase 9 gates
-- [scripts/ci/check_backend_boundary_leakage.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/check_backend_boundary_leakage.sh)
+- [scripts/ci/check_backend_boundary_leakage.sh](../../../scripts/ci/check_backend_boundary_leakage.sh)
 - secret-pattern scan under `crates/`
 - required `rustynetd phase10::tests`
 - `cargo test -p rustynet-backend-wireguard --all-targets --all-features`
@@ -514,7 +514,7 @@ Implementation consequence:
 
 ### 8.3 Membership Gates
 Current gate entrypoint:
-- [scripts/ci/membership_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/membership_gates.sh)
+- [scripts/ci/membership_gates.sh](../../../scripts/ci/membership_gates.sh)
 
 Current gate implementation:
 - membership-targeted clippy/tests
@@ -527,7 +527,7 @@ Implementation consequence:
 
 ### 8.4 Cross-Network Exit Gates
 Current gate entrypoint:
-- [scripts/ci/phase10_cross_network_exit_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_cross_network_exit_gates.sh)
+- [scripts/ci/phase10_cross_network_exit_gates.sh](../../../scripts/ci/phase10_cross_network_exit_gates.sh)
 
 Current gate implementation:
 - validates cross-network report schemas
