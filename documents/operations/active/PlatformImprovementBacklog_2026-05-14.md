@@ -976,6 +976,14 @@ inline. Cross-reference with:
     custom-state-path echo through the report, and per-variant
     serde round-trip on Ok + IntegrityMismatch + InvalidFormat).
     Floor bumped 3 → 9. (commit e286ed9)
+  - `macos_dns_failclosed` test count 8 → 16 (+8 named tests
+    pinning schema_version, IPv4 link-local (169.254.169.254 cloud
+    metadata) rejection, IPv6 link-local rejection, IPv4-mapped
+    IPv6 external address rejection (not misclassified as
+    loopback), full 127.0.0.0/8 loopback range acceptance,
+    multi-directive search/domain parser ordering, bare-nameserver
+    parser tolerance, and no-dedup-across-nameservers drift
+    aggregation). Floor bumped 8 → 16. (commit c57a887)
 * `[ ]` Remaining scope (separate slice): consider whether a
   dedicated `windows_runtime_acls.rs` module is justified now that
   the SDDL surface has explicit drift coverage. Today the
