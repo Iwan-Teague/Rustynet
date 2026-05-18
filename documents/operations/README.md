@@ -35,7 +35,8 @@ Move a document into `operations/done/` when it is historical evidence rather th
 
 See [active/README.md](./active/README.md) for the current list.
 
-The two primary execution ledgers are:
+The primary execution ledgers are:
+- [active/RustynetDataplaneExecutionPlan_2026-05-18.md](./active/RustynetDataplaneExecutionPlan_2026-05-18.md) — source-of-truth for the cross-network dataplane track (D2-D10): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding. Read this first for "what are we building and why."
 - [active/MasterWorkPlan_2026-03-22.md](./active/MasterWorkPlan_2026-03-22.md)
 - [active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 
