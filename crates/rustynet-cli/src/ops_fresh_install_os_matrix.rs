@@ -500,6 +500,46 @@ impl FreshInstallOsMatrixReportView {
     }
 }
 
+/// X2: typed view over the inner *child* report shape walked by
+/// `validate_measured_child_report_for_verify`. The 5 typed slots
+/// correspond to every `.get("...")` call the walker makes against
+/// the child payload; the `extra` flatten preserves any other fields
+/// a child report may carry (forward-compat).
+///
+/// Field-shape rules:
+/// * `evidence_mode`, `git_commit`, `status`, `source_artifact` use
+///   `Option<String>`. Missing slots deserialise to `None`; the
+///   walker's downstream checks (`require_nonempty_string_field`,
+///   the `status != "pass"` check, etc.) keep producing the same
+///   per-field error strings they always did.
+/// * `captured_at_unix` uses `Option<u64>` so a wrong-type slot fails
+///   at deserialize rather than silently slipping past
+///   `.and_then(Value::as_u64)` and being caught later by the
+///   `require_positive_u64_field` helper.
+/// * `source_artifacts` keeps `Option<Value>` so the existing
+///   `validate_source_artifact_entries_for_verify` helper can keep
+///   reading the array via its `&Value` parameter without a shape
+///   change at that boundary.
+///
+/// The primary validation win this view closes is the previously-
+/// silent `if let Some(status) = ...and_then(Value::as_str)` walk:
+/// a wrong-type `status: 42` slot used to skip the
+/// `"must be pass"` check entirely; now it fails at deserialize
+/// with a precise field-shape error.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct FreshInstallMeasuredChildReportView {
+    pub evidence_mode: Option<String>,
+    pub git_commit: Option<String>,
+    pub captured_at_unix: Option<u64>,
+    pub status: Option<String>,
+    pub source_artifacts: Option<Value>,
+    pub source_artifact: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
 fn validate_measured_child_report_for_verify(
     report_path: &Path,
     label: &str,
@@ -548,7 +588,23 @@ fn validate_measured_child_report_for_verify(
         return Ok(());
     }
 
-    if object.get("evidence_mode").and_then(Value::as_str) != Some("measured") {
+    // X2: deserialise the child report shape into the typed view
+    // once. Wrong-type slots (e.g. `status: 42`, `captured_at_unix:
+    // "early"`) fail here instead of silently slipping past the
+    // legacy `.and_then(Value::as_str)` / `.and_then(Value::as_u64)`
+    // walks. The primary validation win this closes is the
+    // previously-silent `if let Some(status) = ...` walk, which used
+    // to skip the `status != "pass"` check entirely when `status`
+    // arrived with the wrong type.
+    let typed: FreshInstallMeasuredChildReportView = serde_json::from_value(payload.clone())
+        .map_err(|err| {
+            format!(
+                "{label} child report has invalid field shape: {} ({err})",
+                resolved.display()
+            )
+        })?;
+
+    if typed.evidence_mode.as_deref() != Some("measured") {
         return Err(format!(
             "{label} child report must set evidence_mode=measured: {}",
             resolved.display()
@@ -576,7 +632,7 @@ fn validate_measured_child_report_for_verify(
         context.max_age_seconds,
     )?;
 
-    if let Some(status) = object.get("status").and_then(Value::as_str)
+    if let Some(status) = typed.status.as_deref()
         && status != "pass"
     {
         return Err(format!(
@@ -585,8 +641,8 @@ fn validate_measured_child_report_for_verify(
         ));
     }
 
-    let child_source_artifacts = object.get("source_artifacts");
-    let child_source_artifact = object.get("source_artifact");
+    let child_source_artifacts = typed.source_artifacts.as_ref();
+    let child_source_artifact = typed.source_artifact.as_deref();
     if child_source_artifacts.is_none() && child_source_artifact.is_none() {
         return Err(format!(
             "{label} child report must declare source_artifacts or source_artifact: {}",
@@ -603,9 +659,6 @@ fn validate_measured_child_report_for_verify(
         )?;
     }
     if let Some(item) = child_source_artifact {
-        let item = item
-            .as_str()
-            .ok_or_else(|| format!("{label}.child_source has invalid source artifact entry"))?;
         let child_path = resolve_artifact_path_for_verify(
             item,
             context.root,
@@ -1776,7 +1829,8 @@ pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
 #[cfg(test)]
 mod tests {
     use super::{
-        FreshInstallOsMatrixReportView, WriteFreshInstallOsMatrixReadinessFixturesConfig,
+        FreshInstallMeasuredChildReportView, FreshInstallOsMatrixReportView,
+        WriteFreshInstallOsMatrixReadinessFixturesConfig,
         execute_ops_write_fresh_install_os_matrix_readiness_fixtures, parse_json_object,
     };
     use serde_json::{Value, json};
@@ -1956,6 +2010,97 @@ mod tests {
         assert!(
             map.contains_key("scenarios"),
             "flattened extras must be preserved"
+        );
+    }
+
+    // ---- X2: FreshInstallMeasuredChildReportView typed-view ----------
+
+    /// Clean fixture: a well-formed child-report shape deserializes
+    /// into every typed slot; an extra ride-through key flows into
+    /// `#[serde(flatten)] extra`.
+    #[test]
+    fn fresh_install_measured_child_report_view_accepts_clean_payload() {
+        let payload = json!({
+            "evidence_mode": "measured",
+            "git_commit": "a".repeat(40),
+            "captured_at_unix": 1_700_000_000u64,
+            "status": "pass",
+            "source_artifacts": ["child.json"],
+            "source_artifact": "child.json",
+            "extra_field": "ride-through",
+        });
+        let view: FreshInstallMeasuredChildReportView = serde_json::from_value(payload)
+            .expect("typed view accepts the clean child-report fixture");
+        assert_eq!(view.evidence_mode.as_deref(), Some("measured"));
+        assert_eq!(view.git_commit.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(view.captured_at_unix, Some(1_700_000_000));
+        assert_eq!(view.status.as_deref(), Some("pass"));
+        assert!(view.source_artifacts.is_some());
+        assert_eq!(view.source_artifact.as_deref(), Some("child.json"));
+        assert_eq!(
+            view.extra.get("extra_field").and_then(Value::as_str),
+            Some("ride-through")
+        );
+    }
+
+    /// Missing optional slots deserialize to `None`. Each typed field
+    /// is `Option<...>` with `#[serde(default)]`, so a child payload
+    /// that only carries `evidence_mode` is well-formed at the typed
+    /// layer (the walker's downstream presence/value checks still
+    /// produce the same per-field errors).
+    #[test]
+    fn fresh_install_measured_child_report_view_accepts_missing_optional_slots() {
+        let payload = json!({ "evidence_mode": "measured" });
+        let view: FreshInstallMeasuredChildReportView =
+            serde_json::from_value(payload).expect("typed view tolerates missing optional slots");
+        assert_eq!(view.evidence_mode.as_deref(), Some("measured"));
+        assert!(view.git_commit.is_none());
+        assert!(view.captured_at_unix.is_none());
+        assert!(view.status.is_none());
+        assert!(view.source_artifacts.is_none());
+        assert!(view.source_artifact.is_none());
+    }
+
+    /// Wrong-type `status` slot rejected at the typed layer. This is
+    /// the primary validation win the typed view closes: a child
+    /// report with `status: 42` previously slipped past the silent
+    /// `.and_then(Value::as_str)` walk entirely, bypassing the
+    /// `status != "pass"` check. Now it fails at deserialize.
+    #[test]
+    fn fresh_install_measured_child_report_view_rejects_wrong_type_status_slot() {
+        let payload = json!({
+            "evidence_mode": "measured",
+            "git_commit": "a".repeat(40),
+            "captured_at_unix": 1_700_000_000u64,
+            "status": 42,
+            "source_artifact": "child.json",
+        });
+        let err = serde_json::from_value::<FreshInstallMeasuredChildReportView>(payload)
+            .expect_err("integer status must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("status") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Wrong-type `captured_at_unix` slot rejected. Previously the
+    /// silent `.and_then(Value::as_u64)` walk would return `None`,
+    /// causing the downstream `require_positive_u64_field` to surface
+    /// a generic "requires positive integer" error. Now the typed
+    /// view fails first with a precise field-shape error.
+    #[test]
+    fn fresh_install_measured_child_report_view_rejects_wrong_type_captured_at_slot() {
+        let payload = json!({
+            "evidence_mode": "measured",
+            "captured_at_unix": "early",
+        });
+        let err = serde_json::from_value::<FreshInstallMeasuredChildReportView>(payload)
+            .expect_err("string captured_at_unix must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("captured_at_unix") || message.contains("u64"),
+            "error must point to the offending field or type: {message}"
         );
     }
 }
