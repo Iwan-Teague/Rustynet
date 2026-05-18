@@ -288,7 +288,7 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
     }
 
     fn restore_default_route(&mut self) {
-        let Some(gateway) = self.default_gateway.clone() else {
+        let Some(gateway) = self.default_gateway.take() else {
             return;
         };
         let _ = self.runner.run(
@@ -298,11 +298,10 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
                 "change".to_string(),
                 "-inet".to_string(),
                 "default".to_string(),
-                gateway.clone(),
+                gateway,
             ],
         );
         self.remove_endpoint_bypass_routes();
-        self.default_gateway = None;
     }
 
     fn terminate_wireguard_go_processes(&mut self) -> Result<(), BackendError> {
