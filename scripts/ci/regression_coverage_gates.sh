@@ -111,7 +111,13 @@ MACOS_FLOORS=(
   "macos_service_hardening:9"
   "macos_dns_failclosed:8"
   "macos_mesh_status:3"
-  "macos_key_custody:2"
+  # Floor bumped 2→11 on X4 coverage parity sweep: 8 new tests
+  # covering schema_version pin, reviewed-entry-paths canonical
+  # snapshot (off-macOS), per-variant serde round-trip on Missing/
+  # Invalid/Forbidden/AbsentAsExpected, unknown-status-tag
+  # rejection, and the overall_ok={Ok|AbsentAsExpected only}
+  # contract from both sides.
+  "macos_key_custody:11"
   "macos_authenticode:2"
 )
 

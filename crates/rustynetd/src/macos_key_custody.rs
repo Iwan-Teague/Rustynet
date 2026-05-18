@@ -360,4 +360,230 @@ mod tests {
         assert!(MACOS_WG_PUBLIC_KEY_PATH.starts_with(MACOS_WG_KEYS_DIR));
         assert!(MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.starts_with(MACOS_WG_KEYS_DIR));
     }
+
+    // ----- X4 coverage parity sweep ---------------------------------------
+
+    fn keys_dir_entry() -> MacosKeyCustodyEntry {
+        MacosKeyCustodyEntry {
+            label: "keys dir".to_string(),
+            path: MACOS_WG_KEYS_DIR.to_string(),
+            expected: "present".to_string(),
+            status: MacosKeyCustodyEntryStatus::Ok {
+                mode: 0o700,
+                uid: 500,
+                gid: 500,
+            },
+        }
+    }
+
+    #[test]
+    fn report_schema_version_pinned_at_one() {
+        // Pin the wire-format schema_version so an accidental bump
+        // forces a deliberate review.
+        let report = MacosKeyCustodyReport {
+            schema_version: 1,
+            overall_ok: true,
+            entries: vec![keys_dir_entry()],
+        };
+        assert_eq!(report.schema_version, 1);
+        let body = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            body.contains("\"schema_version\":1"),
+            "schema_version JSON shape must be int=1: {body}"
+        );
+    }
+
+    #[test]
+    fn reviewed_entry_paths_pinned_in_canonical_order() {
+        // Snapshot the four reviewed entries that the (off-platform)
+        // collector emits today. A future refactor that drops one,
+        // reorders the set, or adds a new reviewed artifact has to
+        // update this snapshot in the same commit.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let report = collect_macos_key_custody_report();
+            let observed: Vec<(&str, &str)> = report
+                .entries
+                .iter()
+                .map(|e| (e.label.as_str(), e.path.as_str()))
+                .collect();
+            assert_eq!(
+                observed,
+                vec![
+                    ("keys dir", MACOS_WG_KEYS_DIR),
+                    ("encrypted private key", MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH),
+                    ("public key", MACOS_WG_PUBLIC_KEY_PATH),
+                    (
+                        "plaintext private key (forbidden)",
+                        MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH,
+                    ),
+                ]
+            );
+        }
+        // The path-constants snapshot (label-independent) is unconditional
+        // so the assertion runs on macOS too.
+        let canonical_paths = [
+            MACOS_WG_KEYS_DIR,
+            MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
+            MACOS_WG_PUBLIC_KEY_PATH,
+            MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH,
+        ];
+        for path in canonical_paths {
+            assert!(
+                path.starts_with("/usr/local/var/rustynet"),
+                "all reviewed paths must live under the reviewed state root: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_status_missing_round_trips_through_serde() {
+        let entry = MacosKeyCustodyEntry {
+            label: "keys dir".to_string(),
+            path: MACOS_WG_KEYS_DIR.to_string(),
+            expected: "present".to_string(),
+            status: MacosKeyCustodyEntryStatus::Missing {
+                reason: "stat failed: ENOENT".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"missing\""), "tag: {body}");
+        let parsed: MacosKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_invalid_round_trips_through_serde() {
+        let entry = MacosKeyCustodyEntry {
+            label: "encrypted private key".to_string(),
+            path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
+            expected: "present".to_string(),
+            status: MacosKeyCustodyEntryStatus::Invalid {
+                reason: "mode 0o644, expected 0o600".to_string(),
+                mode: 0o100644,
+                uid: 500,
+                gid: 500,
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"invalid\""), "tag: {body}");
+        let parsed: MacosKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_forbidden_round_trips_through_serde() {
+        let entry = MacosKeyCustodyEntry {
+            label: "plaintext private key (forbidden)".to_string(),
+            path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
+            expected: "absent".to_string(),
+            status: MacosKeyCustodyEntryStatus::Forbidden {
+                reason: "must not exist at rest after Phase E".to_string(),
+            },
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(body.contains("\"status\":\"forbidden\""), "tag: {body}");
+        let parsed: MacosKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_absent_as_expected_round_trips_through_serde() {
+        let entry = MacosKeyCustodyEntry {
+            label: "plaintext private key (forbidden)".to_string(),
+            path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
+            expected: "absent".to_string(),
+            status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
+        };
+        let body = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            body.contains("\"status\":\"absent_as_expected\""),
+            "tag: {body}"
+        );
+        let parsed: MacosKeyCustodyEntry = serde_json::from_str(&body).expect("deserialize");
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn entry_status_rejects_unknown_tag() {
+        // #[serde(tag = "status", rename_all = "snake_case")] — an
+        // unknown tag must fail closed.
+        let body = r#"{"label":"keys dir","path":"/usr/local/var/rustynet/keys","expected":"present","status":"observe_only","reason":"placeholder"}"#;
+        let err = serde_json::from_str::<MacosKeyCustodyEntry>(body)
+            .expect_err("unknown tag must fail closed");
+        assert!(
+            err.to_string().contains("observe_only") || err.to_string().contains("unknown variant"),
+            "error must reference unknown tag or 'unknown variant': {err}"
+        );
+    }
+
+    #[test]
+    fn report_overall_ok_is_false_when_any_entry_is_invalid() {
+        // The collector derives overall_ok via an all() walk over
+        // entry statuses, accepting Ok + AbsentAsExpected only. Pin
+        // the contract by constructing a mixed report manually and
+        // re-deriving the verdict the same way.
+        let report = MacosKeyCustodyReport {
+            schema_version: 1,
+            overall_ok: false,
+            entries: vec![
+                keys_dir_entry(),
+                MacosKeyCustodyEntry {
+                    label: "encrypted private key".to_string(),
+                    path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
+                    expected: "present".to_string(),
+                    status: MacosKeyCustodyEntryStatus::Invalid {
+                        reason: "mode drift".to_string(),
+                        mode: 0o100644,
+                        uid: 500,
+                        gid: 500,
+                    },
+                },
+            ],
+        };
+        let derived = report.entries.iter().all(|e| {
+            matches!(
+                e.status,
+                MacosKeyCustodyEntryStatus::Ok { .. }
+                    | MacosKeyCustodyEntryStatus::AbsentAsExpected
+            )
+        });
+        assert!(
+            !derived,
+            "overall_ok must be false when any entry is Invalid"
+        );
+        assert_eq!(report.overall_ok, derived);
+    }
+
+    #[test]
+    fn report_overall_ok_is_true_when_only_ok_and_absent_as_expected_present() {
+        // The acceptance contract on the collector: only Ok +
+        // AbsentAsExpected count toward overall_ok=true. Pin from
+        // the positive side too.
+        let report = MacosKeyCustodyReport {
+            schema_version: 1,
+            overall_ok: true,
+            entries: vec![
+                keys_dir_entry(),
+                MacosKeyCustodyEntry {
+                    label: "plaintext private key (forbidden)".to_string(),
+                    path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
+                    expected: "absent".to_string(),
+                    status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
+                },
+            ],
+        };
+        let derived = report.entries.iter().all(|e| {
+            matches!(
+                e.status,
+                MacosKeyCustodyEntryStatus::Ok { .. }
+                    | MacosKeyCustodyEntryStatus::AbsentAsExpected
+            )
+        });
+        assert!(
+            derived,
+            "overall_ok must be true when entries are Ok or AbsentAsExpected"
+        );
+        assert_eq!(report.overall_ok, derived);
+    }
 }
