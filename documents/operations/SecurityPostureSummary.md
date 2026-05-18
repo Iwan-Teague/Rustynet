@@ -82,9 +82,9 @@ Runbook: [`CliExitCodeTaxonomy.md`](./CliExitCodeTaxonomy.md).
 
 ## 3. Static no-secret-leakage audit (X3)
 
-`crates/rustynetd/src/secret_log_audit.rs` is a `cargo test`-time static source-walk audit. Sweeps every `.rs` file under `crates/rustynetd/src/` + `crates/rustynet-cli/src/` and fails closed when any of these patterns appears:
+`crates/rustynetd/src/secret_log_audit.rs` is a `cargo test`-time static source-walk audit. Sweeps every `.rs` file under `crates/rustynetd/src/` + `crates/rustynet-cli/src/` (placeholder/Debug/hex/base64/Display scanners) and `crates/` workspace-wide (deprecated-crypto-imports + secret-material-equality scanners), and fails closed when any of these patterns appears:
 
-1. **Forbidden placeholder tokens in log/print/format macros** — `{passphrase_bytes}`, `{private_key_bytes}`, `{signing_key_bytes}`, `{wrapped_secret}`, `{decrypted_secret}`, `{plaintext_key}`, `{raw_passphrase}`, `{secret_bytes}`. Matches `{token}`, `{token:?}`, `{token:x?}` shapes; ignores commented-out lines and path-only logs.
+1. **Forbidden placeholder tokens in log/print/format macros** — `{passphrase_bytes}`, `{private_key_bytes}`, `{signing_key_bytes}`, `{wrapped_secret}`, `{decrypted_secret}`, `{plaintext_key}`, `{raw_passphrase}`, `{secret_bytes}`, `{signing_seed}`. Matches `{token}`, `{token:?}`, `{token:x?}` shapes; ignores commented-out lines and path-only logs.
 
 2. **Forbidden `Debug` derive / impl on secret-bearing types** — `PassphraseMaterial`, `WrappedKeyMaterial`, `RuntimePrivateKey`, `SigningKeyMaterial`. No-`Debug` is the structural guarantee that `{:?}` cannot leak inner bytes.
 
@@ -94,7 +94,11 @@ Runbook: [`CliExitCodeTaxonomy.md`](./CliExitCodeTaxonomy.md).
 
 5. **Forbidden `Display` / `ToString` impl on canonical secret-bearing types** — same list as the Debug ban.
 
-Workspace sweeps run on every `cargo test` invocation. Current tree: **0 offenders**. Allowlist scope is narrow (only the audit module itself, which necessarily mentions the forbidden tokens as constants).
+6. **Secret-material equality compares (`==` / `!=`) without `ct_eq`** — flags raw equality on forbidden tokens (token / csrf / session_key / nonce / mac / hmac / session_id / signature). Suppressed by `ct_eq` on the same line OR a structured `(path, line, justification)` entry in `REVIEWED_SECRET_EQUALITY_EXCEPTIONS`.
+
+7. **Deprecated-crypto-imports** — rejects `use sha1` / `use md5` / `use md_5` / `use des` / `use des3` / `use triple_des` (with boundary-terminator check to reject safe-name lookalikes like `sha2` / `sha3` / `descriptor` / `md_hashlib`).
+
+Workspace sweeps run on every `cargo test` invocation. Current tree: **0 offenders** across all 7 scanners. Allowlist scope is narrow (only the audit module itself, which necessarily mentions the forbidden tokens / forbidden crate names as constants).
 
 ## 4. Boot-time + ordering invariants
 
