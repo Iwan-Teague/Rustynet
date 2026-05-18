@@ -146,7 +146,7 @@ Modules with typed views landed:
 | `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 615 pinned tests)   |
 | `scripts/ci/start_modularization_smoke.sh`         | bash module / dispatcher contract (32 checks)                                |
 | `scripts/ci/secrets_hygiene_gates.sh`              | structured secret-leak audit + required tests                                |
-| Per-phase gate scripts (`phase1_gates.sh` … `phase10_gates.sh`) | per-phase release-readiness pins                                |
+| Per-phase gate scripts (`phase1_gates.sh`, `phase3_gates.sh` … `phase10_gates.sh`; no phase2 script) | per-phase release-readiness pins                                |
 
 ## 7. Operating-policy hygiene
 
