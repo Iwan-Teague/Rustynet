@@ -60,7 +60,7 @@ named drift tests, the regression-coverage CI gate
 
 - **22 verifier + audit modules** across 4 groups, **593 pinned tests** on the regression-coverage gate floor (sum of per-module floors: linux 196 + macos 74 + windows 278 + shared 45).
 - Every Linux verifier has a macOS + Windows analog (or equivalent surface). Every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls` / `windows_paths`).
-- Workspace test sweep: **2786 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends, measured 2026-05-18 post X4/X7 expansion).
+- Workspace test sweep: **2850 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends, measured 2026-05-18 post X4/X7 expansion + cycle 48 windows_ipc pin).
 
 ## 2. CLI exit-code taxonomy (X6)
 
@@ -133,7 +133,7 @@ Modules with typed views landed:
 |---------------------------------------------------|------------------------------------------------------------------------------|
 | `cargo fmt --all -- --check`                       | format consistency                                                           |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | lint cleanliness with warnings-as-errors                  |
-| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2786 tests as of 2026-05-18)                   |
+| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2850 tests as of 2026-05-18 end-of-run)         |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
 | `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 593 pinned tests)   |
