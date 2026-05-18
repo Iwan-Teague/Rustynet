@@ -1557,18 +1557,28 @@ pub fn execute_ops_check_dependency_exceptions(
 
 fn load_perf_metrics(path: &Path, label: &str) -> Result<HashMap<String, f64>, String> {
     let payload = read_json_value(path, label)?;
-    let payload_object = payload
-        .as_object()
-        .ok_or_else(|| format!("{label} must be a JSON object: {}", path.display()))?;
-    let metrics = payload_object
-        .get("metrics")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{label} metrics must be a non-empty array: {}",
-                path.display()
-            )
-        })?;
+    if !payload.is_object() {
+        return Err(format!("{label} must be a JSON object: {}", path.display()));
+    }
+    // X2: reuse the `Phase1ValidateReportView` + `Phase1MetricEntryView`
+    // typed contract introduced in cycle 65 — both perf-metrics loaders
+    // walk the same `{ metrics: [{ name, value, status, reason }] }`
+    // shape, and routing them through the same view ensures the
+    // contract is pinned in one place. Wrong-type slots (e.g.
+    // `status: 42`) fail at deserialise here instead of slipping
+    // past the legacy `.and_then(Value::as_str)` walks.
+    let typed: Phase1ValidateReportView = serde_json::from_value(payload).map_err(|err| {
+        format!(
+            "{label} has invalid field shape: {} ({err})",
+            path.display()
+        )
+    })?;
+    let metrics = typed.metrics.as_ref().ok_or_else(|| {
+        format!(
+            "{label} metrics must be a non-empty array: {}",
+            path.display()
+        )
+    })?;
     if metrics.is_empty() {
         return Err(format!(
             "{label} metrics must be a non-empty array: {}",
@@ -1578,17 +1588,15 @@ fn load_perf_metrics(path: &Path, label: &str) -> Result<HashMap<String, f64>, S
 
     let mut values = HashMap::new();
     for metric in metrics {
-        let metric_object = metric
-            .as_object()
-            .ok_or_else(|| format!("{label} metric entry must be object: {}", path.display()))?;
-        let metric_name = metric_object
-            .get("name")
-            .and_then(Value::as_str)
+        let metric_name = metric
+            .name
+            .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .ok_or_else(|| format!("{label} metric missing non-empty name: {}", path.display()))?;
-        let metric_value = metric_object
-            .get("value")
+        let metric_value = metric
+            .value
+            .as_ref()
             .and_then(phase1_value_as_number)
             .ok_or_else(|| {
                 format!(
@@ -1599,18 +1607,15 @@ fn load_perf_metrics(path: &Path, label: &str) -> Result<HashMap<String, f64>, S
         if !metric_value.is_finite() || metric_value < 0.0 {
             return Err(format!(
                 "{label} metric '{metric_name}' has invalid numeric value: {}",
-                metric_object.get("value").cloned().unwrap_or(Value::Null)
+                metric.value.clone().unwrap_or(Value::Null)
             ));
         }
-        if metric_object
-            .get("status")
-            .and_then(Value::as_str)
+        if metric
+            .status
+            .as_deref()
             .is_some_and(|status| status == "fail" || status == "not_measurable")
         {
-            let status = metric_object
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
+            let status = metric.status.as_deref().unwrap_or("unknown");
             return Err(format!(
                 "{label} metric '{metric_name}' has failing status: {status}"
             ));
@@ -2537,6 +2542,24 @@ mod tests {
         assert!(
             err.contains("invalid field shape"),
             "validator must wrap the typed deserialise error: {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Cycle 72: `load_perf_metrics` reuses the cycle-65 typed views
+    /// (`Phase1ValidateReportView` + `Phase1MetricEntryView`). A
+    /// wrong-type `metrics` slot surfaces the same "invalid field
+    /// shape" wrap as `phase1_validate_report` — the two loaders now
+    /// share one canonical X2 contract.
+    #[test]
+    fn load_perf_metrics_surfaces_typed_shape_error_for_wrong_type_metrics() {
+        let path = unique_temp_path("rustynet-phase1-perf-shape-error", ".json");
+        std::fs::write(&path, br#"{"metrics": "not-an-array"}"#).expect("write report");
+        let err = super::load_perf_metrics(&path, "perf shape error report")
+            .expect_err("perf loader must surface the typed shape error");
+        assert!(
+            err.contains("invalid field shape"),
+            "perf loader must wrap the typed deserialise error: {err}"
         );
         let _ = std::fs::remove_file(path);
     }
