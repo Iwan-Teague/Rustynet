@@ -128,7 +128,13 @@ SHARED_FLOORS=(
   # `dbg!(passphrase_bytes)` would slip past every other X3 scanner
   # because it has no format-string placeholder and isn't Debug-derive;
   # the new scanner closes that hole.
-  "secret_log_audit:53"
+  # Floor bumped 53→62 on panic-macro placeholder scanner: 1 workspace
+  # sweep + 8 self-tests pin scan_source_for_panic_macro_placeholder_leaks
+  # against panic / unreachable / unimplemented / todo / assert /
+  # assert_eq / assert_ne / debug_assert{,_eq,_ne}. Panic-shape macros
+  # accept a format string and print to stderr + the panic backtrace,
+  # same `{token:?}` leak shape as eprintln! but a distinct macro family.
+  "secret_log_audit:62"
 )
 
 # macOS coverage floors. macOS is a control-plane platform today, not
