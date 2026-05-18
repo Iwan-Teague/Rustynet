@@ -122,12 +122,15 @@ Workspace sweeps run on every `cargo test` invocation. Current tree: **0 offende
 `serde_json::Value` walks in `ops_*.rs` modules being replaced by typed serde views with `#[serde(flatten)] extra: Map<String, Value>` for forward-compat. Each typed view exposes `into_value_map()` so downstream Map-walking helpers keep working unchanged.
 
 Modules with typed views landed:
-- `ops_phase9.rs` — 4 views (`Phase9DrDrillView`, `Phase9IncidentDrillView`, `Phase9SloWindowView`, `Phase9PerformanceSampleView`); all 4 NDJSON consumers migrated
-- `ops_network_discovery.rs` — `NetworkDiscoveryBundleView`
-- `ops_fresh_install_os_matrix.rs` — `FreshInstallOsMatrixReportView`
-- `ops_cross_network_reports.rs` — 3 views (`CrossNetworkSoakMonitorSummaryView`, `CrossNetworkReportPayloadView`, `CrossNetworkSshTrustSummaryView` + `CrossNetworkSshTrustTargetView` substruct)
+- `ops_phase9.rs` — 4 NDJSON views (`Phase9DrDrillView`, `Phase9IncidentDrillView`, `Phase9SloWindowView`, `Phase9PerformanceSampleView`) + 3 phase-10 validator views (`Phase10PerfBudgetReportView`/`Phase10PerfMetricEntryView` for perf-budget validators, `Phase10StatusChecksView` shared by 3 status-checks validators)
+- `ops_network_discovery.rs` — **9 typed views** (full validator surface): top-level `NetworkDiscoveryBundleView` + 8 sub-block views (`NodeIdentityView`, `WireguardView`, `NatProfileView`, `VerifierKeysView`, `DaemonStatusView`, `EndpointCandidateView`, `RustynetArtifactEntryView`, `KnownPeerView`) wired through a shared `deserialize_sub_block::<T>` helper. `validate_no_secrets` retains a generic `Value` walk by design (recursive arbitrary-key/string scanner)
+- `ops_fresh_install_os_matrix.rs` — 2 views (`FreshInstallOsMatrixReportView` top-level + `FreshInstallMeasuredChildReportView` child-report validator)
+- `ops_cross_network_reports.rs` — 4 views (`CrossNetworkSoakMonitorSummaryView`, `CrossNetworkReportPayloadView`, `CrossNetworkSshTrustSummaryView` + `CrossNetworkSshTrustTargetView` substruct, plus `CrossNetworkPathEvidenceView` for the 15-field nested `path_evidence` walker inside `validate_report_payload`)
+- `ops_phase1.rs` — 2 views (`Phase1ValidateReportView` + `Phase1MetricEntryView`) shared between `phase1_validate_report` and `load_perf_metrics` (DRY consolidation)
+- `ops_security_audit.rs` — `SecurityAuditReportPayloadView` over `validate_report_payload`
 - `ops_live_lab_failure_digest.rs` — 4 views (full module migration, 5/5 walks eliminated)
 - `ops_live_lab_orchestrator.rs` — writer side fully migrated. Typed views (in landing order): `LiveLabOrchestratorNoLeakReportView`, `RunSummaryNodeView`/`RunSummaryWorkerView`/`RunSummaryStageView`/`LiveLabRunSummaryView`, `CrossNetworkForensicsManifestView`/`NodeReportView`/`BundleValidationView`, plus the 2026-05-18 batch: `LiveLinuxServerIpBypassReportView` (+ Checks/Evidence), `LiveLinuxControlSurfaceReportView` (+ 5 nested views), `LiveLinuxEndpointHijackReportView` (+ Checks/Evidence), `RealWireguardExitnodeE2eReportView` (+ Checks), `RealWireguardNoLeakUnderLoadReportView` (+ Checks/Metrics), `ActiveNetworkSignedStateTamperReportView` (+ Checks/Hosts/Evidence), `ActiveNetworkRoguePathHijackReportView` (+ Checks/Hosts/Evidence), `E2eDnsQueryResultView`. Only `execute_ops_read_json_field` retains a `Value` walk — intentional shape-agnostic JSON-pointer reader.
+- `main.rs` — `Phase6ProbeMetadataView` over `phase6_load_probe_metadata` (platform parity probe loader)
 
 **Pattern**: every required-string + required-u64 field becomes a typed field with serde required-field semantics. A missing or wrong-type value now fails at parse time with a precise per-line error including the file label, instead of surfacing later as an `ok_or_else` on a stale `Value::as_str()` result.
 
@@ -137,7 +140,7 @@ Modules with typed views landed:
 |---------------------------------------------------|------------------------------------------------------------------------------|
 | `cargo fmt --all -- --check`                       | format consistency                                                           |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | lint cleanliness with warnings-as-errors                  |
-| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2850 tests as of 2026-05-18 end-of-run)         |
+| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2916 tests as of 2026-05-18 post-cycle-74)      |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
 | `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 610 pinned tests)   |
@@ -159,6 +162,6 @@ Per `PlatformImprovementBacklog_2026-05-14.md`:
 - **L6 / L7 / L8 lab-side validation** — cross-boot passphrase stability, IPv6 NAT sibling table, netns reboot integration test. Need Linux lab fixtures.
 - **W1 / W4-collector / W5-collector / W7** — PowerShell helper JSON emit (sync-source / install-release / restart-runtime / verify-runtime / collect-diagnostics sub-phases), Win32 `RegGetKeySecurity` collector, Win32 `CryptQueryObject` thumbprint extraction, Windows install-release real runtime. Need Windows-native infra.
 - **L2 nftables IPv6 parity + named-chain integrity** — runtime-ACL `inet rustynet` / `ip rustynet` family wiring inspection. Verifier extension lives in `phase10.rs`; no test floor yet because the surface is outside the per-platform `linux_runtime_acls` module.
-- **X2 remaining** — writer-side fully migrated on `ops_live_lab_orchestrator.rs` (only `execute_ops_read_json_field` retains a `Value` walk, intentional shape-agnostic JSON-pointer reader by design). `ops_cross_network_reports.rs` has 5 helper `Value` walks intentionally kept (path-evidence extractors over `&[Value]` / `Option<&Value>`) and nested `path_evidence` block walkers as a future slice.
+- **X2 remaining** — writer-side fully migrated on `ops_live_lab_orchestrator.rs` (only `execute_ops_read_json_field` retains a `Value` walk, intentional shape-agnostic JSON-pointer reader by design). `ops_network_discovery.rs` validator surface fully typed (9 views; `validate_no_secrets` retains a generic walk by design). `ops_cross_network_reports.rs` has 5 helper `Value` walks intentionally kept (path-evidence extractors over `&[Value]` / `Option<&Value>`); the nested `path_evidence` block walker landed in cycle 63 (`CrossNetworkPathEvidenceView`, 15 typed slots). `ops_phase9.rs` compatibility_policy + slo + hp2 sub-block walks remain on `&Map<String, Value>` because their `phase9_require_*` helpers already fail-fast on wrong-type — the typed-layer win is cosmetic for those.
 
 Each is incrementally landable when the relevant infra (lab / Windows host / Win32 bindings) is available.
