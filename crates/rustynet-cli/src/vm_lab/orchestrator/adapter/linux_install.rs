@@ -92,11 +92,9 @@ pub fn install_daemon(
     // the bootstrap script's other privileged steps; passwordless sudo is
     // already a precondition of the bootstrap path.
     let verify_script = format!(
-        "test -x {rustynetd} && test -x {rustynet} && \
+        "test -x {LINUX_RUSTYNETD_PATH} && test -x {LINUX_RUSTYNET_PATH} && \
          sudo -n test -f /var/lib/rustynet/keys/wireguard.pub && \
          getent group rustynetd >/dev/null 2>&1",
-        rustynetd = LINUX_RUSTYNETD_PATH,
-        rustynet = LINUX_RUSTYNET_PATH,
     );
     ssh::run_remote(conn, &verify_script, short_timeout)?;
 
@@ -230,9 +228,7 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     ssh::run_remote(
         conn,
         &format!(
-            "sudo rm -f {rustynetd} {rustynet} /etc/systemd/system/rustynetd.service && sudo systemctl daemon-reload 2>/dev/null || true && sudo rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet",
-            rustynetd = LINUX_RUSTYNETD_PATH,
-            rustynet = LINUX_RUSTYNET_PATH,
+            "sudo rm -f {LINUX_RUSTYNETD_PATH} {LINUX_RUSTYNET_PATH} /etc/systemd/system/rustynetd.service && sudo systemctl daemon-reload 2>/dev/null || true && sudo rm -rf /etc/rustynet /var/lib/rustynet /run/rustynet",
         ),
         timeout,
     )?;

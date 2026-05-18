@@ -142,8 +142,7 @@ mod tests {
         );
         assert!(
             matches!(err, AdapterError::UnsupportedPlatform { .. }),
-            "expected UnsupportedPlatform, got: {:?}",
-            err
+            "expected UnsupportedPlatform, got: {err:?}"
         );
     }
 
@@ -161,8 +160,7 @@ mod tests {
         );
         assert!(
             matches!(err, AdapterError::UnsupportedPlatform { .. }),
-            "expected UnsupportedPlatform, got: {:?}",
-            err
+            "expected UnsupportedPlatform, got: {err:?}"
         );
     }
 
@@ -174,8 +172,7 @@ mod tests {
         let err = node_adapter_for("node", VmGuestPlatform::Linux, conn, None).unwrap_err();
         assert!(
             matches!(err, AdapterError::ConnectionPlatformMismatch { .. }),
-            "expected ConnectionPlatformMismatch, got: {:?}",
-            err
+            "expected ConnectionPlatformMismatch, got: {err:?}"
         );
     }
 
@@ -187,8 +184,7 @@ mod tests {
         let err = node_adapter_for("node", VmGuestPlatform::Ios, conn, None).unwrap_err();
         assert!(
             matches!(err, AdapterError::ConnectionPlatformMismatch { .. }),
-            "expected ConnectionPlatformMismatch, got: {:?}",
-            err
+            "expected ConnectionPlatformMismatch, got: {err:?}"
         );
     }
 }

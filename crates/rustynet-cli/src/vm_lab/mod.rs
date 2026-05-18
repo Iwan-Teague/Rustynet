@@ -9330,10 +9330,7 @@ fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize,
         .get("skipped_reasons")
         .and_then(Value::as_array)
         .map_or(0, |items| items.len());
-    Ok((
-        written.len(),
-        format!("{} skipped reason(s)", skipped_count),
-    ))
+    Ok((written.len(), format!("{skipped_count} skipped reason(s)")))
 }
 
 fn capture_windows_exit_evidence_artifacts(
@@ -28429,8 +28426,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         ] {
             assert!(
                 required.contains(&cap),
-                "linux-only capability constant must include {:?}",
-                cap
+                "linux-only capability constant must include {cap:?}"
             );
         }
     }

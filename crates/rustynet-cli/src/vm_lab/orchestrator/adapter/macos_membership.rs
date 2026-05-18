@@ -25,10 +25,7 @@ pub fn issue_membership_owner_key(
 ) -> Result<MembershipOwnerKey, AdapterError> {
     let pem = ssh::run_remote(
         conn,
-        &format!(
-            "cat '{path}' 2>/dev/null || echo ''",
-            path = MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH
-        ),
+        &format!("cat '{MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH}' 2>/dev/null || echo ''"),
         SHORT_TIMEOUT,
     )?;
     let pem = pem.trim().to_string();
@@ -57,10 +54,7 @@ pub fn init_membership_snapshot(
     // 1. Run ops init-membership (idempotent).
     ssh::run_remote(
         conn,
-        &format!(
-            "env RUSTYNET_NODE_ROLE=admin sudo '{rustynet}' ops init-membership",
-            rustynet = MACOS_RUSTYNET_PATH,
-        ),
+        &format!("env RUSTYNET_NODE_ROLE=admin sudo '{MACOS_RUSTYNET_PATH}' ops init-membership",),
         MEDIUM_TIMEOUT,
     )?;
 
@@ -74,12 +68,11 @@ pub fn init_membership_snapshot(
         ssh::run_remote(
             conn,
             &format!(
-                "owner_approver_id=\"$('{rustynet}' ops owner-approver-id 2>/dev/null || echo none)\"; \
-                 sudo '{rustynet}' ops e2e-membership-add \
+                "owner_approver_id=\"$('{MACOS_RUSTYNET_PATH}' ops owner-approver-id 2>/dev/null || echo none)\"; \
+                 sudo '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
                      --client-node-id '{node_id_arg}' \
                      --client-pubkey-hex '{pubkey_arg}' \
                      --owner-approver-id \"$owner_approver_id\"",
-                rustynet = MACOS_RUSTYNET_PATH,
             ),
             MEDIUM_TIMEOUT,
         )?;
@@ -88,10 +81,7 @@ pub fn init_membership_snapshot(
     // 3. Read snapshot back as base64.
     let snapshot_b64 = ssh::run_remote(
         conn,
-        &format!(
-            "cat '{snapshot}' | base64",
-            snapshot = MACOS_MEMBERSHIP_SNAPSHOT_PATH,
-        ),
+        &format!("cat '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}' | base64",),
         SHORT_TIMEOUT,
     )?;
     let data = base64_decode(snapshot_b64.trim())?;

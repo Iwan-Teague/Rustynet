@@ -419,7 +419,7 @@ fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, Ad
     Ok(format!(
         "$stopOut = (& sc.exe stop {svc_q} 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) {{ Write-Warning ('sc.exe stop returned ' + $LASTEXITCODE + ': ' + $stopOut) }}; \
-         for ($i = 0; $i -lt {stop_poll_secs}; $i++) {{ \
+         for ($i = 0; $i -lt {WINDOWS_SERVICE_STOP_POLL_SECS}; $i++) {{ \
              $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
              if ($null -eq $svc -or $svc.Status -ne 'StopPending') {{ break }}; \
              Start-Sleep -Seconds 1 \
@@ -427,20 +427,16 @@ fn windows_service_start_probe_fragment(service_name: &str) -> Result<String, Ad
          $startOut = (& sc.exe start {svc_q} 2>&1) -join ' '; \
          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1056) {{ throw ('sc.exe start failed (exit ' + $LASTEXITCODE + '): ' + $startOut) }}; \
          $svcStatus = $null; \
-         for ($i = 0; $i -lt {start_attempts}; $i++) {{ \
+         for ($i = 0; $i -lt {WINDOWS_SERVICE_START_POLL_ATTEMPTS}; $i++) {{ \
              $svc = Get-Service -Name {svc_q} -ErrorAction Stop; \
              $svcStatus = $svc.Status; \
              if ($svcStatus -eq 'Running') {{ break }}; \
-             Start-Sleep -Seconds {start_interval_secs} \
+             Start-Sleep -Seconds {WINDOWS_SERVICE_START_POLL_INTERVAL_SECS} \
          }}; \
          if ($svcStatus -ne 'Running') {{ \
              $scQuery = (& sc.exe queryex {svc_q} 2>&1) -join ' | '; \
-             throw \"Service failed to reach Running after {start_probe_secs}s (status=$svcStatus sc=[$scQuery])\" \
+             throw \"Service failed to reach Running after {WINDOWS_SERVICE_START_PROBE_MAX_SECS}s (status=$svcStatus sc=[$scQuery])\" \
          }}",
-        stop_poll_secs = WINDOWS_SERVICE_STOP_POLL_SECS,
-        start_attempts = WINDOWS_SERVICE_START_POLL_ATTEMPTS,
-        start_interval_secs = WINDOWS_SERVICE_START_POLL_INTERVAL_SECS,
-        start_probe_secs = WINDOWS_SERVICE_START_PROBE_MAX_SECS,
     ))
 }
 

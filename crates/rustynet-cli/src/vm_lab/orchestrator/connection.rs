@@ -111,8 +111,7 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "must accept existing known_hosts: {:?}",
-            result
+            "must accept existing known_hosts: {result:?}"
         );
     }
 
