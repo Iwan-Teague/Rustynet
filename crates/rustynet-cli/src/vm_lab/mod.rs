@@ -5183,8 +5183,11 @@ impl RuntimePathRole {
 /// Adapter over the canonical runtime path roots a RustyNet host
 /// publishes to the orchestrator. Implementations are platform-
 /// specific; macOS / iOS / Android are intentionally `Unsupported`
-/// stubs that fail closed per CLAUDE.md §10 ("stubs must reject
-/// explicitly with a clear blocker reason; no silent no-op success").
+/// stubs that fail closed per CLAUDE.md §3 ("Fail closed when
+/// trust/security state is missing" + "Do not defer in-scope
+/// requirements behind TODO/FIXME/placeholders"): stubs must
+/// reject explicitly with a clear blocker reason; no silent
+/// no-op success.
 #[allow(dead_code)]
 pub trait RuntimePaths {
     fn path_for(&self, role: RuntimePathRole) -> Result<&Path, String>;
@@ -5277,9 +5280,10 @@ impl RuntimePaths for WindowsRuntimePaths {
 /// reason. Used for OS variants the orchestrator must still
 /// instantiate (so callers do not silently fabricate a host-shaped
 /// answer for an unsupported platform) but for which RustyNet has
-/// not yet defined a reviewed runtime layout. Per CLAUDE.md §10 the
-/// stub MUST reject every method with a clear blocker reason — never
-/// a "no-op success" that lets downstream stages run against an
+/// not yet defined a reviewed runtime layout. Per CLAUDE.md §3
+/// ("Fail closed when trust/security state is missing") the stub
+/// MUST reject every method with a clear blocker reason — never a
+/// "no-op success" that lets downstream stages run against an
 /// undefined layout.
 pub struct UnsupportedRuntimePaths {
     platform_label: &'static str,
@@ -13593,10 +13597,11 @@ fn ensure_live_lab_profile_platform_metadata(profile: &LiveLabProfile) -> Result
 /// - It MUST name a feature that is observable at orchestration time
 ///   (i.e. derived from `VmPlatformProfile`, not from a runtime probe).
 /// - Capabilities expressing security guarantees (e.g. NFT default-
-///   deny enforcement) MUST follow CLAUDE.md §3.10: a target without
-///   the capability fails the stage rather than skipping it. Pure
-///   convenience capabilities (e.g. NETEM kernel-impairment for test
-///   stages) skip-with-reason.
+///   deny enforcement) MUST follow CLAUDE.md §3 (Default-deny
+///   policy is mandatory; Fail closed when trust/security state
+///   is missing): a target without the capability fails the stage
+///   rather than skipping it. Pure convenience capabilities (e.g.
+///   NETEM kernel-impairment for test stages) skip-with-reason.
 ///
 /// The labels listed here mirror the eight reviewed stage-set
 /// dependencies the bash orchestrator (`scripts/e2e/live_linux_lab_orchestrator.sh`)
