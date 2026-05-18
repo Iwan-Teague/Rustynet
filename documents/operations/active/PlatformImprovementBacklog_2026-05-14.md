@@ -1103,15 +1103,35 @@ inline. Cross-reference with:
 
 * `[x]` Commit 255cff4 follow-up: `scripts/ci/regression_coverage_gates.sh`
   runs each platform-specific verifier module's tests and asserts the
-  passing-test count is at least the pinned floor. 11 modules pinned
-  today: 6 Linux (`linux_runtime_acls`, `linux_service_hardening`,
+  passing-test count is at least the pinned floor. Initial coverage:
+  6 Linux (`linux_runtime_acls`, `linux_service_hardening`,
   `linux_dns_failclosed`, `linux_mesh_status`, `linux_key_custody`,
   `linux_authenticode`) + 5 Windows (`windows_service_hardening`,
   `windows_dns_failclosed`, `windows_mesh_status`, `windows_key_custody`,
   `windows_authenticode`). Floors set to current pass counts so any
   refactor that silently removes a drift-test group trips a named
-  failure. `--platform linux|windows|all` flag scopes to one group.
-  Exit code taxonomy: 0 ok / 1 floor breach / 64 bad args.
+  failure. Exit code taxonomy: 0 ok / 1 floor breach / 64 bad args.
+* `[~]` Subsequent expansions:
+  - L8 added `linux_killswitch_boot:21` (boot-time killswitch
+    invariant module).
+  - W4 added `windows_registry_acls:17` (new Win32 registry-key
+    ACL evaluator module).
+  - X4 sweep added `windows_paths:61` (SDDL matcher + path
+    validator coverage parity).
+  - macOS group added (commit b868820) with 6 modules pinned at
+    their current baselines: `macos_runtime_acls:8`,
+    `macos_service_hardening:9`, `macos_dns_failclosed:8`,
+    `macos_mesh_status:3`, `macos_key_custody:2`,
+    `macos_authenticode:2`. `--platform macos` and `--platform all`
+    both runnable.
+  - Linux floors progressively bumped via X4 coverage-parity sweeps:
+    `linux_runtime_acls` 19→27, `linux_mesh_status` 10→24,
+    `linux_authenticode` 3→22, `linux_key_custody` 15→24.
+  - Windows floors progressively bumped via X4 coverage-parity
+    sweeps: `windows_mesh_status` 14→23, `windows_key_custody`
+    18→24, `windows_dns_failclosed` 56→67.
+  Current coverage: 20 modules pinned across linux (7) + macos (6)
+  + windows (7).
 
 ---
 
