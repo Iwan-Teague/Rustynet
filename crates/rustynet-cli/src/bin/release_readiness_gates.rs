@@ -47,12 +47,10 @@ fn run() -> Result<(), i32> {
     })?;
     let bundle_path = env::var_os("RUSTYNET_RELEASE_READINESS_BUNDLE_PATH")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root_dir.join(DEFAULT_BUNDLE_PATH));
+        .map_or_else(|| root_dir.join(DEFAULT_BUNDLE_PATH), PathBuf::from);
     let phase5_report_path = env::var_os("RUSTYNET_PHASE5_GATE_REPORT_PATH")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root_dir.join(DEFAULT_PHASE5_REPORT_PATH));
+        .map_or_else(|| root_dir.join(DEFAULT_PHASE5_REPORT_PATH), PathBuf::from);
 
     let mut bundle = ReleaseReadinessBundle::new(&phase5_report_path);
     write_bundle(&bundle_path, &mut bundle)?;

@@ -164,8 +164,7 @@ impl TamperEvidentAuditLog {
         let previous_hash = self
             .entries
             .last()
-            .map(|entry| entry.entry_hash.clone())
-            .unwrap_or_else(|| "genesis".to_string());
+            .map_or_else(|| "genesis".to_string(), |entry| entry.entry_hash.clone());
         let payload = format!("{index}|{timestamp_unix}|{actor}|{action}|{previous_hash}");
         let entry_hash = sha256_hex(payload.as_bytes());
         self.entries.push(AuditEntry {

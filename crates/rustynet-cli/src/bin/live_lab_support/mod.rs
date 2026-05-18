@@ -88,8 +88,10 @@ fn utm_transport_for_target(target: &str) -> Option<UtmTransport> {
 fn utmctl_path() -> PathBuf {
     env::var_os("LIVE_LAB_UTMCTL_PATH")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Applications/UTM.app/Contents/MacOS/utmctl"))
+        .map_or_else(
+            || PathBuf::from("/Applications/UTM.app/Contents/MacOS/utmctl"),
+            PathBuf::from,
+        )
 }
 
 fn run_status_with_timeout(command: &mut Command, timeout: Duration) -> Result<ExitStatus, String> {
@@ -499,14 +501,14 @@ pub struct LiveLabContext {
 impl LiveLabContext {
     pub fn new(prefix: &str, ssh_identity_file: &Path) -> Result<Self, String> {
         require_local_file_mode(ssh_identity_file, "owner-only", "ssh identity file")?;
-        let pinned_known_hosts_file = env::var_os("LIVE_LAB_PINNED_KNOWN_HOSTS_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
+        let pinned_known_hosts_file = env::var_os("LIVE_LAB_PINNED_KNOWN_HOSTS_FILE").map_or_else(
+            || {
                 env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/root"))
+                    .map_or_else(|| PathBuf::from("/root"), PathBuf::from)
                     .join(".ssh/known_hosts")
-            });
+            },
+            PathBuf::from,
+        );
         require_local_file_mode(
             pinned_known_hosts_file.as_path(),
             "no-group-world-write",
@@ -540,17 +542,11 @@ impl LiveLabContext {
     }
 
     pub fn target_user(target: &str) -> &str {
-        target
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(target)
+        target.split_once('@').map_or(target, |(user, _)| user)
     }
 
     pub fn target_address(target: &str) -> &str {
-        target
-            .split_once('@')
-            .map(|(_, addr)| addr)
-            .unwrap_or(target)
+        target.split_once('@').map_or(target, |(_, addr)| addr)
     }
 
     pub fn resolved_target_address(target: &str) -> Result<String, String> {

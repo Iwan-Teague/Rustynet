@@ -1021,6 +1021,5 @@ pub fn comparative_status_order(status: &str) -> usize {
     COMPARATIVE_STATUS_ORDER
         .iter()
         .find(|(candidate, _)| *candidate == status)
-        .map(|(_, order)| *order)
-        .unwrap_or(usize::MAX)
+        .map_or(usize::MAX, |(_, order)| *order)
 }

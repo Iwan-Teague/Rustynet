@@ -52,8 +52,7 @@ pub fn init_membership_snapshot(
     let exit_node_id = peers
         .iter()
         .find(|p| p.role == NodeRole::Exit)
-        .map(|p| p.node_id.as_str())
-        .unwrap_or("");
+        .map_or("", |p| p.node_id.as_str());
     let exit_node_id_arg = shell_safe_arg(exit_node_id)?;
     ssh::run_remote(
         conn,
@@ -116,8 +115,7 @@ pub fn distribute_signed_bundle(
     // Install atomically with correct permissions.
     let install_dir = install_dst
         .rsplit_once('/')
-        .map(|(dir, _)| dir)
-        .unwrap_or("/var/lib/rustynet");
+        .map_or("/var/lib/rustynet", |(dir, _)| dir);
     // Membership snapshot: mode 0600 owned by the daemon user so the strict
     // `mode & 0o077 == 0` check in load_membership_snapshot passes.
     // Other bundles: mode 0640 root:rustynetd (daemon accepts group-read for
@@ -151,10 +149,7 @@ pub fn distribute_verifier_key(
     let dst = linux_verifier_key_path(&kind);
     let remote_tmp = "/tmp/rn-verifier-key.pub";
     ssh::scp_to(conn, pub_key_path, remote_tmp, MEDIUM_TIMEOUT)?;
-    let dst_dir = dst
-        .rsplit_once('/')
-        .map(|(d, _)| d)
-        .unwrap_or("/etc/rustynet");
+    let dst_dir = dst.rsplit_once('/').map_or("/etc/rustynet", |(d, _)| d);
     ssh::run_remote(
         conn,
         &format!(

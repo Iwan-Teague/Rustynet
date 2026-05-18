@@ -96,8 +96,7 @@ impl ExitNodePolicy {
     pub fn allows(&self, user: &str, node_id: &NodeId) -> bool {
         self.allowed_pairs
             .get(user)
-            .map(|entries| entries.iter().any(|candidate| candidate == node_id))
-            .unwrap_or(false)
+            .is_some_and(|entries| entries.iter().any(|candidate| candidate == node_id))
     }
 }
 
@@ -148,8 +147,7 @@ impl MagicDnsZone {
         while self
             .records
             .get(&candidate)
-            .map(|record| record.node_id != node_id)
-            .unwrap_or(false)
+            .is_some_and(|record| record.node_id != node_id)
         {
             candidate = format!("{base}-{counter}");
             counter = counter.saturating_add(1);
@@ -466,8 +464,7 @@ impl<B: TunnelBackend> LinuxDataplane<B> {
         let route_is_advertised = self
             .advertised_lan_routes
             .get(selected_exit)
-            .map(|routes| routes.iter().any(|route| route == cidr))
-            .unwrap_or(false);
+            .is_some_and(|routes| routes.iter().any(|route| route == cidr));
         if !route_is_advertised {
             return Err(DataplaneError::LanAccessDenied);
         }

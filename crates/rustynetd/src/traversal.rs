@@ -1405,9 +1405,7 @@ fn score_candidate(candidate: TraversalCandidate) -> u64 {
 }
 
 fn handshake_is_fresh(value: Option<u64>, now_unix: u64, freshness_secs: u64) -> bool {
-    value
-        .map(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
-        .unwrap_or(false)
+    value.is_some_and(|timestamp| now_unix.saturating_sub(timestamp) <= freshness_secs)
 }
 
 fn handshake_advanced(previous: Option<u64>, current: Option<u64>) -> bool {

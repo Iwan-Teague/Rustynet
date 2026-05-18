@@ -219,8 +219,7 @@ impl TempOutputGuard {
     fn create() -> Result<Self, String> {
         let base = env::var_os("TMPDIR")
             .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
         fs::create_dir_all(&base).map_err(|err| {
             format!(
                 "failed to create temp output directory {}: {err}",

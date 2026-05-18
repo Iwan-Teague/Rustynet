@@ -1570,8 +1570,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
     if crypto_schedule
         .get("entries")
         .and_then(Value::as_array)
-        .map(std::vec::Vec::is_empty)
-        .unwrap_or(true)
+        .is_none_or(std::vec::Vec::is_empty)
     {
         return Err("crypto deprecation schedule requires non-empty entries".to_string());
     }
@@ -1597,8 +1596,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         let timestamp = parse_utc_to_unix(window_end, "slo latest window_end_utc")?;
         if latest_slo
             .as_ref()
-            .map(|(latest, _)| timestamp > *latest)
-            .unwrap_or(true)
+            .is_none_or(|(latest, _)| timestamp > *latest)
         {
             latest_slo = Some((timestamp, entry_map));
         }
@@ -1703,8 +1701,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         let timestamp = parse_utc_to_unix(executed_at, "incident latest executed_at_utc")?;
         if latest_incident
             .as_ref()
-            .map(|(latest, _)| timestamp > *latest)
-            .unwrap_or(true)
+            .is_none_or(|(latest, _)| timestamp > *latest)
         {
             latest_incident = Some((timestamp, entry.clone()));
         }
@@ -1743,8 +1740,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         let timestamp = parse_utc_to_unix(executed_at, "dr latest executed_at_utc")?;
         if latest_dr
             .as_ref()
-            .map(|(latest, _)| timestamp > *latest)
-            .unwrap_or(true)
+            .is_none_or(|(latest, _)| timestamp > *latest)
         {
             latest_dr = Some((timestamp, entry_map));
         }

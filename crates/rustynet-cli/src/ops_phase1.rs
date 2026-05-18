@@ -1327,10 +1327,10 @@ pub fn execute_ops_check_no_unsafe_rust_sources(
     let mut findings = Vec::new();
 
     for source_path in rust_sources {
-        let repo_relative = source_path
-            .strip_prefix(root.as_path())
-            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| source_path.to_string_lossy().to_string());
+        let repo_relative = source_path.strip_prefix(root.as_path()).map_or_else(
+            |_| source_path.to_string_lossy().to_string(),
+            |relative| relative.to_string_lossy().replace('\\', "/"),
+        );
         if unsafe_scan_path_is_allowlisted(repo_relative.as_str()) {
             continue;
         }

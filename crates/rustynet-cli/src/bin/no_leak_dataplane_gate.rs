@@ -93,11 +93,10 @@ fn run() -> Result<(), i32> {
 }
 
 fn current_os() -> String {
-    Command::new("uname")
-        .arg("-s")
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_else(|_| String::new())
+    Command::new("uname").arg("-s").output().map_or_else(
+        |_| String::new(),
+        |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    )
 }
 
 fn current_uid() -> Result<u32, i32> {

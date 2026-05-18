@@ -54,8 +54,7 @@ fn run() -> Result<(), i32> {
         .unwrap_or_else(|| "1".to_string());
     let report_path = env::var_os("RUSTYNET_PHASE5_GATE_REPORT_PATH")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root_dir.join(DEFAULT_REPORT_PATH));
+        .map_or_else(|| root_dir.join(DEFAULT_REPORT_PATH), PathBuf::from);
 
     let mut report = GateExecutionReport::phase5();
     write_report(&report_path, &mut report)?;

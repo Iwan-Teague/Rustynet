@@ -625,12 +625,9 @@ mod daemon {
 
             let mut sockets = allocated_sockets.write().await;
             sockets.retain(|port, (_socket, alloc)| {
-                active_sessions
-                    .get(port)
-                    .map(|session_id| {
-                        bool::from(session_id.as_bytes().ct_eq(alloc.session_id.as_bytes()))
-                    })
-                    .unwrap_or(false)
+                active_sessions.get(port).is_some_and(|session_id| {
+                    bool::from(session_id.as_bytes().ct_eq(alloc.session_id.as_bytes()))
+                })
             });
         }
     }
@@ -2016,11 +2013,7 @@ mod daemon {
     }
 
     pub async fn run_relay_from_args(mut args: Vec<String>) -> Result<(), String> {
-        if args
-            .first()
-            .map(|value| value.starts_with('-'))
-            .unwrap_or(true)
-        {
+        if args.first().is_none_or(|value| value.starts_with('-')) {
             args.insert(0, "rustynet-relay".to_string());
         }
         reset_relay_stop_requested();

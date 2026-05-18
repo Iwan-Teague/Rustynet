@@ -387,9 +387,8 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
                 .set_write_timeout(Some(config.io_timeout))
                 .map_err(|err| format!("set privileged helper write-timeout failed: {err}"))?;
 
-            let authorized = peer_uid(&stream)
-                .map(|uid| uid == config.allowed_uid || uid == 0)
-                .unwrap_or(false);
+            let authorized =
+                peer_uid(&stream).is_some_and(|uid| uid == config.allowed_uid || uid == 0);
             if !authorized {
                 let _ = write_response(
                     &mut stream,

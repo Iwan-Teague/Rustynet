@@ -22,8 +22,7 @@ pub fn execute_ops_write_daemon_env(
     // Default: NODE_ROLE
     let setup_complete = config
         .get("SETUP_COMPLETE")
-        .map(std::string::String::as_str)
-        .unwrap_or("0");
+        .map_or("0", std::string::String::as_str);
     if !config.contains_key("NODE_ROLE") {
         let default_role = if setup_complete == "1" {
             "admin"
@@ -120,8 +119,7 @@ pub fn execute_ops_write_daemon_env(
         config.remove("FAIL_CLOSED_SSH_ALLOW_CIDRS");
     } else if config
         .get("FAIL_CLOSED_SSH_ALLOW_CIDRS")
-        .map(|s| s.trim())
-        .unwrap_or("")
+        .map_or("", |s| s.trim())
         .is_empty()
     {
         return Err(

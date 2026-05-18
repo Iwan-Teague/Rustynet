@@ -379,8 +379,7 @@ fn parse_windows_build_release_report_output(
         })?;
     let exit_code = parsed
         .get("exit_code")
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string);
     let stderr_tail = parsed
         .get("stderr_tail")
         .and_then(|value| value.as_str())

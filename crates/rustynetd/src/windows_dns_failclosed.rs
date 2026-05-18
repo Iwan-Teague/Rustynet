@@ -390,8 +390,7 @@ fn nrpt_rules_cover_root_namespace(rules: &[WindowsNrptRule]) -> bool {
                     .trim()
                     .parse::<IpAddr>()
                     .ok()
-                    .map(|addr| is_loopback_address(&addr))
-                    .unwrap_or(false)
+                    .is_some_and(|addr| is_loopback_address(&addr))
             })
     })
 }

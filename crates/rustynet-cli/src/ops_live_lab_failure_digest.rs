@@ -477,10 +477,7 @@ fn extract_likely_reason(log_path: &Path) -> String {
         }
     }
     shorten(
-        candidates
-            .last()
-            .map(String::as_str)
-            .unwrap_or("see full log"),
+        candidates.last().map_or("see full log", String::as_str),
         220,
     )
 }

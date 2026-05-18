@@ -122,8 +122,7 @@ fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
 /// against the allowlist (which uses workspace-relative paths).
 fn workspace_relative(path: &Path, workspace_root: &Path) -> PathBuf {
     path.strip_prefix(workspace_root)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| path.to_path_buf())
+        .map_or_else(|_| path.to_path_buf(), PathBuf::from)
 }
 
 /// Pure scan helper: takes a source body and returns the line numbers

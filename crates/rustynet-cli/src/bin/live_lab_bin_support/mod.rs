@@ -178,17 +178,11 @@ pub fn ensure_safe_spec(label: &str, value: &str) -> Result<(), String> {
 }
 
 pub fn target_user(target: &str) -> &str {
-    target
-        .split_once('@')
-        .map(|(user, _)| user)
-        .unwrap_or(target)
+    target.split_once('@').map_or(target, |(user, _)| user)
 }
 
 pub fn target_address(target: &str) -> &str {
-    target
-        .split_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(target)
+    target.split_once('@').map_or(target, |(_, host)| host)
 }
 
 fn target_home(target: &str) -> String {
@@ -249,8 +243,10 @@ fn utm_transport_for_target(target: &str) -> Option<UtmTransport> {
 fn utmctl_path() -> PathBuf {
     env::var_os("LIVE_LAB_UTMCTL_PATH")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Applications/UTM.app/Contents/MacOS/utmctl"))
+        .map_or_else(
+            || PathBuf::from("/Applications/UTM.app/Contents/MacOS/utmctl"),
+            PathBuf::from,
+        )
 }
 
 fn run_status_with_timeout(command: &mut Command, timeout: Duration) -> Result<ExitStatus, String> {

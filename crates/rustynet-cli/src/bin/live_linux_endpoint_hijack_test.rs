@@ -391,10 +391,10 @@ fn print_usage() {
 }
 
 fn now_unix() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+        |_| "0".to_string(),
+        |duration| duration.as_secs().to_string(),
+    )
 }
 
 fn now_utc() -> String {

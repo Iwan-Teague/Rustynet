@@ -614,8 +614,7 @@ pub fn execute_ops_write_membership_phase10_report() -> Result<String, String> {
 /// successful gates run.
 fn write_membership_phase10_report(root_dir: &Path) -> Result<(), String> {
     let git_commit = run_command_capture("git", &["rev-parse", "HEAD"], Some(root_dir), &[])
-        .map(|o| o.stdout.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+        .map_or_else(|_| "unknown".to_string(), |o| o.stdout.trim().to_string());
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1670,9 +1669,10 @@ fn prepare_advisory_db(target_db: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let global_db = env_optional_string("HOME")?
-        .map(|home| PathBuf::from(home).join(".cargo/advisory-db"))
-        .unwrap_or_else(|| PathBuf::from(".cargo/advisory-db"));
+    let global_db = env_optional_string("HOME")?.map_or_else(
+        || PathBuf::from(".cargo/advisory-db"),
+        |home| PathBuf::from(home).join(".cargo/advisory-db"),
+    );
     if copy_advisory_db_if_valid(&global_db, target_db)? {
         return Ok(());
     }

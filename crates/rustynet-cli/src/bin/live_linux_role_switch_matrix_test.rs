@@ -642,8 +642,10 @@ fn ensure_client_role_with_expected_exit(
         capture_client_role_snapshot(context.identity, context.known_hosts, context.host)?;
     let baseline_exit = expected_exit
         .filter(|value| !value.is_empty() && *value != "none")
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| field_value(&baseline, "exit_node"));
+        .map_or_else(
+            || field_value(&baseline, "exit_node"),
+            std::string::ToString::to_string,
+        );
     if baseline_exit.is_empty() || baseline_exit == "none" {
         if role_runtime_ready(&baseline, "client") {
             return Ok(baseline);
@@ -701,8 +703,10 @@ fn ensure_client_role_with_expected_exit(
     )?;
     let restore_exit = expected_exit
         .filter(|value| !value.is_empty() && *value != "none")
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| field_value(&after_switch, "exit_node"));
+        .map_or_else(
+            || field_value(&after_switch, "exit_node"),
+            std::string::ToString::to_string,
+        );
     if restore_exit.is_empty() || restore_exit == "none" {
         Ok(after_switch)
     } else {

@@ -559,8 +559,7 @@ fn resolve_artifact_path(report_path: &Path, raw: &str) -> PathBuf {
     }
     let base = report_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     base.join(candidate)
 }
 
@@ -1626,8 +1625,7 @@ fn validate_report_payload(
 
     let report_dir = report_path
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for (field_name, entries_opt) in [
         ("source_artifacts", typed.source_artifacts.as_deref()),
@@ -2780,8 +2778,7 @@ pub fn execute_ops_read_cross_network_report_fields(
             object
                 .get("status")
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| default_value.clone()),
+                .map_or_else(|| default_value.clone(), str::to_string),
         );
     }
 
@@ -2795,8 +2792,7 @@ pub fn execute_ops_read_cross_network_report_fields(
             checks
                 .and_then(|items| items.get(name))
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| default_value.clone()),
+                .map_or_else(|| default_value.clone(), str::to_string),
         );
     }
 
@@ -2810,8 +2806,7 @@ pub fn execute_ops_read_cross_network_report_fields(
             network
                 .and_then(|items| items.get(name))
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| default_value.clone()),
+                .map_or_else(|| default_value.clone(), str::to_string),
         );
     }
 

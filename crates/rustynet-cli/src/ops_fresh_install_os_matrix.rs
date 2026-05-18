@@ -553,8 +553,7 @@ fn validate_measured_child_report_for_verify(
     if resolved
         .extension()
         .and_then(|value| value.to_str())
-        .map(|value| !value.eq_ignore_ascii_case("json"))
-        .unwrap_or(true)
+        .is_none_or(|value| !value.eq_ignore_ascii_case("json"))
     {
         return Ok(());
     }
@@ -858,14 +857,12 @@ pub fn execute_ops_generate_linux_fresh_install_os_matrix_report(
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let baseline_time = baseline_meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let two_hop_report_path = require_file(config.two_hop_report.as_path(), "two-hop report")?;
     let role_switch_report_path =
@@ -1885,8 +1882,7 @@ mod tests {
         assert!(source_artifacts.iter().any(|entry| {
             entry
                 .as_str()
-                .map(|value| value.ends_with("/live_linux_two_hop_report_stale.json"))
-                .unwrap_or(false)
+                .is_some_and(|value| value.ends_with("/live_linux_two_hop_report_stale.json"))
         }));
 
         fs::remove_dir_all(output_dir.as_path()).expect("cleanup fixture temp dir");
