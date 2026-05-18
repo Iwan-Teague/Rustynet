@@ -1051,13 +1051,21 @@ inline. Cross-reference with:
   parity floors. macos_authenticode 2→7, macos_key_custody 3→11,
   macos_mesh_status 3→9, macos_dns_failclosed 8→16,
   macos_runtime_acls 8→16, macos_service_hardening 9→15.
-* `[ ]` Remaining scope (separate slice): consider whether a
-  dedicated `windows_runtime_acls.rs` module is justified now that
-  the SDDL surface has explicit drift coverage. Today the
+* `[x]` Decision: NO dedicated `windows_runtime_acls.rs` module.
+  Resolved 2026-05-18 after the X4 macOS sweep completed. The
+  SDDL surface has explicit drift coverage in
+  `windows_service_hardening:33` + `windows_paths:61` (61 named
+  drift tests across SDDL grant/deny matcher, local-secret ACL
+  evaluator, runtime-path validator). Splitting those helpers
+  into a third module would add ~0 coverage, force a downstream
+  rewire of every test (which currently imports from
+  `crates/rustynetd/src/windows_paths.rs`), and create a
+  3-module / 2-module mismatch with the Linux side. The
   `windows_paths` + `windows_service_hardening` split holds up;
-  pulling the SDDL helpers into a third module would add little
-  value beyond reshuffling. Defer until a future addition makes
-  the dedicated module worth it.
+  the X7 regression-coverage gate pins both. The dedicated-
+  module question can re-open if a future addition (Win32
+  registry-ACL probe, ACL-cache invalidator, etc.) creates
+  enough surface to justify a third module.
 
 ### X5. Membership evidence + runbook automation
 
