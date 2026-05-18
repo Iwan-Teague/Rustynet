@@ -9,10 +9,10 @@ Primary validator command:
 - `cargo run --quiet -p rustynet-cli -- ops validate-cross-network-remote-exit-reports ...`
 
 Shared Rust schema/validator implementation:
-- [ops_cross_network_reports.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_cross_network_reports.rs)
+- [ops_cross_network_reports.rs](../../crates/rustynet-cli/src/ops_cross_network_reports.rs)
 
 Local schema self-test:
-- [test_validate_cross_network_remote_exit_reports.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/test_validate_cross_network_remote_exit_reports.sh)
+- [test_validate_cross_network_remote_exit_reports.sh](../../scripts/ci/test_validate_cross_network_remote_exit_reports.sh)
 
 ## 2. Required Reports
 The following measured reports are required for the cross-network remote-exit claim:
