@@ -1487,3 +1487,191 @@ fn deprecated_crypto_import_scanner_flags_use_followed_by_only_semicolon() {
         "bare `use des;` must surface: {hits:?}"
     );
 }
+
+// ---- `dbg!` macro scanner + self-tests -----------------------------
+//
+// `dbg!(<expr>)` is a Rust debugging macro that prints `<expr>`
+// formatted via its `Debug` impl to stderr. Same leak shape as
+// `eprintln!("{x:?}")` but the placeholder scanner explicitly
+// only walks `LOG_MACRO_NAMES` (which excludes `dbg`) and only
+// fires on format-string placeholder forms (which `dbg!` doesn't
+// use — it stringifies the argument expression directly). A
+// developer who debug-traces with `dbg!(passphrase_bytes)` slips
+// past every existing X3 scanner. This scanner closes that hole.
+
+/// Pure scan helper for `dbg!(<expr>)` calls whose `<expr>` contains
+/// any forbidden secret-bearing identifier from
+/// `FORBIDDEN_PLACEHOLDER_TOKENS`. Returns (line_number, token).
+pub(crate) fn scan_source_for_dbg_macro_on_secret_tokens(body: &str) -> Vec<(usize, String)> {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        // Find `dbg!(` or `dbg! (` somewhere on the line. Skip if
+        // the macro call is inside a string literal (heuristic:
+        // the dbg! occurrence is preceded by an unescaped `"` on
+        // the same line with no closing `"` between the start of
+        // the line and the dbg! match).
+        let macro_pos = match line.find("dbg!(").or_else(|| line.find("dbg! (")) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Skip if the `dbg!(` lives inside a `// …` line comment.
+        // (The line as a whole isn't a comment-only line, but a
+        // mid-line `// dbg!(passphrase_bytes)` after real code
+        // would still be a comment.)
+        if let Some(comment_pos) = line.find("//")
+            && comment_pos < macro_pos
+        {
+            continue;
+        }
+        // Cheap string-literal check: count unescaped `"` before
+        // the macro match. Odd = inside a literal; skip.
+        let preceding = &line[..macro_pos];
+        let quote_count = preceding
+            .chars()
+            .scan(false, |escaped, ch| {
+                let is_quote = ch == '"' && !*escaped;
+                *escaped = ch == '\\' && !*escaped;
+                Some(is_quote)
+            })
+            .filter(|&q| q)
+            .count();
+        if quote_count % 2 == 1 {
+            continue;
+        }
+        // Now scan the rest of the line (from macro_pos onward)
+        // for any forbidden token appearing as a standalone
+        // identifier — i.e. surrounded by non-identifier chars.
+        let after = &line[macro_pos..];
+        for token in FORBIDDEN_PLACEHOLDER_TOKENS {
+            let Some(token_pos) = after.find(token) else {
+                continue;
+            };
+            // Confirm it's a standalone identifier, not a substring
+            // of a longer name. Char immediately before and after
+            // must NOT be `_`, a letter, or a digit.
+            let before_char = after[..token_pos].chars().last();
+            let after_char = after[token_pos + token.len()..].chars().next();
+            let is_word = |c: Option<char>| c.is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
+            if is_word(before_char) || is_word(after_char) {
+                continue;
+            }
+            hits.push((idx + 1, (*token).to_string()));
+            break;
+        }
+    }
+    hits
+}
+
+#[test]
+fn no_dbg_macro_on_secret_tokens_in_workspace() {
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let mut offenders: Vec<String> = Vec::new();
+    for source_root in audited_source_roots(&root) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(&source_root, &mut files);
+        for file in files {
+            let rel = workspace_relative(&file, &root);
+            if allowlist.contains(&rel) {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&file) else {
+                continue;
+            };
+            let label = rel.display().to_string();
+            for (line_no, token) in scan_source_for_dbg_macro_on_secret_tokens(&body) {
+                offenders.push(format!(
+                    "{label}:{line_no}: dbg!() macro carries secret-bearing identifier `{token}`. \
+                     Remove the dbg!() before commit — `dbg!()` prints via Debug to stderr and bypasses \
+                     the production logger's redaction layer."
+                ));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        panic!(
+            "dbg!() macro secret-leak audit found {} offending site(s):\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn dbg_scanner_flags_passphrase_bytes_argument() {
+    let body = "fn leak() { dbg!(passphrase_bytes); }";
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert!(
+        hits.iter().any(|(_, t)| t == "passphrase_bytes"),
+        "`dbg!(passphrase_bytes)` must fire: {hits:?}"
+    );
+}
+
+#[test]
+fn dbg_scanner_flags_reference_form_of_private_key_bytes() {
+    let body = "fn leak() { let _ = dbg!(&private_key_bytes); }";
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert!(
+        hits.iter().any(|(_, t)| t == "private_key_bytes"),
+        "`dbg!(&private_key_bytes)` (reference form) must fire: {hits:?}"
+    );
+}
+
+#[test]
+fn dbg_scanner_flags_signing_seed_used_as_rvalue() {
+    let body = "fn leak() { let copy = dbg!(signing_seed); use_it(copy); }";
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert!(
+        hits.iter().any(|(_, t)| t == "signing_seed"),
+        "`let _ = dbg!(signing_seed)` rvalue form must fire: {hits:?}"
+    );
+}
+
+#[test]
+fn dbg_scanner_silent_on_commented_offender() {
+    let body = "fn safe() { // dbg!(passphrase_bytes); was here during debugging\n}";
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert!(
+        hits.is_empty(),
+        "commented-out `dbg!(passphrase_bytes)` must not fire: {hits:?}"
+    );
+}
+
+#[test]
+fn dbg_scanner_silent_on_safe_identifier() {
+    let body = "fn safe() { dbg!(message_count); dbg!(retries); }";
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert!(
+        hits.is_empty(),
+        "dbg!() on safe identifiers must not fire: {hits:?}"
+    );
+}
+
+#[test]
+fn dbg_scanner_silent_on_substring_match_inside_longer_identifier() {
+    // `my_passphrase_bytes_helper` contains `passphrase_bytes` as a
+    // substring but is a distinct identifier. The boundary check
+    // (identifier-char before/after) must reject this.
+    let body = "fn maybe_safe() { dbg!(my_passphrase_bytes_helper); }";
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert!(
+        hits.is_empty(),
+        "longer identifier containing token-substring must not fire: {hits:?}"
+    );
+}
+
+#[test]
+fn dbg_scanner_flags_token_substring_inside_complex_expression() {
+    // A real dbg! call with multiple identifiers, one of which is
+    // forbidden. The scanner should fire on the forbidden one.
+    let body = "fn leak() { dbg!(if cond { passphrase_bytes } else { fallback_bytes }); }";
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert!(
+        hits.iter().any(|(_, t)| t == "passphrase_bytes"),
+        "`dbg!(if cond {{ passphrase_bytes }} else …)` must fire on the forbidden branch: {hits:?}"
+    );
+}
