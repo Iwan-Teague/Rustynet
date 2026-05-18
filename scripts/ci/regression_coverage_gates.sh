@@ -118,7 +118,12 @@ SHARED_FLOORS=(
   # Floor bumped 35→37 on signing_seed token extension: 2 new tests
   # pin positive detection of {signing_seed:?} placeholder + silent
   # behavior on filename mentions.
-  "secret_log_audit:37"
+  # Floor bumped 37→45 on G2c migration: 7 new self-tests +
+  # 1 workspace sweep test pin the deprecated-crypto import scanner
+  # (sha1 / md5 / md_5 / des / des3 / triple_des). The shell G2c
+  # grep stays as belt-and-suspenders but the Rust scanner is now
+  # the source of truth.
+  "secret_log_audit:45"
 )
 
 # macOS coverage floors. macOS is a control-plane platform today, not

@@ -1309,3 +1309,181 @@ fn reviewed_exception_list_entries_have_justifications() {
         );
     }
 }
+
+// ---- Deprecated-crypto-imports scanner + self-tests ----------------
+//
+// Mirrors the G2c grep leg of `scripts/ci/security_regression_gates.sh`
+// as a typed Rust scanner with a workspace-sweep self-test. Same
+// pattern that retired the G1 grep into `scan_source_for_secret_
+// material_equality`. The shell G2c grep stays in place as a
+// belt-and-suspenders duplicate for now, but the Rust scanner is
+// the source of truth.
+
+/// Crate names whose `use <crate>` import is forbidden because the
+/// underlying algorithm is on the cryptographic-deprecation
+/// calendar (see `documents/operations/CryptoDeprecationSchedule.md`).
+/// The list is the snake-case identifier as it appears in Rust
+/// `use` statements (i.e. how the source-scanner will see the
+/// crate name, not necessarily the canonical crates.io package
+/// name with hyphens).
+///
+/// Must stay in sync with:
+/// * `deny.toml` `[[bans.deny]]` entries (G2b leg)
+/// * `scripts/ci/security_regression_gates.sh` G2a Cargo.lock
+///   substring pattern + G2c source-scan grep pattern
+const FORBIDDEN_DEPRECATED_CRYPTO_CRATES: &[&str] =
+    &["sha1", "md5", "md_5", "des", "des3", "triple_des"];
+
+pub(crate) fn scan_source_for_deprecated_crypto_imports(body: &str) -> Vec<(usize, String)> {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        // Match `use <crate>` and `pub use <crate>` followed by a
+        // boundary character (`::`, `;`, or whitespace). Substring
+        // matching is intentional — we want to catch the
+        // import keyword + crate name together, not a coincidental
+        // mention of the crate name in prose / strings / comments.
+        for prefix in ["use ", "pub use "] {
+            let Some(prefix_pos) = trimmed.find(prefix) else {
+                continue;
+            };
+            let after_prefix = &trimmed[prefix_pos + prefix.len()..];
+            for crate_name in FORBIDDEN_DEPRECATED_CRYPTO_CRATES {
+                if !after_prefix.starts_with(crate_name) {
+                    continue;
+                }
+                let remainder = &after_prefix[crate_name.len()..];
+                let next_char = remainder.chars().next();
+                let valid_terminator =
+                    matches!(next_char, Some(':') | Some(';') | Some(' ') | None);
+                if !valid_terminator {
+                    continue;
+                }
+                hits.push((line_no, (*crate_name).to_string()));
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// Workspace sweep test — mirrors the scope the G2c shell `grep`
+/// covers (`crates/`). The audit module itself is allow-listed
+/// because it necessarily mentions the forbidden crate names in
+/// the constant + test bodies.
+#[test]
+fn no_deprecated_crypto_imports_in_workspace() {
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let sweep_root = root.join("crates");
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_rs_files(&sweep_root, &mut files);
+    let mut offenders: Vec<String> = Vec::new();
+    for file in files {
+        let rel = workspace_relative(&file, &root);
+        if allowlist.contains(&rel) {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let label = rel.display().to_string();
+        for (line_no, crate_name) in scan_source_for_deprecated_crypto_imports(&body) {
+            offenders.push(format!(
+                "{label}:{line_no}: deprecated-crypto import `use {crate_name}`. \
+                 Replace with a reviewed crypto primitive or document the migration \
+                 in CryptoDeprecationSchedule.md."
+            ));
+        }
+    }
+    if !offenders.is_empty() {
+        panic!(
+            "deprecated-crypto-import audit found {} offending site(s):\n  {}",
+            offenders.len(),
+            offenders.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_sha1_top_level() {
+    let body = "use sha1::Sha1;\nfn hash() { /* ... */ }";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "sha1"),
+        "`use sha1::Sha1` must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_pub_use_md5_wildcard() {
+    let body = "pub use md5::*;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "md5"),
+        "`pub use md5::*` must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_md_5_rustcrypto_form() {
+    let body = "use md_5::Md5;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "md_5"),
+        "RustCrypto `use md_5::Md5` (snake-case of md-5) must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_silent_on_commented_offender() {
+    let body = "// use sha1::Sha1;  // historical note, do not re-add";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.is_empty(),
+        "comment-only mention must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_silent_on_safe_lookalike_crate() {
+    // `sha2`, `sha3`, `descriptor`, and `md_hashlib` are safe-name
+    // lookalikes that share a prefix with banned crates. The scanner
+    // must NOT fire on any of them: the boundary check (`::`/`;`/
+    // ` `/EOL after the crate name) is what distinguishes
+    // `use sha1` (forbidden) from `use sha2` / `use sha3`
+    // (allowed because the boundary check fails for the longer name).
+    let body = "use sha2::Sha256;\nuse sha3::Sha3_256;\nuse descriptor::Foo;\nuse md_hashlib::Md5;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.is_empty(),
+        "safe-name lookalikes must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_silent_on_string_literal_mention() {
+    let body = r#"let name = "sha1"; println!("avoiding {name}");"#;
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.is_empty(),
+        "string-literal mention must not be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_followed_by_only_semicolon() {
+    // `use des;` (bare import with no path) must still surface.
+    // Boundary `;` immediately after the crate name is one of the
+    // accepted terminators.
+    let body = "use des;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "des"),
+        "bare `use des;` must surface: {hits:?}"
+    );
+}
