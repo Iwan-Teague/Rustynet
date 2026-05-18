@@ -19286,12 +19286,12 @@ mod tests {
             "--vm".to_string(),
             "debian-headless-1".to_string(),
             "--local-source-dir".to_string(),
-            "/Users/iwanteague/Desktop/Rustynet".to_string(),
+            "/tmp/test/Rustynet".to_string(),
             "--dest-dir".to_string(),
             "/home/debian/Rustynet".to_string(),
         ]);
         assert!(format!("{vm_lab_sync_local:?}").contains("VmLabSyncRepo"));
-        assert!(format!("{vm_lab_sync_local:?}").contains("/Users/iwanteague/Desktop/Rustynet"));
+        assert!(format!("{vm_lab_sync_local:?}").contains("/tmp/test/Rustynet"));
 
         let vm_lab_sync_bootstrap = parse_command(&[
             "ops".to_string(),
@@ -19321,7 +19321,7 @@ mod tests {
             "--vm".to_string(),
             "debian-headless-1".to_string(),
             "--local-source-dir".to_string(),
-            "/Users/iwanteague/Desktop/Rustynet".to_string(),
+            "/tmp/test/Rustynet".to_string(),
             "--dest-dir".to_string(),
             "/home/debian/Rustynet".to_string(),
             "--program".to_string(),
@@ -19332,10 +19332,7 @@ mod tests {
             "pwd".to_string(),
         ]);
         assert!(format!("{vm_lab_sync_bootstrap_local:?}").contains("VmLabSyncBootstrap"));
-        assert!(
-            format!("{vm_lab_sync_bootstrap_local:?}")
-                .contains("/Users/iwanteague/Desktop/Rustynet")
-        );
+        assert!(format!("{vm_lab_sync_bootstrap_local:?}").contains("/tmp/test/Rustynet"));
 
         let vm_lab_run = parse_command(&[
             "ops".to_string(),
@@ -19682,17 +19679,14 @@ mod tests {
             "--phase".to_string(),
             "sync-source".to_string(),
             "--local-source-dir".to_string(),
-            "/Users/iwanteague/Desktop/Rustynet".to_string(),
+            "/tmp/test/Rustynet".to_string(),
             "--dest-dir".to_string(),
             "/home/debian/Rustynet".to_string(),
             "--vm".to_string(),
             "debian-headless-1".to_string(),
         ]);
         assert!(format!("{vm_lab_bootstrap_phase_local:?}").contains("VmLabBootstrapPhase"));
-        assert!(
-            format!("{vm_lab_bootstrap_phase_local:?}")
-                .contains("/Users/iwanteague/Desktop/Rustynet")
-        );
+        assert!(format!("{vm_lab_bootstrap_phase_local:?}").contains("/tmp/test/Rustynet"));
     }
 
     #[test]
