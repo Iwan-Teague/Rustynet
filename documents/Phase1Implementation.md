@@ -41,8 +41,8 @@ These features are intentionally excluded from Phase 1 implementation scope and 
 3. [Phase1.md](./Phase1.md)
 4. [Phase2.md](./Phase2.md) through [Phase9.md](./Phase9.md) (forward-compatibility constraints only)
 5. Current workspace architecture:
-   - `/Users/iwanteague/Desktop/Rustynet/Cargo.toml`
-   - `/Users/iwanteague/Desktop/Rustynet/crates/*`
+   - `Cargo.toml` (workspace root)
+   - `crates/*` (workspace members)
 
 ### Precedence Rules
 1. `Requirements.md` is the source of truth for product/security requirements.
@@ -308,7 +308,8 @@ Verification:
 - Unknown major versions are rejected at load time.
 
 ## 7) CI/Security Gates for Phase 1 (Exact Commands and Pass Criteria)
-All commands run from `/Users/iwanteague/Desktop/Rustynet`.
+All commands run from the workspace root (the directory containing the
+top-level `Cargo.toml`).
 
 1. Formatting gate:
 ```bash
