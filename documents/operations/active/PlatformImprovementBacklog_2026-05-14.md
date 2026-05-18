@@ -823,12 +823,24 @@ inline. Cross-reference with:
   Removes 2 trailing `Value` walks. 5 new tests including a
   writer-integration test that re-parses through the typed view.
   Closes the writer side of the X2 Phase A list.
+* `[~]` Eleventh X2 slice on `ops_live_lab_orchestrator.rs` landed
+  (commit f1a3a3d). Migrated `execute_ops_e2e_dns_query` to a
+  typed `E2eDnsQueryResultView` (5 fields: i64 rcode + 2 u64
+  counters + 2 Strings). Removes 1 `json!({...})` literal + 4
+  `result["field"] = Value::from(...)` writes + 2 trailing
+  `Value` walks (the `fail_on_no_response` error-presence check
+  + the error-message extraction). 5 new tests pin sentinel
+  rcode=-1, success-state + failure-state round-trips, and
+  fail-closed type rejection (string vs i64).
 * `[ ]` Remaining Phase A walks in `ops_live_lab_orchestrator.rs`
-  (2 production walks across 1 helper + 1 intentional generic
-  JSON-pointer reader):
-  - `e2e_dns_query` (helper)
+  (1 production walk across 1 intentional generic JSON-pointer
+  reader):
   - `execute_ops_read_json_field` (intentional generic shape-agnostic
     JSON-pointer reader — must stay Value-walk)
+
+  X2 writer-side Phase A list effectively closed: the only
+  remaining `Value` walk is the intentional generic JSON-pointer
+  reader that consumes externally-supplied shapes by design.
 * Each is an incremental slice.
 
 ### X3. Logging hardening audit (no-secret-leakage sweep)
