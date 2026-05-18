@@ -1,6 +1,6 @@
 # Rustynet Production Transport-Owning WireGuard Backend Plan
 **Generated:** 2026-03-31  
-**Repository Root:** `/Users/iwanteague/Desktop/Rustynet`  
+**Repository Root:** `workspace root`  
 **Status:** Active supporting implementation plan for the remaining pre-live-lab traversal/relay backend delta  
 **Owning Ledger:** [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 
@@ -18,7 +18,7 @@ This document exists to close the last meaningful non-live implementation gap be
 
 This plan is not a status ledger replacement. Status truth remains in:
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
-- [README.md](/Users/iwanteague/Desktop/Rustynet/README.md)
+- [README.md](../../../README.md)
 
 This document is the implementation blueprint for the remaining code delta only.
 
@@ -26,7 +26,7 @@ This document is the implementation blueprint for the remaining code delta only.
 The following repository state is already true and must not be regressed:
 
 ### 1.1 Backend Contract Already Exists
-The backend API already exposes the required transport-agnostic contract in [crates/rustynet-backend-api/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-api/src/lib.rs):
+The backend API already exposes the required transport-agnostic contract in [crates/rustynet-backend-api/src/lib.rs](../../../crates/rustynet-backend-api/src/lib.rs):
 - `AuthoritativeTransportIdentity`
 - `AuthoritativeTransportResponse`
 - `TunnelBackend::authoritative_transport_identity()`
@@ -36,10 +36,10 @@ The backend API already exposes the required transport-agnostic contract in [cra
 
 ### 1.2 Daemon Already Consumes That Contract Correctly
 The daemon/runtime path already consumes the contract in:
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
-- [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
-- [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs)
-- [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs)
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
+- [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
+- [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs)
+- [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs)
 
 Truthfulness hardening that must remain unchanged:
 - `direct_active` still requires fresh handshake proof.
@@ -47,7 +47,7 @@ Truthfulness hardening that must remain unchanged:
 - command-only backends must still fail closed when authoritative shared transport is required.
 
 ### 1.3 Only The In-Memory Backend Proves Shared Transport Today
-The only backend that currently satisfies the authoritative shared-transport contract is the in-memory/test backend inside [crates/rustynet-backend-wireguard/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs).
+The only backend that currently satisfies the authoritative shared-transport contract is the in-memory/test backend inside [crates/rustynet-backend-wireguard/src/lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs).
 
 Current production backends remain command-only adapters:
 - Linux backend: command runner over kernel WireGuard / `wg` / `ip`
@@ -56,7 +56,7 @@ Current production backends remain command-only adapters:
 Those adapters honestly report blocker strings because they do not own authoritative packet I/O.
 
 ### 1.4 Current WireGuard Backend Crate Now Contains Only A Partial Production Substrate
-[crates/rustynet-backend-wireguard/Cargo.toml](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/Cargo.toml) now pins the released userspace-backend dependencies:
+[crates/rustynet-backend-wireguard/Cargo.toml](../../../crates/rustynet-backend-wireguard/Cargo.toml) now pins the released userspace-backend dependencies:
 - `boringtun = "0.7.0"`
 - `tun-rs = "2.8.2"`
 
@@ -336,9 +336,9 @@ The helper must never own runtime transport.
 
 ## 7. Required File And Module Layout
 Current state:
-- [crates/rustynet-backend-wireguard/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs) is too large to remain the sole implementation file once the userspace runtime lands.
+- [crates/rustynet-backend-wireguard/src/lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs) is too large to remain the sole implementation file once the userspace runtime lands.
 
-Required target layout inside [crates/rustynet-backend-wireguard/src](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src):
+Required target layout inside [crates/rustynet-backend-wireguard/src](../../../crates/rustynet-backend-wireguard/src):
 - `lib.rs`
   - exports backend constructors and shared public types only
 - `in_memory.rs`
@@ -367,9 +367,9 @@ If the final module split differs slightly, the responsibilities above must stil
 Prepare the backend crate for a production userspace runtime without changing product claims yet.
 
 ### 8.2 Files To Touch
-- [crates/rustynet-backend-wireguard/Cargo.toml](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/Cargo.toml)
-- [crates/rustynet-backend-wireguard/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs)
-- newly created files under [crates/rustynet-backend-wireguard/src](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src)
+- [crates/rustynet-backend-wireguard/Cargo.toml](../../../crates/rustynet-backend-wireguard/Cargo.toml)
+- [crates/rustynet-backend-wireguard/src/lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs)
+- newly created files under [crates/rustynet-backend-wireguard/src](../../../crates/rustynet-backend-wireguard/src)
 
 ### 8.3 Exact Work
 1. Split current `lib.rs` into the module layout in Section 7.
@@ -393,27 +393,27 @@ Prepare the backend crate for a production userspace runtime without changing pr
 ### 8.5 Mandatory Validation
 - `cargo fmt --all -- --check`
 - `cargo check -p rustynet-backend-wireguard`
-- existing backend tests in [crates/rustynet-backend-wireguard/tests/conformance.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/tests/conformance.rs)
+- existing backend tests in [crates/rustynet-backend-wireguard/tests/conformance.rs](../../../crates/rustynet-backend-wireguard/tests/conformance.rs)
 
 ### 8.6 Status - 2026-03-31
 Phase 1 is complete in the current tree.
 
 Completed in this slice:
-- [crates/rustynet-backend-wireguard/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs) now acts as a stable crate root with explicit module ownership boundaries and stable public re-exports for the existing in-memory and command-only backends.
-- Existing in-memory backend logic was moved into [crates/rustynet-backend-wireguard/src/in_memory.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/in_memory.rs) without widening any claims or changing its authoritative shared-transport test behavior.
-- Existing Linux command-only backend logic was moved into [crates/rustynet-backend-wireguard/src/linux_command.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/linux_command.rs) without changing its fail-closed blocker behavior.
-- Existing macOS command-only backend logic was moved into [crates/rustynet-backend-wireguard/src/macos_command.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/macos_command.rs) without changing its fail-closed blocker behavior.
-- The required `userspace_shared` module tree now exists under [crates/rustynet-backend-wireguard/src/userspace_shared](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared) as compileable Phase 1 boundary scaffolding only:
+- [crates/rustynet-backend-wireguard/src/lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs) now acts as a stable crate root with explicit module ownership boundaries and stable public re-exports for the existing in-memory and command-only backends.
+- Existing in-memory backend logic was moved into [crates/rustynet-backend-wireguard/src/in_memory.rs](../../../crates/rustynet-backend-wireguard/src/in_memory.rs) without widening any claims or changing its authoritative shared-transport test behavior.
+- Existing Linux command-only backend logic was moved into [crates/rustynet-backend-wireguard/src/linux_command.rs](../../../crates/rustynet-backend-wireguard/src/linux_command.rs) without changing its fail-closed blocker behavior.
+- Existing macOS command-only backend logic was moved into [crates/rustynet-backend-wireguard/src/macos_command.rs](../../../crates/rustynet-backend-wireguard/src/macos_command.rs) without changing its fail-closed blocker behavior.
+- The required `userspace_shared` module tree now exists under [crates/rustynet-backend-wireguard/src/userspace_shared](../../../crates/rustynet-backend-wireguard/src/userspace_shared) as compileable Phase 1 boundary scaffolding only:
   - `mod.rs`
   - `runtime.rs`
   - `socket.rs`
   - `engine.rs`
   - `tun.rs`
   - `handshake.rs`
-- [crates/rustynet-backend-wireguard/Cargo.toml](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/Cargo.toml) now pins released crate versions for:
+- [crates/rustynet-backend-wireguard/Cargo.toml](../../../crates/rustynet-backend-wireguard/Cargo.toml) now pins released crate versions for:
   - `boringtun = "0.7.0"`
   - `tun-rs = "2.8.2"`
-- [Cargo.lock](/Users/iwanteague/Desktop/Rustynet/Cargo.lock) now records the resolved Phase 1 dependency graph for those released versions.
+- [Cargo.lock](../../../Cargo.lock) now records the resolved Phase 1 dependency graph for those released versions.
 
 Not completed in Phase 1:
 - no production `linux-wireguard-userspace-shared` runtime exists yet
@@ -436,11 +436,11 @@ Historical status note:
 Create a real `linux-wireguard-userspace-shared` backend that owns its runtime resources but is not yet fully wired to daemon selection surfaces.
 
 ### 9.2 Files To Touch
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs)
 
 ### 9.3 Exact Work
 1. Add a new backend type for `linux-wireguard-userspace-shared`.
@@ -482,13 +482,13 @@ Add tests proving:
 Phase 2 is complete in the current backend crate.
 
 Completed in this slice:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now defines a real `LinuxUserspaceSharedBackend` type with validated constructor inputs, runtime ownership state, authoritative identity reporting only after successful start, deterministic shutdown, and fail-closed later-phase method behavior.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now implements a real single-owner runtime worker with explicit request/reply messages, worker-owned socket/peer-engine/endpoint/round-trip/handshake containers, ready-handshake startup, and shutdown that joins the worker deterministically.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs) now binds a real authoritative UDP socket to the configured listen port and reports its actual local address through `authoritative_transport_identity()`.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs) now provides a real backend-internal `boringtun` key-material wrapper that reads the configured WireGuard private key, derives the static public key, and owns the future peer-engine container without leaking WireGuard engine types outside the backend crate.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs) now provides the owned handshake telemetry map required for later authenticated handshake advancement without fabricating freshness in Phase 2.
-- [crates/rustynet-backend-wireguard/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs) now re-exports the new Linux userspace-shared backend type for backend-crate construction/testing only; no daemon or product-surface wiring changed in this phase.
-- [crates/rustynet-backend-wireguard/tests/conformance.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/tests/conformance.rs) now covers the new backend lifecycle and confirms the command-only Linux/macOS blocker strings remain unchanged.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now defines a real `LinuxUserspaceSharedBackend` type with validated constructor inputs, runtime ownership state, authoritative identity reporting only after successful start, deterministic shutdown, and fail-closed later-phase method behavior.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now implements a real single-owner runtime worker with explicit request/reply messages, worker-owned socket/peer-engine/endpoint/round-trip/handshake containers, ready-handshake startup, and shutdown that joins the worker deterministically.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs) now binds a real authoritative UDP socket to the configured listen port and reports its actual local address through `authoritative_transport_identity()`.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs) now provides a real backend-internal `boringtun` key-material wrapper that reads the configured WireGuard private key, derives the static public key, and owns the future peer-engine container without leaking WireGuard engine types outside the backend crate.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs) now provides the owned handshake telemetry map required for later authenticated handshake advancement without fabricating freshness in Phase 2.
+- [crates/rustynet-backend-wireguard/src/lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs) now re-exports the new Linux userspace-shared backend type for backend-crate construction/testing only; no daemon or product-surface wiring changed in this phase.
+- [crates/rustynet-backend-wireguard/tests/conformance.rs](../../../crates/rustynet-backend-wireguard/tests/conformance.rs) now covers the new backend lifecycle and confirms the command-only Linux/macOS blocker strings remain unchanged.
 
 Validated in this slice:
 - `authoritative_transport_identity()` is absent before start and present only after successful start.
@@ -502,7 +502,7 @@ Validated in this slice:
 Validation completed for this slice:
 - `rustfmt --edition 2024 crates/rustynet-backend-wireguard/src/lib.rs crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs crates/rustynet-backend-wireguard/tests/conformance.rs`
 - `cargo fmt --all -- --check`
-  - Current result: fails on unrelated pre-existing formatting drift in [mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/vm_lab/mod.rs).
+  - Current result: fails on unrelated pre-existing formatting drift in [mod.rs](../../../crates/rustynet-cli/src/vm_lab/mod.rs).
 - `cargo check -p rustynet-backend-wireguard`
   - Current result: pass
 - `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`
@@ -533,16 +533,16 @@ Residual risks / blockers after Phase 2:
 - Phase 2 does not yet provide STUN or relay operations on the authoritative socket; later-phase methods still fail closed with precise errors.
 - Phase 2 does not yet provide peer ciphertext datapath, TUN lifecycle, or authenticated handshake advancement.
 - Daemon/start/install selection surfaces still intentionally reject `linux-wireguard-userspace-shared`; that remains correct until later phases land.
-- The backend crate still emits non-blocking dead-code warnings from the untouched Phase 1 [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold because the real TUN datapath is intentionally deferred to Phase 5.
+- The backend crate still emits non-blocking dead-code warnings from the untouched Phase 1 [tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold because the real TUN datapath is intentionally deferred to Phase 5.
 
 ## 10. Phase 3: Same-Socket STUN And Relay Control
 ### 10.1 Objective
 Make the backend-owned authoritative socket perform the exact STUN and relay control operations the daemon already expects.
 
 ### 10.2 Files To Touch
-- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs)
 
 ### 10.3 Exact Work
 1. Implement `authoritative_transport_round_trip(...)`.
@@ -585,10 +585,10 @@ Existing daemon tests around authoritative transport must still pass:
 Phase 3 is complete in the current backend crate.
 
 Completed in this slice:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now routes `authoritative_transport_round_trip(...)` and `authoritative_transport_send(...)` into the real userspace-shared runtime instead of the earlier fail-closed placeholder path, while keeping later-phase route/exit-mode work fail-closed.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now owns authoritative round-trip/send execution, enforces one in-flight generic round trip at a time, rejects configured peer endpoints for generic round trips, demultiplexes matching response datagrams before routing all other datagrams into the userspace engine boundary, records authoritative transport generation for test proof, and clears waiter state on timeout, shutdown, and worker exit.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs) now assigns a monotonic authoritative transport-generation token to each real socket instance, exposes nonblocking same-socket receive/send helpers, and preserves backend-owned socket identity without introducing a second socket.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs) now records peer ciphertext ingress at the engine boundary with the same authoritative transport generation used by STUN and relay control operations, which provides the Phase 3 same-socket proof without overclaiming Phase 4 datapath parity.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now routes `authoritative_transport_round_trip(...)` and `authoritative_transport_send(...)` into the real userspace-shared runtime instead of the earlier fail-closed placeholder path, while keeping later-phase route/exit-mode work fail-closed.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now owns authoritative round-trip/send execution, enforces one in-flight generic round trip at a time, rejects configured peer endpoints for generic round trips, demultiplexes matching response datagrams before routing all other datagrams into the userspace engine boundary, records authoritative transport generation for test proof, and clears waiter state on timeout, shutdown, and worker exit.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/socket.rs) now assigns a monotonic authoritative transport-generation token to each real socket instance, exposes nonblocking same-socket receive/send helpers, and preserves backend-owned socket identity without introducing a second socket.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs) now records peer ciphertext ingress at the engine boundary with the same authoritative transport generation used by STUN and relay control operations, which provides the Phase 3 same-socket proof without overclaiming Phase 4 datapath parity.
 
 Validated in this slice:
 - authoritative round trip fails closed before backend start and after shutdown
@@ -610,7 +610,7 @@ Validation completed for this slice:
   - Result: pass
   - Backend crate unit tests: 30 passed
   - Backend crate conformance tests: 6 passed
-  - Non-blocking warning only: untouched Phase 1 [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits dead-code warnings because the real TUN phase remains open
+  - Non-blocking warning only: untouched Phase 1 [tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits dead-code warnings because the real TUN phase remains open
 - `cargo test -p rustynetd daemon_runtime_authoritative_stun_refresh_uses_backend_shared_transport_identity -- --nocapture`
   - Result: pass
 - `cargo test -p rustynetd daemon_runtime_relay_establish_and_keepalive_use_backend_shared_transport_identity -- --nocapture`
@@ -636,16 +636,16 @@ What remains for Phase 4:
 Residual risks / blockers after Phase 3:
 - Phase 3 proves same authoritative socket generation for STUN, relay control, keepalive, and peer-path ingress accounting, but it does not yet provide authenticated handshake truth, full peer ciphertext datapath parity, or TUN lifecycle ownership.
 - Daemon/start/install selection surfaces still intentionally do not construct `linux-wireguard-userspace-shared`; that remains later work.
-- The untouched Phase 1 [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits non-blocking dead-code warnings until the TUN phase lands.
+- The untouched Phase 1 [tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits non-blocking dead-code warnings until the TUN phase lands.
 
 ## 11. Phase 4: Userspace Engine Integration And Handshake Telemetry
 ### 11.1 Objective
 Turn the userspace-shared backend from “socket owner” into a true WireGuard transport owner with authenticated handshake telemetry.
 
 ### 11.2 Files To Touch
-- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs)
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs)
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs)
 
 ### 11.3 Exact Work
 1. Maintain per-peer userspace engine state inside the backend runtime.
@@ -694,10 +694,10 @@ The following semantics must remain unchanged in daemon tests:
 Phase 4 is complete in the current backend crate.
 
 Completed in this slice:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs) now owns real per-peer `boringtun::noise::Tunn` state keyed by `NodeId`, keeps runtime-owned endpoint and allowed-IP state with each peer, routes inbound ciphertext to the matched peer engine by configured endpoint, drives outbound encryption from the current backend-internal plaintext test boundary, and derives authenticated handshake observations from userspace-engine evidence rather than programmed state.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now keeps peer configuration, endpoint state, authoritative socket ownership, round-trip state, and handshake telemetry synchronized inside the single-owner worker, applies engine outcomes back onto the authoritative socket, and implements honest `configure_peer(...)`, `update_peer_endpoint(...)`, `current_peer_endpoint(...)`, `peer_latest_handshake_unix(...)`, `remove_peer(...)`, and `stats(...)` behavior for the Linux userspace-shared backend.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs) now records monotonic per-peer authenticated handshake timestamps only when the userspace engine reports authenticated evidence, and clears that state on peer replacement/removal.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now carries Phase 4 backend tests for authenticated handshake advancement, negative handshake cases, peer replacement/removal, honest endpoint reporting, and honest stats behavior without widening any daemon or product claim.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs) now owns real per-peer `boringtun::noise::Tunn` state keyed by `NodeId`, keeps runtime-owned endpoint and allowed-IP state with each peer, routes inbound ciphertext to the matched peer engine by configured endpoint, drives outbound encryption from the current backend-internal plaintext test boundary, and derives authenticated handshake observations from userspace-engine evidence rather than programmed state.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now keeps peer configuration, endpoint state, authoritative socket ownership, round-trip state, and handshake telemetry synchronized inside the single-owner worker, applies engine outcomes back onto the authoritative socket, and implements honest `configure_peer(...)`, `update_peer_endpoint(...)`, `current_peer_endpoint(...)`, `peer_latest_handshake_unix(...)`, `remove_peer(...)`, and `stats(...)` behavior for the Linux userspace-shared backend.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/handshake.rs) now records monotonic per-peer authenticated handshake timestamps only when the userspace engine reports authenticated evidence, and clears that state on peer replacement/removal.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now carries Phase 4 backend tests for authenticated handshake advancement, negative handshake cases, peer replacement/removal, honest endpoint reporting, and honest stats behavior without widening any daemon or product claim.
 
 Validated in this slice:
 - handshake timestamps are absent until authenticated userspace-engine activity occurs
@@ -753,15 +753,15 @@ Residual risks / blockers after Phase 4:
 Wire the new backend end-to-end into Linux runtime selection without changing defaults or widening unsupported claims.
 
 ### 12.2 Files To Touch
-- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs)
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
-- [crates/rustynetd/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/main.rs)
-- [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh)
-- [crates/rustynet-cli/src/ops_write_daemon_env.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_write_daemon_env.rs)
-- [crates/rustynet-cli/src/ops_install_systemd.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_install_systemd.rs)
-- [crates/rustynet-cli/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs)
-- [scripts/systemd/rustynetd.service](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd.service)
-- [crates/rustynetd/src/privileged_helper.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/privileged_helper.rs) only if helper-assisted TUN setup is required
+- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs)
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
+- [crates/rustynetd/src/main.rs](../../../crates/rustynetd/src/main.rs)
+- [start.sh](../../../start.sh)
+- [crates/rustynet-cli/src/ops_write_daemon_env.rs](../../../crates/rustynet-cli/src/ops_write_daemon_env.rs)
+- [crates/rustynet-cli/src/ops_install_systemd.rs](../../../crates/rustynet-cli/src/ops_install_systemd.rs)
+- [crates/rustynet-cli/src/main.rs](../../../crates/rustynet-cli/src/main.rs)
+- [scripts/systemd/rustynetd.service](../../../scripts/systemd/rustynetd.service)
+- [crates/rustynetd/src/privileged_helper.rs](../../../crates/rustynetd/src/privileged_helper.rs) only if helper-assisted TUN setup is required
 
 ### 12.3 Exact Work
 1. Implement Linux TUN open/create/configure path for the userspace backend.
@@ -797,14 +797,14 @@ Add tests proving:
 Phase 5 is complete in the current tree for the Linux userspace-shared backend slice.
 
 Completed in this slice:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) now provides a real Linux TUN lifecycle with two explicit ownership paths: direct backend-owned setup for local/runtime use and helper-assisted host setup that creates/configures the interface, transfers long-lived file-descriptor ownership immediately into the backend runtime, and tears the interface down on failure or shutdown.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now wires the Linux userspace-shared backend through the TUN lifecycle, fails closed on TUN or socket startup errors, preserves deterministic cleanup, and keeps test-only lifecycle injection available for backend-crate validation without widening any product claim.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now treats the TUN device as runtime-owned state so the single-owner worker, not the daemon or helper, remains the long-lived owner of packet and transport resources.
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now constructs `linux-wireguard-userspace-shared` on Linux, validates the required key/helper configuration honestly, preserves fail-closed behavior on unsupported hosts and blocked macOS userspace-shared mode, and reports `authoritative_backend_shared_transport` once the real backend has been started.
-- [crates/rustynetd/src/privileged_helper.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/privileged_helper.rs) now accepts the narrow `ip tuntap add dev <iface> mode tun user <uid> group <gid>` schema required for helper-assisted Linux TUN creation without widening the helper into a long-lived packet owner.
-- [scripts/systemd/rustynetd.service](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd.service) and [crates/rustynet-cli/src/ops_install_systemd.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_install_systemd.rs) now preserve explicit backend mode selection while exposing `/dev/net/tun` to the daemon service template without changing the default backend away from `linux-wireguard`.
-- [crates/rustynet-backend-wireguard/tests/conformance.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/tests/conformance.rs) and backend/daemon/CLI tests now cover TUN lifecycle cleanup, no-silent-downgrade startup failure, authoritative transport reporting for the real userspace-shared backend, and service-template preservation of backend mode plus TUN-device access.
-- [crates/rustynetd/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/main.rs), [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh), [crates/rustynet-cli/src/ops_write_daemon_env.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_write_daemon_env.rs), and [crates/rustynet-cli/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs) were re-audited and required no Phase 5 edits because they already preserved an explicit `linux-wireguard-userspace-shared` selection without rewriting it.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) now provides a real Linux TUN lifecycle with two explicit ownership paths: direct backend-owned setup for local/runtime use and helper-assisted host setup that creates/configures the interface, transfers long-lived file-descriptor ownership immediately into the backend runtime, and tears the interface down on failure or shutdown.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now wires the Linux userspace-shared backend through the TUN lifecycle, fails closed on TUN or socket startup errors, preserves deterministic cleanup, and keeps test-only lifecycle injection available for backend-crate validation without widening any product claim.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now treats the TUN device as runtime-owned state so the single-owner worker, not the daemon or helper, remains the long-lived owner of packet and transport resources.
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs) now constructs `linux-wireguard-userspace-shared` on Linux, validates the required key/helper configuration honestly, preserves fail-closed behavior on unsupported hosts and blocked macOS userspace-shared mode, and reports `authoritative_backend_shared_transport` once the real backend has been started.
+- [crates/rustynetd/src/privileged_helper.rs](../../../crates/rustynetd/src/privileged_helper.rs) now accepts the narrow `ip tuntap add dev <iface> mode tun user <uid> group <gid>` schema required for helper-assisted Linux TUN creation without widening the helper into a long-lived packet owner.
+- [scripts/systemd/rustynetd.service](../../../scripts/systemd/rustynetd.service) and [crates/rustynet-cli/src/ops_install_systemd.rs](../../../crates/rustynet-cli/src/ops_install_systemd.rs) now preserve explicit backend mode selection while exposing `/dev/net/tun` to the daemon service template without changing the default backend away from `linux-wireguard`.
+- [crates/rustynet-backend-wireguard/tests/conformance.rs](../../../crates/rustynet-backend-wireguard/tests/conformance.rs) and backend/daemon/CLI tests now cover TUN lifecycle cleanup, no-silent-downgrade startup failure, authoritative transport reporting for the real userspace-shared backend, and service-template preservation of backend mode plus TUN-device access.
+- [crates/rustynetd/src/main.rs](../../../crates/rustynetd/src/main.rs), [start.sh](../../../start.sh), [crates/rustynet-cli/src/ops_write_daemon_env.rs](../../../crates/rustynet-cli/src/ops_write_daemon_env.rs), and [crates/rustynet-cli/src/main.rs](../../../crates/rustynet-cli/src/main.rs) were re-audited and required no Phase 5 edits because they already preserved an explicit `linux-wireguard-userspace-shared` selection without rewriting it.
 
 Validated in this slice:
 - `linux-wireguard-userspace-shared` now has a real Linux TUN lifecycle path instead of a placeholder scaffold.
@@ -860,9 +860,9 @@ Residual risks / blockers after Phase 5:
 Prove locally, without live evidence claims, that the production Linux backend now satisfies the same-socket transport invariants.
 
 ### 13.2 Required Test Surfaces
-- [crates/rustynet-backend-wireguard/tests/conformance.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/tests/conformance.rs)
-- backend unit tests under [crates/rustynet-backend-wireguard/src](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src)
-- daemon tests in [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
+- [crates/rustynet-backend-wireguard/tests/conformance.rs](../../../crates/rustynet-backend-wireguard/tests/conformance.rs)
+- backend unit tests under [crates/rustynet-backend-wireguard/src](../../../crates/rustynet-backend-wireguard/src)
+- daemon tests in [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
 
 ### 13.3 Mandatory New Simulated Integration Test
 Add at least one local multi-peer simulated test that proves all of the following together:
@@ -890,9 +890,9 @@ Add tests for:
 Phase 6 is complete in the current backend crate for the Linux userspace-shared simulated-proof slice.
 
 Completed in this slice:
-- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now records actual peer-ciphertext egress on the authoritative socket with the authoritative transport generation used for that send, so simulated proof can use the real production runtime path instead of inferring peer traffic from a receiving-side coincidence.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now carries the Phase 6 multi-peer simulated proof test that exercises one Linux userspace-shared backend instance across peer ciphertext, STUN round trip, relay round trip, and relay keepalive, asserts a single authoritative transport generation across all four path classes, and proves the invariant at generation level rather than by local-address equality alone.
-- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) also now carries the stronger restart/rollover regression proving that the same local port after restart is a new authoritative socket generation, that an in-flight round trip is canceled during shutdown, and that a late packet from the old socket generation becomes peer ingress on the new runtime instead of satisfying stale waiter state.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs) now records actual peer-ciphertext egress on the authoritative socket with the authoritative transport generation used for that send, so simulated proof can use the real production runtime path instead of inferring peer traffic from a receiving-side coincidence.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) now carries the Phase 6 multi-peer simulated proof test that exercises one Linux userspace-shared backend instance across peer ciphertext, STUN round trip, relay round trip, and relay keepalive, asserts a single authoritative transport generation across all four path classes, and proves the invariant at generation level rather than by local-address equality alone.
+- [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) also now carries the stronger restart/rollover regression proving that the same local port after restart is a new authoritative socket generation, that an in-flight round trip is canceled during shutdown, and that a late packet from the old socket generation becomes peer ingress on the new runtime instead of satisfying stale waiter state.
 
 Validated in this slice:
 - one Linux userspace-shared backend instance now has a local multi-peer simulated proof that peer ciphertext egress, STUN round trip, relay round trip, and relay keepalive all traverse the same authoritative transport generation on the production backend path
@@ -1028,14 +1028,14 @@ Validation outcomes:
 
 Post-phase live-lab correction from 2026-04-02:
 - Two reduced five-node helper reruns on committed `main` materially advanced the production Linux userspace-shared path:
-  - [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now prepares and scrubs runtime WireGuard key material for `linux-wireguard-userspace-shared` exactly like the command-only Linux backend, which cleared the earlier startup failure on missing `/run/rustynet/wireguard.key`.
-  - [scripts/systemd/rustynetd-privileged-helper.service](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd-privileged-helper.service) and [crates/rustynet-cli/src/ops_install_systemd.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_install_systemd.rs) now expose `/dev/net/tun` inside the privileged-helper private device namespace, which cleared the earlier helper failure on `ip tuntap add ...` returning `open: No such file or directory`.
+  - [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs) now prepares and scrubs runtime WireGuard key material for `linux-wireguard-userspace-shared` exactly like the command-only Linux backend, which cleared the earlier startup failure on missing `/run/rustynet/wireguard.key`.
+  - [scripts/systemd/rustynetd-privileged-helper.service](../../../scripts/systemd/rustynetd-privileged-helper.service) and [crates/rustynet-cli/src/ops_install_systemd.rs](../../../crates/rustynet-cli/src/ops_install_systemd.rs) now expose `/dev/net/tun` inside the privileged-helper private device namespace, which cleared the earlier helper failure on `ip tuntap add ...` returning `open: No such file or directory`.
 - The current reduced-lab truth is now more precise than the earlier Phase 7 closeout:
   - the helper flow preserves `linux-wireguard-userspace-shared`
   - the daemon starts far enough to create the userspace-owned TUN on at least part of the five-node topology
   - the lab now gets through bootstrap, membership, assignments, and traversal issuance before failing in baseline runtime enforcement
 - The remaining blocker is not a harness or policy artifact. It is still a real backend implementation gap:
-  - the Linux userspace-shared backend continues to fail closed on route application and exit-mode work because [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) still routes `apply_routes(...)` and `set_exit_mode(...)` into later-phase fail-closed placeholders
+  - the Linux userspace-shared backend continues to fail closed on route application and exit-mode work because [crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs) still routes `apply_routes(...)` and `set_exit_mode(...)` into later-phase fail-closed placeholders
   - on failing nodes, `rustynet status` now reports `last_reconcile_error=reconcile dataplane apply failed: backend error: Internal: linux userspace-shared backend does not yet implement route application; later production transport-owning phases remain open`
   - `rustynetd-managed-dns.service` failures are secondary symptoms of that fail-closed dataplane state, not the primary cause
 - Therefore the previous “dependency-policy plus evidence only” blocker set was incomplete. Pre-live-lab readiness still also requires honest route application and exit-mode implementation for the Linux userspace-shared backend.
@@ -1066,32 +1066,32 @@ Exact prerequisites before this plan can be declared pre-live-lab ready:
 The following files must be treated as the primary implementation surface:
 
 ### 15.1 Backend API and WireGuard Backend
-- [crates/rustynet-backend-api/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-api/src/lib.rs)
-- [crates/rustynet-backend-wireguard/Cargo.toml](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/Cargo.toml)
-- [crates/rustynet-backend-wireguard/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/lib.rs)
-- [crates/rustynet-backend-wireguard/tests/conformance.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/tests/conformance.rs)
+- [crates/rustynet-backend-api/src/lib.rs](../../../crates/rustynet-backend-api/src/lib.rs)
+- [crates/rustynet-backend-wireguard/Cargo.toml](../../../crates/rustynet-backend-wireguard/Cargo.toml)
+- [crates/rustynet-backend-wireguard/src/lib.rs](../../../crates/rustynet-backend-wireguard/src/lib.rs)
+- [crates/rustynet-backend-wireguard/tests/conformance.rs](../../../crates/rustynet-backend-wireguard/tests/conformance.rs)
 
 ### 15.2 Daemon Runtime
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
-- [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
-- [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs)
-- [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs)
-- [crates/rustynetd/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/main.rs)
-- [crates/rustynetd/src/privileged_helper.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/privileged_helper.rs) if helper-assisted TUN setup is necessary
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
+- [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
+- [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs)
+- [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs)
+- [crates/rustynetd/src/main.rs](../../../crates/rustynetd/src/main.rs)
+- [crates/rustynetd/src/privileged_helper.rs](../../../crates/rustynetd/src/privileged_helper.rs) if helper-assisted TUN setup is necessary
 
 ### 15.3 Selection And Deployment Surfaces
-- [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh)
-- [crates/rustynet-cli/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs)
-- [crates/rustynet-cli/src/ops_write_daemon_env.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_write_daemon_env.rs)
-- [crates/rustynet-cli/src/ops_install_systemd.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_install_systemd.rs)
-- [scripts/systemd/rustynetd.service](/Users/iwanteague/Desktop/Rustynet/scripts/systemd/rustynetd.service)
+- [start.sh](../../../start.sh)
+- [crates/rustynet-cli/src/main.rs](../../../crates/rustynet-cli/src/main.rs)
+- [crates/rustynet-cli/src/ops_write_daemon_env.rs](../../../crates/rustynet-cli/src/ops_write_daemon_env.rs)
+- [crates/rustynet-cli/src/ops_install_systemd.rs](../../../crates/rustynet-cli/src/ops_install_systemd.rs)
+- [scripts/systemd/rustynetd.service](../../../scripts/systemd/rustynetd.service)
 
 ### 15.4 Gate And Evidence Surfaces
-- [scripts/ci/phase10_hp2_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_hp2_gates.sh)
-- [scripts/ci/membership_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/membership_gates.sh)
-- [scripts/ci/phase10_cross_network_exit_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_cross_network_exit_gates.sh)
-- [scripts/ci/phase10_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_gates.sh)
-- [crates/rustynet-cli/src/ops_cross_network_reports.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_cross_network_reports.rs)
+- [scripts/ci/phase10_hp2_gates.sh](../../../scripts/ci/phase10_hp2_gates.sh)
+- [scripts/ci/membership_gates.sh](../../../scripts/ci/membership_gates.sh)
+- [scripts/ci/phase10_cross_network_exit_gates.sh](../../../scripts/ci/phase10_cross_network_exit_gates.sh)
+- [scripts/ci/phase10_gates.sh](../../../scripts/ci/phase10_gates.sh)
+- [crates/rustynet-cli/src/ops_cross_network_reports.rs](../../../crates/rustynet-cli/src/ops_cross_network_reports.rs)
 
 ## 16. Stop Conditions
 Stop and document the blocker instead of improvising if any of the following becomes true:
@@ -1114,7 +1114,7 @@ Once Phases 1 through 7 are complete and validated, the next work is:
    - `./scripts/ci/phase10_cross_network_exit_gates.sh`
    - `./scripts/ci/phase10_gates.sh`
 5. update:
-   - [README.md](/Users/iwanteague/Desktop/Rustynet/README.md)
+   - [README.md](../../../README.md)
    - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 
 That live-evidence step is intentionally out of scope for this pre-live-lab implementation document.

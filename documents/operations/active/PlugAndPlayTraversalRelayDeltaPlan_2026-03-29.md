@@ -1,13 +1,13 @@
 # Rustynet Plug-and-Play Connectivity Delta Plan (UDP Hole Punching + Relay Fallback)
 **Generated:** 2026-03-29
-**Repository Root:** `/Users/iwanteague/Desktop/Rustynet`
+**Repository Root:** `workspace root`
 **Scope:** Production-grade, secure, plug-and-play cross-network connectivity with direct UDP when possible and ciphertext-only relay fallback when direct is not provable.
 
 ## Execution Scope
 ```text
 You are the implementation agent for the remaining plug-and-play connectivity work in this repository.
-Repository root: /Users/iwanteague/Desktop/Rustynet
-Output file to keep updated during the work: /Users/iwanteague/Desktop/Rustynet/documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
+Repository root: workspace root
+Output file to keep updated during the work: documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
 
 Mission:
 Implement the remaining code, tests, gates, and evidence needed for secure, plug-and-play cross-network Rustynet connectivity without relying on manual consumer-router port forwarding as the correctness path. The target product behavior is:
@@ -19,16 +19,16 @@ Implement the remaining code, tests, gates, and evidence needed for secure, plug
 - users are not required to understand NAT, firewalls, or port forwarding.
 
 Mandatory reading order:
-1. /Users/iwanteague/Desktop/Rustynet/AGENTS.md
-2. /Users/iwanteague/Desktop/Rustynet/CLAUDE.md
-3. /Users/iwanteague/Desktop/Rustynet/README.md
-4. /Users/iwanteague/Desktop/Rustynet/documents/Requirements.md
-5. /Users/iwanteague/Desktop/Rustynet/documents/SecurityMinimumBar.md
-6. /Users/iwanteague/Desktop/Rustynet/documents/phase10.md
-7. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md
-8. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md
-9. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/MasterWorkPlan_2026-03-22.md
-10. /Users/iwanteague/Desktop/Rustynet/documents/operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md
+1. AGENTS.md
+2. CLAUDE.md
+3. README.md
+4. documents/Requirements.md
+5. documents/SecurityMinimumBar.md
+6. documents/phase10.md
+7. documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md
+8. documents/operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md
+9. documents/operations/active/MasterWorkPlan_2026-03-22.md
+10. documents/operations/active/CrossNetworkRemoteExitNodePlan_2026-03-16.md
 11. This document
 12. The code you touch
 
@@ -137,7 +137,7 @@ Supporting implementation plan for the remaining production shared-transport del
 - [ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md](./ProductionTransportOwningWireGuardBackendPlan_2026-03-31.md)
 
 Where documents conflict:
-- [README.md](/Users/iwanteague/Desktop/Rustynet/README.md) and [phase10.md](/Users/iwanteague/Desktop/Rustynet/documents/phase10.md) currently state that full production WAN simultaneous-open and full relay transport are still open work.
+- [README.md](../../../README.md) and [phase10.md](../../../documents/phase10.md) currently state that full production WAN simultaneous-open and full relay transport are still open work.
 - some lower-precedence active traversal notes claim more completion than current live evidence supports.
 - this document resolves those conflicts in favor of the stricter, runtime-proven interpretation.
 
@@ -208,25 +208,25 @@ Primary implications for Rustynet:
 The following capabilities already exist in the codebase:
 
 #### Control Plane / Signed State
-- signed endpoint-hint bundles and traversal coordination records in [crates/rustynet-control/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-control/src/lib.rs)
-- relay session token type and signature verification in [crates/rustynet-control/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-control/src/lib.rs)
+- signed endpoint-hint bundles and traversal coordination records in [crates/rustynet-control/src/lib.rs](../../../crates/rustynet-control/src/lib.rs)
+- relay session token type and signature verification in [crates/rustynet-control/src/lib.rs](../../../crates/rustynet-control/src/lib.rs)
 - endpoint-hint signing key derivation reuse via `derive_endpoint_hint_signing_key(...)`
 
 #### Daemon / Traversal Runtime
-- traversal hint validation, watermark/replay checks, and authoritative indexing in [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
-- traversal engine and deterministic direct probe planning in [crates/rustynetd/src/traversal.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/traversal.rs)
-- traversal probe evaluation and path commit in [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
-- explicit programmed/live path reporting in [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
-- STUN client wiring and `stun_candidates` status exposure in [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs) and [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
+- traversal hint validation, watermark/replay checks, and authoritative indexing in [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
+- traversal engine and deterministic direct probe planning in [crates/rustynetd/src/traversal.rs](../../../crates/rustynetd/src/traversal.rs)
+- traversal probe evaluation and path commit in [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
+- explicit programmed/live path reporting in [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
+- STUN client wiring and `stun_candidates` status exposure in [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs) and [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
 
 #### Relay Pieces
-- relay client module in [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs)
-- relay transport auth/forwarding core in [crates/rustynet-relay/src/transport.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/transport.rs)
-- relay fleet selection primitives in [crates/rustynet-relay/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/lib.rs)
+- relay client module in [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs)
+- relay transport auth/forwarding core in [crates/rustynet-relay/src/transport.rs](../../../crates/rustynet-relay/src/transport.rs)
+- relay fleet selection primitives in [crates/rustynet-relay/src/lib.rs](../../../crates/rustynet-relay/src/lib.rs)
 
 #### Operational Surface
-- direct, relay, failback, DNS, adversarial, and soak live scripts under [scripts/e2e](/Users/iwanteague/Desktop/Rustynet/scripts/e2e)
-- phase10 and HP2 gates under [scripts/ci](/Users/iwanteague/Desktop/Rustynet/scripts/ci)
+- direct, relay, failback, DNS, adversarial, and soak live scripts under [scripts/e2e](../../../scripts/e2e)
+- phase10 and HP2 gates under [scripts/ci](../../../scripts/ci)
 
 ### 6.2 What Is Honest and Working Today
 These things are materially implemented and should be treated as existing baseline, not future work:
@@ -272,8 +272,8 @@ These are not optional improvements. They are correctness bugs or architectural 
 
 ### 8.1 STUN Candidate Port Is Currently Guessed, Not Discovered
 **Files:**
-- [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs)
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
+- [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs)
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
 
 **Current behavior:**
 - `StunClient::query_stun_server(...)` binds `0.0.0.0:0`, i.e. an ephemeral port.
@@ -292,14 +292,14 @@ These are not optional improvements. They are correctness bugs or architectural 
 - candidate publication must stop assuming the public port equals `wg_listen_port`.
 
 **Minimum implementation direction:**
-1. redesign [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs) to return `Vec<SocketAddr>` or richer candidate structs,
+1. redesign [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs) to return `Vec<SocketAddr>` or richer candidate structs,
 2. stop using `SocketAddr::new(ip, self.wg_listen_port)` in daemon runtime,
 3. tie candidate discovery to the active transport socket semantics.
 
 ### 8.2 Relay Client Binds a Separate Ephemeral Socket Despite Its Own Security Comment
 **Files:**
-- [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs)
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
+- [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs)
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
 
 **Current behavior:**
 - `RelayClient::bind(...)` documentation says it should use the same socket as WireGuard traffic so NAT mappings are shared.
@@ -316,9 +316,9 @@ These are not optional improvements. They are correctness bugs or architectural 
 
 ### 8.3 `rustynet-relay` Main Binary Is Still a Placeholder, Not a Production Relay Service
 **Files:**
-- [crates/rustynet-relay/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/main.rs)
-- [crates/rustynet-relay/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/lib.rs)
-- [crates/rustynet-relay/src/transport.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/transport.rs)
+- [crates/rustynet-relay/src/main.rs](../../../crates/rustynet-relay/src/main.rs)
+- [crates/rustynet-relay/src/lib.rs](../../../crates/rustynet-relay/src/lib.rs)
+- [crates/rustynet-relay/src/transport.rs](../../../crates/rustynet-relay/src/transport.rs)
 
 **Current behavior:**
 - the `main.rs` binary only selects a relay from an in-memory fleet and prints a startup line,
@@ -330,9 +330,9 @@ These are not optional improvements. They are correctness bugs or architectural 
 
 ### 8.4 Relay Runtime Exists But Is Not Yet the Product-Correct Fallback Path
 **Files:**
-- [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
-- [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
-- [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs)
+- [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
+- [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
+- [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs)
 
 **Current symptom:**
 - live runs end in `relay_programmed` / `relay_session_disabled` or otherwise unproven relay state instead of `relay_active` with liveness proof.
@@ -347,10 +347,10 @@ These are not optional improvements. They are correctness bugs or architectural 
 
 ### 8.5 Relay Data-Plane Demultiplexing and On-Wire Session Semantics Are Still Underspecified
 **Files:**
-- [crates/rustynet-relay/src/transport.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/transport.rs)
-- [crates/rustynet-relay/src/session.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/session.rs)
-- [crates/rustynet-relay/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/main.rs)
-- [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs)
+- [crates/rustynet-relay/src/transport.rs](../../../crates/rustynet-relay/src/transport.rs)
+- [crates/rustynet-relay/src/session.rs](../../../crates/rustynet-relay/src/session.rs)
+- [crates/rustynet-relay/src/main.rs](../../../crates/rustynet-relay/src/main.rs)
+- [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs)
 
 **Current behavior:**
 - `RelayTransport::forward_packet(...)` expects the caller to already know which `session_id` owns an incoming datagram.
@@ -466,7 +466,7 @@ Why this choice is correct for the product:
 ## 10. File-by-File Delta Plan
 This section is the most important implementation map in the document.
 
-### 10.1 [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs)
+### 10.1 [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs)
 **Current role**
 - basic STUN binding request/response parser
 - returns public IPs only
@@ -491,7 +491,7 @@ This section is the most important implementation map in the document.
 **Correct result**
 - srflx candidate = actual public endpoint for the transport socket that will later attempt peer traffic.
 
-### 10.2 [crates/rustynetd/src/traversal.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/traversal.rs)
+### 10.2 [crates/rustynetd/src/traversal.rs](../../../crates/rustynetd/src/traversal.rs)
 **Current role**
 - candidate validation
 - probe plan generation
@@ -517,7 +517,7 @@ This section is the most important implementation map in the document.
 - assignment-endpoint fallback,
 - speculative “direct_active” claims without handshake proof.
 
-### 10.3 [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs)
+### 10.3 [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs)
 **Current role**
 - path controller
 - probe evaluation integration
@@ -535,7 +535,7 @@ This section is the most important implementation map in the document.
 4. Add tests that direct and relay active states require proof, not just programming.
 5. Ensure relay path transitions do not accidentally destroy or bypass active WireGuard session semantics.
 
-### 10.4 [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs)
+### 10.4 [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs)
 **Current role**
 - runtime orchestration
 - STUN result polling
@@ -563,7 +563,7 @@ This section is the most important implementation map in the document.
    - relay->direct failback
    - direct->relay failover reason
 
-### 10.5 [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs)
+### 10.5 [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs)
 **Current role**
 - client-side relay hello/session establishment
 - session refresh/cleanup
@@ -581,7 +581,7 @@ This section is the most important implementation map in the document.
 4. Add explicit packet I/O APIs or transport shims if backend needs to send/receive through relay in a controlled way.
 5. Add tests that session establishment, refresh, and live traffic operate on the documented transport identity model and do not silently split across multiple socket identities.
 
-### 10.6 [crates/rustynet-relay/src/transport.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/transport.rs)
+### 10.6 [crates/rustynet-relay/src/transport.rs](../../../crates/rustynet-relay/src/transport.rs)
 **Current role**
 - secure relay transport core
 - token auth
@@ -603,7 +603,7 @@ This section is the most important implementation map in the document.
 5. Add cluster/fleet-facing concerns only after single-node correctness is solid.
 6. Add tests proving that one inbound datagram can map to only one authenticated session and can never be forwarded cross-session.
 
-### 10.7 [crates/rustynet-relay/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/main.rs)
+### 10.7 [crates/rustynet-relay/src/main.rs](../../../crates/rustynet-relay/src/main.rs)
 **Current role**
 - placeholder selection demo
 
@@ -625,7 +625,7 @@ This section is the most important implementation map in the document.
 4. Add graceful shutdown and periodic cleanup.
 5. Add operator-safe logs with no secret leakage.
 
-### 10.8 [crates/rustynet-control/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-control/src/lib.rs)
+### 10.8 [crates/rustynet-control/src/lib.rs](../../../crates/rustynet-control/src/lib.rs)
 **Current role**
 - endpoint-hint issuance/verification
 - relay session token definitions and signing
@@ -640,7 +640,7 @@ This section is the most important implementation map in the document.
 4. Keep relay token signing scoped to ciphertext-forward-only semantics.
 5. If the control-plane surface grows beyond maintainability, split relay-specific control-plane logic into a dedicated module under `crates/rustynet-control/src/`.
 
-### 10.9 [crates/rustynet-relay/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-relay/src/lib.rs)
+### 10.9 [crates/rustynet-relay/src/lib.rs](../../../crates/rustynet-relay/src/lib.rs)
 **Current role**
 - fleet selection primitives
 
@@ -649,7 +649,7 @@ This section is the most important implementation map in the document.
 2. Extend only as necessary for runtime relay directory consumption and health scoring.
 3. Avoid growing transport/runtime logic into this file; keep that in dedicated modules.
 
-### 10.10 [crates/rustynetd/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/main.rs)
+### 10.10 [crates/rustynetd/src/main.rs](../../../crates/rustynetd/src/main.rs)
 **Required changes**
 - add/verify config flags and env support for:
   - relay directory path / verifier path if separate from traversal bundle
@@ -658,7 +658,7 @@ This section is the most important implementation map in the document.
   - optional NAT-PMP/PCP/UPnP knobs as opportunistic helpers only
 - fail closed on invalid combinations
 
-### 10.11 [scripts/e2e](/Users/iwanteague/Desktop/Rustynet/scripts/e2e)
+### 10.11 [scripts/e2e](../../../scripts/e2e)
 **Required changes**
 Update or create live scripts so they prove the actual product promise:
 - direct remote exit works when NATs permit,
@@ -669,14 +669,14 @@ Update or create live scripts so they prove the actual product promise:
 - soak remains stable over expiry/refresh windows.
 
 At minimum, keep these scripts current:
-- [live_linux_cross_network_direct_remote_exit_test.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh)
-- [live_linux_cross_network_relay_remote_exit_test.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh)
-- [live_linux_cross_network_failback_roaming_test.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_cross_network_failback_roaming_test.sh)
-- [live_linux_cross_network_remote_exit_dns_test.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh)
-- [live_linux_cross_network_remote_exit_soak_test.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh)
-- [live_linux_cross_network_traversal_adversarial_test.sh](/Users/iwanteague/Desktop/Rustynet/scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh)
+- [live_linux_cross_network_direct_remote_exit_test.sh](../../../scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh)
+- [live_linux_cross_network_relay_remote_exit_test.sh](../../../scripts/e2e/live_linux_cross_network_relay_remote_exit_test.sh)
+- [live_linux_cross_network_failback_roaming_test.sh](../../../scripts/e2e/live_linux_cross_network_failback_roaming_test.sh)
+- [live_linux_cross_network_remote_exit_dns_test.sh](../../../scripts/e2e/live_linux_cross_network_remote_exit_dns_test.sh)
+- [live_linux_cross_network_remote_exit_soak_test.sh](../../../scripts/e2e/live_linux_cross_network_remote_exit_soak_test.sh)
+- [live_linux_cross_network_traversal_adversarial_test.sh](../../../scripts/e2e/live_linux_cross_network_traversal_adversarial_test.sh)
 
-### 10.12 [scripts/ci](/Users/iwanteague/Desktop/Rustynet/scripts/ci)
+### 10.12 [scripts/ci](../../../scripts/ci)
 **Required changes**
 Gates must fail closed on:
 - guessed public candidates,
@@ -686,10 +686,10 @@ Gates must fail closed on:
 - cross-network reports claiming success from programmed state only.
 
 Keep current gates current:
-- [phase10_hp2_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_hp2_gates.sh)
-- [phase10_cross_network_exit_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_cross_network_exit_gates.sh)
-- [phase10_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/phase10_gates.sh)
-- [membership_gates.sh](/Users/iwanteague/Desktop/Rustynet/scripts/ci/membership_gates.sh)
+- [phase10_hp2_gates.sh](../../../scripts/ci/phase10_hp2_gates.sh)
+- [phase10_cross_network_exit_gates.sh](../../../scripts/ci/phase10_cross_network_exit_gates.sh)
+- [phase10_gates.sh](../../../scripts/ci/phase10_gates.sh)
+- [membership_gates.sh](../../../scripts/ci/membership_gates.sh)
 
 ## 11. What Already Exists vs What Must Be Built
 ### 11.1 Already Exists
@@ -717,12 +717,12 @@ Tasks:
 - [x] Fix STUN to return full mapped endpoints.
 - [x] Stop guessing public port from `wg_listen_port`.
 - [ ] Align STUN gathering with actual transport socket identity.
-  - Verified 2026-03-31: [crates/rustynet-backend-api/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-api/src/lib.rs), [crates/rustynetd/src/stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs), [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs), and [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now define and consume an explicit backend-owned authoritative shared-transport round-trip contract for STUN refresh plus transport-identity diagnostics, and the in-memory backend proves that path under test; current production WireGuard backends still report an opaque-socket blocker, so live completion remains unresolved until a production backend mode actually owns peer datagrams.
-  - Verified 2026-03-31: non-default backend mode names `linux-wireguard-userspace-shared` and `macos-wireguard-userspace-shared` now parse in [crates/rustynetd/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/main.rs) and survive host-profile enforcement in [start.sh](/Users/iwanteague/Desktop/Rustynet/start.sh), but [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) still rejects them fail-closed with a precise blocker because no production transport-owning backend exists in-tree yet.
+  - Verified 2026-03-31: [crates/rustynet-backend-api/src/lib.rs](../../../crates/rustynet-backend-api/src/lib.rs), [crates/rustynetd/src/stun_client.rs](../../../crates/rustynetd/src/stun_client.rs), [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs), and [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs) now define and consume an explicit backend-owned authoritative shared-transport round-trip contract for STUN refresh plus transport-identity diagnostics, and the in-memory backend proves that path under test; current production WireGuard backends still report an opaque-socket blocker, so live completion remains unresolved until a production backend mode actually owns peer datagrams.
+  - Verified 2026-03-31: non-default backend mode names `linux-wireguard-userspace-shared` and `macos-wireguard-userspace-shared` now parse in [crates/rustynetd/src/main.rs](../../../crates/rustynetd/src/main.rs) and survive host-profile enforcement in [start.sh](../../../start.sh), but [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs) still rejects them fail-closed with a precise blocker because no production transport-owning backend exists in-tree yet.
 - [ ] Align relay session establishment with the documented transport identity model.
-  - Verified 2026-03-31: [crates/rustynet-backend-api/src/lib.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-api/src/lib.rs), [crates/rustynetd/src/relay_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/relay_client.rs), [crates/rustynetd/src/phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs), and [crates/rustynetd/src/daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now route relay hello/refresh and keepalive through the same backend-owned authoritative shared-transport contract when a backend provides it, and the in-memory backend proves that establish/keepalive path under test; production WireGuard backends still surface an opaque-socket blocker and remain unresolved until a production backend mode actually owns peer datagrams.
+  - Verified 2026-03-31: [crates/rustynet-backend-api/src/lib.rs](../../../crates/rustynet-backend-api/src/lib.rs), [crates/rustynetd/src/relay_client.rs](../../../crates/rustynetd/src/relay_client.rs), [crates/rustynetd/src/phase10.rs](../../../crates/rustynetd/src/phase10.rs), and [crates/rustynetd/src/daemon.rs](../../../crates/rustynetd/src/daemon.rs) now route relay hello/refresh and keepalive through the same backend-owned authoritative shared-transport contract when a backend provides it, and the in-memory backend proves that establish/keepalive path under test; production WireGuard backends still surface an opaque-socket blocker and remain unresolved until a production backend mode actually owns peer datagrams.
 - [x] Add unit tests and live diagnostics proving candidate correctness.
-  - Verified 2026-03-30: [stun_client.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/stun_client.rs) now has mock-server and malformed-response coverage for provided-socket identity and strict bounds checking, and [daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs) now exposes `stun_candidate_local_addrs` and `stun_transport_port_binding` in status/netcheck so transport-identity mismatches are explicit.
+  - Verified 2026-03-30: [stun_client.rs](../../../crates/rustynetd/src/stun_client.rs) now has mock-server and malformed-response coverage for provided-socket identity and strict bounds checking, and [daemon.rs](../../../crates/rustynetd/src/daemon.rs) now exposes `stun_candidate_local_addrs` and `stun_transport_port_binding` in status/netcheck so transport-identity mismatches are explicit.
 
 Success criteria:
 - published srflx candidates correspond to measured public socket tuples,
@@ -731,7 +731,7 @@ Success criteria:
 ### Phase B: Finish Direct WAN Simultaneous-Open on the Live Runtime Path
 Tasks:
 - [x] Reconcile traversal engine design with active runtime behavior.
-  - Verified 2026-03-30: [daemon.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/daemon.rs), [phase10.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/phase10.rs), and [traversal.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynetd/src/traversal.rs) now carry validated signed coordination from the signed traversal bundle set into live direct-probe execution; the runtime no longer fabricates a zeroed `CoordinationSchedule`.
+  - Verified 2026-03-30: [daemon.rs](../../../crates/rustynetd/src/daemon.rs), [phase10.rs](../../../crates/rustynetd/src/phase10.rs), and [traversal.rs](../../../crates/rustynetd/src/traversal.rs) now carry validated signed coordination from the signed traversal bundle set into live direct-probe execution; the runtime no longer fabricates a zeroed `CoordinationSchedule`.
 - [x] Ensure direct probe executor is truly two-sided where required.
   - Verified 2026-03-30: coordinated simultaneous-open is now only attempted when a validated signed coordination schedule exists for the local/remote node pair; otherwise the runtime declines direct and stays on relay, or fail-closes when no relay exists.
 - [x] Make the active runtime prove direct path using fresh handshake evidence.
@@ -1432,7 +1432,7 @@ Tests and gates run:
   - `./scripts/ci/phase10_hp2_gates.sh` (pass)
   - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed on the six missing canonical live cross-network reports)
   - `./scripts/ci/phase10_gates.sh` (fails closed on stale `artifacts/phase10/fresh_install_os_matrix_report.json` commit binding)
-  - `./scripts/ci/membership_gates.sh` rerun advanced through the previous missing-module/clippy blockers and through the full workspace lint/check/test stack; because [crates/rustynet-cli/src/ops_ci_release_perf.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/ops_ci_release_perf.rs) delegates the tail of that gate into the same Phase 10 readiness path, its remaining red state is the separately verified stale fresh-install evidence blocker rather than the old CLI regression.
+  - `./scripts/ci/membership_gates.sh` rerun advanced through the previous missing-module/clippy blockers and through the full workspace lint/check/test stack; because [crates/rustynet-cli/src/ops_ci_release_perf.rs](../../../crates/rustynet-cli/src/ops_ci_release_perf.rs) delegates the tail of that gate into the same Phase 10 readiness path, its remaining red state is the separately verified stale fresh-install evidence blocker rather than the old CLI regression.
 Artifacts / evidence:
   - No new live cross-network artifacts were generated in this slice.
   - `artifacts/phase10/source/traversal_path_selection_report.json` and `artifacts/phase10/source/traversal_probe_security_report.json` were regenerated by `./scripts/ci/phase10_hp2_gates.sh`.
@@ -1495,7 +1495,7 @@ Tests and gates run:
   - `./scripts/ci/phase10_hp2_gates.sh` (pass)
   - `./scripts/ci/phase10_cross_network_exit_gates.sh` (fails closed only on the six missing canonical live cross-network reports)
   - `cargo run --quiet -p rustynet-cli --bin phase10_gates --` (fails closed only on stale fresh-install matrix child-commit evidence for current `HEAD`)
-  - `./scripts/ci/membership_gates.sh` (fails after the shared-transport/runtime checks stay green because the current CLI tree has unrelated `OpsCommand::VmLabSyncBootstrap` / `VmLabWriteLiveLabProfile` / `VmLabRunLiveLab` variants that are not yet handled exhaustively in [crates/rustynet-cli/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs))
+  - `./scripts/ci/membership_gates.sh` (fails after the shared-transport/runtime checks stay green because the current CLI tree has unrelated `OpsCommand::VmLabSyncBootstrap` / `VmLabWriteLiveLabProfile` / `VmLabRunLiveLab` variants that are not yet handled exhaustively in [crates/rustynet-cli/src/main.rs](../../../crates/rustynet-cli/src/main.rs))
 Artifacts / evidence:
   - No new live cross-network artifacts were generated in this slice.
   - `./scripts/ci/phase10_hp2_gates.sh` now passes with the shared-transport-backed traversal/relay non-live contract in place.
@@ -1509,7 +1509,7 @@ Security invariants verified:
 Residual risks / blockers:
   - This slice does not create a production backend mode that owns peer datagrams; the in-memory/test backend proves the contract, but production Linux/macOS command-only modes remain architecture-blocked and intentionally fail closed.
   - Fresh live cross-network evidence and fresh-install matrix evidence for current `HEAD` remain separate release blockers.
-  - `./scripts/ci/membership_gates.sh` is currently blocked by an unrelated CLI compile regression in [crates/rustynet-cli/src/main.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/main.rs) around new VM-lab `OpsCommand` variants; that blocker is outside this shared-transport write slice and does not come from the shared-transport runtime changes above.
+  - `./scripts/ci/membership_gates.sh` is currently blocked by an unrelated CLI compile regression in [crates/rustynet-cli/src/main.rs](../../../crates/rustynet-cli/src/main.rs) around new VM-lab `OpsCommand` variants; that blocker is outside this shared-transport write slice and does not come from the shared-transport runtime changes above.
 ```
 
 ```text
@@ -1634,7 +1634,7 @@ Tests and validation run:
   - `CARGO_TARGET_DIR=/tmp/rustynet-phase2-check cargo check -p rustynet-backend-wireguard`
 Validation outcomes:
   - `rustfmt --edition 2024 ...`: pass
-  - `cargo fmt --all -- --check`: fails on unrelated pre-existing formatting drift in [mod.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-cli/src/vm_lab/mod.rs)
+  - `cargo fmt --all -- --check`: fails on unrelated pre-existing formatting drift in [mod.rs](../../../crates/rustynet-cli/src/vm_lab/mod.rs)
   - `cargo check -p rustynet-backend-wireguard`: pass
   - sandboxed `cargo test -p rustynet-backend-wireguard --tests -- --nocapture`: blocked by sandbox `EPERM` on real UDP socket binds
   - unsandboxed backend-only rerun with isolated target dir: pass
@@ -1660,7 +1660,7 @@ What remains for Phase 3:
 Residual risks / blockers:
   - This slice does not yet wire STUN, relay control, peer ciphertext, TUN datapath, or authenticated handshake advancement into the new backend; those remain later phases.
   - Daemon/start/install selection surfaces are still intentionally untouched in this slice, so product/runtime behavior remains unchanged and the new mode is not yet selectable end-to-end.
-  - The untouched Phase 1 [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits non-blocking dead-code warnings until the real TUN phase lands.
+  - The untouched Phase 1 [tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits non-blocking dead-code warnings until the real TUN phase lands.
 ```
 
 ```text
@@ -1693,7 +1693,7 @@ Validation outcomes:
   - backend crate unit tests: 30 passed
   - backend crate conformance tests: 6 passed
   - targeted daemon authoritative-transport compatibility tests: 4 passed
-  - non-blocking warning only: untouched Phase 1 [tun.rs](/Users/iwanteague/Desktop/Rustynet/crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits dead-code warnings because the TUN phase remains intentionally open
+  - non-blocking warning only: untouched Phase 1 [tun.rs](../../../crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs) scaffold still emits dead-code warnings because the TUN phase remains intentionally open
 Security invariants verified:
   - STUN round trips, relay hello/refresh round trips, relay keepalive sends, and peer ciphertext ingress accounting all use the same backend-owned authoritative socket generation rather than a daemon-owned or same-port side socket.
   - The runtime worker remains the sole owner of authoritative socket state, peer engine state, endpoint state, outstanding generic round-trip state, and handshake telemetry state.
@@ -2755,7 +2755,7 @@ Files changed:
   - documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md
     - Added this evidence entry.
 Commands run:
-  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-iterate-live-lab --inventory documents/operations/active/vm_lab_inventory.json --profile-output /Users/iwanteague/Desktop/Rustynet/profiles/live_lab/generated_vm_lab_20260404_runtime_recovery.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree --report-dir /Users/iwanteague/Desktop/Rustynet/artifacts/live_lab/20260404_runtime_recovery --validation-step fmt --validation-step check:rustynet-backend-wireguard --validation-step check:rustynetd --validation-step test-bin:rustynet-cli:live_linux_exit_handoff_test --collect-failure-diagnostics`
+  - `cargo run --quiet -p rustynet-cli -- ops vm-lab-iterate-live-lab --inventory documents/operations/active/vm_lab_inventory.json --profile-output profiles/live_lab/generated_vm_lab_20260404_runtime_recovery.env --ssh-identity-file /Users/iwanteague/.ssh/rustynet_lab_ed25519 --ssh-known-hosts-file /Users/iwanteague/.ssh/known_hosts --exit-vm debian-headless-1 --client-vm debian-headless-2 --entry-vm debian-headless-3 --aux-vm debian-headless-4 --extra-vm debian-headless-5 --require-same-network --backend linux-wireguard-userspace-shared --source-mode working-tree --report-dir artifacts/live_lab/20260404_runtime_recovery --validation-step fmt --validation-step check:rustynet-backend-wireguard --validation-step check:rustynetd --validation-step test-bin:rustynet-cli:live_linux_exit_handoff_test --collect-failure-diagnostics`
 Validation outcomes:
   - `overall_status=pass`
   - `first_failed_stage=none`
