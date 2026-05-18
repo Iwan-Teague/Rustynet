@@ -271,6 +271,62 @@ struct NatProfileView {
     extra: Map<String, Value>,
 }
 
+/// X2: typed view over the `verifier_keys` sub-block. The 4 typed
+/// slots line up 1:1 with `PUBLIC_KEY_KEYS`. Wrong-type slots
+/// (e.g. an integer in any of the base64 fields) fail at the typed
+/// deserialise instead of slipping past the silent
+/// `.and_then(Value::as_str)` walk.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct VerifierKeysView {
+    pub assignment_verifier_key_b64: Option<String>,
+    pub traversal_verifier_key_b64: Option<String>,
+    pub dns_zone_verifier_key_b64: Option<String>,
+    pub trust_evidence_verifier_key_b64: Option<String>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+impl VerifierKeysView {
+    /// Map a `PUBLIC_KEY_KEYS` entry to its typed slot. Returns
+    /// `None` when the slot was absent on the wire (parity with the
+    /// legacy `verifier_keys.get(key).and_then(Value::as_str)` walk).
+    fn slot(&self, key: &str) -> Option<&str> {
+        match key {
+            "assignment_verifier_key_b64" => self.assignment_verifier_key_b64.as_deref(),
+            "traversal_verifier_key_b64" => self.traversal_verifier_key_b64.as_deref(),
+            "dns_zone_verifier_key_b64" => self.dns_zone_verifier_key_b64.as_deref(),
+            "trust_evidence_verifier_key_b64" => self.trust_evidence_verifier_key_b64.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// X2: typed view over the `daemon_status` sub-block.
+///
+/// * `active: Option<String>` — the legacy walker used
+///   `.unwrap_or_default()`, so a wrong-type slot silently became
+///   `""` and triggered "must be one of …". Typed view rejects
+///   wrong-type at deserialise.
+/// * `socket_present: Option<bool>` — the legacy walker used a
+///   `match` against `.and_then(Value::as_bool)`, so wrong-type
+///   was silent → "must be boolean" (same as missing). Typed view
+///   distinguishes.
+/// * `socket_path: Option<Value>` — kept as `Value` because the
+///   downstream `validate_absolute_path` helper accepts the raw
+///   `Option<&Value>` to also reject non-string values cleanly.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, Default)]
+#[serde(default)]
+struct DaemonStatusView {
+    pub active: Option<String>,
+    pub socket_present: Option<bool>,
+    pub socket_path: Option<Value>,
+    #[allow(dead_code)]
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
 /// Deserialise a sub-block from `object[key]` into a typed view.
 /// Returns:
 /// * `Ok(Some(view))` when the key is present and deserialises.
@@ -493,10 +549,10 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
         Err(err) => problems.push(err),
     }
 
-    match object.get("verifier_keys").and_then(Value::as_object) {
-        Some(verifier_keys) => {
+    match deserialize_sub_block::<VerifierKeysView>(object, "verifier_keys") {
+        Ok(Some(view)) => {
             for key in PUBLIC_KEY_KEYS {
-                let Some(value) = verifier_keys.get(key).and_then(Value::as_str) else {
+                let Some(value) = view.slot(key) else {
                     problems.push(format!("verifier_keys.{key} must be a string"));
                     continue;
                 };
@@ -514,7 +570,8 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
             }
         }
-        None => problems.push("verifier_keys must be an object".to_string()),
+        Ok(None) => problems.push("verifier_keys must be an object".to_string()),
+        Err(err) => problems.push(err),
     }
 
     match object.get("rustynet_artifacts").and_then(Value::as_object) {
@@ -564,12 +621,9 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
         None => problems.push("rustynet_artifacts must be an object".to_string()),
     }
 
-    match object.get("daemon_status").and_then(Value::as_object) {
-        Some(daemon_status) => {
-            let active = daemon_status
-                .get("active")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+    match deserialize_sub_block::<DaemonStatusView>(object, "daemon_status") {
+        Ok(Some(view)) => {
+            let active = view.active.as_deref().unwrap_or_default();
             if !matches!(active, "active" | "inactive" | "socket_present" | "unknown") {
                 problems.push(
                     "daemon_status.active must be one of active/inactive/socket_present/unknown"
@@ -579,7 +633,7 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
             if config.require_daemon_active && !matches!(active, "active" | "socket_present") {
                 problems.push("daemon_status.active must indicate active runtime".to_string());
             }
-            match daemon_status.get("socket_present").and_then(Value::as_bool) {
+            match view.socket_present {
                 Some(socket_present) => {
                     if config.require_socket_present && !socket_present {
                         problems.push(
@@ -589,11 +643,12 @@ fn validate_bundle(path: &Path, payload: &Value, config: &ValidationConfig) -> V
                 }
                 None => problems.push("daemon_status.socket_present must be boolean".to_string()),
             }
-            if !validate_absolute_path(daemon_status.get("socket_path")) {
+            if !validate_absolute_path(view.socket_path.as_ref()) {
                 problems.push("daemon_status.socket_path must be absolute".to_string());
             }
         }
-        None => problems.push("daemon_status must be an object".to_string()),
+        Ok(None) => problems.push("daemon_status must be an object".to_string()),
+        Err(err) => problems.push(err),
     }
 
     match object.get("known_peers").and_then(Value::as_array) {
@@ -752,8 +807,8 @@ pub fn execute_ops_validate_network_discovery_bundle(
 #[cfg(test)]
 mod tests {
     use super::{
-        NatProfileView, NetworkDiscoveryBundleView, NodeIdentityView, WireguardView,
-        deserialize_sub_block,
+        DaemonStatusView, NatProfileView, NetworkDiscoveryBundleView, NodeIdentityView,
+        VerifierKeysView, WireguardView, deserialize_sub_block,
     };
     use serde_json::{Map, Value, json};
 
@@ -987,5 +1042,79 @@ mod tests {
             .expect("valid sub-block must succeed")
             .expect("Ok(None) only for missing");
         assert_eq!(view.behind_nat, Some(false));
+    }
+
+    /// Clean fixture: `VerifierKeysView` accepts the 4
+    /// `PUBLIC_KEY_KEYS` slots; every typed slot populates and the
+    /// `slot()` helper resolves each key correctly. The lookup
+    /// helper is the bridge between the legacy
+    /// `PUBLIC_KEY_KEYS.iter().for_each(|key| ...)` loop and the
+    /// typed fields.
+    #[test]
+    fn verifier_keys_view_accepts_clean_block_and_slot_resolves() {
+        let block = json!({
+            "assignment_verifier_key_b64": "AAA",
+            "traversal_verifier_key_b64": "BBB",
+            "dns_zone_verifier_key_b64": "CCC",
+            "trust_evidence_verifier_key_b64": "DDD",
+        });
+        let view: VerifierKeysView = serde_json::from_value(block).expect("clean parse");
+        assert_eq!(view.slot("assignment_verifier_key_b64"), Some("AAA"));
+        assert_eq!(view.slot("traversal_verifier_key_b64"), Some("BBB"));
+        assert_eq!(view.slot("dns_zone_verifier_key_b64"), Some("CCC"));
+        assert_eq!(view.slot("trust_evidence_verifier_key_b64"), Some("DDD"));
+        assert!(
+            view.slot("unknown_key").is_none(),
+            "unknown keys must return None"
+        );
+    }
+
+    /// Wrong-type slot inside `verifier_keys` rejected at deserialise.
+    /// Previously silent via `.and_then(Value::as_str) -> None`,
+    /// surfacing as "must be a string" (same as missing). Typed view
+    /// distinguishes them.
+    #[test]
+    fn verifier_keys_view_rejects_wrong_type_slot() {
+        let block = json!({ "assignment_verifier_key_b64": 42 });
+        let err = serde_json::from_value::<VerifierKeysView>(block)
+            .expect_err("integer slot must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("assignment_verifier_key_b64") || message.contains("string"),
+            "error must point to the offending field or type: {message}"
+        );
+    }
+
+    /// Clean fixture: `DaemonStatusView` populates `active` string,
+    /// `socket_present` bool, and `socket_path` as the raw Value
+    /// (so the existing `validate_absolute_path(&Option<&Value>)`
+    /// helper keeps working unchanged).
+    #[test]
+    fn daemon_status_view_accepts_clean_block() {
+        let block = json!({
+            "active": "active",
+            "socket_present": true,
+            "socket_path": "/var/run/rustynetd.sock",
+        });
+        let view: DaemonStatusView = serde_json::from_value(block).expect("clean parse");
+        assert_eq!(view.active.as_deref(), Some("active"));
+        assert_eq!(view.socket_present, Some(true));
+        assert!(matches!(view.socket_path, Some(Value::String(_))));
+    }
+
+    /// Wrong-type `socket_present` slot rejected. Previously silent
+    /// via `.and_then(Value::as_bool) -> None`, surfacing as
+    /// "must be boolean" (same as missing). Typed view distinguishes
+    /// the shape error.
+    #[test]
+    fn daemon_status_view_rejects_wrong_type_socket_present() {
+        let block = json!({ "socket_present": "true" });
+        let err = serde_json::from_value::<DaemonStatusView>(block)
+            .expect_err("string socket_present must be rejected at deserialize");
+        let message = err.to_string();
+        assert!(
+            message.contains("socket_present") || message.contains("bool"),
+            "error must point to the offending field or type: {message}"
+        );
     }
 }
