@@ -1537,14 +1537,14 @@ impl EndpointMonitor {
             }
         }
 
-        // Detect removed interfaces.
-        let removed: Vec<String> = self
+        // Detect removed interfaces. Only the first removal is acted on
+        // per reconcile pass; subsequent removals roll up next tick.
+        let removed = self
             .last_seen_addrs
             .keys()
-            .filter(|k| !current_filtered.contains_key(*k))
-            .cloned()
-            .collect();
-        if let Some(iface) = removed.into_iter().next() {
+            .find(|k| !current_filtered.contains_key(*k))
+            .cloned();
+        if let Some(iface) = removed {
             let old_addrs = self.last_seen_addrs.remove(&iface).unwrap_or_default();
             let event = EndpointChangeEvent {
                 interface: iface,

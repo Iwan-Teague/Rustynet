@@ -49,25 +49,21 @@ impl OrchestrationStage for DistributeMembershipStage {
             .map(|a| a.alias.clone())
             .collect();
 
-        let results: Vec<(String, Result<(), String>)> = non_exit
+        let errors: Vec<String> = non_exit
             .iter()
-            .map(|alias| {
-                let r = match ctx.adapters.get(alias.as_str()) {
+            .filter_map(|alias| {
+                match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter
                         .distribute_signed_bundle(BundleKind::Membership, &tmp_path)
                         .map_err(|e| e.to_string()),
                     None => Err(format!("no adapter for '{alias}'")),
-                };
-                (alias.clone(), r)
+                }
+                .err()
+                .map(|e| format!("{alias}: {e}"))
             })
             .collect();
 
         let _ = std::fs::remove_file(&tmp_path);
-
-        let errors: Vec<String> = results
-            .into_iter()
-            .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
-            .collect();
         if errors.is_empty() {
             StageOutcome::Passed
         } else {
