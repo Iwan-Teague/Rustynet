@@ -134,7 +134,10 @@ SHARED_FLOORS=(
   # assert_eq / assert_ne / debug_assert{,_eq,_ne}. Panic-shape macros
   # accept a format string and print to stderr + the panic backtrace,
   # same `{token:?}` leak shape as eprintln! but a distinct macro family.
-  "secret_log_audit:62"
+  # Floor bumped 62→65 on adding rc4 / md4 / md2 to
+  # FORBIDDEN_DEPRECATED_CRYPTO_CRATES (3 new self-tests; deny.toml
+  # gains parallel rc4 / md4 / md2 bans for Cargo.toml-side coverage).
+  "secret_log_audit:65"
 )
 
 # macOS coverage floors. macOS is a control-plane platform today, not

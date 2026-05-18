@@ -1331,8 +1331,17 @@ fn reviewed_exception_list_entries_have_justifications() {
 /// * `deny.toml` `[[bans.deny]]` entries (G2b leg)
 /// * `scripts/ci/security_regression_gates.sh` G2a Cargo.lock
 ///   substring pattern + G2c source-scan grep pattern
-const FORBIDDEN_DEPRECATED_CRYPTO_CRATES: &[&str] =
-    &["sha1", "md5", "md_5", "des", "des3", "triple_des"];
+const FORBIDDEN_DEPRECATED_CRYPTO_CRATES: &[&str] = &[
+    "sha1",
+    "md5",
+    "md_5",
+    "md4",
+    "md2",
+    "rc4",
+    "des",
+    "des3",
+    "triple_des",
+];
 
 pub(crate) fn scan_source_for_deprecated_crypto_imports(body: &str) -> Vec<(usize, String)> {
     let mut hits: Vec<(usize, String)> = Vec::new();
@@ -1485,6 +1494,45 @@ fn deprecated_crypto_import_scanner_flags_use_followed_by_only_semicolon() {
     assert!(
         hits.iter().any(|(_, c)| c == "des"),
         "bare `use des;` must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_md4() {
+    // MD4 has practical collisions (Wang 2005). Banned for parity
+    // with the deny.toml `md4` entry. The X3 scanner closes the
+    // import-statement side of the gate; deny.toml closes the
+    // Cargo.toml side.
+    let body = "use md4::Md4;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "md4"),
+        "`use md4::Md4` must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_md2() {
+    // MD2 has practical preimage attacks and is RFC 6149
+    // historic. Banned for parity with the deny.toml `md2` entry.
+    let body = "use md2::Md2;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "md2"),
+        "`use md2::Md2` must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn deprecated_crypto_import_scanner_flags_use_rc4() {
+    // RC4 has practical bias and recovery attacks (RC4 NOMORE,
+    // Bar-Mitzvah). RFC 7465 prohibits RC4 in TLS. Banned for
+    // parity with the deny.toml `rc4` entry.
+    let body = "use rc4::Rc4;";
+    let hits = scan_source_for_deprecated_crypto_imports(body);
+    assert!(
+        hits.iter().any(|(_, c)| c == "rc4"),
+        "`use rc4::Rc4` must surface: {hits:?}"
     );
 }
 
