@@ -66,16 +66,26 @@ impl StunClient {
 
     /// Gather public mapped endpoints from STUN servers.
     ///
-    /// This method returns full `SocketAddr` (IP + port) as observed by each STUN server.
-    /// Unlike `gather_public_ips`, this method returns the actual mapped port, not a guess.
+    /// Returns the full `SocketAddr` (IP + port) as observed by each STUN
+    /// server. The mapped port is the actual NAT-translated port — not a guess
+    /// or an attached `wg_listen_port` — so the returned candidates are safe
+    /// to publish as srflx peer endpoints. This is the foundation of the
+    /// dataplane traversal path; see
+    /// `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md`
+    /// §D2 for the contract this method satisfies.
     ///
     /// # Arguments
-    /// * `socket` - Optional socket to use for queries. If provided, the mapped endpoint
-    ///   reflects the NAT mapping for that specific socket. If `None`, creates
-    ///   ephemeral sockets per query (legacy behavior, not recommended).
+    /// * `socket` - Optional socket to use for queries. If provided, the
+    ///   mapped endpoint reflects the NAT mapping for that specific socket
+    ///   (i.e. the same UDP socket later used for peer traffic — the
+    ///   correct behaviour in production). If `None`, creates a fresh
+    ///   ephemeral socket per query — useful only for unit-test diversity
+    ///   probes.
     ///
     /// # Returns
-    /// A vector of `StunResult` containing the full mapped endpoint information.
+    /// A vector of `StunResult` containing the full mapped endpoint
+    /// information for each STUN server that responded. Deduplicated by
+    /// mapped endpoint.
     pub fn gather_mapped_endpoints(&self, socket: Option<&UdpSocket>) -> Vec<StunResult> {
         let mut results = Vec::new();
         for server in &self.servers {
@@ -135,22 +145,6 @@ impl StunClient {
         results
     }
 
-    /// Legacy method that returns only IPs.
-    ///
-    /// **DEPRECATED**: Use `gather_mapped_endpoints` instead. This method guesses the port
-    /// by using the local listen port, which is incorrect for NATs that don't preserve ports.
-    pub fn gather_public_ips(&self) -> Vec<IpAddr> {
-        let mut ips = Vec::new();
-        for server in &self.servers {
-            if let Ok(addr) = self.query_stun_server(server)
-                && !ips.contains(&addr.ip())
-            {
-                ips.push(addr.ip());
-            }
-        }
-        ips
-    }
-
     /// Query a STUN server and return full result with metadata.
     fn query_stun_server_full(
         &self,
@@ -196,28 +190,6 @@ impl StunClient {
             server: target,
             local_addr,
         })
-    }
-
-    fn query_stun_server(&self, server: &str) -> Result<SocketAddr, String> {
-        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-        socket
-            .set_read_timeout(Some(self.timeout))
-            .map_err(|e| e.to_string())?;
-
-        let server_addrs = server.to_socket_addrs().map_err(|e| e.to_string())?;
-        let target = server_addrs.into_iter().next().ok_or("no server address")?;
-
-        let tx_id = self.generate_tx_id();
-        let request = self.build_binding_request(&tx_id);
-
-        socket
-            .send_to(&request, target)
-            .map_err(|e| e.to_string())?;
-
-        let mut buf = [0u8; 1024];
-        let (len, _src) = socket.recv_from(&mut buf).map_err(|e| e.to_string())?;
-
-        self.parse_binding_response(&buf[..len], &tx_id)
     }
 
     fn generate_tx_id(&self) -> [u8; 12] {
@@ -987,5 +959,108 @@ mod tests {
             .parse_binding_response(&response, &tx_id)
             .expect_err("partial attribute header must not produce a mapping");
         assert!(err.contains("no mapped address"), "got: {err}");
+    }
+
+    // ---- D2: STUN srflx port discovery contract ----
+    //
+    // Per `RustynetDataplaneExecutionPlan_2026-05-18.md` §D2: the srflx
+    // candidate port the STUN client surfaces must equal the bound transport
+    // socket's actual external port — never a guess, never an attached
+    // `wg_listen_port`. The structural test
+    // `test_gather_mapped_endpoints_with_round_trip_uses_authoritative_local_addr`
+    // pins this via a mock round-trip. The two tests below pin the same
+    // contract end-to-end against real `UdpSocket` instances on loopback
+    // (one IPv4, one IPv6), with an in-process STUN echo server that mirrors
+    // the source endpoint back as XOR-MAPPED-ADDRESS. Over loopback, no NAT
+    // applies, so the mapped endpoint and the bound socket's local address
+    // must be identical — that's the "discovered port == bound port"
+    // invariant.
+
+    fn spawn_local_stun_echo(bind_addr: SocketAddr) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let server_socket = UdpSocket::bind(bind_addr).expect("bind echo server");
+        server_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set echo server read timeout");
+        let server_addr = server_socket.local_addr().expect("echo server local_addr");
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let Ok((len, src)) = server_socket.recv_from(&mut buf) else {
+                return;
+            };
+            if len < 20 {
+                return;
+            }
+            let tx_id: [u8; 12] = buf[8..20].try_into().expect("tx_id slice");
+            let response = build_xor_mapped_binding_response(&tx_id, src);
+            let _ = server_socket.send_to(&response, src);
+        });
+        (server_addr, handle)
+    }
+
+    #[test]
+    fn d2_stun_v4_discovered_port_equals_bound_socket_port() {
+        let (server_addr, server_handle) =
+            spawn_local_stun_echo("127.0.0.1:0".parse().expect("v4 bind addr parses"));
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").expect("v4 client bind");
+        let bound_local = client_socket.local_addr().expect("v4 client local_addr");
+
+        let client = StunClient::new(vec![server_addr.to_string()], Duration::from_secs(5));
+        let result = client
+            .query_stun_server_with_socket(server_addr, &client_socket)
+            .expect("v4 stun query succeeds against in-process echo");
+
+        // Contract: the discovered mapped endpoint over loopback (no NAT
+        // remap) must be byte-identical to the bound socket's local address.
+        // If this assertion ever fails, the STUN client has reintroduced
+        // the "attach wg_listen_port to discovered IP" bug from
+        // `PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md` §8.1.
+        assert_eq!(
+            result.mapped_endpoint, bound_local,
+            "discovered srflx endpoint must equal bound socket's local_addr (v4)"
+        );
+        assert_eq!(
+            result.mapped_endpoint.port(),
+            bound_local.port(),
+            "discovered port must equal bound port (v4)"
+        );
+        assert_eq!(
+            result.local_addr, bound_local,
+            "StunResult.local_addr must equal the socket's actual local_addr (v4)"
+        );
+        assert_eq!(result.server, server_addr);
+
+        server_handle.join().expect("echo server thread joins");
+    }
+
+    #[test]
+    fn d2_stun_v6_discovered_port_equals_bound_socket_port() {
+        let (server_addr, server_handle) =
+            spawn_local_stun_echo("[::1]:0".parse().expect("v6 bind addr parses"));
+
+        let client_socket = UdpSocket::bind("[::1]:0").expect("v6 client bind");
+        let bound_local = client_socket.local_addr().expect("v6 client local_addr");
+
+        let client = StunClient::new(vec![server_addr.to_string()], Duration::from_secs(5));
+        let result = client
+            .query_stun_server_with_socket(server_addr, &client_socket)
+            .expect("v6 stun query succeeds against in-process echo");
+
+        assert_eq!(
+            result.mapped_endpoint, bound_local,
+            "discovered srflx endpoint must equal bound socket's local_addr (v6)"
+        );
+        assert_eq!(
+            result.mapped_endpoint.port(),
+            bound_local.port(),
+            "discovered port must equal bound port (v6)"
+        );
+        assert_eq!(
+            result.local_addr, bound_local,
+            "StunResult.local_addr must equal the socket's actual local_addr (v6)"
+        );
+        assert_eq!(result.server, server_addr);
+
+        server_handle.join().expect("echo server thread joins");
     }
 }
