@@ -29,7 +29,7 @@ pub fn issue_membership_owner_key(
         return Err(AdapterError::Protocol {
             message: "membership owner public key not found on remote; \
                       has membership been initialized?"
-                .to_string(),
+                .to_owned(),
         });
     }
     Ok(MembershipOwnerKey {
@@ -166,30 +166,30 @@ pub fn distribute_verifier_key(
 
 fn linux_verifier_key_path(kind: &BundleKind) -> String {
     match kind {
-        BundleKind::Assignment => "/etc/rustynet/assignment.pub".to_string(),
-        BundleKind::Traversal => "/etc/rustynet/traversal.pub".to_string(),
-        BundleKind::DnsZone => "/etc/rustynet/dns-zone.pub".to_string(),
-        BundleKind::Membership => "/etc/rustynet/membership.pub".to_string(),
+        BundleKind::Assignment => "/etc/rustynet/assignment.pub".to_owned(),
+        BundleKind::Traversal => "/etc/rustynet/traversal.pub".to_owned(),
+        BundleKind::DnsZone => "/etc/rustynet/dns-zone.pub".to_owned(),
+        BundleKind::Membership => "/etc/rustynet/membership.pub".to_owned(),
     }
 }
 
 fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     match kind {
         BundleKind::Membership => (
-            "/tmp/rn-membership.snapshot".to_string(),
-            "/var/lib/rustynet/membership.snapshot".to_string(),
+            "/tmp/rn-membership.snapshot".to_owned(),
+            "/var/lib/rustynet/membership.snapshot".to_owned(),
         ),
         BundleKind::Assignment => (
-            "/tmp/rn-assignment.bundle".to_string(),
-            "/var/lib/rustynet/rustynetd.assignment".to_string(),
+            "/tmp/rn-assignment.bundle".to_owned(),
+            "/var/lib/rustynet/rustynetd.assignment".to_owned(),
         ),
         BundleKind::Traversal => (
-            "/tmp/rn-traversal.bundle".to_string(),
-            "/var/lib/rustynet/rustynetd.traversal".to_string(),
+            "/tmp/rn-traversal.bundle".to_owned(),
+            "/var/lib/rustynet/rustynetd.traversal".to_owned(),
         ),
         BundleKind::DnsZone => (
-            "/tmp/rn-dns-zone.bundle".to_string(),
-            "/var/lib/rustynet/rustynetd.dns-zone".to_string(),
+            "/tmp/rn-dns-zone.bundle".to_owned(),
+            "/var/lib/rustynet/rustynetd.dns-zone".to_owned(),
         ),
     }
 }
@@ -200,7 +200,7 @@ fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        Ok(value.to_string())
+        Ok(value.to_owned())
     } else {
         Err(AdapterError::Protocol {
             message: format!(
@@ -213,10 +213,10 @@ fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
 
 fn hex_32_safe_arg(value: &str) -> Result<String, AdapterError> {
     if NodeMembershipPeer::is_valid_public_key_hex(value) {
-        Ok(value.to_string())
+        Ok(value.to_owned())
     } else {
         Err(AdapterError::Protocol {
-            message: "WireGuard public key must be 64 hex chars".to_string(),
+            message: "WireGuard public key must be 64 hex chars".to_owned(),
         })
     }
 }
@@ -260,7 +260,7 @@ fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
         })
         .map_err(|err| format!("base64 -d spawn failed: {err}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(format!("base64 -d failed: {stderr}"));
     }
     Ok(output.stdout)

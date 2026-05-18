@@ -371,7 +371,7 @@ mod tests {
     fn crypto_calendar_enforces_deny_after_removal() {
         let calendar = CryptoDeprecationCalendar {
             records: vec![CryptoDeprecationRecord {
-                algorithm: "sha1".to_string(),
+                algorithm: "sha1".to_owned(),
                 deprecates_at_unix: 100,
                 removal_at_unix: 200,
             }],
@@ -389,15 +389,15 @@ mod tests {
             calendar.lifecycle_for("sha1", 250),
             AlgorithmLifecycle::Denied
         );
-        assert_eq!(calendar.denied_algorithms(250), vec!["sha1".to_string()]);
+        assert_eq!(calendar.denied_algorithms(250), vec!["sha1".to_owned()]);
     }
 
     #[test]
     fn insecure_compatibility_exception_requires_explicit_active_risk_acceptance() {
         let exception = InsecureCompatibilityException {
-            mode: "legacy-handshake".to_string(),
-            risk_acceptance_id: "SEC-EX-014".to_string(),
-            approved_by: "security-owner".to_string(),
+            mode: "legacy-handshake".to_owned(),
+            risk_acceptance_id: "SEC-EX-014".to_owned(),
+            approved_by: "security-owner".to_owned(),
             created_at_unix: 100,
             expires_at_unix: 120,
             enabled: true,
@@ -406,7 +406,7 @@ mod tests {
         assert!(!exception.is_active(121));
 
         let invalid = InsecureCompatibilityException {
-            mode: "legacy-handshake".to_string(),
+            mode: "legacy-handshake".to_owned(),
             risk_acceptance_id: String::new(),
             approved_by: String::new(),
             created_at_unix: 100,

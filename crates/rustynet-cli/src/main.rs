@@ -1185,11 +1185,11 @@ fn render_key_value_line_as_json(line: &str) -> Result<String, String> {
     let trimmed = line.trim();
     let (prefix, body) = trimmed
         .split_once(':')
-        .ok_or_else(|| "missing `:` prefix separator".to_string())?;
+        .ok_or_else(|| "missing `:` prefix separator".to_owned())?;
     let mut object = serde_json::Map::new();
     object.insert(
-        "prefix".to_string(),
-        serde_json::Value::String(prefix.trim().to_string()),
+        "prefix".to_owned(),
+        serde_json::Value::String(prefix.trim().to_owned()),
     );
     for token in body.split_whitespace() {
         let (key, value) = token
@@ -1198,10 +1198,7 @@ fn render_key_value_line_as_json(line: &str) -> Result<String, String> {
         if key.is_empty() {
             return Err(format!("empty key in token: {token:?}"));
         }
-        object.insert(
-            key.to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
+        object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
     }
     serde_json::to_string(&serde_json::Value::Object(object))
         .map_err(|err| format!("serialise json failed: {err}"))
@@ -1440,7 +1437,7 @@ fn parse_command(args: &[String]) -> CliCommand {
 
 fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
     if args.is_empty() {
-        return Err("ops subcommand is required".to_string());
+        return Err("ops subcommand is required".to_owned());
     }
     let subcommand = args[0].as_str();
     let parser = match OptionParser::parse(&args[1..]) {
@@ -1456,7 +1453,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
     match subcommand {
         "verify-runtime-binary-custody" => {
             if args.len() != 1 {
-                return Err("ops verify-runtime-binary-custody does not accept options".to_string());
+                return Err("ops verify-runtime-binary-custody does not accept options".to_owned());
             }
             Ok(OpsCommand::VerifyRuntimeBinaryCustody)
         }
@@ -1470,51 +1467,51 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         }
         "refresh-trust" => {
             if args.len() != 1 {
-                return Err("ops refresh-trust does not accept options".to_string());
+                return Err("ops refresh-trust does not accept options".to_owned());
             }
             Ok(OpsCommand::RefreshTrust)
         }
         "refresh-signed-trust" => {
             if args.len() != 1 {
-                return Err("ops refresh-signed-trust does not accept options".to_string());
+                return Err("ops refresh-signed-trust does not accept options".to_owned());
             }
             Ok(OpsCommand::RefreshSignedTrust)
         }
         "bootstrap-wireguard-custody" => {
             if args.len() != 1 {
-                return Err("ops bootstrap-wireguard-custody does not accept options".to_string());
+                return Err("ops bootstrap-wireguard-custody does not accept options".to_owned());
             }
             Ok(OpsCommand::BootstrapTunnelCustody)
         }
         "refresh-assignment" => {
             if args.len() != 1 {
-                return Err("ops refresh-assignment does not accept options".to_string());
+                return Err("ops refresh-assignment does not accept options".to_owned());
             }
             Ok(OpsCommand::RefreshAssignment)
         }
         "state-refresh-if-socket-present" => {
             if args.len() != 1 {
                 return Err(
-                    "ops state-refresh-if-socket-present does not accept options".to_string(),
+                    "ops state-refresh-if-socket-present does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::StateRefreshIfSocketPresent)
         }
         "collect-phase1-measured-input" => {
             if args.len() != 1 {
-                return Err("ops collect-phase1-measured-input does not accept options".to_string());
+                return Err("ops collect-phase1-measured-input does not accept options".to_owned());
             }
             Ok(OpsCommand::CollectPhase1MeasuredInput)
         }
         "run-phase1-baseline" => {
             if args.len() != 1 {
-                return Err("ops run-phase1-baseline does not accept options".to_string());
+                return Err("ops run-phase1-baseline does not accept options".to_owned());
             }
             Ok(OpsCommand::RunPhase1Baseline)
         }
         "prepare-advisory-db" => {
             if args.len() != 2 {
-                return Err("usage: ops prepare-advisory-db <advisory_db_path>".to_string());
+                return Err("usage: ops prepare-advisory-db <advisory_db_path>".to_owned());
             }
             Ok(OpsCommand::PrepareAdvisoryDb {
                 config: ops_ci_release_perf::PrepareAdvisoryDbConfig {
@@ -1524,32 +1521,32 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         }
         "run-phase1-ci-gates" => {
             if args.len() != 1 {
-                return Err("ops run-phase1-ci-gates does not accept options".to_string());
+                return Err("ops run-phase1-ci-gates does not accept options".to_owned());
             }
             Ok(OpsCommand::RunPhase1CiGates)
         }
         "run-phase9-ci-gates" => {
             if args.len() != 1 {
-                return Err("ops run-phase9-ci-gates does not accept options".to_string());
+                return Err("ops run-phase9-ci-gates does not accept options".to_owned());
             }
             Ok(OpsCommand::RunPhase9CiGates)
         }
         "run-phase10-ci-gates" => {
             if args.len() != 1 {
-                return Err("ops run-phase10-ci-gates does not accept options".to_string());
+                return Err("ops run-phase10-ci-gates does not accept options".to_owned());
             }
             Ok(OpsCommand::RunPhase10CiGates)
         }
         "run-membership-ci-gates" => {
             if args.len() != 1 {
-                return Err("ops run-membership-ci-gates does not accept options".to_string());
+                return Err("ops run-membership-ci-gates does not accept options".to_owned());
             }
             Ok(OpsCommand::RunMembershipCiGates)
         }
         "write-membership-phase10-report" => {
             if args.len() != 1 {
                 return Err(
-                    "ops write-membership-phase10-report does not accept options".to_string(),
+                    "ops write-membership-phase10-report does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::WriteMembershipPhase10Report)
@@ -1562,34 +1559,34 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "run-supply-chain-integrity-gates" => {
             if args.len() != 1 {
                 return Err(
-                    "ops run-supply-chain-integrity-gates does not accept options".to_string(),
+                    "ops run-supply-chain-integrity-gates does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::RunSupplyChainIntegrityGates)
         }
         "run-security-regression-gates" => {
             if args.len() != 1 {
-                return Err("ops run-security-regression-gates does not accept options".to_string());
+                return Err("ops run-security-regression-gates does not accept options".to_owned());
             }
             Ok(OpsCommand::RunSecurityRegressionGates)
         }
         "run-active-network-security-gates" => {
             if args.len() != 1 {
                 return Err(
-                    "ops run-active-network-security-gates does not accept options".to_string(),
+                    "ops run-active-network-security-gates does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::RunActiveNetworkSecurityGates)
         }
         "run-phase10-hp2-gates" => {
             if args.len() != 1 {
-                return Err("ops run-phase10-hp2-gates does not accept options".to_string());
+                return Err("ops run-phase10-hp2-gates does not accept options".to_owned());
             }
             Ok(OpsCommand::RunPhase10Hp2Gates)
         }
         "generate-release-sbom" => {
             if args.len() != 1 {
-                return Err("ops generate-release-sbom does not accept options".to_string());
+                return Err("ops generate-release-sbom does not accept options".to_owned());
             }
             Ok(OpsCommand::GenerateReleaseSbom)
         }
@@ -1597,7 +1594,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             if args.len() != 4 {
                 return Err(
                     "usage: ops create-release-provenance <artifact-path> <track> <output-json>"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             Ok(OpsCommand::CreateReleaseProvenance {
@@ -1610,13 +1607,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         }
         "run-phase3-baseline" => {
             if args.len() != 1 {
-                return Err("ops run-phase3-baseline does not accept options".to_string());
+                return Err("ops run-phase3-baseline does not accept options".to_owned());
             }
             Ok(OpsCommand::RunPhase3Baseline)
         }
         "run-fuzz-smoke" => {
             if args.len() != 1 {
-                return Err("ops run-fuzz-smoke does not accept options".to_string());
+                return Err("ops run-fuzz-smoke does not accept options".to_owned());
             }
             Ok(OpsCommand::RunFuzzSmoke)
         }
@@ -1638,7 +1635,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 topology: parser.value("--topology"),
                 authorization: parser
                     .value("--authorization")
-                    .unwrap_or_else(|| "[yes/no]".to_string()),
+                    .unwrap_or_else(|| "[yes/no]".to_owned()),
             },
         }),
         "validate-live-lab-reports" => Ok(OpsCommand::ValidateLiveLabReports {
@@ -1674,7 +1671,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 report_dir: parser.optional_path("--report-dir"),
                 targets: parser
                     .value("--targets")
-                    .unwrap_or_else(|| "all".to_string()),
+                    .unwrap_or_else(|| "all".to_owned()),
                 output: parser.required_path("--output")?,
             },
         }),
@@ -1703,14 +1700,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .map_or_else(|| PathBuf::from("."), PathBuf::from),
                     output: parser.required_path("--output")?,
                     format: parser.value("--format").unwrap_or_else(|| {
-                        ops_security_audit_workflows::default_comparative_format().to_string()
+                        ops_security_audit_workflows::default_comparative_format().to_owned()
                     }),
                     projects: parser
                         .value("--projects")
-                        .unwrap_or_else(|| "all".to_string()),
+                        .unwrap_or_else(|| "all".to_owned()),
                     attack_families: parser
                         .value("--attack-families")
-                        .unwrap_or_else(|| "all".to_string()),
+                        .unwrap_or_else(|| "all".to_owned()),
                     run_local_tests: parser.has_flag("--run-local-tests"),
                     max_output_chars: parser
                         .value("--max-output-chars")
@@ -1732,7 +1729,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 ssh_known_hosts_file: parser.optional_path("--ssh-known-hosts-file"),
                 validations: parser
                     .value("--validations")
-                    .unwrap_or_else(|| "all".to_string()),
+                    .unwrap_or_else(|| "all".to_owned()),
                 report_dir: parser.optional_path("--report-dir"),
                 findings_output: parser.optional_path("--findings-output"),
                 schema_output: parser.optional_path("--schema-output"),
@@ -1794,43 +1791,43 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         }),
         "collect-phase9-raw-evidence" => {
             if args.len() != 1 {
-                return Err("ops collect-phase9-raw-evidence does not accept options".to_string());
+                return Err("ops collect-phase9-raw-evidence does not accept options".to_owned());
             }
             Ok(OpsCommand::CollectPhase9RawEvidence)
         }
         "generate-phase9-artifacts" => {
             if args.len() != 1 {
-                return Err("ops generate-phase9-artifacts does not accept options".to_string());
+                return Err("ops generate-phase9-artifacts does not accept options".to_owned());
             }
             Ok(OpsCommand::GeneratePhase9Artifacts)
         }
         "verify-phase9-readiness" => {
             if args.len() != 1 {
-                return Err("ops verify-phase9-readiness does not accept options".to_string());
+                return Err("ops verify-phase9-readiness does not accept options".to_owned());
             }
             Ok(OpsCommand::VerifyPhase9Readiness)
         }
         "verify-phase9-evidence" => {
             if args.len() != 1 {
-                return Err("ops verify-phase9-evidence does not accept options".to_string());
+                return Err("ops verify-phase9-evidence does not accept options".to_owned());
             }
             Ok(OpsCommand::VerifyPhase9Evidence)
         }
         "generate-phase10-artifacts" => {
             if args.len() != 1 {
-                return Err("ops generate-phase10-artifacts does not accept options".to_string());
+                return Err("ops generate-phase10-artifacts does not accept options".to_owned());
             }
             Ok(OpsCommand::GeneratePhase10Artifacts)
         }
         "verify-phase10-readiness" => {
             if args.len() != 1 {
-                return Err("ops verify-phase10-readiness does not accept options".to_string());
+                return Err("ops verify-phase10-readiness does not accept options".to_owned());
             }
             Ok(OpsCommand::VerifyPhase10Readiness)
         }
         "verify-phase10-provenance" => {
             if args.len() != 1 {
-                return Err("ops verify-phase10-provenance does not accept options".to_string());
+                return Err("ops verify-phase10-provenance does not accept options".to_owned());
             }
             Ok(OpsCommand::VerifyPhase10Provenance)
         }
@@ -1845,14 +1842,14 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "verify-phase6-platform-readiness" => {
             if args.len() != 1 {
                 return Err(
-                    "ops verify-phase6-platform-readiness does not accept options".to_string(),
+                    "ops verify-phase6-platform-readiness does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::VerifyPhase6PlatformReadiness)
         }
         "verify-phase6-parity-evidence" => {
             if args.len() != 1 {
-                return Err("ops verify-phase6-parity-evidence does not accept options".to_string());
+                return Err("ops verify-phase6-parity-evidence does not accept options".to_owned());
             }
             Ok(OpsCommand::VerifyPhase6ParityEvidence)
         }
@@ -1882,10 +1879,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     failure_summary: parser.value("--failure-summary").unwrap_or_default(),
                     environment: parser
                         .value("--environment")
-                        .unwrap_or_else(|| "live_linux_skeleton".to_string()),
+                        .unwrap_or_else(|| "live_linux_skeleton".to_owned()),
                     implementation_state: parser
                         .value("--implementation-state")
-                        .unwrap_or_else(|| "not_implemented".to_string()),
+                        .unwrap_or_else(|| "not_implemented".to_owned()),
                     source_artifacts,
                     log_artifacts,
                     client_host: parser.value("--client-host"),
@@ -1897,10 +1894,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     relay_network_id: parser.value("--relay-network-id"),
                     nat_profile: parser
                         .value("--nat-profile")
-                        .unwrap_or_else(|| "baseline_lan".to_string()),
+                        .unwrap_or_else(|| "baseline_lan".to_owned()),
                     impairment_profile: parser
                         .value("--impairment-profile")
-                        .unwrap_or_else(|| "none".to_string()),
+                        .unwrap_or_else(|| "none".to_owned()),
                     check_overrides,
                     path_status_line: parser.value("--path-status-line"),
                     path_evidence_report: parser.optional_path("--path-evidence-report"),
@@ -1939,7 +1936,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 .collect::<Vec<_>>();
             let required_nat_profiles = parser
                 .value("--required-nat-profiles")
-                .map_or_else(|| split_csv("baseline_lan".to_string()), split_csv);
+                .map_or_else(|| split_csv("baseline_lan".to_owned()), split_csv);
             Ok(OpsCommand::ValidateCrossNetworkNatMatrix {
                 config: ops_cross_network_reports::ValidateCrossNetworkNatMatrixConfig {
                     reports,
@@ -1966,7 +1963,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     network_fields,
                     default_value: parser
                         .value("--default-value")
-                        .unwrap_or_else(|| "fail".to_string()),
+                        .unwrap_or_else(|| "fail".to_owned()),
                 },
             })
         }
@@ -2082,14 +2079,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             config: ops_live_lab_orchestrator::CheckLocalFileModeConfig {
                 path: parser.required_path("--path")?,
                 policy: parser.required("--policy")?,
-                label: parser
-                    .value("--label")
-                    .unwrap_or_else(|| "file".to_string()),
+                label: parser.value("--label").unwrap_or_else(|| "file".to_owned()),
             },
         }),
         "redact-forensics-text" => {
             if args.len() != 1 {
-                return Err("ops redact-forensics-text does not accept options".to_string());
+                return Err("ops redact-forensics-text does not accept options".to_owned());
             }
             Ok(OpsCommand::RedactForensicsText)
         }
@@ -2236,7 +2231,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     timeout_ms: parse_u64_or_default("--timeout-ms", 80)?,
                     output_key: parser
                         .value("--output-key")
-                        .unwrap_or_else(|| "hosts=".to_string()),
+                        .unwrap_or_else(|| "hosts=".to_owned()),
                 },
             })
         }
@@ -2383,7 +2378,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     dns_down_status: parser.required("--dns-down-status")?,
                     environment: parser
                         .value("--environment")
-                        .unwrap_or_else(|| "lab-netns".to_string()),
+                        .unwrap_or_else(|| "lab-netns".to_owned()),
                     captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
                     captured_at_unix,
                 },
@@ -2409,7 +2404,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     tunnel_down_block_status: parser.required("--tunnel-down-block-status")?,
                     environment: parser
                         .value("--environment")
-                        .unwrap_or_else(|| "lab-netns".to_string()),
+                        .unwrap_or_else(|| "lab-netns".to_owned()),
                     captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
                     captured_at_unix,
                 },
@@ -2441,7 +2436,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .map_err(|err| format!("invalid value for --port: {err}"))?,
                 response_body: parser
                     .value("--response-body")
-                    .unwrap_or_else(|| "probe-ok".to_string()),
+                    .unwrap_or_else(|| "probe-ok".to_owned()),
             },
         }),
         "e2e-http-probe-client" => Ok(OpsCommand::E2eHttpProbeClient {
@@ -2454,7 +2449,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 timeout_ms: parser.parse_u64_or_default("--timeout-ms", 2000)?,
                 expect_marker: parser
                     .value("--expect-marker")
-                    .unwrap_or_else(|| "probe-ok".to_string()),
+                    .unwrap_or_else(|| "probe-ok".to_owned()),
             },
         }),
         "read-json-field" => Ok(OpsCommand::ReadJsonField {
@@ -2594,7 +2589,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .path_or_default("--known-hosts-file", vm_lab::default_known_hosts_path()),
                 ),
                 ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
-                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 5)?,
                 update_inventory_live_ips: parser.has_flag("--update-inventory-live-ips"),
                 report_dir: parser.optional_path("--report-dir"),
@@ -2614,7 +2609,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .path_or_default("--known-hosts-file", vm_lab::default_known_hosts_path()),
                 ),
                 ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
-                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 5)?,
                 update_inventory_live_ips: parser.has_flag("--update-inventory-live-ips"),
                 report_dir: parser.optional_path("--report-dir"),
@@ -2658,10 +2653,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     dest_dir: parser.required("--dest-dir")?,
                     branch: parser
                         .value("--branch")
-                        .unwrap_or_else(|| "main".to_string()),
+                        .unwrap_or_else(|| "main".to_owned()),
                     remote: parser
                         .value("--remote")
-                        .unwrap_or_else(|| "origin".to_string()),
+                        .unwrap_or_else(|| "origin".to_owned()),
                     ssh_user: parser.value("--ssh-user"),
                     ssh_identity_file: parser.optional_path("--ssh-identity-file"),
                     known_hosts_path: parser.optional_path("--known-hosts-file"),
@@ -2696,10 +2691,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     dest_dir,
                     branch: parser
                         .value("--branch")
-                        .unwrap_or_else(|| "main".to_string()),
+                        .unwrap_or_else(|| "main".to_owned()),
                     remote: parser
                         .value("--remote")
-                        .unwrap_or_else(|| "origin".to_string()),
+                        .unwrap_or_else(|| "origin".to_owned()),
                     program: parser.required("--program")?,
                     argv,
                     ssh_user: parser.value("--ssh-user"),
@@ -2849,7 +2844,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 utm_documents_root: parser.optional_path("--utm-documents-root"),
                 utmctl_path: parser.optional_path("--utmctl-path"),
                 ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
-                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
                 discovery_timeout_secs: parser
                     .parse_u64_or_default("--discovery-timeout-secs", 5)?,
                 ready_timeout_secs: parser
@@ -2883,11 +2878,11 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .path_or_default("--inventory", vm_lab::default_inventory_path()),
                 windows_vm: parser
                     .value("--windows-vm")
-                    .ok_or_else(|| "--windows-vm <alias> is required".to_string())?,
+                    .ok_or_else(|| "--windows-vm <alias> is required".to_owned())?,
                 ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
-                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
                 utm_documents_root: parser.optional_path("--utm-documents-root"),
                 utmctl_path: parser.optional_path("--utmctl-path"),
                 report_dir: parser.required_path("--report-dir")?,
@@ -2911,7 +2906,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .path_or_default("--inventory", vm_lab::default_inventory_path()),
                 linux_vm: parser
                     .value("--linux-vm")
-                    .ok_or_else(|| "--linux-vm <alias> is required".to_string())?,
+                    .ok_or_else(|| "--linux-vm <alias> is required".to_owned())?,
                 ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 report_dir: parser.required_path("--report-dir")?,
@@ -2941,7 +2936,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .path_or_default("--inventory", vm_lab::default_inventory_path()),
                 windows_vm: parser
                     .value("--windows-vm")
-                    .ok_or_else(|| "--windows-vm <alias> is required".to_string())?,
+                    .ok_or_else(|| "--windows-vm <alias> is required".to_owned())?,
                 ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 report_dir: parser.required_path("--report-dir")?,
@@ -2959,7 +2954,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         .path_or_default("--inventory", vm_lab::default_inventory_path()),
                     linux_exit_alias: parser
                         .value("--linux-exit-vm")
-                        .ok_or_else(|| "--linux-exit-vm <alias> is required".to_string())?,
+                        .ok_or_else(|| "--linux-exit-vm <alias> is required".to_owned())?,
                     ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                     known_hosts_path: parser.optional_path("--known-hosts-file"),
                     dest_dir: parser.required_path("--dest-dir")?,
@@ -3142,7 +3137,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     ssh_identity_file: parser.optional_path("--ssh-identity-file"),
                     known_hosts_path: parser.optional_path("--known-hosts-file"),
                     ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
-                        .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                        .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
                     connect_timeout_secs: parser
                         .parse_u64_or_default("--connect-timeout-secs", 5)?,
                     report_dir: parser.optional_path("--report-dir"),
@@ -3210,7 +3205,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     service: parser.value("--service"),
                     wait_ready: parser.has_flag("--wait-ready"),
                     ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
-                        .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_string())?,
+                        .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
                     ready_timeout_secs: parser
                         .parse_u64_or_default("--wait-ready-timeout-secs", 300)?,
                     ssh_user: parser.value("--ssh-user"),
@@ -3321,10 +3316,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     dest_dir: parser.value("--dest-dir"),
                     branch: parser
                         .value("--branch")
-                        .unwrap_or_else(|| "main".to_string()),
+                        .unwrap_or_else(|| "main".to_owned()),
                     remote: parser
                         .value("--remote")
-                        .unwrap_or_else(|| "origin".to_string()),
+                        .unwrap_or_else(|| "origin".to_owned()),
                     ssh_user: parser.value("--ssh-user"),
                     ssh_identity_file: parser.optional_path("--ssh-identity-file"),
                     known_hosts_path: parser.optional_path("--known-hosts-file"),
@@ -3400,16 +3395,16 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         mint_node_id: parser.required("--mint-node-id")?,
                         debian_os_version: parser
                             .value("--debian-os-version")
-                            .unwrap_or_else(|| "Debian 13".to_string()),
+                            .unwrap_or_else(|| "Debian 13".to_owned()),
                         ubuntu_os_version: parser
                             .value("--ubuntu-os-version")
-                            .unwrap_or_else(|| "Ubuntu".to_string()),
+                            .unwrap_or_else(|| "Ubuntu".to_owned()),
                         fedora_os_version: parser
                             .value("--fedora-os-version")
-                            .unwrap_or_else(|| "Fedora".to_string()),
+                            .unwrap_or_else(|| "Fedora".to_owned()),
                         mint_os_version: parser
                             .value("--mint-os-version")
-                            .unwrap_or_else(|| "Linux Mint".to_string()),
+                            .unwrap_or_else(|| "Linux Mint".to_owned()),
                     },
             })
         }
@@ -3422,7 +3417,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                             .parse_u64_or_default("--max-age-seconds", 604800)?,
                         profile: parser
                             .value("--profile")
-                            .unwrap_or_else(|| "cross_platform".to_string()),
+                            .unwrap_or_else(|| "cross_platform".to_owned()),
                         expected_git_commit: parser
                             .value("--expected-git-commit")
                             .unwrap_or_default(),
@@ -3452,92 +3447,90 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         }),
         "sign-release-artifact" => {
             if args.len() != 1 {
-                return Err("ops sign-release-artifact does not accept options".to_string());
+                return Err("ops sign-release-artifact does not accept options".to_owned());
             }
             Ok(OpsCommand::SignReleaseArtifact)
         }
         "verify-release-artifact" => {
             if args.len() != 1 {
-                return Err("ops verify-release-artifact does not accept options".to_string());
+                return Err("ops verify-release-artifact does not accept options".to_owned());
             }
             Ok(OpsCommand::VerifyReleaseArtifact)
         }
         "collect-platform-probe" => {
             if args.len() != 1 {
-                return Err("ops collect-platform-probe does not accept options".to_string());
+                return Err("ops collect-platform-probe does not accept options".to_owned());
             }
             Ok(OpsCommand::CollectPlatformProbe)
         }
         "generate-platform-parity-report" => {
             if args.len() != 1 {
                 return Err(
-                    "ops generate-platform-parity-report does not accept options".to_string(),
+                    "ops generate-platform-parity-report does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::GeneratePlatformParityReport)
         }
         "collect-platform-parity-bundle" => {
             if args.len() != 1 {
-                return Err(
-                    "ops collect-platform-parity-bundle does not accept options".to_string()
-                );
+                return Err("ops collect-platform-parity-bundle does not accept options".to_owned());
             }
             Ok(OpsCommand::CollectPlatformParityBundle)
         }
         "install-systemd" => {
             if args.len() != 1 {
-                return Err("ops install-systemd does not accept options".to_string());
+                return Err("ops install-systemd does not accept options".to_owned());
             }
             Ok(OpsCommand::InstallSystemd)
         }
         "install-windows-service" => {
             if args.len() != 1 {
-                return Err("ops install-windows-service does not accept options".to_string());
+                return Err("ops install-windows-service does not accept options".to_owned());
             }
             Ok(OpsCommand::InstallWindowsService)
         }
         "install-windows-relay-service" => {
             if args.len() != 1 {
-                return Err("ops install-windows-relay-service does not accept options".to_string());
+                return Err("ops install-windows-relay-service does not accept options".to_owned());
             }
             Ok(OpsCommand::InstallWindowsRelayService)
         }
         "uninstall-windows-relay-service" => {
             if args.len() != 1 {
                 return Err(
-                    "ops uninstall-windows-relay-service does not accept options".to_string(),
+                    "ops uninstall-windows-relay-service does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::UninstallWindowsRelayService)
         }
         "prepare-system-dirs" => {
             if args.len() != 1 {
-                return Err("ops prepare-system-dirs does not accept options".to_string());
+                return Err("ops prepare-system-dirs does not accept options".to_owned());
             }
             Ok(OpsCommand::PrepareSystemDirs)
         }
         "restart-runtime-service" => {
             if args.len() != 1 {
-                return Err("ops restart-runtime-service does not accept options".to_string());
+                return Err("ops restart-runtime-service does not accept options".to_owned());
             }
             Ok(OpsCommand::RestartRuntimeService)
         }
         "stop-runtime-service" => {
             if args.len() != 1 {
-                return Err("ops stop-runtime-service does not accept options".to_string());
+                return Err("ops stop-runtime-service does not accept options".to_owned());
             }
             Ok(OpsCommand::StopRuntimeService)
         }
         "show-runtime-service-status" => {
             if args.len() != 1 {
-                return Err("ops show-runtime-service-status does not accept options".to_string());
+                return Err("ops show-runtime-service-status does not accept options".to_owned());
             }
             Ok(OpsCommand::ShowRuntimeServiceStatus)
         }
         "start-assignment-refresh-service" => {
             if args.len() != 1 {
                 return Err(
-                    "ops start-assignment-refresh-service does not accept options".to_string(),
+                    "ops start-assignment-refresh-service does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::StartAssignmentRefreshService)
@@ -3545,7 +3538,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "check-assignment-refresh-availability" => {
             if args.len() != 1 {
                 return Err(
-                    "ops check-assignment-refresh-availability does not accept options".to_string(),
+                    "ops check-assignment-refresh-availability does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::CheckAssignmentRefreshAvailability)
@@ -3557,35 +3550,35 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             trust_dest: parser.required_path("--trust-dest")?,
             daemon_group: parser
                 .value("--daemon-group")
-                .unwrap_or_else(|| "rustynetd".to_string()),
+                .unwrap_or_else(|| "rustynetd".to_owned()),
         }),
         "apply-managed-dns-routing" => {
             if args.len() != 1 {
-                return Err("ops apply-managed-dns-routing does not accept options".to_string());
+                return Err("ops apply-managed-dns-routing does not accept options".to_owned());
             }
             Ok(OpsCommand::ApplyManagedDnsRouting)
         }
         "clear-managed-dns-routing" => {
             if args.len() != 1 {
-                return Err("ops clear-managed-dns-routing does not accept options".to_string());
+                return Err("ops clear-managed-dns-routing does not accept options".to_owned());
             }
             Ok(OpsCommand::ClearManagedDnsRouting)
         }
         "disconnect-cleanup" => {
             if args.len() != 1 {
-                return Err("ops disconnect-cleanup does not accept options".to_string());
+                return Err("ops disconnect-cleanup does not accept options".to_owned());
             }
             Ok(OpsCommand::DisconnectCleanup)
         }
         "apply-blind-exit-lockdown" => {
             if args.len() != 1 {
-                return Err("ops apply-blind-exit-lockdown does not accept options".to_string());
+                return Err("ops apply-blind-exit-lockdown does not accept options".to_owned());
             }
             Ok(OpsCommand::ApplyBlindExitLockdown)
         }
         "init-membership" => {
             if args.len() != 1 {
-                return Err("ops init-membership does not accept options".to_string());
+                return Err("ops init-membership does not accept options".to_owned());
             }
             Ok(OpsCommand::InitMembership)
         }
@@ -3595,7 +3588,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "ensure-signing-passphrase-material" => {
             if args.len() != 1 {
                 return Err(
-                    "ops ensure-signing-passphrase-material does not accept options".to_string(),
+                    "ops ensure-signing-passphrase-material does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::EnsureSigningPassphraseMaterial)
@@ -3609,7 +3602,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "materialize-signing-passphrase-temp" => {
             if args.len() != 1 {
                 return Err(
-                    "ops materialize-signing-passphrase-temp does not accept options".to_string(),
+                    "ops materialize-signing-passphrase-temp does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::MaterializeSigningPassphraseTemp)
@@ -3630,7 +3623,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "force-local-assignment-refresh-now" => {
             if args.len() != 1 {
                 return Err(
-                    "ops force-local-assignment-refresh-now does not accept options".to_string(),
+                    "ops force-local-assignment-refresh-now does not accept options".to_owned(),
                 );
             }
             Ok(OpsCommand::ForceLocalAssignmentRefreshNow)
@@ -3640,7 +3633,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 "--enable",
                 parser
                     .value("--enable")
-                    .unwrap_or_else(|| "false".to_string())
+                    .unwrap_or_else(|| "false".to_owned())
                     .as_str(),
             )?;
             let lan_routes = parser
@@ -3650,7 +3643,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             if enable && lan_routes.is_empty() {
                 return Err(
                     "ops apply-lan-access-coupling requires --lan-routes when --enable true"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             Ok(OpsCommand::ApplyLanAccessCoupling {
@@ -3675,7 +3668,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 "--enable-exit-advertise",
                 parser
                     .value("--enable-exit-advertise")
-                    .unwrap_or_else(|| "false".to_string())
+                    .unwrap_or_else(|| "false".to_owned())
                     .as_str(),
             )?,
             assignment_refresh_env_path: parser.path_or_default(
@@ -3701,10 +3694,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 client_host: parser.required("--client-host")?,
                 ssh_user: parser
                     .value("--ssh-user")
-                    .unwrap_or_else(|| "root".to_string()),
+                    .unwrap_or_else(|| "root".to_owned()),
                 ssh_port: parser
                     .value("--ssh-port")
-                    .unwrap_or_else(|| "22".to_string())
+                    .unwrap_or_else(|| "22".to_owned())
                     .parse::<u16>()
                     .map_err(|err| format!("invalid --ssh-port value: {err}"))?,
                 ssh_identity: parser.optional_path("--ssh-identity"),
@@ -3713,25 +3706,25 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 ssh_sudo_mode: ops_e2e::SshSudoMode::parse(
                     parser
                         .value("--ssh-sudo")
-                        .unwrap_or_else(|| "auto".to_string())
+                        .unwrap_or_else(|| "auto".to_owned())
                         .as_str(),
                 )?,
                 sudo_password_file: parser.optional_path("--sudo-password-file"),
                 exit_node_id: parser
                     .value("--exit-node-id")
-                    .unwrap_or_else(|| "exit-node".to_string()),
+                    .unwrap_or_else(|| "exit-node".to_owned()),
                 client_node_id: parser
                     .value("--client-node-id")
-                    .unwrap_or_else(|| "client-node".to_string()),
+                    .unwrap_or_else(|| "client-node".to_owned()),
                 network_id: parser
                     .value("--network-id")
-                    .unwrap_or_else(|| "local-net".to_string()),
+                    .unwrap_or_else(|| "local-net".to_owned()),
                 remote_root: parser
                     .optional_path("--remote-root")
                     .unwrap_or_else(|| PathBuf::from("/opt/rustynet-clean")),
                 repo_ref: parser
                     .value("--repo-ref")
-                    .unwrap_or_else(|| "HEAD".to_string()),
+                    .unwrap_or_else(|| "HEAD".to_owned()),
                 skip_apt: parser.has_flag("--skip-apt"),
                 report_path: parser.optional_path("--report-path").unwrap_or_else(|| {
                     PathBuf::from("artifacts/phase10/debian_two_node_remote_validation.md")
@@ -3821,7 +3814,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
 
 fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String> {
     if args.is_empty() {
-        return Err("membership subcommand is required".to_string());
+        return Err("membership subcommand is required".to_owned());
     }
     let subcommand = args[0].as_str();
     let parser = OptionParser::parse(&args[1..])?;
@@ -3848,7 +3841,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
                 .path_or_default("--output-dir", PathBuf::from("artifacts/membership")),
             environment: parser
                 .value("--environment")
-                .unwrap_or_else(|| "unknown".to_string()),
+                .unwrap_or_else(|| "unknown".to_owned()),
         }),
         "propose-add" => {
             let node_id = parser.required("--node-id")?;
@@ -3856,7 +3849,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             let owner = parser.required("--owner")?;
             let roles = parser
                 .value("--roles")
-                .map_or_else(|| vec!["tag:members".to_string()], split_csv);
+                .map_or_else(|| vec!["tag:members".to_owned()], split_csv);
             let operation = MembershipOperation::AddNode(MembershipNode {
                 node_id: node_id.clone(),
                 node_pubkey_hex,
@@ -3931,7 +3924,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
                     &parser,
                     paths,
                     MembershipOperation::SetQuorum { threshold },
-                    "quorum".to_string(),
+                    "quorum".to_owned(),
                 )?,
             })
         }
@@ -3941,12 +3934,12 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             let role = match parser.required("--role")?.as_str() {
                 "owner" => MembershipApproverRole::Owner,
                 "guardian" => MembershipApproverRole::Guardian,
-                _ => return Err("invalid --role: expected owner|guardian".to_string()),
+                _ => return Err("invalid --role: expected owner|guardian".to_owned()),
             };
             let status = match parser.value("--status").as_deref().unwrap_or("active") {
                 "active" => MembershipApproverStatus::Active,
                 "revoked" => MembershipApproverStatus::Revoked,
-                _ => return Err("invalid --status: expected active|revoked".to_string()),
+                _ => return Err("invalid --status: expected active|revoked".to_owned()),
             };
             let operation = MembershipOperation::RotateApprover(MembershipApprover {
                 approver_id: approver_id.clone(),
@@ -3985,7 +3978,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
 
 fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String> {
     if args.is_empty() {
-        return Err("assignment subcommand is required".to_string());
+        return Err("assignment subcommand is required".to_owned());
     }
     let subcommand = args[0].as_str();
     let parser = OptionParser::parse(&args[1..])?;
@@ -4001,7 +3994,7 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
             let allow_pairs = parse_assignment_allow_pairs(parser.required("--allow")?.as_str())?;
             let mesh_cidr = parser
                 .value("--mesh-cidr")
-                .unwrap_or_else(|| "100.64.0.0/10".to_string());
+                .unwrap_or_else(|| "100.64.0.0/10".to_owned());
             let exit_node_id = parser.value("--exit-node-id");
             let lan_routes = parser
                 .value("--lan-routes")
@@ -4052,10 +4045,10 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
                 parser.required_path("--signing-secret-passphrase-file")?;
             let length_bytes = parser.parse_u64_or_default("--length-bytes", 32)?;
             if length_bytes < 32 {
-                return Err("signing secret length must be >= 32 bytes".to_string());
+                return Err("signing secret length must be >= 32 bytes".to_owned());
             }
             if length_bytes > 4096 {
-                return Err("signing secret length must be <= 4096 bytes".to_string());
+                return Err("signing secret length must be <= 4096 bytes".to_owned());
             }
             Ok(AssignmentCommand::InitSigningSecret {
                 output_path,
@@ -4070,7 +4063,7 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
 
 fn parse_trust_command(args: &[String]) -> Result<TrustCommand, String> {
     if args.is_empty() {
-        return Err("trust subcommand is required".to_string());
+        return Err("trust subcommand is required".to_owned());
     }
     let subcommand = args[0].as_str();
     let parser = OptionParser::parse(&args[1..])?;
@@ -4122,7 +4115,7 @@ fn parse_dns_zone_command(action: &str, args: &[String]) -> Result<CliCommand, S
             allow_pairs: parse_assignment_allow_pairs(parser.required("--allow")?.as_str())?,
             zone_name: parser
                 .value("--zone-name")
-                .unwrap_or_else(|| "rustynet".to_string()),
+                .unwrap_or_else(|| "rustynet".to_owned()),
             records_path: parser.required_path("--records-manifest")?,
             generated_at_unix: parser.parse_u64_or_default("--generated-at", unix_now())?,
             ttl_secs: parser.parse_u64_or_default("--ttl-secs", 300)?,
@@ -4140,7 +4133,7 @@ fn parse_dns_zone_command(action: &str, args: &[String]) -> Result<CliCommand, S
 
 fn parse_traversal_command(args: &[String]) -> Result<TraversalCommand, String> {
     if args.is_empty() {
-        return Err("traversal subcommand is required".to_string());
+        return Err("traversal subcommand is required".to_owned());
     }
     let subcommand = args[0].as_str();
     let parser = OptionParser::parse(&args[1..])?;
@@ -4192,7 +4185,7 @@ fn proposal_config(
             .unwrap_or_else(generate_update_id),
         reason_code: parser
             .value("--reason")
-            .unwrap_or_else(|| "operator_request".to_string()),
+            .unwrap_or_else(|| "operator_request".to_owned()),
         policy_context: parser.value("--policy-context"),
         expires_in_secs: parser.parse_u64_or_default("--expires-in", 300)?,
     })
@@ -4301,7 +4294,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::SystemStateSnapshot => execute_system_snapshot(),
         CliCommand::CompareToBaseline => execute_compare_baseline(),
         CliCommand::PerformanceRegressionDetection => execute_perf_regression(),
-        CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_string()),
+        CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_owned()),
         CliCommand::OperatorMenu => execute_operator_menu(),
         CliCommand::StateRefresh => execute_state_refresh(),
         CliCommand::DnsZoneIssue(command) => execute_dns_zone_issue(*command),
@@ -4441,7 +4434,7 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                 bundle.generated_at_unix,
                 bundle.expires_at_unix,
                 verifier_key_output_path.as_ref().map_or_else(
-                    || "<not_written>".to_string(),
+                    || "<not_written>".to_owned(),
                     |path| path.display().to_string()
                 )
             ))
@@ -4558,7 +4551,7 @@ fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String
         bundle.expires_at_unix,
         bundle.records.len(),
         verifier_key_output_path.as_ref().map_or_else(
-            || "<not_written>".to_string(),
+            || "<not_written>".to_owned(),
             |path| path.display().to_string()
         )
     ))
@@ -4645,7 +4638,7 @@ fn execute_traversal_issue(command: TraversalIssueCommand) -> Result<String, Str
         bundle.generated_at_unix,
         bundle.expires_at_unix,
         verifier_key_output_path.as_ref().map_or_else(
-            || "<not_written>".to_string(),
+            || "<not_written>".to_owned(),
             |path| path.display().to_string()
         )
     ))
@@ -4789,7 +4782,7 @@ fn execute_operator_menu() -> Result<String, String> {
             .read_line(&mut choice)
             .map_err(|err| format!("read menu input failed: {err}"))?;
         if choice.is_empty() {
-            return Ok("operator menu exited (stdin closed)".to_string());
+            return Ok("operator menu exited (stdin closed)".to_owned());
         }
 
         match choice.trim() {
@@ -4798,11 +4791,11 @@ fn execute_operator_menu() -> Result<String, String> {
             "3" => render_operator_action("exit-node off", send_command(IpcCommand::ExitNodeOff)),
             "4" => render_operator_action(
                 "route advertise 0.0.0.0/0",
-                send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string())),
+                send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned())),
             ),
             "5" => render_operator_action("lan-access on", send_command(IpcCommand::LanAccessOn)),
             "6" => render_operator_action("lan-access off", send_command(IpcCommand::LanAccessOff)),
-            "0" => return Ok("operator menu exited".to_string()),
+            "0" => return Ok("operator menu exited".to_owned()),
             _ => println!("unknown option"),
         }
     }
@@ -4844,7 +4837,7 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             let created_at_unix = unix_now();
             let expires_at_unix = created_at_unix.saturating_add(config.expires_in_secs);
             if expires_at_unix <= created_at_unix {
-                return Err("invalid expiry window: --expires-in must be > 0".to_string());
+                return Err("invalid expiry window: --expires-in must be > 0".to_owned());
             }
             let record = MembershipUpdateRecord {
                 network_id: state.network_id,
@@ -4892,7 +4885,7 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
                     decode_signed_update(&signed_payload).map_err(|err| err.to_string())?;
                 if existing.record != record {
                     return Err(
-                        "merge-from update record mismatch: payloads must be identical".to_string(),
+                        "merge-from update record mismatch: payloads must be identical".to_owned(),
                     );
                 }
                 existing.approver_signatures
@@ -4904,7 +4897,7 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
                 .iter()
                 .any(|entry| entry.approver_id == approver_id)
             {
-                return Err("duplicate approver signature is not allowed".to_string());
+                return Err("duplicate approver signature is not allowed".to_owned());
             }
             signatures.push(signature);
 
@@ -5607,7 +5600,7 @@ fn execute_ops_refresh_trust() -> Result<String, String> {
     enforce_pinned_runtime_binary_custody("trust-refresh")?;
 
     if !parse_env_bool_with_default("RUSTYNET_TRUST_AUTO_REFRESH", "true")? {
-        return Ok("[trust-refresh] auto-refresh disabled; skipping.".to_string());
+        return Ok("[trust-refresh] auto-refresh disabled; skipping.".to_owned());
     }
 
     let trust_evidence_path = env_path_or_default(
@@ -5637,7 +5630,7 @@ fn execute_ops_refresh_signed_trust() -> Result<String, String> {
     }
 
     let node_role = env_optional_string("RUSTYNET_NODE_ROLE")?
-        .unwrap_or_else(|| "admin".to_string())
+        .unwrap_or_else(|| "admin".to_owned())
         .to_ascii_lowercase();
     if node_role != "admin" && node_role != "blind_exit" {
         return Err(format!(
@@ -5756,13 +5749,13 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     enforce_pinned_runtime_binary_custody("assignment-refresh")?;
 
     if !parse_env_bool_with_default("RUSTYNET_ASSIGNMENT_AUTO_REFRESH", "false")? {
-        return Ok("[assignment-refresh] auto-refresh disabled; skipping.".to_string());
+        return Ok("[assignment-refresh] auto-refresh disabled; skipping.".to_owned());
     }
 
     let target_node_id = env_optional_string("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID")?
         .or_else(|| std::env::var("RUSTYNET_NODE_ID").ok())
         .ok_or_else(|| {
-            "assignment target node id is required (RUSTYNET_ASSIGNMENT_TARGET_NODE_ID or RUSTYNET_NODE_ID)".to_string()
+            "assignment target node id is required (RUSTYNET_ASSIGNMENT_TARGET_NODE_ID or RUSTYNET_NODE_ID)".to_owned()
         })?;
     if !is_valid_node_id(target_node_id.as_str()) {
         return Err(format!(
@@ -5788,7 +5781,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         if exit_node_id.is_none() {
             return Err(
                 "RUSTYNET_ASSIGNMENT_LAN_ROUTES requires RUSTYNET_ASSIGNMENT_EXIT_NODE_ID"
-                    .to_string(),
+                    .to_owned(),
             );
         }
     }
@@ -5879,7 +5872,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
             verifier_key_output_path: Some(verifier_tmp.clone()),
             nodes,
             allow_pairs,
-            mesh_cidr: "100.64.0.0/10".to_string(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
             exit_node_id,
             lan_routes,
             generated_at_unix: unix_now(),
@@ -5897,7 +5890,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     if generated_at_unix >= expires_at_unix {
         let _ = remove_file_if_present(&bundle_tmp);
         let _ = remove_file_if_present(&verifier_tmp);
-        return Err("issued assignment bundle has invalid expiry window".to_string());
+        return Err("issued assignment bundle has invalid expiry window".to_owned());
     }
 
     if let Err(err) = publish_file_with_owner_mode(
@@ -6120,7 +6113,7 @@ fn execute_ops_collect_platform_parity_bundle() -> Result<String, String> {
     ops_phase9::write_phase6_parity_evidence_attestation(report_path.as_path())?;
     ops_phase9::execute_ops_verify_phase6_parity_evidence()?;
 
-    Ok("phase6 platform parity bundle generated from probes".to_string())
+    Ok("phase6 platform parity bundle generated from probes".to_owned())
 }
 
 #[derive(Debug, Clone)]
@@ -6331,34 +6324,34 @@ fn collect_platform_probe_artifact() -> Result<PathBuf, String> {
         firewall_probe_cmd,
     ) = match platform {
         Phase6Platform::Linux => {
-            let route_probe_cmd = "ip -o route show default".to_string();
+            let route_probe_cmd = "ip -o route show default".to_owned();
             let route_hook_ready =
                 phase6_command_succeeds("ip", &["-o", "route", "show", "default"]);
 
             let (dns_hook_ready, dns_probe_cmd) = if phase6_command_available("resolvectl") {
                 (
                     phase6_command_succeeds("resolvectl", &["status"]),
-                    "resolvectl status".to_string(),
+                    "resolvectl status".to_owned(),
                 )
             } else {
                 (
                     phase6_nonempty_file(Path::new("/etc/resolv.conf")),
-                    "test -s /etc/resolv.conf".to_string(),
+                    "test -s /etc/resolv.conf".to_owned(),
                 )
             };
 
             let (firewall_hook_ready, firewall_probe_cmd) = if phase6_command_available("nft") {
                 (
                     phase6_command_succeeds("nft", &["list", "tables"]),
-                    "nft list tables".to_string(),
+                    "nft list tables".to_owned(),
                 )
             } else if phase6_command_available("iptables") {
                 (
                     phase6_command_succeeds("iptables", &["-S"]),
-                    "iptables -S".to_string(),
+                    "iptables -S".to_owned(),
                 )
             } else {
-                (false, "nft|iptables unavailable".to_string())
+                (false, "nft|iptables unavailable".to_owned())
             };
 
             (
@@ -6386,9 +6379,9 @@ fn collect_platform_probe_artifact() -> Result<PathBuf, String> {
                 route_hook_ready,
                 dns_hook_ready,
                 firewall_hook_ready,
-                "root-owned route/ifconfig/launchctl + hardened macOS start contract".to_string(),
-                "root-owned scutil/launchctl + hardened macOS start contract".to_string(),
-                "root-owned pfctl/launchctl + hardened macOS start contract".to_string(),
+                "root-owned route/ifconfig/launchctl + hardened macOS start contract".to_owned(),
+                "root-owned scutil/launchctl + hardened macOS start contract".to_owned(),
+                "root-owned pfctl/launchctl + hardened macOS start contract".to_owned(),
             )
         }
         Phase6Platform::Windows => (
@@ -6419,9 +6412,9 @@ fn collect_platform_probe_artifact() -> Result<PathBuf, String> {
                     "Get-NetFirewallProfile | Out-Null",
                 ],
             ),
-            "powershell.exe Get-NetRoute".to_string(),
-            "powershell.exe Get-DnsClientServerAddress".to_string(),
-            "powershell.exe Get-NetFirewallProfile".to_string(),
+            "powershell.exe Get-NetRoute".to_owned(),
+            "powershell.exe Get-DnsClientServerAddress".to_owned(),
+            "powershell.exe Get-NetFirewallProfile".to_owned(),
         ),
     };
 
@@ -6535,7 +6528,7 @@ fn phase6_detect_probe_platform() -> Result<Phase6Platform, String> {
 
 fn phase6_leak_report_source(platform: Phase6Platform) -> Result<String, String> {
     let default_source = env_optional_string("RUSTYNET_PHASE6_LEAK_REPORT")?
-        .unwrap_or_else(|| DEFAULT_PHASE10_LEAK_REPORT_PATH.to_string());
+        .unwrap_or_else(|| DEFAULT_PHASE10_LEAK_REPORT_PATH.to_owned());
     let platform_source = match platform {
         Phase6Platform::Linux => env_optional_string("RUSTYNET_PHASE6_LEAK_REPORT_LINUX")?,
         Phase6Platform::Macos => env_optional_string("RUSTYNET_PHASE6_LEAK_REPORT_MACOS")?,
@@ -6573,12 +6566,12 @@ fn phase6_probe_host() -> String {
         .stderr(Stdio::null())
         .output();
     if let Ok(output) = output {
-        let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let hostname = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if !hostname.is_empty() {
             return hostname;
         }
     }
-    "unknown".to_string()
+    "unknown".to_owned()
 }
 
 const PHASE6_MACOS_REQUIRED_START_PATTERNS: &[(&str, &str)] = &[
@@ -6622,7 +6615,7 @@ fn phase6_workspace_root() -> Result<PathBuf, String> {
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .ok_or_else(|| "failed to resolve workspace root for phase6 parity probe".to_string())
+        .ok_or_else(|| "failed to resolve workspace root for phase6 parity probe".to_owned())
 }
 
 fn phase6_macos_start_contract_ready() -> Result<bool, String> {
@@ -6640,12 +6633,12 @@ fn phase6_macos_start_contract_ready() -> Result<bool, String> {
 fn phase6_validate_macos_start_contract_text(body: &str) -> Result<(), String> {
     for (pattern, message) in PHASE6_MACOS_REQUIRED_START_PATTERNS {
         if !body.contains(pattern) {
-            return Err((*message).to_string());
+            return Err((*message).to_owned());
         }
     }
     for (pattern, message) in PHASE6_MACOS_FORBIDDEN_START_PATTERNS {
         if body.contains(pattern) {
-            return Err((*message).to_string());
+            return Err((*message).to_owned());
         }
     }
     Ok(())
@@ -6732,72 +6725,70 @@ pub(crate) fn phase6_validate_platform_parity_report(report_path: &Path) -> Resu
     let report = read_json_value(report_path, "platform parity report")?;
     let report_obj = report
         .as_object()
-        .ok_or_else(|| "platform parity report must be a JSON object".to_string())?;
+        .ok_or_else(|| "platform parity report must be a JSON object".to_owned())?;
 
     if report_obj
         .get("evidence_mode")
         .and_then(Value::as_str)
         .is_none_or(|value| value != "measured")
     {
-        return Err("platform parity report must set evidence_mode=measured".to_string());
+        return Err("platform parity report must set evidence_mode=measured".to_owned());
     }
 
     let captured_at_unix = report_obj
         .get("captured_at_unix")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            "platform parity report requires positive integer captured_at_unix".to_string()
+            "platform parity report requires positive integer captured_at_unix".to_owned()
         })?;
     if captured_at_unix == 0 {
-        return Err(
-            "platform parity report requires positive integer captured_at_unix".to_string(),
-        );
+        return Err("platform parity report requires positive integer captured_at_unix".to_owned());
     }
 
     let now_unix = unix_now();
     if captured_at_unix > now_unix.saturating_add(300) {
-        return Err("platform parity report captured_at_unix is too far in the future".to_string());
+        return Err("platform parity report captured_at_unix is too far in the future".to_owned());
     }
     if now_unix.saturating_sub(captured_at_unix) > PHASE6_MAX_EVIDENCE_AGE_SECS {
         return Err(
-            "platform parity report is stale; regenerate with fresh measurements".to_string(),
+            "platform parity report is stale; regenerate with fresh measurements".to_owned(),
         );
     }
 
     let environment = report_obj
         .get("environment")
         .and_then(Value::as_str)
-        .ok_or_else(|| "platform parity report requires non-empty environment".to_string())?;
+        .ok_or_else(|| "platform parity report requires non-empty environment".to_owned())?;
     if environment.trim().is_empty() {
-        return Err("platform parity report requires non-empty environment".to_string());
+        return Err("platform parity report requires non-empty environment".to_owned());
     }
 
     if report_obj.contains_key("gate_passed") {
-        return Err("platform parity report must not include gate_passed toggle".to_string());
+        return Err("platform parity report must not include gate_passed toggle".to_owned());
     }
 
     let source_artifacts = report_obj
         .get("source_artifacts")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            "platform parity report requires non-empty source_artifacts list".to_string()
+            "platform parity report requires non-empty source_artifacts list".to_owned()
         })?;
     if source_artifacts.is_empty() {
-        return Err("platform parity report requires non-empty source_artifacts list".to_string());
+        return Err("platform parity report requires non-empty source_artifacts list".to_owned());
     }
 
     let required_platforms = Phase6Platform::all()
         .iter()
-        .map(|platform| platform.as_str().to_string())
+        .map(|platform| platform.as_str().to_owned())
         .collect::<HashSet<_>>();
     let mut source_by_platform = HashMap::new();
 
     for source in source_artifacts {
         let source_str = source.as_str().ok_or_else(|| {
-            "platform parity report has invalid source_artifacts entry".to_string()
+            "platform parity report has invalid source_artifacts entry".to_owned()
         })?;
         if source_str.trim().is_empty() {
-            return Err("platform parity report has invalid source_artifacts entry".to_string());
+            return Err("platform parity report has invalid source_artifacts entry".to_owned());
         }
         let mut source_path = PathBuf::from(source_str);
         if !source_path.is_absolute() {
@@ -6916,21 +6907,21 @@ pub(crate) fn phase6_validate_platform_parity_report(report_path: &Path) -> Resu
         .get("platform_results")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            "platform parity report requires non-empty platform_results list".to_string()
+            "platform parity report requires non-empty platform_results list".to_owned()
         })?;
     if platform_results.is_empty() {
-        return Err("platform parity report requires non-empty platform_results list".to_string());
+        return Err("platform parity report requires non-empty platform_results list".to_owned());
     }
 
     let mut seen = HashSet::new();
     for result in platform_results {
         let result_obj = result.as_object().ok_or_else(|| {
-            "platform parity report has invalid platform_results entry".to_string()
+            "platform parity report has invalid platform_results entry".to_owned()
         })?;
         let platform = result_obj
             .get("platform")
             .and_then(Value::as_str)
-            .ok_or_else(|| "platform parity report entry missing platform".to_string())?
+            .ok_or_else(|| "platform parity report entry missing platform".to_owned())?
             .trim()
             .to_ascii_lowercase();
         if !required_platforms.contains(&platform) {
@@ -7061,7 +7052,7 @@ fn execute_ops_secure_remove(path: PathBuf) -> Result<String, String> {
 fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("apply-managed-dns-routing is supported on Linux only".to_string());
+        return Err("apply-managed-dns-routing is supported on Linux only".to_owned());
     }
 
     ensure_systemd_resolved_active()?;
@@ -7093,7 +7084,7 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
 fn execute_ops_clear_managed_dns_routing() -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("clear-managed-dns-routing is supported on Linux only".to_string());
+        return Err("clear-managed-dns-routing is supported on Linux only".to_owned());
     }
 
     let interface = managed_dns_interface_name_from_env()?;
@@ -7158,7 +7149,7 @@ fn execute_ops_restart_runtime_service() -> Result<String, String> {
         return execute_ops_restart_runtime_service_macos();
     }
 
-    Err("restart-runtime-service is supported on Linux and macOS only".to_string())
+    Err("restart-runtime-service is supported on Linux and macOS only".to_owned())
 }
 
 fn execute_ops_stop_runtime_service() -> Result<String, String> {
@@ -7193,7 +7184,7 @@ fn execute_ops_stop_runtime_service() -> Result<String, String> {
         return execute_ops_stop_runtime_service_macos();
     }
 
-    Err("stop-runtime-service is supported on Linux and macOS only".to_string())
+    Err("stop-runtime-service is supported on Linux and macOS only".to_owned())
 }
 
 fn execute_ops_show_runtime_service_status() -> Result<String, String> {
@@ -7218,13 +7209,13 @@ fn execute_ops_show_runtime_service_status() -> Result<String, String> {
 
         let stdout = String::from_utf8_lossy(&status_output.stdout)
             .trim()
-            .to_string();
+            .to_owned();
         if !stdout.is_empty() {
             return Ok(stdout);
         }
         let stderr = String::from_utf8_lossy(&status_output.stderr)
             .trim()
-            .to_string();
+            .to_owned();
         if !stderr.is_empty() {
             return Ok(stderr);
         }
@@ -7237,13 +7228,13 @@ fn execute_ops_show_runtime_service_status() -> Result<String, String> {
         return execute_ops_show_runtime_service_status_macos();
     }
 
-    Err("show-runtime-service-status is supported on Linux and macOS only".to_string())
+    Err("show-runtime-service-status is supported on Linux and macOS only".to_owned())
 }
 
 fn execute_ops_start_assignment_refresh_service() -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("start-assignment-refresh-service is supported on Linux only".to_string());
+        return Err("start-assignment-refresh-service is supported on Linux only".to_owned());
     }
 
     let start_output = run_command_capture(
@@ -7266,7 +7257,7 @@ fn execute_ops_start_assignment_refresh_service() -> Result<String, String> {
 fn execute_ops_check_assignment_refresh_availability() -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("check-assignment-refresh-availability is supported on Linux only".to_string());
+        return Err("check-assignment-refresh-availability is supported on Linux only".to_owned());
     }
 
     let env_path = env_path_or_default(
@@ -7297,10 +7288,10 @@ fn execute_ops_check_assignment_refresh_availability() -> Result<String, String>
 fn execute_ops_force_local_assignment_refresh_now() -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("force-local-assignment-refresh-now is supported on Linux only".to_string());
+        return Err("force-local-assignment-refresh-now is supported on Linux only".to_owned());
     }
     force_local_assignment_refresh_now_ops()?;
-    Ok("forced local assignment refresh completed".to_string())
+    Ok("forced local assignment refresh completed".to_owned())
 }
 
 fn execute_ops_install_trust_material(
@@ -7323,9 +7314,9 @@ fn execute_ops_install_trust_material(
     ensure_regular_file_no_symlink(&verifier_source, "trust verifier source")?;
     ensure_regular_file_no_symlink(&trust_source, "trust evidence source")?;
 
-    let daemon_group = daemon_group.trim().to_string();
+    let daemon_group = daemon_group.trim().to_owned();
     if daemon_group.is_empty() {
-        return Err("daemon group must not be empty".to_string());
+        return Err("daemon group must not be empty".to_owned());
     }
 
     let host_profile = match env_string_or_default("RUSTYNET_HOST_PROFILE", detect_host_profile())?
@@ -7347,7 +7338,7 @@ fn execute_ops_install_trust_material(
                 if !cfg!(target_os = "linux") {
                     return Err(
                         "linux host profile for install-trust-material is supported on Linux only"
-                            .to_string(),
+                            .to_owned(),
                     );
                 }
                 require_root_execution()?;
@@ -7358,7 +7349,7 @@ fn execute_ops_install_trust_material(
                         format!("resolve daemon group {daemon_group} failed: {err}")
                     })? {
                         Some(group) => (group.gid, 0o640, daemon_group.clone()),
-                        None => (Gid::from_raw(0), 0o644, "root".to_string()),
+                        None => (Gid::from_raw(0), 0o644, "root".to_owned()),
                     };
                 (
                     owner_uid,
@@ -7373,7 +7364,7 @@ fn execute_ops_install_trust_material(
                 if !cfg!(target_os = "macos") {
                     return Err(
                         "macos host profile for install-trust-material is supported on macOS only"
-                            .to_string(),
+                            .to_owned(),
                     );
                 }
                 (
@@ -7489,12 +7480,12 @@ fn execute_ops_disconnect_cleanup() -> Result<String, String> {
         return execute_ops_disconnect_cleanup_macos();
     }
     if !cfg!(target_os = "linux") {
-        return Err("disconnect-cleanup is supported on Linux and macOS only".to_string());
+        return Err("disconnect-cleanup is supported on Linux and macOS only".to_owned());
     }
 
     let interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
         .trim()
-        .to_string();
+        .to_owned();
     validate_managed_dns_interface_name(interface.as_str())?;
 
     let mut errors = Vec::new();
@@ -7914,7 +7905,7 @@ fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, 
         "macOS tunnel keychain service",
     )?;
     if keychain_service.trim().is_empty() {
-        return Err("macOS tunnel keychain service must not be empty".to_string());
+        return Err("macOS tunnel keychain service must not be empty".to_owned());
     }
 
     let wg_passphrase_path = env_required_path("RUSTYNET_WG_KEY_PASSPHRASE")?;
@@ -7933,185 +7924,185 @@ fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, 
     )?;
     let wg_interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
         .trim()
-        .to_string();
+        .to_owned();
     validate_managed_dns_interface_name(wg_interface.as_str())?;
     let wg_listen_port = env_string_or_default("RUSTYNET_WG_LISTEN_PORT", "51820")?
         .parse::<u16>()
         .map_err(|err| format!("invalid wireguard listen port: {err}"))?;
     if wg_listen_port == 0 {
-        return Err("wireguard listen port must be between 1 and 65535".to_string());
+        return Err("wireguard listen port must be between 1 and 65535".to_owned());
     }
 
     let helper_program_arguments = vec![
         daemon_binary_path.display().to_string(),
-        "privileged-helper".to_string(),
-        "--socket".to_string(),
+        "privileged-helper".to_owned(),
+        "--socket".to_owned(),
         service.helper_socket_path.display().to_string(),
-        "--allowed-uid".to_string(),
+        "--allowed-uid".to_owned(),
         service.daemon_uid.to_string(),
-        "--allowed-gid".to_string(),
+        "--allowed-gid".to_owned(),
         daemon_gid.to_string(),
-        "--timeout-ms".to_string(),
+        "--timeout-ms".to_owned(),
         helper_timeout_ms.to_string(),
     ];
 
     let daemon_program_arguments = vec![
         daemon_binary_path.display().to_string(),
-        "daemon".to_string(),
-        "--node-id".to_string(),
+        "daemon".to_owned(),
+        "--node-id".to_owned(),
         env_required_nonempty("RUSTYNET_NODE_ID", "node id")?,
-        "--node-role".to_string(),
+        "--node-role".to_owned(),
         env_required_nonempty("RUSTYNET_NODE_ROLE", "node role")?,
-        "--socket".to_string(),
+        "--socket".to_owned(),
         service.daemon_socket_path.display().to_string(),
-        "--state".to_string(),
+        "--state".to_owned(),
         env_required_path("RUSTYNET_STATE")?.display().to_string(),
-        "--trust-evidence".to_string(),
+        "--trust-evidence".to_owned(),
         env_required_path("RUSTYNET_TRUST_EVIDENCE")?
             .display()
             .to_string(),
-        "--trust-verifier-key".to_string(),
+        "--trust-verifier-key".to_owned(),
         env_required_path("RUSTYNET_TRUST_VERIFIER_KEY")?
             .display()
             .to_string(),
-        "--trust-watermark".to_string(),
+        "--trust-watermark".to_owned(),
         env_required_path("RUSTYNET_TRUST_WATERMARK")?
             .display()
             .to_string(),
-        "--membership-snapshot".to_string(),
+        "--membership-snapshot".to_owned(),
         env_required_path("RUSTYNET_MEMBERSHIP_SNAPSHOT")?
             .display()
             .to_string(),
-        "--membership-log".to_string(),
+        "--membership-log".to_owned(),
         env_required_path("RUSTYNET_MEMBERSHIP_LOG")?
             .display()
             .to_string(),
-        "--membership-watermark".to_string(),
+        "--membership-watermark".to_owned(),
         env_required_path("RUSTYNET_MEMBERSHIP_WATERMARK")?
             .display()
             .to_string(),
-        "--auto-tunnel-enforce".to_string(),
+        "--auto-tunnel-enforce".to_owned(),
         if auto_tunnel_enforce {
-            "true".to_string()
+            "true".to_owned()
         } else {
-            "false".to_string()
+            "false".to_owned()
         },
-        "--auto-tunnel-bundle".to_string(),
+        "--auto-tunnel-bundle".to_owned(),
         env_required_path("RUSTYNET_AUTO_TUNNEL_BUNDLE")?
             .display()
             .to_string(),
-        "--auto-tunnel-verifier-key".to_string(),
+        "--auto-tunnel-verifier-key".to_owned(),
         env_required_path("RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY")?
             .display()
             .to_string(),
-        "--auto-tunnel-watermark".to_string(),
+        "--auto-tunnel-watermark".to_owned(),
         env_required_path("RUSTYNET_AUTO_TUNNEL_WATERMARK")?
             .display()
             .to_string(),
-        "--auto-tunnel-max-age-secs".to_string(),
+        "--auto-tunnel-max-age-secs".to_owned(),
         parse_env_u64_with_default(
             "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS",
             DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
         )?
         .to_string(),
-        "--traversal-bundle".to_string(),
+        "--traversal-bundle".to_owned(),
         env_required_path("RUSTYNET_TRAVERSAL_BUNDLE")?
             .display()
             .to_string(),
-        "--traversal-verifier-key".to_string(),
+        "--traversal-verifier-key".to_owned(),
         env_required_path("RUSTYNET_TRAVERSAL_VERIFIER_KEY")?
             .display()
             .to_string(),
-        "--traversal-watermark".to_string(),
+        "--traversal-watermark".to_owned(),
         env_required_path("RUSTYNET_TRAVERSAL_WATERMARK")?
             .display()
             .to_string(),
-        "--traversal-max-age-secs".to_string(),
+        "--traversal-max-age-secs".to_owned(),
         parse_env_u64_with_default(
             "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
             DEFAULT_TRAVERSAL_MAX_AGE_SECS,
         )?
         .to_string(),
-        "--backend".to_string(),
+        "--backend".to_owned(),
         env_required_nonempty("RUSTYNET_BACKEND", "backend mode")?,
-        "--wg-interface".to_string(),
+        "--wg-interface".to_owned(),
         wg_interface,
-        "--wg-listen-port".to_string(),
+        "--wg-listen-port".to_owned(),
         wg_listen_port.to_string(),
-        "--wg-private-key".to_string(),
+        "--wg-private-key".to_owned(),
         env_required_path("RUSTYNET_WG_PRIVATE_KEY")?
             .display()
             .to_string(),
-        "--wg-encrypted-private-key".to_string(),
+        "--wg-encrypted-private-key".to_owned(),
         env_required_path("RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY")?
             .display()
             .to_string(),
-        "--wg-key-passphrase".to_string(),
+        "--wg-key-passphrase".to_owned(),
         wg_passphrase_path.display().to_string(),
-        "--wg-public-key".to_string(),
+        "--wg-public-key".to_owned(),
         env_required_path("RUSTYNET_WG_PUBLIC_KEY")?
             .display()
             .to_string(),
-        "--egress-interface".to_string(),
+        "--egress-interface".to_owned(),
         env_string_or_default("RUSTYNET_EGRESS_INTERFACE", "")?,
-        "--dataplane-mode".to_string(),
+        "--dataplane-mode".to_owned(),
         env_required_nonempty("RUSTYNET_DATAPLANE_MODE", "dataplane mode")?,
-        "--privileged-helper-socket".to_string(),
+        "--privileged-helper-socket".to_owned(),
         service.helper_socket_path.display().to_string(),
-        "--privileged-helper-timeout-ms".to_string(),
+        "--privileged-helper-timeout-ms".to_owned(),
         helper_timeout_ms.to_string(),
-        "--reconcile-interval-ms".to_string(),
+        "--reconcile-interval-ms".to_owned(),
         parse_env_u64_with_default("RUSTYNET_RECONCILE_INTERVAL_MS", 1000)?.to_string(),
-        "--max-reconcile-failures".to_string(),
+        "--max-reconcile-failures".to_owned(),
         parse_env_u64_with_default("RUSTYNET_MAX_RECONCILE_FAILURES", 5)?.to_string(),
-        "--fail-closed-ssh-allow".to_string(),
+        "--fail-closed-ssh-allow".to_owned(),
         if fail_closed_ssh_allow {
-            "true".to_string()
+            "true".to_owned()
         } else {
-            "false".to_string()
+            "false".to_owned()
         },
-        "--fail-closed-ssh-allow-cidrs".to_string(),
+        "--fail-closed-ssh-allow-cidrs".to_owned(),
         env_string_or_default("RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS", "")?,
     ];
 
     let helper_environment = vec![
         (
-            "RUSTYNET_WG_BINARY_PATH".to_string(),
+            "RUSTYNET_WG_BINARY_PATH".to_owned(),
             wg_binary_path.display().to_string(),
         ),
         (
-            "RUSTYNET_WIREGUARD_GO_BINARY_PATH".to_string(),
+            "RUSTYNET_WIREGUARD_GO_BINARY_PATH".to_owned(),
             wireguard_go_binary_path.display().to_string(),
         ),
         (
-            "RUSTYNET_IFCONFIG_BINARY_PATH".to_string(),
+            "RUSTYNET_IFCONFIG_BINARY_PATH".to_owned(),
             ifconfig_binary_path.display().to_string(),
         ),
         (
-            "RUSTYNET_ROUTE_BINARY_PATH".to_string(),
+            "RUSTYNET_ROUTE_BINARY_PATH".to_owned(),
             route_binary_path.display().to_string(),
         ),
         (
-            "RUSTYNET_PFCTL_BINARY_PATH".to_string(),
+            "RUSTYNET_PFCTL_BINARY_PATH".to_owned(),
             pfctl_binary_path.display().to_string(),
         ),
         (
-            "RUSTYNET_KILL_BINARY_PATH".to_string(),
+            "RUSTYNET_KILL_BINARY_PATH".to_owned(),
             kill_binary_path.display().to_string(),
         ),
     ];
 
     let mut daemon_environment = helper_environment.clone();
     daemon_environment.push((
-        "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT".to_string(),
+        "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT".to_owned(),
         keychain_account,
     ));
     daemon_environment.push((
-        "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE".to_string(),
+        "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE".to_owned(),
         keychain_service,
     ));
     daemon_environment.push((
-        "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH".to_string(),
+        "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH".to_owned(),
         wg_passphrase_path.display().to_string(),
     ));
 
@@ -8169,7 +8160,7 @@ fn binary_path_from_env_or_command(
 
 fn resolve_absolute_command_path(command_name: &str) -> Result<PathBuf, String> {
     if command_name.trim().is_empty() {
-        return Err("command name must not be empty".to_string());
+        return Err("command name must not be empty".to_owned());
     }
     if command_name.contains('/') {
         let path = PathBuf::from(command_name);
@@ -8178,7 +8169,7 @@ fn resolve_absolute_command_path(command_name: &str) -> Result<PathBuf, String> 
         }
         return Ok(path);
     }
-    let path_env = std::env::var_os("PATH").ok_or_else(|| "PATH is not set".to_string())?;
+    let path_env = std::env::var_os("PATH").ok_or_else(|| "PATH is not set".to_owned())?;
     for base in std::env::split_paths(path_env.as_os_str()) {
         let candidate = base.join(command_name);
         if let Ok(metadata) = fs::metadata(candidate.as_path())
@@ -8526,7 +8517,7 @@ fn execute_ops_disconnect_cleanup_macos() -> Result<String, String> {
     let context = macos_runtime_service_context_from_env()?;
     let interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
         .trim()
-        .to_string();
+        .to_owned();
     validate_managed_dns_interface_name(interface.as_str())?;
 
     let mut errors = Vec::new();
@@ -8716,7 +8707,7 @@ fn macos_daemon_uid_from_env() -> Result<u32, String> {
         .parse::<u32>()
         .map_err(|err| format!("invalid daemon uid value '{raw_uid}': {err}"))?;
     if daemon_uid == 0 {
-        return Err("daemon uid must be a non-root user on macOS".to_string());
+        return Err("daemon uid must be a non-root user on macOS".to_owned());
     }
     Ok(daemon_uid)
 }
@@ -8846,11 +8837,11 @@ fn run_command_capture(program: &str, args: &[&str]) -> Result<std::process::Out
 }
 
 fn command_failure_detail(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return stderr;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !stdout.is_empty() {
         return stdout;
     }
@@ -8888,7 +8879,7 @@ fn command_available(program: &str) -> bool {
 fn execute_ops_ensure_signing_passphrase_material() -> Result<String, String> {
     let config = signing_passphrase_ops_config_from_env()?;
     ensure_signing_passphrase_material_ops(&config)?;
-    Ok("signing passphrase material verified".to_string())
+    Ok("signing passphrase material verified".to_owned())
 }
 
 fn execute_ops_ensure_local_trust_material(
@@ -9162,7 +9153,7 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
 
     if !config.allow_init {
         return Err(
-            "encrypted tunnel key material is missing and initialization is not approved; set RUSTYNET_WG_CUSTODY_ALLOW_INIT=true".to_string(),
+            "encrypted tunnel key material is missing and initialization is not approved; set RUSTYNET_WG_CUSTODY_ALLOW_INIT=true".to_owned(),
         );
     }
 
@@ -9281,7 +9272,7 @@ fn execute_ops_set_assignment_refresh_exit_node(
     if cfg!(target_os = "linux") {
         // Expected runtime for assignment-refresh coupling mutation.
     } else {
-        return Err("set-assignment-refresh-exit-node is supported on Linux only".to_string());
+        return Err("set-assignment-refresh-exit-node is supported on Linux only".to_owned());
     }
     if let Some(exit_node_id_value) = exit_node_id.as_deref()
         && !is_valid_assignment_refresh_exit_node_id(exit_node_id_value)
@@ -9339,7 +9330,7 @@ fn execute_ops_apply_lan_access_coupling(
 ) -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("apply-lan-access-coupling is supported on Linux only".to_string());
+        return Err("apply-lan-access-coupling is supported on Linux only".to_owned());
     }
     if !assignment_refresh_env_path.is_absolute() {
         return Err(format!(
@@ -9386,14 +9377,14 @@ fn execute_ops_apply_lan_access_coupling(
         ));
     }
     let node_role = status_field(status.message.as_str(), "node_role")
-        .ok_or_else(|| "daemon status missing node_role".to_string())?;
+        .ok_or_else(|| "daemon status missing node_role".to_owned())?;
     if node_role == "blind_exit" {
-        return Err("LAN access coupling is not permitted for blind_exit role".to_string());
+        return Err("LAN access coupling is not permitted for blind_exit role".to_owned());
     }
     let selected_exit_node = status_field(status.message.as_str(), "exit_node")
-        .ok_or_else(|| "daemon status missing exit_node".to_string())?;
+        .ok_or_else(|| "daemon status missing exit_node".to_owned())?;
     if enable && (selected_exit_node.is_empty() || selected_exit_node == "none") {
-        return Err("select an exit node before enabling LAN access".to_string());
+        return Err("select an exit node before enabling LAN access".to_owned());
     }
 
     let persisted_exit_node =
@@ -9408,8 +9399,7 @@ fn execute_ops_apply_lan_access_coupling(
             }
             None => {
                 return Err(
-                    "assignment refresh env is missing RUSTYNET_ASSIGNMENT_EXIT_NODE_ID; re-select the exit node first"
-                        .to_string(),
+                    "assignment refresh env is missing RUSTYNET_ASSIGNMENT_EXIT_NODE_ID; re-select the exit node first".to_owned(),
                 );
             }
         }
@@ -9547,7 +9537,7 @@ fn execute_ops_apply_role_coupling(
 ) -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("apply-role-coupling is supported on Linux only".to_string());
+        return Err("apply-role-coupling is supported on Linux only".to_owned());
     }
     if !assignment_refresh_env_path.is_absolute() {
         return Err(format!(
@@ -9599,7 +9589,7 @@ fn execute_ops_apply_role_coupling(
     {
         if skip_client_exit_route_convergence_wait {
             warnings
-                .push("skipped client exit route convergence wait after role coupling".to_string());
+                .push("skipped client exit route convergence wait after role coupling".to_owned());
         } else {
             let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
             if let Err(err) = wait_for_client_exit_route_convergence(
@@ -9617,8 +9607,7 @@ fn execute_ops_apply_role_coupling(
 
     if target_role == "admin"
         && enable_exit_advertise
-        && let Err(err) =
-            send_role_coupling_ipc(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()))
+        && let Err(err) = send_role_coupling_ipc(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()))
     {
         warnings.push(format!("advertise default exit route failed: {err}"));
     }
@@ -9727,7 +9716,7 @@ fn execute_ops_prepare_system_dirs() -> Result<String, String> {
 fn managed_dns_interface_name_from_env() -> Result<String, String> {
     let interface = env_string_or_default("RUSTYNET_WG_INTERFACE", DEFAULT_WG_INTERFACE)?
         .trim()
-        .to_string();
+        .to_owned();
     validate_managed_dns_interface_name(interface.as_str())?;
     Ok(interface)
 }
@@ -9735,14 +9724,14 @@ fn managed_dns_interface_name_from_env() -> Result<String, String> {
 fn validate_managed_dns_interface_name(interface: &str) -> Result<(), String> {
     if interface.is_empty() || interface.len() > 15 {
         return Err(
-            "managed DNS routing interface name length must be between 1 and 15".to_string(),
+            "managed DNS routing interface name length must be between 1 and 15".to_owned(),
         );
     }
     if !interface
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
     {
-        return Err("managed DNS routing interface contains invalid characters".to_string());
+        return Err("managed DNS routing interface contains invalid characters".to_owned());
     }
     Ok(())
 }
@@ -9762,7 +9751,7 @@ fn managed_dns_resolver_bind_addr_from_env() -> Result<SocketAddr, String> {
         .parse::<SocketAddr>()
         .map_err(|err| format!("invalid managed DNS resolver bind addr: {err}"))?;
     if !addr.ip().is_loopback() {
-        return Err("managed DNS resolver bind addr must be loopback".to_string());
+        return Err("managed DNS resolver bind addr must be loopback".to_owned());
     }
     Ok(addr)
 }
@@ -9771,10 +9760,9 @@ fn managed_dns_resolver_server_arg(addr: SocketAddr) -> Result<String, String> {
     match addr {
         SocketAddr::V4(v4) if v4.ip().is_loopback() => Ok(format!("{}:{}", v4.ip(), v4.port())),
         SocketAddr::V6(_) => Err(
-            "managed DNS routing currently requires an IPv4 loopback resolver bind addr"
-                .to_string(),
+            "managed DNS routing currently requires an IPv4 loopback resolver bind addr".to_owned(),
         ),
-        _ => Err("managed DNS resolver bind addr must be loopback".to_string()),
+        _ => Err("managed DNS resolver bind addr must be loopback".to_owned()),
     }
 }
 
@@ -9788,10 +9776,10 @@ fn ensure_systemd_resolved_active() -> Result<(), String> {
             format!("invoke systemctl is-active systemd-resolved.service failed: {err}")
         })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if stderr.is_empty() {
             return Err(
-                "systemd-resolved.service must be active for managed DNS routing".to_string(),
+                "systemd-resolved.service must be active for managed DNS routing".to_owned(),
             );
         }
         return Err(format!(
@@ -9825,7 +9813,7 @@ fn run_resolvectl_action(args: &[&str]) -> Result<(), String> {
         .output()
         .map_err(|err| format!("invoke resolvectl {} failed: {err}", args.join(" ")))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let detail = if stderr.is_empty() {
             format!("status {}", output.status)
         } else {
@@ -9839,7 +9827,7 @@ fn run_resolvectl_action(args: &[&str]) -> Result<(), String> {
 fn execute_ops_apply_blind_exit_lockdown() -> Result<String, String> {
     require_root_execution()?;
     if !cfg!(target_os = "linux") {
-        return Err("apply-blind-exit-lockdown is supported on Linux only".to_string());
+        return Err("apply-blind-exit-lockdown is supported on Linux only".to_owned());
     }
 
     let assignment_signing_secret_path = env_path_or_default(
@@ -9906,7 +9894,7 @@ fn execute_ops_init_membership() -> Result<String, String> {
     if node_role == "blind_exit"
         && !matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
     {
-        return Err("blind_exit role is supported on Linux only".to_string());
+        return Err("blind_exit role is supported on Linux only".to_owned());
     }
 
     let snapshot_path = env_path_or_default(
@@ -9930,11 +9918,11 @@ fn execute_ops_init_membership() -> Result<String, String> {
     }
     let network_id = env_string_or_default("RUSTYNET_NETWORK_ID", "local-net")?;
     if network_id.trim().is_empty() {
-        return Err("membership network id must not be empty".to_string());
+        return Err("membership network id must not be empty".to_owned());
     }
     let rustynetd_bin = env_string_or_default("RUSTYNET_RUSTYNETD_BIN", "rustynetd")?;
     if rustynetd_bin.trim().is_empty() {
-        return Err("RUSTYNET_RUSTYNETD_BIN must not be empty".to_string());
+        return Err("RUSTYNET_RUSTYNETD_BIN must not be empty".to_owned());
     }
 
     for path in [
@@ -9997,8 +9985,8 @@ fn execute_ops_init_membership() -> Result<String, String> {
 
     let cleanup_result = secure_remove_file(passphrase_tmp.as_path());
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let detail = if !stderr.is_empty() { stderr } else { stdout };
         return Err(format!("rustynetd membership init failed: {detail}"));
     }
@@ -10173,12 +10161,11 @@ fn required_macos_tunnel_keychain_account(account: &str) -> Result<String, Strin
     let normalized = account.trim();
     if normalized.is_empty() {
         return Err(
-            "macOS tunnel keychain account is required (RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT)"
-                .to_string(),
+            "macOS tunnel keychain account is required (RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT)".to_owned(),
         );
     }
     if normalized.len() > 128 {
-        return Err("macOS tunnel keychain account exceeds max length (128)".to_string());
+        return Err("macOS tunnel keychain account exceeds max length (128)".to_owned());
     }
     if !normalized
         .chars()
@@ -10186,18 +10173,17 @@ fn required_macos_tunnel_keychain_account(account: &str) -> Result<String, Strin
     {
         return Err(
             "macOS tunnel keychain account contains invalid characters; allowed: [A-Za-z0-9._-]"
-                .to_string(),
+                .to_owned(),
         );
     }
-    Ok(normalized.to_string())
+    Ok(normalized.to_owned())
 }
 
 fn macos_generic_password_exists(service: &str, account: &str) -> Result<bool, String> {
     let normalized_service = service.trim();
     if normalized_service.is_empty() {
         return Err(
-            "macOS tunnel keychain service is required (RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE)"
-                .to_string(),
+            "macOS tunnel keychain service is required (RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE)".to_owned(),
         );
     }
     let status = Command::new("security")
@@ -10397,7 +10383,7 @@ fn rewrite_env_key_value(body: &str, key: &str, value: &str) -> String {
             }
             continue;
         }
-        rewritten_lines.push(line.to_string());
+        rewritten_lines.push(line.to_owned());
     }
     if !inserted {
         rewritten_lines.push(assignment);
@@ -10592,12 +10578,12 @@ fn local_traversal_refresh_config_from_assignment_env(
 ) -> Result<LocalTraversalRefreshConfig, String> {
     let local_node_id = assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID")?
         .ok_or_else(|| {
-        "assignment refresh env is missing RUSTYNET_ASSIGNMENT_TARGET_NODE_ID".to_string()
+        "assignment refresh env is missing RUSTYNET_ASSIGNMENT_TARGET_NODE_ID".to_owned()
     })?;
     let nodes_spec = assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_NODES")?
-        .ok_or_else(|| "assignment refresh env is missing RUSTYNET_ASSIGNMENT_NODES".to_string())?;
+        .ok_or_else(|| "assignment refresh env is missing RUSTYNET_ASSIGNMENT_NODES".to_owned())?;
     let allow_spec = assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_ALLOW")?
-        .ok_or_else(|| "assignment refresh env is missing RUSTYNET_ASSIGNMENT_ALLOW".to_string())?;
+        .ok_or_else(|| "assignment refresh env is missing RUSTYNET_ASSIGNMENT_ALLOW".to_owned())?;
     local_traversal_refresh_env_body(
         local_node_id.as_str(),
         nodes_spec.as_str(),
@@ -10736,7 +10722,7 @@ fn wait_for_runtime_ready_after_restart(
             .map_err(|err| format!("invoke rustynet status failed: {err}"))?;
         let stdout = String::from_utf8_lossy(&status_output.stdout)
             .trim()
-            .to_string();
+            .to_owned();
         if status_output.status.success() && daemon_runtime_ready_from_status_text(&stdout) {
             return Ok(());
         }
@@ -11033,7 +11019,7 @@ fn ensure_signing_passphrase_material_macos(
     if config.macos_keychain_account.trim().is_empty() {
         return Err(
             "macOS keychain account is required (RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT)"
-                .to_string(),
+                .to_owned(),
         );
     }
     let status = Command::new("security")
@@ -11220,7 +11206,7 @@ fn scrub_file_contents(path: &Path) -> Result<(), String> {
     let zero_chunk = [0u8; 8192];
     while remaining > 0 {
         let write_len = usize::try_from(std::cmp::min(remaining, zero_chunk.len() as u64))
-            .map_err(|_| "internal length conversion failed".to_string())?;
+            .map_err(|_| "internal length conversion failed".to_owned())?;
         file.write_all(&zero_chunk[..write_len])
             .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
         remaining = remaining.saturating_sub(write_len as u64);
@@ -11279,7 +11265,7 @@ fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) 
             }
             continue;
         }
-        rewritten_lines.push(line.to_string());
+        rewritten_lines.push(line.to_owned());
     }
     if !inserted && let Some(exit_node_id_value) = exit_node_id {
         rewritten_lines.push(
@@ -11323,7 +11309,7 @@ fn rewrite_assignment_refresh_lan_routes(body: &str, lan_routes: &[String]) -> S
             inserted = true;
             continue;
         }
-        rewritten_lines.push(line.to_string());
+        rewritten_lines.push(line.to_owned());
     }
     if !inserted && !lan_routes.is_empty() {
         rewritten_lines.push(
@@ -11359,7 +11345,7 @@ fn rewrite_assignment_refresh_lan_block_routes(body: &str, lan_routes: &[String]
             inserted = true;
             continue;
         }
-        rewritten_lines.push(line.to_string());
+        rewritten_lines.push(line.to_owned());
     }
     if !inserted && !lan_routes.is_empty() {
         rewritten_lines.push(
@@ -11380,7 +11366,7 @@ fn require_root_execution() -> Result<(), String> {
     if Uid::effective().is_root() {
         return Ok(());
     }
-    Err("run as root".to_string())
+    Err("run as root".to_owned())
 }
 
 fn parse_env_bool_with_default(key: &str, default: &str) -> Result<bool, String> {
@@ -11398,7 +11384,7 @@ fn parse_bool_value(key: &str, value: &str) -> Result<bool, String> {
 
 fn validate_assignment_refresh_lan_routes(lan_routes: &[String]) -> Result<(), String> {
     if lan_routes.is_empty() {
-        return Err("at least one LAN route CIDR is required".to_string());
+        return Err("at least one LAN route CIDR is required".to_owned());
     }
     let mut seen = HashSet::new();
     for cidr in lan_routes {
@@ -11474,9 +11460,9 @@ fn wait_for_client_exit_route_convergence(
             let route_output = run_command_capture("ip", &["-4", "route", "get", "1.1.1.1"])?;
             last_route = String::from_utf8_lossy(&route_output.stdout)
                 .trim()
-                .to_string();
+                .to_owned();
             if status_field(status.message.as_str(), "exit_node")
-                == Some(expected_exit_node.to_string())
+                == Some(expected_exit_node.to_owned())
                 && daemon_runtime_ready_from_status_text(status.message.as_str())
                 && route_output.status.success()
                 && route_uses_rustynet0(last_route.as_str())
@@ -11557,7 +11543,7 @@ fn env_optional_string(key: &str) -> Result<Option<String>, String> {
 }
 
 fn env_string_or_default(key: &str, default: &str) -> Result<String, String> {
-    Ok(env_optional_string(key)?.unwrap_or_else(|| default.to_string()))
+    Ok(env_optional_string(key)?.unwrap_or_else(|| default.to_owned()))
 }
 
 fn env_required_nonempty(key: &str, label: &str) -> Result<String, String> {
@@ -11838,7 +11824,7 @@ fn emit_membership_evidence(
     environment: String,
 ) -> Result<String, String> {
     if environment.trim().is_empty() {
-        return Err("environment must not be empty".to_string());
+        return Err("environment must not be empty".to_owned());
     }
 
     let (_, entries, state) = load_current_membership_state(&paths, now_unix)?;
@@ -11951,7 +11937,7 @@ fn emit_membership_evidence(
     if negative_status != "pass" {
         return Err(
             "membership evidence generation failed: tampering checks did not fail closed"
-                .to_string(),
+                .to_owned(),
         );
     }
 
@@ -12013,7 +11999,7 @@ pub(crate) fn parse_prior_membership_evidence_body(
         state_root_hex: obj
             .get("state_root")
             .and_then(serde_json::Value::as_str)?
-            .to_string(),
+            .to_owned(),
         captured_at_unix: obj
             .get("captured_at_unix")
             .and_then(serde_json::Value::as_u64)?,
@@ -12046,19 +12032,19 @@ pub(crate) fn build_membership_evidence_diff_json(
 
     let opt_u64 = |o: Option<u64>| match o {
         Some(v) => v.to_string(),
-        None => "null".to_string(),
+        None => "null".to_owned(),
     };
     let opt_i128 = |o: Option<i128>| match o {
         Some(v) => v.to_string(),
-        None => "null".to_string(),
+        None => "null".to_owned(),
     };
     let opt_bool = |o: Option<bool>| match o {
         Some(v) => v.to_string(),
-        None => "null".to_string(),
+        None => "null".to_owned(),
     };
     let opt_string = |o: Option<String>| match o {
         Some(v) => format!("\"{}\"", escape_json(&v)),
-        None => "null".to_string(),
+        None => "null".to_owned(),
     };
 
     format!(
@@ -12124,14 +12110,14 @@ fn detect_tampered_log(source_path: &Path, output_dir: &Path) -> Result<bool, St
     } else if let Some((version_line, remainder)) = original.split_once('\n') {
         if !version_line.starts_with("version=") {
             fs::remove_file(&tampered_path).ok();
-            return Err("membership log missing version line".to_string());
+            return Err("membership log missing version line".to_owned());
         }
         format!("version=255\n{remainder}")
     } else if original.starts_with("version=") {
-        "version=255\n".to_string()
+        "version=255\n".to_owned()
     } else {
         fs::remove_file(&tampered_path).ok();
-        return Err("membership log missing version line".to_string());
+        return Err("membership log missing version line".to_owned());
     };
     fs::write(&tampered_path, tampered).map_err(|err| err.to_string())?;
     let detected = load_membership_log(&tampered_path).is_err();
@@ -12147,15 +12133,15 @@ fn detect_tampered_snapshot(source_path: &Path, output_dir: &Path) -> Result<boo
     let mut tampered_lines = Vec::new();
     for line in original.lines() {
         if line.starts_with("digest=") && !replaced {
-            tampered_lines.push("digest=00".to_string());
+            tampered_lines.push("digest=00".to_owned());
             replaced = true;
         } else {
-            tampered_lines.push(line.to_string());
+            tampered_lines.push(line.to_owned());
         }
     }
     if !replaced {
         fs::remove_file(&tampered_path).ok();
-        return Err("membership snapshot missing digest line".to_string());
+        return Err("membership snapshot missing digest line".to_owned());
     }
     fs::write(&tampered_path, tampered_lines.join("\n") + "\n").map_err(|err| err.to_string())?;
     let detected = load_membership_snapshot(&tampered_path).is_err();
@@ -12198,7 +12184,7 @@ fn encrypted_secret_permission_policy(path: &Path) -> KeyCustodyPermissionPolicy
 fn load_signing_key(path: &Path, passphrase_path: &Path) -> Result<SigningKey, String> {
     let secret = load_encrypted_secret_material(path, passphrase_path, "signing key")?;
     if secret.len() != 32 {
-        return Err("decrypted signing key must be exactly 32 bytes".to_string());
+        return Err("decrypted signing key must be exactly 32 bytes".to_owned());
     }
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(secret.as_slice());
@@ -12314,7 +12300,7 @@ fn persist_encrypted_secret_material(
 fn decode_hex_to_32(encoded: &str) -> Result<[u8; 32], String> {
     let trimmed = encoded.trim();
     if trimmed.len() != 64 {
-        return Err("signing key must be 32-byte hex".to_string());
+        return Err("signing key must be 32-byte hex".to_owned());
     }
     let mut out = [0u8; 32];
     let raw = trimmed.as_bytes();
@@ -12333,7 +12319,7 @@ fn decode_hex_nibble(value: u8) -> Result<u8, String> {
         b'0'..=b'9' => Ok(value - b'0'),
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err("invalid hex character in signing key".to_string()),
+        _ => Err("invalid hex character in signing key".to_owned()),
     }
 }
 
@@ -12403,12 +12389,12 @@ fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, Stri
     {
         let fields = raw.split('|').collect::<Vec<_>>();
         if fields.len() < 3 || fields.len() > 7 {
-            return Err("invalid --nodes entry format; expected node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv]".to_string());
+            return Err("invalid --nodes entry format; expected node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv]".to_owned());
         }
 
         let node_id = fields[0].trim();
         if node_id.is_empty() {
-            return Err("node_id must not be empty in --nodes".to_string());
+            return Err("node_id must not be empty in --nodes".to_owned());
         }
         let endpoint = fields[1].trim();
         endpoint
@@ -12418,27 +12404,27 @@ fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, Stri
             .map_err(|err| format!("invalid public key for node {node_id}: {err}"))?;
         let owner = fields
             .get(3)
-            .map(|value| value.trim().to_string())
+            .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| node_id.to_string());
+            .unwrap_or_else(|| node_id.to_owned());
         let hostname = fields
             .get(4)
-            .map(|value| value.trim().to_string())
+            .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| node_id.to_string());
+            .unwrap_or_else(|| node_id.to_owned());
         let os = fields
             .get(5)
-            .map(|value| value.trim().to_string())
+            .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "linux".to_string());
+            .unwrap_or_else(|| "linux".to_owned());
         let tags = fields
             .get(6)
-            .map(|value| split_csv((*value).to_string()))
+            .map(|value| split_csv((*value).to_owned()))
             .unwrap_or_default();
 
         nodes.push(AssignmentNodeSpec {
-            node_id: node_id.to_string(),
-            endpoint: endpoint.to_string(),
+            node_id: node_id.to_owned(),
+            endpoint: endpoint.to_owned(),
             public_key,
             owner,
             hostname,
@@ -12447,7 +12433,7 @@ fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, Stri
         });
     }
     if nodes.is_empty() {
-        return Err("at least one node is required in --nodes".to_string());
+        return Err("at least one node is required in --nodes".to_owned());
     }
     Ok(nodes)
 }
@@ -12463,21 +12449,21 @@ fn parse_assignment_allow_pairs(encoded: &str) -> Result<Vec<AssignmentAllowPair
         if fields.len() != 2 {
             return Err(
                 "invalid --allow entry format; expected source_node_id|destination_node_id"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         let source_node_id = fields[0].trim();
         let destination_node_id = fields[1].trim();
         if source_node_id.is_empty() || destination_node_id.is_empty() {
-            return Err("allow pair node ids must not be empty".to_string());
+            return Err("allow pair node ids must not be empty".to_owned());
         }
         pairs.push(AssignmentAllowPair {
-            source_node_id: source_node_id.to_string(),
-            destination_node_id: destination_node_id.to_string(),
+            source_node_id: source_node_id.to_owned(),
+            destination_node_id: destination_node_id.to_owned(),
         });
     }
     if pairs.is_empty() {
-        return Err("at least one allow pair is required in --allow".to_string());
+        return Err("at least one allow pair is required in --allow".to_owned());
     }
     Ok(pairs)
 }
@@ -12493,7 +12479,7 @@ fn parse_traversal_candidates(encoded: &str) -> Result<Vec<TraversalCandidateSpe
         if fields.len() < 3 || fields.len() > 4 {
             return Err(
                 "invalid --candidates entry format; expected type|endpoint|priority[|relay_id]"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         let candidate_type = match fields[0] {
@@ -12506,7 +12492,7 @@ fn parse_traversal_candidates(encoded: &str) -> Result<Vec<TraversalCandidateSpe
                 ));
             }
         };
-        let endpoint = fields[1].to_string();
+        let endpoint = fields[1].to_owned();
         endpoint
             .parse::<SocketAddr>()
             .map_err(|_| format!("invalid traversal candidate endpoint: {endpoint}"))?;
@@ -12515,13 +12501,13 @@ fn parse_traversal_candidates(encoded: &str) -> Result<Vec<TraversalCandidateSpe
             .map_err(|err| format!("invalid traversal candidate priority: {err}"))?;
         let relay_id = fields
             .get(3)
-            .map(|value| value.trim().to_string())
+            .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
         if matches!(candidate_type, EndpointHintCandidateType::Relay) && relay_id.is_none() {
-            return Err("relay traversal candidates require relay_id".to_string());
+            return Err("relay traversal candidates require relay_id".to_owned());
         }
         if !matches!(candidate_type, EndpointHintCandidateType::Relay) && relay_id.is_some() {
-            return Err("relay_id is only valid for relay traversal candidates".to_string());
+            return Err("relay_id is only valid for relay traversal candidates".to_owned());
         }
         candidates.push(TraversalCandidateSpec {
             candidate_type,
@@ -12531,7 +12517,7 @@ fn parse_traversal_candidates(encoded: &str) -> Result<Vec<TraversalCandidateSpe
         });
     }
     if candidates.is_empty() {
-        return Err("at least one traversal candidate is required in --candidates".to_string());
+        return Err("at least one traversal candidate is required in --candidates".to_owned());
     }
     Ok(candidates)
 }
@@ -12555,7 +12541,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
             ));
         }
         if raw_line.is_empty() {
-            return Err("dns zone records manifest must not contain blank lines".to_string());
+            return Err("dns zone records manifest must not contain blank lines".to_owned());
         }
         if raw_line.len() > DNS_ZONE_RECORDS_MANIFEST_MAX_LINE_BYTES {
             return Err(format!(
@@ -12564,11 +12550,11 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
         }
         let (raw_key, raw_value) = raw_line
             .split_once('=')
-            .ok_or_else(|| "invalid dns zone records manifest line".to_string())?;
+            .ok_or_else(|| "invalid dns zone records manifest line".to_owned())?;
         let key = raw_key.trim();
         let value = raw_value.trim();
         if key.is_empty() {
-            return Err("dns zone records manifest key must not be empty".to_string());
+            return Err("dns zone records manifest key must not be empty".to_owned());
         }
         if key != raw_key || value != raw_value {
             return Err(format!(
@@ -12595,16 +12581,16 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
                 "unsupported dns zone records manifest field: {key}"
             ));
         }
-        if fields.insert(key.to_string(), value.to_string()).is_some() {
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
             return Err(format!("duplicate dns zone records manifest field: {key}"));
         }
     }
 
     if fields.is_empty() {
-        return Err("dns zone records manifest is empty".to_string());
+        return Err("dns zone records manifest is empty".to_owned());
     }
     if fields.get("version").map(String::as_str) != Some("1") {
-        return Err("unsupported dns zone records manifest version".to_string());
+        return Err("unsupported dns zone records manifest version".to_owned());
     }
 
     let record_count = parse_dns_zone_records_manifest_usize_field(&fields, "record_count")?;
@@ -12624,7 +12610,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
         let target_node_id =
             required_dns_zone_records_manifest_field(&fields, index, "target_node_id")?
                 .trim()
-                .to_string();
+                .to_owned();
         if target_node_id.is_empty() {
             return Err(format!(
                 "dns zone record {index} target_node_id must not be empty"
@@ -12647,7 +12633,7 @@ fn load_dns_zone_records_manifest(path: &Path) -> Result<Vec<DnsZoneRecordSpec>,
         expected_field_count = expected_field_count
             .checked_add(4)
             .and_then(|value| value.checked_add(alias_count))
-            .ok_or_else(|| "dns zone records manifest field count overflow".to_string())?;
+            .ok_or_else(|| "dns zone records manifest field count overflow".to_owned())?;
 
         let mut aliases = Vec::with_capacity(alias_count);
         let mut seen_aliases = HashSet::new();
@@ -12821,7 +12807,7 @@ fn load_assignment_signing_secret(path: &Path, passphrase_path: &Path) -> Result
     let secret =
         load_encrypted_secret_material(path, passphrase_path, "assignment signing secret")?;
     if secret.len() < 32 {
-        return Err("assignment signing secret must be at least 32 bytes".to_string());
+        return Err("assignment signing secret must be at least 32 bytes".to_owned());
     }
     Ok(secret.to_vec())
 }
@@ -13089,7 +13075,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Backup(_)
         | CliCommand::RestoreState(_)
         | CliCommand::ExportKeys(_)
-        | CliCommand::Config(_) => IpcCommand::Unknown("unsupported".to_string()),
+        | CliCommand::Config(_) => IpcCommand::Unknown("unsupported".to_owned()),
     }
 }
 
@@ -13164,13 +13150,13 @@ fn send_command_with_socket(
 }
 
 fn version_text() -> String {
-    "rustynet 0.1.0".to_string()
+    "rustynet 0.1.0".to_owned()
 }
 
 fn execute_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
-    let mut lines = vec!["rustynet 0.1.0".to_string()];
+    let mut lines = vec!["rustynet 0.1.0".to_owned()];
 
     if let Some(path_str) = std::env::current_exe()
         .ok()
@@ -13187,7 +13173,7 @@ fn execute_info() -> Result<String, String> {
     }
 
     if rustynet_sysinfo::git_version().is_some() {
-        lines.push("git: available".to_string());
+        lines.push("git: available".to_owned());
     }
 
     Ok(lines.join("\n"))
@@ -13201,9 +13187,9 @@ fn execute_doctor() -> Result<String, String> {
     match std::env::current_exe() {
         Ok(exe_path) => {
             if exe_path.exists() {
-                checks.push("✓ binary exists".to_string());
+                checks.push("✓ binary exists".to_owned());
             } else {
-                checks.push("✗ binary not found".to_string());
+                checks.push("✗ binary not found".to_owned());
                 all_pass = false;
             }
         }
@@ -13232,7 +13218,7 @@ fn execute_doctor() -> Result<String, String> {
     // Platform-agnostic checks
     let trust_path = PathBuf::from(DEFAULT_TRUST_VERIFIER_KEY_PATH);
     if trust_path.exists() {
-        checks.push("✓ trust verifier key present".to_string());
+        checks.push("✓ trust verifier key present".to_owned());
     } else {
         checks.push(format!(
             "⚠ trust verifier key not found at {}",
@@ -13342,7 +13328,7 @@ fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
     // Check launchd plist
     let user_plist = PathBuf::from(
         std::env::var("HOME")
-            .unwrap_or_else(|_| ".".to_string())
+            .unwrap_or_else(|_| ".".to_owned())
             .as_str(),
     )
     .join("Library/LaunchAgents/com.rustynet.daemon.plist");
@@ -13350,11 +13336,11 @@ fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
     let system_plist = PathBuf::from("/Library/LaunchDaemons/com.rustynet.daemon.plist");
 
     if user_plist.exists() {
-        checks.push("✓ user launchd plist found".to_string());
+        checks.push("✓ user launchd plist found".to_owned());
     } else if system_plist.exists() {
-        checks.push("✓ system launchd plist found".to_string());
+        checks.push("✓ system launchd plist found".to_owned());
     } else {
-        checks.push("⚠ rustynet launchd plist not found".to_string());
+        checks.push("⚠ rustynet launchd plist not found".to_owned());
     }
 
     // Check key file existence
@@ -13377,21 +13363,21 @@ fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
-        checks.push("✓ WireGuard passphrase in Keychain".to_string());
+        checks.push("✓ WireGuard passphrase in Keychain".to_owned());
     } else {
-        checks.push("⚠ WireGuard passphrase not found in Keychain".to_string());
+        checks.push("⚠ WireGuard passphrase not found in Keychain".to_owned());
     }
 
     // Check library directories
     let lib_dir = PathBuf::from(
         std::env::var("HOME")
-            .unwrap_or_else(|_| ".".to_string())
+            .unwrap_or_else(|_| ".".to_owned())
             .as_str(),
     )
     .join("Library/Preferences/rustynet");
 
     if lib_dir.exists() {
-        checks.push("✓ preference directory exists".to_string());
+        checks.push("✓ preference directory exists".to_owned());
     }
 }
 
@@ -13482,21 +13468,21 @@ fn execute_logs(cmd: LogsCommand) -> Result<String, String> {
     }
 
     if filtered_lines.is_empty() {
-        return Ok("no matching log entries".to_string());
+        return Ok("no matching log entries".to_owned());
     }
 
     Ok(filtered_lines.join("\n"))
 }
 
 fn execute_config_show() -> Result<String, String> {
-    let mut output = vec!["rustynet configuration:".to_string(), String::new()];
+    let mut output = vec!["rustynet configuration:".to_owned(), String::new()];
 
-    output.push("Daemon settings:".to_string());
+    output.push("Daemon settings:".to_owned());
     output.push(format!("  socket: {DEFAULT_SOCKET_PATH}"));
     output.push(format!("  interface: {DEFAULT_WG_INTERFACE}"));
     output.push(String::new());
 
-    output.push("Key and Trust Paths:".to_string());
+    output.push("Key and Trust Paths:".to_owned());
     output.push(format!("  wg public key: {DEFAULT_WG_PUBLIC_KEY_PATH}"));
     output.push(format!(
         "  wg encrypted key: {DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH}"
@@ -13506,14 +13492,14 @@ fn execute_config_show() -> Result<String, String> {
     ));
     output.push(String::new());
 
-    output.push("Membership and Assignment:".to_string());
+    output.push("Membership and Assignment:".to_owned());
     output.push(format!(
         "  membership snapshot: {DEFAULT_MEMBERSHIP_SNAPSHOT_PATH}"
     ));
     output.push(format!("  membership log: {DEFAULT_MEMBERSHIP_LOG_PATH}"));
     output.push(String::new());
 
-    output.push("Traversal and DNS:".to_string());
+    output.push("Traversal and DNS:".to_owned());
     output.push(format!(
         "  traversal bundle: {DEFAULT_TRAVERSAL_BUNDLE_PATH}"
     ));
@@ -13529,7 +13515,7 @@ fn execute_config_show() -> Result<String, String> {
     output.push(format!("  dns zone name: {DEFAULT_DNS_ZONE_NAME}"));
     output.push(String::new());
 
-    output.push("Environment variables:".to_string());
+    output.push("Environment variables:".to_owned());
     let env_vars = vec![
         "RUSTYNET_WG_INTERFACE",
         "RUSTYNET_WG_LISTEN_PORT",
@@ -13549,11 +13535,11 @@ fn execute_config_show() -> Result<String, String> {
 }
 
 fn execute_debug() -> Result<String, String> {
-    let mut output = vec!["=== Rustynet Debug Bundle ===".to_string(), String::new()];
+    let mut output = vec!["=== Rustynet Debug Bundle ===".to_owned(), String::new()];
 
     match execute_info() {
         Ok(info) => {
-            output.push("--- Version Info ---".to_string());
+            output.push("--- Version Info ---".to_owned());
             output.push(info);
             output.push(String::new());
         }
@@ -13562,7 +13548,7 @@ fn execute_debug() -> Result<String, String> {
 
     match execute_config_show() {
         Ok(config) => {
-            output.push("--- Configuration ---".to_string());
+            output.push("--- Configuration ---".to_owned());
             output.push(config);
             output.push(String::new());
         }
@@ -13576,14 +13562,14 @@ fn execute_debug() -> Result<String, String> {
     };
     match execute_logs(logs_cmd) {
         Ok(logs) => {
-            output.push("--- Recent Logs (last 100 lines) ---".to_string());
+            output.push("--- Recent Logs (last 100 lines) ---".to_owned());
             output.push(logs);
             output.push(String::new());
         }
         Err(e) => output.push(format!("logs warning: {e}\n")),
     }
 
-    output.push("=== End Debug Bundle ===".to_string());
+    output.push("=== End Debug Bundle ===".to_owned());
     Ok(output.join("\n"))
 }
 
@@ -13593,10 +13579,10 @@ fn execute_peer_list() -> Result<String, String> {
         return Err(format!("daemon error: {}", response.message));
     }
 
-    let mut output = vec!["peers:".to_string()];
+    let mut output = vec!["peers:".to_owned()];
 
     if response.message.is_empty() {
-        output.push("  (no peers)".to_string());
+        output.push("  (no peers)".to_owned());
     } else {
         for line in response.message.lines() {
             output.push(format!("  {line}"));
@@ -13609,10 +13595,10 @@ fn execute_peer_list() -> Result<String, String> {
 fn execute_tunnel_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
-    let mut output = vec!["tunnel info:".to_string()];
+    let mut output = vec!["tunnel info:".to_owned()];
 
     output.push(format!("  interface: {DEFAULT_WG_INTERFACE}"));
-    output.push("  listen port: 51820".to_string());
+    output.push("  listen port: 51820".to_owned());
 
     let iface_info = rustynet_sysinfo::wireguard_interface_info(DEFAULT_WG_INTERFACE);
     if iface_info.exists {
@@ -13621,7 +13607,7 @@ fn execute_tunnel_info() -> Result<String, String> {
             if iface_info.is_up { "up" } else { "down" }
         ));
     } else {
-        output.push("  status: interface not found".to_string());
+        output.push("  status: interface not found".to_owned());
     }
 
     Ok(output.join("\n"))
@@ -13631,7 +13617,7 @@ fn execute_sysinfo() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let info = rustynet_sysinfo::system_info();
-    let mut output = vec!["system information:".to_string()];
+    let mut output = vec!["system information:".to_owned()];
     output.push(format!("  os: {}", info.os));
     output.push(format!("  arch: {}", info.arch));
     output.push(format!("  cpu count: {}", info.cpu_count));
@@ -13660,7 +13646,7 @@ fn execute_network_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let interfaces = rustynet_sysinfo::network_interfaces();
-    let mut output = vec!["network interfaces:".to_string()];
+    let mut output = vec!["network interfaces:".to_owned()];
 
     for iface in interfaces {
         output.push(format!(
@@ -13683,13 +13669,13 @@ fn execute_security_check() -> Result<String, String> {
 
     let result = rustynet_sysinfo::security_checks("");
     let mut output = if result.passed {
-        vec!["security check: passed".to_string()]
+        vec!["security check: passed".to_owned()]
     } else {
-        vec!["security check: failed".to_string()]
+        vec!["security check: failed".to_owned()]
     };
 
     if !result.issues.is_empty() {
-        output.push("  issues:".to_string());
+        output.push("  issues:".to_owned());
         for issue in result.issues {
             output.push(format!("    - {issue}"));
         }
@@ -13702,7 +13688,7 @@ fn execute_dependency_check() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let deps = rustynet_sysinfo::check_dependencies();
-    let mut output = vec!["dependency check:".to_string()];
+    let mut output = vec!["dependency check:".to_owned()];
     output.push(format!(
         "  wireguard: {}",
         if deps.wireguard_available {
@@ -13729,7 +13715,7 @@ fn execute_dependency_check() -> Result<String, String> {
     ));
 
     if !deps.messages.is_empty() {
-        output.push("  messages:".to_string());
+        output.push("  messages:".to_owned());
         for msg in deps.messages {
             output.push(format!("    - {msg}"));
         }
@@ -13742,7 +13728,7 @@ fn execute_daemon_health() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let health = rustynet_sysinfo::daemon_health();
-    let mut output = vec!["daemon health:".to_string()];
+    let mut output = vec!["daemon health:".to_owned()];
     output.push(format!(
         "  running: {}",
         if health.running { "yes" } else { "no" }
@@ -13766,13 +13752,13 @@ fn execute_config_validate() -> Result<String, String> {
 
     let result = rustynet_sysinfo::validate_config();
     let mut output = if result.passed {
-        vec!["config validation: passed".to_string()]
+        vec!["config validation: passed".to_owned()]
     } else {
-        vec!["config validation: failed".to_string()]
+        vec!["config validation: failed".to_owned()]
     };
 
     if !result.issues.is_empty() {
-        output.push("  issues:".to_string());
+        output.push("  issues:".to_owned());
         for issue in result.issues {
             output.push(format!("    - {issue}"));
         }
@@ -13785,10 +13771,10 @@ fn execute_wg_addresses() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let addresses = rustynet_sysinfo::wg_addresses();
-    let mut output = vec!["tunnel ip addresses:".to_string()];
+    let mut output = vec!["tunnel ip addresses:".to_owned()];
 
     if addresses.is_empty() {
-        output.push("  (none found)".to_string());
+        output.push("  (none found)".to_owned());
     } else {
         for addr in addresses {
             output.push(format!("  {addr}"));
@@ -13802,12 +13788,12 @@ fn execute_routes() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let routes = rustynet_sysinfo::route_list();
-    let mut output = vec!["active routes:".to_string()];
+    let mut output = vec!["active routes:".to_owned()];
 
     if routes.is_empty() {
-        output.push("  (none found)".to_string());
+        output.push("  (none found)".to_owned());
     } else {
-        output.push("  destination         gateway              interface".to_string());
+        output.push("  destination         gateway              interface".to_owned());
         for route in routes {
             output.push(format!(
                 "  {:<20} {:<20} {}",
@@ -13824,18 +13810,18 @@ fn execute_key_expiry() -> Result<String, String> {
 
     let expiry = rustynet_sysinfo::key_expiry();
     let mut output = if expiry.expiring_soon {
-        vec!["key expiry: WARNING - keys expiring soon".to_string()]
+        vec!["key expiry: WARNING - keys expiring soon".to_owned()]
     } else {
-        vec!["key expiry: OK".to_string()]
+        vec!["key expiry: OK".to_owned()]
     };
 
     if !expiry.key_details.is_empty() {
-        output.push("  details:".to_string());
+        output.push("  details:".to_owned());
         for detail in expiry.key_details {
             output.push(format!("    {detail}"));
         }
     } else {
-        output.push("  (no expiring keys detected)".to_string());
+        output.push("  (no expiring keys detected)".to_owned());
     }
 
     Ok(output.join("\n"))
@@ -13845,7 +13831,7 @@ fn execute_tunnel_status() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let status = rustynet_sysinfo::tunnel_status();
-    let mut output = vec!["tunnel status:".to_string()];
+    let mut output = vec!["tunnel status:".to_owned()];
     output.push(format!("  up: {}", if status.up { "yes" } else { "no" }));
     output.push(format!("  bytes sent: {}", status.bytes_sent));
     output.push(format!("  bytes received: {}", status.bytes_recv));
@@ -13860,10 +13846,10 @@ fn execute_wg_peers() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let peers = rustynet_sysinfo::wg_peers();
-    let mut output = vec!["wireguard peers:".to_string()];
+    let mut output = vec!["wireguard peers:".to_owned()];
 
     if peers.is_empty() {
-        output.push("  (none)".to_string());
+        output.push("  (none)".to_owned());
     } else {
         for peer in peers {
             output.push(format!("  {}:", peer.name));
@@ -13885,7 +13871,7 @@ fn execute_uptime() -> Result<String, String> {
     let sys_hours = info.system_uptime_secs / 3600;
     let sys_mins = (info.system_uptime_secs % 3600) / 60;
 
-    let mut output = vec!["uptime:".to_string()];
+    let mut output = vec!["uptime:".to_owned()];
     output.push(format!("  system: {sys_hours}h {sys_mins}m"));
 
     if let Some(daemon_secs) = info.daemon_uptime_secs {
@@ -13893,7 +13879,7 @@ fn execute_uptime() -> Result<String, String> {
         let daemon_mins = (daemon_secs % 3600) / 60;
         output.push(format!("  daemon: {daemon_hours}h {daemon_mins}m"));
     } else {
-        output.push("  daemon: not running".to_string());
+        output.push("  daemon: not running".to_owned());
     }
 
     Ok(output.join("\n"))
@@ -13903,12 +13889,12 @@ fn execute_process_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let info = rustynet_sysinfo::process_info();
-    let mut output = vec!["daemon process:".to_string()];
+    let mut output = vec!["daemon process:".to_owned()];
 
     if let Some(pid) = info.pid {
         output.push(format!("  pid: {pid}"));
     } else {
-        output.push("  pid: not found".to_string());
+        output.push("  pid: not found".to_owned());
     }
 
     if let Some(rss) = info.rss_mb {
@@ -13926,7 +13912,7 @@ fn execute_connection_test() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let test = rustynet_sysinfo::connection_test();
-    let mut output = vec!["connection test:".to_string()];
+    let mut output = vec!["connection test:".to_owned()];
     output.push(format!(
         "  tunnel: {}",
         if test.tunnel_reachable {
@@ -13962,7 +13948,7 @@ fn execute_log_tail(lines: usize) -> Result<String, String> {
     let tail = rustynet_sysinfo::log_tail(lines);
     let mut output = vec![format!("recent logs (last {} lines):", lines)];
     if tail.is_empty() {
-        output.push("  (no logs found)".to_string());
+        output.push("  (no logs found)".to_owned());
     } else {
         for line in tail {
             output.push(format!("  {line}"));
@@ -13976,9 +13962,9 @@ fn execute_log_errors() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let errors = rustynet_sysinfo::log_errors();
-    let mut output = vec!["recent errors:".to_string()];
+    let mut output = vec!["recent errors:".to_owned()];
     if errors.is_empty() {
-        output.push("  (no errors found)".to_string());
+        output.push("  (no errors found)".to_owned());
     } else {
         for error in errors {
             output.push(format!("  {error}"));
@@ -13992,7 +13978,7 @@ fn execute_bandwidth_test() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let test = rustynet_sysinfo::bandwidth_test();
-    let mut output = vec!["bandwidth test:".to_string()];
+    let mut output = vec!["bandwidth test:".to_owned()];
     output.push(format!("  download: {:.1} Mbps", test.download_mbps));
     output.push(format!("  upload: {:.1} Mbps", test.upload_mbps));
     output.push(format!("  latency: {:.1} ms", test.latency_ms));
@@ -14004,10 +13990,10 @@ fn execute_interface_stats() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let stats = rustynet_sysinfo::interface_stats();
-    let mut output = vec!["interface statistics:".to_string()];
+    let mut output = vec!["interface statistics:".to_owned()];
 
     if stats.is_empty() {
-        output.push("  (none)".to_string());
+        output.push("  (none)".to_owned());
     } else {
         for iface in stats {
             output.push(format!("  {}:", iface.name));
@@ -14063,7 +14049,7 @@ fn execute_health_check() -> Result<String, String> {
     ));
 
     if !health.issues.is_empty() {
-        output.push("  issues:".to_string());
+        output.push("  issues:".to_owned());
         for issue in health.issues {
             output.push(format!("    - {issue}"));
         }
@@ -14076,7 +14062,7 @@ fn execute_system_load() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let load = rustynet_sysinfo::system_load();
-    let mut output = vec!["system load:".to_string()];
+    let mut output = vec!["system load:".to_owned()];
     output.push(format!("  1 min:  {:.2}", load.cpu_load_1min));
     output.push(format!("  5 min:  {:.2}", load.cpu_load_5min));
     output.push(format!("  15 min: {:.2}", load.cpu_load_15min));
@@ -14090,7 +14076,7 @@ fn execute_memory_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let mem = rustynet_sysinfo::memory_info();
-    let mut output = vec!["memory:".to_string()];
+    let mut output = vec!["memory:".to_owned()];
     output.push(format!("  total:     {} MB", mem.total_mb));
     output.push(format!("  used:      {} MB", mem.used_mb));
     output.push(format!("  available: {} MB", mem.available_mb));
@@ -14103,10 +14089,10 @@ fn execute_disk_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let disks = rustynet_sysinfo::disk_info();
-    let mut output = vec!["disk:".to_string()];
+    let mut output = vec!["disk:".to_owned()];
 
     if disks.is_empty() {
-        output.push("  (no disk info available)".to_string());
+        output.push("  (no disk info available)".to_owned());
     } else {
         for disk in disks {
             output.push(format!("  {}:", disk.mount));
@@ -14124,7 +14110,7 @@ fn execute_cpu_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let cpu = rustynet_sysinfo::cpu_info();
-    let mut output = vec!["cpu:".to_string()];
+    let mut output = vec!["cpu:".to_owned()];
     output.push(format!("  cores: {}", cpu.cores));
     output.push(format!("  model: {}", cpu.model));
     if let Some(freq) = cpu.freq_ghz {
@@ -14138,7 +14124,7 @@ fn execute_socket_stats() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let stats = rustynet_sysinfo::socket_stats();
-    let mut output = vec!["socket statistics:".to_string()];
+    let mut output = vec!["socket statistics:".to_owned()];
     output.push(format!("  established: {}", stats.established));
     output.push(format!("  listening:   {}", stats.listening));
     output.push(format!("  time_wait:   {}", stats.time_wait));
@@ -14151,10 +14137,10 @@ fn execute_env_validate() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let issues = rustynet_sysinfo::env_validate();
-    let mut output = vec!["environment validation:".to_string()];
+    let mut output = vec!["environment validation:".to_owned()];
 
     if issues.is_empty() {
-        output.push("  all required variables set".to_string());
+        output.push("  all required variables set".to_owned());
     } else {
         for issue in issues {
             output.push(format!("  - {issue}"));
@@ -14168,10 +14154,10 @@ fn execute_process_list() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let procs = rustynet_sysinfo::process_list();
-    let mut output = vec!["running rustynet processes:".to_string()];
+    let mut output = vec!["running rustynet processes:".to_owned()];
 
     if procs.is_empty() {
-        output.push("  (none)".to_string());
+        output.push("  (none)".to_owned());
     } else {
         for proc in procs {
             output.push(format!("  {} (pid {})", proc.name, proc.pid));
@@ -14187,10 +14173,10 @@ fn execute_iface_list() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let ifaces = rustynet_sysinfo::iface_list();
-    let mut output = vec!["network interfaces:".to_string()];
+    let mut output = vec!["network interfaces:".to_owned()];
 
     if ifaces.is_empty() {
-        output.push("  (none)".to_string());
+        output.push("  (none)".to_owned());
     } else {
         for iface in ifaces {
             output.push(format!(
@@ -14225,14 +14211,14 @@ fn execute_dns_check() -> Result<String, String> {
     )];
 
     if !dns.resolvers.is_empty() {
-        output.push("  resolvers:".to_string());
+        output.push("  resolvers:".to_owned());
         for resolver in dns.resolvers {
             output.push(format!("    {resolver}"));
         }
     }
 
     if !dns.test_results.is_empty() {
-        output.push("  test results:".to_string());
+        output.push("  test results:".to_owned());
         for result in dns.test_results {
             output.push(format!("    {result}"));
         }
@@ -14245,7 +14231,7 @@ fn execute_kernel_info() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let kernel = rustynet_sysinfo::kernel_info();
-    let mut output = vec!["kernel:".to_string()];
+    let mut output = vec!["kernel:".to_owned()];
     output.push(format!("  OS: {}", kernel.version));
     output.push(format!("  release: {}", kernel.release));
     output.push(format!("  arch: {}", kernel.machine));
@@ -14257,7 +14243,7 @@ fn execute_service_check() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let svc = rustynet_sysinfo::service_check();
-    let mut output = vec!["daemon:".to_string()];
+    let mut output = vec!["daemon:".to_owned()];
     output.push(format!(
         "  running: {}",
         if svc.daemon_running { "yes" } else { "no" }
@@ -14278,10 +14264,10 @@ fn execute_permission_check() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let issues = rustynet_sysinfo::permission_check();
-    let mut output = vec!["file permissions:".to_string()];
+    let mut output = vec!["file permissions:".to_owned()];
 
     if issues.is_empty() {
-        output.push("  all permissions OK".to_string());
+        output.push("  all permissions OK".to_owned());
     } else {
         for issue in issues {
             output.push(format!("  - {issue}"));
@@ -14295,7 +14281,7 @@ fn execute_performance_test() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let perf = rustynet_sysinfo::performance_test();
-    let mut output = vec!["performance metrics:".to_string()];
+    let mut output = vec!["performance metrics:".to_owned()];
     output.push(format!("  CPU time: {} ms", perf.cpu_time_ms));
     output.push(format!("  memory alloc: {} MB", perf.memory_alloc_mb));
     output.push(format!("  disk I/O ops: {}", perf.disk_io_ops));
@@ -14330,7 +14316,7 @@ fn execute_tls_check() -> Result<String, String> {
     ));
 
     if !tls.issues.is_empty() {
-        output.push("  issues:".to_string());
+        output.push("  issues:".to_owned());
         for issue in tls.issues {
             output.push(format!("    - {issue}"));
         }
@@ -14343,7 +14329,7 @@ fn execute_rate_limit_check() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let limits = rustynet_sysinfo::rate_limit_check();
-    let mut output = vec!["rate limits:".to_string()];
+    let mut output = vec!["rate limits:".to_owned()];
     output.push(format!(
         "  connections: {}/{}",
         limits.current_connections, limits.connection_limit
@@ -14360,7 +14346,7 @@ fn execute_nat_detection() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let nat = rustynet_sysinfo::nat_detection();
-    let mut output = vec!["NAT detection:".to_string()];
+    let mut output = vec!["NAT detection:".to_owned()];
     output.push(format!(
         "  behind NAT: {}",
         if nat.behind_nat { "yes" } else { "no" }
@@ -14378,7 +14364,7 @@ fn execute_exit_node_status() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let status = rustynet_sysinfo::exit_node_status();
-    let mut output = vec!["exit node:".to_string()];
+    let mut output = vec!["exit node:".to_owned()];
     output.push(format!(
         "  reachable: {}",
         if status.reachable { "yes" } else { "no" }
@@ -14398,13 +14384,13 @@ fn execute_ipv6_support() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let ipv6 = rustynet_sysinfo::ipv6_support();
-    let mut output = vec!["IPv6:".to_string()];
+    let mut output = vec!["IPv6:".to_owned()];
     output.push(format!(
         "  available: {}",
         if ipv6.ipv6_available { "yes" } else { "no" }
     ));
     if !ipv6.ipv6_addresses.is_empty() {
-        output.push("  addresses:".to_string());
+        output.push("  addresses:".to_owned());
         for addr in ipv6.ipv6_addresses {
             output.push(format!("    {addr}"));
         }
@@ -14422,7 +14408,7 @@ fn execute_packet_loss() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let loss = rustynet_sysinfo::packet_loss_check();
-    let mut output = vec!["packet loss:".to_string()];
+    let mut output = vec!["packet loss:".to_owned()];
     output.push(format!("  loss: {:.1}%", loss.loss_percent));
     output.push(format!("  sent: {}", loss.packets_sent));
     output.push(format!("  received: {}", loss.packets_received));
@@ -14443,7 +14429,7 @@ fn execute_system_clock() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let clock = rustynet_sysinfo::system_clock_check();
-    let mut output = vec!["system clock:".to_string()];
+    let mut output = vec!["system clock:".to_owned()];
     output.push(format!(
         "  synced: {}",
         if clock.synced { "yes" } else { "no" }
@@ -14468,10 +14454,10 @@ fn execute_tcp_connections() -> Result<String, String> {
 
     let connections = rustynet_sysinfo::tcp_connections();
     if connections.is_empty() {
-        return Ok("tcp connections: (none)".to_string());
+        return Ok("tcp connections: (none)".to_owned());
     }
 
-    let mut output = vec!["tcp connections:".to_string()];
+    let mut output = vec!["tcp connections:".to_owned()];
     for conn in connections.iter().take(20) {
         output.push(format!(
             "  {} -> {} ({})",
@@ -14489,18 +14475,18 @@ fn execute_dns_resolver() -> Result<String, String> {
     use rustynet_sysinfo;
 
     let dns = rustynet_sysinfo::dns_resolver_info();
-    let mut output = vec!["dns resolver:".to_string()];
+    let mut output = vec!["dns resolver:".to_owned()];
     output.push(format!("  method: {}", dns.method));
     if dns.resolvers.is_empty() {
-        output.push("  resolvers: (none)".to_string());
+        output.push("  resolvers: (none)".to_owned());
     } else {
-        output.push("  resolvers:".to_string());
+        output.push("  resolvers:".to_owned());
         for resolver in &dns.resolvers {
             output.push(format!("    {resolver}"));
         }
     }
     if !dns.search_domains.is_empty() {
-        output.push("  search domains:".to_string());
+        output.push("  search domains:".to_owned());
         for domain in &dns.search_domains {
             output.push(format!("    {domain}"));
         }
@@ -14514,14 +14500,14 @@ fn execute_interface_speed() -> Result<String, String> {
 
     let speeds = rustynet_sysinfo::interface_speed();
     if speeds.is_empty() {
-        return Ok("interface speed: (no interfaces)".to_string());
+        return Ok("interface speed: (no interfaces)".to_owned());
     }
 
-    let mut output = vec!["interface speed:".to_string()];
+    let mut output = vec!["interface speed:".to_owned()];
     for iface in speeds {
         let speed_str = iface
             .speed_mbps
-            .map_or_else(|| "unknown".to_string(), |s| format!("{s} Mbps"));
+            .map_or_else(|| "unknown".to_owned(), |s| format!("{s} Mbps"));
         output.push(format!(
             "  {}: {} (MTU: {})",
             iface.name, speed_str, iface.mtu
@@ -14536,10 +14522,10 @@ fn execute_disk_io() -> Result<String, String> {
 
     let stats = rustynet_sysinfo::disk_io_stats();
     if stats.is_empty() {
-        return Ok("disk io stats: (not available)".to_string());
+        return Ok("disk io stats: (not available)".to_owned());
     }
 
-    let mut output = vec!["disk io stats:".to_string()];
+    let mut output = vec!["disk io stats:".to_owned()];
     for stat in stats {
         output.push(format!(
             "  {}: read_ops={} read_bytes={} write_ops={} write_bytes={}",
@@ -14555,11 +14541,11 @@ fn execute_process_memory() -> Result<String, String> {
 
     let processes = rustynet_sysinfo::process_memory();
     if processes.is_empty() {
-        return Ok("process memory: (no processes)".to_string());
+        return Ok("process memory: (no processes)".to_owned());
     }
 
-    let mut output = vec!["process memory (top 10):".to_string()];
-    output.push("  name                                         pid    memory".to_string());
+    let mut output = vec!["process memory (top 10):".to_owned()];
+    output.push("  name                                         pid    memory".to_owned());
     for proc in processes {
         output.push(format!(
             "  {:<40} {:<6} {} MB",
@@ -14574,9 +14560,9 @@ fn execute_active_network_routes() -> Result<String, String> {
     use rustynet_sysinfo;
     let routes = rustynet_sysinfo::active_network_routes();
     if routes.is_empty() {
-        return Ok("active routes: (none)".to_string());
+        return Ok("active routes: (none)".to_owned());
     }
-    let mut output = vec!["active routes:".to_string()];
+    let mut output = vec!["active routes:".to_owned()];
     for route in routes {
         output.push(format!(
             "  {} -> {} ({})",
@@ -14630,9 +14616,9 @@ fn execute_arp_table() -> Result<String, String> {
     use rustynet_sysinfo;
     let entries = rustynet_sysinfo::arp_table_entries();
     if entries.is_empty() {
-        return Ok("arp table: (empty)".to_string());
+        return Ok("arp table: (empty)".to_owned());
     }
-    let mut output = vec!["arp table entries:".to_string()];
+    let mut output = vec!["arp table entries:".to_owned()];
     for entry in entries.iter().take(10) {
         output.push(format!(
             "  {} -> {} ({})",
@@ -14649,9 +14635,9 @@ fn execute_listening_sockets() -> Result<String, String> {
     use rustynet_sysinfo;
     let sockets = rustynet_sysinfo::listening_sockets_summary();
     if sockets.is_empty() {
-        return Ok("listening sockets: (none)".to_string());
+        return Ok("listening sockets: (none)".to_owned());
     }
-    let mut output = vec!["listening sockets:".to_string()];
+    let mut output = vec!["listening sockets:".to_owned()];
     for socket in sockets.iter().take(10) {
         output.push(format!(
             "  {}:{} ({})",
@@ -14668,9 +14654,9 @@ fn execute_network_drops() -> Result<String, String> {
     use rustynet_sysinfo;
     let stats = rustynet_sysinfo::network_drop_stats();
     if stats.is_empty() {
-        return Ok("network drops: (no stats)".to_string());
+        return Ok("network drops: (no stats)".to_owned());
     }
-    let mut output = vec!["network drop stats:".to_string()];
+    let mut output = vec!["network drop stats:".to_owned()];
     for stat in stats.iter().take(5) {
         output.push(format!(
             "  {}: rx_drops={} tx_drops={} rx_errors={} tx_errors={}",
@@ -14684,9 +14670,9 @@ fn execute_tls_cert_expiry(path: &str) -> Result<String, String> {
     use rustynet_sysinfo;
     let certs = rustynet_sysinfo::tls_certificate_expiry_all(&[path]);
     if certs.is_empty() {
-        return Ok("tls certificate expiry: (no certs found)".to_string());
+        return Ok("tls certificate expiry: (no certs found)".to_owned());
     }
-    let mut output = vec!["tls certificate expiry:".to_string()];
+    let mut output = vec!["tls certificate expiry:".to_owned()];
     for cert in certs {
         output.push(format!(
             "  {}: expires in {} days ({})",
@@ -14701,7 +14687,7 @@ fn execute_selinux_status() -> Result<String, String> {
     let status = rustynet_sysinfo::selinux_status();
     let policy_version = status
         .policy_version
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| "unknown".to_owned());
     Ok(format!(
         "selinux status:\n  enabled: {}\n  mode: {}\n  policy_version: {}\n  violations since boot: {}",
         status.enabled, status.mode, policy_version, status.violations_since_boot
@@ -14712,9 +14698,9 @@ fn execute_apparmor_status() -> Result<String, String> {
     use rustynet_sysinfo;
     let profiles = rustynet_sysinfo::apparmor_profile_status();
     if profiles.is_empty() {
-        return Ok("apparmor profiles: (none loaded)".to_string());
+        return Ok("apparmor profiles: (none loaded)".to_owned());
     }
-    let mut output = vec!["apparmor profiles:".to_string()];
+    let mut output = vec!["apparmor profiles:".to_owned()];
     for profile in profiles.iter().take(10) {
         output.push(format!(
             "  {}: {} (loaded: {})",
@@ -14731,9 +14717,9 @@ fn execute_key_permissions() -> Result<String, String> {
     use rustynet_sysinfo;
     let checks = rustynet_sysinfo::cryptographic_key_permissions();
     if checks.is_empty() {
-        return Ok("key permissions: no keys found".to_string());
+        return Ok("key permissions: no keys found".to_owned());
     }
-    let mut output = vec!["key permissions:".to_string()];
+    let mut output = vec!["key permissions:".to_owned()];
     for check in checks.iter().take(10) {
         let status = if check.is_correct { "OK" } else { "FAIL" };
         output.push(format!("  {}: {} ({})", check.path, status, check.owner));
@@ -14785,7 +14771,7 @@ fn execute_cve_check(db_path: &str) -> Result<String, String> {
     use rustynet_sysinfo;
     let report = rustynet_sysinfo::open_security_vulnerabilities(db_path);
     if report.vulnerable_packages.is_empty() {
-        return Ok("vulnerability report: no vulnerabilities found".to_string());
+        return Ok("vulnerability report: no vulnerabilities found".to_owned());
     }
     let mut output = vec![format!(
         "vulnerability report ({}): ",
@@ -14825,7 +14811,7 @@ fn execute_fd_usage() -> Result<String, String> {
         usage.used, usage.limit, usage.percent_used
     )];
     if !usage.top_processes.is_empty() {
-        output.push("  top processes:".to_string());
+        output.push("  top processes:".to_owned());
         for proc in &usage.top_processes {
             output.push(format!("    {}: {}", proc.pid, proc.fd_count));
         }
@@ -14855,9 +14841,9 @@ fn execute_inode_usage() -> Result<String, String> {
     use rustynet_sysinfo;
     let usage = rustynet_sysinfo::inode_usage_per_filesystem();
     if usage.is_empty() {
-        return Ok("inode usage: (no filesystems)".to_string());
+        return Ok("inode usage: (no filesystems)".to_owned());
     }
-    let mut output = vec!["inode usage:".to_string()];
+    let mut output = vec!["inode usage:".to_owned()];
     for fs in usage.iter().take(5) {
         output.push(format!(
             "  {}: {}/{} ({}%)",
@@ -14875,7 +14861,7 @@ fn execute_thread_count() -> Result<String, String> {
         threads.total_threads, threads.limit, threads.percent_used
     )];
     if !threads.top_processes.is_empty() {
-        output.push("  top processes:".to_string());
+        output.push("  top processes:".to_owned());
         for proc in &threads.top_processes {
             output.push(format!("    {}: {} threads", proc.pid, proc.thread_count));
         }
@@ -14914,9 +14900,9 @@ fn execute_daemon_crashes() -> Result<String, String> {
     use rustynet_sysinfo;
     let crashes = rustynet_sysinfo::daemon_crash_logs_recent(10);
     if crashes.is_empty() {
-        return Ok("daemon crashes: (none)".to_string());
+        return Ok("daemon crashes: (none)".to_owned());
     }
-    let mut output = vec!["recent daemon crashes:".to_string()];
+    let mut output = vec!["recent daemon crashes:".to_owned()];
     for crash in crashes {
         let exit_code = crash.exit_code.unwrap_or(-1);
         output.push(format!("  {}: exit_code={}", crash.timestamp, exit_code));
@@ -14928,9 +14914,9 @@ fn execute_daemon_files() -> Result<String, String> {
     use rustynet_sysinfo;
     let handles = rustynet_sysinfo::daemon_open_file_handles();
     if handles.is_empty() {
-        return Ok("daemon files: (none open)".to_string());
+        return Ok("daemon files: (none open)".to_owned());
     }
-    let mut output = vec!["daemon open files:".to_string()];
+    let mut output = vec!["daemon open files:".to_owned()];
     for handle in handles.iter().take(10) {
         output.push(format!(
             "  {}: type={} size={}",
@@ -14947,9 +14933,9 @@ fn execute_systemd_deps() -> Result<String, String> {
     use rustynet_sysinfo;
     let graph = rustynet_sysinfo::systemd_unit_dependency_graph();
     if graph.units.is_empty() {
-        return Ok("systemd dependencies: (no units)".to_string());
+        return Ok("systemd dependencies: (no units)".to_owned());
     }
-    let mut output = vec!["systemd unit dependencies:".to_string()];
+    let mut output = vec!["systemd unit dependencies:".to_owned()];
     for unit in graph.units.iter().take(10) {
         output.push(format!("  {}:", unit.name));
         for req in &unit.requires {
@@ -14987,7 +14973,7 @@ fn execute_filesystem_journal() -> Result<String, String> {
     let journal = rustynet_sysinfo::filesystem_journal_status();
     let next_fsck = journal
         .next_fsck_date
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| "unknown".to_owned());
     Ok(format!(
         "filesystem journal status:\n  journal_size: {} MB\n  recovery_needed: {}\n  orphaned_inodes: {}\n  next_fsck: {}",
         journal.journal_size_mb, journal.recovery_needed, journal.orphaned_inodes, next_fsck
@@ -14998,9 +14984,9 @@ fn execute_disk_errors() -> Result<String, String> {
     use rustynet_sysinfo;
     let errors = rustynet_sysinfo::block_device_error_counters();
     if errors.is_empty() {
-        return Ok("block device errors: (no errors)".to_string());
+        return Ok("block device errors: (no errors)".to_owned());
     }
-    let mut output = vec!["block device errors:".to_string()];
+    let mut output = vec!["block device errors:".to_owned()];
     for dev in errors.iter().take(5) {
         output.push(format!(
             "  {}: smart_errors={} read_errors={} write_errors={}",
@@ -15073,7 +15059,7 @@ fn execute_acl_audit(path: &str) -> Result<String, String> {
         acl.path, acl.owner, acl.mode, acl.is_restrictive
     )];
     if !acl.extended_acl.is_empty() {
-        output.push("  extended acl: yes".to_string());
+        output.push("  extended acl: yes".to_owned());
     }
     Ok(output.join("\n"))
 }
@@ -15100,9 +15086,9 @@ fn execute_compare_baseline() -> Result<String, String> {
     use rustynet_sysinfo;
     let report = rustynet_sysinfo::compare_to_baseline(&rustynet_sysinfo::system_state_snapshot());
     if report.anomalies.is_empty() {
-        return Ok("baseline comparison: no anomalies detected".to_string());
+        return Ok("baseline comparison: no anomalies detected".to_owned());
     }
-    let mut output = vec!["baseline anomalies detected:".to_string()];
+    let mut output = vec!["baseline anomalies detected:".to_owned()];
     for anomaly in report.anomalies.iter().take(10) {
         output.push(format!(
             "  {}: {} vs {} ({}% deviation)",
@@ -15116,9 +15102,9 @@ fn execute_perf_regression() -> Result<String, String> {
     use rustynet_sysinfo;
     let regressions = rustynet_sysinfo::performance_regression_detection(&[]);
     if regressions.is_empty() {
-        return Ok("performance regression: no regressions detected".to_string());
+        return Ok("performance regression: no regressions detected".to_owned());
     }
-    let mut output = vec!["performance regressions detected:".to_string()];
+    let mut output = vec!["performance regressions detected:".to_owned()];
     for regression in regressions.iter().take(5) {
         output.push(format!(
             "  {}: trend={} slope={}%/day",
@@ -15134,13 +15120,13 @@ fn execute_exit_node_list() -> Result<String, String> {
         return Err(format!("daemon error: {}", response.message));
     }
 
-    let mut output = vec!["available exit nodes:".to_string()];
+    let mut output = vec!["available exit nodes:".to_owned()];
 
-    output.push("  (exit node list)".to_string());
-    output.push("    node-id         status   routes".to_string());
-    output.push("    exit-37         direct   0.0.0.0/0".to_string());
-    output.push("    exit-42*        relay    0.0.0.0/0 (current)".to_string());
-    output.push("    exit-51         offline  -".to_string());
+    output.push("  (exit node list)".to_owned());
+    output.push("    node-id         status   routes".to_owned());
+    output.push("    exit-37         direct   0.0.0.0/0".to_owned());
+    output.push("    exit-42*        relay    0.0.0.0/0 (current)".to_owned());
+    output.push("    exit-51         offline  -".to_owned());
 
     Ok(output.join("\n"))
 }
@@ -15185,31 +15171,31 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
 fn execute_connectivity_test() -> Result<String, String> {
     use rustynet_sysinfo;
 
-    let mut output = vec!["connectivity test:".to_string()];
+    let mut output = vec!["connectivity test:".to_owned()];
 
-    output.push("  DNS resolution:".to_string());
+    output.push("  DNS resolution:".to_owned());
     match resolve_domain("rustynet.dev") {
         Ok(addresses) if !addresses.is_empty() => {
             output.push(format!("    ✓ DNS working (resolved to {})", addresses[0]));
         }
         _ => {
-            output.push("    ✗ DNS failed".to_string());
+            output.push("    ✗ DNS failed".to_owned());
         }
     }
 
-    output.push("  Tunnel status:".to_string());
+    output.push("  Tunnel status:".to_owned());
     let iface_info = rustynet_sysinfo::wireguard_interface_info(DEFAULT_WG_INTERFACE);
     if iface_info.exists && iface_info.is_up {
-        output.push("    ✓ Tunnel active".to_string());
+        output.push("    ✓ Tunnel active".to_owned());
     } else {
-        output.push("    ✗ Tunnel not active".to_string());
+        output.push("    ✗ Tunnel not active".to_owned());
     }
 
-    output.push("  Exit node reachability:".to_string());
+    output.push("  Exit node reachability:".to_owned());
     if test_connectivity("8.8.8.8", 443) {
-        output.push("    ✓ Exit node reachable".to_string());
+        output.push("    ✓ Exit node reachable".to_owned());
     } else {
-        output.push("    ✗ Exit node unreachable".to_string());
+        output.push("    ✗ Exit node unreachable".to_owned());
     }
 
     Ok(output.join("\n"))
@@ -15230,11 +15216,11 @@ fn test_connectivity(host: &str, port: u16) -> bool {
 }
 
 fn execute_peer_stats() -> Result<String, String> {
-    let mut output = vec!["peer statistics:".to_string()];
+    let mut output = vec!["peer statistics:".to_owned()];
 
     output.push(
         "  peer-id           latency  packet-loss  jitter  handshake    data-rx    data-tx"
-            .to_string(),
+            .to_owned(),
     );
 
     let response = send_command(IpcCommand::Status)?;
@@ -15243,7 +15229,7 @@ fn execute_peer_stats() -> Result<String, String> {
     }
 
     if response.message.is_empty() {
-        output.push("  (no connected peers)".to_string());
+        output.push("  (no connected peers)".to_owned());
     } else {
         for (i, _line) in response.message.lines().enumerate() {
             if i < 5 {
@@ -15265,43 +15251,43 @@ fn execute_peer_stats() -> Result<String, String> {
 }
 
 fn execute_bandwidth() -> Result<String, String> {
-    let mut output = vec!["bandwidth/speed test:".to_string()];
+    let mut output = vec!["bandwidth/speed test:".to_owned()];
 
     output.push(String::new());
-    output.push("  Direct path:".to_string());
-    output.push("    latency:      8.2ms".to_string());
-    output.push("    upload:       125.3 Mbps".to_string());
-    output.push("    download:     142.8 Mbps".to_string());
+    output.push("  Direct path:".to_owned());
+    output.push("    latency:      8.2ms".to_owned());
+    output.push("    upload:       125.3 Mbps".to_owned());
+    output.push("    download:     142.8 Mbps".to_owned());
 
     output.push(String::new());
-    output.push("  Relay path (current):".to_string());
-    output.push("    latency:      24.5ms".to_string());
-    output.push("    upload:       87.1 Mbps".to_string());
-    output.push("    download:     103.4 Mbps".to_string());
+    output.push("  Relay path (current):".to_owned());
+    output.push("    latency:      24.5ms".to_owned());
+    output.push("    upload:       87.1 Mbps".to_owned());
+    output.push("    download:     103.4 Mbps".to_owned());
 
     output.push(String::new());
     output.push(
-        "  Recommendation: direct path is faster (3x latency, 30% throughput gain)".to_string(),
+        "  Recommendation: direct path is faster (3x latency, 30% throughput gain)".to_owned(),
     );
 
     Ok(output.join("\n"))
 }
 
 fn execute_metrics() -> Result<String, String> {
-    let mut output = vec!["tunnel metrics:".to_string()];
+    let mut output = vec!["tunnel metrics:".to_owned()];
 
-    output.push("  uptime:              28d 14h 32m".to_string());
-    output.push("  data transferred:    2.3 TB (1.1 TB up, 1.2 TB down)".to_string());
-    output.push("  connection mode:     relay".to_string());
-    output.push("  average latency:     18.3ms".to_string());
-    output.push("  peer count:          3".to_string());
-    output.push("  last state refresh:  2m 15s ago".to_string());
+    output.push("  uptime:              28d 14h 32m".to_owned());
+    output.push("  data transferred:    2.3 TB (1.1 TB up, 1.2 TB down)".to_owned());
+    output.push("  connection mode:     relay".to_owned());
+    output.push("  average latency:     18.3ms".to_owned());
+    output.push("  peer count:          3".to_owned());
+    output.push("  last state refresh:  2m 15s ago".to_owned());
 
     Ok(output.join("\n"))
 }
 
 fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
-    let mut output = vec!["dns test:".to_string()];
+    let mut output = vec!["dns test:".to_owned()];
 
     let domain_to_test = domain.as_deref().unwrap_or("example.com");
 
@@ -15315,9 +15301,9 @@ fn execute_dns_test(domain: Option<String>) -> Result<String, String> {
             if let Some(addr) = addresses.first() {
                 output.push(format!("  result:   {addr}"));
                 output.push(format!("  latency:  {elapsed}ms"));
-                output.push("  status:   ✓ resolved through tunnel".to_string());
+                output.push("  status:   ✓ resolved through tunnel".to_owned());
             } else {
-                output.push("  status:   ✗ no addresses returned".to_string());
+                output.push("  status:   ✗ no addresses returned".to_owned());
             }
         }
         Err(e) => {
@@ -15350,7 +15336,7 @@ fn resolve_domain(domain: &str) -> Result<Vec<String>, String> {
         Ok(addrs) => {
             let addresses: Vec<String> = addrs.map(|sa| sa.ip().to_string()).collect();
             if addresses.is_empty() {
-                Err("no A or AAAA records found".to_string())
+                Err("no A or AAAA records found".to_owned())
             } else {
                 Ok(addresses)
             }
@@ -15642,7 +15628,7 @@ fn parse_node_command(args: &[String]) -> Result<NodeCommand, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--"))
                 .cloned()
-                .ok_or_else(|| "node probe requires <node-id> positional".to_string())?;
+                .ok_or_else(|| "node probe requires <node-id> positional".to_owned())?;
             Ok(NodeCommand::Probe {
                 node_id,
                 tcp_port: parse_optional_u16(args, "--tcp-port")?,
@@ -15668,7 +15654,7 @@ fn parse_policy_command(args: &[String]) -> Result<PolicyCommand, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--"))
                 .cloned()
-                .ok_or_else(|| "policy apply requires <policy-file> positional".to_string())?;
+                .ok_or_else(|| "policy apply requires <policy-file> positional".to_owned())?;
             Ok(PolicyCommand::Apply {
                 policy_file: PathBuf::from(policy_file),
                 dry_run: args_have_flag(args, "--dry-run"),
@@ -15683,7 +15669,7 @@ fn parse_policy_command(args: &[String]) -> Result<PolicyCommand, String> {
                 .cloned()
                 .collect();
             if positionals.len() < 2 {
-                return Err("policy test requires <source-node> <dest-node>".to_string());
+                return Err("policy test requires <source-node> <dest-node>".to_owned());
             }
             Ok(PolicyCommand::Test {
                 source_node: positionals[0].clone(),
@@ -15721,7 +15707,7 @@ fn parse_relay_command(args: &[String]) -> Result<RelayCommand, String> {
                 .skip(1)
                 .find(|a| !a.starts_with("--"))
                 .cloned()
-                .ok_or_else(|| "relay health requires <relay-id> positional".to_string())?;
+                .ok_or_else(|| "relay health requires <relay-id> positional".to_owned())?;
             Ok(RelayCommand::Health { relay_id, json })
         }
         _ => Err(format!("unknown relay subcommand: {sub}")),
@@ -15802,7 +15788,7 @@ fn parse_restore_command(args: &[String]) -> Result<RestoreStateCommand, String>
     }
     let backup_path = parse_optional_kv(args, "--path")
         .map(PathBuf::from)
-        .ok_or_else(|| "restore state requires --path <backup-file>".to_string())?;
+        .ok_or_else(|| "restore state requires --path <backup-file>".to_owned())?;
     Ok(RestoreStateCommand {
         backup_path,
         verify: args_have_flag(args, "--verify"),
@@ -15812,7 +15798,7 @@ fn parse_restore_command(args: &[String]) -> Result<RestoreStateCommand, String>
 }
 
 fn parse_export_keys_command(args: &[String]) -> Result<ExportKeysCommand, String> {
-    let format_text = parse_optional_kv(args, "--format").unwrap_or_else(|| "raw".to_string());
+    let format_text = parse_optional_kv(args, "--format").unwrap_or_else(|| "raw".to_owned());
     let format = match format_text.as_str() {
         "pem" => KeyExportFormat::Pem,
         "raw" => KeyExportFormat::Raw,
@@ -15843,7 +15829,7 @@ fn parse_config_subcommand(args: &[String]) -> Result<ConfigSubCommand, String> 
         }),
         "export" => {
             let format_text =
-                parse_optional_kv(args, "--format").unwrap_or_else(|| "toml".to_string());
+                parse_optional_kv(args, "--format").unwrap_or_else(|| "toml".to_owned());
             let format = match format_text.as_str() {
                 "toml" => ConfigExportFormat::Toml,
                 "json" => ConfigExportFormat::Json,
@@ -15874,7 +15860,7 @@ fn read_node_id_from_env_or_file() -> Option<String> {
     }
     for path in ["/etc/rustynet/node.id", "/var/lib/rustynet/node.id"] {
         if let Ok(content) = std::fs::read_to_string(path) {
-            let trimmed = content.trim().to_string();
+            let trimmed = content.trim().to_owned();
             if !trimmed.is_empty() {
                 return Some(trimmed);
             }
@@ -15886,7 +15872,7 @@ fn read_node_id_from_env_or_file() -> Option<String> {
 fn read_node_role_from_env() -> Option<String> {
     std::env::var("RUSTYNET_NODE_ROLE")
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
 }
 
@@ -15958,7 +15944,7 @@ fn canonical_runtime_config_env_path() -> &'static str {
 fn read_file_to_trimmed_string(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
 }
 
@@ -15979,10 +15965,10 @@ fn unix_now_secs() -> u64 {
 fn execute_node(command: NodeCommand) -> Result<String, String> {
     match command {
         NodeCommand::Info { peers, json } => {
-            let node_id = read_node_id_from_env_or_file().unwrap_or_else(|| "unknown".to_string());
-            let role = read_node_role_from_env().unwrap_or_else(|| "unknown".to_string());
+            let node_id = read_node_id_from_env_or_file().unwrap_or_else(|| "unknown".to_owned());
+            let role = read_node_role_from_env().unwrap_or_else(|| "unknown".to_owned());
             let public_key = read_file_to_trimmed_string(canonical_wg_public_key_path())
-                .unwrap_or_else(|| "<not-provisioned>".to_string());
+                .unwrap_or_else(|| "<not-provisioned>".to_owned());
             let trust_evidence_age_secs = std::fs::metadata(canonical_trust_evidence_path())
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -16002,7 +15988,7 @@ fn execute_node(command: NodeCommand) -> Result<String, String> {
             });
             let mut human = format!(
                 "node_id: {node_id}\nrole: {role}\npublic_key: {public_key}\ntrust_evidence_age_secs: {}\n",
-                trust_evidence_age_secs.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
+                trust_evidence_age_secs.map_or_else(|| "<unknown>".to_owned(), |s| s.to_string()),
             );
             if peers {
                 human.push_str(&format!("peer_count: {peer_count}\n"));
@@ -16044,7 +16030,7 @@ fn execute_node(command: NodeCommand) -> Result<String, String> {
                 json,
                 payload,
                 if human.is_empty() {
-                    "no nodes in membership snapshot".to_string()
+                    "no nodes in membership snapshot".to_owned()
                 } else {
                     human
                 },
@@ -16250,7 +16236,7 @@ fn read_membership_nodes() -> Result<Vec<serde_json::Value>, String> {
         let mut fields = serde_json::Map::new();
         for token in line.split_whitespace() {
             if let Some((k, v)) = token.split_once('=') {
-                fields.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                fields.insert(k.to_owned(), serde_json::Value::String(v.to_owned()));
             }
         }
         if !fields.is_empty() {
@@ -16272,10 +16258,10 @@ fn lookup_node_endpoint(node_id: &str) -> Option<String> {
         }
         for token in line.split_whitespace() {
             if let Some(value) = token.strip_prefix("endpoint=") {
-                return Some(value.to_string());
+                return Some(value.to_owned());
             }
             if let Some(value) = token.strip_prefix("last_known_ip=") {
-                return Some(value.to_string());
+                return Some(value.to_owned());
             }
         }
     }
@@ -16323,7 +16309,7 @@ fn execute_policy(command: PolicyCommand) -> Result<String, String> {
             }
             let payload = json!({ "rules": rules, "count": rules.len() });
             let human = if rules.is_empty() {
-                "no allow rules in current assignment bundle".to_string()
+                "no allow rules in current assignment bundle".to_owned()
             } else {
                 rules
                     .iter()
@@ -16408,7 +16394,7 @@ fn execute_policy(command: PolicyCommand) -> Result<String, String> {
                     && dst == dest_node
                 {
                     allowed = true;
-                    matched_rule = Some(rest.to_string());
+                    matched_rule = Some(rest.to_owned());
                     break;
                 }
             }
@@ -16447,7 +16433,7 @@ fn execute_relay(command: RelayCommand) -> Result<String, String> {
                 .collect();
             let payload = json!({ "relays": relays, "count": relays.len() });
             let human = if relays.is_empty() {
-                "no relays in membership snapshot".to_string()
+                "no relays in membership snapshot".to_owned()
             } else {
                 relays
                     .iter()
@@ -16474,7 +16460,7 @@ fn execute_relay(command: RelayCommand) -> Result<String, String> {
                     s.lines()
                         .find_map(|l| l.strip_prefix("selected_exit_node=").map(String::from))
                 })
-                .unwrap_or_else(|| "<none-selected>".to_string());
+                .unwrap_or_else(|| "<none-selected>".to_owned());
             let payload = json!({
                 "strategy": match strategy {
                     RelaySelectStrategy::Auto => "auto",
@@ -16507,7 +16493,7 @@ fn execute_relay(command: RelayCommand) -> Result<String, String> {
             });
             let human = format!(
                 "relay_id: {relay_id}\nendpoint: {}\nreachable: {}\nlatency_ms: {}",
-                endpoint.unwrap_or_else(|| "<unmapped>".to_string()),
+                endpoint.unwrap_or_else(|| "<unmapped>".to_owned()),
                 probe.reachable,
                 probe.latency_ms.map(|m| m.to_string()).unwrap_or_default(),
             );
@@ -16641,7 +16627,7 @@ fn execute_trust_state(command: TrustStateCommand) -> Result<String, String> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| unix_now_secs().saturating_sub(d.as_secs()));
     let verifier_pubkey =
-        read_file_to_trimmed_string(verifier_path).unwrap_or_else(|| "<missing>".to_string());
+        read_file_to_trimmed_string(verifier_path).unwrap_or_else(|| "<missing>".to_owned());
     let payload = json!({
         "verifier_key_path": verifier_path,
         "verifier_key": verifier_pubkey,
@@ -16652,7 +16638,7 @@ fn execute_trust_state(command: TrustStateCommand) -> Result<String, String> {
     });
     let human = format!(
         "verifier_key_path: {verifier_path}\nverifier_key: {verifier_pubkey}\nevidence_path: {evidence_path}\nevidence_size_bytes: {evidence_size}\nevidence_age_secs: {}",
-        evidence_age_secs.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
+        evidence_age_secs.map_or_else(|| "<unknown>".to_owned(), |s| s.to_string()),
     );
     Ok(cli_human_or_json(command.json, payload, human))
 }
@@ -16763,7 +16749,7 @@ fn execute_analytics(command: AnalyticsCommand) -> Result<String, String> {
                         transport: "icmp",
                         reachable: false,
                         latency_ms: None,
-                        error: Some("no endpoint".to_string()),
+                        error: Some("no endpoint".to_owned()),
                     },
                     probe_icmp,
                 );
@@ -16785,7 +16771,7 @@ fn execute_analytics(command: AnalyticsCommand) -> Result<String, String> {
                         e["role"].as_str().unwrap_or("?"),
                         e["latency_ms"]
                             .as_u64()
-                            .map_or_else(|| "<unreachable>".to_string(), |m| m.to_string()),
+                            .map_or_else(|| "<unreachable>".to_owned(), |m| m.to_string()),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -16921,7 +16907,7 @@ fn execute_export_keys(command: ExportKeysCommand) -> Result<String, String> {
     let raw = std::fs::read_to_string(pub_path)
         .map_err(|e| format!("read {pub_path}: {e}"))?
         .trim()
-        .to_string();
+        .to_owned();
     let serialized = match command.format {
         KeyExportFormat::Raw => raw.clone(),
         KeyExportFormat::Pem => {
@@ -16960,7 +16946,7 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
         .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
         .filter_map(|l| {
             l.split_once('=')
-                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
         })
         .collect();
     match command {
@@ -17089,9 +17075,9 @@ mod tests {
     #[test]
     fn parse_supports_phase10_route_advertise_command() {
         let command = parse_command(&[
-            "route".to_string(),
-            "advertise".to_string(),
-            "192.168.1.0/24".to_string(),
+            "route".to_owned(),
+            "advertise".to_owned(),
+            "192.168.1.0/24".to_owned(),
         ]);
         assert!(format!("{command:?}").contains("RouteAdvertise"));
     }
@@ -17112,34 +17098,34 @@ mod tests {
     #[test]
     fn parse_supports_dns_zone_commands() {
         let issue = parse_command(&[
-            "dns".to_string(),
-            "zone".to_string(),
-            "issue".to_string(),
-            "--signing-secret".to_string(),
-            "/tmp/signing.secret".to_string(),
-            "--signing-secret-passphrase-file".to_string(),
-            "/tmp/signing.pass".to_string(),
-            "--subject-node-id".to_string(),
-            "node-a".to_string(),
-            "--nodes".to_string(),
-            "node-a|192.0.2.1:51820|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            "--allow".to_string(),
-            "node-a|node-a".to_string(),
-            "--records-manifest".to_string(),
-            "/tmp/dns-records.manifest".to_string(),
-            "--output".to_string(),
-            "/tmp/dns-zone.bundle".to_string(),
+            "dns".to_owned(),
+            "zone".to_owned(),
+            "issue".to_owned(),
+            "--signing-secret".to_owned(),
+            "/tmp/signing.secret".to_owned(),
+            "--signing-secret-passphrase-file".to_owned(),
+            "/tmp/signing.pass".to_owned(),
+            "--subject-node-id".to_owned(),
+            "node-a".to_owned(),
+            "--nodes".to_owned(),
+            "node-a|192.0.2.1:51820|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "--allow".to_owned(),
+            "node-a|node-a".to_owned(),
+            "--records-manifest".to_owned(),
+            "/tmp/dns-records.manifest".to_owned(),
+            "--output".to_owned(),
+            "/tmp/dns-zone.bundle".to_owned(),
         ]);
         assert!(format!("{issue:?}").contains("DnsZoneIssue"));
 
         let verify = parse_command(&[
-            "dns".to_string(),
-            "zone".to_string(),
-            "verify".to_string(),
-            "--bundle".to_string(),
-            "/tmp/dns-zone.bundle".to_string(),
-            "--verifier-key".to_string(),
-            "/tmp/dns-zone.pub".to_string(),
+            "dns".to_owned(),
+            "zone".to_owned(),
+            "verify".to_owned(),
+            "--bundle".to_owned(),
+            "/tmp/dns-zone.bundle".to_owned(),
+            "--verifier-key".to_owned(),
+            "/tmp/dns-zone.pub".to_owned(),
         ]);
         assert!(format!("{verify:?}").contains("DnsZoneVerify"));
     }
@@ -17147,48 +17133,48 @@ mod tests {
     #[test]
     fn parse_supports_signed_state_verify_commands() {
         let assignment_verify = parse_command(&[
-            "assignment".to_string(),
-            "verify".to_string(),
-            "--bundle".to_string(),
-            "/tmp/rustynetd.assignment".to_string(),
-            "--verifier-key".to_string(),
-            "/tmp/assignment.pub".to_string(),
-            "--watermark".to_string(),
-            "/tmp/rustynetd.assignment.watermark".to_string(),
+            "assignment".to_owned(),
+            "verify".to_owned(),
+            "--bundle".to_owned(),
+            "/tmp/rustynetd.assignment".to_owned(),
+            "--verifier-key".to_owned(),
+            "/tmp/assignment.pub".to_owned(),
+            "--watermark".to_owned(),
+            "/tmp/rustynetd.assignment.watermark".to_owned(),
         ]);
         assert!(format!("{assignment_verify:?}").contains("Verify"));
 
         let traversal_verify = parse_command(&[
-            "traversal".to_string(),
-            "verify".to_string(),
-            "--bundle".to_string(),
-            "/tmp/rustynetd.traversal".to_string(),
-            "--verifier-key".to_string(),
-            "/tmp/traversal.pub".to_string(),
-            "--watermark".to_string(),
-            "/tmp/rustynetd.traversal.watermark".to_string(),
+            "traversal".to_owned(),
+            "verify".to_owned(),
+            "--bundle".to_owned(),
+            "/tmp/rustynetd.traversal".to_owned(),
+            "--verifier-key".to_owned(),
+            "/tmp/traversal.pub".to_owned(),
+            "--watermark".to_owned(),
+            "/tmp/rustynetd.traversal.watermark".to_owned(),
         ]);
         assert!(format!("{traversal_verify:?}").contains("Traversal"));
 
         let trust_verify = parse_command(&[
-            "trust".to_string(),
-            "verify".to_string(),
-            "--evidence".to_string(),
-            "/tmp/rustynetd.trust".to_string(),
-            "--verifier-key".to_string(),
-            "/tmp/trust-evidence.pub".to_string(),
-            "--watermark".to_string(),
-            "/tmp/rustynetd.trust.watermark".to_string(),
+            "trust".to_owned(),
+            "verify".to_owned(),
+            "--evidence".to_owned(),
+            "/tmp/rustynetd.trust".to_owned(),
+            "--verifier-key".to_owned(),
+            "/tmp/trust-evidence.pub".to_owned(),
+            "--watermark".to_owned(),
+            "/tmp/rustynetd.trust.watermark".to_owned(),
         ]);
         assert!(format!("{trust_verify:?}").contains("Trust"));
     }
 
     #[test]
     fn parse_supports_key_commands() {
-        let rotate = parse_command(&["key".to_string(), "rotate".to_string()]);
+        let rotate = parse_command(&["key".to_owned(), "rotate".to_owned()]);
         assert!(format!("{rotate:?}").contains("KeyRotate"));
 
-        let revoke = parse_command(&["key".to_string(), "revoke".to_string()]);
+        let revoke = parse_command(&["key".to_owned(), "revoke".to_owned()]);
         assert!(format!("{revoke:?}").contains("KeyRevoke"));
     }
 
@@ -17272,7 +17258,7 @@ mod tests {
         assert_eq!(records[0].label, "app");
         assert_eq!(
             records[0].aliases,
-            vec!["ssh".to_string(), "gateway".to_string()]
+            vec!["ssh".to_owned(), "gateway".to_owned()]
         );
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir_all(base);
@@ -17280,24 +17266,24 @@ mod tests {
 
     #[test]
     fn parse_supports_phase6_parity_ops_commands() {
-        let probe = parse_command(&["ops".to_string(), "collect-platform-probe".to_string()]);
+        let probe = parse_command(&["ops".to_owned(), "collect-platform-probe".to_owned()]);
         assert!(format!("{probe:?}").contains("CollectPlatformProbe"));
 
         let report = parse_command(&[
-            "ops".to_string(),
-            "generate-platform-parity-report".to_string(),
+            "ops".to_owned(),
+            "generate-platform-parity-report".to_owned(),
         ]);
         assert!(format!("{report:?}").contains("GeneratePlatformParityReport"));
 
         let bundle = parse_command(&[
-            "ops".to_string(),
-            "collect-platform-parity-bundle".to_string(),
+            "ops".to_owned(),
+            "collect-platform-parity-bundle".to_owned(),
         ]);
         assert!(format!("{bundle:?}").contains("CollectPlatformParityBundle"));
 
         let verify_readiness = parse_command(&[
-            "ops".to_string(),
-            "verify-phase6-platform-readiness".to_string(),
+            "ops".to_owned(),
+            "verify-phase6-platform-readiness".to_owned(),
         ]);
         assert!(format!("{verify_readiness:?}").contains("VerifyPhase6PlatformReadiness"));
     }
@@ -17784,19 +17770,19 @@ mod tests {
 
     #[test]
     fn parse_supports_operator_menu_command() {
-        let menu = parse_command(&["operator".to_string(), "menu".to_string()]);
+        let menu = parse_command(&["operator".to_owned(), "menu".to_owned()]);
         assert!(format!("{menu:?}").contains("OperatorMenu"));
     }
 
     #[test]
     fn parse_supports_membership_commands() {
         let command = parse_command(&[
-            "membership".to_string(),
-            "status".to_string(),
-            "--snapshot".to_string(),
-            "/tmp/membership.snapshot".to_string(),
-            "--log".to_string(),
-            "/tmp/membership.log".to_string(),
+            "membership".to_owned(),
+            "status".to_owned(),
+            "--snapshot".to_owned(),
+            "/tmp/membership.snapshot".to_owned(),
+            "--log".to_owned(),
+            "/tmp/membership.log".to_owned(),
         ]);
         assert!(format!("{command:?}").contains("Membership"));
     }
@@ -17804,12 +17790,12 @@ mod tests {
     #[test]
     fn parse_supports_membership_evidence_generation() {
         let command = parse_command(&[
-            "membership".to_string(),
-            "generate-evidence".to_string(),
-            "--output-dir".to_string(),
-            "artifacts/membership".to_string(),
-            "--environment".to_string(),
-            "ci-netns".to_string(),
+            "membership".to_owned(),
+            "generate-evidence".to_owned(),
+            "--output-dir".to_owned(),
+            "artifacts/membership".to_owned(),
+            "--environment".to_owned(),
+            "ci-netns".to_owned(),
         ]);
         assert!(format!("{command:?}").contains("GenerateEvidence"));
     }
@@ -17817,105 +17803,101 @@ mod tests {
     #[test]
     fn parse_supports_assignment_issue_command() {
         let command = parse_command(&[
-            "assignment".to_string(),
-            "issue".to_string(),
-            "--target-node-id".to_string(),
-            "client-40".to_string(),
-            "--nodes".to_string(),
-            "client-40|192.0.2.40:51820|11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff;exit-37|192.0.2.37:51820|aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string(),
-            "--allow".to_string(),
-            "client-40|exit-37".to_string(),
-            "--signing-secret".to_string(),
-            "/tmp/assignment.secret".to_string(),
-            "--signing-secret-passphrase-file".to_string(),
-            "/tmp/signing.passphrase".to_string(),
-            "--output".to_string(),
-            "/tmp/assignment.bundle".to_string(),
+            "assignment".to_owned(),
+            "issue".to_owned(),
+            "--target-node-id".to_owned(),
+            "client-40".to_owned(),
+            "--nodes".to_owned(),
+            "client-40|192.0.2.40:51820|11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff;exit-37|192.0.2.37:51820|aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_owned(),
+            "--allow".to_owned(),
+            "client-40|exit-37".to_owned(),
+            "--signing-secret".to_owned(),
+            "/tmp/assignment.secret".to_owned(),
+            "--signing-secret-passphrase-file".to_owned(),
+            "/tmp/signing.passphrase".to_owned(),
+            "--output".to_owned(),
+            "/tmp/assignment.bundle".to_owned(),
         ]);
         assert!(format!("{command:?}").contains("Assignment"));
     }
 
     #[test]
     fn parse_supports_ops_commands() {
-        let trust = parse_command(&["ops".to_string(), "refresh-trust".to_string()]);
+        let trust = parse_command(&["ops".to_owned(), "refresh-trust".to_owned()]);
         assert!(format!("{trust:?}").contains("RefreshTrust"));
 
-        let verify_runtime_binary_custody = parse_command(&[
-            "ops".to_string(),
-            "verify-runtime-binary-custody".to_string(),
-        ]);
+        let verify_runtime_binary_custody =
+            parse_command(&["ops".to_owned(), "verify-runtime-binary-custody".to_owned()]);
         assert!(
             format!("{verify_runtime_binary_custody:?}").contains("VerifyRuntimeBinaryCustody")
         );
 
-        let signed_trust = parse_command(&["ops".to_string(), "refresh-signed-trust".to_string()]);
+        let signed_trust = parse_command(&["ops".to_owned(), "refresh-signed-trust".to_owned()]);
         assert!(format!("{signed_trust:?}").contains("RefreshSignedTrust"));
 
         let bootstrap_wg =
-            parse_command(&["ops".to_string(), "bootstrap-wireguard-custody".to_string()]);
+            parse_command(&["ops".to_owned(), "bootstrap-wireguard-custody".to_owned()]);
         assert!(format!("{bootstrap_wg:?}").contains("BootstrapTunnelCustody"));
 
-        let assignment = parse_command(&["ops".to_string(), "refresh-assignment".to_string()]);
+        let assignment = parse_command(&["ops".to_owned(), "refresh-assignment".to_owned()]);
         assert!(format!("{assignment:?}").contains("RefreshAssignment"));
 
-        let collect_phase1 = parse_command(&[
-            "ops".to_string(),
-            "collect-phase1-measured-input".to_string(),
-        ]);
+        let collect_phase1 =
+            parse_command(&["ops".to_owned(), "collect-phase1-measured-input".to_owned()]);
         assert!(format!("{collect_phase1:?}").contains("CollectPhase1MeasuredInput"));
 
-        let run_phase1 = parse_command(&["ops".to_string(), "run-phase1-baseline".to_string()]);
+        let run_phase1 = parse_command(&["ops".to_owned(), "run-phase1-baseline".to_owned()]);
         assert!(format!("{run_phase1:?}").contains("RunPhase1Baseline"));
 
         let generate_attack_matrix = parse_command(&[
-            "ops".to_string(),
-            "generate-attack-matrix".to_string(),
-            "--attacks".to_string(),
-            "control-plane-replay,route-hijack".to_string(),
-            "--nodes".to_string(),
-            "admin:admin,client1:client".to_string(),
-            "--output".to_string(),
-            "/tmp/attack-matrix.md".to_string(),
-            "--format".to_string(),
-            "json".to_string(),
+            "ops".to_owned(),
+            "generate-attack-matrix".to_owned(),
+            "--attacks".to_owned(),
+            "control-plane-replay,route-hijack".to_owned(),
+            "--nodes".to_owned(),
+            "admin:admin,client1:client".to_owned(),
+            "--output".to_owned(),
+            "/tmp/attack-matrix.md".to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
         ]);
         assert!(format!("{generate_attack_matrix:?}").contains("GenerateAttackMatrix"));
 
         let generate_assessment_from_matrix = parse_command(&[
-            "ops".to_string(),
-            "generate-assessment-from-matrix".to_string(),
-            "--project".to_string(),
-            "Rustynet".to_string(),
-            "--matrix-json".to_string(),
-            "/tmp/attack-matrix.json".to_string(),
-            "--output".to_string(),
-            "/tmp/assessment.md".to_string(),
-            "--authorization".to_string(),
-            "approved".to_string(),
+            "ops".to_owned(),
+            "generate-assessment-from-matrix".to_owned(),
+            "--project".to_owned(),
+            "Rustynet".to_owned(),
+            "--matrix-json".to_owned(),
+            "/tmp/attack-matrix.json".to_owned(),
+            "--output".to_owned(),
+            "/tmp/assessment.md".to_owned(),
+            "--authorization".to_owned(),
+            "approved".to_owned(),
         ]);
         assert!(
             format!("{generate_assessment_from_matrix:?}").contains("GenerateAssessmentFromMatrix")
         );
 
         let validate_live_lab_reports = parse_command(&[
-            "ops".to_string(),
-            "validate-live-lab-reports".to_string(),
-            "--reports".to_string(),
-            "artifacts/live_lab/report-a.json,artifacts/live_lab/report-b.json".to_string(),
-            "--output".to_string(),
-            "/tmp/live_lab_schema_validation.md".to_string(),
+            "ops".to_owned(),
+            "validate-live-lab-reports".to_owned(),
+            "--reports".to_owned(),
+            "artifacts/live_lab/report-a.json,artifacts/live_lab/report-b.json".to_owned(),
+            "--output".to_owned(),
+            "/tmp/live_lab_schema_validation.md".to_owned(),
         ]);
         assert!(format!("{validate_live_lab_reports:?}").contains("ValidateLiveLabReports"));
 
         let evaluate_live_coverage_promotion = parse_command(&[
-            "ops".to_string(),
-            "evaluate-live-coverage-promotion".to_string(),
-            "--report-dir".to_string(),
-            "artifacts/live_lab".to_string(),
-            "--targets".to_string(),
-            "control_surface_exposure,endpoint_hijack".to_string(),
-            "--output".to_string(),
-            "/tmp/live_lab_coverage_promotion.md".to_string(),
+            "ops".to_owned(),
+            "evaluate-live-coverage-promotion".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab".to_owned(),
+            "--targets".to_owned(),
+            "control_surface_exposure,endpoint_hijack".to_owned(),
+            "--output".to_owned(),
+            "/tmp/live_lab_coverage_promotion.md".to_owned(),
         ]);
         assert!(
             format!("{evaluate_live_coverage_promotion:?}")
@@ -17923,27 +17905,27 @@ mod tests {
         );
 
         let generate_live_lab_findings = parse_command(&[
-            "ops".to_string(),
-            "generate-live-lab-findings".to_string(),
-            "--report-dir".to_string(),
-            "artifacts/live_lab".to_string(),
-            "--output".to_string(),
-            "/tmp/live_lab_findings.md".to_string(),
+            "ops".to_owned(),
+            "generate-live-lab-findings".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab".to_owned(),
+            "--output".to_owned(),
+            "/tmp/live_lab_findings.md".to_owned(),
         ]);
         assert!(format!("{generate_live_lab_findings:?}").contains("GenerateLiveLabFindings"));
 
         let generate_comparative_exploit_coverage = parse_command(&[
-            "ops".to_string(),
-            "generate-comparative-exploit-coverage".to_string(),
-            "--workspace".to_string(),
-            ".".to_string(),
-            "--output".to_string(),
-            "/tmp/comparative.md".to_string(),
-            "--projects".to_string(),
-            "tailscale".to_string(),
-            "--attack-families".to_string(),
-            "route-hijack".to_string(),
-            "--run-local-tests".to_string(),
+            "ops".to_owned(),
+            "generate-comparative-exploit-coverage".to_owned(),
+            "--workspace".to_owned(),
+            ".".to_owned(),
+            "--output".to_owned(),
+            "/tmp/comparative.md".to_owned(),
+            "--projects".to_owned(),
+            "tailscale".to_owned(),
+            "--attack-families".to_owned(),
+            "route-hijack".to_owned(),
+            "--run-local-tests".to_owned(),
         ]);
         assert!(
             format!("{generate_comparative_exploit_coverage:?}")
@@ -17951,156 +17933,153 @@ mod tests {
         );
 
         let run_live_lab_validations = parse_command(&[
-            "ops".to_string(),
-            "run-live-lab-validations".to_string(),
-            "--repo-root".to_string(),
-            "/tmp/rustynet".to_string(),
-            "--ssh-password-file".to_string(),
-            "/tmp/ssh.pass".to_string(),
-            "--sudo-password-file".to_string(),
-            "/tmp/sudo.pass".to_string(),
-            "--dry-run".to_string(),
-            "--skip-ssh-reachability-preflight".to_string(),
-            "--client-host".to_string(),
-            "debian@192.0.2.10".to_string(),
+            "ops".to_owned(),
+            "run-live-lab-validations".to_owned(),
+            "--repo-root".to_owned(),
+            "/tmp/rustynet".to_owned(),
+            "--ssh-password-file".to_owned(),
+            "/tmp/ssh.pass".to_owned(),
+            "--sudo-password-file".to_owned(),
+            "/tmp/sudo.pass".to_owned(),
+            "--dry-run".to_owned(),
+            "--skip-ssh-reachability-preflight".to_owned(),
+            "--client-host".to_owned(),
+            "debian@192.0.2.10".to_owned(),
         ]);
         assert!(format!("{run_live_lab_validations:?}").contains("RunLiveLabValidations"));
 
         let prepare_advisory_db = parse_command(&[
-            "ops".to_string(),
-            "prepare-advisory-db".to_string(),
-            "/tmp/rustynet-advisory-db".to_string(),
+            "ops".to_owned(),
+            "prepare-advisory-db".to_owned(),
+            "/tmp/rustynet-advisory-db".to_owned(),
         ]);
         assert!(format!("{prepare_advisory_db:?}").contains("PrepareAdvisoryDb"));
 
         let check_no_unsafe = parse_command(&[
-            "ops".to_string(),
-            "check-no-unsafe-rust-sources".to_string(),
-            "--root".to_string(),
-            "crates".to_string(),
+            "ops".to_owned(),
+            "check-no-unsafe-rust-sources".to_owned(),
+            "--root".to_owned(),
+            "crates".to_owned(),
         ]);
         assert!(format!("{check_no_unsafe:?}").contains("CheckNoUnsafeRustSources"));
 
         let check_dependency_exceptions = parse_command(&[
-            "ops".to_string(),
-            "check-dependency-exceptions".to_string(),
-            "--path".to_string(),
-            "documents/operations/dependency_exceptions.json".to_string(),
+            "ops".to_owned(),
+            "check-dependency-exceptions".to_owned(),
+            "--path".to_owned(),
+            "documents/operations/dependency_exceptions.json".to_owned(),
         ]);
         assert!(format!("{check_dependency_exceptions:?}").contains("CheckDependencyExceptions"));
 
         let check_perf_regression = parse_command(&[
-            "ops".to_string(),
-            "check-perf-regression".to_string(),
-            "--phase1-report".to_string(),
-            "artifacts/perf/phase1/baseline.json".to_string(),
-            "--phase3-report".to_string(),
-            "artifacts/perf/phase3/mesh_baseline.json".to_string(),
+            "ops".to_owned(),
+            "check-perf-regression".to_owned(),
+            "--phase1-report".to_owned(),
+            "artifacts/perf/phase1/baseline.json".to_owned(),
+            "--phase3-report".to_owned(),
+            "artifacts/perf/phase3/mesh_baseline.json".to_owned(),
         ]);
         assert!(format!("{check_perf_regression:?}").contains("CheckPerfRegression"));
 
         let check_secrets_hygiene = parse_command(&[
-            "ops".to_string(),
-            "check-secrets-hygiene".to_string(),
-            "--root".to_string(),
-            ".".to_string(),
+            "ops".to_owned(),
+            "check-secrets-hygiene".to_owned(),
+            "--root".to_owned(),
+            ".".to_owned(),
         ]);
         assert!(format!("{check_secrets_hygiene:?}").contains("CheckSecretsHygiene"));
 
         let collect_phase9_raw =
-            parse_command(&["ops".to_string(), "collect-phase9-raw-evidence".to_string()]);
+            parse_command(&["ops".to_owned(), "collect-phase9-raw-evidence".to_owned()]);
         assert!(format!("{collect_phase9_raw:?}").contains("CollectPhase9RawEvidence"));
 
         let generate_phase9 =
-            parse_command(&["ops".to_string(), "generate-phase9-artifacts".to_string()]);
+            parse_command(&["ops".to_owned(), "generate-phase9-artifacts".to_owned()]);
         assert!(format!("{generate_phase9:?}").contains("GeneratePhase9Artifacts"));
 
         let verify_phase9_readiness =
-            parse_command(&["ops".to_string(), "verify-phase9-readiness".to_string()]);
+            parse_command(&["ops".to_owned(), "verify-phase9-readiness".to_owned()]);
         assert!(format!("{verify_phase9_readiness:?}").contains("VerifyPhase9Readiness"));
 
-        let verify_phase9 =
-            parse_command(&["ops".to_string(), "verify-phase9-evidence".to_string()]);
+        let verify_phase9 = parse_command(&["ops".to_owned(), "verify-phase9-evidence".to_owned()]);
         assert!(format!("{verify_phase9:?}").contains("VerifyPhase9Evidence"));
 
         let generate_phase10 =
-            parse_command(&["ops".to_string(), "generate-phase10-artifacts".to_string()]);
+            parse_command(&["ops".to_owned(), "generate-phase10-artifacts".to_owned()]);
         assert!(format!("{generate_phase10:?}").contains("GeneratePhase10Artifacts"));
 
         let verify_phase10_readiness =
-            parse_command(&["ops".to_string(), "verify-phase10-readiness".to_string()]);
+            parse_command(&["ops".to_owned(), "verify-phase10-readiness".to_owned()]);
         assert!(format!("{verify_phase10_readiness:?}").contains("VerifyPhase10Readiness"));
 
         let verify_phase10_provenance =
-            parse_command(&["ops".to_string(), "verify-phase10-provenance".to_string()]);
+            parse_command(&["ops".to_owned(), "verify-phase10-provenance".to_owned()]);
         assert!(format!("{verify_phase10_provenance:?}").contains("VerifyPhase10Provenance"));
 
         let write_phase10_hp2_reports = parse_command(&[
-            "ops".to_string(),
-            "write-phase10-hp2-traversal-reports".to_string(),
-            "--source-dir".to_string(),
-            "artifacts/phase10/source".to_string(),
-            "--environment".to_string(),
-            "ci".to_string(),
-            "--path-selection-log".to_string(),
-            "artifacts/phase10/source/traversal_path_selection_tests.log".to_string(),
-            "--probe-security-log".to_string(),
-            "artifacts/phase10/source/traversal_probe_security_tests.log".to_string(),
+            "ops".to_owned(),
+            "write-phase10-hp2-traversal-reports".to_owned(),
+            "--source-dir".to_owned(),
+            "artifacts/phase10/source".to_owned(),
+            "--environment".to_owned(),
+            "ci".to_owned(),
+            "--path-selection-log".to_owned(),
+            "artifacts/phase10/source/traversal_path_selection_tests.log".to_owned(),
+            "--probe-security-log".to_owned(),
+            "artifacts/phase10/source/traversal_probe_security_tests.log".to_owned(),
         ]);
         assert!(
             format!("{write_phase10_hp2_reports:?}").contains("WritePhase10Hp2TraversalReports")
         );
 
         let verify_phase6_platform_readiness = parse_command(&[
-            "ops".to_string(),
-            "verify-phase6-platform-readiness".to_string(),
+            "ops".to_owned(),
+            "verify-phase6-platform-readiness".to_owned(),
         ]);
         assert!(
             format!("{verify_phase6_platform_readiness:?}")
                 .contains("VerifyPhase6PlatformReadiness")
         );
 
-        let verify_phase6_parity = parse_command(&[
-            "ops".to_string(),
-            "verify-phase6-parity-evidence".to_string(),
-        ]);
+        let verify_phase6_parity =
+            parse_command(&["ops".to_owned(), "verify-phase6-parity-evidence".to_owned()]);
         assert!(format!("{verify_phase6_parity:?}").contains("VerifyPhase6ParityEvidence"));
 
         let verify_required_test_output = parse_command(&[
-            "ops".to_string(),
-            "verify-required-test-output".to_string(),
-            "--output".to_string(),
-            "/tmp/rustynet-required-test.log".to_string(),
-            "--package".to_string(),
-            "rustynetd".to_string(),
-            "--test-filter".to_string(),
-            "daemon::tests::sample".to_string(),
+            "ops".to_owned(),
+            "verify-required-test-output".to_owned(),
+            "--output".to_owned(),
+            "/tmp/rustynet-required-test.log".to_owned(),
+            "--package".to_owned(),
+            "rustynetd".to_owned(),
+            "--test-filter".to_owned(),
+            "daemon::tests::sample".to_owned(),
         ]);
         assert!(format!("{verify_required_test_output:?}").contains("VerifyRequiredTestOutput"));
 
         let generate_cross_network_report = parse_command(&[
-            "ops".to_string(),
-            "generate-cross-network-remote-exit-report".to_string(),
-            "--suite".to_string(),
-            "cross_network_direct_remote_exit".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/cross_network_direct_remote_exit_report.json".to_string(),
-            "--log-path".to_string(),
-            "artifacts/phase10/source/cross_network_direct_remote_exit.log".to_string(),
-            "--status".to_string(),
-            "fail".to_string(),
-            "--path-status-line".to_string(),
-            "node_id=client-1 path_mode=direct_active path_programmed_mode=direct_programmed path_live_proven=true path_latest_live_handshake_unix=123 relay_session_state=unused".to_string(),
-            "--path-evidence-report".to_string(),
-            "artifacts/phase10/child_report.json".to_string(),
-            "--source-artifact".to_string(),
-            "scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh".to_string(),
-            "--source-artifact".to_string(),
-            "artifacts/phase10/some-extra-source.txt".to_string(),
-            "--check".to_string(),
-            "direct_remote_exit_success=pass".to_string(),
-            "--check".to_string(),
-            "remote_exit_no_underlay_leak=fail".to_string(),
+            "ops".to_owned(),
+            "generate-cross-network-remote-exit-report".to_owned(),
+            "--suite".to_owned(),
+            "cross_network_direct_remote_exit".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/cross_network_direct_remote_exit_report.json".to_owned(),
+            "--log-path".to_owned(),
+            "artifacts/phase10/source/cross_network_direct_remote_exit.log".to_owned(),
+            "--status".to_owned(),
+            "fail".to_owned(),
+            "--path-status-line".to_owned(),
+            "node_id=client-1 path_mode=direct_active path_programmed_mode=direct_programmed path_live_proven=true path_latest_live_handshake_unix=123 relay_session_state=unused".to_owned(),
+            "--path-evidence-report".to_owned(),
+            "artifacts/phase10/child_report.json".to_owned(),
+            "--source-artifact".to_owned(),
+            "scripts/e2e/live_linux_cross_network_direct_remote_exit_test.sh".to_owned(),
+            "--source-artifact".to_owned(),
+            "artifacts/phase10/some-extra-source.txt".to_owned(),
+            "--check".to_owned(),
+            "direct_remote_exit_success=pass".to_owned(),
+            "--check".to_owned(),
+            "remote_exit_no_underlay_leak=fail".to_owned(),
         ]);
         assert!(
             format!("{generate_cross_network_report:?}")
@@ -18117,15 +18096,15 @@ mod tests {
         );
 
         let validate_cross_network_reports = parse_command(&[
-            "ops".to_string(),
-            "validate-cross-network-remote-exit-reports".to_string(),
-            "--artifact-dir".to_string(),
-            "artifacts/phase10".to_string(),
-            "--max-evidence-age-seconds".to_string(),
-            "600".to_string(),
-            "--expected-git-commit".to_string(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            "--require-pass-status".to_string(),
+            "ops".to_owned(),
+            "validate-cross-network-remote-exit-reports".to_owned(),
+            "--artifact-dir".to_owned(),
+            "artifacts/phase10".to_owned(),
+            "--max-evidence-age-seconds".to_owned(),
+            "600".to_owned(),
+            "--expected-git-commit".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "--require-pass-status".to_owned(),
         ]);
         assert!(
             format!("{validate_cross_network_reports:?}")
@@ -18133,17 +18112,17 @@ mod tests {
         );
 
         let validate_cross_network_nat_matrix = parse_command(&[
-            "ops".to_string(),
-            "validate-cross-network-nat-matrix".to_string(),
-            "--artifact-dir".to_string(),
-            "artifacts/phase10".to_string(),
-            "--required-nat-profiles".to_string(),
-            "baseline_lan,hard_nat".to_string(),
-            "--max-evidence-age-seconds".to_string(),
-            "600".to_string(),
-            "--expected-git-commit".to_string(),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            "--require-pass-status".to_string(),
+            "ops".to_owned(),
+            "validate-cross-network-nat-matrix".to_owned(),
+            "--artifact-dir".to_owned(),
+            "artifacts/phase10".to_owned(),
+            "--required-nat-profiles".to_owned(),
+            "baseline_lan,hard_nat".to_owned(),
+            "--max-evidence-age-seconds".to_owned(),
+            "600".to_owned(),
+            "--expected-git-commit".to_owned(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            "--require-pass-status".to_owned(),
         ]);
         assert!(
             format!("{validate_cross_network_nat_matrix:?}")
@@ -18151,17 +18130,17 @@ mod tests {
         );
 
         let read_cross_network_report_fields = parse_command(&[
-            "ops".to_string(),
-            "read-cross-network-report-fields".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/cross_network_direct_remote_exit_report.json".to_string(),
-            "--include-status".to_string(),
-            "--check".to_string(),
-            "direct_remote_exit_success".to_string(),
-            "--network-field".to_string(),
-            "client_underlay_ip".to_string(),
-            "--default-value".to_string(),
-            "unknown".to_string(),
+            "ops".to_owned(),
+            "read-cross-network-report-fields".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/cross_network_direct_remote_exit_report.json".to_owned(),
+            "--include-status".to_owned(),
+            "--check".to_owned(),
+            "direct_remote_exit_success".to_owned(),
+            "--network-field".to_owned(),
+            "client_underlay_ip".to_owned(),
+            "--default-value".to_owned(),
+            "unknown".to_owned(),
         ]);
         assert!(
             format!("{read_cross_network_report_fields:?}")
@@ -18169,109 +18148,109 @@ mod tests {
         );
 
         let classify_cross_network_topology = parse_command(&[
-            "ops".to_string(),
-            "classify-cross-network-topology".to_string(),
-            "--ip-a".to_string(),
-            "192.0.2.10".to_string(),
-            "--ip-b".to_string(),
-            "192.0.3.10".to_string(),
-            "--ipv4-prefix".to_string(),
-            "24".to_string(),
-            "--ipv6-prefix".to_string(),
-            "64".to_string(),
+            "ops".to_owned(),
+            "classify-cross-network-topology".to_owned(),
+            "--ip-a".to_owned(),
+            "192.0.2.10".to_owned(),
+            "--ip-b".to_owned(),
+            "192.0.3.10".to_owned(),
+            "--ipv4-prefix".to_owned(),
+            "24".to_owned(),
+            "--ipv6-prefix".to_owned(),
+            "64".to_owned(),
         ]);
         assert!(
             format!("{classify_cross_network_topology:?}").contains("ClassifyCrossNetworkTopology")
         );
 
         let choose_cross_network_roam_alias = parse_command(&[
-            "ops".to_string(),
-            "choose-cross-network-roam-alias".to_string(),
-            "--exit-ip".to_string(),
-            "192.0.2.10".to_string(),
-            "--used-ip".to_string(),
-            "192.0.2.11".to_string(),
-            "--used-ip".to_string(),
-            "192.0.2.12".to_string(),
-            "--ipv4-prefix".to_string(),
-            "24".to_string(),
-            "--ipv6-prefix".to_string(),
-            "64".to_string(),
+            "ops".to_owned(),
+            "choose-cross-network-roam-alias".to_owned(),
+            "--exit-ip".to_owned(),
+            "192.0.2.10".to_owned(),
+            "--used-ip".to_owned(),
+            "192.0.2.11".to_owned(),
+            "--used-ip".to_owned(),
+            "192.0.2.12".to_owned(),
+            "--ipv4-prefix".to_owned(),
+            "24".to_owned(),
+            "--ipv6-prefix".to_owned(),
+            "64".to_owned(),
         ]);
         assert!(
             format!("{choose_cross_network_roam_alias:?}").contains("ChooseCrossNetworkRoamAlias")
         );
 
         let validate_ipv4_address = parse_command(&[
-            "ops".to_string(),
-            "validate-ipv4-address".to_string(),
-            "--ip".to_string(),
-            "203.0.113.10".to_string(),
+            "ops".to_owned(),
+            "validate-ipv4-address".to_owned(),
+            "--ip".to_owned(),
+            "203.0.113.10".to_owned(),
         ]);
         assert!(format!("{validate_ipv4_address:?}").contains("ValidateIpv4Address"));
 
         let write_cross_network_soak_monitor_summary = parse_command(&[
-            "ops".to_string(),
-            "write-cross-network-soak-monitor-summary".to_string(),
-            "--path".to_string(),
+            "ops".to_owned(),
+            "write-cross-network-soak-monitor-summary".to_owned(),
+            "--path".to_owned(),
             "artifacts/phase10/source/cross_network_remote_exit_soak_monitor_summary.json"
-                .to_string(),
-            "--samples".to_string(),
-            "100".to_string(),
-            "--failing-samples".to_string(),
-            "0".to_string(),
-            "--max-consecutive-failures-observed".to_string(),
-            "0".to_string(),
-            "--elapsed-secs".to_string(),
-            "600".to_string(),
-            "--required-soak-duration-secs".to_string(),
-            "600".to_string(),
-            "--allowed-failing-samples".to_string(),
-            "2".to_string(),
-            "--allowed-max-consecutive-failures".to_string(),
-            "1".to_string(),
-            "--direct-remote-exit-ready".to_string(),
-            "pass".to_string(),
-            "--post-soak-bypass-ready".to_string(),
-            "pass".to_string(),
-            "--no-plaintext-passphrase-files".to_string(),
-            "pass".to_string(),
-            "--direct-samples".to_string(),
-            "100".to_string(),
-            "--relay-samples".to_string(),
-            "0".to_string(),
-            "--fail-closed-samples".to_string(),
-            "0".to_string(),
-            "--other-path-samples".to_string(),
-            "0".to_string(),
-            "--path-transition-count".to_string(),
-            "0".to_string(),
-            "--status-mismatch-samples".to_string(),
-            "0".to_string(),
-            "--route-mismatch-samples".to_string(),
-            "0".to_string(),
-            "--endpoint-mismatch-samples".to_string(),
-            "0".to_string(),
-            "--dns-alarm-bad-samples".to_string(),
-            "0".to_string(),
-            "--transport-identity-failures".to_string(),
-            "0".to_string(),
-            "--endpoint-change-events-start".to_string(),
-            "1".to_string(),
-            "--endpoint-change-events-end".to_string(),
-            "1".to_string(),
-            "--endpoint-change-events-delta".to_string(),
-            "0".to_string(),
-            "--first-non-direct-reason".to_string(),
-            "none".to_string(),
-            "--last-path-mode".to_string(),
-            "direct_active".to_string(),
-            "--last-path-reason".to_string(),
-            "fresh_handshake_observed".to_string(),
-            "--first-failure-reason".to_string(),
-            "none".to_string(),
-            "--long-soak-stable".to_string(),
-            "pass".to_string(),
+                .to_owned(),
+            "--samples".to_owned(),
+            "100".to_owned(),
+            "--failing-samples".to_owned(),
+            "0".to_owned(),
+            "--max-consecutive-failures-observed".to_owned(),
+            "0".to_owned(),
+            "--elapsed-secs".to_owned(),
+            "600".to_owned(),
+            "--required-soak-duration-secs".to_owned(),
+            "600".to_owned(),
+            "--allowed-failing-samples".to_owned(),
+            "2".to_owned(),
+            "--allowed-max-consecutive-failures".to_owned(),
+            "1".to_owned(),
+            "--direct-remote-exit-ready".to_owned(),
+            "pass".to_owned(),
+            "--post-soak-bypass-ready".to_owned(),
+            "pass".to_owned(),
+            "--no-plaintext-passphrase-files".to_owned(),
+            "pass".to_owned(),
+            "--direct-samples".to_owned(),
+            "100".to_owned(),
+            "--relay-samples".to_owned(),
+            "0".to_owned(),
+            "--fail-closed-samples".to_owned(),
+            "0".to_owned(),
+            "--other-path-samples".to_owned(),
+            "0".to_owned(),
+            "--path-transition-count".to_owned(),
+            "0".to_owned(),
+            "--status-mismatch-samples".to_owned(),
+            "0".to_owned(),
+            "--route-mismatch-samples".to_owned(),
+            "0".to_owned(),
+            "--endpoint-mismatch-samples".to_owned(),
+            "0".to_owned(),
+            "--dns-alarm-bad-samples".to_owned(),
+            "0".to_owned(),
+            "--transport-identity-failures".to_owned(),
+            "0".to_owned(),
+            "--endpoint-change-events-start".to_owned(),
+            "1".to_owned(),
+            "--endpoint-change-events-end".to_owned(),
+            "1".to_owned(),
+            "--endpoint-change-events-delta".to_owned(),
+            "0".to_owned(),
+            "--first-non-direct-reason".to_owned(),
+            "none".to_owned(),
+            "--last-path-mode".to_owned(),
+            "direct_active".to_owned(),
+            "--last-path-reason".to_owned(),
+            "fresh_handshake_observed".to_owned(),
+            "--first-failure-reason".to_owned(),
+            "none".to_owned(),
+            "--long-soak-stable".to_owned(),
+            "pass".to_owned(),
         ]);
         assert!(
             format!("{write_cross_network_soak_monitor_summary:?}")
@@ -18279,32 +18258,32 @@ mod tests {
         );
 
         let check_local_file_mode = parse_command(&[
-            "ops".to_string(),
-            "check-local-file-mode".to_string(),
-            "--path".to_string(),
-            "/tmp/known_hosts".to_string(),
-            "--policy".to_string(),
-            "no-group-world-write".to_string(),
-            "--label".to_string(),
-            "pinned SSH known_hosts file".to_string(),
+            "ops".to_owned(),
+            "check-local-file-mode".to_owned(),
+            "--path".to_owned(),
+            "/tmp/known_hosts".to_owned(),
+            "--policy".to_owned(),
+            "no-group-world-write".to_owned(),
+            "--label".to_owned(),
+            "pinned SSH known_hosts file".to_owned(),
         ]);
         assert!(format!("{check_local_file_mode:?}").contains("CheckLocalFileMode"));
 
         let redact_forensics_text =
-            parse_command(&["ops".to_string(), "redact-forensics-text".to_string()]);
+            parse_command(&["ops".to_owned(), "redact-forensics-text".to_owned()]);
         assert!(format!("{redact_forensics_text:?}").contains("RedactForensicsText"));
 
         let write_cross_network_forensics_manifest = parse_command(&[
-            "ops".to_string(),
-            "write-cross-network-forensics-manifest".to_string(),
-            "--stage".to_string(),
-            "cross_network_direct_remote_exit".to_string(),
-            "--collected-at-utc".to_string(),
-            "20260321T100000Z".to_string(),
-            "--stage-dir".to_string(),
-            "artifacts/phase10/forensics".to_string(),
-            "--output".to_string(),
-            "artifacts/phase10/forensics/manifest.json".to_string(),
+            "ops".to_owned(),
+            "write-cross-network-forensics-manifest".to_owned(),
+            "--stage".to_owned(),
+            "cross_network_direct_remote_exit".to_owned(),
+            "--collected-at-utc".to_owned(),
+            "20260321T100000Z".to_owned(),
+            "--stage-dir".to_owned(),
+            "artifacts/phase10/forensics".to_owned(),
+            "--output".to_owned(),
+            "artifacts/phase10/forensics/manifest.json".to_owned(),
         ]);
         assert!(
             format!("{write_cross_network_forensics_manifest:?}")
@@ -18312,15 +18291,15 @@ mod tests {
         );
 
         let write_live_lab_stage_artifact_index = parse_command(&[
-            "ops".to_string(),
-            "write-live-lab-stage-artifact-index".to_string(),
-            "--stage-name".to_string(),
-            "cross_network_direct_remote_exit".to_string(),
-            "--stage-dir".to_string(),
-            "artifacts/live_lab/forensics/cross_network_direct_remote_exit".to_string(),
-            "--output".to_string(),
+            "ops".to_owned(),
+            "write-live-lab-stage-artifact-index".to_owned(),
+            "--stage-name".to_owned(),
+            "cross_network_direct_remote_exit".to_owned(),
+            "--stage-dir".to_owned(),
+            "artifacts/live_lab/forensics/cross_network_direct_remote_exit".to_owned(),
+            "--output".to_owned(),
             "artifacts/live_lab/forensics/cross_network_direct_remote_exit/artifact_index.json"
-                .to_string(),
+                .to_owned(),
         ]);
         assert!(
             format!("{write_live_lab_stage_artifact_index:?}")
@@ -18328,25 +18307,25 @@ mod tests {
         );
 
         let sha256_file = parse_command(&[
-            "ops".to_string(),
-            "sha256-file".to_string(),
-            "--path".to_string(),
-            "artifacts/phase10/discovery-a.json".to_string(),
+            "ops".to_owned(),
+            "sha256-file".to_owned(),
+            "--path".to_owned(),
+            "artifacts/phase10/discovery-a.json".to_owned(),
         ]);
         assert!(format!("{sha256_file:?}").contains("Sha256File"));
 
         let validate_cross_network_forensics_bundle = parse_command(&[
-            "ops".to_string(),
-            "validate-cross-network-forensics-bundle".to_string(),
-            "--stage-name".to_string(),
-            "cross_network_direct_remote_exit".to_string(),
-            "--nodes-tsv".to_string(),
-            "artifacts/live_lab/state/nodes.tsv".to_string(),
-            "--stage-dir".to_string(),
-            "artifacts/live_lab/forensics/cross_network_direct_remote_exit".to_string(),
-            "--output".to_string(),
+            "ops".to_owned(),
+            "validate-cross-network-forensics-bundle".to_owned(),
+            "--stage-name".to_owned(),
+            "cross_network_direct_remote_exit".to_owned(),
+            "--nodes-tsv".to_owned(),
+            "artifacts/live_lab/state/nodes.tsv".to_owned(),
+            "--stage-dir".to_owned(),
+            "artifacts/live_lab/forensics/cross_network_direct_remote_exit".to_owned(),
+            "--output".to_owned(),
             "artifacts/live_lab/forensics/cross_network_direct_remote_exit/bundle_validation.json"
-                .to_string(),
+                .to_owned(),
         ]);
         assert!(
             format!("{validate_cross_network_forensics_bundle:?}")
@@ -18354,22 +18333,22 @@ mod tests {
         );
 
         let write_cross_network_preflight_report = parse_command(&[
-            "ops".to_string(),
-            "write-cross-network-preflight-report".to_string(),
-            "--nodes-tsv".to_string(),
-            "artifacts/live_lab/state/nodes.tsv".to_string(),
-            "--stage-dir".to_string(),
-            "artifacts/live_lab/parallel-cross-network-preflight".to_string(),
-            "--output".to_string(),
-            "artifacts/live_lab/cross_network_preflight_report.json".to_string(),
-            "--reference-unix".to_string(),
-            "1772984762".to_string(),
-            "--max-clock-skew-secs".to_string(),
-            "10".to_string(),
-            "--discovery-max-age-secs".to_string(),
-            "900".to_string(),
-            "--signed-artifact-max-age-secs".to_string(),
-            "900".to_string(),
+            "ops".to_owned(),
+            "write-cross-network-preflight-report".to_owned(),
+            "--nodes-tsv".to_owned(),
+            "artifacts/live_lab/state/nodes.tsv".to_owned(),
+            "--stage-dir".to_owned(),
+            "artifacts/live_lab/parallel-cross-network-preflight".to_owned(),
+            "--output".to_owned(),
+            "artifacts/live_lab/cross_network_preflight_report.json".to_owned(),
+            "--reference-unix".to_owned(),
+            "1772984762".to_owned(),
+            "--max-clock-skew-secs".to_owned(),
+            "10".to_owned(),
+            "--discovery-max-age-secs".to_owned(),
+            "900".to_owned(),
+            "--signed-artifact-max-age-secs".to_owned(),
+            "900".to_owned(),
         ]);
         assert!(
             format!("{write_cross_network_preflight_report:?}")
@@ -18377,38 +18356,38 @@ mod tests {
         );
 
         let write_live_linux_reboot_recovery_report = parse_command(&[
-            "ops".to_string(),
-            "write-live-linux-reboot-recovery-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/live_lab/live_linux_reboot_recovery_report.json".to_string(),
-            "--observations-path".to_string(),
-            "artifacts/live_lab/live_linux_reboot_recovery_observations.txt".to_string(),
-            "--exit-pre".to_string(),
-            "a".to_string(),
-            "--exit-post".to_string(),
-            "b".to_string(),
-            "--client-pre".to_string(),
-            "c".to_string(),
-            "--client-post".to_string(),
-            "d".to_string(),
-            "--exit-return".to_string(),
-            "pass".to_string(),
-            "--exit-boot-change".to_string(),
-            "pass".to_string(),
-            "--post-exit-dns-refresh".to_string(),
-            "pass".to_string(),
-            "--post-exit-twohop".to_string(),
-            "pass".to_string(),
-            "--client-return".to_string(),
-            "pass".to_string(),
-            "--client-boot-change".to_string(),
-            "pass".to_string(),
-            "--post-client-dns-refresh".to_string(),
-            "pass".to_string(),
-            "--post-client-twohop".to_string(),
-            "pass".to_string(),
-            "--salvage-twohop".to_string(),
-            "skipped".to_string(),
+            "ops".to_owned(),
+            "write-live-linux-reboot-recovery-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/live_lab/live_linux_reboot_recovery_report.json".to_owned(),
+            "--observations-path".to_owned(),
+            "artifacts/live_lab/live_linux_reboot_recovery_observations.txt".to_owned(),
+            "--exit-pre".to_owned(),
+            "a".to_owned(),
+            "--exit-post".to_owned(),
+            "b".to_owned(),
+            "--client-pre".to_owned(),
+            "c".to_owned(),
+            "--client-post".to_owned(),
+            "d".to_owned(),
+            "--exit-return".to_owned(),
+            "pass".to_owned(),
+            "--exit-boot-change".to_owned(),
+            "pass".to_owned(),
+            "--post-exit-dns-refresh".to_owned(),
+            "pass".to_owned(),
+            "--post-exit-twohop".to_owned(),
+            "pass".to_owned(),
+            "--client-return".to_owned(),
+            "pass".to_owned(),
+            "--client-boot-change".to_owned(),
+            "pass".to_owned(),
+            "--post-client-dns-refresh".to_owned(),
+            "pass".to_owned(),
+            "--post-client-twohop".to_owned(),
+            "pass".to_owned(),
+            "--salvage-twohop".to_owned(),
+            "skipped".to_owned(),
         ]);
         assert!(
             format!("{write_live_linux_reboot_recovery_report:?}")
@@ -18416,130 +18395,130 @@ mod tests {
         );
 
         let write_live_linux_lab_run_summary = parse_command(&[
-            "ops".to_string(),
-            "write-live-linux-lab-run-summary".to_string(),
-            "--nodes-tsv".to_string(),
-            "artifacts/live_lab/state/nodes.tsv".to_string(),
-            "--stages-tsv".to_string(),
-            "artifacts/live_lab/state/stages.tsv".to_string(),
-            "--summary-json".to_string(),
-            "artifacts/live_lab/run_summary.json".to_string(),
-            "--summary-md".to_string(),
-            "artifacts/live_lab/run_summary.md".to_string(),
-            "--run-id".to_string(),
-            "20260321T100000Z".to_string(),
-            "--network-id".to_string(),
-            "lab-net".to_string(),
-            "--report-dir".to_string(),
-            "artifacts/live_lab".to_string(),
-            "--overall-status".to_string(),
-            "pass".to_string(),
-            "--started-at-local".to_string(),
-            "2026-03-21 10:00:00 UTC".to_string(),
-            "--started-at-utc".to_string(),
-            "2026-03-21T10:00:00Z".to_string(),
-            "--started-at-unix".to_string(),
-            "1772983200".to_string(),
-            "--finished-at-local".to_string(),
-            "2026-03-21 10:10:00 UTC".to_string(),
-            "--finished-at-utc".to_string(),
-            "2026-03-21T10:10:00Z".to_string(),
-            "--finished-at-unix".to_string(),
-            "1772983800".to_string(),
-            "--elapsed-secs".to_string(),
-            "600".to_string(),
-            "--elapsed-human".to_string(),
-            "10m 0s".to_string(),
+            "ops".to_owned(),
+            "write-live-linux-lab-run-summary".to_owned(),
+            "--nodes-tsv".to_owned(),
+            "artifacts/live_lab/state/nodes.tsv".to_owned(),
+            "--stages-tsv".to_owned(),
+            "artifacts/live_lab/state/stages.tsv".to_owned(),
+            "--summary-json".to_owned(),
+            "artifacts/live_lab/run_summary.json".to_owned(),
+            "--summary-md".to_owned(),
+            "artifacts/live_lab/run_summary.md".to_owned(),
+            "--run-id".to_owned(),
+            "20260321T100000Z".to_owned(),
+            "--network-id".to_owned(),
+            "lab-net".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab".to_owned(),
+            "--overall-status".to_owned(),
+            "pass".to_owned(),
+            "--started-at-local".to_owned(),
+            "2026-03-21 10:00:00 UTC".to_owned(),
+            "--started-at-utc".to_owned(),
+            "2026-03-21T10:00:00Z".to_owned(),
+            "--started-at-unix".to_owned(),
+            "1772983200".to_owned(),
+            "--finished-at-local".to_owned(),
+            "2026-03-21 10:10:00 UTC".to_owned(),
+            "--finished-at-utc".to_owned(),
+            "2026-03-21T10:10:00Z".to_owned(),
+            "--finished-at-unix".to_owned(),
+            "1772983800".to_owned(),
+            "--elapsed-secs".to_owned(),
+            "600".to_owned(),
+            "--elapsed-human".to_owned(),
+            "10m 0s".to_owned(),
         ]);
         assert!(
             format!("{write_live_linux_lab_run_summary:?}").contains("WriteLiveLinuxLabRunSummary")
         );
 
         let scan_ipv4_port_range = parse_command(&[
-            "ops".to_string(),
-            "scan-ipv4-port-range".to_string(),
-            "--network-prefix".to_string(),
-            "192.168.18".to_string(),
-            "--start-host".to_string(),
-            "1".to_string(),
-            "--end-host".to_string(),
-            "254".to_string(),
-            "--port".to_string(),
-            "22".to_string(),
-            "--timeout-ms".to_string(),
-            "80".to_string(),
-            "--output-key".to_string(),
-            "ssh_port22_hosts=".to_string(),
+            "ops".to_owned(),
+            "scan-ipv4-port-range".to_owned(),
+            "--network-prefix".to_owned(),
+            "192.168.18".to_owned(),
+            "--start-host".to_owned(),
+            "1".to_owned(),
+            "--end-host".to_owned(),
+            "254".to_owned(),
+            "--port".to_owned(),
+            "22".to_owned(),
+            "--timeout-ms".to_owned(),
+            "80".to_owned(),
+            "--output-key".to_owned(),
+            "ssh_port22_hosts=".to_owned(),
         ]);
         assert!(format!("{scan_ipv4_port_range:?}").contains("ScanIpv4PortRange"));
 
         let update_role_switch_host_result = parse_command(&[
-            "ops".to_string(),
-            "update-role-switch-host-result".to_string(),
-            "--hosts-json-path".to_string(),
-            "artifacts/phase10/role_switch_hosts.json".to_string(),
-            "--os-id".to_string(),
-            "debian13".to_string(),
-            "--temp-role".to_string(),
-            "admin".to_string(),
-            "--switch-execution".to_string(),
-            "pass".to_string(),
-            "--post-switch-reconcile".to_string(),
-            "pass".to_string(),
-            "--policy-still-enforced".to_string(),
-            "pass".to_string(),
-            "--least-privilege-preserved".to_string(),
-            "pass".to_string(),
+            "ops".to_owned(),
+            "update-role-switch-host-result".to_owned(),
+            "--hosts-json-path".to_owned(),
+            "artifacts/phase10/role_switch_hosts.json".to_owned(),
+            "--os-id".to_owned(),
+            "debian13".to_owned(),
+            "--temp-role".to_owned(),
+            "admin".to_owned(),
+            "--switch-execution".to_owned(),
+            "pass".to_owned(),
+            "--post-switch-reconcile".to_owned(),
+            "pass".to_owned(),
+            "--policy-still-enforced".to_owned(),
+            "pass".to_owned(),
+            "--least-privilege-preserved".to_owned(),
+            "pass".to_owned(),
         ]);
         assert!(
             format!("{update_role_switch_host_result:?}").contains("UpdateRoleSwitchHostResult")
         );
 
         let write_role_switch_matrix_report = parse_command(&[
-            "ops".to_string(),
-            "write-role-switch-matrix-report".to_string(),
-            "--hosts-json-path".to_string(),
-            "artifacts/phase10/role_switch_hosts.json".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/role_switch_matrix_report.json".to_string(),
-            "--source-path".to_string(),
-            "artifacts/phase10/source/role_switch_matrix.md".to_string(),
-            "--git-commit".to_string(),
-            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
-            "--captured-at-unix".to_string(),
-            "1772983200".to_string(),
-            "--overall-status".to_string(),
-            "pass".to_string(),
+            "ops".to_owned(),
+            "write-role-switch-matrix-report".to_owned(),
+            "--hosts-json-path".to_owned(),
+            "artifacts/phase10/role_switch_hosts.json".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/role_switch_matrix_report.json".to_owned(),
+            "--source-path".to_owned(),
+            "artifacts/phase10/source/role_switch_matrix.md".to_owned(),
+            "--git-commit".to_owned(),
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
+            "--captured-at-unix".to_owned(),
+            "1772983200".to_owned(),
+            "--overall-status".to_owned(),
+            "pass".to_owned(),
         ]);
         assert!(
             format!("{write_role_switch_matrix_report:?}").contains("WriteRoleSwitchMatrixReport")
         );
 
         let write_live_linux_server_ip_bypass_report = parse_command(&[
-            "ops".to_string(),
-            "write-live-linux-server-ip-bypass-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/live_linux_server_ip_bypass_report.json".to_string(),
-            "--allowed-management-cidrs".to_string(),
-            "192.168.18.0/24".to_string(),
-            "--probe-from-client-status".to_string(),
-            "pass".to_string(),
-            "--probe-ip".to_string(),
-            "192.168.18.51".to_string(),
-            "--probe-port".to_string(),
-            "18080".to_string(),
-            "--client-internet-route".to_string(),
-            "1.1.1.1 dev rustynet0".to_string(),
-            "--client-probe-route".to_string(),
-            "192.168.18.51 dev enp0s3".to_string(),
-            "--client-table-51820".to_string(),
-            "default dev rustynet0".to_string(),
-            "--client-endpoints".to_string(),
-            "peer=192.168.18.51:51820".to_string(),
-            "--probe-self-test".to_string(),
-            "probe-ok".to_string(),
-            "--probe-from-client-output".to_string(),
-            "blocked".to_string(),
+            "ops".to_owned(),
+            "write-live-linux-server-ip-bypass-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/live_linux_server_ip_bypass_report.json".to_owned(),
+            "--allowed-management-cidrs".to_owned(),
+            "192.168.18.0/24".to_owned(),
+            "--probe-from-client-status".to_owned(),
+            "pass".to_owned(),
+            "--probe-ip".to_owned(),
+            "192.168.18.51".to_owned(),
+            "--probe-port".to_owned(),
+            "18080".to_owned(),
+            "--client-internet-route".to_owned(),
+            "1.1.1.1 dev rustynet0".to_owned(),
+            "--client-probe-route".to_owned(),
+            "192.168.18.51 dev enp0s3".to_owned(),
+            "--client-table-51820".to_owned(),
+            "default dev rustynet0".to_owned(),
+            "--client-endpoints".to_owned(),
+            "peer=192.168.18.51:51820".to_owned(),
+            "--probe-self-test".to_owned(),
+            "probe-ok".to_owned(),
+            "--probe-from-client-output".to_owned(),
+            "blocked".to_owned(),
         ]);
         assert!(
             format!("{write_live_linux_server_ip_bypass_report:?}")
@@ -18547,22 +18526,22 @@ mod tests {
         );
 
         let write_live_linux_control_surface_report = parse_command(&[
-            "ops".to_string(),
-            "write-live-linux-control-surface-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/live_linux_control_surface_exposure_report.json".to_string(),
-            "--dns-bind-addr".to_string(),
-            "127.0.0.1:53535".to_string(),
-            "--remote-dns-probe-status".to_string(),
-            "pass".to_string(),
-            "--remote-dns-probe-output".to_string(),
-            "{}".to_string(),
-            "--work-dir".to_string(),
-            "artifacts/phase10/source/control_surface".to_string(),
-            "--host-label".to_string(),
-            "client".to_string(),
-            "--host-label".to_string(),
-            "exit".to_string(),
+            "ops".to_owned(),
+            "write-live-linux-control-surface-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/live_linux_control_surface_exposure_report.json".to_owned(),
+            "--dns-bind-addr".to_owned(),
+            "127.0.0.1:53535".to_owned(),
+            "--remote-dns-probe-status".to_owned(),
+            "pass".to_owned(),
+            "--remote-dns-probe-output".to_owned(),
+            "{}".to_owned(),
+            "--work-dir".to_owned(),
+            "artifacts/phase10/source/control_surface".to_owned(),
+            "--host-label".to_owned(),
+            "client".to_owned(),
+            "--host-label".to_owned(),
+            "exit".to_owned(),
         ]);
         assert!(
             format!("{write_live_linux_control_surface_report:?}")
@@ -18570,12 +18549,12 @@ mod tests {
         );
 
         let rewrite_assignment_peer_endpoint_ip = parse_command(&[
-            "ops".to_string(),
-            "rewrite-assignment-peer-endpoint-ip".to_string(),
-            "--assignment-path".to_string(),
-            "/var/lib/rustynet/rustynetd.assignment".to_string(),
-            "--endpoint-ip".to_string(),
-            "203.0.113.10".to_string(),
+            "ops".to_owned(),
+            "rewrite-assignment-peer-endpoint-ip".to_owned(),
+            "--assignment-path".to_owned(),
+            "/var/lib/rustynet/rustynetd.assignment".to_owned(),
+            "--endpoint-ip".to_owned(),
+            "203.0.113.10".to_owned(),
         ]);
         assert!(
             format!("{rewrite_assignment_peer_endpoint_ip:?}")
@@ -18583,38 +18562,38 @@ mod tests {
         );
 
         let rewrite_assignment_mesh_cidr = parse_command(&[
-            "ops".to_string(),
-            "rewrite-assignment-mesh-cidr".to_string(),
-            "--assignment-path".to_string(),
-            "/var/lib/rustynet/rustynetd.assignment".to_string(),
-            "--mesh-cidr".to_string(),
-            "100.65.0.0/10".to_string(),
+            "ops".to_owned(),
+            "rewrite-assignment-mesh-cidr".to_owned(),
+            "--assignment-path".to_owned(),
+            "/var/lib/rustynet/rustynetd.assignment".to_owned(),
+            "--mesh-cidr".to_owned(),
+            "100.65.0.0/10".to_owned(),
         ]);
         assert!(format!("{rewrite_assignment_mesh_cidr:?}").contains("RewriteAssignmentMeshCidr"));
 
         let write_live_linux_endpoint_hijack_report = parse_command(&[
-            "ops".to_string(),
-            "write-live-linux-endpoint-hijack-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/live_linux_endpoint_hijack_report.json".to_string(),
-            "--rogue-endpoint-ip".to_string(),
-            "203.0.113.10".to_string(),
-            "--baseline-status".to_string(),
-            "state=ExitActive restricted_safe_mode=false".to_string(),
-            "--baseline-netcheck".to_string(),
-            "path_mode=direct_active".to_string(),
-            "--baseline-endpoints".to_string(),
-            "peer-a=192.168.18.51:51820".to_string(),
-            "--status-after-hijack".to_string(),
-            "state=FailClosed restricted_safe_mode=true".to_string(),
-            "--netcheck-after-hijack".to_string(),
-            "path_mode=fail_closed".to_string(),
-            "--endpoints-after-hijack".to_string(),
-            "peer-a=192.168.18.51:51820".to_string(),
-            "--status-after-recovery".to_string(),
-            "state=ExitActive restricted_safe_mode=false".to_string(),
-            "--endpoints-after-recovery".to_string(),
-            "peer-a=192.168.18.51:51820".to_string(),
+            "ops".to_owned(),
+            "write-live-linux-endpoint-hijack-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/live_linux_endpoint_hijack_report.json".to_owned(),
+            "--rogue-endpoint-ip".to_owned(),
+            "203.0.113.10".to_owned(),
+            "--baseline-status".to_owned(),
+            "state=ExitActive restricted_safe_mode=false".to_owned(),
+            "--baseline-netcheck".to_owned(),
+            "path_mode=direct_active".to_owned(),
+            "--baseline-endpoints".to_owned(),
+            "peer-a=192.168.18.51:51820".to_owned(),
+            "--status-after-hijack".to_owned(),
+            "state=FailClosed restricted_safe_mode=true".to_owned(),
+            "--netcheck-after-hijack".to_owned(),
+            "path_mode=fail_closed".to_owned(),
+            "--endpoints-after-hijack".to_owned(),
+            "peer-a=192.168.18.51:51820".to_owned(),
+            "--status-after-recovery".to_owned(),
+            "state=ExitActive restricted_safe_mode=false".to_owned(),
+            "--endpoints-after-recovery".to_owned(),
+            "peer-a=192.168.18.51:51820".to_owned(),
         ]);
         assert!(
             format!("{write_live_linux_endpoint_hijack_report:?}")
@@ -18622,24 +18601,24 @@ mod tests {
         );
 
         let write_real_wireguard_exitnode_e2e_report = parse_command(&[
-            "ops".to_string(),
-            "write-real-wireguard-exitnode-e2e-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/netns_e2e_report.json".to_string(),
-            "--exit-status".to_string(),
-            "pass".to_string(),
-            "--lan-off-status".to_string(),
-            "pass".to_string(),
-            "--lan-on-status".to_string(),
-            "pass".to_string(),
-            "--dns-up-status".to_string(),
-            "pass".to_string(),
-            "--kill-switch-status".to_string(),
-            "pass".to_string(),
-            "--dns-down-status".to_string(),
-            "pass".to_string(),
-            "--environment".to_string(),
-            "lab-netns".to_string(),
+            "ops".to_owned(),
+            "write-real-wireguard-exitnode-e2e-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/netns_e2e_report.json".to_owned(),
+            "--exit-status".to_owned(),
+            "pass".to_owned(),
+            "--lan-off-status".to_owned(),
+            "pass".to_owned(),
+            "--lan-on-status".to_owned(),
+            "pass".to_owned(),
+            "--dns-up-status".to_owned(),
+            "pass".to_owned(),
+            "--kill-switch-status".to_owned(),
+            "pass".to_owned(),
+            "--dns-down-status".to_owned(),
+            "pass".to_owned(),
+            "--environment".to_owned(),
+            "lab-netns".to_owned(),
         ]);
         assert!(
             format!("{write_real_wireguard_exitnode_e2e_report:?}")
@@ -18647,22 +18626,22 @@ mod tests {
         );
 
         let write_real_wireguard_no_leak_report = parse_command(&[
-            "ops".to_string(),
-            "write-real-wireguard-no-leak-under-load-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/no_leak_dataplane_report.json".to_string(),
-            "--load-pcap".to_string(),
-            "/tmp/load.pcap".to_string(),
-            "--down-pcap".to_string(),
-            "/tmp/down.pcap".to_string(),
-            "--tunnel-up-status".to_string(),
-            "pass".to_string(),
-            "--load-ping-status".to_string(),
-            "pass".to_string(),
-            "--tunnel-down-block-status".to_string(),
-            "pass".to_string(),
-            "--environment".to_string(),
-            "lab-netns".to_string(),
+            "ops".to_owned(),
+            "write-real-wireguard-no-leak-under-load-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/no_leak_dataplane_report.json".to_owned(),
+            "--load-pcap".to_owned(),
+            "/tmp/load.pcap".to_owned(),
+            "--down-pcap".to_owned(),
+            "/tmp/down.pcap".to_owned(),
+            "--tunnel-up-status".to_owned(),
+            "pass".to_owned(),
+            "--load-ping-status".to_owned(),
+            "pass".to_owned(),
+            "--tunnel-down-block-status".to_owned(),
+            "pass".to_owned(),
+            "--environment".to_owned(),
+            "lab-netns".to_owned(),
         ]);
         assert!(
             format!("{write_real_wireguard_no_leak_report:?}")
@@ -18670,99 +18649,99 @@ mod tests {
         );
 
         let verify_no_leak_report = parse_command(&[
-            "ops".to_string(),
-            "verify-no-leak-dataplane-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/no_leak_dataplane_report.json".to_string(),
+            "ops".to_owned(),
+            "verify-no-leak-dataplane-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/no_leak_dataplane_report.json".to_owned(),
         ]);
         assert!(format!("{verify_no_leak_report:?}").contains("VerifyNoLeakDataplaneReport"));
 
         let e2e_dns_query = parse_command(&[
-            "ops".to_string(),
-            "e2e-dns-query".to_string(),
-            "--server".to_string(),
-            "127.0.0.1".to_string(),
-            "--port".to_string(),
-            "53535".to_string(),
-            "--qname".to_string(),
-            "exit.rustynet".to_string(),
-            "--timeout-ms".to_string(),
-            "1000".to_string(),
-            "--fail-on-no-response".to_string(),
+            "ops".to_owned(),
+            "e2e-dns-query".to_owned(),
+            "--server".to_owned(),
+            "127.0.0.1".to_owned(),
+            "--port".to_owned(),
+            "53535".to_owned(),
+            "--qname".to_owned(),
+            "exit.rustynet".to_owned(),
+            "--timeout-ms".to_owned(),
+            "1000".to_owned(),
+            "--fail-on-no-response".to_owned(),
         ]);
         assert!(format!("{e2e_dns_query:?}").contains("E2eDnsQuery"));
 
         let e2e_http_probe_server = parse_command(&[
-            "ops".to_string(),
-            "e2e-http-probe-server".to_string(),
-            "--bind-ip".to_string(),
-            "192.168.18.51".to_string(),
-            "--port".to_string(),
-            "18080".to_string(),
-            "--response-body".to_string(),
-            "probe-ok".to_string(),
+            "ops".to_owned(),
+            "e2e-http-probe-server".to_owned(),
+            "--bind-ip".to_owned(),
+            "192.168.18.51".to_owned(),
+            "--port".to_owned(),
+            "18080".to_owned(),
+            "--response-body".to_owned(),
+            "probe-ok".to_owned(),
         ]);
         assert!(format!("{e2e_http_probe_server:?}").contains("E2eHttpProbeServer"));
 
         let e2e_http_probe_client = parse_command(&[
-            "ops".to_string(),
-            "e2e-http-probe-client".to_string(),
-            "--host".to_string(),
-            "192.168.18.51".to_string(),
-            "--port".to_string(),
-            "18080".to_string(),
-            "--timeout-ms".to_string(),
-            "2000".to_string(),
-            "--expect-marker".to_string(),
-            "probe-ok".to_string(),
+            "ops".to_owned(),
+            "e2e-http-probe-client".to_owned(),
+            "--host".to_owned(),
+            "192.168.18.51".to_owned(),
+            "--port".to_owned(),
+            "18080".to_owned(),
+            "--timeout-ms".to_owned(),
+            "2000".to_owned(),
+            "--expect-marker".to_owned(),
+            "probe-ok".to_owned(),
         ]);
         assert!(format!("{e2e_http_probe_client:?}").contains("E2eHttpProbeClient"));
 
         let read_json_field = parse_command(&[
-            "ops".to_string(),
-            "read-json-field".to_string(),
-            "--payload".to_string(),
-            "{\"rcode\":0}".to_string(),
-            "--field".to_string(),
-            "rcode".to_string(),
+            "ops".to_owned(),
+            "read-json-field".to_owned(),
+            "--payload".to_owned(),
+            "{\"rcode\":0}".to_owned(),
+            "--field".to_owned(),
+            "rcode".to_owned(),
         ]);
         assert!(format!("{read_json_field:?}").contains("ReadJsonField"));
 
         let extract_dns_expected_ip = parse_command(&[
-            "ops".to_string(),
-            "extract-managed-dns-expected-ip".to_string(),
-            "--fqdn".to_string(),
-            "exit.rustynet".to_string(),
-            "--inspect-output".to_string(),
-            "fqdn=exit.rustynet expected_ip=100.64.0.1".to_string(),
+            "ops".to_owned(),
+            "extract-managed-dns-expected-ip".to_owned(),
+            "--fqdn".to_owned(),
+            "exit.rustynet".to_owned(),
+            "--inspect-output".to_owned(),
+            "fqdn=exit.rustynet expected_ip=100.64.0.1".to_owned(),
         ]);
         assert!(format!("{extract_dns_expected_ip:?}").contains("ExtractManagedDnsExpectedIp"));
 
         let write_active_network_signed_state_tamper_report = parse_command(&[
-            "ops".to_string(),
-            "write-active-network-signed-state-tamper-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/signed_state_tamper_e2e_report.json".to_string(),
-            "--baseline-status".to_string(),
-            "pass".to_string(),
-            "--tamper-reject-status".to_string(),
-            "pass".to_string(),
-            "--fail-closed-status".to_string(),
-            "pass".to_string(),
-            "--netcheck-fail-closed-status".to_string(),
-            "pass".to_string(),
-            "--recovery-status".to_string(),
-            "pass".to_string(),
-            "--exit-host".to_string(),
-            "192.168.18.49".to_string(),
-            "--client-host".to_string(),
-            "192.168.18.50".to_string(),
-            "--status-after-tamper".to_string(),
-            "state=FailClosed".to_string(),
-            "--netcheck-after-tamper".to_string(),
-            "path_mode=fail_closed".to_string(),
-            "--status-after-recovery".to_string(),
-            "state=ExitActive".to_string(),
+            "ops".to_owned(),
+            "write-active-network-signed-state-tamper-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/signed_state_tamper_e2e_report.json".to_owned(),
+            "--baseline-status".to_owned(),
+            "pass".to_owned(),
+            "--tamper-reject-status".to_owned(),
+            "pass".to_owned(),
+            "--fail-closed-status".to_owned(),
+            "pass".to_owned(),
+            "--netcheck-fail-closed-status".to_owned(),
+            "pass".to_owned(),
+            "--recovery-status".to_owned(),
+            "pass".to_owned(),
+            "--exit-host".to_owned(),
+            "192.168.18.49".to_owned(),
+            "--client-host".to_owned(),
+            "192.168.18.50".to_owned(),
+            "--status-after-tamper".to_owned(),
+            "state=FailClosed".to_owned(),
+            "--netcheck-after-tamper".to_owned(),
+            "path_mode=fail_closed".to_owned(),
+            "--status-after-recovery".to_owned(),
+            "state=ExitActive".to_owned(),
         ]);
         assert!(
             format!("{write_active_network_signed_state_tamper_report:?}")
@@ -18770,42 +18749,42 @@ mod tests {
         );
 
         let write_active_network_rogue_path_hijack_report = parse_command(&[
-            "ops".to_string(),
-            "write-active-network-rogue-path-hijack-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/rogue_path_hijack_e2e_report.json".to_string(),
-            "--baseline-status".to_string(),
-            "pass".to_string(),
-            "--hijack-reject-status".to_string(),
-            "pass".to_string(),
-            "--fail-closed-status".to_string(),
-            "pass".to_string(),
-            "--netcheck-fail-closed-status".to_string(),
-            "pass".to_string(),
-            "--no-rogue-endpoint-status".to_string(),
-            "pass".to_string(),
-            "--recovery-status".to_string(),
-            "pass".to_string(),
-            "--recovery-endpoint-status".to_string(),
-            "pass".to_string(),
-            "--rogue-endpoint-ip".to_string(),
-            "203.0.113.10".to_string(),
-            "--exit-host".to_string(),
-            "192.168.18.49".to_string(),
-            "--client-host".to_string(),
-            "192.168.18.50".to_string(),
-            "--endpoints-before".to_string(),
-            "peer-a=192.168.18.49:51820".to_string(),
-            "--endpoints-after-hijack".to_string(),
-            "peer-a=192.168.18.49:51820".to_string(),
-            "--endpoints-after-recovery".to_string(),
-            "peer-a=192.168.18.49:51820".to_string(),
-            "--status-after-hijack".to_string(),
-            "state=FailClosed".to_string(),
-            "--netcheck-after-hijack".to_string(),
-            "path_mode=fail_closed".to_string(),
-            "--status-after-recovery".to_string(),
-            "state=ExitActive".to_string(),
+            "ops".to_owned(),
+            "write-active-network-rogue-path-hijack-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/rogue_path_hijack_e2e_report.json".to_owned(),
+            "--baseline-status".to_owned(),
+            "pass".to_owned(),
+            "--hijack-reject-status".to_owned(),
+            "pass".to_owned(),
+            "--fail-closed-status".to_owned(),
+            "pass".to_owned(),
+            "--netcheck-fail-closed-status".to_owned(),
+            "pass".to_owned(),
+            "--no-rogue-endpoint-status".to_owned(),
+            "pass".to_owned(),
+            "--recovery-status".to_owned(),
+            "pass".to_owned(),
+            "--recovery-endpoint-status".to_owned(),
+            "pass".to_owned(),
+            "--rogue-endpoint-ip".to_owned(),
+            "203.0.113.10".to_owned(),
+            "--exit-host".to_owned(),
+            "192.168.18.49".to_owned(),
+            "--client-host".to_owned(),
+            "192.168.18.50".to_owned(),
+            "--endpoints-before".to_owned(),
+            "peer-a=192.168.18.49:51820".to_owned(),
+            "--endpoints-after-hijack".to_owned(),
+            "peer-a=192.168.18.49:51820".to_owned(),
+            "--endpoints-after-recovery".to_owned(),
+            "peer-a=192.168.18.49:51820".to_owned(),
+            "--status-after-hijack".to_owned(),
+            "state=FailClosed".to_owned(),
+            "--netcheck-after-hijack".to_owned(),
+            "path_mode=fail_closed".to_owned(),
+            "--status-after-recovery".to_owned(),
+            "state=ExitActive".to_owned(),
         ]);
         assert!(
             format!("{write_active_network_rogue_path_hijack_report:?}")
@@ -18813,21 +18792,21 @@ mod tests {
         );
 
         let validate_network_discovery_bundle = parse_command(&[
-            "ops".to_string(),
-            "validate-network-discovery-bundle".to_string(),
-            "--bundle".to_string(),
-            "artifacts/phase10/discovery-a.json".to_string(),
-            "--bundle".to_string(),
-            "artifacts/phase10/discovery-b.json".to_string(),
-            "--bundles".to_string(),
-            "artifacts/phase10/discovery-c.json,artifacts/phase10/discovery-b.json".to_string(),
-            "--max-age-seconds".to_string(),
-            "600".to_string(),
-            "--require-verifier-keys".to_string(),
-            "--require-daemon-active".to_string(),
-            "--require-socket-present".to_string(),
-            "--output".to_string(),
-            "artifacts/phase10/discovery-validation.md".to_string(),
+            "ops".to_owned(),
+            "validate-network-discovery-bundle".to_owned(),
+            "--bundle".to_owned(),
+            "artifacts/phase10/discovery-a.json".to_owned(),
+            "--bundle".to_owned(),
+            "artifacts/phase10/discovery-b.json".to_owned(),
+            "--bundles".to_owned(),
+            "artifacts/phase10/discovery-c.json,artifacts/phase10/discovery-b.json".to_owned(),
+            "--max-age-seconds".to_owned(),
+            "600".to_owned(),
+            "--require-verifier-keys".to_owned(),
+            "--require-daemon-active".to_owned(),
+            "--require-socket-present".to_owned(),
+            "--output".to_owned(),
+            "artifacts/phase10/discovery-validation.md".to_owned(),
         ]);
         assert!(
             format!("{validate_network_discovery_bundle:?}")
@@ -18835,24 +18814,24 @@ mod tests {
         );
 
         let generate_live_lab_failure_digest = parse_command(&[
-            "ops".to_string(),
-            "generate-live-linux-lab-failure-digest".to_string(),
-            "--nodes-tsv".to_string(),
-            "artifacts/live_lab/test/state/nodes.tsv".to_string(),
-            "--stages-tsv".to_string(),
-            "artifacts/live_lab/test/state/stages.tsv".to_string(),
-            "--report-dir".to_string(),
-            "artifacts/live_lab/test".to_string(),
-            "--run-id".to_string(),
-            "20260321T120000Z".to_string(),
-            "--network-id".to_string(),
-            "rn-live-lab-20260321T120000Z".to_string(),
-            "--overall-status".to_string(),
-            "fail".to_string(),
-            "--output-json".to_string(),
-            "artifacts/live_lab/test/failure_digest.json".to_string(),
-            "--output-md".to_string(),
-            "artifacts/live_lab/test/failure_digest.md".to_string(),
+            "ops".to_owned(),
+            "generate-live-linux-lab-failure-digest".to_owned(),
+            "--nodes-tsv".to_owned(),
+            "artifacts/live_lab/test/state/nodes.tsv".to_owned(),
+            "--stages-tsv".to_owned(),
+            "artifacts/live_lab/test/state/stages.tsv".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab/test".to_owned(),
+            "--run-id".to_owned(),
+            "20260321T120000Z".to_owned(),
+            "--network-id".to_owned(),
+            "rn-live-lab-20260321T120000Z".to_owned(),
+            "--overall-status".to_owned(),
+            "fail".to_owned(),
+            "--output-json".to_owned(),
+            "artifacts/live_lab/test/failure_digest.json".to_owned(),
+            "--output-md".to_owned(),
+            "artifacts/live_lab/test/failure_digest.md".to_owned(),
         ]);
         assert!(
             format!("{generate_live_lab_failure_digest:?}")
@@ -18860,22 +18839,22 @@ mod tests {
         );
 
         let rebind_fresh_install_inputs = parse_command(&[
-            "ops".to_string(),
-            "rebind-linux-fresh-install-os-matrix-inputs".to_string(),
-            "--dest-dir".to_string(),
-            "artifacts/phase10/source/fresh_install_os_matrix".to_string(),
-            "--bootstrap-log".to_string(),
-            "artifacts/live_lab/test/logs/bootstrap.log".to_string(),
-            "--baseline-log".to_string(),
-            "artifacts/live_lab/test/logs/baseline.log".to_string(),
-            "--two-hop-report".to_string(),
-            "artifacts/live_lab/test/live_linux_two_hop_report.json".to_string(),
-            "--role-switch-report".to_string(),
-            "artifacts/live_lab/test/live_linux_role_switch_matrix_report.json".to_string(),
-            "--lan-toggle-report".to_string(),
-            "artifacts/live_lab/test/live_linux_lan_toggle_report.json".to_string(),
-            "--exit-handoff-report".to_string(),
-            "artifacts/live_lab/test/live_linux_exit_handoff_report.json".to_string(),
+            "ops".to_owned(),
+            "rebind-linux-fresh-install-os-matrix-inputs".to_owned(),
+            "--dest-dir".to_owned(),
+            "artifacts/phase10/source/fresh_install_os_matrix".to_owned(),
+            "--bootstrap-log".to_owned(),
+            "artifacts/live_lab/test/logs/bootstrap.log".to_owned(),
+            "--baseline-log".to_owned(),
+            "artifacts/live_lab/test/logs/baseline.log".to_owned(),
+            "--two-hop-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_two_hop_report.json".to_owned(),
+            "--role-switch-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_role_switch_matrix_report.json".to_owned(),
+            "--lan-toggle-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_lan_toggle_report.json".to_owned(),
+            "--exit-handoff-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_exit_handoff_report.json".to_owned(),
         ]);
         assert!(
             format!("{rebind_fresh_install_inputs:?}")
@@ -18883,40 +18862,40 @@ mod tests {
         );
 
         let generate_fresh_install_report = parse_command(&[
-            "ops".to_string(),
-            "generate-linux-fresh-install-os-matrix-report".to_string(),
-            "--output".to_string(),
-            "artifacts/phase10/fresh_install_os_matrix_report.json".to_string(),
-            "--environment".to_string(),
-            "live-linux-lab".to_string(),
-            "--source-mode".to_string(),
-            "local-head".to_string(),
-            "--expected-git-commit-file".to_string(),
-            "artifacts/live_lab/test/state/expected_git_commit.txt".to_string(),
-            "--git-status-file".to_string(),
-            "artifacts/live_lab/test/state/git_status.txt".to_string(),
-            "--bootstrap-log".to_string(),
-            "artifacts/live_lab/test/logs/bootstrap.log".to_string(),
-            "--baseline-log".to_string(),
-            "artifacts/live_lab/test/logs/baseline.log".to_string(),
-            "--two-hop-report".to_string(),
-            "artifacts/live_lab/test/live_linux_two_hop_report.json".to_string(),
-            "--role-switch-report".to_string(),
-            "artifacts/live_lab/test/live_linux_role_switch_matrix_report.json".to_string(),
-            "--lan-toggle-report".to_string(),
-            "artifacts/live_lab/test/live_linux_lan_toggle_report.json".to_string(),
-            "--exit-handoff-report".to_string(),
-            "artifacts/live_lab/test/live_linux_exit_handoff_report.json".to_string(),
-            "--exit-node-id".to_string(),
-            "exit-1".to_string(),
-            "--client-node-id".to_string(),
-            "client-1".to_string(),
-            "--ubuntu-node-id".to_string(),
-            "ubuntu-1".to_string(),
-            "--fedora-node-id".to_string(),
-            "fedora-1".to_string(),
-            "--mint-node-id".to_string(),
-            "mint-1".to_string(),
+            "ops".to_owned(),
+            "generate-linux-fresh-install-os-matrix-report".to_owned(),
+            "--output".to_owned(),
+            "artifacts/phase10/fresh_install_os_matrix_report.json".to_owned(),
+            "--environment".to_owned(),
+            "live-linux-lab".to_owned(),
+            "--source-mode".to_owned(),
+            "local-head".to_owned(),
+            "--expected-git-commit-file".to_owned(),
+            "artifacts/live_lab/test/state/expected_git_commit.txt".to_owned(),
+            "--git-status-file".to_owned(),
+            "artifacts/live_lab/test/state/git_status.txt".to_owned(),
+            "--bootstrap-log".to_owned(),
+            "artifacts/live_lab/test/logs/bootstrap.log".to_owned(),
+            "--baseline-log".to_owned(),
+            "artifacts/live_lab/test/logs/baseline.log".to_owned(),
+            "--two-hop-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_two_hop_report.json".to_owned(),
+            "--role-switch-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_role_switch_matrix_report.json".to_owned(),
+            "--lan-toggle-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_lan_toggle_report.json".to_owned(),
+            "--exit-handoff-report".to_owned(),
+            "artifacts/live_lab/test/live_linux_exit_handoff_report.json".to_owned(),
+            "--exit-node-id".to_owned(),
+            "exit-1".to_owned(),
+            "--client-node-id".to_owned(),
+            "client-1".to_owned(),
+            "--ubuntu-node-id".to_owned(),
+            "ubuntu-1".to_owned(),
+            "--fedora-node-id".to_owned(),
+            "fedora-1".to_owned(),
+            "--mint-node-id".to_owned(),
+            "mint-1".to_owned(),
         ]);
         assert!(
             format!("{generate_fresh_install_report:?}")
@@ -18924,16 +18903,16 @@ mod tests {
         );
 
         let verify_fresh_install_report = parse_command(&[
-            "ops".to_string(),
-            "verify-linux-fresh-install-os-matrix-readiness".to_string(),
-            "--report-path".to_string(),
-            "artifacts/phase10/fresh_install_os_matrix_report.json".to_string(),
-            "--max-age-seconds".to_string(),
-            "604800".to_string(),
-            "--profile".to_string(),
-            "linux".to_string(),
-            "--expected-git-commit".to_string(),
-            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            "ops".to_owned(),
+            "verify-linux-fresh-install-os-matrix-readiness".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/phase10/fresh_install_os_matrix_report.json".to_owned(),
+            "--max-age-seconds".to_owned(),
+            "604800".to_owned(),
+            "--profile".to_owned(),
+            "linux".to_owned(),
+            "--expected-git-commit".to_owned(),
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
         ]);
         assert!(
             format!("{verify_fresh_install_report:?}")
@@ -18941,16 +18920,16 @@ mod tests {
         );
 
         let write_fresh_install_fixtures = parse_command(&[
-            "ops".to_string(),
-            "write-fresh-install-os-matrix-readiness-fixtures".to_string(),
-            "--output-dir".to_string(),
-            "/tmp/rustynet-fresh-install-fixtures".to_string(),
-            "--head-commit".to_string(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            "--stale-commit".to_string(),
-            "1111111111111111111111111111111111111111".to_string(),
-            "--now-unix".to_string(),
-            "1773300000".to_string(),
+            "ops".to_owned(),
+            "write-fresh-install-os-matrix-readiness-fixtures".to_owned(),
+            "--output-dir".to_owned(),
+            "/tmp/rustynet-fresh-install-fixtures".to_owned(),
+            "--head-commit".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "--stale-commit".to_owned(),
+            "1111111111111111111111111111111111111111".to_owned(),
+            "--now-unix".to_owned(),
+            "1773300000".to_owned(),
         ]);
         assert!(
             format!("{write_fresh_install_fixtures:?}")
@@ -18958,12 +18937,12 @@ mod tests {
         );
 
         let write_unsigned_release_provenance = parse_command(&[
-            "ops".to_string(),
-            "write-unsigned-release-provenance".to_string(),
-            "--input".to_string(),
-            "artifacts/release/rustynetd.provenance.json".to_string(),
-            "--output".to_string(),
-            "artifacts/release/unsigned.provenance.json".to_string(),
+            "ops".to_owned(),
+            "write-unsigned-release-provenance".to_owned(),
+            "--input".to_owned(),
+            "artifacts/release/rustynetd.provenance.json".to_owned(),
+            "--output".to_owned(),
+            "artifacts/release/unsigned.provenance.json".to_owned(),
         ]);
         assert!(
             format!("{write_unsigned_release_provenance:?}")
@@ -18971,177 +18950,175 @@ mod tests {
         );
 
         let sign_release_artifact =
-            parse_command(&["ops".to_string(), "sign-release-artifact".to_string()]);
+            parse_command(&["ops".to_owned(), "sign-release-artifact".to_owned()]);
         assert!(format!("{sign_release_artifact:?}").contains("SignReleaseArtifact"));
 
         let verify_release_artifact =
-            parse_command(&["ops".to_string(), "verify-release-artifact".to_string()]);
+            parse_command(&["ops".to_owned(), "verify-release-artifact".to_owned()]);
         assert!(format!("{verify_release_artifact:?}").contains("VerifyReleaseArtifact"));
 
-        let installer = parse_command(&["ops".to_string(), "install-systemd".to_string()]);
+        let installer = parse_command(&["ops".to_owned(), "install-systemd".to_owned()]);
         assert!(format!("{installer:?}").contains("InstallSystemd"));
 
         let windows_installer =
-            parse_command(&["ops".to_string(), "install-windows-service".to_string()]);
+            parse_command(&["ops".to_owned(), "install-windows-service".to_owned()]);
         assert!(format!("{windows_installer:?}").contains("InstallWindowsService"));
 
-        let windows_relay_installer = parse_command(&[
-            "ops".to_string(),
-            "install-windows-relay-service".to_string(),
-        ]);
+        let windows_relay_installer =
+            parse_command(&["ops".to_owned(), "install-windows-relay-service".to_owned()]);
         assert!(format!("{windows_relay_installer:?}").contains("InstallWindowsRelayService"));
 
         let windows_relay_uninstaller = parse_command(&[
-            "ops".to_string(),
-            "uninstall-windows-relay-service".to_string(),
+            "ops".to_owned(),
+            "uninstall-windows-relay-service".to_owned(),
         ]);
         assert!(format!("{windows_relay_uninstaller:?}").contains("UninstallWindowsRelayService"));
 
-        let prepare_dirs = parse_command(&["ops".to_string(), "prepare-system-dirs".to_string()]);
+        let prepare_dirs = parse_command(&["ops".to_owned(), "prepare-system-dirs".to_owned()]);
         assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));
 
         let restart_runtime =
-            parse_command(&["ops".to_string(), "restart-runtime-service".to_string()]);
+            parse_command(&["ops".to_owned(), "restart-runtime-service".to_owned()]);
         assert!(format!("{restart_runtime:?}").contains("RestartRuntimeService"));
 
-        let stop_runtime = parse_command(&["ops".to_string(), "stop-runtime-service".to_string()]);
+        let stop_runtime = parse_command(&["ops".to_owned(), "stop-runtime-service".to_owned()]);
         assert!(format!("{stop_runtime:?}").contains("StopRuntimeService"));
 
         let runtime_status =
-            parse_command(&["ops".to_string(), "show-runtime-service-status".to_string()]);
+            parse_command(&["ops".to_owned(), "show-runtime-service-status".to_owned()]);
         assert!(format!("{runtime_status:?}").contains("ShowRuntimeServiceStatus"));
 
         let start_assignment_refresh = parse_command(&[
-            "ops".to_string(),
-            "start-assignment-refresh-service".to_string(),
+            "ops".to_owned(),
+            "start-assignment-refresh-service".to_owned(),
         ]);
         assert!(format!("{start_assignment_refresh:?}").contains("StartAssignmentRefreshService"));
 
         let check_assignment_refresh = parse_command(&[
-            "ops".to_string(),
-            "check-assignment-refresh-availability".to_string(),
+            "ops".to_owned(),
+            "check-assignment-refresh-availability".to_owned(),
         ]);
         assert!(
             format!("{check_assignment_refresh:?}").contains("CheckAssignmentRefreshAvailability")
         );
 
         let install_trust_material = parse_command(&[
-            "ops".to_string(),
-            "install-trust-material".to_string(),
-            "--verifier-source".to_string(),
-            "/tmp/trust.pub".to_string(),
-            "--trust-source".to_string(),
-            "/tmp/rustynetd.trust".to_string(),
-            "--verifier-dest".to_string(),
-            "/etc/rustynet/trust-evidence.pub".to_string(),
-            "--trust-dest".to_string(),
-            "/var/lib/rustynet/rustynetd.trust".to_string(),
-            "--daemon-group".to_string(),
-            "rustynetd".to_string(),
+            "ops".to_owned(),
+            "install-trust-material".to_owned(),
+            "--verifier-source".to_owned(),
+            "/tmp/trust.pub".to_owned(),
+            "--trust-source".to_owned(),
+            "/tmp/rustynetd.trust".to_owned(),
+            "--verifier-dest".to_owned(),
+            "/etc/rustynet/trust-evidence.pub".to_owned(),
+            "--trust-dest".to_owned(),
+            "/var/lib/rustynet/rustynetd.trust".to_owned(),
+            "--daemon-group".to_owned(),
+            "rustynetd".to_owned(),
         ]);
         assert!(format!("{install_trust_material:?}").contains("InstallTrustMaterial"));
 
         let apply_managed_dns =
-            parse_command(&["ops".to_string(), "apply-managed-dns-routing".to_string()]);
+            parse_command(&["ops".to_owned(), "apply-managed-dns-routing".to_owned()]);
         assert!(format!("{apply_managed_dns:?}").contains("ApplyManagedDnsRouting"));
 
         let clear_managed_dns =
-            parse_command(&["ops".to_string(), "clear-managed-dns-routing".to_string()]);
+            parse_command(&["ops".to_owned(), "clear-managed-dns-routing".to_owned()]);
         assert!(format!("{clear_managed_dns:?}").contains("ClearManagedDnsRouting"));
 
         let disconnect_cleanup =
-            parse_command(&["ops".to_string(), "disconnect-cleanup".to_string()]);
+            parse_command(&["ops".to_owned(), "disconnect-cleanup".to_owned()]);
         assert!(format!("{disconnect_cleanup:?}").contains("DisconnectCleanup"));
 
         let blind_exit_lockdown =
-            parse_command(&["ops".to_string(), "apply-blind-exit-lockdown".to_string()]);
+            parse_command(&["ops".to_owned(), "apply-blind-exit-lockdown".to_owned()]);
         assert!(format!("{blind_exit_lockdown:?}").contains("ApplyBlindExitLockdown"));
 
-        let init_membership = parse_command(&["ops".to_string(), "init-membership".to_string()]);
+        let init_membership = parse_command(&["ops".to_owned(), "init-membership".to_owned()]);
         assert!(format!("{init_membership:?}").contains("InitMembership"));
 
         let secure_remove = parse_command(&[
-            "ops".to_string(),
-            "secure-remove".to_string(),
-            "--path".to_string(),
-            "/tmp/secret.txt".to_string(),
+            "ops".to_owned(),
+            "secure-remove".to_owned(),
+            "--path".to_owned(),
+            "/tmp/secret.txt".to_owned(),
         ]);
         assert!(format!("{secure_remove:?}").contains("SecureRemove"));
 
         let ensure_signing = parse_command(&[
-            "ops".to_string(),
-            "ensure-signing-passphrase-material".to_string(),
+            "ops".to_owned(),
+            "ensure-signing-passphrase-material".to_owned(),
         ]);
         assert!(format!("{ensure_signing:?}").contains("EnsureSigningPassphraseMaterial"));
 
         let ensure_local_trust = parse_command(&[
-            "ops".to_string(),
-            "ensure-local-trust-material".to_string(),
-            "--signing-key-passphrase-file".to_string(),
-            "/tmp/signing-passphrase".to_string(),
+            "ops".to_owned(),
+            "ensure-local-trust-material".to_owned(),
+            "--signing-key-passphrase-file".to_owned(),
+            "/tmp/signing-passphrase".to_owned(),
         ]);
         assert!(format!("{ensure_local_trust:?}").contains("EnsureLocalTrustMaterial"));
 
         let materialize_signing = parse_command(&[
-            "ops".to_string(),
-            "materialize-signing-passphrase".to_string(),
-            "--output".to_string(),
-            "/tmp/signing-passphrase".to_string(),
+            "ops".to_owned(),
+            "materialize-signing-passphrase".to_owned(),
+            "--output".to_owned(),
+            "/tmp/signing-passphrase".to_owned(),
         ]);
         assert!(format!("{materialize_signing:?}").contains("MaterializeSigningPassphrase"));
 
         let materialize_signing_temp = parse_command(&[
-            "ops".to_string(),
-            "materialize-signing-passphrase-temp".to_string(),
+            "ops".to_owned(),
+            "materialize-signing-passphrase-temp".to_owned(),
         ]);
         assert!(
             format!("{materialize_signing_temp:?}").contains("MaterializeSigningPassphraseTemp")
         );
 
         let set_exit = parse_command(&[
-            "ops".to_string(),
-            "set-assignment-refresh-exit-node".to_string(),
-            "--env-path".to_string(),
-            "/etc/rustynet/assignment-refresh.env".to_string(),
-            "--exit-node-id".to_string(),
-            "exit-40".to_string(),
+            "ops".to_owned(),
+            "set-assignment-refresh-exit-node".to_owned(),
+            "--env-path".to_owned(),
+            "/etc/rustynet/assignment-refresh.env".to_owned(),
+            "--exit-node-id".to_owned(),
+            "exit-40".to_owned(),
         ]);
         assert!(format!("{set_exit:?}").contains("SetAssignmentRefreshExitNode"));
 
         let force_assignment_refresh = parse_command(&[
-            "ops".to_string(),
-            "force-local-assignment-refresh-now".to_string(),
+            "ops".to_owned(),
+            "force-local-assignment-refresh-now".to_owned(),
         ]);
         assert!(format!("{force_assignment_refresh:?}").contains("ForceLocalAssignmentRefreshNow"));
 
         let state_refresh_if_socket_present = parse_command(&[
-            "ops".to_string(),
-            "state-refresh-if-socket-present".to_string(),
+            "ops".to_owned(),
+            "state-refresh-if-socket-present".to_owned(),
         ]);
         assert!(
             format!("{state_refresh_if_socket_present:?}").contains("StateRefreshIfSocketPresent")
         );
 
         let lan_coupling = parse_command(&[
-            "ops".to_string(),
-            "apply-lan-access-coupling".to_string(),
-            "--enable".to_string(),
-            "true".to_string(),
-            "--lan-routes".to_string(),
-            "192.168.1.0/24".to_string(),
+            "ops".to_owned(),
+            "apply-lan-access-coupling".to_owned(),
+            "--enable".to_owned(),
+            "true".to_owned(),
+            "--lan-routes".to_owned(),
+            "192.168.1.0/24".to_owned(),
         ]);
         assert!(format!("{lan_coupling:?}").contains("ApplyLanAccessCoupling"));
 
         let role_coupling = parse_command(&[
-            "ops".to_string(),
-            "apply-role-coupling".to_string(),
-            "--target-role".to_string(),
-            "client".to_string(),
-            "--preferred-exit-node-id".to_string(),
-            "exit-40".to_string(),
-            "--enable-exit-advertise".to_string(),
-            "false".to_string(),
-            "--skip-client-exit-route-convergence-wait".to_string(),
+            "ops".to_owned(),
+            "apply-role-coupling".to_owned(),
+            "--target-role".to_owned(),
+            "client".to_owned(),
+            "--preferred-exit-node-id".to_owned(),
+            "exit-40".to_owned(),
+            "--enable-exit-advertise".to_owned(),
+            "false".to_owned(),
+            "--skip-client-exit-route-convergence-wait".to_owned(),
         ]);
         assert!(format!("{role_coupling:?}").contains("ApplyRoleCoupling"));
         assert!(
@@ -19149,153 +19126,153 @@ mod tests {
         );
 
         let peer_store_validate = parse_command(&[
-            "ops".to_string(),
-            "peer-store-validate".to_string(),
-            "--config-dir".to_string(),
-            "/tmp/rustynet-config".to_string(),
-            "--peers-file".to_string(),
-            "/tmp/rustynet-config/peers.db".to_string(),
+            "ops".to_owned(),
+            "peer-store-validate".to_owned(),
+            "--config-dir".to_owned(),
+            "/tmp/rustynet-config".to_owned(),
+            "--peers-file".to_owned(),
+            "/tmp/rustynet-config/peers.db".to_owned(),
         ]);
         assert!(format!("{peer_store_validate:?}").contains("PeerStoreValidate"));
 
         let peer_store_list = parse_command(&[
-            "ops".to_string(),
-            "peer-store-list".to_string(),
-            "--config-dir".to_string(),
-            "/tmp/rustynet-config".to_string(),
-            "--peers-file".to_string(),
-            "/tmp/rustynet-config/peers.db".to_string(),
-            "--role".to_string(),
-            "admin".to_string(),
-            "--node-id".to_string(),
-            "exit-1".to_string(),
+            "ops".to_owned(),
+            "peer-store-list".to_owned(),
+            "--config-dir".to_owned(),
+            "/tmp/rustynet-config".to_owned(),
+            "--peers-file".to_owned(),
+            "/tmp/rustynet-config/peers.db".to_owned(),
+            "--role".to_owned(),
+            "admin".to_owned(),
+            "--node-id".to_owned(),
+            "exit-1".to_owned(),
         ]);
         assert!(format!("{peer_store_list:?}").contains("PeerStoreList"));
 
         let remote_e2e = parse_command(&[
-            "ops".to_string(),
-            "run-debian-two-node-e2e".to_string(),
-            "--exit-host".to_string(),
-            "192.168.18.37".to_string(),
-            "--client-host".to_string(),
-            "192.168.18.40".to_string(),
-            "--ssh-allow-cidrs".to_string(),
-            "192.168.18.2/32".to_string(),
+            "ops".to_owned(),
+            "run-debian-two-node-e2e".to_owned(),
+            "--exit-host".to_owned(),
+            "192.168.18.37".to_owned(),
+            "--client-host".to_owned(),
+            "192.168.18.40".to_owned(),
+            "--ssh-allow-cidrs".to_owned(),
+            "192.168.18.2/32".to_owned(),
         ]);
         assert!(format!("{remote_e2e:?}").contains("RunDebianTwoNodeE2e"));
 
         let bootstrap = parse_command(&[
-            "ops".to_string(),
-            "e2e-bootstrap-host".to_string(),
-            "--role".to_string(),
-            "admin".to_string(),
-            "--node-id".to_string(),
-            "exit-node".to_string(),
-            "--network-id".to_string(),
-            "local-net".to_string(),
-            "--src-dir".to_string(),
-            "/opt/rustynet-clean/src".to_string(),
-            "--ssh-allow-cidrs".to_string(),
-            "192.168.18.2/32".to_string(),
+            "ops".to_owned(),
+            "e2e-bootstrap-host".to_owned(),
+            "--role".to_owned(),
+            "admin".to_owned(),
+            "--node-id".to_owned(),
+            "exit-node".to_owned(),
+            "--network-id".to_owned(),
+            "local-net".to_owned(),
+            "--src-dir".to_owned(),
+            "/opt/rustynet-clean/src".to_owned(),
+            "--ssh-allow-cidrs".to_owned(),
+            "192.168.18.2/32".to_owned(),
         ]);
         assert!(format!("{bootstrap:?}").contains("E2eBootstrapHost"));
 
         let enforce = parse_command(&[
-            "ops".to_string(),
-            "e2e-enforce-host".to_string(),
-            "--role".to_string(),
-            "client".to_string(),
-            "--node-id".to_string(),
-            "client-node".to_string(),
-            "--src-dir".to_string(),
-            "/opt/rustynet-clean/src".to_string(),
-            "--ssh-allow-cidrs".to_string(),
-            "192.168.18.2/32".to_string(),
+            "ops".to_owned(),
+            "e2e-enforce-host".to_owned(),
+            "--role".to_owned(),
+            "client".to_owned(),
+            "--node-id".to_owned(),
+            "client-node".to_owned(),
+            "--src-dir".to_owned(),
+            "/opt/rustynet-clean/src".to_owned(),
+            "--ssh-allow-cidrs".to_owned(),
+            "192.168.18.2/32".to_owned(),
         ]);
         assert!(format!("{enforce:?}").contains("E2eEnforceHost"));
 
         let membership = parse_command(&[
-            "ops".to_string(),
-            "e2e-membership-add".to_string(),
-            "--client-node-id".to_string(),
-            "client-node".to_string(),
-            "--client-pubkey-hex".to_string(),
-            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string(),
-            "--owner-approver-id".to_string(),
-            "exit-node-owner".to_string(),
+            "ops".to_owned(),
+            "e2e-membership-add".to_owned(),
+            "--client-node-id".to_owned(),
+            "client-node".to_owned(),
+            "--client-pubkey-hex".to_owned(),
+            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_owned(),
+            "--owner-approver-id".to_owned(),
+            "exit-node-owner".to_owned(),
         ]);
         assert!(format!("{membership:?}").contains("E2eMembershipAdd"));
 
         let assignments = parse_command(&[
-            "ops".to_string(),
-            "e2e-issue-assignments".to_string(),
-            "--exit-node-id".to_string(),
-            "exit-node".to_string(),
-            "--client-node-id".to_string(),
-            "client-node".to_string(),
-            "--exit-endpoint".to_string(),
-            "192.168.18.37:51820".to_string(),
-            "--client-endpoint".to_string(),
-            "192.168.18.40:51820".to_string(),
-            "--exit-pubkey-hex".to_string(),
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_string(),
-            "--client-pubkey-hex".to_string(),
-            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_string(),
-            "--artifact-dir".to_string(),
-            "/run/rustynet/e2e-issue-artifacts.test".to_string(),
+            "ops".to_owned(),
+            "e2e-issue-assignments".to_owned(),
+            "--exit-node-id".to_owned(),
+            "exit-node".to_owned(),
+            "--client-node-id".to_owned(),
+            "client-node".to_owned(),
+            "--exit-endpoint".to_owned(),
+            "192.168.18.37:51820".to_owned(),
+            "--client-endpoint".to_owned(),
+            "192.168.18.40:51820".to_owned(),
+            "--exit-pubkey-hex".to_owned(),
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".to_owned(),
+            "--client-pubkey-hex".to_owned(),
+            "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff".to_owned(),
+            "--artifact-dir".to_owned(),
+            "/run/rustynet/e2e-issue-artifacts.test".to_owned(),
         ]);
         assert!(format!("{assignments:?}").contains("E2eIssueAssignments"));
         assert!(format!("{assignments:?}").contains("e2e-issue-artifacts.test"));
 
         let assignments_from_env = parse_command(&[
-            "ops".to_string(),
-            "e2e-issue-assignment-bundles-from-env".to_string(),
-            "--env-file".to_string(),
-            "/tmp/rn-assign.env".to_string(),
-            "--issue-dir".to_string(),
-            "/run/rustynet/assignment-issue".to_string(),
+            "ops".to_owned(),
+            "e2e-issue-assignment-bundles-from-env".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rn-assign.env".to_owned(),
+            "--issue-dir".to_owned(),
+            "/run/rustynet/assignment-issue".to_owned(),
         ]);
         assert!(format!("{assignments_from_env:?}").contains("E2eIssueAssignmentBundlesFromEnv"));
 
         let traversal_from_env = parse_command(&[
-            "ops".to_string(),
-            "e2e-issue-traversal-bundles-from-env".to_string(),
-            "--env-file".to_string(),
-            "/tmp/rn-traversal.env".to_string(),
-            "--issue-dir".to_string(),
-            "/run/rustynet/traversal-issue".to_string(),
+            "ops".to_owned(),
+            "e2e-issue-traversal-bundles-from-env".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rn-traversal.env".to_owned(),
+            "--issue-dir".to_owned(),
+            "/run/rustynet/traversal-issue".to_owned(),
         ]);
         assert!(format!("{traversal_from_env:?}").contains("E2eIssueTraversalBundlesFromEnv"));
 
         let dns_zone_from_env = parse_command(&[
-            "ops".to_string(),
-            "e2e-issue-dns-zone-bundles-from-env".to_string(),
-            "--env-file".to_string(),
-            "/tmp/rn-dns.env".to_string(),
-            "--issue-dir".to_string(),
-            "/run/rustynet/dns-zone-issue".to_string(),
+            "ops".to_owned(),
+            "e2e-issue-dns-zone-bundles-from-env".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rn-dns.env".to_owned(),
+            "--issue-dir".to_owned(),
+            "/run/rustynet/dns-zone-issue".to_owned(),
         ]);
         assert!(format!("{dns_zone_from_env:?}").contains("E2eIssueDnsZoneBundlesFromEnv"));
 
-        let vm_lab_list = parse_command(&["ops".to_string(), "vm-lab-list".to_string()]);
+        let vm_lab_list = parse_command(&["ops".to_owned(), "vm-lab-list".to_owned()]);
         assert!(format!("{vm_lab_list:?}").contains("VmLabList"));
 
         let vm_lab_discover_local_utm = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-discover-local-utm".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--utm-documents-root".to_string(),
-            "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents".to_string(),
-            "--utmctl-path".to_string(),
-            "/Applications/UTM.app/Contents/MacOS/utmctl".to_string(),
-            "--ssh-port".to_string(),
-            "2222".to_string(),
-            "--timeout-secs".to_string(),
-            "15".to_string(),
-            "--update-inventory-live-ips".to_string(),
-            "--report-dir".to_string(),
-            "/tmp/vm-lab-discovery".to_string(),
+            "ops".to_owned(),
+            "vm-lab-discover-local-utm".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--utm-documents-root".to_owned(),
+            "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents".to_owned(),
+            "--utmctl-path".to_owned(),
+            "/Applications/UTM.app/Contents/MacOS/utmctl".to_owned(),
+            "--ssh-port".to_owned(),
+            "2222".to_owned(),
+            "--timeout-secs".to_owned(),
+            "15".to_owned(),
+            "--update-inventory-live-ips".to_owned(),
+            "--report-dir".to_owned(),
+            "/tmp/vm-lab-discovery".to_owned(),
         ]);
         assert!(format!("{vm_lab_discover_local_utm:?}").contains("VmLabDiscoverLocalUtm"));
         assert!(format!("{vm_lab_discover_local_utm:?}").contains("2222"));
@@ -19305,11 +19282,11 @@ mod tests {
         assert!(format!("{vm_lab_discover_local_utm:?}").contains("/tmp/vm-lab-discovery"));
 
         let vm_lab_discover_local_utm_summary = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-discover-local-utm-summary".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--update-inventory-live-ips".to_string(),
+            "ops".to_owned(),
+            "vm-lab-discover-local-utm-summary".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--update-inventory-live-ips".to_owned(),
         ]);
         assert!(
             format!("{vm_lab_discover_local_utm_summary:?}")
@@ -19321,182 +19298,182 @@ mod tests {
         );
 
         let vm_lab_start = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-start".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--vm".to_string(),
-            "debian-headless-3".to_string(),
-            "--timeout-secs".to_string(),
-            "120".to_string(),
+            "ops".to_owned(),
+            "vm-lab-start".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-3".to_owned(),
+            "--timeout-secs".to_owned(),
+            "120".to_owned(),
         ]);
         assert!(format!("{vm_lab_start:?}").contains("VmLabStart"));
         assert!(format!("{vm_lab_start:?}").contains("debian-headless-3"));
 
         let vm_lab_sync = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-sync-repo".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--vm".to_string(),
-            "debian-headless-2".to_string(),
-            "--target".to_string(),
-            "root@192.168.18.51".to_string(),
-            "--repo-url".to_string(),
-            "git@github.com:iwanteague/Rustyfin.git".to_string(),
-            "--dest-dir".to_string(),
-            "/home/debian/Rustyfin".to_string(),
-            "--branch".to_string(),
-            "main".to_string(),
-            "--ssh-user".to_string(),
-            "root".to_string(),
+            "ops".to_owned(),
+            "vm-lab-sync-repo".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-2".to_owned(),
+            "--target".to_owned(),
+            "root@192.168.18.51".to_owned(),
+            "--repo-url".to_owned(),
+            "git@github.com:iwanteague/Rustyfin.git".to_owned(),
+            "--dest-dir".to_owned(),
+            "/home/debian/Rustyfin".to_owned(),
+            "--branch".to_owned(),
+            "main".to_owned(),
+            "--ssh-user".to_owned(),
+            "root".to_owned(),
         ]);
         assert!(format!("{vm_lab_sync:?}").contains("VmLabSyncRepo"));
         assert!(format!("{vm_lab_sync:?}").contains("Rustyfin"));
         assert!(format!("{vm_lab_sync:?}").contains("root@192.168.18.51"));
 
         let vm_lab_sync_local = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-sync-repo".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--local-source-dir".to_string(),
-            "/tmp/test/Rustynet".to_string(),
-            "--dest-dir".to_string(),
-            "/home/debian/Rustynet".to_string(),
+            "ops".to_owned(),
+            "vm-lab-sync-repo".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--local-source-dir".to_owned(),
+            "/tmp/test/Rustynet".to_owned(),
+            "--dest-dir".to_owned(),
+            "/home/debian/Rustynet".to_owned(),
         ]);
         assert!(format!("{vm_lab_sync_local:?}").contains("VmLabSyncRepo"));
         assert!(format!("{vm_lab_sync_local:?}").contains("/tmp/test/Rustynet"));
 
         let vm_lab_sync_bootstrap = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-sync-bootstrap".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--require-same-network".to_string(),
-            "--repo-url".to_string(),
-            "git@github.com:iwanteague/Rustyfin.git".to_string(),
-            "--dest-dir".to_string(),
-            "/home/debian/Rustyfin".to_string(),
-            "--program".to_string(),
-            "cargo".to_string(),
-            "--arg".to_string(),
-            "build".to_string(),
-            "--arg".to_string(),
-            "--release".to_string(),
+            "ops".to_owned(),
+            "vm-lab-sync-bootstrap".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--require-same-network".to_owned(),
+            "--repo-url".to_owned(),
+            "git@github.com:iwanteague/Rustyfin.git".to_owned(),
+            "--dest-dir".to_owned(),
+            "/home/debian/Rustyfin".to_owned(),
+            "--program".to_owned(),
+            "cargo".to_owned(),
+            "--arg".to_owned(),
+            "build".to_owned(),
+            "--arg".to_owned(),
+            "--release".to_owned(),
         ]);
         assert!(format!("{vm_lab_sync_bootstrap:?}").contains("VmLabSyncBootstrap"));
         assert!(format!("{vm_lab_sync_bootstrap:?}").contains("require_same_network: true"));
 
         let vm_lab_sync_bootstrap_local = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-sync-bootstrap".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--local-source-dir".to_string(),
-            "/tmp/test/Rustynet".to_string(),
-            "--dest-dir".to_string(),
-            "/home/debian/Rustynet".to_string(),
-            "--program".to_string(),
-            "sh".to_string(),
-            "--arg".to_string(),
-            "-lc".to_string(),
-            "--arg".to_string(),
-            "pwd".to_string(),
+            "ops".to_owned(),
+            "vm-lab-sync-bootstrap".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--local-source-dir".to_owned(),
+            "/tmp/test/Rustynet".to_owned(),
+            "--dest-dir".to_owned(),
+            "/home/debian/Rustynet".to_owned(),
+            "--program".to_owned(),
+            "sh".to_owned(),
+            "--arg".to_owned(),
+            "-lc".to_owned(),
+            "--arg".to_owned(),
+            "pwd".to_owned(),
         ]);
         assert!(format!("{vm_lab_sync_bootstrap_local:?}").contains("VmLabSyncBootstrap"));
         assert!(format!("{vm_lab_sync_bootstrap_local:?}").contains("/tmp/test/Rustynet"));
 
         let vm_lab_run = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-run".to_string(),
-            "--vm".to_string(),
-            "debian-headless-2".to_string(),
-            "--target".to_string(),
-            "debian@192.168.18.52".to_string(),
-            "--workdir".to_string(),
-            "/home/debian/Rustyfin".to_string(),
-            "--program".to_string(),
-            "cargo".to_string(),
-            "--arg".to_string(),
-            "build".to_string(),
-            "--arg".to_string(),
-            "--release".to_string(),
-            "--sudo".to_string(),
+            "ops".to_owned(),
+            "vm-lab-run".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-2".to_owned(),
+            "--target".to_owned(),
+            "debian@192.168.18.52".to_owned(),
+            "--workdir".to_owned(),
+            "/home/debian/Rustyfin".to_owned(),
+            "--program".to_owned(),
+            "cargo".to_owned(),
+            "--arg".to_owned(),
+            "build".to_owned(),
+            "--arg".to_owned(),
+            "--release".to_owned(),
+            "--sudo".to_owned(),
         ]);
         assert!(format!("{vm_lab_run:?}").contains("VmLabRun"));
         assert!(format!("{vm_lab_run:?}").contains("debian@192.168.18.52"));
         assert!(format!("{vm_lab_run:?}").contains("--release"));
 
         let vm_lab_bootstrap = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-bootstrap".to_string(),
-            "--all".to_string(),
-            "--workdir".to_string(),
-            "/home/debian/Rustyfin".to_string(),
-            "--program".to_string(),
-            "cargo".to_string(),
-            "--arg".to_string(),
-            "build".to_string(),
+            "ops".to_owned(),
+            "vm-lab-bootstrap".to_owned(),
+            "--all".to_owned(),
+            "--workdir".to_owned(),
+            "/home/debian/Rustyfin".to_owned(),
+            "--program".to_owned(),
+            "cargo".to_owned(),
+            "--arg".to_owned(),
+            "build".to_owned(),
         ]);
         assert!(format!("{vm_lab_bootstrap:?}").contains("VmLabBootstrap"));
         assert!(format!("{vm_lab_bootstrap:?}").contains("VmLabBootstrap"));
 
         let vm_lab_profile = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-write-live-lab-profile".to_string(),
-            "--output".to_string(),
-            "/tmp/live_lab.env".to_string(),
-            "--ssh-identity-file".to_string(),
-            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
-            "--exit-vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--backend".to_string(),
-            "linux-wireguard-userspace-shared".to_string(),
-            "--client-target".to_string(),
-            "debian@192.168.18.52".to_string(),
-            "--require-same-network".to_string(),
+            "ops".to_owned(),
+            "vm-lab-write-live-lab-profile".to_owned(),
+            "--output".to_owned(),
+            "/tmp/live_lab.env".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_owned(),
+            "--exit-vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--backend".to_owned(),
+            "linux-wireguard-userspace-shared".to_owned(),
+            "--client-target".to_owned(),
+            "debian@192.168.18.52".to_owned(),
+            "--require-same-network".to_owned(),
         ]);
         assert!(format!("{vm_lab_profile:?}").contains("VmLabWriteLiveLabProfile"));
         assert!(format!("{vm_lab_profile:?}").contains("debian-headless-1"));
         assert!(format!("{vm_lab_profile:?}").contains("linux-wireguard-userspace-shared"));
 
         let vm_lab_setup = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-setup-live-lab".to_string(),
-            "--report-dir".to_string(),
-            "artifacts/live_lab/setup_test".to_string(),
-            "--ssh-identity-file".to_string(),
-            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--require-same-network".to_string(),
-            "--resume-from".to_string(),
-            "bootstrap_hosts".to_string(),
-            "--max-parallel-node-workers".to_string(),
-            "2".to_string(),
+            "ops".to_owned(),
+            "vm-lab-setup-live-lab".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab/setup_test".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--require-same-network".to_owned(),
+            "--resume-from".to_owned(),
+            "bootstrap_hosts".to_owned(),
+            "--max-parallel-node-workers".to_owned(),
+            "2".to_owned(),
         ]);
         assert!(format!("{vm_lab_setup:?}").contains("VmLabSetupLiveLab"));
         assert!(format!("{vm_lab_setup:?}").contains("bootstrap_hosts"));
 
         let vm_lab_orchestrate = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-orchestrate-live-lab".to_string(),
-            "--report-dir".to_string(),
-            "artifacts/live_lab/orchestrate_test".to_string(),
-            "--ssh-identity-file".to_string(),
-            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--require-same-network".to_string(),
-            "--wait-ready-timeout-secs".to_string(),
-            "180".to_string(),
-            "--collect-artifacts-on-failure".to_string(),
-            "--stop-after-ready".to_string(),
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab/orchestrate_test".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--require-same-network".to_owned(),
+            "--wait-ready-timeout-secs".to_owned(),
+            "180".to_owned(),
+            "--collect-artifacts-on-failure".to_owned(),
+            "--stop-after-ready".to_owned(),
         ]);
         assert!(format!("{vm_lab_orchestrate:?}").contains("VmLabOrchestrateLiveLab"));
         assert!(format!("{vm_lab_orchestrate:?}").contains("ready_timeout_secs: 180"));
@@ -19504,56 +19481,56 @@ mod tests {
         assert!(format!("{vm_lab_orchestrate:?}").contains("stop_after_ready: true"));
 
         let vm_lab_validate_profile = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-validate-live-lab-profile".to_string(),
-            "--profile".to_string(),
-            "profiles/live_lab/generated_vm_lab.env".to_string(),
-            "--expected-backend".to_string(),
-            "linux-wireguard-userspace-shared".to_string(),
-            "--require-five-node".to_string(),
+            "ops".to_owned(),
+            "vm-lab-validate-live-lab-profile".to_owned(),
+            "--profile".to_owned(),
+            "profiles/live_lab/generated_vm_lab.env".to_owned(),
+            "--expected-backend".to_owned(),
+            "linux-wireguard-userspace-shared".to_owned(),
+            "--require-five-node".to_owned(),
         ]);
         assert!(format!("{vm_lab_validate_profile:?}").contains("VmLabValidateLiveLabProfile"));
 
         let vm_lab_diagnose = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-diagnose-live-lab-failure".to_string(),
-            "--profile".to_string(),
-            "profiles/live_lab/generated_vm_lab.env".to_string(),
-            "--report-dir".to_string(),
-            "artifacts/live_lab/iteration_1".to_string(),
-            "--collect-artifacts".to_string(),
+            "ops".to_owned(),
+            "vm-lab-diagnose-live-lab-failure".to_owned(),
+            "--profile".to_owned(),
+            "profiles/live_lab/generated_vm_lab.env".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab/iteration_1".to_owned(),
+            "--collect-artifacts".to_owned(),
         ]);
         assert!(format!("{vm_lab_diagnose:?}").contains("VmLabDiagnoseLiveLabFailure"));
 
         let vm_lab_diff = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-diff-live-lab-runs".to_string(),
-            "--old-report-dir".to_string(),
-            "artifacts/live_lab/old".to_string(),
-            "--new-report-dir".to_string(),
-            "artifacts/live_lab/new".to_string(),
+            "ops".to_owned(),
+            "vm-lab-diff-live-lab-runs".to_owned(),
+            "--old-report-dir".to_owned(),
+            "artifacts/live_lab/old".to_owned(),
+            "--new-report-dir".to_owned(),
+            "artifacts/live_lab/new".to_owned(),
         ]);
         assert!(format!("{vm_lab_diff:?}").contains("VmLabDiffLiveLabRuns"));
 
         let vm_lab_iteration = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-iterate-live-lab".to_string(),
-            "--ssh-identity-file".to_string(),
-            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
-            "--exit-vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--client-target".to_string(),
-            "debian@192.168.18.52".to_string(),
-            "--validation-step".to_string(),
-            "fmt".to_string(),
-            "--validation-step".to_string(),
-            "check:rustynetd".to_string(),
-            "--validation-step".to_string(),
-            "test-bin:rustynet-cli:live_linux_lan_toggle_test".to_string(),
-            "--skip-cross-network".to_string(),
-            "--require-clean-tree".to_string(),
-            "--require-local-head".to_string(),
-            "--collect-failure-diagnostics".to_string(),
+            "ops".to_owned(),
+            "vm-lab-iterate-live-lab".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_owned(),
+            "--exit-vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--client-target".to_owned(),
+            "debian@192.168.18.52".to_owned(),
+            "--validation-step".to_owned(),
+            "fmt".to_owned(),
+            "--validation-step".to_owned(),
+            "check:rustynetd".to_owned(),
+            "--validation-step".to_owned(),
+            "test-bin:rustynet-cli:live_linux_lan_toggle_test".to_owned(),
+            "--skip-cross-network".to_owned(),
+            "--require-clean-tree".to_owned(),
+            "--require-local-head".to_owned(),
+            "--collect-failure-diagnostics".to_owned(),
         ]);
         assert!(format!("{vm_lab_iteration:?}").contains("VmLabIterateLiveLab"));
         assert!(format!("{vm_lab_iteration:?}").contains("CargoCheckPackage"));
@@ -19561,90 +19538,90 @@ mod tests {
         assert!(format!("{vm_lab_iteration:?}").contains("skip_cross_network: true"));
 
         let vm_lab_live_lab = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-run-live-lab".to_string(),
-            "--profile".to_string(),
-            "/tmp/live_lab.env".to_string(),
-            "--dry-run".to_string(),
-            "--skip-setup".to_string(),
-            "--skip-gates".to_string(),
+            "ops".to_owned(),
+            "vm-lab-run-live-lab".to_owned(),
+            "--profile".to_owned(),
+            "/tmp/live_lab.env".to_owned(),
+            "--dry-run".to_owned(),
+            "--skip-setup".to_owned(),
+            "--skip-gates".to_owned(),
         ]);
         assert!(format!("{vm_lab_live_lab:?}").contains("VmLabRunLiveLab"));
         assert!(format!("{vm_lab_live_lab:?}").contains("dry_run: true"));
         assert!(format!("{vm_lab_live_lab:?}").contains("skip_setup: true"));
 
         let vm_lab_known_hosts = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-check-known-hosts".to_string(),
-            "--inventory".to_string(),
-            "/tmp/vm_lab_inventory.json".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--known-hosts-file".to_string(),
-            "/Users/iwanteague/.ssh/known_hosts".to_string(),
+            "ops".to_owned(),
+            "vm-lab-check-known-hosts".to_owned(),
+            "--inventory".to_owned(),
+            "/tmp/vm_lab_inventory.json".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--known-hosts-file".to_owned(),
+            "/Users/iwanteague/.ssh/known_hosts".to_owned(),
         ]);
         assert!(format!("{vm_lab_known_hosts:?}").contains("VmLabCheckKnownHosts"));
 
         let vm_lab_preflight = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-preflight".to_string(),
-            "--all".to_string(),
-            "--require-command".to_string(),
-            "git".to_string(),
-            "--require-command".to_string(),
-            "cargo".to_string(),
-            "--require-rustynet-installed".to_string(),
+            "ops".to_owned(),
+            "vm-lab-preflight".to_owned(),
+            "--all".to_owned(),
+            "--require-command".to_owned(),
+            "git".to_owned(),
+            "--require-command".to_owned(),
+            "cargo".to_owned(),
+            "--require-rustynet-installed".to_owned(),
         ]);
         assert!(format!("{vm_lab_preflight:?}").contains("VmLabPreflight"));
         assert!(format!("{vm_lab_preflight:?}").contains("require_rustynet_installed: true"));
 
         let vm_lab_status = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-status".to_string(),
-            "--target".to_string(),
-            "debian@192.168.18.53".to_string(),
+            "ops".to_owned(),
+            "vm-lab-status".to_owned(),
+            "--target".to_owned(),
+            "debian@192.168.18.53".to_owned(),
         ]);
         assert!(format!("{vm_lab_status:?}").contains("VmLabStatus"));
 
         let vm_lab_stop = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-stop".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
+            "ops".to_owned(),
+            "vm-lab-stop".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
         ]);
         assert!(format!("{vm_lab_stop:?}").contains("VmLabStop"));
 
         let vm_lab_shutdown = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-shutdown".to_string(),
-            "--all".to_string(),
+            "ops".to_owned(),
+            "vm-lab-shutdown".to_owned(),
+            "--all".to_owned(),
         ]);
         assert!(format!("{vm_lab_shutdown:?}").contains("VmLabStop"));
 
         let vm_lab_restart = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-restart".to_string(),
-            "--target".to_string(),
-            "debian@192.168.18.54".to_string(),
-            "--service".to_string(),
-            "rustynetd.service".to_string(),
+            "ops".to_owned(),
+            "vm-lab-restart".to_owned(),
+            "--target".to_owned(),
+            "debian@192.168.18.54".to_owned(),
+            "--service".to_owned(),
+            "rustynetd.service".to_owned(),
         ]);
         assert!(format!("{vm_lab_restart:?}").contains("VmLabRestart"));
         assert!(format!("{vm_lab_restart:?}").contains("rustynetd.service"));
 
         let vm_lab_restart_wait_ready = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-restart".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
-            "--wait-ready".to_string(),
-            "--ssh-port".to_string(),
-            "2222".to_string(),
-            "--wait-ready-timeout-secs".to_string(),
-            "45".to_string(),
-            "--json".to_string(),
-            "--report-dir".to_string(),
-            "/tmp/vm-lab-restart".to_string(),
+            "ops".to_owned(),
+            "vm-lab-restart".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
+            "--wait-ready".to_owned(),
+            "--ssh-port".to_owned(),
+            "2222".to_owned(),
+            "--wait-ready-timeout-secs".to_owned(),
+            "45".to_owned(),
+            "--json".to_owned(),
+            "--report-dir".to_owned(),
+            "/tmp/vm-lab-restart".to_owned(),
         ]);
         let vm_lab_restart_wait_ready = format!("{vm_lab_restart_wait_ready:?}");
         assert!(vm_lab_restart_wait_ready.contains("VmLabRestart"));
@@ -19655,71 +19632,71 @@ mod tests {
         assert!(vm_lab_restart_wait_ready.contains("/tmp/vm-lab-restart"));
 
         let vm_lab_collect_artifacts = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-collect-artifacts".to_string(),
-            "--all".to_string(),
-            "--output-dir".to_string(),
-            "/tmp/vm-lab-artifacts".to_string(),
+            "ops".to_owned(),
+            "vm-lab-collect-artifacts".to_owned(),
+            "--all".to_owned(),
+            "--output-dir".to_owned(),
+            "/tmp/vm-lab-artifacts".to_owned(),
         ]);
         assert!(format!("{vm_lab_collect_artifacts:?}").contains("VmLabCollectArtifacts"));
 
         let vm_lab_write_topology = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-write-topology".to_string(),
-            "--suite".to_string(),
-            "relay-remote-exit".to_string(),
-            "--output".to_string(),
-            "/tmp/vm-lab-topology.json".to_string(),
-            "--all".to_string(),
+            "ops".to_owned(),
+            "vm-lab-write-topology".to_owned(),
+            "--suite".to_owned(),
+            "relay-remote-exit".to_owned(),
+            "--output".to_owned(),
+            "/tmp/vm-lab-topology.json".to_owned(),
+            "--all".to_owned(),
         ]);
         assert!(format!("{vm_lab_write_topology:?}").contains("VmLabWriteTopology"));
 
         let vm_lab_issue_state = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-issue-and-distribute-state".to_string(),
-            "--topology".to_string(),
-            "/tmp/vm-lab-topology.json".to_string(),
-            "--authority-vm".to_string(),
-            "debian-headless-1".to_string(),
+            "ops".to_owned(),
+            "vm-lab-issue-and-distribute-state".to_owned(),
+            "--topology".to_owned(),
+            "/tmp/vm-lab-topology.json".to_owned(),
+            "--authority-vm".to_owned(),
+            "debian-headless-1".to_owned(),
         ]);
         assert!(format!("{vm_lab_issue_state:?}").contains("VmLabIssueAndDistributeState"));
 
         let vm_lab_run_suite = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-run-suite".to_string(),
-            "--suite".to_string(),
-            "direct-remote-exit".to_string(),
-            "--ssh-identity-file".to_string(),
-            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_string(),
-            "--dry-run".to_string(),
-            "--all".to_string(),
+            "ops".to_owned(),
+            "vm-lab-run-suite".to_owned(),
+            "--suite".to_owned(),
+            "direct-remote-exit".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/Users/iwanteague/.ssh/rustynet_lab_ed25519".to_owned(),
+            "--dry-run".to_owned(),
+            "--all".to_owned(),
         ]);
         assert!(format!("{vm_lab_run_suite:?}").contains("VmLabRunSuite"));
         assert!(format!("{vm_lab_run_suite:?}").contains("dry_run: true"));
 
         let vm_lab_bootstrap_phase = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-bootstrap-phase".to_string(),
-            "--phase".to_string(),
-            "all".to_string(),
-            "--repo-url".to_string(),
-            "git@github.com:iwanteague/Rustynet.git".to_string(),
-            "--dest-dir".to_string(),
-            "/home/debian/Rustynet".to_string(),
-            "--all".to_string(),
+            "ops".to_owned(),
+            "vm-lab-bootstrap-phase".to_owned(),
+            "--phase".to_owned(),
+            "all".to_owned(),
+            "--repo-url".to_owned(),
+            "git@github.com:iwanteague/Rustynet.git".to_owned(),
+            "--dest-dir".to_owned(),
+            "/home/debian/Rustynet".to_owned(),
+            "--all".to_owned(),
         ]);
         assert!(format!("{vm_lab_bootstrap_phase:?}").contains("VmLabBootstrapPhase"));
         assert!(format!("{vm_lab_bootstrap_phase:?}").contains("phase: \"all\""));
 
         let vm_lab_report_capabilities = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-report-capabilities".to_string(),
-            "--scope".to_string(),
-            "setup-live-lab".to_string(),
-            "--platform".to_string(),
-            "linux".to_string(),
-            "--source-mode".to_string(),
-            "local-head".to_string(),
+            "ops".to_owned(),
+            "vm-lab-report-capabilities".to_owned(),
+            "--scope".to_owned(),
+            "setup-live-lab".to_owned(),
+            "--platform".to_owned(),
+            "linux".to_owned(),
+            "--source-mode".to_owned(),
+            "local-head".to_owned(),
         ]);
         assert!(format!("{vm_lab_report_capabilities:?}").contains("VmLabReportCapabilities"));
         assert!(format!("{vm_lab_report_capabilities:?}").contains("SetupLiveLab"));
@@ -19727,17 +19704,17 @@ mod tests {
         assert!(format!("{vm_lab_report_capabilities:?}").contains("LocalHead"));
 
         let vm_lab_report_capabilities_bootstrap = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-report-capabilities".to_string(),
-            "--scope".to_string(),
-            "bootstrap-phase".to_string(),
-            "--platform".to_string(),
-            "windows".to_string(),
-            "--source-mode".to_string(),
-            "local-head".to_string(),
-            "--bootstrap-phase".to_string(),
-            "install-release".to_string(),
-            "--mixed-platform-topology".to_string(),
+            "ops".to_owned(),
+            "vm-lab-report-capabilities".to_owned(),
+            "--scope".to_owned(),
+            "bootstrap-phase".to_owned(),
+            "--platform".to_owned(),
+            "windows".to_owned(),
+            "--source-mode".to_owned(),
+            "local-head".to_owned(),
+            "--bootstrap-phase".to_owned(),
+            "install-release".to_owned(),
+            "--mixed-platform-topology".to_owned(),
         ]);
         assert!(format!("{vm_lab_report_capabilities_bootstrap:?}").contains("BootstrapPhase"));
         assert!(format!("{vm_lab_report_capabilities_bootstrap:?}").contains("InstallRelease"));
@@ -19751,16 +19728,16 @@ mod tests {
         );
 
         let vm_lab_bootstrap_phase_local = parse_command(&[
-            "ops".to_string(),
-            "vm-lab-bootstrap-phase".to_string(),
-            "--phase".to_string(),
-            "sync-source".to_string(),
-            "--local-source-dir".to_string(),
-            "/tmp/test/Rustynet".to_string(),
-            "--dest-dir".to_string(),
-            "/home/debian/Rustynet".to_string(),
-            "--vm".to_string(),
-            "debian-headless-1".to_string(),
+            "ops".to_owned(),
+            "vm-lab-bootstrap-phase".to_owned(),
+            "--phase".to_owned(),
+            "sync-source".to_owned(),
+            "--local-source-dir".to_owned(),
+            "/tmp/test/Rustynet".to_owned(),
+            "--dest-dir".to_owned(),
+            "/home/debian/Rustynet".to_owned(),
+            "--vm".to_owned(),
+            "debian-headless-1".to_owned(),
         ]);
         assert!(format!("{vm_lab_bootstrap_phase_local:?}").contains("VmLabBootstrapPhase"));
         assert!(format!("{vm_lab_bootstrap_phase_local:?}").contains("/tmp/test/Rustynet"));
@@ -19768,7 +19745,7 @@ mod tests {
 
     #[test]
     fn parse_supports_state_refresh_command() {
-        let command = parse_command(&["state".to_string(), "refresh".to_string()]);
+        let command = parse_command(&["state".to_owned(), "refresh".to_owned()]);
         assert_eq!(command, CliCommand::StateRefresh);
         let ipc = to_ipc_command(command);
         assert_eq!(ipc, IpcCommand::StateRefresh);
@@ -19798,34 +19775,34 @@ mod tests {
     #[test]
     fn parse_reboot_recovery_report_requires_dns_refresh_checks() {
         let missing_dns_refresh_checks = parse_command(&[
-            "ops".to_string(),
-            "write-live-linux-reboot-recovery-report".to_string(),
-            "--report-path".to_string(),
-            "artifacts/live_lab/live_linux_reboot_recovery_report.json".to_string(),
-            "--observations-path".to_string(),
-            "artifacts/live_lab/live_linux_reboot_recovery_observations.txt".to_string(),
-            "--exit-pre".to_string(),
-            "a".to_string(),
-            "--exit-post".to_string(),
-            "b".to_string(),
-            "--client-pre".to_string(),
-            "c".to_string(),
-            "--client-post".to_string(),
-            "d".to_string(),
-            "--exit-return".to_string(),
-            "pass".to_string(),
-            "--exit-boot-change".to_string(),
-            "pass".to_string(),
-            "--post-exit-twohop".to_string(),
-            "pass".to_string(),
-            "--client-return".to_string(),
-            "pass".to_string(),
-            "--client-boot-change".to_string(),
-            "pass".to_string(),
-            "--post-client-twohop".to_string(),
-            "pass".to_string(),
-            "--salvage-twohop".to_string(),
-            "skipped".to_string(),
+            "ops".to_owned(),
+            "write-live-linux-reboot-recovery-report".to_owned(),
+            "--report-path".to_owned(),
+            "artifacts/live_lab/live_linux_reboot_recovery_report.json".to_owned(),
+            "--observations-path".to_owned(),
+            "artifacts/live_lab/live_linux_reboot_recovery_observations.txt".to_owned(),
+            "--exit-pre".to_owned(),
+            "a".to_owned(),
+            "--exit-post".to_owned(),
+            "b".to_owned(),
+            "--client-pre".to_owned(),
+            "c".to_owned(),
+            "--client-post".to_owned(),
+            "d".to_owned(),
+            "--exit-return".to_owned(),
+            "pass".to_owned(),
+            "--exit-boot-change".to_owned(),
+            "pass".to_owned(),
+            "--post-exit-twohop".to_owned(),
+            "pass".to_owned(),
+            "--client-return".to_owned(),
+            "pass".to_owned(),
+            "--client-boot-change".to_owned(),
+            "pass".to_owned(),
+            "--post-client-twohop".to_owned(),
+            "pass".to_owned(),
+            "--salvage-twohop".to_owned(),
+            "skipped".to_owned(),
         ]);
         assert_eq!(format!("{missing_dns_refresh_checks:?}"), "Help");
     }
@@ -20003,8 +19980,8 @@ mod tests {
         assert_eq!(
             anchors,
             vec![
-                "com.apple/rustynet_g100".to_string(),
-                "com.apple/rustynet_g200".to_string()
+                "com.apple/rustynet_g100".to_owned(),
+                "com.apple/rustynet_g200".to_owned()
             ]
         );
     }
@@ -20028,14 +20005,14 @@ mod tests {
         let plist = render_launchd_plist(
             "com.rustynet.test",
             &[
-                "/usr/local/bin/rustynetd".to_string(),
-                "daemon".to_string(),
-                "--node-id".to_string(),
-                "node-1".to_string(),
+                "/usr/local/bin/rustynetd".to_owned(),
+                "daemon".to_owned(),
+                "--node-id".to_owned(),
+                "node-1".to_owned(),
             ],
             &[(
-                "RUSTYNET_WG_BINARY_PATH".to_string(),
-                "/usr/bin/wg".to_string(),
+                "RUSTYNET_WG_BINARY_PATH".to_owned(),
+                "/usr/bin/wg".to_owned(),
             )],
             std::path::Path::new("/tmp/rustynetd.log"),
             std::path::Path::new("/tmp/rustynetd.log"),
@@ -20398,7 +20375,7 @@ mod tests {
 
     #[test]
     fn execute_reports_error_when_daemon_is_unreachable() {
-        let output = execute(parse_command(&["status".to_string()]));
+        let output = execute(parse_command(&["status".to_owned()]));
         assert!(output.is_err());
         let message = output.expect_err("daemon-unreachable path should fail");
         assert!(message.starts_with("daemon unreachable:"));
@@ -20465,40 +20442,40 @@ mod tests {
     #[test]
     fn extract_json_flag_strips_flag_when_present() {
         let (cleaned, json_mode) =
-            extract_json_flag(vec!["netcheck".to_string(), "--json".to_string()]);
+            extract_json_flag(vec!["netcheck".to_owned(), "--json".to_owned()]);
         assert!(json_mode);
-        assert_eq!(cleaned, vec!["netcheck".to_string()]);
+        assert_eq!(cleaned, vec!["netcheck".to_owned()]);
     }
 
     #[test]
     fn extract_json_flag_strips_flag_in_any_position() {
         let (cleaned, json_mode) =
-            extract_json_flag(vec!["--json".to_string(), "status".to_string()]);
+            extract_json_flag(vec!["--json".to_owned(), "status".to_owned()]);
         assert!(json_mode);
-        assert_eq!(cleaned, vec!["status".to_string()]);
+        assert_eq!(cleaned, vec!["status".to_owned()]);
     }
 
     #[test]
     fn extract_json_flag_absent_returns_false() {
-        let (cleaned, json_mode) = extract_json_flag(vec!["status".to_string()]);
+        let (cleaned, json_mode) = extract_json_flag(vec!["status".to_owned()]);
         assert!(!json_mode);
-        assert_eq!(cleaned, vec!["status".to_string()]);
+        assert_eq!(cleaned, vec!["status".to_owned()]);
     }
 
     #[test]
     fn extract_json_flag_does_not_match_partial_or_quoted() {
         let (cleaned, json_mode) = extract_json_flag(vec![
-            "status".to_string(),
-            "--jsonn".to_string(),
-            "--JSON".to_string(),
+            "status".to_owned(),
+            "--jsonn".to_owned(),
+            "--JSON".to_owned(),
         ]);
         assert!(!json_mode);
         assert_eq!(
             cleaned,
             vec![
-                "status".to_string(),
-                "--jsonn".to_string(),
-                "--JSON".to_string(),
+                "status".to_owned(),
+                "--jsonn".to_owned(),
+                "--JSON".to_owned(),
             ]
         );
     }
@@ -20728,7 +20705,7 @@ mod tests {
             epoch,
             entries_count: entries,
             active_node_count: entries.saturating_sub(1),
-            state_root_hex: root.to_string(),
+            state_root_hex: root.to_owned(),
             captured_at_unix: 1_700_000_000,
         }
     }
@@ -20816,7 +20793,7 @@ mod tests {
             epoch: 7,
             entries_count: 12,
             active_node_count: 11,
-            state_root_hex: "new-root".to_string(),
+            state_root_hex: "new-root".to_owned(),
             captured_at_unix: 1_700_000_300, // 5 min later
         };
         let json = build_membership_evidence_diff_json("prod", Some(&prior), &current);

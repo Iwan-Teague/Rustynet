@@ -32,7 +32,7 @@ struct UtmTransport {
 
 fn target_home(target: &str) -> String {
     match LiveLabContext::target_user(target) {
-        "root" => "/root".to_string(),
+        "root" => "/root".to_owned(),
         user => format!("/home/{user}"),
     }
 }
@@ -40,7 +40,7 @@ fn target_home(target: &str) -> String {
 fn env_var_nonempty(key: &str) -> Option<String> {
     env::var(key)
         .ok()
-        .map(|value| value.trim().to_string())
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
 
@@ -78,7 +78,7 @@ fn utm_transport_for_target(target: &str) -> Option<UtmTransport> {
         };
         return Some(UtmTransport {
             utm_name,
-            user: LiveLabContext::target_user(target).to_string(),
+            user: LiveLabContext::target_user(target).to_owned(),
             home: target_home(target),
         });
     }
@@ -205,8 +205,8 @@ fn utm_exec_output(transport: &UtmTransport, command: &str) -> Result<Output, St
 fn utm_exec_root_status(transport: &UtmTransport, command: &str) -> Result<ExitStatus, String> {
     let root_transport = UtmTransport {
         utm_name: transport.utm_name.clone(),
-        user: "root".to_string(),
-        home: "/root".to_string(),
+        user: "root".to_owned(),
+        home: "/root".to_owned(),
     };
     utm_exec_status(&root_transport, command)
 }
@@ -418,7 +418,7 @@ pub fn require_local_file_mode(path: &Path, policy: &str, label: &str) -> Result
 
 pub fn shell_single_quote(value: &str) -> String {
     if value.is_empty() {
-        return "''".to_string();
+        return "''".to_owned();
     }
     let mut quoted = String::from("'");
     for ch in value.chars() {
@@ -551,7 +551,7 @@ impl LiveLabContext {
 
     pub fn resolved_target_address(target: &str) -> Result<String, String> {
         if utm_transport_for_target(target).is_some() {
-            return Ok(Self::target_address(target).to_string());
+            return Ok(Self::target_address(target).to_owned());
         }
         let resolved = Command::new("ssh")
             .args(["-G", target])
@@ -575,7 +575,7 @@ impl LiveLabContext {
 
     pub fn remote_src_dir(target: &str) -> String {
         if Self::target_user(target) == "root" {
-            "/root/Rustynet".to_string()
+            "/root/Rustynet".to_owned()
         } else {
             format!("/home/{}/Rustynet", Self::target_user(target))
         }
@@ -813,7 +813,7 @@ impl LiveLabContext {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| "retry exhausted".to_string()))
+        Err(last_err.unwrap_or_else(|| "retry exhausted".to_owned()))
     }
 
     pub fn run_root_allow_failure_with_retry(
@@ -835,7 +835,7 @@ impl LiveLabContext {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| "retry exhausted".to_string()))
+        Err(last_err.unwrap_or_else(|| "retry exhausted".to_owned()))
     }
 
     pub fn retry_root(
@@ -857,7 +857,7 @@ impl LiveLabContext {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| "retry exhausted".to_string()))
+        Err(last_err.unwrap_or_else(|| "retry exhausted".to_owned()))
     }
 
     pub fn wait_for_daemon_socket(
@@ -872,7 +872,7 @@ impl LiveLabContext {
 
     pub fn verify_sudo(&self, target: &str) -> Result<(), String> {
         let hostname = self.capture(target, &["hostname"])?;
-        let hostname = hostname.trim().to_string();
+        let hostname = hostname.trim().to_owned();
         if hostname.is_empty() {
             return Err(format!("failed to resolve hostname on {target}"));
         }
@@ -897,7 +897,7 @@ impl LiveLabContext {
             return Ok(());
         }
         self.verify_sudo(target)?;
-        self.verified_hosts.insert(target.to_string());
+        self.verified_hosts.insert(target.to_owned());
         Ok(())
     }
 
@@ -922,17 +922,17 @@ fn render_failure_output(output: &Output) -> String {
     if !stderr.is_empty() && !stdout.is_empty() {
         format!("{stderr} (stdout: {stdout})")
     } else if !stderr.is_empty() {
-        stderr.to_string()
+        stderr.to_owned()
     } else if !stdout.is_empty() {
         format!("stdout: {stdout}")
     } else {
-        "remote command exited non-zero without output".to_string()
+        "remote command exited non-zero without output".to_owned()
     }
 }
 
 fn render_remote_argv(args: &[&str]) -> Result<String, String> {
     if args.is_empty() {
-        return Err("refusing to run empty remote command".to_string());
+        return Err("refusing to run empty remote command".to_owned());
     }
     let mut rendered = String::new();
     for (index, arg) in args.iter().enumerate() {
@@ -1019,7 +1019,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect::<Vec<_>>();
     if compact.len() % 4 != 0 {
-        return Err("invalid base64 length".to_string());
+        return Err("invalid base64 length".to_owned());
     }
     let mut output = Vec::with_capacity((compact.len() / 4) * 3);
     let mut index = 0usize;
@@ -1029,12 +1029,12 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         let c2 = compact[index + 2];
         let c3 = compact[index + 3];
         if c0 == b'=' || c1 == b'=' {
-            return Err("invalid base64 padding".to_string());
+            return Err("invalid base64 padding".to_owned());
         }
         let v0 = table[c0 as usize];
         let v1 = table[c1 as usize];
         if v0 == 0xFF || v1 == 0xFF {
-            return Err("invalid base64 character".to_string());
+            return Err("invalid base64 character".to_owned());
         }
         output.push((v0 << 2) | (v1 >> 4));
 
@@ -1042,25 +1042,25 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         let pad3 = c3 == b'=';
         if pad2 {
             if !pad3 {
-                return Err("invalid base64 padding".to_string());
+                return Err("invalid base64 padding".to_owned());
             }
         } else {
             let v2 = table[c2 as usize];
             if v2 == 0xFF {
-                return Err("invalid base64 character".to_string());
+                return Err("invalid base64 character".to_owned());
             }
             output.push((v1 << 4) | (v2 >> 2));
             if !pad3 {
                 let v3 = table[c3 as usize];
                 if v3 == 0xFF {
-                    return Err("invalid base64 character".to_string());
+                    return Err("invalid base64 character".to_owned());
                 }
                 output.push((v2 << 6) | v3);
             }
         }
 
         if (pad2 || pad3) && index + 4 != compact.len() {
-            return Err("invalid base64 padding".to_string());
+            return Err("invalid base64 padding".to_owned());
         }
         index += 4;
     }
@@ -1097,7 +1097,7 @@ pub fn run_cargo_ops(
         .output()
         .map_err(|err| format!("failed to run cargo ops {ops_subcommand}: {err}"))?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
         Err(format!(
             "cargo ops {ops_subcommand} failed: {}",
@@ -1116,10 +1116,10 @@ pub fn parse_ipv4(value: &str, label: &str) -> Result<Ipv4Addr, String> {
 
 fn known_hosts_lookup_host(host: &str, port: &str) -> Result<String, String> {
     if host.is_empty() {
-        return Err("known_hosts lookup host must not be empty".to_string());
+        return Err("known_hosts lookup host must not be empty".to_owned());
     }
     if port.is_empty() || port == "22" {
-        Ok(host.to_string())
+        Ok(host.to_owned())
     } else {
         Ok(format!("[{host}]:{port}"))
     }
@@ -1139,7 +1139,7 @@ fn resolved_target_address_from_ssh_g(target: &str, resolved: &str) -> String {
     ssh_g_value(resolved, "hostname")
         .filter(|hostname| !hostname.is_empty() && *hostname != "none")
         .unwrap_or_else(|| LiveLabContext::target_address(target))
-        .to_string()
+        .to_owned()
 }
 
 fn resolved_known_hosts_candidates(target: &str, resolved: &str) -> Result<Vec<String>, String> {
@@ -1230,9 +1230,9 @@ port 2222
         assert_eq!(
             candidates,
             vec![
-                "[rusty-lab]:2222".to_string(),
-                "[192.168.18.65]:2222".to_string(),
-                "[debian-headless-2]:2222".to_string()
+                "[rusty-lab]:2222".to_owned(),
+                "[192.168.18.65]:2222".to_owned(),
+                "[debian-headless-2]:2222".to_owned()
             ]
         );
     }
@@ -1245,7 +1245,7 @@ port 22
 ";
         let candidates = resolved_known_hosts_candidates("debian@debian-headless-2", resolved)
             .expect("candidates");
-        assert_eq!(candidates, vec!["debian-headless-2".to_string()]);
+        assert_eq!(candidates, vec!["debian-headless-2".to_owned()]);
     }
 
     #[test]

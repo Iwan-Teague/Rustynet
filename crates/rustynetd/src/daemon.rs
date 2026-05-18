@@ -408,50 +408,50 @@ impl StateFetcher {
         // Expect form: http://host[:port]/path
         let url = url.trim();
         if !url.starts_with("http://") {
-            return Err("only http:// URLs are supported in this minimal fetcher".to_string());
+            return Err("only http:// URLs are supported in this minimal fetcher".to_owned());
         }
         let without_proto = &url[7..];
         let parts: Vec<&str> = without_proto.splitn(2, '/').collect();
-        let host_port = parts.first().ok_or_else(|| "invalid url".to_string())?;
+        let host_port = parts.first().ok_or_else(|| "invalid url".to_owned())?;
         let path = format!("/{}", parts.get(1).unwrap_or(&""));
         let mut host = host_port.to_string();
         let mut port = 80u16;
         if host_port.contains(':') {
             let mut hp = host_port.splitn(2, ':');
-            host = hp.next().unwrap_or("").to_string();
+            host = hp.next().unwrap_or("").to_owned();
             if let Some(p) = hp.next() {
                 port = p
                     .parse::<u16>()
-                    .map_err(|_| "invalid port in url".to_string())?;
+                    .map_err(|_| "invalid port in url".to_owned())?;
             }
         }
         let addr = format!("{host}:{port}");
         let mut stream = match std::net::TcpStream::connect_timeout(
             &addr
                 .to_socket_addrs()
-                .map_err(|_| "resolve failed".to_string())?
+                .map_err(|_| "resolve failed".to_owned())?
                 .next()
-                .ok_or_else(|| "resolve returned no addresses".to_string())?,
+                .ok_or_else(|| "resolve returned no addresses".to_owned())?,
             Duration::from_secs(3),
         ) {
             Ok(s) => s,
-            Err(_) => return Err("network unreachable".to_string()),
+            Err(_) => return Err("network unreachable".to_owned()),
         };
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
-            .map_err(|_| "write to socket failed".to_string())?;
+            .map_err(|_| "write to socket failed".to_owned())?;
         let mut buf = Vec::new();
         stream
             .read_to_end(&mut buf)
-            .map_err(|_| "read from socket failed".to_string())?;
+            .map_err(|_| "read from socket failed".to_owned())?;
         // Very minimal HTTP response parsing: look for \r\n\r\n and take the rest as body.
         if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let body = buf.split_off(idx + 4);
             Ok(body)
         } else {
-            Err("malformed http response".to_string())
+            Err("malformed http response".to_owned())
         }
     }
 
@@ -865,7 +865,7 @@ impl DaemonBackendMode {
 fn validate_control_socket_path(path: &Path) -> Result<(), DaemonError> {
     if !path.is_absolute() {
         return Err(DaemonError::InvalidConfig(
-            "socket path must be absolute".to_string(),
+            "socket path must be absolute".to_owned(),
         ));
     }
     Ok(())
@@ -881,7 +881,7 @@ fn validate_control_socket_path(path: &Path) -> Result<(), DaemonError> {
 fn validate_privileged_helper_control_path(path: &Path) -> Result<(), DaemonError> {
     if !path.is_absolute() {
         return Err(DaemonError::InvalidConfig(
-            "privileged helper socket path must be absolute".to_string(),
+            "privileged helper socket path must be absolute".to_owned(),
         ));
     }
     Ok(())
@@ -1002,7 +1002,7 @@ impl std::str::FromStr for NodeRole {
             "admin" => Ok(NodeRole::Admin),
             "client" => Ok(NodeRole::Client),
             "blind_exit" | "blind-exit" => Ok(NodeRole::BlindExit),
-            _ => Err("invalid node role: expected admin, client, or blind_exit".to_string()),
+            _ => Err("invalid node role: expected admin, client, or blind_exit".to_owned()),
         }
     }
 }
@@ -1098,7 +1098,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            node_id: DEFAULT_NODE_ID.to_string(),
+            node_id: DEFAULT_NODE_ID.to_owned(),
             node_role: NodeRole::default(),
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             state_path: PathBuf::from(DEFAULT_STATE_PATH),
@@ -1123,7 +1123,7 @@ impl Default for DaemonConfig {
             dns_zone_watermark_path: PathBuf::from(DEFAULT_DNS_ZONE_WATERMARK_PATH),
             dns_zone_max_age_secs: NonZeroU64::new(DEFAULT_DNS_ZONE_MAX_AGE_SECS)
                 .expect("default dns zone max age must be non-zero"),
-            dns_zone_name: DEFAULT_DNS_ZONE_NAME.to_string(),
+            dns_zone_name: DEFAULT_DNS_ZONE_NAME.to_owned(),
             dns_resolver_bind_addr: DEFAULT_DNS_RESOLVER_BIND_ADDR
                 .parse()
                 .expect("default dns resolver bind addr must parse"),
@@ -1172,7 +1172,7 @@ impl Default for DaemonConfig {
             )
             .expect("default traversal stun gather timeout must be non-zero"),
             backend_mode: DaemonBackendMode::default(),
-            wg_interface: DEFAULT_WG_INTERFACE.to_string(),
+            wg_interface: DEFAULT_WG_INTERFACE.to_owned(),
             wg_listen_port: DEFAULT_WG_LISTEN_PORT,
             wg_private_key_path: Some(PathBuf::from(DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH)),
             wg_encrypted_private_key_path: Some(PathBuf::from(
@@ -1204,9 +1204,9 @@ impl Default for DaemonConfig {
                 DEFAULT_RELAY_SESSION_IDLE_TIMEOUT_SECS,
             )
             .expect("default relay session idle timeout must be non-zero"),
-            egress_interface: DEFAULT_EGRESS_INTERFACE.to_string(),
+            egress_interface: DEFAULT_EGRESS_INTERFACE.to_owned(),
             remote_ops_token_verifier_key_path: None,
-            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
             auto_port_forward_exit: DEFAULT_AUTO_PORT_FORWARD_EXIT,
             auto_port_forward_lease_secs: NonZeroU32::new(DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS)
                 .expect("default auto port-forward lease must be non-zero"),
@@ -1540,7 +1540,7 @@ struct RuntimePathStateSummary {
 
 fn format_stun_local_addrs(observations: &[StunResult]) -> String {
     if observations.is_empty() {
-        return "none".to_string();
+        return "none".to_owned();
     }
     observations
         .iter()
@@ -1696,10 +1696,10 @@ pub fn verify_signed_trust_state_artifact(
     max_clock_skew_secs: u64,
 ) -> Result<SignedTrustVerificationReport, String> {
     if max_age_secs == 0 {
-        return Err("trust max age seconds must be greater than zero".to_string());
+        return Err("trust max age seconds must be greater than zero".to_owned());
     }
     if max_clock_skew_secs == 0 {
-        return Err("trust max clock skew seconds must be greater than zero".to_string());
+        return Err("trust max clock skew seconds must be greater than zero".to_owned());
     }
 
     let previous_watermark = load_trust_watermark(watermark_path).map_err(|err| err.to_string())?;
@@ -1717,10 +1717,10 @@ pub fn verify_signed_trust_state_artifact(
     )
     .map_err(|err| err.to_string())?;
     if !envelope.evidence.tls13_valid {
-        return Err("trust evidence tls13_valid=false".to_string());
+        return Err("trust evidence tls13_valid=false".to_owned());
     }
     if !envelope.evidence.signed_control_valid {
-        return Err("trust evidence signed_control_valid=false".to_string());
+        return Err("trust evidence signed_control_valid=false".to_owned());
     }
     if envelope.evidence.signed_data_age_secs > max_age_secs {
         return Err(format!(
@@ -1737,7 +1737,7 @@ pub fn verify_signed_trust_state_artifact(
     let payload_digest = envelope
         .watermark
         .payload_digest
-        .ok_or_else(|| "trust watermark payload digest is missing".to_string())?;
+        .ok_or_else(|| "trust watermark payload digest is missing".to_owned())?;
 
     Ok(SignedTrustVerificationReport {
         updated_at_unix: envelope.watermark.updated_at_unix,
@@ -1759,10 +1759,10 @@ pub fn verify_signed_assignment_state_artifact(
     expected_node_id: Option<&str>,
 ) -> Result<SignedAssignmentVerificationReport, String> {
     if max_age_secs == 0 {
-        return Err("assignment max age seconds must be greater than zero".to_string());
+        return Err("assignment max age seconds must be greater than zero".to_owned());
     }
     if max_clock_skew_secs == 0 {
-        return Err("assignment max clock skew seconds must be greater than zero".to_string());
+        return Err("assignment max clock skew seconds must be greater than zero".to_owned());
     }
 
     let previous_watermark =
@@ -1796,7 +1796,7 @@ pub fn verify_signed_assignment_state_artifact(
     let payload_digest = envelope
         .watermark
         .payload_digest
-        .ok_or_else(|| "assignment watermark payload digest is missing".to_string())?;
+        .ok_or_else(|| "assignment watermark payload digest is missing".to_owned())?;
 
     Ok(SignedAssignmentVerificationReport {
         node_id: envelope.bundle.node_id,
@@ -1818,10 +1818,10 @@ pub fn verify_signed_traversal_state_artifact(
     expected_source_node_id: Option<&str>,
 ) -> Result<SignedTraversalVerificationReport, String> {
     if max_age_secs == 0 {
-        return Err("traversal max age seconds must be greater than zero".to_string());
+        return Err("traversal max age seconds must be greater than zero".to_owned());
     }
     if max_clock_skew_secs == 0 {
-        return Err("traversal max clock skew seconds must be greater than zero".to_string());
+        return Err("traversal max clock skew seconds must be greater than zero".to_owned());
     }
 
     let previous_watermark =
@@ -1845,7 +1845,7 @@ pub fn verify_signed_traversal_state_artifact(
     )
     .map_err(|err| err.to_string())?;
     if envelope.bundles.is_empty() {
-        return Err("verified traversal bundle set is empty".to_string());
+        return Err("verified traversal bundle set is empty".to_owned());
     }
 
     let mut source_node_ids = BTreeSet::new();
@@ -1866,11 +1866,11 @@ pub fn verify_signed_traversal_state_artifact(
     let first_bundle = envelope
         .bundles
         .first()
-        .ok_or_else(|| "verified traversal bundle set is empty".to_string())?;
+        .ok_or_else(|| "verified traversal bundle set is empty".to_owned())?;
     let payload_digest = envelope
         .watermark
         .payload_digest
-        .ok_or_else(|| "traversal watermark payload digest is missing".to_string())?;
+        .ok_or_else(|| "traversal watermark payload digest is missing".to_owned())?;
 
     Ok(SignedTraversalVerificationReport {
         generated_at_unix: first_bundle.bundle.generated_at_unix,
@@ -2072,7 +2072,7 @@ impl DaemonBackend {
                 #[cfg(not(test))]
                 {
                     Err(DaemonError::InvalidConfig(
-                        "in-memory backend is disabled in production daemon paths".to_string(),
+                        "in-memory backend is disabled in production daemon paths".to_owned(),
                     ))
                 }
             }
@@ -2112,15 +2112,14 @@ impl DaemonBackend {
                 #[cfg(not(target_os = "linux"))]
                 {
                     Err(DaemonError::InvalidConfig(
-                        "linux-wireguard backend is only supported on linux".to_string(),
+                        "linux-wireguard backend is only supported on linux".to_owned(),
                     ))
                 }
             }
             DaemonBackendMode::LinuxWireguardUserspaceShared => {
                 let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
                     DaemonError::InvalidConfig(
-                        "wg private key path is required for linux-wireguard-userspace-shared backend"
-                            .to_string(),
+                        "wg private key path is required for linux-wireguard-userspace-shared backend".to_owned(),
                     )
                 })?;
                 validate_private_key_permissions(private_key)?;
@@ -2165,7 +2164,7 @@ impl DaemonBackend {
                 {
                     Err(DaemonError::InvalidConfig(
                         "linux-wireguard-userspace-shared backend is only supported on linux"
-                            .to_string(),
+                            .to_owned(),
                     ))
                 }
             }
@@ -2177,14 +2176,13 @@ impl DaemonBackend {
                         .as_ref()
                         .ok_or_else(|| {
                             DaemonError::InvalidConfig(
-                                "privileged helper socket path is required for macos-wireguard backend"
-                                    .to_string(),
+                                "privileged helper socket path is required for macos-wireguard backend".to_owned(),
                             )
                         })?;
                     let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
                         DaemonError::InvalidConfig(
                             "wg private key path is required for macos-wireguard backend"
-                                .to_string(),
+                                .to_owned(),
                         )
                     })?;
                     validate_private_key_permissions(private_key)?;
@@ -2214,7 +2212,7 @@ impl DaemonBackend {
                 DaemonBackendMode::MacosWireguardUserspaceShared
                     .userspace_shared_blocker()
                     .expect("macos shared backend blocker should exist")
-                    .to_string(),
+                    .to_owned(),
             )),
             DaemonBackendMode::WindowsWireguardNt => {
                 #[cfg(windows)]
@@ -2245,7 +2243,7 @@ impl DaemonBackend {
                 #[cfg(not(windows))]
                 {
                     Err(DaemonError::InvalidConfig(
-                        "windows-wireguard-nt backend is only supported on Windows".to_string(),
+                        "windows-wireguard-nt backend is only supported on Windows".to_owned(),
                     ))
                 }
             }
@@ -2554,7 +2552,7 @@ impl DaemonBackend {
             DaemonBackend::InMemory(backend) => {
                 backend.configure_authoritative_shared_transport_for_test(
                     local_addr,
-                    label.to_string(),
+                    label.to_owned(),
                 );
                 Ok(())
             }
@@ -2822,7 +2820,7 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
     {
         return Err(DaemonError::InvalidConfig(
             "preissued relay token spool cannot be combined with daemon-local relay token signing"
-                .to_string(),
+                .to_owned(),
         ));
     }
     if let Some(spool_dir) = config.relay_session_token_spool_dir.as_ref() {
@@ -2884,8 +2882,7 @@ fn load_optional_relay_fleet(
     };
     let watermark_path = config.relay_fleet_watermark_path.as_ref().ok_or_else(|| {
         DaemonError::InvalidConfig(
-            "relay fleet watermark path is required when relay fleet bundle path is set"
-                .to_string(),
+            "relay fleet watermark path is required when relay fleet bundle path is set".to_owned(),
         )
     })?;
     let previous_watermark = load_traversal_watermark(watermark_path.as_path()).map_err(|err| {
@@ -2908,9 +2905,9 @@ fn load_optional_relay_fleet(
 fn relay_fleet_default_path_from_env(env_name: &str, default_path: &str) -> PathBuf {
     let raw = std::env::var(env_name)
         .ok()
-        .map(|value| value.trim().to_string())
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default_path.to_string());
+        .unwrap_or_else(|| default_path.to_owned());
     PathBuf::from(raw)
 }
 
@@ -2920,8 +2917,8 @@ impl DaemonRuntime {
             .map_err(|err| DaemonError::InvalidConfig(format!("invalid node id: {err}")))?;
         let policy = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "user:local".to_string(),
-                dst: "*".to_string(),
+                src: "user:local".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::Mesh, TrafficContext::SharedExit],
@@ -3138,7 +3135,7 @@ impl DaemonRuntime {
             });
             if !exit_active {
                 return Err(MembershipBootstrapError::ExitNodeNotActive(
-                    exit_node.to_string(),
+                    exit_node.to_owned(),
                 ));
             }
         }
@@ -3193,7 +3190,7 @@ impl DaemonRuntime {
         for peer in &bundle.peers {
             let decision = self.policy.evaluate_with_membership(
                 &ContextualAccessRequest {
-                    src: subject.to_string(),
+                    src: subject.to_owned(),
                     dst: format!("node:{}", peer.node_id.as_str()),
                     protocol: Protocol::Any,
                     context: TrafficContext::Mesh,
@@ -3215,7 +3212,7 @@ impl DaemonRuntime {
             };
             let cidr_decision = self.policy.evaluate_with_membership(
                 &ContextualAccessRequest {
-                    src: subject.to_string(),
+                    src: subject.to_owned(),
                     dst: route.destination_cidr.clone(),
                     protocol: Protocol::Any,
                     context,
@@ -3230,7 +3227,7 @@ impl DaemonRuntime {
             }
             let via_decision = self.policy.evaluate_with_membership(
                 &ContextualAccessRequest {
-                    src: subject.to_string(),
+                    src: subject.to_owned(),
                     dst: format!("node:{}", route.via_node.as_str()),
                     protocol: Protocol::Any,
                     context,
@@ -3258,7 +3255,7 @@ impl DaemonRuntime {
 
         let Some(auto_tunnel) = auto_tunnel else {
             self.dns_zone_error = Some(
-                "dns zone bundle present but signed assignment context is unavailable".to_string(),
+                "dns zone bundle present but signed assignment context is unavailable".to_owned(),
             );
             return;
         };
@@ -3381,14 +3378,14 @@ impl DaemonRuntime {
             "absent"
         };
         let record_count = self.dns_zone.as_ref().map_or_else(
-            || "0".to_string(),
+            || "0".to_owned(),
             |envelope| envelope.bundle.records.len().to_string(),
         );
         let error = self
             .dns_zone_error
             .as_deref()
-            .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
-        (state.to_string(), record_count, error)
+            .map_or_else(|| "none".to_owned(), sanitize_netcheck_value);
+        (state.to_owned(), record_count, error)
     }
 
     fn dns_inspect_message(&self) -> String {
@@ -3399,7 +3396,7 @@ impl DaemonRuntime {
                     sanitize_netcheck_value(error)
                 );
             }
-            return "dns inspect: state=absent".to_string();
+            return "dns inspect: state=absent".to_owned();
         };
 
         let mut message = format!(
@@ -3412,7 +3409,7 @@ impl DaemonRuntime {
         );
         for (index, record) in envelope.bundle.records.iter().enumerate() {
             let aliases = if record.aliases.is_empty() {
-                "none".to_string()
+                "none".to_owned()
             } else {
                 sanitize_netcheck_value(
                     &record
@@ -3646,7 +3643,7 @@ impl DaemonRuntime {
         {
             return Err(
                 "signed traversal refresh failed: traversal state missing while peers are managed"
-                    .to_string(),
+                    .to_owned(),
             );
         }
 
@@ -3838,22 +3835,22 @@ impl DaemonRuntime {
             return ("error", sanitize_netcheck_value(err));
         }
         let Some(envelope) = self.traversal_hints.as_ref() else {
-            return ("missing", "signed_traversal_state_missing".to_string());
+            return ("missing", "signed_traversal_state_missing".to_owned());
         };
         let Some(expires_at) = envelope
             .bundles
             .first()
             .map(|bundle| bundle.bundle.expires_at_unix)
         else {
-            return ("error", "signed_traversal_bundle_set_empty".to_string());
+            return ("error", "signed_traversal_bundle_set_empty".to_owned());
         };
         let remaining_secs = expires_at.saturating_sub(now_unix);
         if remaining_secs == 0 {
-            ("critical", "signed_traversal_state_expired".to_string())
+            ("critical", "signed_traversal_state_expired".to_owned())
         } else if remaining_secs <= MIN_TRAVERSAL_REFRESH_MARGIN_SECS {
-            ("warning", "signed_traversal_state_near_expiry".to_string())
+            ("warning", "signed_traversal_state_near_expiry".to_owned())
         } else {
-            ("ok", "none".to_string())
+            ("ok", "none".to_owned())
         }
     }
 
@@ -3862,16 +3859,16 @@ impl DaemonRuntime {
             return ("error", sanitize_netcheck_value(err));
         }
         let Some(envelope) = self.dns_zone.as_ref() else {
-            return ("missing", "signed_dns_zone_state_missing".to_string());
+            return ("missing", "signed_dns_zone_state_missing".to_owned());
         };
         let expires_at = envelope.bundle.expires_at_unix;
         let remaining_secs = expires_at.saturating_sub(now_unix);
         if remaining_secs == 0 {
-            ("critical", "signed_dns_zone_state_expired".to_string())
+            ("critical", "signed_dns_zone_state_expired".to_owned())
         } else if remaining_secs <= MIN_DNS_ZONE_REFRESH_MARGIN_SECS {
-            ("warning", "signed_dns_zone_state_near_expiry".to_string())
+            ("warning", "signed_dns_zone_state_near_expiry".to_owned())
         } else {
-            ("ok", "none".to_string())
+            ("ok", "none".to_owned())
         }
     }
 
@@ -3952,9 +3949,9 @@ impl DaemonRuntime {
         } else if self.transport_socket_identity_requested()
             && self.controller.authoritative_transport_identity().is_none()
         {
-            "backend_authoritative_shared_transport_not_exposed".to_string()
+            "backend_authoritative_shared_transport_not_exposed".to_owned()
         } else {
-            "none".to_string()
+            "none".to_owned()
         }
     }
 
@@ -3962,7 +3959,7 @@ impl DaemonRuntime {
         self.controller
             .authoritative_transport_identity()
             .map_or_else(
-                || "none".to_string(),
+                || "none".to_owned(),
                 |identity| sanitize_netcheck_value(&identity.label),
             )
     }
@@ -3971,34 +3968,28 @@ impl DaemonRuntime {
         self.controller
             .authoritative_transport_identity()
             .map_or_else(
-                || "none".to_string(),
+                || "none".to_owned(),
                 |identity| sanitize_netcheck_value(&identity.local_addr.to_string()),
             )
     }
 
     fn selected_exit_peer_endpoint_summary(&self) -> (String, String) {
         let Some(selected_exit_node) = self.selected_exit_node.as_deref() else {
-            return ("none".to_string(), "none".to_string());
+            return ("none".to_owned(), "none".to_owned());
         };
-        let node_id = match NodeId::new(selected_exit_node.to_string()) {
+        let node_id = match NodeId::new(selected_exit_node.to_owned()) {
             Ok(node_id) => node_id,
             Err(err) => {
-                return (
-                    "none".to_string(),
-                    sanitize_netcheck_value(&err.to_string()),
-                );
+                return ("none".to_owned(), sanitize_netcheck_value(&err.to_string()));
             }
         };
         match self.controller.current_peer_endpoint(&node_id) {
             Ok(Some(endpoint)) => (
                 sanitize_netcheck_value(&format!("{}:{}", endpoint.addr, endpoint.port)),
-                "none".to_string(),
+                "none".to_owned(),
             ),
-            Ok(None) => ("none".to_string(), "none".to_string()),
-            Err(err) => (
-                "none".to_string(),
-                sanitize_netcheck_value(&err.to_string()),
-            ),
+            Ok(None) => ("none".to_owned(), "none".to_owned()),
+            Err(err) => ("none".to_owned(), sanitize_netcheck_value(&err.to_string())),
         }
     }
 
@@ -4006,7 +3997,7 @@ impl DaemonRuntime {
         match self.controller.current_peer_endpoints() {
             Ok(endpoints) => {
                 if endpoints.is_empty() {
-                    return ("none".to_string(), "none".to_string());
+                    return ("none".to_owned(), "none".to_owned());
                 }
                 let summary = endpoints
                     .into_iter()
@@ -4020,12 +4011,9 @@ impl DaemonRuntime {
                     })
                     .collect::<Vec<_>>()
                     .join("+");
-                (sanitize_netcheck_value(&summary), "none".to_string())
+                (sanitize_netcheck_value(&summary), "none".to_owned())
             }
-            Err(err) => (
-                "none".to_string(),
-                sanitize_netcheck_value(&err.to_string()),
-            ),
+            Err(err) => ("none".to_owned(), sanitize_netcheck_value(&err.to_string())),
         }
     }
 
@@ -4056,7 +4044,7 @@ impl DaemonRuntime {
         };
         let path_latest_live_handshake_unix = path_state
             .latest_live_handshake_unix
-            .map_or_else(|| "none".to_string(), |value| value.to_string());
+            .map_or_else(|| "none".to_owned(), |value| value.to_string());
         let relay_session_configured = if path_state.relay_session_configured {
             "true"
         } else {
@@ -4064,7 +4052,7 @@ impl DaemonRuntime {
         };
         let relay_session_next_expiry_unix = path_state
             .relay_session_next_expiry_unix
-            .map_or_else(|| "none".to_string(), |value| value.to_string());
+            .map_or_else(|| "none".to_owned(), |value| value.to_string());
         let traversal_authority = self.traversal_authority_mode().as_str();
         let (
             probe_result,
@@ -4119,20 +4107,20 @@ impl DaemonRuntime {
                     "invalid",
                     "none",
                     "none",
-                    "none".to_string(),
-                    "none".to_string(),
-                    "none".to_string(),
-                    "none".to_string(),
+                    "none".to_owned(),
+                    "none".to_owned(),
+                    "none".to_owned(),
+                    "none".to_owned(),
                 )
             } else {
                 (
                     "missing",
                     "none",
                     "none",
-                    "none".to_string(),
-                    "none".to_string(),
-                    "none".to_string(),
-                    "none".to_string(),
+                    "none".to_owned(),
+                    "none".to_owned(),
+                    "none".to_owned(),
+                    "none".to_owned(),
                 )
             };
 
@@ -4169,7 +4157,7 @@ impl DaemonRuntime {
         let traversal_error = self
             .traversal_hint_error
             .as_deref()
-            .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
+            .map_or_else(|| "none".to_owned(), sanitize_netcheck_value);
         let traversal_probe_max_candidates = self.traversal_probe_config.max_candidates;
         let traversal_probe_max_pairs = self.traversal_probe_config.max_probe_pairs;
         let traversal_probe_rounds = self.traversal_probe_config.simultaneous_open_rounds;
@@ -4180,11 +4168,11 @@ impl DaemonRuntime {
             self.traversal_probe_handshake_freshness_secs;
         let traversal_probe_reprobe_interval_secs = self.traversal_probe_reprobe_interval_secs;
         let max_candidate_priority =
-            max_candidate_priority.map_or_else(|| "none".to_string(), |value| value.to_string());
+            max_candidate_priority.map_or_else(|| "none".to_owned(), |value| value.to_string());
         let traversal_preexpiry_refresh_events = self.traversal_preexpiry_refresh_events;
         let traversal_last_preexpiry_refresh_unix = self
             .traversal_last_preexpiry_refresh_unix
-            .map_or_else(|| "none".to_string(), |value| value.to_string());
+            .map_or_else(|| "none".to_owned(), |value| value.to_string());
         let traversal_stale_rejections = self.traversal_stale_rejections;
         let traversal_replay_rejections = self.traversal_replay_rejections;
         let traversal_future_dated_rejections = self.traversal_future_dated_rejections;
@@ -4192,18 +4180,18 @@ impl DaemonRuntime {
         let traversal_endpoint_fingerprint = self
             .traversal_last_endpoint_fingerprint
             .as_deref()
-            .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
+            .map_or_else(|| "none".to_owned(), sanitize_netcheck_value);
         let (traversal_alarm_state, traversal_alarm_reason) = self.traversal_alarm_state(now);
         let (dns_alarm_state, dns_alarm_reason) = self.dns_zone_alarm_state(now);
         let dns_preexpiry_refresh_events = self.dns_zone_preexpiry_refresh_events;
         let dns_last_preexpiry_refresh_unix = self
             .dns_zone_last_preexpiry_refresh_unix
-            .map_or_else(|| "none".to_string(), |value| value.to_string());
+            .map_or_else(|| "none".to_owned(), |value| value.to_string());
         let dns_stale_rejections = self.dns_zone_stale_rejections;
         let dns_replay_rejections = self.dns_zone_replay_rejections;
         let dns_future_dated_rejections = self.dns_zone_future_dated_rejections;
         let stun_candidates = if self.local_stun_candidates.is_empty() {
-            "none".to_string()
+            "none".to_owned()
         } else {
             self.local_stun_candidates
                 .iter()
@@ -4218,7 +4206,7 @@ impl DaemonRuntime {
         let transport_socket_identity_label = self.transport_socket_identity_label();
         let transport_socket_identity_local_addr = self.transport_socket_identity_local_addr();
         let local_host_candidates = if self.local_host_candidates.is_empty() {
-            "none".to_string()
+            "none".to_owned()
         } else {
             self.local_host_candidates
                 .iter()
@@ -4367,7 +4355,7 @@ impl DaemonRuntime {
             {
                 return Err(
                     "traversal authority requires signed traversal state for all managed peers"
-                        .to_string(),
+                        .to_owned(),
                 );
             }
             return Ok(());
@@ -4380,7 +4368,7 @@ impl DaemonRuntime {
         let indexed_peer_set = traversal_index.keys().cloned().collect::<BTreeSet<_>>();
         let extra_peers = indexed_peer_set
             .difference(&managed_peer_set)
-            .map(|node_id| node_id.as_str().to_string())
+            .map(|node_id| node_id.as_str().to_owned())
             .collect::<Vec<_>>();
         if !extra_peers.is_empty() {
             self.traversal_probe_statuses.clear();
@@ -4552,7 +4540,7 @@ impl DaemonRuntime {
             statuses.insert(
                 remote_node_id.clone(),
                 TraversalProbeStatus {
-                    remote_node_id: remote_node_id.as_str().to_string(),
+                    remote_node_id: remote_node_id.as_str().to_owned(),
                     decision: report.decision,
                     reason: report.reason,
                     attempts: report.attempts,
@@ -4723,7 +4711,7 @@ impl DaemonRuntime {
         let Some(envelope) = self.traversal_hints.as_ref() else {
             return Err(
                 "traversal authority requires signed traversal state for all managed peers"
-                    .to_string(),
+                    .to_owned(),
             );
         };
         let traversal_index =
@@ -4735,7 +4723,7 @@ impl DaemonRuntime {
         let indexed_peers = traversal_index.keys().cloned().collect::<BTreeSet<_>>();
         let missing_peers = expected_peers
             .difference(&indexed_peers)
-            .map(|node_id| node_id.as_str().to_string())
+            .map(|node_id| node_id.as_str().to_owned())
             .collect::<Vec<_>>();
         if !missing_peers.is_empty() {
             return Err(format!(
@@ -4745,7 +4733,7 @@ impl DaemonRuntime {
         }
         let extra_peers = indexed_peers
             .difference(&expected_peers)
-            .map(|node_id| node_id.as_str().to_string())
+            .map(|node_id| node_id.as_str().to_owned())
             .collect::<Vec<_>>();
         if !extra_peers.is_empty() {
             return Err(format!(
@@ -4885,12 +4873,12 @@ impl DaemonRuntime {
     ) {
         if self.traversal_probe_statuses.is_empty() {
             return (
-                "none".to_string(),
-                "none".to_string(),
-                "0".to_string(),
-                "none".to_string(),
-                "none".to_string(),
-                "none".to_string(),
+                "none".to_owned(),
+                "none".to_owned(),
+                "0".to_owned(),
+                "none".to_owned(),
+                "none".to_owned(),
+                "none".to_owned(),
                 0,
                 0,
                 0,
@@ -4914,8 +4902,8 @@ impl DaemonRuntime {
                 .next()
                 .expect("single traversal probe status should exist");
             return (
-                status.decision.as_str().to_string(),
-                status.reason.as_str().to_string(),
+                status.decision.as_str().to_owned(),
+                status.reason.as_str().to_owned(),
                 status.attempts.to_string(),
                 sanitize_netcheck_value(&format!(
                     "{}:{}",
@@ -4923,10 +4911,10 @@ impl DaemonRuntime {
                 )),
                 status
                     .latest_handshake_unix
-                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
                 status
                     .next_reprobe_unix
-                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
                 1,
                 direct_peers,
                 relay_peers,
@@ -4941,16 +4929,16 @@ impl DaemonRuntime {
             "mixed"
         };
         (
-            combined_result.to_string(),
-            "multi_peer_summary".to_string(),
+            combined_result.to_owned(),
+            "multi_peer_summary".to_owned(),
             self.traversal_probe_statuses
                 .values()
                 .map(|status| status.attempts)
                 .sum::<usize>()
                 .to_string(),
-            "multiple".to_string(),
-            "multiple".to_string(),
-            "multiple".to_string(),
+            "multiple".to_owned(),
+            "multiple".to_owned(),
+            "multiple".to_owned(),
             self.traversal_probe_statuses.len(),
             direct_peers,
             relay_peers,
@@ -4963,9 +4951,9 @@ impl DaemonRuntime {
             DataplaneState::FailClosed => {
                 return RuntimePathStateSummary {
                     live_mode: "fail_closed",
-                    live_reason: "fail_closed".to_string(),
+                    live_reason: "fail_closed".to_owned(),
                     programmed_mode: "fail_closed",
-                    programmed_reason: "fail_closed".to_string(),
+                    programmed_reason: "fail_closed".to_owned(),
                     live_proven: false,
                     programmed_peer_count: 0,
                     live_peer_count: 0,
@@ -4984,9 +4972,9 @@ impl DaemonRuntime {
             DataplaneState::ControlTrusted => {
                 return RuntimePathStateSummary {
                     live_mode: "control_trusted",
-                    live_reason: "control_trusted".to_string(),
+                    live_reason: "control_trusted".to_owned(),
                     programmed_mode: "control_trusted",
-                    programmed_reason: "control_trusted".to_string(),
+                    programmed_reason: "control_trusted".to_owned(),
                     live_proven: false,
                     programmed_peer_count: 0,
                     live_peer_count: 0,
@@ -5005,9 +4993,9 @@ impl DaemonRuntime {
             DataplaneState::Init => {
                 return RuntimePathStateSummary {
                     live_mode: "initializing",
-                    live_reason: "init".to_string(),
+                    live_reason: "init".to_owned(),
                     programmed_mode: "initializing",
-                    programmed_reason: "init".to_string(),
+                    programmed_reason: "init".to_owned(),
                     live_proven: false,
                     programmed_peer_count: 0,
                     live_peer_count: 0,
@@ -5115,13 +5103,13 @@ impl DaemonRuntime {
             "direct_programmed"
         };
         let programmed_reason = if programmed_relay_peers > 0 {
-            "relay_endpoint_programmed".to_string()
+            "relay_endpoint_programmed".to_owned()
         } else if self.controller.has_armed_relay_path() {
-            "relay_armed".to_string()
+            "relay_armed".to_owned()
         } else if self.traversal_authority_mode().is_enforced() && self.traversal_hints.is_some() {
-            "traversal_authority".to_string()
+            "traversal_authority".to_owned()
         } else {
-            "static_assignment".to_string()
+            "static_assignment".to_owned()
         };
 
         let live_peer_count = live_direct_peers.saturating_add(live_relay_peers);
@@ -5144,38 +5132,38 @@ impl DaemonRuntime {
                         .next()
                         .copied()
                         .unwrap_or("fresh_handshake_observed")
-                        .to_string()
+                        .to_owned()
                 } else {
-                    "fresh_handshake_observed".to_string()
+                    "fresh_handshake_observed".to_owned()
                 }
             }
-            "relay_active" => "relay_selected_endpoint_with_fresh_handshake".to_string(),
+            "relay_active" => "relay_selected_endpoint_with_fresh_handshake".to_owned(),
             "mixed_active" => {
                 if live_peer_count < programmed_peer_count {
-                    "partial_live_proof".to_string()
+                    "partial_live_proof".to_owned()
                 } else {
-                    "mixed_live_paths".to_string()
+                    "mixed_live_paths".to_owned()
                 }
             }
             _ => {
                 if programmed_relay_peers > 0 {
                     if !relay_session_configured {
-                        "relay_session_disabled".to_string()
+                        "relay_session_disabled".to_owned()
                     } else if self.transport_socket_identity_blocker.is_some() {
-                        "relay_transport_identity_blocked".to_string()
+                        "relay_transport_identity_blocked".to_owned()
                     } else if self.controller.authoritative_transport_identity().is_none() {
-                        "relay_transport_unavailable".to_string()
+                        "relay_transport_unavailable".to_owned()
                     } else if relay_session_expired_peers > 0 {
-                        "relay_session_expired".to_string()
+                        "relay_session_expired".to_owned()
                     } else if relay_session_established_peers == 0 {
-                        "relay_session_missing".to_string()
+                        "relay_session_missing".to_owned()
                     } else if relay_session_selected_endpoint_peers < programmed_relay_peers {
-                        "relay_endpoint_unselected".to_string()
+                        "relay_endpoint_unselected".to_owned()
                     } else {
-                        "relay_handshake_unproven".to_string()
+                        "relay_handshake_unproven".to_owned()
                     }
                 } else if programmed_direct_peers > 0 {
-                    "direct_handshake_unproven".to_string()
+                    "direct_handshake_unproven".to_owned()
                 } else {
                     programmed_reason.clone()
                 }
@@ -5237,7 +5225,7 @@ impl DaemonRuntime {
         } else {
             return None;
         };
-        NodeId::new(remote_node.to_string()).ok()
+        NodeId::new(remote_node.to_owned()).ok()
     }
 
     fn bootstrap(&mut self) {
@@ -5305,7 +5293,7 @@ impl DaemonRuntime {
         match self.restore_state() {
             Ok(()) => {}
             Err(_err) => {
-                self.restrict_permanent("state restore failed integrity checks".to_string());
+                self.restrict_permanent("state restore failed integrity checks".to_owned());
                 let _ = self
                     .controller
                     .force_fail_closed("state_restore_integrity_failed");
@@ -5455,8 +5443,8 @@ impl DaemonRuntime {
                 )
             } else {
                 (
-                    "100.64.0.0/10".to_string(),
-                    "100.64.0.1/32".to_string(),
+                    "100.64.0.0/10".to_owned(),
+                    "100.64.0.1/32".to_owned(),
                     Vec::new(),
                     Vec::new(),
                     None,
@@ -5639,7 +5627,7 @@ impl DaemonRuntime {
                     .signature
                     .clone()
                     .try_into()
-                    .map_err(|_| "invalid signature length".to_string())?,
+                    .map_err(|_| "invalid signature length".to_owned())?,
             );
             verifier
                 .verify(&payload, &signature)
@@ -5652,12 +5640,12 @@ impl DaemonRuntime {
                 .or_default();
             seen_nonces.retain(|nonce| *nonce >= active_window_floor);
             if !seen_nonces.insert(envelope.nonce) {
-                return Err("remote command replay detected".to_string());
+                return Err("remote command replay detected".to_owned());
             }
 
             Ok(envelope.command.clone())
         } else {
-            Err("remote ops not configured".to_string())
+            Err("remote ops not configured".to_owned())
         }
     }
 
@@ -5698,22 +5686,22 @@ impl DaemonRuntime {
             IpcCommand::Status => {
                 self.refresh_traversal_hint_state(false);
                 let last_assignment = self.last_applied_assignment.map_or_else(
-                    || "none".to_string(),
+                    || "none".to_owned(),
                     |watermark| format!("{}:{}", watermark.generated_at_unix, watermark.nonce),
                 );
                 let membership_epoch = self
                     .membership_state
                     .as_ref()
-                    .map_or_else(|| "none".to_string(), |state| state.epoch.to_string());
+                    .map_or_else(|| "none".to_owned(), |state| state.epoch.to_string());
                 let membership_active_nodes = self.membership_state.as_ref().map_or_else(
-                    || "none".to_string(),
+                    || "none".to_owned(),
                     |state| state.active_nodes().len().to_string(),
                 );
                 let (dns_zone_state, dns_zone_record_count, dns_zone_error) =
                     self.dns_zone_status_summary();
                 let port_forward_external_port = self
                     .exit_port_forward_external_port()
-                    .map_or_else(|| "none".to_string(), |port| port.to_string());
+                    .map_or_else(|| "none".to_owned(), |port| port.to_string());
                 let port_forward_error = self
                     .exit_port_forward_last_error
                     .as_deref()
@@ -5735,7 +5723,7 @@ impl DaemonRuntime {
                     "false"
                 };
                 let traversal_peer_count = self.traversal_hints.as_ref().map_or_else(
-                    || "0".to_string(),
+                    || "0".to_owned(),
                     |envelope| envelope.bundles.len().to_string(),
                 );
                 let traversal_probe_max_candidates =
@@ -5760,7 +5748,7 @@ impl DaemonRuntime {
                     self.traversal_preexpiry_refresh_events.to_string();
                 let traversal_last_preexpiry_refresh_unix = self
                     .traversal_last_preexpiry_refresh_unix
-                    .map_or_else(|| "none".to_string(), |value| value.to_string());
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string());
                 let traversal_stale_rejections = self.traversal_stale_rejections.to_string();
                 let traversal_replay_rejections = self.traversal_replay_rejections.to_string();
                 let traversal_future_dated_rejections =
@@ -5770,7 +5758,7 @@ impl DaemonRuntime {
                 let traversal_endpoint_fingerprint = self
                     .traversal_last_endpoint_fingerprint
                     .as_deref()
-                    .map_or_else(|| "none".to_string(), sanitize_netcheck_value);
+                    .map_or_else(|| "none".to_owned(), sanitize_netcheck_value);
                 let (traversal_alarm_state, traversal_alarm_reason) =
                     self.traversal_alarm_state(unix_now());
                 let (dns_alarm_state, dns_alarm_reason) = self.dns_zone_alarm_state(unix_now());
@@ -5778,7 +5766,7 @@ impl DaemonRuntime {
                     self.dns_zone_preexpiry_refresh_events.to_string();
                 let dns_last_preexpiry_refresh_unix = self
                     .dns_zone_last_preexpiry_refresh_unix
-                    .map_or_else(|| "none".to_string(), |value| value.to_string());
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string());
                 let dns_stale_rejections = self.dns_zone_stale_rejections.to_string();
                 let dns_replay_rejections = self.dns_zone_replay_rejections.to_string();
                 let dns_future_dated_rejections = self.dns_zone_future_dated_rejections.to_string();
@@ -5801,7 +5789,7 @@ impl DaemonRuntime {
                 };
                 let path_latest_live_handshake_unix = path_state
                     .latest_live_handshake_unix
-                    .map_or_else(|| "none".to_string(), |value| value.to_string());
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string());
                 let relay_session_configured = if path_state.relay_session_configured {
                     "true"
                 } else {
@@ -5809,7 +5797,7 @@ impl DaemonRuntime {
                 };
                 let relay_session_next_expiry_unix = path_state
                     .relay_session_next_expiry_unix
-                    .map_or_else(|| "none".to_string(), |value| value.to_string());
+                    .map_or_else(|| "none".to_owned(), |value| value.to_string());
                 IpcResponse::ok(format!(
                     "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}",
                     self.local_node_id,
@@ -5833,7 +5821,7 @@ impl DaemonRuntime {
                     self.reconcile_attempts,
                     self.reconcile_failures,
                     self.last_reconcile_unix
-                        .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                        .map_or_else(|| "none".to_owned(), |value| value.to_string()),
                     self.last_reconcile_error.as_deref().unwrap_or("none"),
                     if self.wg_encrypted_private_key_path.is_some() {
                         "true"
@@ -5987,8 +5975,8 @@ impl DaemonRuntime {
                             .advertise_lan_route(node_id, "192.168.1.0/24");
                     }
                     let _ = self.controller.ensure_lan_route_allowed(RouteGrantRequest {
-                        user: "user:local".to_string(),
-                        cidr: "192.168.1.0/24".to_string(),
+                        user: "user:local".to_owned(),
+                        cidr: "192.168.1.0/24".to_owned(),
                         protocol: Protocol::Any,
                         context: TrafficContext::SharedExit,
                     });
@@ -6061,7 +6049,7 @@ impl DaemonRuntime {
         if let Some(client) = self.privileged_helper_client.as_ref() {
             let runtime_path = runtime_key_path
                 .to_str()
-                .ok_or_else(|| "runtime key path must be valid utf-8".to_string())?;
+                .ok_or_else(|| "runtime key path must be valid utf-8".to_owned())?;
             let output = client.run_capture(
                 PrivilegedCommandProgram::Wg,
                 &[
@@ -6091,8 +6079,7 @@ impl DaemonRuntime {
                 )?,
                 DaemonBackendMode::LinuxWireguardUserspaceShared => {
                     return Err(
-                        "interface down is not supported for linux-wireguard-userspace-shared backend; use backend shutdown"
-                            .to_string(),
+                        "interface down is not supported for linux-wireguard-userspace-shared backend; use backend shutdown".to_owned(),
                     );
                 }
                 DaemonBackendMode::MacosWireguard => client.run_capture(
@@ -6103,12 +6090,11 @@ impl DaemonRuntime {
                     return Err(DaemonBackendMode::MacosWireguardUserspaceShared
                         .userspace_shared_blocker()
                         .expect("macos shared backend blocker should exist")
-                        .to_string());
+                        .to_owned());
                 }
                 DaemonBackendMode::WindowsWireguardNt => {
                     return Err(
-                        "interface down is not supported for windows-wireguard-nt backend; use backend shutdown or Windows service stop"
-                            .to_string(),
+                        "interface down is not supported for windows-wireguard-nt backend; use backend shutdown or Windows service stop".to_owned(),
                     );
                 }
                 DaemonBackendMode::WindowsUnsupported => {
@@ -6118,7 +6104,7 @@ impl DaemonRuntime {
                     );
                 }
                 DaemonBackendMode::InMemory => {
-                    return Err("interface down is not supported for in-memory backend".to_string());
+                    return Err("interface down is not supported for in-memory backend".to_owned());
                 }
             };
             if output.success() {
@@ -6150,13 +6136,13 @@ impl DaemonRuntime {
         ) {
             return Err(
                 "key rotation is only supported for linux-wireguard or macos-wireguard backend"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         let runtime_path = self
             .wg_private_key_path
             .clone()
-            .ok_or_else(|| "wg private key path is not configured".to_string())?;
+            .ok_or_else(|| "wg private key path is not configured".to_owned())?;
 
         let mut old_runtime = fs::read(&runtime_path).ok();
         let mut old_encrypted = self
@@ -6173,8 +6159,7 @@ impl DaemonRuntime {
 
             if let Some(encrypted_path) = self.wg_encrypted_private_key_path.as_ref() {
                 let passphrase_path = self.wg_key_passphrase_path.as_ref().ok_or_else(|| {
-                    "wg key passphrase path is required when encrypted key storage is configured"
-                        .to_string()
+                    "wg key passphrase path is required when encrypted key storage is configured".to_owned()
                 })?;
                 if let Err(err) = encrypt_private_key(&new_private, encrypted_path, passphrase_path)
                 {
@@ -6255,10 +6240,10 @@ impl DaemonRuntime {
         ) {
             return Err(
                 "key revoke is only supported for linux-wireguard or macos-wireguard backend"
-                    .to_string(),
+                    .to_owned(),
             );
         }
-        self.restrict_permanent("local key revoked".to_string());
+        self.restrict_permanent("local key revoked".to_owned());
         let _ = self.controller.force_fail_closed("local_key_revoked");
 
         let mut failures = Vec::new();
@@ -6291,7 +6276,7 @@ impl DaemonRuntime {
         }
 
         if failures.is_empty() {
-            Ok("local key revoked: interface disabled and key material removed".to_string())
+            Ok("local key revoked: interface disabled and key material removed".to_owned())
         } else {
             Err(format!(
                 "key revoke completed with errors: {}",
@@ -6335,7 +6320,7 @@ impl DaemonRuntime {
             lan_access_enabled: self.lan_access_enabled,
         };
         persist_session_snapshot(&snapshot, &self.state_path).map_err(|err| {
-            self.restrict_permanent("state persist failure".to_string());
+            self.restrict_permanent("state persist failure".to_owned());
             let _ = self.controller.force_fail_closed("state_persist_failure");
             err.to_string()
         })
@@ -6347,7 +6332,7 @@ impl DaemonRuntime {
             .as_ref()
             .ok_or("no assignment path")?;
         if !bundle_path.exists() {
-            return Err("assignment bundle not found".to_string());
+            return Err("assignment bundle not found".to_owned());
         }
         let _content = std::fs::read_to_string(bundle_path).map_err(|e| e.to_string())?;
 
@@ -6527,8 +6512,8 @@ impl DaemonRuntime {
                     )
                 } else {
                     (
-                        "100.64.0.0/10".to_string(),
-                        "100.64.0.1/32".to_string(),
+                        "100.64.0.0/10".to_owned(),
+                        "100.64.0.1/32".to_owned(),
                         Vec::new(),
                         Vec::new(),
                         None,
@@ -6713,7 +6698,7 @@ impl DaemonRuntime {
             .contains(BLIND_EXIT_DEFAULT_ROUTE_CIDR)
         {
             self.advertised_routes
-                .insert(BLIND_EXIT_DEFAULT_ROUTE_CIDR.to_string());
+                .insert(BLIND_EXIT_DEFAULT_ROUTE_CIDR.to_owned());
             self.local_route_reconcile_pending = true;
             changed = true;
         }
@@ -6892,7 +6877,7 @@ impl DaemonRuntime {
         {
             let _ = should_serve_exit;
             self.exit_port_forward_last_error =
-                Some("auto port forward is supported only on Linux".to_string());
+                Some("auto port forward is supported only on Linux".to_owned());
         }
     }
 
@@ -7282,12 +7267,12 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     let mut config = config;
     if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
         return Err(DaemonError::InvalidConfig(
-            "in-memory backend is disabled in production daemon paths".to_string(),
+            "in-memory backend is disabled in production daemon paths".to_owned(),
         ));
     }
     if config.socket_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "socket path must not be empty".to_string(),
+            "socket path must not be empty".to_owned(),
         ));
     }
     resolve_configured_egress_interface(&mut config)?;
@@ -7755,55 +7740,55 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
 
 fn parse_dns_question(request: &[u8]) -> Result<DnsQuestion, String> {
     if request.len() < DNS_HEADER_BYTES {
-        return Err("dns request too short".to_string());
+        return Err("dns request too short".to_owned());
     }
     let id = u16::from_be_bytes([request[0], request[1]]);
     let flags = u16::from_be_bytes([request[2], request[3]]);
     if (flags & DNS_FLAG_QR) != 0 {
-        return Err("dns request must be a query".to_string());
+        return Err("dns request must be a query".to_owned());
     }
     let qdcount = u16::from_be_bytes([request[4], request[5]]);
     if qdcount != 1 {
-        return Err("dns request must contain exactly one question".to_string());
+        return Err("dns request must contain exactly one question".to_owned());
     }
     let mut offset = DNS_HEADER_BYTES;
     let mut labels = Vec::new();
     loop {
         let length = *request
             .get(offset)
-            .ok_or_else(|| "dns qname is truncated".to_string())?;
+            .ok_or_else(|| "dns qname is truncated".to_owned())?;
         offset = offset.saturating_add(1);
         if length == 0 {
             break;
         }
         if (length & 0b1100_0000) != 0 {
-            return Err("dns name compression is not supported in queries".to_string());
+            return Err("dns name compression is not supported in queries".to_owned());
         }
         let label_len = usize::from(length);
         let end = offset.saturating_add(label_len);
         let label_bytes = request
             .get(offset..end)
-            .ok_or_else(|| "dns qname label is truncated".to_string())?;
+            .ok_or_else(|| "dns qname label is truncated".to_owned())?;
         let label = std::str::from_utf8(label_bytes)
-            .map_err(|_| "dns qname contains invalid utf8".to_string())?;
+            .map_err(|_| "dns qname contains invalid utf8".to_owned())?;
         labels.push(label.to_ascii_lowercase());
         offset = end;
     }
     let qtype = u16::from_be_bytes([
         *request
             .get(offset)
-            .ok_or_else(|| "dns qtype is truncated".to_string())?,
+            .ok_or_else(|| "dns qtype is truncated".to_owned())?,
         *request
             .get(offset + 1)
-            .ok_or_else(|| "dns qtype is truncated".to_string())?,
+            .ok_or_else(|| "dns qtype is truncated".to_owned())?,
     ]);
     let qclass = u16::from_be_bytes([
         *request
             .get(offset + 2)
-            .ok_or_else(|| "dns qclass is truncated".to_string())?,
+            .ok_or_else(|| "dns qclass is truncated".to_owned())?,
         *request
             .get(offset + 3)
-            .ok_or_else(|| "dns qclass is truncated".to_string())?,
+            .ok_or_else(|| "dns qclass is truncated".to_owned())?,
     ]);
     Ok(DnsQuestion {
         id,
@@ -7924,12 +7909,12 @@ fn prepare_runtime_wireguard_key_material(
     }
 
     let runtime_path = runtime_path.ok_or_else(|| {
-        "wg private key path is required for linux-wireguard, macos-wireguard, or windows-wireguard-nt backend".to_string()
+        "wg private key path is required for linux-wireguard, macos-wireguard, or windows-wireguard-nt backend".to_owned()
     })?;
 
     if let Some(encrypted_path) = encrypted_private_key_path {
         let passphrase_path = passphrase_path.ok_or_else(|| {
-            "wg key passphrase path is required when encrypted key path is configured".to_string()
+            "wg key passphrase path is required when encrypted key path is configured".to_owned()
         })?;
         let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
             .map_err(|err| format!("wg key decrypt failed: {err}"))?;
@@ -7948,7 +7933,7 @@ fn prepare_runtime_wireguard_key_material(
 fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
         return Err(DaemonError::InvalidConfig(
-            "in-memory backend is disabled in production daemon paths".to_string(),
+            "in-memory backend is disabled in production daemon paths".to_owned(),
         ));
     }
     if matches!(
@@ -7959,7 +7944,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             .backend_mode
             .userspace_shared_blocker()
             .expect("macos userspace-shared blocker should exist");
-        return Err(DaemonError::InvalidConfig(blocker.to_string()));
+        return Err(DaemonError::InvalidConfig(blocker.to_owned()));
     }
     #[cfg(all(not(test), not(target_os = "linux")))]
     if matches!(
@@ -7967,7 +7952,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         DaemonBackendMode::LinuxWireguardUserspaceShared
     ) {
         return Err(DaemonError::InvalidConfig(
-            "linux-wireguard-userspace-shared backend is only supported on linux".to_string(),
+            "linux-wireguard-userspace-shared backend is only supported on linux".to_owned(),
         ));
     }
 
@@ -7980,8 +7965,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         || config.dns_zone_url.is_some()
     {
         return Err(DaemonError::InvalidConfig(
-            "remote network state fetch is disabled in hardened daemon paths; use pinned local signed artifacts"
-                .to_string(),
+            "remote network state fetch is disabled in hardened daemon paths; use pinned local signed artifacts".to_owned(),
         ));
     }
 
@@ -8028,13 +8012,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         (Some(_), None) => {
             return Err(DaemonError::InvalidConfig(
                 "relay fleet watermark path is required when relay fleet bundle path is set"
-                    .to_string(),
+                    .to_owned(),
             ));
         }
         (None, Some(_)) => {
             return Err(DaemonError::InvalidConfig(
                 "relay fleet bundle path is required when relay fleet watermark path is set"
-                    .to_string(),
+                    .to_owned(),
             ));
         }
         (None, None) => {}
@@ -8075,7 +8059,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     }
     if config.traversal_probe_handshake_freshness_secs.get() > config.traversal_max_age_secs.get() {
         return Err(DaemonError::InvalidConfig(
-            "traversal probe handshake freshness must not exceed traversal max age".to_string(),
+            "traversal probe handshake freshness must not exceed traversal max age".to_owned(),
         ));
     }
     if config.traversal_probe_reprobe_interval_secs.get()
@@ -8089,90 +8073,90 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         .map_err(|err| DaemonError::InvalidConfig(format!("dns zone name is invalid: {err}")))?;
     if !config.dns_resolver_bind_addr.ip().is_loopback() {
         return Err(DaemonError::InvalidConfig(
-            "dns resolver bind addr must be loopback".to_string(),
+            "dns resolver bind addr must be loopback".to_owned(),
         ));
     }
     if config.wg_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "wireguard interface must not be empty".to_string(),
+            "wireguard interface must not be empty".to_owned(),
         ));
     }
     if config.wg_listen_port == 0 {
         return Err(DaemonError::InvalidConfig(
-            "wireguard listen port must be in range 1-65535".to_string(),
+            "wireguard listen port must be in range 1-65535".to_owned(),
         ));
     }
     if config.egress_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "egress interface must not be empty".to_string(),
+            "egress interface must not be empty".to_owned(),
         ));
     }
     if config.auto_port_forward_lease_secs.get() < 60 {
         return Err(DaemonError::InvalidConfig(
-            "auto port-forward lease must be at least 60 seconds".to_string(),
+            "auto port-forward lease must be at least 60 seconds".to_owned(),
         ));
     }
     if config.auto_port_forward_exit
         && !matches!(config.backend_mode, DaemonBackendMode::LinuxWireguard)
     {
         return Err(DaemonError::InvalidConfig(
-            "auto port-forward exit is supported only with linux-wireguard backend".to_string(),
+            "auto port-forward exit is supported only with linux-wireguard backend".to_owned(),
         ));
     }
     if config.trust_evidence_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "trust evidence path must not be empty".to_string(),
+            "trust evidence path must not be empty".to_owned(),
         ));
     }
     if config.trust_verifier_key_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "trust verifier key path must not be empty".to_string(),
+            "trust verifier key path must not be empty".to_owned(),
         ));
     }
     if config.trust_watermark_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "trust watermark path must not be empty".to_string(),
+            "trust watermark path must not be empty".to_owned(),
         ));
     }
     if config.membership_snapshot_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "membership snapshot path must not be empty".to_string(),
+            "membership snapshot path must not be empty".to_owned(),
         ));
     }
     if config.membership_log_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "membership log path must not be empty".to_string(),
+            "membership log path must not be empty".to_owned(),
         ));
     }
     if config.membership_watermark_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "membership watermark path must not be empty".to_string(),
+            "membership watermark path must not be empty".to_owned(),
         ));
     }
     if config.remote_ops_expected_subject.trim().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "remote ops expected subject must not be empty".to_string(),
+            "remote ops expected subject must not be empty".to_owned(),
         ));
     }
     if config.traversal_bundle_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "traversal bundle path must not be empty".to_string(),
+            "traversal bundle path must not be empty".to_owned(),
         ));
     }
     if config.traversal_verifier_key_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "traversal verifier key path must not be empty".to_string(),
+            "traversal verifier key path must not be empty".to_owned(),
         ));
     }
     if config.traversal_watermark_path.as_os_str().is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "traversal watermark path must not be empty".to_string(),
+            "traversal watermark path must not be empty".to_owned(),
         ));
     }
     if let Some(path) = config.relay_session_signing_secret_path.as_ref() {
         if path.as_os_str().is_empty() {
             return Err(DaemonError::InvalidConfig(
-                "relay session signing secret path must not be empty".to_string(),
+                "relay session signing secret path must not be empty".to_owned(),
             ));
         }
         validate_runtime_file_path(path, "relay session signing secret")?;
@@ -8180,7 +8164,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if let Some(path) = config.relay_session_signing_secret_passphrase_path.as_ref() {
         if path.as_os_str().is_empty() {
             return Err(DaemonError::InvalidConfig(
-                "relay session signing secret passphrase path must not be empty".to_string(),
+                "relay session signing secret passphrase path must not be empty".to_owned(),
             ));
         }
         validate_runtime_file_path(path, "relay session signing secret passphrase")?;
@@ -8188,7 +8172,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     if let Some(path) = config.relay_session_token_spool_dir.as_ref() {
         if path.as_os_str().is_empty() {
             return Err(DaemonError::InvalidConfig(
-                "relay session token spool dir must not be empty".to_string(),
+                "relay session token spool dir must not be empty".to_owned(),
             ));
         }
         validate_runtime_file_path(path, "relay session token spool dir")?;
@@ -8202,7 +8186,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     {
         return Err(DaemonError::InvalidConfig(
             "preissued relay token spool cannot be combined with daemon-local relay token signing"
-                .to_string(),
+                .to_owned(),
         ));
     }
     if config.relay_session_signing_secret_path.is_some()
@@ -8235,7 +8219,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     }
     if config.relay_session_refresh_margin_secs.get() >= config.relay_session_token_ttl_secs.get() {
         return Err(DaemonError::InvalidConfig(
-            "relay session refresh margin must be less than relay session token ttl".to_string(),
+            "relay session refresh margin must be less than relay session token ttl".to_owned(),
         ));
     }
     if config.relay_session_token_ttl_secs.get() > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
@@ -8249,7 +8233,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             || config.auto_tunnel_watermark_path.is_none())
     {
         return Err(DaemonError::InvalidConfig(
-            "auto tunnel enforce requires bundle, verifier key, and watermark paths".to_string(),
+            "auto tunnel enforce requires bundle, verifier key, and watermark paths".to_owned(),
         ));
     }
     if config
@@ -8271,13 +8255,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         if config.wg_encrypted_private_key_path.is_some() && config.wg_key_passphrase_path.is_none()
         {
             return Err(DaemonError::InvalidConfig(
-                "wg key passphrase path is required when encrypted key path is set".to_string(),
+                "wg key passphrase path is required when encrypted key path is set".to_owned(),
             ));
         }
         if config.wg_key_passphrase_path.is_some() && config.wg_encrypted_private_key_path.is_none()
         {
             return Err(DaemonError::InvalidConfig(
-                "wg encrypted private key path is required when passphrase path is set".to_string(),
+                "wg encrypted private key path is required when passphrase path is set".to_owned(),
             ));
         }
     }
@@ -8291,14 +8275,13 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     ) && config.wg_private_key_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "wg private key path is required for linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, or windows-wireguard-nt backend"
-                .to_string(),
+            "wg private key path is required for linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, or windows-wireguard-nt backend".to_owned(),
         ));
     }
     if config.fail_closed_ssh_allow {
         if config.fail_closed_ssh_allow_cidrs.is_empty() {
             return Err(DaemonError::InvalidConfig(
-                "fail-closed ssh allow requires at least one management cidr".to_string(),
+                "fail-closed ssh allow requires at least one management cidr".to_owned(),
             ));
         }
     }
@@ -8310,8 +8293,7 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     ) && config.privileged_helper_socket_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "privileged helper socket path is required for linux-wireguard, linux-wireguard-userspace-shared, or macos-wireguard backend"
-                .to_string(),
+            "privileged helper socket path is required for linux-wireguard, linux-wireguard-userspace-shared, or macos-wireguard backend".to_owned(),
         ));
     }
 
@@ -8336,10 +8318,10 @@ where
 {
     let value = configured.trim();
     if value.is_empty() {
-        return Err("egress interface must not be empty".to_string());
+        return Err("egress interface must not be empty".to_owned());
     }
     if !value.eq_ignore_ascii_case(DEFAULT_EGRESS_INTERFACE) {
-        return Ok(value.to_string());
+        return Ok(value.to_owned());
     }
     detect()
 }
@@ -8358,11 +8340,11 @@ fn parse_windows_default_egress_interface_output(
     raw: &str,
     tunnel_alias: &str,
 ) -> Result<String, String> {
-    let alias = raw.trim().to_string();
+    let alias = raw.trim().to_owned();
     if alias.is_empty() {
         return Err(
             "Windows egress detection returned no interface (no non-tunnel default route?)"
-                .to_string(),
+                .to_owned(),
         );
     }
     if !alias.is_ascii() {
@@ -8457,7 +8439,7 @@ fn detect_route_interface(program: &str, args: &[&str]) -> Result<String, String
         .output()
         .map_err(|err| format!("spawn {program} for egress detection failed: {err}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(format!(
             "{program} egress detection exited unsuccessfully: status={} stderr={stderr}",
             output.status
@@ -8466,7 +8448,7 @@ fn detect_route_interface(program: &str, args: &[&str]) -> Result<String, String
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| format!("{program} egress detection returned non-utf8 output"))?;
     parse_first_route_interface(stdout.as_str())
-        .ok_or_else(|| "unable to detect default egress interface from route output".to_string())
+        .ok_or_else(|| "unable to detect default egress interface from route output".to_owned())
 }
 
 fn parse_first_route_interface(output: &str) -> Option<String> {
@@ -8578,14 +8560,14 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
     }
     if config.auto_tunnel_enforce {
         let bundle_path = config.auto_tunnel_bundle_path.as_ref().ok_or_else(|| {
-            DaemonError::InvalidConfig("auto tunnel enforce requires bundle path".to_string())
+            DaemonError::InvalidConfig("auto tunnel enforce requires bundle path".to_owned())
         })?;
         let verifier_key_path = config
             .auto_tunnel_verifier_key_path
             .as_ref()
             .ok_or_else(|| {
                 DaemonError::InvalidConfig(
-                    "auto tunnel enforce requires verifier key path".to_string(),
+                    "auto tunnel enforce requires verifier key path".to_owned(),
                 )
             })?;
         validate_auto_tunnel_bundle_permissions(bundle_path)?;
@@ -8646,18 +8628,18 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
 
     let auto_tunnel_preflight = if config.auto_tunnel_enforce {
         let bundle_path = config.auto_tunnel_bundle_path.as_ref().ok_or_else(|| {
-            DaemonError::InvalidConfig("auto tunnel enforce requires bundle path".to_string())
+            DaemonError::InvalidConfig("auto tunnel enforce requires bundle path".to_owned())
         })?;
         let verifier_key_path = config
             .auto_tunnel_verifier_key_path
             .as_ref()
             .ok_or_else(|| {
                 DaemonError::InvalidConfig(
-                    "auto tunnel enforce requires verifier key path".to_string(),
+                    "auto tunnel enforce requires verifier key path".to_owned(),
                 )
             })?;
         let watermark_path = config.auto_tunnel_watermark_path.as_ref().ok_or_else(|| {
-            DaemonError::InvalidConfig("auto tunnel enforce requires watermark path".to_string())
+            DaemonError::InvalidConfig("auto tunnel enforce requires watermark path".to_owned())
         })?;
         let watermark = load_auto_tunnel_watermark(watermark_path).map_err(|err| {
             DaemonError::InvalidConfig(format!("auto tunnel watermark preflight failed: {err}"))
@@ -8874,7 +8856,7 @@ fn load_trust_evidence(
             MAX_TRUST_EVIDENCE_KEY_DEPTH,
         )
         .map_err(TrustBootstrapError::InvalidFormat)?;
-        if !seen_keys.insert(key.to_string()) {
+        if !seen_keys.insert(key.to_owned()) {
             return Err(TrustBootstrapError::InvalidFormat(format!(
                 "duplicate key {key}"
             )));
@@ -8918,7 +8900,7 @@ fn load_trust_evidence(
                 nonce = value.parse::<u64>().ok();
             }
             "signature" => {
-                signature_hex = Some(value.to_string());
+                signature_hex = Some(value.to_owned());
             }
             _ => {
                 return Err(TrustBootstrapError::InvalidFormat(format!(
@@ -8930,35 +8912,34 @@ fn load_trust_evidence(
 
     if version != Some(2) {
         return Err(TrustBootstrapError::InvalidFormat(
-            "unsupported trust evidence version".to_string(),
+            "unsupported trust evidence version".to_owned(),
         ));
     }
 
     let record = TrustEvidenceRecord {
         tls13_valid: tls13_valid
-            .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing tls13_valid".to_string()))?,
+            .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing tls13_valid".to_owned()))?,
         signed_control_valid: signed_control_valid.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing signed_control_valid".to_string())
+            TrustBootstrapError::InvalidFormat("missing signed_control_valid".to_owned())
         })?,
         signed_data_age_secs: signed_data_age_secs.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing signed_data_age_secs".to_string())
+            TrustBootstrapError::InvalidFormat("missing signed_data_age_secs".to_owned())
         })?,
         clock_skew_secs: clock_skew_secs.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing clock_skew_secs".to_string())
+            TrustBootstrapError::InvalidFormat("missing clock_skew_secs".to_owned())
         })?,
         updated_at_unix: updated_at_unix.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing updated_at_unix".to_string())
+            TrustBootstrapError::InvalidFormat("missing updated_at_unix".to_owned())
         })?,
         nonce: nonce
-            .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing nonce".to_string()))?,
+            .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing nonce".to_owned()))?,
     };
 
     let signature_hex = signature_hex.ok_or_else(|| {
-        TrustBootstrapError::InvalidFormat("missing trust evidence signature".to_string())
+        TrustBootstrapError::InvalidFormat("missing trust evidence signature".to_owned())
     })?;
-    let signature_bytes = decode_hex_to_fixed::<64>(&signature_hex).map_err(|_| {
-        TrustBootstrapError::InvalidFormat("invalid signature encoding".to_string())
-    })?;
+    let signature_bytes = decode_hex_to_fixed::<64>(&signature_hex)
+        .map_err(|_| TrustBootstrapError::InvalidFormat("invalid signature encoding".to_owned()))?;
     let signature = Signature::from_bytes(&signature_bytes);
     let payload = trust_evidence_payload(&record);
     verifying_key
@@ -9059,7 +9040,7 @@ fn parse_limited_key_value_line(
         ));
     }
     let Some((key, value)) = line.split_once('=') else {
-        return Err("line missing key/value separator".to_string());
+        return Err("line missing key/value separator".to_owned());
     };
     if key.is_empty() {
         return Err(format!("line {line_number} has empty key"));
@@ -9179,9 +9160,9 @@ fn is_allowed_relay_fleet_key(key: &str) -> bool {
 
 fn traversal_coordination_pair_key(left: &str, right: &str) -> (String, String) {
     if left <= right {
-        (left.to_string(), right.to_string())
+        (left.to_owned(), right.to_owned())
     } else {
-        (right.to_string(), left.to_string())
+        (right.to_owned(), left.to_owned())
     }
 }
 
@@ -9220,7 +9201,7 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], TrustBo
     let trimmed = encoded.trim();
     if trimmed.len() != N * 2 {
         return Err(TrustBootstrapError::InvalidFormat(
-            "unexpected hex length".to_string(),
+            "unexpected hex length".to_owned(),
         ));
     }
     let raw = trimmed.as_bytes();
@@ -9240,7 +9221,7 @@ fn decode_hex_nibble(value: u8) -> Result<u8, TrustBootstrapError> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err(TrustBootstrapError::InvalidFormat(
-            "invalid hex character".to_string(),
+            "invalid hex character".to_owned(),
         )),
     }
 }
@@ -9259,7 +9240,7 @@ fn load_verifying_key(path: &Path) -> Result<VerifyingKey, TrustBootstrapError> 
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing verifier key".to_string()))?;
+        .ok_or_else(|| TrustBootstrapError::InvalidFormat("missing verifier key".to_owned()))?;
     let key_bytes = decode_hex_to_fixed::<32>(key_line)?;
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| TrustBootstrapError::KeyInvalid)
 }
@@ -9284,13 +9265,13 @@ fn load_remote_ops_access_token_verifying_key(path: &Path) -> Result<VerifyingKe
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .ok_or_else(|| {
-            DaemonError::InvalidConfig("missing remote ops token verifier key".to_string())
+            DaemonError::InvalidConfig("missing remote ops token verifier key".to_owned())
         })?;
     let key_bytes = decode_hex_to_fixed::<32>(key_line).map_err(|_| {
-        DaemonError::InvalidConfig("invalid remote ops verifier key hex".to_string())
+        DaemonError::InvalidConfig("invalid remote ops verifier key hex".to_owned())
     })?;
     VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|_| DaemonError::InvalidConfig("remote ops verifier key is invalid".to_string()))
+        .map_err(|_| DaemonError::InvalidConfig("remote ops verifier key is invalid".to_owned()))
 }
 
 fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBootstrapError> {
@@ -9307,7 +9288,7 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(TrustBootstrapError::InvalidFormat(
-                "watermark line missing key/value separator".to_string(),
+                "watermark line missing key/value separator".to_owned(),
             ));
         };
         match key {
@@ -9331,24 +9312,22 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
         }
     }
     let version = version.ok_or_else(|| {
-        TrustBootstrapError::InvalidFormat("missing watermark version".to_string())
+        TrustBootstrapError::InvalidFormat("missing watermark version".to_owned())
     })?;
     if version != 2 {
         return Err(TrustBootstrapError::InvalidFormat(
-            "unsupported watermark version; expected version=2".to_string(),
+            "unsupported watermark version; expected version=2".to_owned(),
         ));
     }
     Ok(Some(TrustWatermark {
         updated_at_unix: updated_at_unix.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_string())
+            TrustBootstrapError::InvalidFormat("missing watermark updated_at_unix".to_owned())
         })?,
         nonce: nonce.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+            TrustBootstrapError::InvalidFormat("missing watermark nonce".to_owned())
         })?,
         payload_digest: Some(payload_digest.ok_or_else(|| {
-            TrustBootstrapError::InvalidFormat(
-                "missing watermark payload_digest_sha256".to_string(),
-            )
+            TrustBootstrapError::InvalidFormat("missing watermark payload_digest_sha256".to_owned())
         })?),
     }))
 }
@@ -9374,7 +9353,7 @@ fn persist_trust_watermark(
         watermark.nonce,
         encode_hex(&watermark.payload_digest.ok_or_else(|| {
             TrustBootstrapError::InvalidFormat(
-                "watermark payload digest must be present".to_string(),
+                "watermark payload digest must be present".to_owned(),
             )
         })?)
     );
@@ -9453,7 +9432,7 @@ fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWatermark>,
     let mut state_root: Option<String> = None;
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
-            return Err("membership watermark line missing key/value separator".to_string());
+            return Err("membership watermark line missing key/value separator".to_owned());
         };
         match key {
             "version" => {
@@ -9463,18 +9442,18 @@ fn load_membership_watermark(path: &Path) -> Result<Option<MembershipWatermark>,
                 epoch = value.parse::<u64>().ok();
             }
             "state_root" => {
-                state_root = Some(value.to_string());
+                state_root = Some(value.to_owned());
             }
             _ => return Err(format!("unknown membership watermark key {key}")),
         }
     }
     if version != Some(1) {
-        return Err("unsupported membership watermark version".to_string());
+        return Err("unsupported membership watermark version".to_owned());
     }
     Ok(Some(MembershipWatermark {
-        epoch: epoch.ok_or_else(|| "missing membership watermark epoch".to_string())?,
+        epoch: epoch.ok_or_else(|| "missing membership watermark epoch".to_owned())?,
         state_root: state_root
-            .ok_or_else(|| "missing membership watermark state_root".to_string())?,
+            .ok_or_else(|| "missing membership watermark state_root".to_owned())?,
     }))
 }
 
@@ -9582,15 +9561,15 @@ fn load_auto_tunnel_bundle(
         if key == "signature" {
             if signature_hex.is_some() {
                 return Err(AutoTunnelBootstrapError::InvalidFormat(
-                    "duplicate key signature".to_string(),
+                    "duplicate key signature".to_owned(),
                 ));
             }
-            signature_hex = Some(value.to_string());
+            signature_hex = Some(value.to_owned());
             continue;
         }
         payload.push_str(line);
         payload.push('\n');
-        if fields.insert(key.to_string(), value.to_string()).is_some() {
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
             return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
                 "duplicate key {key}"
             )));
@@ -9604,84 +9583,82 @@ fn load_auto_tunnel_bundle(
 
     let version = fields
         .get("version")
-        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing version".to_string()))?;
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing version".to_owned()))?;
     if version != "1" {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "unsupported bundle version".to_string(),
+            "unsupported bundle version".to_owned(),
         ));
     }
 
     let node_id = fields
         .get("node_id")
-        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing node_id".to_string()))?
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing node_id".to_owned()))?
         .clone();
     NodeId::new(node_id.clone())
         .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
 
     let mesh_cidr = fields
         .get("mesh_cidr")
-        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing mesh_cidr".to_string()))?
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing mesh_cidr".to_owned()))?
         .clone();
     if !is_valid_ipv4_or_ipv6_cidr(&mesh_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "invalid mesh_cidr".to_string(),
+            "invalid mesh_cidr".to_owned(),
         ));
     }
 
     let assigned_cidr = fields
         .get("assigned_cidr")
-        .ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat("missing assigned_cidr".to_string())
-        })?
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing assigned_cidr".to_owned()))?
         .clone();
     if !is_valid_ipv4_or_ipv6_cidr(&assigned_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "invalid assigned_cidr".to_string(),
+            "invalid assigned_cidr".to_owned(),
         ));
     }
     if !is_host_cidr(&assigned_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "assigned_cidr must be a host cidr".to_string(),
+            "assigned_cidr must be a host cidr".to_owned(),
         ));
     }
     if !cidr_contains(&mesh_cidr, &assigned_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "assigned_cidr is outside mesh_cidr".to_string(),
+            "assigned_cidr is outside mesh_cidr".to_owned(),
         ));
     }
 
     let generated_at_unix = fields
         .get("generated_at_unix")
         .ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat("missing generated_at_unix".to_string())
+            AutoTunnelBootstrapError::InvalidFormat("missing generated_at_unix".to_owned())
         })?
         .parse::<u64>()
         .map_err(|_| {
-            AutoTunnelBootstrapError::InvalidFormat("invalid generated_at_unix".to_string())
+            AutoTunnelBootstrapError::InvalidFormat("invalid generated_at_unix".to_owned())
         })?;
     let expires_at_unix = fields
         .get("expires_at_unix")
         .ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat("missing expires_at_unix".to_string())
+            AutoTunnelBootstrapError::InvalidFormat("missing expires_at_unix".to_owned())
         })?
         .parse::<u64>()
         .map_err(|_| {
-            AutoTunnelBootstrapError::InvalidFormat("invalid expires_at_unix".to_string())
+            AutoTunnelBootstrapError::InvalidFormat("invalid expires_at_unix".to_owned())
         })?;
     if generated_at_unix >= expires_at_unix {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "invalid generated/expires ordering".to_string(),
+            "invalid generated/expires ordering".to_owned(),
         ));
     }
 
     let nonce = fields
         .get("nonce")
-        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing nonce".to_string()))?
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing nonce".to_owned()))?
         .parse::<u64>()
-        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid nonce".to_string()))?;
+        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid nonce".to_owned()))?;
 
     let signature_hex = signature_hex.ok_or_else(|| {
-        AutoTunnelBootstrapError::InvalidFormat("missing bundle signature".to_string())
+        AutoTunnelBootstrapError::InvalidFormat("missing bundle signature".to_owned())
     })?;
     let signature_bytes = decode_auto_tunnel_hex_to_fixed::<64>(&signature_hex)?;
     let signature = Signature::from_bytes(&signature_bytes);
@@ -9722,9 +9699,9 @@ fn load_auto_tunnel_bundle(
 
     let peer_count = fields
         .get("peer_count")
-        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing peer_count".to_string()))?
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing peer_count".to_owned()))?
         .parse::<usize>()
-        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid peer_count".to_string()))?;
+        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid peer_count".to_owned()))?;
     if peer_count > MAX_AUTO_TUNNEL_PEER_COUNT {
         return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
             "peer_count exceeds maximum of {MAX_AUTO_TUNNEL_PEER_COUNT}"
@@ -9788,9 +9765,9 @@ fn load_auto_tunnel_bundle(
 
     let route_count = fields
         .get("route_count")
-        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing route_count".to_string()))?
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing route_count".to_owned()))?
         .parse::<usize>()
-        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid route_count".to_string()))?;
+        .map_err(|_| AutoTunnelBootstrapError::InvalidFormat("invalid route_count".to_owned()))?;
     if route_count > MAX_AUTO_TUNNEL_ROUTE_COUNT {
         return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
             "route_count exceeds maximum of {MAX_AUTO_TUNNEL_ROUTE_COUNT}"
@@ -9798,11 +9775,11 @@ fn load_auto_tunnel_bundle(
     }
     let expected_field_count = 9usize
         .checked_add(peer_count.checked_mul(4).ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat("peer field count overflow".to_string())
+            AutoTunnelBootstrapError::InvalidFormat("peer field count overflow".to_owned())
         })?)
         .and_then(|value| value.checked_add(route_count.checked_mul(3)?))
         .ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat("route field count overflow".to_string())
+            AutoTunnelBootstrapError::InvalidFormat("route field count overflow".to_owned())
         })?;
     if fields.len() != expected_field_count {
         return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
@@ -9842,11 +9819,11 @@ fn load_auto_tunnel_bundle(
             }
         };
         if matches!(kind, RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan) {
-            let via = via_node.as_str().to_string();
+            let via = via_node.as_str().to_owned();
             if let Some(existing) = selected_exit_node.as_deref() {
                 if existing != via {
                     return Err(AutoTunnelBootstrapError::InvalidFormat(
-                        "exit routes reference multiple exit nodes".to_string(),
+                        "exit routes reference multiple exit nodes".to_owned(),
                     ));
                 }
             }
@@ -9892,7 +9869,7 @@ fn load_auto_tunnel_verifying_key(path: &Path) -> Result<VerifyingKey, AutoTunne
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .ok_or_else(|| {
-            AutoTunnelBootstrapError::InvalidFormat("missing verifier key".to_string())
+            AutoTunnelBootstrapError::InvalidFormat("missing verifier key".to_owned())
         })?;
     let key_bytes = decode_auto_tunnel_hex_to_fixed::<32>(key_line)?;
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| AutoTunnelBootstrapError::KeyInvalid)
@@ -9905,7 +9882,7 @@ fn decode_auto_tunnel_hex_to_fixed<const N: usize>(
     let trimmed = encoded.trim();
     if trimmed.len() != N * 2 {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "unexpected hex length".to_string(),
+            "unexpected hex length".to_owned(),
         ));
     }
     let raw = trimmed.as_bytes();
@@ -9925,7 +9902,7 @@ fn decode_auto_tunnel_hex_nibble(value: u8) -> Result<u8, AutoTunnelBootstrapErr
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err(AutoTunnelBootstrapError::InvalidFormat(
-            "invalid hex character".to_string(),
+            "invalid hex character".to_owned(),
         )),
     }
 }
@@ -9956,7 +9933,7 @@ fn load_auto_tunnel_watermark(
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(AutoTunnelBootstrapError::InvalidFormat(
-                "watermark line missing key/value separator".to_string(),
+                "watermark line missing key/value separator".to_owned(),
             ));
         };
         match key {
@@ -9980,22 +9957,22 @@ fn load_auto_tunnel_watermark(
         }
     }
     let generated_at_unix = generated_at_unix.ok_or_else(|| {
-        AutoTunnelBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_string())
+        AutoTunnelBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_owned())
     })?;
     let nonce = nonce.ok_or_else(|| {
-        AutoTunnelBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+        AutoTunnelBootstrapError::InvalidFormat("missing watermark nonce".to_owned())
     })?;
     let version = version.ok_or_else(|| {
-        AutoTunnelBootstrapError::InvalidFormat("missing watermark version".to_string())
+        AutoTunnelBootstrapError::InvalidFormat("missing watermark version".to_owned())
     })?;
     if version != 2 {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
-            "unsupported watermark version; expected version=2".to_string(),
+            "unsupported watermark version; expected version=2".to_owned(),
         ));
     }
     let payload_digest = Some(payload_digest.ok_or_else(|| {
         AutoTunnelBootstrapError::InvalidFormat(
-            "missing watermark payload_digest_sha256".to_string(),
+            "missing watermark payload_digest_sha256".to_owned(),
         )
     })?);
     Ok(Some(AutoTunnelWatermark {
@@ -10022,7 +9999,7 @@ fn persist_auto_tunnel_watermark(
         .payload_digest
         .ok_or_else(|| {
             AutoTunnelBootstrapError::InvalidFormat(
-                "watermark payload digest is required".to_string(),
+                "watermark payload digest is required".to_owned(),
             )
         })
         .map(|digest| encode_hex(&digest))?;
@@ -10183,7 +10160,7 @@ fn load_dns_zone_watermark(path: &Path) -> Result<Option<DnsZoneWatermark>, DnsZ
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(DnsZoneBootstrapError::InvalidFormat(
-                "watermark line missing key/value separator".to_string(),
+                "watermark line missing key/value separator".to_owned(),
             ));
         };
         match key {
@@ -10205,21 +10182,21 @@ fn load_dns_zone_watermark(path: &Path) -> Result<Option<DnsZoneWatermark>, DnsZ
         }
     }
     let generated_at_unix = generated_at_unix.ok_or_else(|| {
-        DnsZoneBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_string())
+        DnsZoneBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_owned())
     })?;
     let nonce = nonce.ok_or_else(|| {
-        DnsZoneBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+        DnsZoneBootstrapError::InvalidFormat("missing watermark nonce".to_owned())
     })?;
     let version = version.ok_or_else(|| {
-        DnsZoneBootstrapError::InvalidFormat("missing watermark version".to_string())
+        DnsZoneBootstrapError::InvalidFormat("missing watermark version".to_owned())
     })?;
     if version != 2 {
         return Err(DnsZoneBootstrapError::InvalidFormat(
-            "unsupported watermark version; expected version=2".to_string(),
+            "unsupported watermark version; expected version=2".to_owned(),
         ));
     }
     let payload_digest = payload_digest.ok_or_else(|| {
-        DnsZoneBootstrapError::InvalidFormat("missing watermark payload_digest_sha256".to_string())
+        DnsZoneBootstrapError::InvalidFormat("missing watermark payload_digest_sha256".to_owned())
     })?;
     Ok(Some(DnsZoneWatermark {
         version,
@@ -10306,11 +10283,11 @@ fn load_traversal_bundle(
     )?;
     if envelope.bundles.len() != 1 {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "expected exactly one traversal bundle entry".to_string(),
+            "expected exactly one traversal bundle entry".to_owned(),
         ));
     }
     envelope.bundles.into_iter().next().ok_or_else(|| {
-        TraversalBootstrapError::InvalidFormat("missing traversal bundle".to_string())
+        TraversalBootstrapError::InvalidFormat("missing traversal bundle".to_owned())
     })
 }
 
@@ -10347,7 +10324,7 @@ fn load_traversal_bundle_set(
     }
     let Some(first_bundle) = bundles.first() else {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "traversal bundle set contains no endpoint hint entries".to_string(),
+            "traversal bundle set contains no endpoint hint entries".to_owned(),
         ));
     };
     for bundle in &bundles[1..] {
@@ -10356,8 +10333,7 @@ fn load_traversal_bundle_set(
             || bundle.bundle.nonce != first_bundle.bundle.nonce
         {
             return Err(TraversalBootstrapError::InvalidFormat(
-                "traversal bundle entries must share a single generated_at/expires_at/nonce snapshot"
-                    .to_string(),
+                "traversal bundle entries must share a single generated_at/expires_at/nonce snapshot".to_owned(),
             ));
         }
     }
@@ -10371,7 +10347,7 @@ fn load_traversal_bundle_set(
         if !seen_coordination_pairs.insert(key) {
             return Err(TraversalBootstrapError::InvalidFormat(
                 "traversal bundle contains duplicate coordination entries for a node pair"
-                    .to_string(),
+                    .to_owned(),
             ));
         }
     }
@@ -10489,7 +10465,7 @@ fn validate_relay_fleet_bundle_wire_shape(content: &str) -> Result<(), Traversal
         }
         if signature_seen {
             return Err(TraversalBootstrapError::InvalidFormat(
-                "relay fleet signature must be the final line".to_string(),
+                "relay fleet signature must be the final line".to_owned(),
             ));
         }
         let (key, _value) = parse_limited_key_value_line(
@@ -10512,12 +10488,12 @@ fn validate_relay_fleet_bundle_wire_shape(content: &str) -> Result<(), Traversal
     }
     if line_count == 0 {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "relay fleet bundle is empty".to_string(),
+            "relay fleet bundle is empty".to_owned(),
         ));
     }
     if !signature_seen {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "relay fleet bundle missing signature".to_string(),
+            "relay fleet bundle missing signature".to_owned(),
         ));
     }
     Ok(())
@@ -10555,7 +10531,7 @@ fn split_traversal_bundle_sections(content: &str) -> Result<Vec<String>, Travers
             }
             if !saw_signature {
                 return Err(TraversalBootstrapError::InvalidFormat(
-                    "blank line before traversal bundle signature".to_string(),
+                    "blank line before traversal bundle signature".to_owned(),
                 ));
             }
             sections.push(current.join("\n"));
@@ -10568,7 +10544,7 @@ fn split_traversal_bundle_sections(content: &str) -> Result<Vec<String>, Travers
             current.clear();
             saw_signature = false;
         }
-        current.push(line.to_string());
+        current.push(line.to_owned());
         if line.starts_with("signature=") {
             saw_signature = true;
         }
@@ -10578,7 +10554,7 @@ fn split_traversal_bundle_sections(content: &str) -> Result<Vec<String>, Travers
     }
     if sections.is_empty() {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "traversal bundle is empty".to_string(),
+            "traversal bundle is empty".to_owned(),
         ));
     }
     Ok(sections)
@@ -10619,15 +10595,15 @@ fn parse_traversal_bundle_section(
         if key == "signature" {
             if signature_hex.is_some() {
                 return Err(TraversalBootstrapError::InvalidFormat(
-                    "duplicate key signature".to_string(),
+                    "duplicate key signature".to_owned(),
                 ));
             }
-            signature_hex = Some(value.to_string());
+            signature_hex = Some(value.to_owned());
             continue;
         }
         payload.push_str(line);
         payload.push('\n');
-        if fields.insert(key.to_string(), value.to_string()).is_some() {
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
             return Err(TraversalBootstrapError::InvalidFormat(format!(
                 "duplicate key {key}"
             )));
@@ -10641,10 +10617,10 @@ fn parse_traversal_bundle_section(
 
     let version = fields
         .get("version")
-        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing version".to_string()))?;
+        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing version".to_owned()))?;
     if version != "1" {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "unsupported traversal version".to_string(),
+            "unsupported traversal version".to_owned(),
         ));
     }
     if fields.get("type").map(String::as_str) == Some("traversal_coordination") {
@@ -10657,23 +10633,19 @@ fn parse_traversal_bundle_section(
     }
     if fields.get("path_policy").map(String::as_str) != Some("direct_preferred_relay_allowed") {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "unsupported traversal path_policy".to_string(),
+            "unsupported traversal path_policy".to_owned(),
         ));
     }
 
     let source_node_id = fields
         .get("source_node_id")
-        .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing source_node_id".to_string())
-        })?
+        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing source_node_id".to_owned()))?
         .clone();
     NodeId::new(source_node_id.clone())
         .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
     let target_node_id = fields
         .get("target_node_id")
-        .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing target_node_id".to_string())
-        })?
+        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing target_node_id".to_owned()))?
         .clone();
     NodeId::new(target_node_id.clone())
         .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
@@ -10681,34 +10653,34 @@ fn parse_traversal_bundle_section(
     let generated_at_unix = fields
         .get("generated_at_unix")
         .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing generated_at_unix".to_string())
+            TraversalBootstrapError::InvalidFormat("missing generated_at_unix".to_owned())
         })?
         .parse::<u64>()
         .map_err(|_| {
-            TraversalBootstrapError::InvalidFormat("invalid generated_at_unix".to_string())
+            TraversalBootstrapError::InvalidFormat("invalid generated_at_unix".to_owned())
         })?;
     let expires_at_unix = fields
         .get("expires_at_unix")
         .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing expires_at_unix".to_string())
+            TraversalBootstrapError::InvalidFormat("missing expires_at_unix".to_owned())
         })?
         .parse::<u64>()
         .map_err(|_| {
-            TraversalBootstrapError::InvalidFormat("invalid expires_at_unix".to_string())
+            TraversalBootstrapError::InvalidFormat("invalid expires_at_unix".to_owned())
         })?;
     if generated_at_unix >= expires_at_unix {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "invalid generated/expires ordering".to_string(),
+            "invalid generated/expires ordering".to_owned(),
         ));
     }
     let nonce = fields
         .get("nonce")
-        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing nonce".to_string()))?
+        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing nonce".to_owned()))?
         .parse::<u64>()
-        .map_err(|_| TraversalBootstrapError::InvalidFormat("invalid nonce".to_string()))?;
+        .map_err(|_| TraversalBootstrapError::InvalidFormat("invalid nonce".to_owned()))?;
 
     let signature_hex = signature_hex.ok_or_else(|| {
-        TraversalBootstrapError::InvalidFormat("missing traversal signature".to_string())
+        TraversalBootstrapError::InvalidFormat("missing traversal signature".to_owned())
     })?;
     let signature_bytes = decode_traversal_hex_to_fixed::<64>(&signature_hex)?;
     let signature = Signature::from_bytes(&signature_bytes);
@@ -10727,11 +10699,11 @@ fn parse_traversal_bundle_section(
     let candidate_count = fields
         .get("candidate_count")
         .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing candidate_count".to_string())
+            TraversalBootstrapError::InvalidFormat("missing candidate_count".to_owned())
         })?
         .parse::<usize>()
         .map_err(|_| {
-            TraversalBootstrapError::InvalidFormat("invalid candidate_count".to_string())
+            TraversalBootstrapError::InvalidFormat("invalid candidate_count".to_owned())
         })?;
     if candidate_count == 0 || candidate_count > MAX_TRAVERSAL_CANDIDATE_COUNT {
         return Err(TraversalBootstrapError::InvalidFormat(format!(
@@ -10740,10 +10712,10 @@ fn parse_traversal_bundle_section(
     }
     let expected_field_count = 8usize
         .checked_add(candidate_count.checked_mul(6).ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("candidate field count overflow".to_string())
+            TraversalBootstrapError::InvalidFormat("candidate field count overflow".to_owned())
         })?)
         .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("candidate field count overflow".to_string())
+            TraversalBootstrapError::InvalidFormat("candidate field count overflow".to_owned())
         })?;
     if fields.len() != expected_field_count {
         return Err(TraversalBootstrapError::InvalidFormat(format!(
@@ -10812,7 +10784,7 @@ fn parse_traversal_bundle_section(
         let relay_id = if relay_id_raw.trim().is_empty() {
             None
         } else {
-            Some(relay_id_raw.trim().to_string())
+            Some(relay_id_raw.trim().to_owned())
         };
         if matches!(candidate_type, TraversalCandidateType::Relay) && relay_id.is_none() {
             return Err(TraversalBootstrapError::InvalidFormat(format!(
@@ -10845,7 +10817,7 @@ fn parse_traversal_bundle_section(
         );
         if !seen.insert(dedupe) {
             return Err(TraversalBootstrapError::InvalidFormat(
-                "duplicate traversal candidate tuple".to_string(),
+                "duplicate traversal candidate tuple".to_owned(),
             ));
         }
 
@@ -10894,47 +10866,45 @@ fn parse_traversal_coordination_section(
         fields
             .get("session_id")
             .ok_or_else(|| {
-                TraversalBootstrapError::InvalidFormat(
-                    "missing coordination session_id".to_string(),
-                )
+                TraversalBootstrapError::InvalidFormat("missing coordination session_id".to_owned())
             })?
             .as_str(),
     )
     .map_err(|_| {
-        TraversalBootstrapError::InvalidFormat("invalid coordination session_id".to_string())
+        TraversalBootstrapError::InvalidFormat("invalid coordination session_id".to_owned())
     })?;
     if session_id.iter().all(|value| *value == 0) {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "coordination session_id must not be all zeros".to_string(),
+            "coordination session_id must not be all zeros".to_owned(),
         ));
     }
     let probe_start_unix = fields
         .get("probe_start_unix")
         .ok_or_else(|| {
             TraversalBootstrapError::InvalidFormat(
-                "missing coordination probe_start_unix".to_string(),
+                "missing coordination probe_start_unix".to_owned(),
             )
         })?
         .parse::<u64>()
         .map_err(|_| {
             TraversalBootstrapError::InvalidFormat(
-                "invalid coordination probe_start_unix".to_string(),
+                "invalid coordination probe_start_unix".to_owned(),
             )
         })?;
     let node_a = fields
         .get("node_a")
         .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing coordination node_a".to_string())
+            TraversalBootstrapError::InvalidFormat("missing coordination node_a".to_owned())
         })?
         .trim()
-        .to_string();
+        .to_owned();
     let node_b = fields
         .get("node_b")
         .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing coordination node_b".to_string())
+            TraversalBootstrapError::InvalidFormat("missing coordination node_b".to_owned())
         })?
         .trim()
-        .to_string();
+        .to_owned();
     NodeId::new(node_a.clone())
         .map_err(|err| TraversalBootstrapError::InvalidFormat(err.to_string()))?;
     NodeId::new(node_b.clone())
@@ -10942,48 +10912,42 @@ fn parse_traversal_coordination_section(
     let issued_at_unix = fields
         .get("issued_at_unix")
         .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat(
-                "missing coordination issued_at_unix".to_string(),
-            )
+            TraversalBootstrapError::InvalidFormat("missing coordination issued_at_unix".to_owned())
         })?
         .parse::<u64>()
         .map_err(|_| {
-            TraversalBootstrapError::InvalidFormat(
-                "invalid coordination issued_at_unix".to_string(),
-            )
+            TraversalBootstrapError::InvalidFormat("invalid coordination issued_at_unix".to_owned())
         })?;
     let expires_at_unix = fields
         .get("expires_at_unix")
         .ok_or_else(|| {
             TraversalBootstrapError::InvalidFormat(
-                "missing coordination expires_at_unix".to_string(),
+                "missing coordination expires_at_unix".to_owned(),
             )
         })?
         .parse::<u64>()
         .map_err(|_| {
             TraversalBootstrapError::InvalidFormat(
-                "invalid coordination expires_at_unix".to_string(),
+                "invalid coordination expires_at_unix".to_owned(),
             )
         })?;
     let nonce = decode_traversal_hex_to_fixed::<16>(
         fields
             .get("nonce")
             .ok_or_else(|| {
-                TraversalBootstrapError::InvalidFormat("missing coordination nonce".to_string())
+                TraversalBootstrapError::InvalidFormat("missing coordination nonce".to_owned())
             })?
             .as_str(),
     )
-    .map_err(|_| {
-        TraversalBootstrapError::InvalidFormat("invalid coordination nonce".to_string())
-    })?;
+    .map_err(|_| TraversalBootstrapError::InvalidFormat("invalid coordination nonce".to_owned()))?;
     if nonce.iter().all(|value| *value == 0) {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "coordination nonce must not be all zeros".to_string(),
+            "coordination nonce must not be all zeros".to_owned(),
         ));
     }
 
     let signature_hex = signature_hex.ok_or_else(|| {
-        TraversalBootstrapError::InvalidFormat("missing traversal signature".to_string())
+        TraversalBootstrapError::InvalidFormat("missing traversal signature".to_owned())
     })?;
     let signature_bytes = decode_traversal_hex_to_fixed::<64>(&signature_hex)?;
     let signature = Signature::from_bytes(&signature_bytes);
@@ -10994,7 +10958,7 @@ fn parse_traversal_coordination_section(
     Ok(TraversalSectionEnvelope::Coordination(
         TraversalCoordinationEnvelope {
             record: SignedTraversalCoordinationRecord {
-                payload: payload.to_string(),
+                payload: payload.to_owned(),
                 signature_hex,
                 session_id,
                 probe_start_unix,
@@ -11170,7 +11134,7 @@ fn select_runtime_relay_candidate_with_verified_fleet(
     let relay_id_label = candidate
         .relay_id
         .as_deref()
-        .ok_or_else(|| "relay candidate missing relay_id".to_string())?;
+        .ok_or_else(|| "relay candidate missing relay_id".to_owned())?;
     validate_runtime_relay_candidate_endpoint(candidate.endpoint)?;
     let selected = RuntimeRelayCandidate {
         endpoint: candidate.endpoint,
@@ -11189,10 +11153,10 @@ fn ensure_runtime_relay_candidate_in_verified_fleet(
 ) -> Result<(), String> {
     let fleet_index = verified_relay_fleet_endpoint_index(relay_fleet)?;
     let Some(endpoints) = fleet_index.get(&candidate.relay_id) else {
-        return Err("relay candidate relay_id is absent from signed relay fleet".to_string());
+        return Err("relay candidate relay_id is absent from signed relay fleet".to_owned());
     };
     if !endpoints.contains(&candidate.endpoint) {
-        return Err("relay candidate endpoint is absent from signed relay fleet".to_string());
+        return Err("relay candidate endpoint is absent from signed relay fleet".to_owned());
     }
     Ok(())
 }
@@ -11211,13 +11175,13 @@ fn verified_relay_fleet_endpoint_index(
         let endpoint = relay
             .endpoint
             .parse::<SocketAddr>()
-            .map_err(|_| "relay fleet endpoint is invalid".to_string())?;
+            .map_err(|_| "relay fleet endpoint is invalid".to_owned())?;
         validate_runtime_relay_candidate_endpoint(endpoint)
             .map_err(|err| format!("relay fleet {err}"))?;
         index.entry(relay_id).or_default().insert(endpoint);
     }
     if index.is_empty() {
-        return Err("signed relay fleet contains no enabled relays".to_string());
+        return Err("signed relay fleet contains no enabled relays".to_owned());
     }
     Ok(index)
 }
@@ -11228,7 +11192,7 @@ fn validate_runtime_relay_fleet_descriptor(relay: &RelayFleetNodeDescriptor) -> 
         .bytes()
         .any(|byte| matches!(byte, b'\n' | b'\r' | b'='))
     {
-        return Err("relay fleet relay_id must be a single-line payload value".to_string());
+        return Err("relay fleet relay_id must be a single-line payload value".to_owned());
     }
     let region = relay.region.trim();
     if region.is_empty()
@@ -11238,21 +11202,21 @@ fn validate_runtime_relay_fleet_descriptor(relay: &RelayFleetNodeDescriptor) -> 
             .bytes()
             .any(|byte| matches!(byte, b'\n' | b'\r' | b'='))
     {
-        return Err("relay fleet region must be a bounded single-line ASCII value".to_string());
+        return Err("relay fleet region must be a bounded single-line ASCII value".to_owned());
     }
     if relay.capacity == 0 {
-        return Err("relay fleet capacity must be greater than zero".to_string());
+        return Err("relay fleet capacity must be greater than zero".to_owned());
     }
     Ok(())
 }
 
 fn validate_runtime_relay_candidate_endpoint(endpoint: SocketAddr) -> Result<(), String> {
     if endpoint.port() == 0 {
-        return Err("relay candidate must not use port 0".to_string());
+        return Err("relay candidate must not use port 0".to_owned());
     }
     if endpoint.ip().is_unspecified() || endpoint.ip().is_loopback() || endpoint.ip().is_multicast()
     {
-        return Err("relay candidate must not use special transport address".to_string());
+        return Err("relay candidate must not use special transport address".to_owned());
     }
     match endpoint.ip() {
         std::net::IpAddr::V4(v4) => {
@@ -11261,12 +11225,12 @@ fn validate_runtime_relay_candidate_endpoint(endpoint: SocketAddr) -> Result<(),
                 || v4.is_broadcast()
                 || is_shared_carrier_grade_nat_ipv4(v4)
             {
-                return Err("relay candidate must not use private transport address".to_string());
+                return Err("relay candidate must not use private transport address".to_owned());
             }
         }
         std::net::IpAddr::V6(v6) => {
             if v6.is_unicast_link_local() || v6.is_unique_local() {
-                return Err("relay candidate must not use private transport address".to_string());
+                return Err("relay candidate must not use private transport address".to_owned());
             }
         }
     }
@@ -11303,7 +11267,7 @@ fn host_ip_from_host_cidr_daemon(value: &str) -> Option<String> {
     if prefix != "32" && prefix != "128" {
         return None;
     }
-    Some(ip.to_string())
+    Some(ip.to_owned())
 }
 
 fn collect_assignment_mesh_ip_map(
@@ -11313,14 +11277,14 @@ fn collect_assignment_mesh_ip_map(
         || !is_host_cidr(&auto_tunnel.assigned_cidr)
     {
         return Err(DnsZoneBootstrapError::AssignmentMismatch(
-            "local assigned_cidr must be a host cidr inside mesh_cidr".to_string(),
+            "local assigned_cidr must be a host cidr inside mesh_cidr".to_owned(),
         ));
     }
     let mut ip_map = BTreeMap::new();
     let mut seen_ips = BTreeSet::new();
     let local_ip = host_ip_from_host_cidr_daemon(&auto_tunnel.assigned_cidr).ok_or_else(|| {
         DnsZoneBootstrapError::AssignmentMismatch(
-            "local assigned_cidr must be a host cidr".to_string(),
+            "local assigned_cidr must be a host cidr".to_owned(),
         )
     })?;
     seen_ips.insert(local_ip.clone());
@@ -11417,9 +11381,7 @@ fn load_traversal_verifying_key(path: &Path) -> Result<VerifyingKey, TraversalBo
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| {
-            TraversalBootstrapError::InvalidFormat("missing verifier key".to_string())
-        })?;
+        .ok_or_else(|| TraversalBootstrapError::InvalidFormat("missing verifier key".to_owned()))?;
     let key_bytes = decode_traversal_hex_to_fixed::<32>(key_line)?;
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| TraversalBootstrapError::KeyInvalid)
 }
@@ -11431,7 +11393,7 @@ fn decode_traversal_hex_to_fixed<const N: usize>(
     let trimmed = encoded.trim();
     if trimmed.len() != N * 2 {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "unexpected hex length".to_string(),
+            "unexpected hex length".to_owned(),
         ));
     }
     let raw = trimmed.as_bytes();
@@ -11451,7 +11413,7 @@ fn decode_traversal_hex_nibble(value: u8) -> Result<u8, TraversalBootstrapError>
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err(TraversalBootstrapError::InvalidFormat(
-            "invalid hex character".to_string(),
+            "invalid hex character".to_owned(),
         )),
     }
 }
@@ -11481,7 +11443,7 @@ fn load_traversal_watermark(
     for line in content.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(TraversalBootstrapError::InvalidFormat(
-                "watermark line missing key/value separator".to_string(),
+                "watermark line missing key/value separator".to_owned(),
             ));
         };
         match key {
@@ -11499,23 +11461,21 @@ fn load_traversal_watermark(
         }
     }
     let generated_at_unix = generated_at_unix.ok_or_else(|| {
-        TraversalBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_string())
+        TraversalBootstrapError::InvalidFormat("missing watermark generated_at_unix".to_owned())
     })?;
     let nonce = nonce.ok_or_else(|| {
-        TraversalBootstrapError::InvalidFormat("missing watermark nonce".to_string())
+        TraversalBootstrapError::InvalidFormat("missing watermark nonce".to_owned())
     })?;
     let version = version.ok_or_else(|| {
-        TraversalBootstrapError::InvalidFormat("missing watermark version".to_string())
+        TraversalBootstrapError::InvalidFormat("missing watermark version".to_owned())
     })?;
     if version != 2 {
         return Err(TraversalBootstrapError::InvalidFormat(
-            "unsupported watermark version; expected version=2".to_string(),
+            "unsupported watermark version; expected version=2".to_owned(),
         ));
     }
     let payload_digest = Some(payload_digest.ok_or_else(|| {
-        TraversalBootstrapError::InvalidFormat(
-            "missing watermark payload_digest_sha256".to_string(),
-        )
+        TraversalBootstrapError::InvalidFormat("missing watermark payload_digest_sha256".to_owned())
     })?);
     Ok(Some(TraversalWatermark {
         generated_at_unix,
@@ -11541,7 +11501,7 @@ fn persist_traversal_watermark(
         .payload_digest
         .ok_or_else(|| {
             TraversalBootstrapError::InvalidFormat(
-                "watermark payload digest is required".to_string(),
+                "watermark payload digest is required".to_owned(),
             )
         })
         .map(|digest| encode_hex(&digest))?;
@@ -12291,7 +12251,7 @@ mod tests {
     ) -> String {
         let signing_key = SigningKey::from_bytes(&signing_seed);
         let _envelope = RemoteCommandEnvelope {
-            subject: subject.to_string(),
+            subject: subject.to_owned(),
             nonce,
             command: command.clone(),
             signature: Vec::new(),
@@ -12405,7 +12365,7 @@ mod tests {
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             remote_ops_token_verifier_key_path: Some(remote_ops_verifier_path),
-            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
             ..DaemonConfig::default()
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
@@ -12420,7 +12380,7 @@ mod tests {
         let signature = remote_signing_key.sign(&payload);
 
         let envelope = RemoteCommandEnvelope {
-            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
             nonce,
             command: command.clone(),
             signature: signature.to_bytes().to_vec(),
@@ -12442,7 +12402,7 @@ mod tests {
         );
         let expired_signature = remote_signing_key.sign(&expired_payload);
         let expired_envelope = RemoteCommandEnvelope {
-            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
             nonce: expired_nonce,
             command: command.clone(),
             signature: expired_signature.to_bytes().to_vec(),
@@ -12512,7 +12472,7 @@ mod tests {
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             remote_ops_token_verifier_key_path: Some(remote_ops_verifier_path),
-            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_string(),
+            remote_ops_expected_subject: DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT.to_owned(),
             ..DaemonConfig::default()
         };
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
@@ -12528,7 +12488,7 @@ mod tests {
         let signature = remote_signing_key.sign(&payload);
 
         let envelope = RemoteCommandEnvelope {
-            subject: wrong_subject.to_string(),
+            subject: wrong_subject.to_owned(),
             nonce,
             command: command.clone(),
             signature: signature.to_bytes().to_vec(),
@@ -12549,7 +12509,7 @@ mod tests {
             (IpcCommand::Netcheck, true, true, true),
             (IpcCommand::StateRefresh, true, true, true),
             (
-                IpcCommand::ExitNodeSelect("node-exit".to_string()),
+                IpcCommand::ExitNodeSelect("node-exit".to_owned()),
                 true,
                 true,
                 false,
@@ -12559,13 +12519,13 @@ mod tests {
             (IpcCommand::LanAccessOff, true, true, false),
             (IpcCommand::DnsInspect, true, true, true),
             (
-                IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()),
+                IpcCommand::RouteAdvertise("192.168.1.0/24".to_owned()),
                 true,
                 false,
                 false,
             ),
             (
-                IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()),
+                IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()),
                 true,
                 false,
                 false,
@@ -12573,7 +12533,7 @@ mod tests {
             (IpcCommand::KeyRotate, true, false, false),
             (IpcCommand::KeyRevoke, true, false, false),
             (
-                IpcCommand::Unknown("unknown".to_string()),
+                IpcCommand::Unknown("unknown".to_owned()),
                 true,
                 false,
                 false,
@@ -12664,15 +12624,15 @@ mod tests {
             IpcCommand::Netcheck,
             IpcCommand::StateRefresh,
             IpcCommand::DnsInspect,
-            IpcCommand::ExitNodeSelect("node-exit".to_string()),
+            IpcCommand::ExitNodeSelect("node-exit".to_owned()),
             IpcCommand::ExitNodeOff,
             IpcCommand::LanAccessOn,
             IpcCommand::LanAccessOff,
-            IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()),
-            IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()),
+            IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()),
+            IpcCommand::RouteAdvertise("192.168.1.0/24".to_owned()),
             IpcCommand::KeyRotate,
             IpcCommand::KeyRevoke,
-            IpcCommand::Unknown("unknown".to_string()),
+            IpcCommand::Unknown("unknown".to_owned()),
         ]
     }
 
@@ -12808,10 +12768,10 @@ mod tests {
         runtime.local_route_reconcile_pending = false;
 
         if !role.is_blind_exit() && !mode.auto_tunnel_enforced() {
-            runtime.selected_exit_node = Some("node-exit".to_string());
+            runtime.selected_exit_node = Some("node-exit".to_owned());
         } else if role.is_blind_exit() {
             // Start from an intentionally over-privileged state and force invariant cleanup.
-            runtime.selected_exit_node = Some("node-exit".to_string());
+            runtime.selected_exit_node = Some("node-exit".to_owned());
             runtime.lan_access_enabled = true;
             runtime.controller.set_lan_access(true);
             runtime
@@ -12820,13 +12780,13 @@ mod tests {
         }
 
         if matches!(hop, RoleAuthMatrixHop::TwoHop) {
-            runtime.advertised_routes.insert("0.0.0.0/0".to_string());
+            runtime.advertised_routes.insert("0.0.0.0/0".to_owned());
             runtime.local_route_reconcile_pending = true;
             runtime.reconcile();
         }
 
         if mode.restricted_safe() {
-            runtime.restrict_recoverable("matrix-forced-restricted".to_string());
+            runtime.restrict_recoverable("matrix-forced-restricted".to_owned());
         }
 
         (runtime, test_dir)
@@ -13369,11 +13329,11 @@ mod tests {
             timing.ttl_secs,
             nonce,
             &[rustynet_dns_zone::DnsZoneRecordInput {
-                label: "app".to_string(),
-                target_node_id: target_node_id.to_string(),
+                label: "app".to_owned(),
+                target_node_id: target_node_id.to_owned(),
                 rr_type: rustynet_dns_zone::DnsRecordType::A,
                 target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
-                expected_ip: expected_ip.to_string(),
+                expected_ip: expected_ip.to_owned(),
                 ttl_secs: timing.ttl_secs,
                 aliases: aliases
                     .iter()
@@ -13582,7 +13542,7 @@ mod tests {
             path,
             verifier_path,
             [23u8; 32],
-            &[bundle_payload, coordination_payload.to_string()],
+            &[bundle_payload, coordination_payload.to_owned()],
         );
     }
 
@@ -13681,7 +13641,7 @@ mod tests {
     ) -> RelayClient {
         let signing_key = SigningKey::from_bytes(&[23u8; 32]);
         let mut relay_client = RelayClient::new(
-            NodeId::new(local_node_id.to_string()).expect("local node id should parse"),
+            NodeId::new(local_node_id.to_owned()).expect("local node id should parse"),
             Arc::new(signing_key),
             RelayClientConfig {
                 session_timeout,
@@ -13942,8 +13902,8 @@ mod tests {
         };
         #[cfg(target_os = "macos")]
         {
-            config.wg_interface = "utun9".to_string();
-            config.egress_interface = "en0".to_string();
+            config.wg_interface = "utun9".to_owned();
+            config.egress_interface = "en0".to_owned();
         }
 
         let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
@@ -13952,7 +13912,7 @@ mod tests {
 
     fn seed_local_probe_candidate(runtime: &mut DaemonRuntime) {
         runtime.local_host_candidates.insert(
-            "eth-test".to_string(),
+            "eth-test".to_owned(),
             vec![
                 "192.0.2.10"
                     .parse()
@@ -13964,7 +13924,7 @@ mod tests {
     fn seed_local_probe_candidate_snapshot(runtime: &mut DaemonRuntime) {
         let mut snapshot = std::collections::BTreeMap::new();
         snapshot.insert(
-            "eth-test".to_string(),
+            "eth-test".to_owned(),
             vec![
                 "192.0.2.10"
                     .parse()
@@ -13977,11 +13937,11 @@ mod tests {
     fn transient_loopback_only_candidate_snapshot() -> BTreeMap<String, Vec<IpAddr>> {
         BTreeMap::from([
             (
-                "lo".to_string(),
+                "lo".to_owned(),
                 vec!["127.0.0.1".parse().expect("ipv4 should parse")],
             ),
             (
-                "rustynet0".to_string(),
+                "rustynet0".to_owned(),
                 vec!["100.109.33.213".parse().expect("ipv4 should parse")],
             ),
         ])
@@ -13989,7 +13949,7 @@ mod tests {
 
     fn usable_probe_candidate_snapshot() -> BTreeMap<String, Vec<IpAddr>> {
         BTreeMap::from([(
-            "enp0s1".to_string(),
+            "enp0s1".to_owned(),
             vec!["192.168.64.22".parse().expect("ipv4 should parse")],
         )])
     }
@@ -14131,33 +14091,33 @@ mod tests {
         owner_signing: &SigningKey,
     ) {
         let mut state_nodes = vec![MembershipNode {
-            node_id: local_node_id.to_string(),
+            node_id: local_node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[9; 32]),
-            owner: "owner@example.local".to_string(),
+            owner: "owner@example.local".to_owned(),
             status: MembershipNodeStatus::Active,
-            roles: vec!["tag:servers".to_string()],
+            roles: vec!["tag:servers".to_owned()],
             joined_at_unix: 100,
             updated_at_unix: 100,
         }];
         for (index, (node_id, status)) in nodes.iter().enumerate() {
             let pubkey_byte = 11u8.saturating_add(index as u8);
             state_nodes.push(MembershipNode {
-                node_id: (*node_id).to_string(),
+                node_id: (*node_id).to_owned(),
                 node_pubkey_hex: hex_encode(&[pubkey_byte; 32]),
-                owner: "owner@example.local".to_string(),
+                owner: "owner@example.local".to_owned(),
                 status: *status,
-                roles: vec!["tag:exit".to_string()],
+                roles: vec!["tag:exit".to_owned()],
                 joined_at_unix: 100,
                 updated_at_unix: 100,
             });
         }
         let state = MembershipState {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
-            network_id: "net-test".to_string(),
+            network_id: "net-test".to_owned(),
             epoch: 1,
             nodes: state_nodes,
             approver_set: vec![MembershipApprover {
-                approver_id: "owner-1".to_string(),
+                approver_id: "owner-1".to_owned(),
                 approver_pubkey_hex: hex_encode(owner_signing.verifying_key().as_bytes()),
                 role: MembershipApproverRole::Owner,
                 status: MembershipApproverStatus::Active,
@@ -14484,7 +14444,7 @@ mod tests {
     #[test]
     fn validate_daemon_config_rejects_remote_fetch_urls() {
         let config = DaemonConfig {
-            trust_url: Some("http://127.0.0.1:8080/trust".to_string()),
+            trust_url: Some("http://127.0.0.1:8080/trust".to_owned()),
             ..DaemonConfig::default()
         };
         let err = validate_daemon_config(&config)
@@ -15056,8 +15016,8 @@ mod tests {
         // an older membership snapshot being able to replay it (revert
         // membership view, e.g. re-activate a revoked node) and being
         // forced to use the latest signed snapshot.
-        let root_a = "aaaaaaaa".to_string();
-        let root_b = "bbbbbbbb".to_string();
+        let root_a = "aaaaaaaa".to_owned();
+        let root_b = "bbbbbbbb".to_owned();
 
         // 1. Strictly older epoch → replay regardless of state_root.
         let prev = MembershipWatermark {
@@ -15130,11 +15090,11 @@ mod tests {
         // daemon has advanced past it.
         let prev = MembershipWatermark {
             epoch: 1,
-            state_root: "root1".to_string(),
+            state_root: "root1".to_owned(),
         };
         let stale = MembershipWatermark {
             epoch: 0,
-            state_root: "root0".to_string(),
+            state_root: "root0".to_owned(),
         };
         assert!(
             membership_watermark_is_replay(&stale, &prev),
@@ -15344,7 +15304,7 @@ mod tests {
                     *first = if *first == '0' { '1' } else { '0' };
                     format!("signature={}", chars.into_iter().collect::<String>())
                 } else {
-                    line.to_string()
+                    line.to_owned()
                 }
             })
             .collect::<Vec<_>>()
@@ -16265,7 +16225,7 @@ mod tests {
 
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::InMemory,
-            node_id: "daemon-local".to_string(),
+            node_id: "daemon-local".to_owned(),
             state_path,
             trust_evidence_path: trust_path,
             trust_verifier_key_path: trust_verifier_path,
@@ -16304,12 +16264,12 @@ mod tests {
     #[test]
     fn resolve_egress_interface_value_uses_detector_only_for_auto() {
         let explicit =
-            resolve_egress_interface_value("wlp2s0", || Err("detector should not run".to_string()))
+            resolve_egress_interface_value("wlp2s0", || Err("detector should not run".to_owned()))
                 .expect("explicit interface should be preserved");
         assert_eq!(explicit, "wlp2s0");
 
         let detected =
-            resolve_egress_interface_value(DEFAULT_EGRESS_INTERFACE, || Ok("enp0s8".to_string()))
+            resolve_egress_interface_value(DEFAULT_EGRESS_INTERFACE, || Ok("enp0s8".to_owned()))
                 .expect("auto interface should use detector");
         assert_eq!(detected, "enp0s8");
     }
@@ -16496,7 +16456,7 @@ mod tests {
             .map(|result| result.mapped_endpoint)
             .collect();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         assert_eq!(
             runtime.controller.managed_peer_endpoint(&exit_node),
             Some(SocketEndpoint {
@@ -16699,7 +16659,7 @@ mod tests {
 
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let expected_endpoint = SocketEndpoint {
             addr: relay_addr.ip(),
             port: 61_001,
@@ -16744,7 +16704,7 @@ mod tests {
             "relay-eu-1",
         );
         runtime.transport_socket_identity_blocker =
-            Some("authoritative backend udp socket unavailable".to_string());
+            Some("authoritative backend udp socket unavailable".to_owned());
         runtime.relay_client = Some(build_test_relay_client(
             "daemon-local",
             Duration::from_millis(200),
@@ -16799,7 +16759,7 @@ mod tests {
             "relay-eu-1",
         );
         runtime.transport_socket_identity_blocker =
-            Some("authoritative backend udp socket unavailable".to_string());
+            Some("authoritative backend udp socket unavailable".to_owned());
         let mut relay_client = build_test_relay_client(
             "daemon-local",
             Duration::from_millis(200),
@@ -16887,8 +16847,8 @@ mod tests {
             .start(RuntimeContext {
                 local_node: NodeId::new("daemon-local").expect("test node id should parse"),
                 interface_name: runtime.wg_interface.clone(),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.0.1/32".to_string(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.0.1/32".to_owned(),
             })
             .expect("linux userspace-shared backend should start");
 
@@ -16998,7 +16958,7 @@ mod tests {
         let authoritative_local_addr: SocketAddr =
             "0.0.0.0:51820".parse().expect("local addr should parse");
         let allocated_port = 61_044;
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
 
         configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
         script_runtime_authoritative_relay_ack(
@@ -17155,7 +17115,7 @@ mod tests {
 
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let relay_endpoint = SocketEndpoint {
             addr: relay_addr.ip(),
             port: 61_011,
@@ -17215,7 +17175,7 @@ mod tests {
 
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let established_relay_endpoint = SocketEndpoint {
             addr: relay_addr.ip(),
             port: 61_012,
@@ -17265,7 +17225,7 @@ mod tests {
 
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let initial_status = runtime
             .traversal_probe_statuses
             .get(&exit_node)
@@ -17335,7 +17295,7 @@ mod tests {
 
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         assert_eq!(runtime.controller.state(), DataplaneState::FailClosed);
         assert!(
             runtime
@@ -17419,7 +17379,7 @@ mod tests {
         seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let status = runtime
             .traversal_probe_statuses
             .get(&exit_node)
@@ -17519,7 +17479,7 @@ mod tests {
                 .unwrap_or("none")
                 .contains("coordination nonce replay detected")
         );
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         assert!(
             runtime.traversal_probe_statuses.contains_key(&exit_node),
             "probe status should remain available after refresh"
@@ -17605,7 +17565,7 @@ mod tests {
         seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let status = runtime
             .traversal_probe_statuses
             .get(&exit_node)
@@ -17709,7 +17669,7 @@ mod tests {
         seed_local_probe_candidate(&mut runtime);
         runtime.bootstrap();
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         assert_eq!(
             runtime.controller.peer_path(&exit_node),
             Some(PathMode::Relay)
@@ -17878,7 +17838,7 @@ mod tests {
         seed_local_probe_candidate(&mut runtime);
         runtime.controller.set_stability_windows(0, 0);
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let direct_endpoint = SocketEndpoint {
             addr: "10.0.0.2".parse().expect("ipv4 should parse"),
             port: 51820,
@@ -18030,7 +17990,7 @@ mod tests {
         runtime.bootstrap();
         runtime.controller.set_stability_windows(0, 0);
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         let direct_endpoint = SocketEndpoint {
             addr: "10.0.0.2".parse().expect("ipv4 should parse"),
             port: 51820,
@@ -18174,7 +18134,7 @@ mod tests {
         seed_local_probe_candidate_snapshot(&mut runtime);
         runtime.controller.set_stability_windows(0, 0);
 
-        let exit_node = NodeId::new("node-exit".to_string()).expect("node id should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
         runtime
             .controller
             .backend_mut_for_test()
@@ -19702,19 +19662,19 @@ mod tests {
         assert_eq!(
             runtime
                 .controller
-                .peer_path(&NodeId::new("node-exit".to_string()).unwrap()),
+                .peer_path(&NodeId::new("node-exit".to_owned()).unwrap()),
             Some(crate::phase10::PathMode::Relay)
         );
         assert_eq!(
             runtime
                 .controller
-                .peer_path(&NodeId::new("node-relay".to_string()).unwrap()),
+                .peer_path(&NodeId::new("node-relay".to_owned()).unwrap()),
             Some(crate::phase10::PathMode::Relay)
         );
         assert_eq!(
             runtime
                 .controller
-                .managed_peer_endpoint(&NodeId::new("node-exit".to_string()).unwrap()),
+                .managed_peer_endpoint(&NodeId::new("node-exit".to_owned()).unwrap()),
             Some(SocketEndpoint {
                 addr: "203.0.113.77".parse().expect("ipv4 should parse"),
                 port: 443,
@@ -19723,7 +19683,7 @@ mod tests {
         assert_eq!(
             runtime
                 .controller
-                .managed_peer_endpoint(&NodeId::new("node-relay".to_string()).unwrap()),
+                .managed_peer_endpoint(&NodeId::new("node-relay".to_owned()).unwrap()),
             Some(SocketEndpoint {
                 addr: "203.0.113.78".parse().expect("ipv4 should parse"),
                 port: 443,
@@ -19966,7 +19926,7 @@ mod tests {
             endpoint: "203.0.113.77:443"
                 .parse()
                 .expect("relay endpoint should parse"),
-            relay_id: Some(" relay-eu-1 ".to_string()),
+            relay_id: Some(" relay-eu-1 ".to_owned()),
             priority: 20,
         };
 
@@ -19985,7 +19945,7 @@ mod tests {
             endpoint: "203.0.113.77:443"
                 .parse()
                 .expect("relay endpoint should parse"),
-            relay_id: Some("relay-label-too-long".to_string()),
+            relay_id: Some("relay-label-too-long".to_owned()),
             priority: 20,
         };
 
@@ -20008,7 +19968,7 @@ mod tests {
             let candidate = TraversalCandidate {
                 candidate_type: TraversalCandidateType::Relay,
                 endpoint: endpoint.parse().expect("test relay endpoint should parse"),
-                relay_id: Some("relay-eu-1".to_string()),
+                relay_id: Some("relay-eu-1".to_owned()),
                 priority: 20,
             };
             select_runtime_relay_candidate(&[candidate])
@@ -20034,9 +19994,9 @@ mod tests {
         enabled: bool,
     ) -> RelayFleetNodeDescriptor {
         RelayFleetNodeDescriptor {
-            relay_id: relay_id.to_string(),
-            region: "test-region".to_string(),
-            endpoint: endpoint.to_string(),
+            relay_id: relay_id.to_owned(),
+            region: "test-region".to_owned(),
+            endpoint: endpoint.to_owned(),
             priority: 10,
             capacity: 100,
             enabled,
@@ -20050,7 +20010,7 @@ mod tests {
             endpoint: "203.0.113.77:443"
                 .parse()
                 .expect("relay endpoint should parse"),
-            relay_id: Some(" relay-eu-1 ".to_string()),
+            relay_id: Some(" relay-eu-1 ".to_owned()),
             priority: 20,
         };
         let fleet = test_relay_fleet(vec![test_relay_descriptor(
@@ -20079,7 +20039,7 @@ mod tests {
             endpoint: "203.0.113.77:443"
                 .parse()
                 .expect("relay endpoint should parse"),
-            relay_id: Some("relay-eu-1".to_string()),
+            relay_id: Some("relay-eu-1".to_owned()),
             priority: 20,
         };
         let fleet = test_relay_fleet(vec![test_relay_descriptor(
@@ -20101,7 +20061,7 @@ mod tests {
             endpoint: "203.0.113.77:443"
                 .parse()
                 .expect("relay endpoint should parse"),
-            relay_id: Some("relay-eu-1".to_string()),
+            relay_id: Some("relay-eu-1".to_owned()),
             priority: 20,
         };
         let fleet = test_relay_fleet(vec![test_relay_descriptor(
@@ -20532,17 +20492,16 @@ mod tests {
         assert!(status.ok);
         assert!(status.message.contains("state="));
 
-        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_owned()));
         assert!(select.ok);
         assert!(select.message.contains("exit-node selected"));
 
-        let route =
-            runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()));
+        let route = runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_owned()));
         assert!(route.ok);
         assert!(route.message.contains("route advertised"));
 
         let invalid_route =
-            runtime.handle_command(IpcCommand::RouteAdvertise("bad-route".to_string()));
+            runtime.handle_command(IpcCommand::RouteAdvertise("bad-route".to_owned()));
         assert!(!invalid_route.ok);
 
         let _ = std::fs::remove_file(state_path);
@@ -21359,11 +21318,11 @@ mod tests {
             60,
             9,
             &[rustynet_dns_zone::DnsZoneRecordInput {
-                label: "app".to_string(),
-                target_node_id: "node-exit".to_string(),
+                label: "app".to_owned(),
+                target_node_id: "node-exit".to_owned(),
                 rr_type: rustynet_dns_zone::DnsRecordType::A,
                 target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
-                expected_ip: "100.64.0.2".to_string(),
+                expected_ip: "100.64.0.2".to_owned(),
                 ttl_secs: 60,
                 aliases: Vec::new(),
             }],
@@ -21501,7 +21460,7 @@ mod tests {
         .expect("signed assignment should load");
 
         let config = DaemonConfig {
-            node_id: "daemon-local".to_string(),
+            node_id: "daemon-local".to_owned(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -21570,7 +21529,7 @@ mod tests {
         .expect("signed assignment should load");
 
         let config = DaemonConfig {
-            node_id: "daemon-local".to_string(),
+            node_id: "daemon-local".to_owned(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -21597,7 +21556,7 @@ mod tests {
     #[test]
     fn dns_resolver_servfails_managed_name_when_zone_is_missing() {
         let config = DaemonConfig {
-            node_id: "daemon-local".to_string(),
+            node_id: "daemon-local".to_owned(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -21644,7 +21603,7 @@ mod tests {
         .expect("signed assignment should load");
 
         let config = DaemonConfig {
-            node_id: "daemon-local".to_string(),
+            node_id: "daemon-local".to_owned(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -21654,7 +21613,7 @@ mod tests {
         runtime.dns_zone_watermark_path = dns_zone_watermark_path.clone();
         runtime.refresh_dns_zone_state(Some(&assignment));
         assert!(runtime.dns_zone.is_some());
-        runtime.dns_zone_error = Some("dns zone bundle replay detected".to_string());
+        runtime.dns_zone_error = Some("dns zone bundle replay detected".to_owned());
 
         let response = build_dns_response(&runtime, &build_dns_query("app.rustynet", 1))
             .expect("resolver should answer");
@@ -21672,7 +21631,7 @@ mod tests {
     #[test]
     fn dns_resolver_refuses_non_managed_name() {
         let config = DaemonConfig {
-            node_id: "daemon-local".to_string(),
+            node_id: "daemon-local".to_owned(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -21732,11 +21691,10 @@ mod tests {
         assert!(status.ok);
         assert!(status.message.contains("node_role=client"));
 
-        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_owned()));
         assert!(select.ok);
 
-        let route =
-            runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()));
+        let route = runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_owned()));
         assert!(!route.ok);
         assert!(route.message.contains("node role"));
 
@@ -21787,7 +21745,7 @@ mod tests {
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
 
-        runtime.advertised_routes.insert("0.0.0.0/0".to_string());
+        runtime.advertised_routes.insert("0.0.0.0/0".to_owned());
         let status = runtime.handle_command(IpcCommand::Status);
         assert!(status.ok);
         assert!(status.message.contains("node_role=client"));
@@ -21841,7 +21799,7 @@ mod tests {
         assert!(status.message.contains("node_role=blind_exit"));
         assert!(status.message.contains("serving_exit_node=true"));
 
-        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        let select = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_owned()));
         assert!(!select.ok);
         assert!(select.message.contains("node role"));
 
@@ -21853,7 +21811,7 @@ mod tests {
         assert!(!lan_on.ok);
         assert!(lan_on.message.contains("node role"));
 
-        let route = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()));
+        let route = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()));
         assert!(!route.ok);
         assert!(route.message.contains("node role"));
 
@@ -21940,7 +21898,7 @@ mod tests {
         assert!(status.message.contains("exit_node=none"));
         assert!(status.message.contains("restricted_safe_mode=false"));
 
-        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_owned()));
         assert!(!denied.ok);
         assert!(denied.message.contains("node role"));
 
@@ -21964,18 +21922,18 @@ mod tests {
     fn sanitize_dataplane_routes_for_blind_exit_drops_exit_scoped_routes_only() {
         let routes = vec![
             Route {
-                destination_cidr: "100.64.0.0/10".to_string(),
-                via_node: NodeId::new("mesh-peer".to_string()).expect("mesh peer node id"),
+                destination_cidr: "100.64.0.0/10".to_owned(),
+                via_node: NodeId::new("mesh-peer".to_owned()).expect("mesh peer node id"),
                 kind: RouteKind::Mesh,
             },
             Route {
-                destination_cidr: "0.0.0.0/0".to_string(),
-                via_node: NodeId::new("exit-peer".to_string()).expect("exit peer node id"),
+                destination_cidr: "0.0.0.0/0".to_owned(),
+                via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
                 kind: RouteKind::ExitNodeDefault,
             },
             Route {
-                destination_cidr: "192.168.1.0/24".to_string(),
-                via_node: NodeId::new("exit-peer".to_string()).expect("exit peer node id"),
+                destination_cidr: "192.168.1.0/24".to_owned(),
+                via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
                 kind: RouteKind::ExitNodeLan,
             },
         ];
@@ -21989,8 +21947,8 @@ mod tests {
     #[test]
     fn sanitize_dataplane_routes_for_non_blind_exit_preserves_routes() {
         let routes = vec![Route {
-            destination_cidr: "0.0.0.0/0".to_string(),
-            via_node: NodeId::new("exit-peer".to_string()).expect("exit peer node id"),
+            destination_cidr: "0.0.0.0/0".to_owned(),
+            via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
             kind: RouteKind::ExitNodeDefault,
         }];
 
@@ -22078,7 +22036,7 @@ mod tests {
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
 
-        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_owned()));
         assert!(!denied.ok);
         assert!(denied.message.contains("not active in membership state"));
 
@@ -22211,7 +22169,7 @@ mod tests {
         assert!(status.message.contains("auto_tunnel_enforce=true"));
         assert!(status.message.contains("last_assignment="));
 
-        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_string()));
+        let denied = runtime.handle_command(IpcCommand::ExitNodeSelect("node-exit".to_owned()));
         assert!(!denied.ok);
         assert!(
             denied
@@ -22294,7 +22252,7 @@ mod tests {
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
 
-        let allowed = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()));
+        let allowed = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()));
         assert!(allowed.ok);
 
         let status = runtime.handle_command(IpcCommand::Status);
@@ -22302,7 +22260,7 @@ mod tests {
         assert!(status.message.contains("serving_exit_node=true"));
 
         let denied =
-            runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_string()));
+            runtime.handle_command(IpcCommand::RouteAdvertise("192.168.1.0/24".to_owned()));
         assert!(!denied.ok);
         assert!(
             denied
@@ -22393,7 +22351,7 @@ mod tests {
         }
 
         let denied = runtime.handle_command(IpcCommand::RouteAdvertise(
-            super::BLIND_EXIT_DEFAULT_ROUTE_CIDR.to_string(),
+            super::BLIND_EXIT_DEFAULT_ROUTE_CIDR.to_owned(),
         ));
         assert!(!denied.ok);
         assert!(denied.message.contains("route advertise denied"));
@@ -22488,7 +22446,7 @@ mod tests {
         let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
         runtime.bootstrap();
 
-        let enabled = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_string()));
+        let enabled = runtime.handle_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()));
         assert!(enabled.ok);
 
         let status = runtime.handle_command(IpcCommand::Status);
@@ -22605,10 +22563,10 @@ mod tests {
     #[test]
     fn state_fetcher_new_from_daemon_discards_remote_fetch_urls() {
         let config = DaemonConfig {
-            trust_url: Some("http://127.0.0.1:8080/trust".to_string()),
-            traversal_url: Some("http://127.0.0.1:8080/traversal".to_string()),
-            assignment_url: Some("http://127.0.0.1:8080/assignment".to_string()),
-            dns_zone_url: Some("http://127.0.0.1:8080/dns".to_string()),
+            trust_url: Some("http://127.0.0.1:8080/trust".to_owned()),
+            traversal_url: Some("http://127.0.0.1:8080/traversal".to_owned()),
+            assignment_url: Some("http://127.0.0.1:8080/assignment".to_owned()),
+            dns_zone_url: Some("http://127.0.0.1:8080/dns".to_owned()),
             ..DaemonConfig::default()
         };
 

@@ -25,7 +25,7 @@ fn run() -> Result<(), i32> {
         env::var("RUSTYNET_PHASE1_PERF_SAMPLES_PATH")
             .ok()
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_PHASE1_SOURCE.to_string()),
+            .unwrap_or_else(|| DEFAULT_PHASE1_SOURCE.to_owned()),
     );
     if !phase1_source.is_absolute() {
         phase1_source = root_dir.join(phase1_source);

@@ -266,7 +266,7 @@ pub fn execute_ops_run_live_lab_validations(
     config: RunLiveLabValidationsConfig,
 ) -> Result<String, String> {
     if config.skip_ssh_reachability_preflight && !config.dry_run {
-        return Err("--skip-ssh-reachability-preflight is only allowed with --dry-run".to_string());
+        return Err("--skip-ssh-reachability-preflight is only allowed with --dry-run".to_owned());
     }
     let repo_root = resolve_path(config.repo_root.as_path())?;
     let report_dir = if let Some(path) = config.report_dir.as_ref() {
@@ -316,7 +316,7 @@ pub fn execute_ops_run_live_lab_validations(
             build_validation_command(spec, &config, repo_root.as_path(), report_dir.as_path())?;
         let result = if config.dry_run {
             ValidationRunResult {
-                validation_key: spec.key.to_string(),
+                validation_key: spec.key.to_owned(),
                 command,
                 rc: 0,
                 stderr: String::new(),
@@ -456,7 +456,7 @@ fn selected_validation_specs(
     }
     let keys = split_csv(raw);
     if keys.is_empty() {
-        return Err("no validation keys supplied".to_string());
+        return Err("no validation keys supplied".to_owned());
     }
     let mut specs = Vec::new();
     let mut unknown = Vec::new();
@@ -527,7 +527,7 @@ fn resolve_known_hosts_path(raw: Option<&Path>) -> Result<PathBuf, String> {
     if default.is_file() {
         return resolve_path(default.as_path());
     }
-    Err("a pinned SSH known_hosts file is required; pass --ssh-known-hosts-file".to_string())
+    Err("a pinned SSH known_hosts file is required; pass --ssh-known-hosts-file".to_owned())
 }
 
 fn run_preflight(config: &RunLiveLabValidationsConfig) -> Result<PathBuf, String> {
@@ -625,8 +625,8 @@ fn selected_targets(config: &RunLiveLabValidationsConfig) -> Vec<String> {
     let mut deduped = Vec::new();
     let mut seen = HashSet::new();
     for target in ordered.into_iter().flatten() {
-        if seen.insert(target.to_string()) {
-            deduped.push(target.to_string());
+        if seen.insert(target.to_owned()) {
+            deduped.push(target.to_owned());
         }
     }
     deduped
@@ -667,7 +667,7 @@ fn target_host(target: &str) -> String {
     target
         .split_once('@')
         .map_or(target, |(_, host)| host)
-        .to_string()
+        .to_owned()
 }
 
 fn ssh_reachability_check(
@@ -681,7 +681,7 @@ fn ssh_reachability_check(
         &[
             password_file.to_string_lossy().to_string(),
             known_hosts_path.to_string_lossy().to_string(),
-            target.to_string(),
+            target.to_owned(),
             connect_timeout_secs.to_string(),
         ],
     )?;
@@ -705,16 +705,16 @@ fn remote_runtime_requirements_check(
         &[
             password_file.to_string_lossy().to_string(),
             known_hosts_path.to_string_lossy().to_string(),
-            target.to_string(),
+            target.to_owned(),
             connect_timeout_secs.to_string(),
-            REMOTE_RUNTIME_REQUIREMENTS_COMMAND.to_string(),
+            REMOTE_RUNTIME_REQUIREMENTS_COMMAND.to_owned(),
         ],
     )?;
     if output.status.success() {
         Ok(())
     } else {
         let detail = non_empty_output(output.stdout, output.stderr)
-            .unwrap_or_else(|| "missing remote prerequisite".to_string());
+            .unwrap_or_else(|| "missing remote prerequisite".to_owned());
         Err(format!(
             "remote prerequisite preflight failed for {target}: {detail}"
         ))
@@ -747,25 +747,25 @@ fn build_validation_command(
     let log_path = report_dir.join(spec.default_report_name.replace(".json", ".log"));
     let mut command = vec![
         script_path.display().to_string(),
-        "--ssh-password-file".to_string(),
+        "--ssh-password-file".to_owned(),
         resolve_path(config.ssh_password_file.as_path())?
             .display()
             .to_string(),
-        "--sudo-password-file".to_string(),
+        "--sudo-password-file".to_owned(),
         resolve_path(config.sudo_password_file.as_path())?
             .display()
             .to_string(),
-        "--report-path".to_string(),
+        "--report-path".to_owned(),
         report_path.display().to_string(),
-        "--log-path".to_string(),
+        "--log-path".to_owned(),
         log_path.display().to_string(),
     ];
     for arg_name in spec.supported_args {
         if let Some(value) = validation_arg_value(config, arg_name)
             && let Some(flag) = validation_arg_flag(arg_name)
         {
-            command.push(flag.to_string());
-            command.push(value.to_string());
+            command.push(flag.to_owned());
+            command.push(value.to_owned());
         }
     }
     Ok((command, report_path))
@@ -786,7 +786,7 @@ fn run_validation(
     let output = Command::new(
         command
             .first()
-            .ok_or_else(|| "empty validation command".to_string())?,
+            .ok_or_else(|| "empty validation command".to_owned())?,
     )
     .args(&command[1..])
     .current_dir(cwd)
@@ -794,10 +794,10 @@ fn run_validation(
     .output()
     .map_err(|err| format!("run validation {validation_key} failed: {err}"))?;
     Ok(ValidationRunResult {
-        validation_key: validation_key.to_string(),
+        validation_key: validation_key.to_owned(),
         command,
         rc: output.status.code().unwrap_or(1),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         report_path,
     })
 }
@@ -814,12 +814,12 @@ fn render_live_validation_summary(
     promotion_output: &Path,
 ) -> String {
     let mut lines = vec![
-        "# Rustynet Live-Lab Validation Run".to_string(),
+        "# Rustynet Live-Lab Validation Run".to_owned(),
         String::new(),
-        "## Validator Commands".to_string(),
+        "## Validator Commands".to_owned(),
         String::new(),
-        "| Validation | Exit Code | Report Path |".to_string(),
-        "| --- | --- | --- |".to_string(),
+        "| Validation | Exit Code | Report Path |".to_owned(),
+        "| --- | --- | --- |".to_owned(),
     ];
     for result in results {
         lines.push(format!(
@@ -831,7 +831,7 @@ fn render_live_validation_summary(
     }
     lines.extend([
         String::new(),
-        "## Consolidated Outputs".to_string(),
+        "## Consolidated Outputs".to_owned(),
         String::new(),
         format!(
             "- Pinned SSH known_hosts file: `{}`",
@@ -854,14 +854,14 @@ fn render_live_validation_summary(
             String::new(),
             format!("- Command: `{}`", result.command.join(" ")),
             format!("- Exit code: `{}`", result.rc),
-            "- stderr:".to_string(),
-            "```text".to_string(),
+            "- stderr:".to_owned(),
+            "```text".to_owned(),
             if result.stderr.is_empty() {
-                "[no stderr]".to_string()
+                "[no stderr]".to_owned()
             } else {
                 result.stderr.clone()
             },
-            "```".to_string(),
+            "```".to_owned(),
             String::new(),
         ]);
     }
@@ -897,7 +897,7 @@ fn collect_report_paths(
         }
     }
     if deduped.is_empty() {
-        return Err("no report files supplied".to_string());
+        return Err("no report files supplied".to_owned());
     }
     Ok(deduped)
 }
@@ -944,13 +944,13 @@ fn derive_findings(
     let Some(spec) = mode.and_then(validation_spec_by_mode) else {
         if status != STATUS_PASS {
             findings.push(Finding {
-                severity: "high".to_string(),
+                severity: "high".to_owned(),
                 title: format!("Unknown report mode failed: {}", mode.unwrap_or("[missing]")),
-                exploit_family: "unknown".to_string(),
-                mode_title: mode.unwrap_or("[missing]").to_string(),
+                exploit_family: "unknown".to_owned(),
+                mode_title: mode.unwrap_or("[missing]").to_owned(),
                 report_path: report_path.display().to_string(),
-                check_name: "[mode]".to_string(),
-                rationale: "The live-lab report failed, but the skill does not yet know how to map this mode into enforcement points.".to_string(),
+                check_name: "[mode]".to_owned(),
+                rationale: "The live-lab report failed, but the skill does not yet know how to map this mode into enforcement points.".to_owned(),
                 affected_files: Vec::new(),
                 evidence_summary: summarize_evidence(payload, 600),
             });
@@ -960,17 +960,17 @@ fn derive_findings(
 
     let Some(checks) = checks else {
         findings.push(Finding {
-            severity: "high".to_string(),
+            severity: "high".to_owned(),
             title: format!("{} report schema invalid", spec.title),
-            exploit_family: spec.exploit_family.to_string(),
-            mode_title: spec.title.to_string(),
+            exploit_family: spec.exploit_family.to_owned(),
+            mode_title: spec.title.to_owned(),
             report_path: report_path.display().to_string(),
-            check_name: "[schema]".to_string(),
-            rationale: "The report did not contain a usable checks object, so the live result cannot be trusted.".to_string(),
+            check_name: "[schema]".to_owned(),
+            rationale: "The report did not contain a usable checks object, so the live result cannot be trusted.".to_owned(),
             affected_files: spec
                 .affected_files
                 .iter()
-                .map(|path| (*path).to_string())
+                .map(|path| (*path).to_owned())
                 .collect(),
             evidence_summary: summarize_evidence(payload, 600),
         });
@@ -981,7 +981,7 @@ fn derive_findings(
         match value.as_str() {
             Some(CHECK_PASS) => {
                 passes.push(PassingCheck {
-                    mode_title: spec.title.to_string(),
+                    mode_title: spec.title.to_owned(),
                     check_name: check_name.clone(),
                     report_path: report_path.display().to_string(),
                 });
@@ -990,7 +990,7 @@ fn derive_findings(
                 findings.push(make_finding(
                     "medium",
                     format!("{} check skipped: {check_name}", spec.title),
-                    "A skipped adversarial check leaves the corresponding exploit class unvalidated on the live lab.".to_string(),
+                    "A skipped adversarial check leaves the corresponding exploit class unvalidated on the live lab.".to_owned(),
                     spec,
                     report_path,
                     payload,
@@ -1008,12 +1008,12 @@ fn derive_findings(
                 let title = if metadata.title.is_empty() {
                     format!("{}: {check_name}", spec.unknown_failure_title)
                 } else {
-                    metadata.title.to_string()
+                    metadata.title.to_owned()
                 };
                 let rationale = if metadata.rationale.is_empty() {
-                    "A live-lab check failed and needs manual review because the skill does not yet have a more specific mapping for it.".to_string()
+                    "A live-lab check failed and needs manual review because the skill does not yet have a more specific mapping for it.".to_owned()
                 } else {
-                    metadata.rationale.to_string()
+                    metadata.rationale.to_owned()
                 };
                 let severity = if metadata.severity.is_empty() {
                     "high"
@@ -1036,9 +1036,9 @@ fn derive_findings(
     if status != STATUS_PASS && findings.is_empty() {
         findings.push(make_finding(
             "high",
-            spec.unknown_failure_title.to_string(),
+            spec.unknown_failure_title.to_owned(),
             "The report status failed even though no individual failed checks were extracted."
-                .to_string(),
+                .to_owned(),
             spec,
             report_path,
             payload,
@@ -1058,17 +1058,17 @@ fn make_finding(
     check_name: &str,
 ) -> Finding {
     Finding {
-        severity: severity.to_string(),
+        severity: severity.to_owned(),
         title,
-        exploit_family: spec.exploit_family.to_string(),
-        mode_title: spec.title.to_string(),
+        exploit_family: spec.exploit_family.to_owned(),
+        mode_title: spec.title.to_owned(),
         report_path: report_path.display().to_string(),
-        check_name: check_name.to_string(),
+        check_name: check_name.to_owned(),
         rationale,
         affected_files: spec
             .affected_files
             .iter()
-            .map(|path| (*path).to_string())
+            .map(|path| (*path).to_owned())
             .collect(),
         evidence_summary: summarize_evidence(payload, 600),
     }
@@ -1129,18 +1129,18 @@ fn render_findings_markdown(
         )
     });
     let mut lines = vec![
-        "# Rustynet Live-Lab Security Findings".to_string(),
+        "# Rustynet Live-Lab Security Findings".to_owned(),
         String::new(),
         format!("Generated: {}", utc_timestamp()),
         String::new(),
-        "## Summary".to_string(),
+        "## Summary".to_owned(),
         String::new(),
         format!("- Reports analyzed: {}", analyzed_reports.len()),
         format!("- Findings: {}", ordered_findings.len()),
         format!("- Passing checks recorded: {}", passes.len()),
         format!("- Schema problems: {}", schema_problems.len()),
         String::new(),
-        "## Reports".to_string(),
+        "## Reports".to_owned(),
         String::new(),
     ];
     for report in analyzed_reports {
@@ -1149,13 +1149,13 @@ fn render_findings_markdown(
     lines.push(String::new());
     if ordered_findings.is_empty() {
         lines.extend([
-            "## Findings".to_string(),
+            "## Findings".to_owned(),
             String::new(),
-            "No failing or skipped checks were found in the supplied reports.".to_string(),
+            "No failing or skipped checks were found in the supplied reports.".to_owned(),
             String::new(),
         ]);
     } else {
-        lines.extend(["## Findings".to_string(), String::new()]);
+        lines.extend(["## Findings".to_owned(), String::new()]);
         for finding in &ordered_findings {
             lines.extend([
                 format!(
@@ -1172,7 +1172,7 @@ fn render_findings_markdown(
                 format!(
                     "- Likely affected files: {}",
                     if finding.affected_files.is_empty() {
-                        "[unknown]".to_string()
+                        "[unknown]".to_owned()
                     } else {
                         finding
                             .affected_files
@@ -1188,15 +1188,15 @@ fn render_findings_markdown(
         }
     }
     if !schema_problems.is_empty() {
-        lines.extend(["## Schema Problems".to_string(), String::new()]);
+        lines.extend(["## Schema Problems".to_owned(), String::new()]);
         for problem in schema_problems {
             lines.push(format!("- {problem}"));
         }
         lines.push(String::new());
     }
-    lines.extend(["## Passing Checks".to_string(), String::new()]);
+    lines.extend(["## Passing Checks".to_owned(), String::new()]);
     if passes.is_empty() {
-        lines.push("No passing checks were recorded.".to_string());
+        lines.push("No passing checks were recorded.".to_owned());
     } else {
         let mut ordered_passes = passes.to_vec();
         ordered_passes.sort_by_key(|passed| (passed.mode_title.clone(), passed.check_name.clone()));
@@ -1209,11 +1209,11 @@ fn render_findings_markdown(
     }
     lines.extend([
         String::new(),
-        "## Next Actions".to_string(),
+        "## Next Actions".to_owned(),
         String::new(),
-        "1. Fix every `critical` finding before treating the corresponding exploit class as covered.".to_string(),
-        "2. Re-run the specific live validation report after each fix; do not rely on adjacent unit tests alone.".to_string(),
-        "3. If a report had schema problems, repair the reporting path before trusting any pass/fail outcome from that validator.".to_string(),
+        "1. Fix every `critical` finding before treating the corresponding exploit class as covered.".to_owned(),
+        "2. Re-run the specific live validation report after each fix; do not rely on adjacent unit tests alone.".to_owned(),
+        "3. If a report had schema problems, repair the reporting path before trusting any pass/fail outcome from that validator.".to_owned(),
         String::new(),
     ]);
     lines.join("\n")
@@ -1231,10 +1231,10 @@ fn severity_order(severity: &str) -> usize {
 
 fn summarize_evidence(payload: &serde_json::Map<String, Value>, limit: usize) -> String {
     let Some(evidence) = payload.get("evidence").and_then(Value::as_object) else {
-        return "[no structured evidence present]".to_string();
+        return "[no structured evidence present]".to_owned();
     };
     if evidence.is_empty() {
-        return "[no structured evidence present]".to_string();
+        return "[no structured evidence present]".to_owned();
     }
     let mut keys = evidence.keys().cloned().collect::<Vec<_>>();
     keys.sort();
@@ -1257,10 +1257,8 @@ fn summarize_evidence(payload: &serde_json::Map<String, Value>, limit: usize) ->
 
 fn stringify_json_value(value: &Value) -> String {
     match value {
-        Value::String(text) => text.trim().to_string(),
-        other => {
-            serde_json::to_string(other).unwrap_or_else(|_| "\"[unserializable]\"".to_string())
-        }
+        Value::String(text) => text.trim().to_owned(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "\"[unserializable]\"".to_owned()),
     }
 }
 
@@ -1273,7 +1271,7 @@ fn parse_optional_filter(raw: &str) -> Result<Option<HashSet<String>>, String> {
         .map(|item| item.to_lowercase())
         .collect::<HashSet<_>>();
     if values.is_empty() {
-        return Err("empty filter supplied".to_string());
+        return Err("empty filter supplied".to_owned());
     }
     Ok(Some(values))
 }
@@ -1297,7 +1295,7 @@ fn select_comparative_entries(
         entries.push(entry);
     }
     if entries.is_empty() {
-        Err("no entries matched the selected filters".to_string())
+        Err("no entries matched the selected filters".to_owned())
     } else {
         Ok(entries)
     }
@@ -1337,14 +1335,14 @@ fn run_comparative_commands(
             }
             combined.push_str(String::from_utf8_lossy(&output.stderr).as_ref());
         }
-        let combined = truncate_output(combined.trim().to_string(), max_output_chars);
+        let combined = truncate_output(combined.trim().to_owned(), max_output_chars);
         let rc = output.status.code().unwrap_or(1);
         results.push(ComparativeCommandResult {
-            key: key.to_string(),
-            label: spec.label.to_string(),
-            argv: spec.argv.iter().map(|value| (*value).to_string()).collect(),
+            key: key.to_owned(),
+            label: spec.label.to_owned(),
+            argv: spec.argv.iter().map(|value| (*value).to_owned()).collect(),
             rc,
-            status: if rc == 0 { "pass" } else { "fail" }.to_string(),
+            status: if rc == 0 { "pass" } else { "fail" }.to_owned(),
             output: combined,
         });
     }
@@ -1373,9 +1371,9 @@ fn render_comparative_markdown(
         )
     });
     let mut lines = vec![
-        "# Rustynet Comparative VPN Exploit Coverage".to_string(),
+        "# Rustynet Comparative VPN Exploit Coverage".to_owned(),
         String::new(),
-        "## Summary".to_string(),
+        "## Summary".to_owned(),
         String::new(),
         format!("- Covered: {}", counts.get("covered").copied().unwrap_or(0)),
         format!(
@@ -1394,10 +1392,10 @@ fn render_comparative_markdown(
             counts.get("future_surface_gap").copied().unwrap_or(0)
         ),
         String::new(),
-        "## Comparative Incident Matrix".to_string(),
+        "## Comparative Incident Matrix".to_owned(),
         String::new(),
-        "| Project | Incident | Exploit Class | Rustynet Analog | Status | Sources |".to_string(),
-        "| --- | --- | --- | --- | --- | --- |".to_string(),
+        "| Project | Incident | Exploit Class | Rustynet Analog | Status | Sources |".to_owned(),
+        "| --- | --- | --- | --- | --- | --- |".to_owned(),
     ];
     for entry in &sorted_entries {
         lines.push(format!(
@@ -1412,7 +1410,7 @@ fn render_comparative_markdown(
     }
     lines.extend([
         String::new(),
-        "## Detailed Mapping".to_string(),
+        "## Detailed Mapping".to_owned(),
         String::new(),
     ]);
     for entry in entries {
@@ -1427,7 +1425,7 @@ fn render_comparative_markdown(
             format!("- Rustynet analog: {}", entry.rustynet_analog),
             format!("- Coverage status: `{}`", entry.coverage_status),
             format!("- Expected secure result: {}", entry.expected_secure_result),
-            "- Local verification commands:".to_string(),
+            "- Local verification commands:".to_owned(),
         ]);
         for key in entry.command_keys {
             if let Some(spec) = comparative_command_spec(key) {
@@ -1435,7 +1433,7 @@ fn render_comparative_markdown(
             }
         }
         if !entry.live_validation_scripts.is_empty() {
-            lines.push("- Live validation scripts:".to_string());
+            lines.push("- Live validation scripts:".to_owned());
             for script in entry.live_validation_scripts {
                 lines.push(format!("  - `{script}`"));
             }
@@ -1445,10 +1443,10 @@ fn render_comparative_markdown(
     }
     if let Some(command_results) = command_results {
         lines.extend([
-            "## Local Verification Results".to_string(),
+            "## Local Verification Results".to_owned(),
             String::new(),
-            "| Command | Result | Exit Code |".to_string(),
-            "| --- | --- | --- |".to_string(),
+            "| Command | Result | Exit Code |".to_owned(),
+            "| --- | --- | --- |".to_owned(),
         ]);
         for result in command_results {
             lines.push(format!(
@@ -1466,24 +1464,24 @@ fn render_comparative_markdown(
                 format!("- Command: `{}`", result.argv.join(" ")),
                 format!("- Result: `{}`", result.status),
                 format!("- Exit code: `{}`", result.rc),
-                "- Output:".to_string(),
-                "```text".to_string(),
+                "- Output:".to_owned(),
+                "```text".to_owned(),
                 if result.output.is_empty() {
-                    "[no output]".to_string()
+                    "[no output]".to_owned()
                 } else {
                     result.output.clone()
                 },
-                "```".to_string(),
+                "```".to_owned(),
                 String::new(),
             ]);
         }
     }
     lines.extend([
-        "## Immediate Priorities".to_string(),
+        "## Immediate Priorities".to_owned(),
         String::new(),
-        "1. Keep all `future_surface_gap` items blocked into design before the comparable feature ships.".to_string(),
-        "2. Run the listed live validation scripts for every `partially_covered` item on an authorized lab before treating coverage as strong.".to_string(),
-        "3. Re-run the mapped local commands whenever the corresponding trust boundary changes.".to_string(),
+        "1. Keep all `future_surface_gap` items blocked into design before the comparable feature ships.".to_owned(),
+        "2. Run the listed live validation scripts for every `partially_covered` item on an authorized lab before treating coverage as strong.".to_owned(),
+        "3. Re-run the mapped local commands whenever the corresponding trust boundary changes.".to_owned(),
         String::new(),
     ]);
     lines.join("\n")
@@ -1576,11 +1574,11 @@ fn load_json_value(path: &Path) -> Result<Value, String> {
 }
 
 fn non_empty_output(primary: Vec<u8>, secondary: Vec<u8>) -> Option<String> {
-    let primary = String::from_utf8_lossy(&primary).trim().to_string();
+    let primary = String::from_utf8_lossy(&primary).trim().to_owned();
     if !primary.is_empty() {
         return Some(primary);
     }
-    let secondary = String::from_utf8_lossy(&secondary).trim().to_string();
+    let secondary = String::from_utf8_lossy(&secondary).trim().to_owned();
     if !secondary.is_empty() {
         Some(secondary)
     } else {
@@ -1603,14 +1601,14 @@ fn utc_timestamp() -> String {
         .output();
     match output {
         Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             if text.is_empty() {
-                "[unknown]".to_string()
+                "[unknown]".to_owned()
             } else {
                 text
             }
         }
-        _ => "[unknown]".to_string(),
+        _ => "[unknown]".to_owned(),
     }
 }
 
@@ -1685,9 +1683,9 @@ mod tests {
             GenerateComparativeExploitCoverageConfig {
                 workspace: PathBuf::from("."),
                 output: output.clone(),
-                format: "md".to_string(),
-                projects: "tailscale".to_string(),
-                attack_families: "local-socket-spoofing".to_string(),
+                format: "md".to_owned(),
+                projects: "tailscale".to_owned(),
+                attack_families: "local-socket-spoofing".to_owned(),
                 run_local_tests: false,
                 max_output_chars: 1200,
             },
@@ -1705,7 +1703,7 @@ mod tests {
             ssh_password_file: PathBuf::from("/tmp/ssh.pass"),
             sudo_password_file: PathBuf::from("/tmp/sudo.pass"),
             ssh_known_hosts_file: Some(PathBuf::from("/tmp/known_hosts")),
-            validations: "control_surface_exposure".to_string(),
+            validations: "control_surface_exposure".to_owned(),
             report_dir: Some(PathBuf::from("/tmp/reports")),
             findings_output: None,
             schema_output: None,
@@ -1714,12 +1712,12 @@ mod tests {
             dry_run: true,
             skip_ssh_reachability_preflight: true,
             exit_host: None,
-            client_host: Some("debian@192.0.2.10".to_string()),
+            client_host: Some("debian@192.0.2.10".to_owned()),
             entry_host: None,
             aux_host: None,
             extra_host: None,
             probe_host: None,
-            dns_bind_addr: Some("127.0.0.1:53".to_string()),
+            dns_bind_addr: Some("127.0.0.1:53".to_owned()),
             ssh_allow_cidrs: None,
             probe_port: None,
             rogue_endpoint_ip: None,
@@ -1739,9 +1737,9 @@ mod tests {
         let (command, _) =
             build_validation_command(spec, &config, temp.as_path(), temp.join("out").as_path())
                 .expect("build command");
-        assert!(command.contains(&"--client-host".to_string()));
-        assert!(command.contains(&"debian@192.0.2.10".to_string()));
-        assert!(command.contains(&"--dns-bind-addr".to_string()));
+        assert!(command.contains(&"--client-host".to_owned()));
+        assert!(command.contains(&"debian@192.0.2.10".to_owned()));
+        assert!(command.contains(&"--dns-bind-addr".to_owned()));
     }
 
     #[test]
@@ -1757,7 +1755,7 @@ mod tests {
             ssh_password_file: PathBuf::from("/tmp/ssh.pass"),
             sudo_password_file: PathBuf::from("/tmp/sudo.pass"),
             ssh_known_hosts_file: Some(PathBuf::from("/tmp/known_hosts")),
-            validations: "server_ip_bypass".to_string(),
+            validations: "server_ip_bypass".to_owned(),
             report_dir: None,
             findings_output: None,
             schema_output: None,

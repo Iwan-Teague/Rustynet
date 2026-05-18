@@ -38,7 +38,7 @@ pub fn collect_macos_authenticode_report() -> MacosAuthenticodeReport {
                  analogous to Windows Authenticode. Gatekeeper verification runs at \
                  first-launch time. A runtime codesign --verify probe is not part of \
                  the reviewed macOS posture today."
-            .to_string(),
+            .to_owned(),
     }
 }
 

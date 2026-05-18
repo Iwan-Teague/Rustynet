@@ -296,7 +296,7 @@ pub fn execute_ops_evaluate_live_coverage_promotion(
 fn parse_attacks(raw: &str) -> Result<Vec<String>, String> {
     let attacks = split_csv_string(raw);
     if attacks.is_empty() {
-        return Err("no attack keys supplied".to_string());
+        return Err("no attack keys supplied".to_owned());
     }
     for attack in &attacks {
         if attack_spec(attack.as_str()).is_none() {
@@ -322,12 +322,12 @@ fn parse_nodes(raw: &str) -> Result<Vec<NodeSpec>, String> {
             return Err(format!("invalid node spec: {item}"));
         }
         nodes.push(NodeSpec {
-            label: label.to_string(),
-            role: role.to_string(),
+            label: label.to_owned(),
+            role: role.to_owned(),
         });
     }
     if nodes.is_empty() {
-        return Err("no nodes supplied".to_string());
+        return Err("no nodes supplied".to_owned());
     }
     Ok(nodes)
 }
@@ -338,13 +338,13 @@ fn build_attack_rows(attacks: &[String], nodes: &[NodeSpec]) -> Result<Vec<Attac
         let spec =
             attack_spec(attack.as_str()).ok_or_else(|| format!("unknown attack keys: {attack}"))?;
         rows.push(AttackRow {
-            attack_key: spec.key.to_string(),
-            attack_family: spec.title.to_string(),
+            attack_key: spec.key.to_owned(),
+            attack_family: spec.title.to_owned(),
             primary_nodes: suggested_targets(spec.key, nodes),
-            hypothesis: spec.hypothesis.to_string(),
-            expected_secure_behavior: spec.expected.to_string(),
-            result: "[pass/fail/blocked/skipped]".to_string(),
-            evidence: "[fill in logs, tests, reports]".to_string(),
+            hypothesis: spec.hypothesis.to_owned(),
+            expected_secure_behavior: spec.expected.to_owned(),
+            result: "[pass/fail/blocked/skipped]".to_owned(),
+            evidence: "[fill in logs, tests, reports]".to_owned(),
         });
     }
     Ok(rows)
@@ -418,16 +418,16 @@ fn render_attack_matrix_markdown(rows: &[AttackRow], nodes: &[NodeSpec]) -> Stri
         .collect::<Vec<_>>()
         .join(", ");
     let mut lines = vec![
-        "# Attack Matrix".to_string(),
+        "# Attack Matrix".to_owned(),
         String::new(),
-        "## Lab Nodes".to_string(),
+        "## Lab Nodes".to_owned(),
         String::new(),
         format!("- {node_summary}"),
         String::new(),
-        "## Planned Attacks".to_string(),
+        "## Planned Attacks".to_owned(),
         String::new(),
-        "| Attack Family | Primary Nodes | Hypothesis | Expected Secure Behavior | Result | Evidence |".to_string(),
-        "| --- | --- | --- | --- | --- | --- |".to_string(),
+        "| Attack Family | Primary Nodes | Hypothesis | Expected Secure Behavior | Result | Evidence |".to_owned(),
+        "| --- | --- | --- | --- | --- | --- |".to_owned(),
     ];
     for row in rows {
         lines.push(format!(
@@ -453,22 +453,22 @@ fn load_matrix_payload(path: &Path) -> Result<AssessmentMatrix, String> {
     let payload = load_json_object(path)?;
     let nodes_value = payload
         .get("nodes")
-        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_string())?;
+        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_owned())?;
     let attacks_value = payload
         .get("attacks")
-        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_string())?;
+        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_owned())?;
     let nodes_array = nodes_value
         .as_array()
-        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_string())?;
+        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_owned())?;
     let attacks_array = attacks_value
         .as_array()
-        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_string())?;
+        .ok_or_else(|| "matrix payload must contain 'nodes' and 'attacks' arrays".to_owned())?;
 
     let mut nodes = Vec::new();
     for node in nodes_array {
         let object = node
             .as_object()
-            .ok_or_else(|| "invalid node entry in matrix payload".to_string())?;
+            .ok_or_else(|| "invalid node entry in matrix payload".to_owned())?;
         let label = require_non_empty_string_field(
             object,
             "label",
@@ -492,7 +492,7 @@ fn load_matrix_payload(path: &Path) -> Result<AssessmentMatrix, String> {
     for attack in attacks_array {
         let object = attack
             .as_object()
-            .ok_or_else(|| "invalid attack entry in matrix payload".to_string())?;
+            .ok_or_else(|| "invalid attack entry in matrix payload".to_owned())?;
         let mut missing = Vec::new();
         for field in required_attack_fields {
             if object.get(field).and_then(Value::as_str).is_none() {
@@ -506,28 +506,22 @@ fn load_matrix_payload(path: &Path) -> Result<AssessmentMatrix, String> {
             ));
         }
         attacks.push(AttackRow {
-            attack_key: object["attack_key"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            attack_key: object["attack_key"].as_str().unwrap_or_default().to_owned(),
             attack_family: object["attack_family"]
                 .as_str()
                 .unwrap_or_default()
-                .to_string(),
+                .to_owned(),
             primary_nodes: object["primary_nodes"]
                 .as_str()
                 .unwrap_or_default()
-                .to_string(),
-            hypothesis: object["hypothesis"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+                .to_owned(),
+            hypothesis: object["hypothesis"].as_str().unwrap_or_default().to_owned(),
             expected_secure_behavior: object["expected_secure_behavior"]
                 .as_str()
                 .unwrap_or_default()
-                .to_string(),
-            result: object["result"].as_str().unwrap_or_default().to_string(),
-            evidence: object["evidence"].as_str().unwrap_or_default().to_string(),
+                .to_owned(),
+            result: object["result"].as_str().unwrap_or_default().to_owned(),
+            evidence: object["evidence"].as_str().unwrap_or_default().to_owned(),
         });
     }
 
@@ -542,7 +536,7 @@ fn render_assessment_markdown(
 ) -> String {
     let generated_at = utc_timestamp();
     let attack_lines = if attacks.is_empty() {
-        "- [fill in attack families]".to_string()
+        "- [fill in attack families]".to_owned()
     } else {
         attacks
             .iter()
@@ -551,9 +545,8 @@ fn render_assessment_markdown(
             .join("\n")
     };
     let mut matrix_lines = vec![
-        "| Attack Family | Primary Nodes | Hypothesis | Expected Secure Behavior | Result | Evidence |"
-            .to_string(),
-        "| --- | --- | --- | --- | --- | --- |".to_string(),
+        "| Attack Family | Primary Nodes | Hypothesis | Expected Secure Behavior | Result | Evidence |".to_owned(),
+        "| --- | --- | --- | --- | --- | --- |".to_owned(),
     ];
     for attack in attacks {
         matrix_lines.push(format!(
@@ -591,7 +584,7 @@ fn collect_report_paths(
         }
     }
     if deduped.is_empty() {
-        return Err("no report files supplied".to_string());
+        return Err("no report files supplied".to_owned());
     }
     Ok(deduped)
 }
@@ -749,9 +742,9 @@ fn validate_report_payload(path: &Path, payload: &Map<String, Value>) -> Vec<Str
 
 fn render_validation_markdown(report_paths: &[PathBuf], errors: &[String]) -> String {
     let mut lines = vec![
-        "# Rustynet Live-Lab Report Validation".to_string(),
+        "# Rustynet Live-Lab Report Validation".to_owned(),
         String::new(),
-        "## Reports".to_string(),
+        "## Reports".to_owned(),
         String::new(),
     ];
     for path in report_paths {
@@ -760,13 +753,13 @@ fn render_validation_markdown(report_paths: &[PathBuf], errors: &[String]) -> St
     lines.push(String::new());
     if errors.is_empty() {
         lines.extend([
-            "## Result".to_string(),
+            "## Result".to_owned(),
             String::new(),
-            "All supplied reports matched the expected shared schema.".to_string(),
+            "All supplied reports matched the expected shared schema.".to_owned(),
             String::new(),
         ]);
     } else {
-        lines.extend(["## Errors".to_string(), String::new()]);
+        lines.extend(["## Errors".to_owned(), String::new()]);
         for error in errors {
             lines.push(format!("- {error}"));
         }
@@ -789,7 +782,7 @@ fn selected_validation_specs(raw: &str) -> Result<Vec<&'static LiveValidationSpe
     }
     let keys = split_csv_string(raw);
     if keys.is_empty() {
-        return Err("no targets supplied".to_string());
+        return Err("no targets supplied".to_owned());
     }
     let mut specs = Vec::new();
     let mut unknown = Vec::new();
@@ -814,7 +807,7 @@ fn load_reports_by_mode(
         let payload = load_json_value(path.as_path())?;
         if let Some(mode) = payload.get("mode").and_then(Value::as_str) {
             loaded.insert(
-                mode.to_string(),
+                mode.to_owned(),
                 LoadedReportRecord {
                     path: path.clone(),
                     payload,
@@ -839,11 +832,11 @@ fn evaluate_spec(
 ) -> Result<PromotionRow, String> {
     let Some(record) = loaded.get(spec.mode) else {
         return Ok(PromotionRow {
-            validation: spec.key.to_string(),
+            validation: spec.key.to_owned(),
             targets: spec.coverage_targets.join(", "),
             eligible: false,
-            reason: "required live report missing".to_string(),
-            report_path: "[missing]".to_string(),
+            reason: "required live report missing".to_owned(),
+            report_path: "[missing]".to_owned(),
         });
     };
     let payload_object = record
@@ -853,28 +846,28 @@ fn evaluate_spec(
     let schema_errors = validate_report_payload(record.path.as_path(), payload_object);
     if !schema_errors.is_empty() {
         return Ok(PromotionRow {
-            validation: spec.key.to_string(),
+            validation: spec.key.to_owned(),
             targets: spec.coverage_targets.join(", "),
             eligible: false,
-            reason: "report schema validation failed".to_string(),
+            reason: "report schema validation failed".to_owned(),
             report_path: record.path.display().to_string(),
         });
     }
     if payload_object.get("status").and_then(Value::as_str) != Some(STATUS_PASS) {
         return Ok(PromotionRow {
-            validation: spec.key.to_string(),
+            validation: spec.key.to_owned(),
             targets: spec.coverage_targets.join(", "),
             eligible: false,
-            reason: "report status is not pass".to_string(),
+            reason: "report status is not pass".to_owned(),
             report_path: record.path.display().to_string(),
         });
     }
     let Some(checks) = payload_object.get("checks").and_then(Value::as_object) else {
         return Ok(PromotionRow {
-            validation: spec.key.to_string(),
+            validation: spec.key.to_owned(),
             targets: spec.coverage_targets.join(", "),
             eligible: false,
-            reason: "report checks object is missing or invalid".to_string(),
+            reason: "report checks object is missing or invalid".to_owned(),
             report_path: record.path.display().to_string(),
         });
     };
@@ -886,7 +879,7 @@ fn evaluate_spec(
         .collect::<Vec<_>>();
     if !failing.is_empty() {
         return Ok(PromotionRow {
-            validation: spec.key.to_string(),
+            validation: spec.key.to_owned(),
             targets: spec.coverage_targets.join(", "),
             eligible: false,
             reason: format!("required checks did not all pass: {}", failing.join(", ")),
@@ -894,20 +887,20 @@ fn evaluate_spec(
         });
     }
     Ok(PromotionRow {
-        validation: spec.key.to_string(),
+        validation: spec.key.to_owned(),
         targets: spec.coverage_targets.join(", "),
         eligible: true,
-        reason: "all required checks passed".to_string(),
+        reason: "all required checks passed".to_owned(),
         report_path: record.path.display().to_string(),
     })
 }
 
 fn render_promotion_markdown(rows: &[PromotionRow]) -> String {
     let mut lines = vec![
-        "# Rustynet Live Coverage Promotion Gate".to_string(),
+        "# Rustynet Live Coverage Promotion Gate".to_owned(),
         String::new(),
-        "| Validation | Comparative Targets | Eligible | Reason | Report |".to_string(),
-        "| --- | --- | --- | --- | --- |".to_string(),
+        "| Validation | Comparative Targets | Eligible | Reason | Report |".to_owned(),
+        "| --- | --- | --- | --- | --- |".to_owned(),
     ];
     for row in rows {
         lines.push(format!(
@@ -960,7 +953,7 @@ fn require_non_empty_string_field(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| error.to_string())
+        .ok_or_else(|| error.to_owned())
 }
 
 fn split_csv_string(raw: &str) -> Vec<String> {
@@ -986,9 +979,9 @@ fn utc_timestamp() -> String {
         .output();
     match output {
         Ok(output) if output.status.success() => String::from_utf8(output.stdout)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z\n".to_string())
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z\n".to_owned())
             .trim()
-            .to_string(),
+            .to_owned(),
         _ => format!("{}", unix_now()),
     }
 }
@@ -1065,10 +1058,10 @@ mod tests {
         let temp = temp_dir("attack-matrix");
         let output = temp.join("matrix.json");
         execute_ops_generate_attack_matrix(GenerateAttackMatrixConfig {
-            attacks: "control-plane-replay,route-hijack".to_string(),
-            nodes: "exit:admin,client:client".to_string(),
+            attacks: "control-plane-replay,route-hijack".to_owned(),
+            nodes: "exit:admin,client:client".to_owned(),
             output: output.clone(),
-            format: "json".to_string(),
+            format: "json".to_owned(),
         })
         .expect("generate matrix");
         let body = fs::read_to_string(output).expect("read matrix");
@@ -1079,7 +1072,7 @@ mod tests {
     #[test]
     fn build_attack_rows_prefers_admin_for_route_hijack() {
         let nodes = parse_nodes("exit:admin,client:client").expect("nodes");
-        let attacks = vec!["route-hijack".to_string()];
+        let attacks = vec!["route-hijack".to_owned()];
         let rows = build_attack_rows(&attacks, &nodes).expect("rows");
         assert_eq!(rows[0].primary_nodes, "exit");
     }
@@ -1091,11 +1084,11 @@ mod tests {
         fs::write(matrix.as_path(), "{\"nodes\":[],\"attacks\":[{}]}")
             .expect("write invalid matrix");
         let err = execute_ops_generate_assessment_from_matrix(GenerateAssessmentFromMatrixConfig {
-            project: "Rustynet".to_string(),
+            project: "Rustynet".to_owned(),
             matrix_json: matrix,
             output: temp.join("report.md"),
             topology: None,
-            authorization: "[yes/no]".to_string(),
+            authorization: "[yes/no]".to_owned(),
         })
         .expect_err("must fail");
         assert!(err.contains("invalid attack entry in matrix payload"));
@@ -1215,7 +1208,7 @@ mod tests {
             execute_ops_evaluate_live_coverage_promotion(EvaluateLiveCoveragePromotionConfig {
                 reports: vec![report],
                 report_dir: None,
-                targets: "control_surface_exposure".to_string(),
+                targets: "control_surface_exposure".to_owned(),
                 output: output.clone(),
             })
             .expect("promotion should pass");
@@ -1233,7 +1226,7 @@ mod tests {
             execute_ops_evaluate_live_coverage_promotion(EvaluateLiveCoveragePromotionConfig {
                 reports: Vec::new(),
                 report_dir: Some(temp),
-                targets: "control_surface_exposure".to_string(),
+                targets: "control_surface_exposure".to_owned(),
                 output,
             })
             .expect_err("missing reports should fail");
@@ -1259,11 +1252,11 @@ mod tests {
     #[test]
     fn render_promotion_markdown_includes_reason_and_report() {
         let markdown = render_promotion_markdown(&[super::PromotionRow {
-            validation: "control_surface_exposure".to_string(),
-            targets: "Tailscale TS-2022-005".to_string(),
+            validation: "control_surface_exposure".to_owned(),
+            targets: "Tailscale TS-2022-005".to_owned(),
             eligible: false,
-            reason: "required live report missing".to_string(),
-            report_path: "[missing]".to_string(),
+            reason: "required live report missing".to_owned(),
+            report_path: "[missing]".to_owned(),
         }]);
         assert!(markdown.contains("required live report missing"));
         assert!(markdown.contains("`[missing]`"));

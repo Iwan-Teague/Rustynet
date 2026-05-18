@@ -578,9 +578,9 @@ mod tests {
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("phase2-local").expect("valid node id"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.0/10".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         }
     }
 
@@ -641,7 +641,7 @@ mod tests {
                 port: endpoint.port(),
             },
             public_key: [31; 32],
-            allowed_ips: vec!["100.64.1.0/24".to_string()],
+            allowed_ips: vec!["100.64.1.0/24".to_owned()],
         }
     }
 
@@ -670,7 +670,7 @@ mod tests {
 
     fn route(destination_cidr: &str, kind: RouteKind) -> Route {
         Route {
-            destination_cidr: destination_cidr.to_string(),
+            destination_cidr: destination_cidr.to_owned(),
             via_node: NodeId::new("phase1-route-node").expect("valid node id"),
             kind,
         }
@@ -768,8 +768,8 @@ mod tests {
                 prepare_calls: 1,
                 cleanup_calls: 0,
                 live_handles: 1,
-                last_interface_name: Some("rustynet0".to_string()),
-                last_local_cidr: Some("100.64.0.1/32".to_string()),
+                last_interface_name: Some("rustynet0".to_owned()),
+                last_local_cidr: Some("100.64.0.1/32".to_owned()),
                 last_cleanup_interface_name: None,
                 route_reconcile_calls: 0,
                 last_route_interface_name: None,
@@ -817,7 +817,7 @@ mod tests {
         let private_key_path = write_private_key([10; 32]);
         let listen_port = free_listen_port();
         let tun_lifecycle = TestTunLifecycle::with_behavior(TestTunBehavior::FailBeforeOpen(
-            "linux userspace-shared test TUN setup failed".to_string(),
+            "linux userspace-shared test TUN setup failed".to_owned(),
         ));
         let tun_state = tun_lifecycle.state();
         let mut backend =
@@ -839,8 +839,8 @@ mod tests {
                 prepare_calls: 1,
                 cleanup_calls: 0,
                 live_handles: 0,
-                last_interface_name: Some("rustynet0".to_string()),
-                last_local_cidr: Some("100.64.0.1/32".to_string()),
+                last_interface_name: Some("rustynet0".to_owned()),
+                last_local_cidr: Some("100.64.0.1/32".to_owned()),
                 last_cleanup_interface_name: None,
                 route_reconcile_calls: 0,
                 last_route_interface_name: None,
@@ -879,9 +879,9 @@ mod tests {
                 prepare_calls: 1,
                 cleanup_calls: 1,
                 live_handles: 0,
-                last_interface_name: Some("rustynet0".to_string()),
-                last_local_cidr: Some("100.64.0.1/32".to_string()),
-                last_cleanup_interface_name: Some("rustynet0".to_string()),
+                last_interface_name: Some("rustynet0".to_owned()),
+                last_local_cidr: Some("100.64.0.1/32".to_owned()),
+                last_cleanup_interface_name: Some("rustynet0".to_owned()),
                 route_reconcile_calls: 0,
                 last_route_interface_name: None,
                 programmed_route_cidrs: Vec::new(),
@@ -922,9 +922,9 @@ mod tests {
                 prepare_calls: 1,
                 cleanup_calls: 1,
                 live_handles: 0,
-                last_interface_name: Some("rustynet0".to_string()),
-                last_local_cidr: Some("100.64.0.1/32".to_string()),
-                last_cleanup_interface_name: Some("rustynet0".to_string()),
+                last_interface_name: Some("rustynet0".to_owned()),
+                last_local_cidr: Some("100.64.0.1/32".to_owned()),
+                last_cleanup_interface_name: Some("rustynet0".to_owned()),
                 route_reconcile_calls: 0,
                 last_route_interface_name: None,
                 programmed_route_cidrs: Vec::new(),
@@ -1084,17 +1084,17 @@ mod tests {
         assert_eq!(snapshot.route_reconcile_calls, 1);
         assert_eq!(
             snapshot.last_route_interface_name,
-            Some("rustynet0".to_string())
+            Some("rustynet0".to_owned())
         );
         assert_eq!(
             snapshot.programmed_route_cidrs,
-            vec!["100.64.20.0/24".to_string()]
+            vec!["100.64.20.0/24".to_owned()]
         );
         assert_eq!(
             snapshot.route_mutations,
             vec![TunRouteMutation {
                 kind: TunRouteMutationKind::Replace,
-                destination_cidr: "100.64.20.0/24".to_string(),
+                destination_cidr: "100.64.20.0/24".to_owned(),
             }]
         );
 
@@ -1128,7 +1128,7 @@ mod tests {
         assert_eq!(snapshot.route_reconcile_calls, 2);
         assert_eq!(
             snapshot.programmed_route_cidrs,
-            vec!["192.168.50.0/24".to_string(), "100.64.40.0/24".to_string(),]
+            vec!["192.168.50.0/24".to_owned(), "100.64.40.0/24".to_owned(),]
         );
         assert!(
             snapshot.route_mutations.iter().any(|mutation| {
@@ -1163,7 +1163,7 @@ mod tests {
 
         tun_state.set_route_behavior(TestRouteBehavior::FailOnReplace {
             cidr: failing_route.destination_cidr.clone(),
-            message: "phase1 route replace failure".to_string(),
+            message: "phase1 route replace failure".to_owned(),
         });
         let err = backend
             .apply_routes(vec![failing_route.clone()])
@@ -1174,7 +1174,7 @@ mod tests {
         let snapshot_after_failure = tun_state.snapshot();
         assert_eq!(
             snapshot_after_failure.programmed_route_cidrs,
-            vec!["100.64.60.0/24".to_string()]
+            vec!["100.64.60.0/24".to_owned()]
         );
 
         tun_state.set_route_behavior(TestRouteBehavior::Succeed);
@@ -1185,7 +1185,7 @@ mod tests {
         let snapshot_after_recovery = tun_state.snapshot();
         assert_eq!(
             snapshot_after_recovery.programmed_route_cidrs,
-            vec!["100.64.70.0/24".to_string()]
+            vec!["100.64.70.0/24".to_owned()]
         );
         assert!(
             snapshot_after_recovery
@@ -1222,7 +1222,7 @@ mod tests {
 
         tun_state.set_route_behavior(TestRouteBehavior::FailOnDelete {
             cidr: stale_route.destination_cidr.clone(),
-            message: "phase1 route delete failure".to_string(),
+            message: "phase1 route delete failure".to_owned(),
         });
         let err = backend
             .apply_routes(vec![replacement_route.clone()])
@@ -1233,7 +1233,7 @@ mod tests {
         let snapshot = tun_state.snapshot();
         assert_eq!(
             snapshot.programmed_route_cidrs,
-            vec!["100.64.80.0/24".to_string()]
+            vec!["100.64.80.0/24".to_owned()]
         );
 
         backend.shutdown().expect("shutdown should succeed");
@@ -1370,7 +1370,7 @@ mod tests {
             .expect("backend should start successfully");
 
         tun_state.set_exit_mode_behavior(TestExitModeBehavior::FailOnAddPriority {
-            message: "phase2 exit add failure".to_string(),
+            message: "phase2 exit add failure".to_owned(),
         });
         let err = backend
             .set_exit_mode(ExitMode::FullTunnel)
@@ -1403,7 +1403,7 @@ mod tests {
             .expect("full tunnel exit mode should apply");
 
         tun_state.set_exit_mode_behavior(TestExitModeBehavior::FailOnDeletePriority {
-            message: "phase2 exit delete failure".to_string(),
+            message: "phase2 exit delete failure".to_owned(),
         });
         let err = backend
             .set_exit_mode(ExitMode::Off)
@@ -1441,7 +1441,7 @@ mod tests {
             .expect("full tunnel exit mode should apply");
 
         tun_state.set_exit_mode_behavior(TestExitModeBehavior::FailOnDeleteTable {
-            message: "phase2 exit delete-table failure".to_string(),
+            message: "phase2 exit delete-table failure".to_owned(),
         });
         let err = backend
             .set_exit_mode(ExitMode::Off)
@@ -1886,9 +1886,9 @@ mod tests {
         right_backend
             .start(RuntimeContext {
                 local_node: NodeId::new("phase6-right").expect("valid node id"),
-                interface_name: "rustynet1".to_string(),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.1.1/32".to_string(),
+                interface_name: "rustynet1".to_owned(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.1.1/32".to_owned(),
             })
             .expect("right backend should start");
 
@@ -2489,9 +2489,9 @@ mod tests {
         right_backend
             .start(RuntimeContext {
                 local_node: NodeId::new("phase4-right").expect("valid node id"),
-                interface_name: "rustynet1".to_string(),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.1.1/32".to_string(),
+                interface_name: "rustynet1".to_owned(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.1.1/32".to_owned(),
             })
             .expect("right backend should start");
 
@@ -2583,9 +2583,9 @@ mod tests {
         right_backend
             .start(RuntimeContext {
                 local_node: NodeId::new("phase4-right").expect("valid node id"),
-                interface_name: "rustynet1".to_string(),
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                local_cidr: "100.64.1.1/32".to_string(),
+                interface_name: "rustynet1".to_owned(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.1.1/32".to_owned(),
             })
             .expect("right backend should start");
 

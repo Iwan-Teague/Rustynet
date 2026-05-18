@@ -88,7 +88,7 @@ impl ExitNodePolicy {
 
     pub fn allow_user_for_node(&mut self, user: &str, node_id: NodeId) {
         self.allowed_pairs
-            .entry(user.to_string())
+            .entry(user.to_owned())
             .or_default()
             .push(node_id);
     }
@@ -162,7 +162,7 @@ impl MagicDnsZone {
             MagicDnsRecord {
                 hostname: format!("{}.{}", candidate, self.domain),
                 node_id: node_id.clone(),
-                ip: ip.to_string(),
+                ip: ip.to_owned(),
                 aliases,
             },
         );
@@ -235,7 +235,7 @@ impl HandshakeFloodGuard {
     }
 
     pub fn allow_handshake(&mut self, source: &str, now_unix: u64) -> bool {
-        let attempts = self.source_attempts.entry(source.to_string()).or_default();
+        let attempts = self.source_attempts.entry(source.to_owned()).or_default();
         let cutoff = now_unix.saturating_sub(self.config.window_secs);
         attempts.retain(|value| *value >= cutoff);
         if attempts.len() as u32 >= self.config.max_attempts_per_window {
@@ -330,7 +330,7 @@ impl<B: TunnelBackend> LinuxDataplane<B> {
     pub fn start(&mut self) -> Result<(), DataplaneError> {
         self.backend.start(RuntimeContext {
             local_node: self.local_node.clone(),
-            interface_name: "rustynet0".to_string(),
+            interface_name: "rustynet0".to_owned(),
             mesh_cidr: self.mesh_cidr.clone(),
             local_cidr: self.mesh_cidr.clone(),
         })?;
@@ -444,12 +444,12 @@ impl<B: TunnelBackend> LinuxDataplane<B> {
         self.advertised_lan_routes
             .entry(node_id)
             .or_default()
-            .push(cidr.to_string());
+            .push(cidr.to_owned());
     }
 
     pub fn set_lan_route_permission(&mut self, user: &str, cidr: &str, allowed: bool) {
         self.lan_route_acl
-            .insert((user.to_string(), cidr.to_string()), allowed);
+            .insert((user.to_owned(), cidr.to_owned()), allowed);
     }
 
     pub fn ensure_lan_route_allowed(&self, user: &str, cidr: &str) -> Result<(), DataplaneError> {
@@ -471,7 +471,7 @@ impl<B: TunnelBackend> LinuxDataplane<B> {
 
         let allowed = self
             .lan_route_acl
-            .get(&(user.to_string(), cidr.to_string()))
+            .get(&(user.to_owned(), cidr.to_owned()))
             .copied()
             .unwrap_or(false);
         if !allowed {
@@ -659,7 +659,7 @@ fn normalize_dns_label(value: &str) -> String {
         }
     }
     if out.is_empty() {
-        "node".to_string()
+        "node".to_owned()
     } else {
         out
     }
@@ -681,8 +681,8 @@ mod tests {
     fn allow_all_policy() -> rustynet_policy::PolicySet {
         rustynet_policy::PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: rustynet_policy::Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -691,8 +691,8 @@ mod tests {
 
     fn default_intent() -> PeerAccessIntent {
         PeerAccessIntent {
-            source: "group:family".to_string(),
-            destination: "tag:servers".to_string(),
+            source: "group:family".to_owned(),
+            destination: "tag:servers".to_owned(),
             protocol: rustynet_policy::Protocol::Tcp,
         }
     }
@@ -705,7 +705,7 @@ mod tests {
                 port: 51820,
             },
             public_key: [7; 32],
-            allowed_ips: vec!["100.100.10.1/32".to_string()],
+            allowed_ips: vec!["100.100.10.1/32".to_owned()],
         }
     }
 
@@ -715,7 +715,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::new(
             WireguardBackend::default(),
             local_node,
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
 
@@ -730,7 +730,7 @@ mod tests {
             .expect("peer should connect");
         dataplane
             .apply_routes(vec![Route {
-                destination_cidr: "100.100.20.0/24".to_string(),
+                destination_cidr: "100.100.20.0/24".to_owned(),
                 via_node: NodeId::new("node-b").expect("id should parse"),
                 kind: RouteKind::Mesh,
             }])
@@ -752,7 +752,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::new(
             WireguardBackend::default(),
             local_node,
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             rustynet_policy::PolicySet::default(),
         );
 
@@ -772,7 +772,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::new(
             WireguardBackend::default(),
             local_node,
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
         let peer_id = NodeId::new("node-b").expect("peer id should be valid");
@@ -824,7 +824,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::with_security(
             WireguardBackend::default(),
             local_node,
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
             HandshakeGuardConfig {
                 max_attempts_per_window: 1,
@@ -858,7 +858,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::with_security(
             WireguardBackend::default(),
             local_node,
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
             HandshakeGuardConfig::default(),
             RekeyConfig { interval_secs: 60 },
@@ -892,19 +892,19 @@ mod tests {
         let mut node_a = LinuxDataplane::new(
             WireguardBackend::default(),
             NodeId::new("node-a").expect("node id should be valid"),
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
         let mut node_b = LinuxDataplane::new(
             WireguardBackend::default(),
             NodeId::new("node-b").expect("node id should be valid"),
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
         let mut node_c = LinuxDataplane::new(
             WireguardBackend::default(),
             NodeId::new("node-c").expect("node id should be valid"),
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
 
@@ -1007,7 +1007,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::new(
             WireguardBackend::default(),
             NodeId::new("node-a").expect("node id should be valid"),
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
         let exit_node = NodeId::new("node-exit").expect("node id should be valid");
@@ -1045,7 +1045,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::new(
             WireguardBackend::default(),
             NodeId::new("node-a").expect("node id should be valid"),
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
         dataplane.start().expect("dataplane should start");
@@ -1054,13 +1054,13 @@ mod tests {
             "NAS",
             NodeId::new("node-nas-1").expect("node id should be valid"),
             "100.100.10.10",
-            vec!["storage".to_string()],
+            vec!["storage".to_owned()],
         );
         let duplicate_name = dataplane.upsert_magic_dns_record(
             "nas",
             NodeId::new("node-nas-2").expect("node id should be valid"),
             "100.100.10.11",
-            vec!["backup".to_string()],
+            vec!["backup".to_owned()],
         );
 
         assert_eq!(primary_name, "nas");
@@ -1077,7 +1077,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::new(
             WireguardBackend::default(),
             NodeId::new("node-a").expect("node id should be valid"),
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
         dataplane.start().expect("dataplane should start");
@@ -1108,7 +1108,7 @@ mod tests {
         let mut dataplane = LinuxDataplane::new(
             WireguardBackend::default(),
             NodeId::new("node-a").expect("node id should be valid"),
-            "100.64.0.0/10".to_string(),
+            "100.64.0.0/10".to_owned(),
             allow_all_policy(),
         );
         let exit_node = NodeId::new("node-exit").expect("node id should be valid");

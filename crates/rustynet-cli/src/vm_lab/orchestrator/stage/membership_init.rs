@@ -31,7 +31,7 @@ impl OrchestrationStage for MembershipInitStage {
             .map(|a| a.alias.clone());
         let exit_alias = match exit_alias {
             Some(a) => a,
-            None => return StageOutcome::Failed("no Exit node in assignments".to_string()),
+            None => return StageOutcome::Failed("no Exit node in assignments".to_owned()),
         };
 
         // Clone peers before adapter borrow
@@ -62,7 +62,7 @@ impl OrchestrationStage for MembershipInitStage {
         match (owner_key_r, snapshot_r) {
             (Err(e), _) => StageOutcome::Failed(format!("issue_membership_owner_key: {e}")),
             (_, None) => StageOutcome::Failed(
-                "owner key fetch succeeded but no snapshot attempted".to_string(),
+                "owner key fetch succeeded but no snapshot attempted".to_owned(),
             ),
             (_, Some(Err(e))) => StageOutcome::Failed(format!("init_membership_snapshot: {e}")),
             (_, Some(Ok(snap))) => {
@@ -126,7 +126,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,
@@ -144,11 +144,11 @@ mod tests {
         let mut ctx = OrchestrationContext {
             assignments: vec![
                 NodeRoleAssignment {
-                    alias: "exit-1".to_string(),
+                    alias: "exit-1".to_owned(),
                     role: NodeRole::Exit,
                 },
                 NodeRoleAssignment {
-                    alias: "client-1".to_string(),
+                    alias: "client-1".to_owned(),
                     role: NodeRole::Client,
                 },
             ],
@@ -157,7 +157,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,
@@ -167,15 +167,15 @@ mod tests {
         let exit_key = "a".repeat(64);
         let client_key = "b".repeat(64);
         ctx.collected_pubkeys
-            .insert("exit-1".to_string(), WireguardPublicKey(exit_key.clone()));
+            .insert("exit-1".to_owned(), WireguardPublicKey(exit_key.clone()));
         ctx.collected_pubkeys.insert(
-            "client-1".to_string(),
+            "client-1".to_owned(),
             WireguardPublicKey(client_key.clone()),
         );
         ctx.node_ids
-            .insert("exit-1".to_string(), "exit-node-id".to_string());
+            .insert("exit-1".to_owned(), "exit-node-id".to_owned());
         ctx.node_ids
-            .insert("client-1".to_string(), "client-node-id".to_string());
+            .insert("client-1".to_owned(), "client-node-id".to_owned());
 
         let peers = build_membership_peers(&ctx).unwrap();
         let client = peers.iter().find(|p| p.alias == "client-1").unwrap();
@@ -188,7 +188,7 @@ mod tests {
     fn build_membership_peers_rejects_missing_or_invalid_pubkey() {
         let mut ctx = OrchestrationContext {
             assignments: vec![NodeRoleAssignment {
-                alias: "client-1".to_string(),
+                alias: "client-1".to_owned(),
                 role: NodeRole::Client,
             }],
             adapters: HashMap::new(),
@@ -196,7 +196,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,
@@ -204,12 +204,12 @@ mod tests {
             endpoints: HashMap::new(),
         };
         ctx.node_ids
-            .insert("client-1".to_string(), "client-node-id".to_string());
+            .insert("client-1".to_owned(), "client-node-id".to_owned());
         assert!(build_membership_peers(&ctx).is_err());
 
         ctx.collected_pubkeys.insert(
-            "client-1".to_string(),
-            WireguardPublicKey("not-hex".to_string()),
+            "client-1".to_owned(),
+            WireguardPublicKey("not-hex".to_owned()),
         );
         assert!(build_membership_peers(&ctx).is_err());
     }

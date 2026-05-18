@@ -89,14 +89,14 @@ mod tests {
         let fleet = RelayFleet {
             nodes: vec![
                 RelayNode {
-                    id: "relay-a".to_string(),
-                    region: "us-east".to_string(),
+                    id: "relay-a".to_owned(),
+                    region: "us-east".to_owned(),
                     healthy: true,
                     latency_ms: 20,
                 },
                 RelayNode {
-                    id: "relay-b".to_string(),
-                    region: "us-east".to_string(),
+                    id: "relay-b".to_owned(),
+                    region: "us-east".to_owned(),
                     healthy: true,
                     latency_ms: 10,
                 },
@@ -113,14 +113,14 @@ mod tests {
         let mut fleet = RelayFleet {
             nodes: vec![
                 RelayNode {
-                    id: "relay-a".to_string(),
-                    region: "us-east".to_string(),
+                    id: "relay-a".to_owned(),
+                    region: "us-east".to_owned(),
                     healthy: true,
                     latency_ms: 10,
                 },
                 RelayNode {
-                    id: "relay-b".to_string(),
-                    region: "us-west".to_string(),
+                    id: "relay-b".to_owned(),
+                    region: "us-west".to_owned(),
                     healthy: true,
                     latency_ms: 15,
                 },
@@ -144,14 +144,14 @@ mod tests {
         let fleet = RelayFleet {
             nodes: vec![
                 RelayNode {
-                    id: "relay-a".to_string(),
-                    region: "us-east".to_string(),
+                    id: "relay-a".to_owned(),
+                    region: "us-east".to_owned(),
                     healthy: true,
                     latency_ms: 10,
                 },
                 RelayNode {
-                    id: "relay-b".to_string(),
-                    region: "eu-west".to_string(),
+                    id: "relay-b".to_owned(),
+                    region: "eu-west".to_owned(),
                     healthy: true,
                     latency_ms: 5,
                 },
@@ -159,8 +159,8 @@ mod tests {
         };
 
         let policy = RelaySelectionPolicy {
-            preferred_region: Some("eu-west".to_string()),
-            allowed_regions: vec!["eu-west".to_string()],
+            preferred_region: Some("eu-west".to_owned()),
+            allowed_regions: vec!["eu-west".to_owned()],
         };
         let selected = fleet
             .select_with_policy(&policy)

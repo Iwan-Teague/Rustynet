@@ -149,13 +149,13 @@ mod tests {
             state_path: Some(PathBuf::from(
                 "/tmp/rustynet-linux-mesh-status-fixture-does-not-exist",
             )),
-            expected_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
+            expected_peer_ids: vec!["peer-a".to_owned(), "peer-b".to_owned()],
             max_age_seconds: Some(300),
         };
         let report = collect_linux_mesh_status_report(&options);
         assert_eq!(
             report.expected_peer_ids,
-            vec!["peer-a".to_string(), "peer-b".to_string()]
+            vec!["peer-a".to_owned(), "peer-b".to_owned()]
         );
         assert_eq!(report.max_age_seconds, Some(300));
     }
@@ -373,9 +373,9 @@ mod tests {
             lan_access_enabled: false,
         };
         let expected = vec![
-            "peer-a".to_string(),
-            "peer-b".to_string(),
-            "peer-c".to_string(),
+            "peer-a".to_owned(),
+            "peer-b".to_owned(),
+            "peer-c".to_owned(),
         ];
         let reasons = evaluate_windows_mesh_status(&snap, expected.as_slice(), None);
         for name in &expected {
@@ -418,9 +418,9 @@ mod tests {
         // generated peer-id alphabet and must not be normalised or
         // rejected.
         let exotic = vec![
-            "peer_a-01".to_string(),
-            "peer-b_02".to_string(),
-            "_trailing".to_string(),
+            "peer_a-01".to_owned(),
+            "peer-b_02".to_owned(),
+            "_trailing".to_owned(),
         ];
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
@@ -447,11 +447,11 @@ mod tests {
         let snap = WindowsMeshSnapshotLoad::Ok {
             timestamp_unix: 1_700_000_000,
             age_seconds: 5,
-            peer_ids: vec!["peer-a".to_string()],
-            selected_exit_node: Some("peer-unexpected".to_string()),
+            peer_ids: vec!["peer-a".to_owned()],
+            selected_exit_node: Some("peer-unexpected".to_owned()),
             lan_access_enabled: false,
         };
-        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_string()], None);
+        let reasons = evaluate_windows_mesh_status(&snap, &["peer-a".to_owned()], None);
         assert!(
             reasons.is_empty(),
             "selected_exit_node is not part of the evaluator contract: {reasons:?}"
@@ -501,16 +501,16 @@ mod tests {
     fn snapshot_load_ok_variant_serde_round_trips_via_report() {
         let report = LinuxMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_LINUX_STATE_PATH.to_string(),
+            state_path: DEFAULT_LINUX_STATE_PATH.to_owned(),
             overall_ok: true,
             snapshot: WindowsMeshSnapshotLoad::Ok {
                 timestamp_unix: 1_700_000_000,
                 age_seconds: 30,
-                peer_ids: vec!["peer-a".to_string()],
-                selected_exit_node: Some("peer-a".to_string()),
+                peer_ids: vec!["peer-a".to_owned()],
+                selected_exit_node: Some("peer-a".to_owned()),
                 lan_access_enabled: false,
             },
-            expected_peer_ids: vec!["peer-a".to_string()],
+            expected_peer_ids: vec!["peer-a".to_owned()],
             max_age_seconds: Some(300),
             drift_reasons: vec![],
         };
@@ -524,14 +524,14 @@ mod tests {
     fn snapshot_load_missing_variant_serde_round_trips_via_report() {
         let report = LinuxMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_LINUX_STATE_PATH.to_string(),
+            state_path: DEFAULT_LINUX_STATE_PATH.to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::Missing {
-                reason: "no such file".to_string(),
+                reason: "no such file".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec!["state snapshot missing: no such file".to_string()],
+            drift_reasons: vec!["state snapshot missing: no such file".to_owned()],
         };
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains("\"load_status\":\"missing\""));
@@ -543,14 +543,14 @@ mod tests {
     fn snapshot_load_integrity_mismatch_variant_serde_round_trips_via_report() {
         let report = LinuxMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_LINUX_STATE_PATH.to_string(),
+            state_path: DEFAULT_LINUX_STATE_PATH.to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::IntegrityMismatch {
-                reason: "checksum failed".to_string(),
+                reason: "checksum failed".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec!["state snapshot integrity mismatch: checksum failed".to_string()],
+            drift_reasons: vec!["state snapshot integrity mismatch: checksum failed".to_owned()],
         };
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains("\"load_status\":\"integrity_mismatch\""));
@@ -562,14 +562,14 @@ mod tests {
     fn snapshot_load_invalid_format_variant_serde_round_trips_via_report() {
         let report = LinuxMeshStatusReport {
             schema_version: 1,
-            state_path: DEFAULT_LINUX_STATE_PATH.to_string(),
+            state_path: DEFAULT_LINUX_STATE_PATH.to_owned(),
             overall_ok: false,
             snapshot: WindowsMeshSnapshotLoad::InvalidFormat {
-                reason: "missing field".to_string(),
+                reason: "missing field".to_owned(),
             },
             expected_peer_ids: vec![],
             max_age_seconds: None,
-            drift_reasons: vec!["state snapshot invalid format: missing field".to_string()],
+            drift_reasons: vec!["state snapshot invalid format: missing field".to_owned()],
         };
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains("\"load_status\":\"invalid_format\""));

@@ -54,7 +54,7 @@ impl AuthoritativeSocket {
     ) -> Result<AuthoritativeTransportIdentity, BackendError> {
         Ok(AuthoritativeTransportIdentity {
             local_addr: self.local_addr()?,
-            label: label.to_string(),
+            label: label.to_owned(),
         })
     }
 

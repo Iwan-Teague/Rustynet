@@ -114,7 +114,7 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         self.runner.run(
             self.wireguard_exe_path.to_string_lossy().as_ref(),
             &[
-                "/installtunnelservice".to_string(),
+                "/installtunnelservice".to_owned(),
                 self.config_path.display().to_string(),
             ],
         )
@@ -139,7 +139,7 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         loop {
             let result = self.runner.run_capture(
                 self.wg_exe_path.to_string_lossy().as_ref(),
-                &["show".to_string(), self.tunnel_name.clone()],
+                &["show".to_owned(), self.tunnel_name.clone()],
             );
             if let Ok(out) = result
                 && !out.stdout.trim().is_empty()
@@ -162,7 +162,7 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         self.runner.run(
             self.wireguard_exe_path.to_string_lossy().as_ref(),
             &[
-                "/uninstalltunnelservice".to_string(),
+                "/uninstalltunnelservice".to_owned(),
                 self.tunnel_name.clone(),
             ],
         )
@@ -192,20 +192,20 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         self.runner.run(
             self.netsh_exe_path.to_string_lossy().as_ref(),
             &[
-                "interface".to_string(),
-                family.to_string(),
-                "add".to_string(),
-                "route".to_string(),
+                "interface".to_owned(),
+                family.to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
                 format!("prefix={destination_cidr}"),
                 format!("interface={}", self.tunnel_name),
-                next_hop.to_string(),
-                "store=active".to_string(),
+                next_hop.to_owned(),
+                "store=active".to_owned(),
                 // Use a low metric so WireGuard routes take precedence over the
                 // physical NIC default route. Without this, the auto-calculated
                 // interface metric (typically 200+) loses to the physical NIC
                 // default route (typically metric 10–25), causing FullTunnel
                 // traffic to bypass the WireGuard interface entirely.
-                "metric=1".to_string(),
+                "metric=1".to_owned(),
             ],
         )
     }
@@ -216,13 +216,13 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         self.runner.run(
             self.netsh_exe_path.to_string_lossy().as_ref(),
             &[
-                "interface".to_string(),
-                family.to_string(),
-                "delete".to_string(),
-                "route".to_string(),
+                "interface".to_owned(),
+                family.to_owned(),
+                "delete".to_owned(),
+                "route".to_owned(),
                 format!("prefix={destination_cidr}"),
                 format!("interface={}", self.tunnel_name),
-                "store=active".to_string(),
+                "store=active".to_owned(),
             ],
         )
     }
@@ -299,13 +299,13 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         self.runner.run(
             self.wg_exe_path.to_string_lossy().as_ref(),
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.tunnel_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "endpoint".to_string(),
+                "endpoint".to_owned(),
                 endpoint,
-                "allowed-ips".to_string(),
+                "allowed-ips".to_owned(),
                 allowed_ips,
             ],
         )
@@ -330,9 +330,9 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         let output = self.runner.run_capture(
             self.wg_exe_path.to_string_lossy().as_ref(),
             &[
-                "show".to_string(),
+                "show".to_owned(),
                 self.tunnel_name.clone(),
-                "latest-handshakes".to_string(),
+                "latest-handshakes".to_owned(),
             ],
         )?;
         let public_key = encode_wg_public_key_base64(&peer.public_key);
@@ -343,9 +343,9 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
         let output = self.runner.run_capture(
             self.wg_exe_path.to_string_lossy().as_ref(),
             &[
-                "show".to_string(),
+                "show".to_owned(),
                 self.tunnel_name.clone(),
-                "transfer".to_string(),
+                "transfer".to_owned(),
             ],
         )?;
         parse_transfer_totals(&output, self.peers.values())
@@ -445,11 +445,11 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
         self.runner.run(
             self.wg_exe_path.to_string_lossy().as_ref(),
             &[
-                "set".to_string(),
+                "set".to_owned(),
                 self.tunnel_name.clone(),
-                "peer".to_string(),
+                "peer".to_owned(),
                 encode_wg_public_key_base64(&peer.public_key),
-                "remove".to_string(),
+                "remove".to_owned(),
             ],
         )?;
         self.sync_persistent_config()
@@ -493,7 +493,7 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
 
     fn transport_socket_identity_blocker(&self) -> Option<String> {
         Some(
-            "windows wireguard backend is a command-only adapter over the official WireGuard for Windows tunnel service and its OS-managed WireGuardNT UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_string(),
+            "windows wireguard backend is a command-only adapter over the official WireGuard for Windows tunnel service and its OS-managed WireGuardNT UDP socket; it exposes configuration and handshake queries but no authoritative packet-I/O handle or backend-owned datagram multiplexer, so the daemon cannot safely run STUN or relay bootstrap/refresh on the real peer-traffic transport, and a same-port daemon side socket is not authoritative transport identity".to_owned(),
         )
     }
 
@@ -626,7 +626,7 @@ fn read_private_key_value(path: &Path) -> Result<String, BackendError> {
             "windows private key file contains invalid characters",
         ));
     }
-    Ok(key.to_string())
+    Ok(key.to_owned())
 }
 
 fn parse_transfer_totals(
@@ -905,7 +905,7 @@ mod tests {
                 // exits on the first poll in tests that don't model slow start.
                 show_interface_output: Arc::new(Mutex::new(
                     "interface: rustynet0\n  public key: AAAA=\n  listening port: 51820\n"
-                        .to_string(),
+                        .to_owned(),
                 )),
             }
         }
@@ -922,7 +922,7 @@ mod tests {
             self.commands
                 .lock()
                 .expect("commands")
-                .push((program.to_string(), args.to_vec()));
+                .push((program.to_owned(), args.to_vec()));
             Ok(())
         }
 
@@ -934,7 +934,7 @@ mod tests {
             self.commands
                 .lock()
                 .expect("commands")
-                .push((program.to_string(), args.to_vec()));
+                .push((program.to_owned(), args.to_vec()));
             let stdout = if args.iter().any(|arg| arg == "latest-handshakes") {
                 self.handshake_output.lock().expect("handshake").clone()
             } else if args.iter().any(|arg| arg == "transfer") {
@@ -958,9 +958,9 @@ mod tests {
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("local-node").expect("valid node id"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.0/10".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         }
     }
 
@@ -972,7 +972,7 @@ mod tests {
                 port: 51820,
             },
             public_key: [7; 32],
-            allowed_ips: vec!["100.64.10.0/24".to_string()],
+            allowed_ips: vec!["100.64.10.0/24".to_owned()],
         }
     }
 
@@ -1030,7 +1030,7 @@ mod tests {
         assert_eq!(
             recorded[0].1,
             vec![
-                "/installtunnelservice".to_string(),
+                "/installtunnelservice".to_owned(),
                 config_path.display().to_string()
             ]
         );
@@ -1038,7 +1038,7 @@ mod tests {
         assert_eq!(recorded[1].0, wg_path.to_string_lossy());
         assert_eq!(
             recorded[1].1,
-            vec!["show".to_string(), "rustynet0".to_string()]
+            vec!["show".to_owned(), "rustynet0".to_owned()]
         );
     }
 
@@ -1099,12 +1099,12 @@ mod tests {
         backend
             .apply_routes(vec![
                 Route {
-                    destination_cidr: "100.64.20.0/24".to_string(),
+                    destination_cidr: "100.64.20.0/24".to_owned(),
                     via_node: peer.node_id.clone(),
                     kind: RouteKind::Mesh,
                 },
                 Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: peer.node_id.clone(),
                     kind: RouteKind::ExitNodeDefault,
                 },
@@ -1128,15 +1128,15 @@ mod tests {
                 program == &netsh_path.to_string_lossy()
                     && args
                         == &vec![
-                            "interface".to_string(),
-                            "ipv4".to_string(),
-                            "add".to_string(),
-                            "route".to_string(),
-                            "prefix=100.64.20.0/24".to_string(),
-                            "interface=rustynet0".to_string(),
-                            "nexthop=0.0.0.0".to_string(),
-                            "store=active".to_string(),
-                            "metric=1".to_string(),
+                            "interface".to_owned(),
+                            "ipv4".to_owned(),
+                            "add".to_owned(),
+                            "route".to_owned(),
+                            "prefix=100.64.20.0/24".to_owned(),
+                            "interface=rustynet0".to_owned(),
+                            "nexthop=0.0.0.0".to_owned(),
+                            "store=active".to_owned(),
+                            "metric=1".to_owned(),
                         ]
             }),
             "mesh route should be installed through netsh"
@@ -1146,15 +1146,15 @@ mod tests {
                 program == &netsh_path.to_string_lossy()
                     && args
                         == &vec![
-                            "interface".to_string(),
-                            "ipv4".to_string(),
-                            "add".to_string(),
-                            "route".to_string(),
-                            "prefix=0.0.0.0/0".to_string(),
-                            "interface=rustynet0".to_string(),
-                            "nexthop=0.0.0.0".to_string(),
-                            "store=active".to_string(),
-                            "metric=1".to_string(),
+                            "interface".to_owned(),
+                            "ipv4".to_owned(),
+                            "add".to_owned(),
+                            "route".to_owned(),
+                            "prefix=0.0.0.0/0".to_owned(),
+                            "interface=rustynet0".to_owned(),
+                            "nexthop=0.0.0.0".to_owned(),
+                            "store=active".to_owned(),
+                            "metric=1".to_owned(),
                         ]
             }),
             "default route should be installed only after exit mode enables it"
@@ -1233,10 +1233,7 @@ mod tests {
         let recorded = runner.recorded();
         assert_eq!(
             recorded.last().expect("shutdown command").1,
-            vec![
-                "/uninstalltunnelservice".to_string(),
-                "rustynet0".to_string()
-            ]
+            vec!["/uninstalltunnelservice".to_owned(), "rustynet0".to_owned()]
         );
     }
 
@@ -1324,7 +1321,7 @@ mod tests {
             .expect("peer should configure");
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "2001:db8::/64".to_string(),
+                destination_cidr: "2001:db8::/64".to_owned(),
                 via_node: peer.node_id.clone(),
                 kind: RouteKind::Mesh,
             }])
@@ -1337,15 +1334,15 @@ mod tests {
                 program == &netsh_path.to_string_lossy()
                     && args
                         == &vec![
-                            "interface".to_string(),
-                            "ipv6".to_string(),
-                            "add".to_string(),
-                            "route".to_string(),
-                            "prefix=2001:db8::/64".to_string(),
-                            "interface=rustynet0".to_string(),
-                            "nexthop=::".to_string(),
-                            "store=active".to_string(),
-                            "metric=1".to_string(),
+                            "interface".to_owned(),
+                            "ipv6".to_owned(),
+                            "add".to_owned(),
+                            "route".to_owned(),
+                            "prefix=2001:db8::/64".to_owned(),
+                            "interface=rustynet0".to_owned(),
+                            "nexthop=::".to_owned(),
+                            "store=active".to_owned(),
+                            "metric=1".to_owned(),
                         ]
             }),
             "ipv6 mesh route must use the reviewed netsh argv with metric=1 and store=active"
@@ -1362,13 +1359,13 @@ mod tests {
                 program == &netsh_path.to_string_lossy()
                     && args
                         == &vec![
-                            "interface".to_string(),
-                            "ipv6".to_string(),
-                            "delete".to_string(),
-                            "route".to_string(),
-                            "prefix=2001:db8::/64".to_string(),
-                            "interface=rustynet0".to_string(),
-                            "store=active".to_string(),
+                            "interface".to_owned(),
+                            "ipv6".to_owned(),
+                            "delete".to_owned(),
+                            "route".to_owned(),
+                            "prefix=2001:db8::/64".to_owned(),
+                            "interface=rustynet0".to_owned(),
+                            "store=active".to_owned(),
                         ]
             }),
             "ipv6 mesh route delete must use the reviewed netsh argv shape"
@@ -1425,7 +1422,7 @@ mod tests {
             .expect("peer should configure");
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "100.64.20.0/24".to_string(),
+                destination_cidr: "100.64.20.0/24".to_owned(),
                 via_node: peer.node_id.clone(),
                 kind: RouteKind::Mesh,
             }])
@@ -1555,11 +1552,11 @@ mod tests {
         assert_eq!(
             remove.1,
             vec![
-                "set".to_string(),
-                "rustynet0".to_string(),
-                "peer".to_string(),
+                "set".to_owned(),
+                "rustynet0".to_owned(),
+                "peer".to_owned(),
                 public_key,
-                "remove".to_string(),
+                "remove".to_owned(),
             ]
         );
     }
@@ -1595,7 +1592,7 @@ mod tests {
         assert!(
             backend
                 .apply_routes(vec![Route {
-                    destination_cidr: "100.64.20.0/24".to_string(),
+                    destination_cidr: "100.64.20.0/24".to_owned(),
                     via_node: peer.node_id.clone(),
                     kind: RouteKind::Mesh,
                 }])

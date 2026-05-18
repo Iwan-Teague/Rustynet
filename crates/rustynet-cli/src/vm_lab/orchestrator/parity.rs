@@ -51,8 +51,8 @@ pub fn build_live_lab_run_report(
                 StageOutcome::Failed(msg) => (StageOutcomeRecord::Failed, Some(msg.clone())),
             };
             StageReport {
-                stage_id: id.as_str().to_string(),
-                stage_name: id.as_str().to_string(),
+                stage_id: id.as_str().to_owned(),
+                stage_name: id.as_str().to_owned(),
                 outcome: rec,
                 duration_ms: 0,
                 error_detail,
@@ -77,7 +77,7 @@ pub fn build_live_lab_run_report(
     let mut node_statuses: HashMap<String, NodeStatus> = HashMap::new();
     for assignment in &ctx.assignments {
         let platform = ctx.adapters.get(&assignment.alias).map_or_else(
-            || "unknown".to_string(),
+            || "unknown".to_owned(),
             |a| format!("{:?}", a.platform()).to_lowercase(),
         );
         node_statuses.insert(
@@ -85,7 +85,7 @@ pub fn build_live_lab_run_report(
             NodeStatus {
                 alias: assignment.alias.clone(),
                 platform,
-                role: assignment.role.as_str().to_string(),
+                role: assignment.role.as_str().to_owned(),
                 validator_results: Vec::new(),
             },
         );
@@ -261,8 +261,8 @@ mod tests {
 
     fn stage(id: &str, outcome: StageOutcomeRecord) -> StageReport {
         StageReport {
-            stage_id: id.to_string(),
-            stage_name: id.to_string(),
+            stage_id: id.to_owned(),
+            stage_name: id.to_owned(),
             outcome,
             duration_ms: 0,
             error_detail: None,
@@ -273,17 +273,17 @@ mod tests {
         let validator_results = validators
             .into_iter()
             .map(|(op, passed)| ValidatorResult {
-                op: op.to_string(),
+                op: op.to_owned(),
                 passed,
                 summary: String::new(),
             })
             .collect();
         (
-            alias.to_string(),
+            alias.to_owned(),
             NodeStatus {
-                alias: alias.to_string(),
-                platform: "linux".to_string(),
-                role: "client".to_string(),
+                alias: alias.to_owned(),
+                platform: "linux".to_owned(),
+                role: "client".to_owned(),
                 validator_results,
             },
         )
@@ -296,8 +296,8 @@ mod tests {
         nodes: Vec<(String, NodeStatus)>,
     ) -> LiveLabRunReport {
         LiveLabRunReport {
-            run_id: run_id.to_string(),
-            timestamp_utc: "2026-04-29T00:00:00Z".to_string(),
+            run_id: run_id.to_owned(),
+            timestamp_utc: "2026-04-29T00:00:00Z".to_owned(),
             overall_status: overall,
             stages: stages_in,
             node_statuses: nodes.into_iter().collect::<HashMap<_, _>>(),
@@ -396,7 +396,7 @@ mod tests {
         );
         let diff = diff_live_lab_reports(&a, &b);
         assert!(!diff.overall_parity_pass);
-        assert_eq!(diff.stages_only_in_right, vec!["extra".to_string()]);
+        assert_eq!(diff.stages_only_in_right, vec!["extra".to_owned()]);
         assert!(diff.stages_only_in_left.is_empty());
         let extra_entry = diff
             .stages

@@ -239,7 +239,7 @@ impl WireguardBackend {
         BackendError::internal(format!(
             "authoritative shared transport {action} unavailable: {}",
             self.transport_socket_identity_blocker().unwrap_or_else(|| {
-                "in-memory backend authoritative shared transport is not configured".to_string()
+                "in-memory backend authoritative shared transport is not configured".to_owned()
             })
         ))
     }
@@ -638,9 +638,9 @@ mod tests {
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("local-node").expect("valid node id"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.1/32".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.1/32".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         }
     }
 
@@ -652,7 +652,7 @@ mod tests {
                 port: 51820,
             },
             public_key: [7; 32],
-            allowed_ips: vec!["100.64.1.0/24".to_string()],
+            allowed_ips: vec!["100.64.1.0/24".to_owned()],
         }
     }
 
@@ -674,7 +674,7 @@ mod tests {
             .expect("exit mode switch should succeed");
         backend
             .apply_routes(vec![Route {
-                destination_cidr: "0.0.0.0/0".to_string(),
+                destination_cidr: "0.0.0.0/0".to_owned(),
                 via_node: NodeId::new("peer-a").expect("valid node id"),
                 kind: RouteKind::ExitNodeDefault,
             }])

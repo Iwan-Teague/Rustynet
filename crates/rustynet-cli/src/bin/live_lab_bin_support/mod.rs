@@ -187,7 +187,7 @@ pub fn target_address(target: &str) -> &str {
 
 fn target_home(target: &str) -> String {
     match target_user(target) {
-        "root" => "/root".to_string(),
+        "root" => "/root".to_owned(),
         user => format!("/home/{user}"),
     }
 }
@@ -195,7 +195,7 @@ fn target_home(target: &str) -> String {
 fn env_var_nonempty(key: &str) -> Option<String> {
     env::var(key)
         .ok()
-        .map(|value| value.trim().to_string())
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
 
@@ -233,7 +233,7 @@ fn utm_transport_for_target(target: &str) -> Option<UtmTransport> {
         };
         return Some(UtmTransport {
             utm_name,
-            user: target_user(target).to_string(),
+            user: target_user(target).to_owned(),
             home: target_home(target),
         });
     }
@@ -360,8 +360,8 @@ fn utm_exec_output(transport: &UtmTransport, command: &str) -> Result<Output, St
 fn utm_exec_root_status(transport: &UtmTransport, command: &str) -> Result<ExitStatus, String> {
     let root_transport = UtmTransport {
         utm_name: transport.utm_name.clone(),
-        user: "root".to_string(),
-        home: "/root".to_string(),
+        user: "root".to_owned(),
+        home: "/root".to_owned(),
     };
     utm_exec_status(&root_transport, command)
 }
@@ -444,7 +444,7 @@ fn resolved_target_address_from_ssh_g(target: &str, resolved: &str) -> String {
     ssh_g_value(resolved, "hostname")
         .filter(|hostname| !hostname.is_empty() && *hostname != "none")
         .unwrap_or_else(|| target_address(target))
-        .to_string()
+        .to_owned()
 }
 
 pub fn resolved_target_address(target: &str) -> Result<String, String> {
@@ -470,7 +470,7 @@ pub fn resolved_target_address(target: &str) -> Result<String, String> {
 
 pub fn remote_src_dir(target: &str) -> String {
     match target_user(target) {
-        "root" => "/root/Rustynet".to_string(),
+        "root" => "/root/Rustynet".to_owned(),
         user => format!("/home/{user}/Rustynet"),
     }
 }
@@ -490,7 +490,7 @@ pub fn shell_quote(value: &str) -> String {
 
 pub fn quote_env_value(value: &str) -> Result<String, String> {
     if value.contains('\0') || value.contains('\n') || value.contains('\r') {
-        return Err("env value contains newline or NUL characters".to_string());
+        return Err("env value contains newline or NUL characters".to_owned());
     }
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
@@ -613,7 +613,7 @@ pub fn run_cargo_bin(root_dir: &Path, bin_name: &str, args: &[OsString]) -> Resu
 
 pub fn ensure_pinned_known_hosts_file(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
-        return Err("pinned known_hosts file path is required".to_string());
+        return Err("pinned known_hosts file path is required".to_owned());
     }
     if !path.is_file() {
         return Err(format!(
@@ -644,7 +644,7 @@ pub fn ensure_pinned_known_hosts_file(path: &Path) -> Result<(), String> {
 pub fn load_home_known_hosts_path() -> Result<PathBuf, String> {
     let home = env::var_os("HOME")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "HOME is not set".to_string())?;
+        .ok_or_else(|| "HOME is not set".to_owned())?;
     Ok(PathBuf::from(home).join(".ssh/known_hosts"))
 }
 
@@ -662,10 +662,10 @@ pub fn seed_known_hosts(src: &Path, dst: &Path) -> Result<(), String> {
 
 fn known_hosts_lookup_host(host: &str, port: &str) -> Result<String, String> {
     if host.is_empty() {
-        return Err("known_hosts lookup host must not be empty".to_string());
+        return Err("known_hosts lookup host must not be empty".to_owned());
     }
     if port.is_empty() || port == "22" {
-        Ok(host.to_string())
+        Ok(host.to_owned())
     } else {
         Ok(format!("[{host}]:{port}"))
     }
@@ -1255,7 +1255,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         .filter(|ch| !ch.is_ascii_whitespace())
         .collect::<Vec<_>>();
     if clean.is_empty() || clean.len() % 4 != 0 {
-        return Err("invalid base64 wireguard public key".to_string());
+        return Err("invalid base64 wireguard public key".to_owned());
     }
     let mut output = Vec::with_capacity(clean.len() / 4 * 3);
     for chunk in clean.chunks(4) {
@@ -1268,7 +1268,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
             } else if let Some(value) = reverse.get(ch) {
                 sextets[index] = *value;
             } else {
-                return Err("invalid base64 wireguard public key".to_string());
+                return Err("invalid base64 wireguard public key".to_owned());
             }
         }
         let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
@@ -1292,12 +1292,12 @@ pub fn git_head_commit(root_dir: &Path) -> Result<String, String> {
         .output()
         .map_err(|err| format!("failed to run git rev-parse HEAD: {err}"))?;
     if !output.status.success() {
-        return Err("git rev-parse HEAD failed".to_string());
+        return Err("git rev-parse HEAD failed".to_owned());
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let trimmed = text.trim().to_lowercase();
     if trimmed.is_empty() {
-        return Err("git rev-parse HEAD returned empty output".to_string());
+        return Err("git rev-parse HEAD returned empty output".to_owned());
     }
     Ok(trimmed)
 }
@@ -1306,13 +1306,13 @@ pub fn read_last_matching_line(text: &str, needle: &str) -> String {
     text.lines()
         .rfind(|line| line.contains(needle))
         .unwrap_or("")
-        .to_string()
+        .to_owned()
 }
 
 pub fn field_value(line: &str, key: &str) -> String {
     for field in line.split_whitespace() {
         if let Some(value) = field.strip_prefix(&format!("{key}=")) {
-            return value.to_string();
+            return value.to_owned();
         }
     }
     String::new()
@@ -1396,9 +1396,9 @@ port 2222
         assert_eq!(
             candidates,
             vec![
-                "[rusty-lab]:2222".to_string(),
-                "[192.168.18.65]:2222".to_string(),
-                "[debian-headless-2]:2222".to_string()
+                "[rusty-lab]:2222".to_owned(),
+                "[192.168.18.65]:2222".to_owned(),
+                "[debian-headless-2]:2222".to_owned()
             ]
         );
     }
@@ -1411,7 +1411,7 @@ port 22
 ";
         let candidates = resolved_known_hosts_candidates("debian@debian-headless-2", resolved)
             .expect("candidates");
-        assert_eq!(candidates, vec!["debian-headless-2".to_string()]);
+        assert_eq!(candidates, vec!["debian-headless-2".to_owned()]);
     }
 
     #[test]

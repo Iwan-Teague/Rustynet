@@ -121,11 +121,11 @@ fn run() -> Result<(), String> {
         print_usage();
         return Err(
             "missing required argument: --ssh-identity-file, --client-host, --probe-host"
-                .to_string(),
+                .to_owned(),
         );
     }
     if client_host == probe_host {
-        return Err("invalid path: --client-host and --probe-host must differ".to_string());
+        return Err("invalid path: --client-host and --probe-host must differ".to_owned());
     }
 
     if let Some(parent) = report_path.parent() {
@@ -146,8 +146,8 @@ fn run() -> Result<(), String> {
     } else {
         parse_ipv4(&probe_bind_ip, "probe bind ip")?.to_string()
     };
-    let probe_pid_path = "/tmp/rn-underlay-http-server.pid".to_string();
-    let probe_log_path = "/tmp/rn-underlay-http-server.log".to_string();
+    let probe_pid_path = "/tmp/rn-underlay-http-server.pid".to_owned();
+    let probe_log_path = "/tmp/rn-underlay-http-server.log".to_owned();
     let _cleanup = ProbeCleanup {
         ctx: ctx.clone(),
         host: probe_host.clone(),
@@ -276,31 +276,31 @@ fn run() -> Result<(), String> {
     let captured_at_utc = now_utc();
     let captured_at_unix = now_unix();
     let report_args = vec![
-        "--report-path".to_string(),
+        "--report-path".to_owned(),
         report_path.to_string_lossy().to_string(),
-        "--allowed-management-cidrs".to_string(),
+        "--allowed-management-cidrs".to_owned(),
         ssh_allow_cidrs.clone(),
-        "--probe-from-client-status".to_string(),
-        probe_from_client_status.to_string(),
-        "--probe-ip".to_string(),
+        "--probe-from-client-status".to_owned(),
+        probe_from_client_status.to_owned(),
+        "--probe-ip".to_owned(),
         probe_ip.clone(),
-        "--probe-port".to_string(),
+        "--probe-port".to_owned(),
         probe_port.clone(),
-        "--client-internet-route".to_string(),
+        "--client-internet-route".to_owned(),
         client_internet_route.clone(),
-        "--client-probe-route".to_string(),
+        "--client-probe-route".to_owned(),
         client_probe_route.clone(),
-        "--client-table-51820".to_string(),
+        "--client-table-51820".to_owned(),
         client_table_51820.clone(),
-        "--client-endpoints".to_string(),
+        "--client-endpoints".to_owned(),
         client_endpoints.clone(),
-        "--probe-self-test".to_string(),
+        "--probe-self-test".to_owned(),
         probe_self_test.clone(),
-        "--probe-from-client-output".to_string(),
+        "--probe-from-client-output".to_owned(),
         probe_from_client_output.clone(),
-        "--captured-at-utc".to_string(),
+        "--captured-at-utc".to_owned(),
         captured_at_utc,
-        "--captured-at-unix".to_string(),
+        "--captured-at-unix".to_owned(),
         captured_at_unix,
     ];
     let report_refs = report_args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -383,7 +383,7 @@ fn print_usage() {
 
 fn now_unix() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
-        |_| "0".to_string(),
+        |_| "0".to_owned(),
         |duration| duration.as_secs().to_string(),
     )
 }

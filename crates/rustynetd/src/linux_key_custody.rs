@@ -97,7 +97,7 @@ const REQUIREMENT_ABSENT: &str = "absent";
 pub fn evaluate_linux_key_custody(entries: &[LinuxKeyCustodyEntry]) -> Result<(), Vec<String>> {
     let mut reasons: Vec<String> = Vec::new();
     if entries.is_empty() {
-        reasons.push("key custody report contains no entries".to_string());
+        reasons.push("key custody report contains no entries".to_owned());
         return Err(reasons);
     }
     for entry in entries {
@@ -433,9 +433,9 @@ fn probe_present_directory(
     _expected_group: &str,
 ) -> LinuxKeyCustodyEntry {
     LinuxKeyCustodyEntry {
-        label: label.to_string(),
-        path: path.to_string(),
-        requirement: REQUIREMENT_PRESENT.to_string(),
+        label: label.to_owned(),
+        path: path.to_owned(),
+        requirement: REQUIREMENT_PRESENT.to_owned(),
         status: LinuxKeyCustodyEntryStatus::Missing {
             reason: format!(
                 "{label} probe at {path} requires a Linux runtime host; \
@@ -454,9 +454,9 @@ fn probe_present_file(
     _expected_group: &str,
 ) -> LinuxKeyCustodyEntry {
     LinuxKeyCustodyEntry {
-        label: label.to_string(),
-        path: path.to_string(),
-        requirement: REQUIREMENT_PRESENT.to_string(),
+        label: label.to_owned(),
+        path: path.to_owned(),
+        requirement: REQUIREMENT_PRESENT.to_owned(),
         status: LinuxKeyCustodyEntryStatus::Missing {
             reason: format!(
                 "{label} probe at {path} requires a Linux runtime host; \
@@ -469,9 +469,9 @@ fn probe_present_file(
 #[cfg(not(target_os = "linux"))]
 fn probe_forbidden_path(label: &str, path: &str) -> LinuxKeyCustodyEntry {
     LinuxKeyCustodyEntry {
-        label: label.to_string(),
-        path: path.to_string(),
-        requirement: REQUIREMENT_ABSENT.to_string(),
+        label: label.to_owned(),
+        path: path.to_owned(),
+        requirement: REQUIREMENT_ABSENT.to_owned(),
         status: LinuxKeyCustodyEntryStatus::AbsentAsExpected,
     }
 }
@@ -482,9 +482,9 @@ mod tests {
 
     fn ok_entry(label: &str, path: &str) -> LinuxKeyCustodyEntry {
         LinuxKeyCustodyEntry {
-            label: label.to_string(),
-            path: path.to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: label.to_owned(),
+            path: path.to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Ok {
                 mode: 0o100600,
                 uid: 998,
@@ -495,9 +495,9 @@ mod tests {
 
     fn absent_entry(label: &str, path: &str) -> LinuxKeyCustodyEntry {
         LinuxKeyCustodyEntry {
-            label: label.to_string(),
-            path: path.to_string(),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            label: label.to_owned(),
+            path: path.to_owned(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::AbsentAsExpected,
         }
     }
@@ -545,11 +545,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_missing_required_artifact() {
         let entries = vec![LinuxKeyCustodyEntry {
-            label: "encrypted WireGuard private key".to_string(),
-            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "encrypted WireGuard private key".to_owned(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Missing {
-                reason: "ENOENT".to_string(),
+                reason: "ENOENT".to_owned(),
             },
         }];
         let reasons =
@@ -563,11 +563,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_forbidden_plaintext_key_at_rest() {
         let entries = vec![LinuxKeyCustodyEntry {
-            label: "plaintext WireGuard private key (legacy)".to_string(),
-            path: LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            label: "plaintext WireGuard private key (legacy)".to_owned(),
+            path: LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Forbidden {
-                reason: "must not exist at rest".to_string(),
+                reason: "must not exist at rest".to_owned(),
             },
         }];
         let reasons =
@@ -583,11 +583,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_invalid_mode_or_owner() {
         let entries = vec![LinuxKeyCustodyEntry {
-            label: "encrypted WireGuard private key".to_string(),
-            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "encrypted WireGuard private key".to_owned(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Invalid {
-                reason: "mode is 0o644, expected 0o600".to_string(),
+                reason: "mode is 0o644, expected 0o600".to_owned(),
                 mode: 0o100644,
                 uid: 998,
                 gid: 998,
@@ -620,7 +620,7 @@ mod tests {
         for entry in entries.iter_mut() {
             if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Missing {
-                    reason: "ENOENT".to_string(),
+                    reason: "ENOENT".to_owned(),
                 };
             }
         }
@@ -642,7 +642,7 @@ mod tests {
         for entry in entries.iter_mut() {
             if entry.path == LINUX_SIGNING_KEY_PASSPHRASE_CREDENTIAL_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Missing {
-                    reason: "ENOENT".to_string(),
+                    reason: "ENOENT".to_owned(),
                 };
             }
         }
@@ -666,7 +666,7 @@ mod tests {
         for entry in entries.iter_mut() {
             if entry.path == LINUX_CREDENTIALS_DIR {
                 entry.status = LinuxKeyCustodyEntryStatus::Invalid {
-                    reason: "mode is 0o750, expected 0o700".to_string(),
+                    reason: "mode is 0o750, expected 0o700".to_owned(),
                     mode: 0o40750,
                     uid: 0,
                     gid: 0,
@@ -691,7 +691,7 @@ mod tests {
         for entry in entries.iter_mut() {
             if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Invalid {
-                    reason: "mode is 0o640, expected 0o600".to_string(),
+                    reason: "mode is 0o640, expected 0o600".to_owned(),
                     mode: 0o100640,
                     uid: 0,
                     gid: 0,
@@ -718,7 +718,7 @@ mod tests {
         for entry in entries.iter_mut() {
             if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Invalid {
-                    reason: "owner uid is 998, expected 0 (root)".to_string(),
+                    reason: "owner uid is 998, expected 0 (root)".to_owned(),
                     mode: 0o100600,
                     uid: 998,
                     gid: 998,
@@ -828,9 +828,9 @@ mod tests {
         // explicitly so a future #[serde(rename)] on mode/uid/gid trips
         // this test.
         let entry = LinuxKeyCustodyEntry {
-            label: "encrypted WireGuard private key".to_string(),
-            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "encrypted WireGuard private key".to_owned(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Ok {
                 mode: 0o100600,
                 uid: 998,
@@ -849,11 +849,11 @@ mod tests {
         // Invalid carries reason + mode + uid + gid; pin the full shape
         // through serde.
         let entry = LinuxKeyCustodyEntry {
-            label: "encrypted WireGuard private key".to_string(),
-            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "encrypted WireGuard private key".to_owned(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Invalid {
-                reason: "mode is 0o644, expected 0o600".to_string(),
+                reason: "mode is 0o644, expected 0o600".to_owned(),
                 mode: 0o100644,
                 uid: 998,
                 gid: 998,
@@ -872,11 +872,11 @@ mod tests {
     #[test]
     fn entry_status_forbidden_round_trips_through_serde() {
         let entry = LinuxKeyCustodyEntry {
-            label: "plaintext WireGuard private key (legacy)".to_string(),
-            path: LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            label: "plaintext WireGuard private key (legacy)".to_owned(),
+            path: LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Forbidden {
-                reason: "must not exist at rest after Phase E migration".to_string(),
+                reason: "must not exist at rest after Phase E migration".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -906,9 +906,9 @@ mod tests {
         // surface as a named drift reason rather than fall through
         // silently.
         let entries = vec![LinuxKeyCustodyEntry {
-            label: "encrypted WireGuard private key".to_string(),
-            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            requirement: "absnet".to_string(), // typo
+            label: "encrypted WireGuard private key".to_owned(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            requirement: "absnet".to_owned(), // typo
             status: LinuxKeyCustodyEntryStatus::Ok {
                 mode: 0o100600,
                 uid: 998,
@@ -936,7 +936,7 @@ mod tests {
         for entry in entries.iter_mut() {
             if entry.path == LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Invalid {
-                    reason: "mode is 0o644, expected 0o600".to_string(),
+                    reason: "mode is 0o644, expected 0o600".to_owned(),
                     mode: 0o100644,
                     uid: 998,
                     gid: 998,
@@ -944,12 +944,12 @@ mod tests {
             }
             if entry.path == LINUX_WG_KEY_PASSPHRASE_CREDENTIAL_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Missing {
-                    reason: "ENOENT".to_string(),
+                    reason: "ENOENT".to_owned(),
                 };
             }
             if entry.path == LINUX_WG_PLAINTEXT_PRIVATE_KEY_PATH {
                 entry.status = LinuxKeyCustodyEntryStatus::Forbidden {
-                    reason: "must not exist at rest".to_string(),
+                    reason: "must not exist at rest".to_owned(),
                 };
             }
         }
@@ -982,11 +982,11 @@ mod tests {
         // hand-edited fixture), the evaluator must surface a named
         // contradiction rather than silently accept the entry.
         let entries = vec![LinuxKeyCustodyEntry {
-            label: "encrypted WireGuard private key".to_string(),
-            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "encrypted WireGuard private key".to_owned(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::Forbidden {
-                reason: "spuriously marked forbidden".to_string(),
+                reason: "spuriously marked forbidden".to_owned(),
             },
         }];
         let reasons = evaluate_linux_key_custody(&entries)
@@ -1007,9 +1007,9 @@ mod tests {
         // collector bug is visible rather than silently flipping the
         // verdict to pass.
         let entries = vec![LinuxKeyCustodyEntry {
-            label: "encrypted WireGuard private key".to_string(),
-            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "encrypted WireGuard private key".to_owned(),
+            path: LINUX_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: LinuxKeyCustodyEntryStatus::AbsentAsExpected,
         }];
         let reasons = evaluate_linux_key_custody(&entries)

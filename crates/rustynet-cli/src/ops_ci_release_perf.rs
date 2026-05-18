@@ -142,7 +142,7 @@ pub fn execute_ops_run_phase1_ci_gates() -> Result<String, String> {
         r"\[\[UNRESOLVED\]\]|\{\{UNRESOLVED\}\}",
         &["crates", "documents"],
     )? {
-        return Err("Documentation hygiene gate failed".to_string());
+        return Err("Documentation hygiene gate failed".to_owned());
     }
 
     execute_ops_run_security_regression_gates()?;
@@ -159,7 +159,7 @@ pub fn execute_ops_run_phase1_ci_gates() -> Result<String, String> {
         )],
     )?;
 
-    Ok("Phase 1 CI gates: PASS".to_string())
+    Ok("Phase 1 CI gates: PASS".to_owned())
 }
 
 pub fn execute_ops_run_phase9_ci_gates() -> Result<String, String> {
@@ -265,7 +265,7 @@ pub fn execute_ops_run_phase9_ci_gates() -> Result<String, String> {
         require_file(&root_dir.join(path), "phase9 operations artifact")?;
     }
 
-    Ok("Phase 9 CI gates: PASS".to_string())
+    Ok("Phase 9 CI gates: PASS".to_owned())
 }
 
 pub fn execute_ops_run_phase10_ci_gates() -> Result<String, String> {
@@ -325,7 +325,7 @@ pub fn execute_ops_run_phase10_ci_gates() -> Result<String, String> {
         r#"BEGIN PRIVATE KEY|SECRET_KEY=|API_KEY=|TOKEN=.{8,}|password\s*=\s*"[^"]+""#,
         &["crates"],
     )? {
-        return Err("Secret redaction gate failed".to_string());
+        return Err("Secret redaction gate failed".to_owned());
     }
 
     run_script(
@@ -409,7 +409,7 @@ pub fn execute_ops_run_phase10_ci_gates() -> Result<String, String> {
         &shared_env,
     )?;
 
-    Ok("Phase 10 CI gates: PASS".to_string())
+    Ok("Phase 10 CI gates: PASS".to_owned())
 }
 
 pub fn execute_ops_run_membership_ci_gates() -> Result<String, String> {
@@ -522,7 +522,7 @@ pub fn execute_ops_run_membership_ci_gates() -> Result<String, String> {
             set_mode_owner_only(&membership_log_path)?;
             membership_bootstrap_state = true;
         } else {
-            return Err("membership state sources are missing; provide runtime paths via RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH/RUSTYNET_MEMBERSHIP_LOG_PATH or seed files under artifacts/membership/source".to_string());
+            return Err("membership state sources are missing; provide runtime paths via RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH/RUSTYNET_MEMBERSHIP_LOG_PATH or seed files under artifacts/membership/source".to_owned());
         }
     }
 
@@ -589,13 +589,13 @@ pub fn execute_ops_run_membership_ci_gates() -> Result<String, String> {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(u64::MAX);
         if !membership_bootstrap_state || entries != 0 {
-            return Err("membership audit integrity log missing chain entries".to_string());
+            return Err("membership audit integrity log missing chain entries".to_owned());
         }
     }
 
     write_membership_phase10_report(&root_dir)?;
 
-    Ok("Membership CI gates: PASS".to_string())
+    Ok("Membership CI gates: PASS".to_owned())
 }
 
 /// Standalone entry point: generate `artifacts/phase10/membership_report.json`
@@ -605,7 +605,7 @@ pub fn execute_ops_run_membership_ci_gates() -> Result<String, String> {
 pub fn execute_ops_write_membership_phase10_report() -> Result<String, String> {
     let root_dir = repo_root()?;
     write_membership_phase10_report(&root_dir)?;
-    Ok("membership_report.json written".to_string())
+    Ok("membership_report.json written".to_owned())
 }
 
 /// Write `artifacts/phase10/membership_report.json` recording which membership
@@ -614,7 +614,7 @@ pub fn execute_ops_write_membership_phase10_report() -> Result<String, String> {
 /// successful gates run.
 fn write_membership_phase10_report(root_dir: &Path) -> Result<(), String> {
     let git_commit = run_command_capture("git", &["rev-parse", "HEAD"], Some(root_dir), &[])
-        .map_or_else(|_| "unknown".to_string(), |o| o.stdout.trim().to_string());
+        .map_or_else(|_| "unknown".to_owned(), |o| o.stdout.trim().to_owned());
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -894,7 +894,7 @@ pub fn execute_ops_run_supply_chain_integrity_gates() -> Result<String, String> 
     .success()
     {
         cleanup_files(&cleanup_paths);
-        return Err("supply-chain gate failed: unsigned provenance was accepted".to_string());
+        return Err("supply-chain gate failed: unsigned provenance was accepted".to_owned());
     }
 
     if let Err(err) = copy_file(&release_artifact_path, &tampered_artifact_path) {
@@ -934,11 +934,11 @@ pub fn execute_ops_run_supply_chain_integrity_gates() -> Result<String, String> 
     .success()
     {
         cleanup_files(&cleanup_paths);
-        return Err("supply-chain gate failed: tampered artifact was accepted".to_string());
+        return Err("supply-chain gate failed: tampered artifact was accepted".to_owned());
     }
 
     cleanup_files(&cleanup_paths);
-    Ok("Supply-chain integrity gates: PASS".to_string())
+    Ok("Supply-chain integrity gates: PASS".to_owned())
 }
 
 pub fn execute_ops_run_security_regression_gates() -> Result<String, String> {
@@ -1050,9 +1050,7 @@ pub fn execute_ops_run_security_regression_gates() -> Result<String, String> {
         env_truthy_with_default("CI", false)?,
     )?;
     if require_no_leak_gate && run_no_leak_gate_mode == "0" {
-        return Err(
-            "no-leak dataplane gate disable is forbidden when gate is required".to_string(),
-        );
+        return Err("no-leak dataplane gate disable is forbidden when gate is required".to_owned());
     }
     match run_no_leak_gate_mode.as_str() {
         "1" => run_script(&root_dir, "scripts/ci/no_leak_dataplane_gate.sh", &[])?,
@@ -1061,8 +1059,7 @@ pub fn execute_ops_run_security_regression_gates() -> Result<String, String> {
                 run_script(&root_dir, "scripts/ci/no_leak_dataplane_gate.sh", &[])?;
             } else if require_no_leak_gate {
                 return Err(
-                    "no-leak dataplane gate is required but host is not eligible (requires root Linux)"
-                        .to_string(),
+                    "no-leak dataplane gate is required but host is not eligible (requires root Linux)".to_owned(),
                 );
             } else {
                 println!("No-leak dataplane gate skipped (requires root Linux).");
@@ -1083,7 +1080,7 @@ pub fn execute_ops_run_security_regression_gates() -> Result<String, String> {
         ensure_linux_for_gate("RUSTYNET_SECURITY_RUN_REAL_NETNS_E2E=1")?;
         if !current_uid_is_root()? {
             return Err(
-                "RUSTYNET_SECURITY_RUN_REAL_NETNS_E2E=1 requires root privileges".to_string(),
+                "RUSTYNET_SECURITY_RUN_REAL_NETNS_E2E=1 requires root privileges".to_owned(),
             );
         }
         run_script(&root_dir, "scripts/e2e/real_wireguard_exitnode_e2e.sh", &[])?;
@@ -1095,18 +1092,17 @@ pub fn execute_ops_run_security_regression_gates() -> Result<String, String> {
         env_truthy_with_default("RUSTYNET_SECURITY_REQUIRE_ACTIVE_NETWORK_GATES", false)?;
     if require_active_network_gates && !run_active_network_gates {
         return Err(
-            "active network security gates are required but disabled; set RUSTYNET_SECURITY_RUN_ACTIVE_NETWORK_GATES=1"
-                .to_string(),
+            "active network security gates are required but disabled; set RUSTYNET_SECURITY_RUN_ACTIVE_NETWORK_GATES=1".to_owned(),
         );
     }
     if run_active_network_gates {
         let config = active_network_security_config_from_env()?;
         execute_ops_run_active_network_security_gates(config)?;
     } else if require_active_network_gates {
-        return Err("active network security gates are required but did not execute".to_string());
+        return Err("active network security gates are required but did not execute".to_owned());
     }
 
-    Ok("Security regression gates: PASS".to_string())
+    Ok("Security regression gates: PASS".to_owned())
 }
 
 pub fn execute_ops_run_active_network_security_gates(
@@ -1123,17 +1119,17 @@ pub fn execute_ops_run_active_network_security_gates(
     )?;
 
     let mut common_args = vec![
-        "--exit-host".to_string(),
+        "--exit-host".to_owned(),
         config.exit_host,
-        "--client-host".to_string(),
+        "--client-host".to_owned(),
         config.client_host,
-        "--ssh-user".to_string(),
+        "--ssh-user".to_owned(),
         config.ssh_user,
-        "--ssh-port".to_string(),
+        "--ssh-port".to_owned(),
         config.ssh_port,
-        "--ssh-sudo".to_string(),
+        "--ssh-sudo".to_owned(),
         config.ssh_sudo_mode,
-        "--ssh-allow-cidrs".to_string(),
+        "--ssh-allow-cidrs".to_owned(),
         config.ssh_allow_cidrs,
     ];
     push_optional_arg(&mut common_args, "--ssh-identity", config.ssh_identity);
@@ -1158,7 +1154,7 @@ pub fn execute_ops_run_active_network_security_gates(
         config.baseline_report_path,
     );
     if config.skip_apt {
-        common_args.push("--skip-apt".to_string());
+        common_args.push("--skip-apt".to_owned());
     }
 
     let signed_report_path = config.signed_report_path.to_string_lossy().to_string();
@@ -1166,7 +1162,7 @@ pub fn execute_ops_run_active_network_security_gates(
     let rogue_endpoint_ip = config.rogue_endpoint_ip;
 
     let mut signed_args = common_args.clone();
-    signed_args.push("--tamper-report-path".to_string());
+    signed_args.push("--tamper-report-path".to_owned());
     signed_args.push(signed_report_path);
     run_script_strings(
         &root_dir,
@@ -1176,9 +1172,9 @@ pub fn execute_ops_run_active_network_security_gates(
     )?;
 
     let mut hijack_args = common_args;
-    hijack_args.push("--rogue-endpoint-ip".to_string());
+    hijack_args.push("--rogue-endpoint-ip".to_owned());
     hijack_args.push(rogue_endpoint_ip);
-    hijack_args.push("--hijack-report-path".to_string());
+    hijack_args.push("--hijack-report-path".to_owned());
     hijack_args.push(hijack_report_path);
     run_script_strings(
         &root_dir,
@@ -1187,7 +1183,7 @@ pub fn execute_ops_run_active_network_security_gates(
         &[],
     )?;
 
-    Ok("Active network security gates: PASS".to_string())
+    Ok("Active network security gates: PASS".to_owned())
 }
 
 pub fn execute_ops_run_phase10_hp2_gates() -> Result<String, String> {
@@ -1352,7 +1348,7 @@ pub fn execute_ops_run_phase10_hp2_gates() -> Result<String, String> {
         &[],
     )?;
 
-    Ok("Phase 10 HP2 traversal gates: PASS".to_string())
+    Ok("Phase 10 HP2 traversal gates: PASS".to_owned())
 }
 
 pub fn execute_ops_generate_release_sbom() -> Result<String, String> {
@@ -1472,7 +1468,7 @@ pub fn execute_ops_run_fuzz_smoke() -> Result<String, String> {
             &[],
         )?;
     }
-    Ok("Fuzz smoke: PASS".to_string())
+    Ok("Fuzz smoke: PASS".to_owned())
 }
 
 pub fn active_network_security_config_from_env() -> Result<ActiveNetworkSecurityGatesConfig, String>
@@ -1525,7 +1521,7 @@ fn prepare_security_cargo_context(
             .unwrap_or_else(|| {
                 format!(
                     "{}/.cargo",
-                    env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                    env::var("HOME").unwrap_or_else(|_| ".".to_owned())
                 )
             }),
     );
@@ -1616,15 +1612,15 @@ fn run_security_audit_and_deny(
     #[allow(unreachable_code)]
     let mut env_pairs_owned = Vec::new();
     env_pairs_owned.push((
-        "CARGO_HOME".to_string(),
+        "CARGO_HOME".to_owned(),
         _security.effective_cargo_home.to_string_lossy().to_string(),
     ));
     if let Some(home) = &_security.effective_home {
-        env_pairs_owned.push(("HOME".to_string(), home.to_string_lossy().to_string()));
+        env_pairs_owned.push(("HOME".to_owned(), home.to_string_lossy().to_string()));
     }
     if let Some(rustup_home) = &_security.effective_rustup_home {
         env_pairs_owned.push((
-            "RUSTUP_HOME".to_string(),
+            "RUSTUP_HOME".to_owned(),
             rustup_home.to_string_lossy().to_string(),
         ));
     }
@@ -1814,10 +1810,10 @@ fn detect_host_triple() -> Result<String, String> {
     let output = run_command_capture("rustc", &["-vV"], None, &[])?;
     for line in output.stdout.lines() {
         if let Some(rest) = line.strip_prefix("host: ") {
-            return Ok(rest.trim().to_string());
+            return Ok(rest.trim().to_owned());
         }
     }
-    Err("failed to determine rustc host triple".to_string())
+    Err("failed to determine rustc host triple".to_owned())
 }
 
 fn ensure_security_toolchain_available(toolchain: &str) -> Result<(), String> {
@@ -1886,7 +1882,7 @@ fn run_script_with_env(
 ) -> Result<(), String> {
     let owned_args = args
         .iter()
-        .map(|value| (*value).to_string())
+        .map(|value| (*value).to_owned())
         .collect::<Vec<_>>();
     run_script_strings(root_dir, script, owned_args.as_slice(), env_pairs)
 }
@@ -2041,7 +2037,7 @@ fn run_command_capture(
 
 fn run_logged_test(root_dir: &Path, log_path: &Path, command: &[&str]) -> Result<(), String> {
     if command.is_empty() {
-        return Err("logged test command must not be empty".to_string());
+        return Err("logged test command must not be empty".to_owned());
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -2231,7 +2227,7 @@ fn resolve_path_from_env_or_default(key: &str, default: &str) -> Result<PathBuf,
 fn resolve_path(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("path must not be empty".to_string());
+        return Err("path must not be empty".to_owned());
     }
     let path = PathBuf::from(trimmed);
     if path.is_absolute() {
@@ -2248,7 +2244,7 @@ fn env_optional_string(key: &str) -> Result<Option<String>, String> {
             if trimmed.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(trimmed.to_string()))
+                Ok(Some(trimmed.to_owned()))
             }
         }
         Err(env::VarError::NotPresent) => Ok(None),
@@ -2259,7 +2255,7 @@ fn env_optional_string(key: &str) -> Result<Option<String>, String> {
 }
 
 fn env_string_or_default(key: &str, default: &str) -> Result<String, String> {
-    Ok(env_optional_string(key)?.unwrap_or_else(|| default.to_string()))
+    Ok(env_optional_string(key)?.unwrap_or_else(|| default.to_owned()))
 }
 
 fn required_env_string(key: &str) -> Result<String, String> {
@@ -2466,16 +2462,16 @@ fn timestamp_utc() -> String {
         .output();
     match output {
         Ok(output) if output.status.success() => String::from_utf8(output.stdout)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z\n".to_string())
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z\n".to_owned())
             .trim()
-            .to_string(),
-        _ => "1970-01-01T00:00:00Z".to_string(),
+            .to_owned(),
+        _ => "1970-01-01T00:00:00Z".to_owned(),
     }
 }
 
 fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: Option<String>) {
     if let Some(value) = value {
-        args.push(flag.to_string());
+        args.push(flag.to_owned());
         args.push(value);
     }
 }

@@ -266,9 +266,9 @@ impl ApiAbuseMonitor {
         now_unix: u64,
     ) -> Result<bool, AuthError> {
         let key = (
-            source_ip.to_string(),
-            identity.to_string(),
-            endpoint.to_string(),
+            source_ip.to_owned(),
+            identity.to_owned(),
+            endpoint.to_owned(),
         );
         let history = self.failures.entry(key).or_default();
         let window_start = now_unix.saturating_sub(self.policy.window_secs);
@@ -278,10 +278,10 @@ impl ApiAbuseMonitor {
         if history.len() as u32 >= self.policy.threshold {
             let mut guard = self.alerts.lock().map_err(|_| AuthError::Internal)?;
             guard.push(AbuseAlert {
-                source_ip: source_ip.to_string(),
-                identity: identity.to_string(),
-                endpoint: endpoint.to_string(),
-                reason: reason.to_string(),
+                source_ip: source_ip.to_owned(),
+                identity: identity.to_owned(),
+                endpoint: endpoint.to_owned(),
+                reason: reason.to_owned(),
                 timestamp_unix: now_unix,
             });
             return Ok(true);
@@ -435,18 +435,18 @@ impl AuthSurfaceGuard {
         let locked_until = {
             let lockout = self
                 .lockouts
-                .entry(identity.to_string())
+                .entry(identity.to_owned())
                 .or_insert_with(LockoutState::new);
             lockout.locked_until_unix
         };
 
         if now_unix < locked_until {
             self.record_event(SecurityEvent {
-                endpoint: endpoint.to_string(),
-                source_ip: source_ip.to_string(),
-                identity: identity.to_string(),
-                failure_class: "lockout".to_string(),
-                limiter_decision: "denied_locked".to_string(),
+                endpoint: endpoint.to_owned(),
+                source_ip: source_ip.to_owned(),
+                identity: identity.to_owned(),
+                failure_class: "lockout".to_owned(),
+                limiter_decision: "denied_locked".to_owned(),
                 timestamp_unix: now_unix,
             })?;
             return Err(AuthError::LockedOutUntil(locked_until));
@@ -454,7 +454,7 @@ impl AuthSurfaceGuard {
 
         let ip_bucket = self
             .ip_buckets
-            .entry(source_ip.to_string())
+            .entry(source_ip.to_owned())
             .or_insert_with(|| Bucket::new(self.rate_config.ip_burst, now_unix));
         ip_bucket.consume(
             now_unix,
@@ -464,7 +464,7 @@ impl AuthSurfaceGuard {
 
         let identity_bucket = self
             .identity_buckets
-            .entry(identity.to_string())
+            .entry(identity.to_owned())
             .or_insert_with(|| Bucket::new(self.rate_config.identity_burst, now_unix));
         identity_bucket.consume(
             now_unix,
@@ -478,7 +478,7 @@ impl AuthSurfaceGuard {
     pub fn register_failure(&mut self, identity: &str, now_unix: u64) {
         let lockout = self
             .lockouts
-            .entry(identity.to_string())
+            .entry(identity.to_owned())
             .or_insert_with(LockoutState::new);
 
         lockout.consecutive_failures = lockout.consecutive_failures.saturating_add(1);
@@ -494,7 +494,7 @@ impl AuthSurfaceGuard {
     pub fn register_success(&mut self, identity: &str) {
         let lockout = self
             .lockouts
-            .entry(identity.to_string())
+            .entry(identity.to_owned())
             .or_insert_with(LockoutState::new);
         lockout.consecutive_failures = 0;
         lockout.locked_until_unix = 0;
@@ -705,7 +705,7 @@ impl ThrowawayCredentialStore {
             creator,
             scope,
             kind: CredentialKind::Throwaway,
-            storage_policy: "throwaway_default".to_string(),
+            storage_policy: "throwaway_default".to_owned(),
             created_at_unix,
             expires_at_unix,
             max_uses: 1,
@@ -805,7 +805,7 @@ impl ThrowawayCredentialStore {
             credential.state = ThrowawayCredentialState::Expired;
             drop(guard);
             self.record_audit_event(CredentialAuditEvent {
-                credential_id: id.to_string(),
+                credential_id: id.to_owned(),
                 from_state: Some(ThrowawayCredentialState::Created),
                 to_state: ThrowawayCredentialState::Expired,
                 timestamp_unix: now_unix,
@@ -829,7 +829,7 @@ impl ThrowawayCredentialStore {
         drop(guard);
 
         self.record_audit_event(CredentialAuditEvent {
-            credential_id: id.to_string(),
+            credential_id: id.to_owned(),
             from_state: Some(ThrowawayCredentialState::Created),
             to_state,
             timestamp_unix: now_unix,
@@ -859,12 +859,12 @@ impl ThrowawayCredentialStore {
         drop(guard);
         let generation = self.increment_revocation_generation()?;
         self.record_revocation_event(CredentialRevocationEvent {
-            credential_id: id.to_string(),
+            credential_id: id.to_owned(),
             generation,
             revoked_at_unix: now_unix,
         })?;
         self.record_audit_event(CredentialAuditEvent {
-            credential_id: id.to_string(),
+            credential_id: id.to_owned(),
             from_state: Some(ThrowawayCredentialState::Created),
             to_state: ThrowawayCredentialState::Revoked,
             timestamp_unix: now_unix,
@@ -1070,13 +1070,13 @@ pub fn load_trust_state(path: impl AsRef<Path>) -> Result<TrustState, TrustState
                 generation = value.parse::<u64>().ok();
             }
             "signing_fingerprint" => {
-                fingerprint = Some(value.to_string());
+                fingerprint = Some(value.to_owned());
             }
             "updated_at_unix" => {
                 updated_at = value.parse::<u64>().ok();
             }
             "mac" => {
-                mac = Some(value.to_string());
+                mac = Some(value.to_owned());
             }
             _ => return Err(TrustStateError::InvalidFormat),
         }
@@ -1137,7 +1137,7 @@ fn load_trust_state_mac_key(path: &Path) -> Result<[u8; 32], TrustStateError> {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .ok_or(TrustStateError::KeyUnavailable)?
-        .to_string();
+        .to_owned();
     content.zeroize();
     let key = decode_hex_to_fixed::<32>(&key_line).map_err(|_| TrustStateError::InvalidFormat)?;
     key_line.zeroize();
@@ -1464,27 +1464,27 @@ pub fn parse_signed_relay_fleet_bundle_wire(
     let relay_count = parse_relay_fleet_required_usize(&fields, "relay_count")?;
     if parse_relay_fleet_required_u64(&fields, "version")? != 1 {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet bundle unsupported version".to_string(),
+            "relay fleet bundle unsupported version".to_owned(),
         ));
     }
     if generated_at_unix == 0 || generated_at_unix >= expires_at_unix {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet bundle invalid generated/expires ordering".to_string(),
+            "relay fleet bundle invalid generated/expires ordering".to_owned(),
         ));
     }
     if expires_at_unix.saturating_sub(generated_at_unix) > 300 {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet bundle ttl exceeds max supported value".to_string(),
+            "relay fleet bundle ttl exceeds max supported value".to_owned(),
         ));
     }
     if nonce == 0 {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet bundle nonce must be greater than zero".to_string(),
+            "relay fleet bundle nonce must be greater than zero".to_owned(),
         ));
     }
     if relay_count == 0 || relay_count > 64 {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet bundle relay_count out of range".to_string(),
+            "relay fleet bundle relay_count out of range".to_owned(),
         ));
     }
     let relays = parse_relay_fleet_descriptors(&fields, relay_count)?;
@@ -1492,7 +1492,7 @@ pub fn parse_signed_relay_fleet_bundle_wire(
         serialize_relay_fleet_payload(generated_at_unix, expires_at_unix, nonce, &relays)?;
     if expected_payload != payload {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet bundle payload is not canonical".to_string(),
+            "relay fleet bundle payload is not canonical".to_owned(),
         ));
     }
     Ok(SignedRelayFleetBundle {
@@ -1637,16 +1637,16 @@ pub const MAX_RELAY_SESSION_TOKEN_TTL_SECS: u64 = 120;
 pub fn canonical_relay_id_from_label(label: &str) -> Result<[u8; 16], String> {
     let trimmed = label.trim();
     if trimmed.is_empty() {
-        return Err("relay_id must not be empty".to_string());
+        return Err("relay_id must not be empty".to_owned());
     }
     if !trimmed.is_ascii() {
-        return Err("relay_id must be ASCII".to_string());
+        return Err("relay_id must be ASCII".to_owned());
     }
     if !is_single_line_payload_value(trimmed) {
-        return Err("relay_id must be a single-line payload value".to_string());
+        return Err("relay_id must be a single-line payload value".to_owned());
     }
     if trimmed.len() > 16 {
-        return Err("relay_id must be at most 16 ASCII bytes".to_string());
+        return Err("relay_id must be at most 16 ASCII bytes".to_owned());
     }
     let mut relay_id = [0u8; 16];
     relay_id[..trimmed.len()].copy_from_slice(trimmed.as_bytes());
@@ -1736,10 +1736,10 @@ impl RelaySessionToken {
             .try_fill_bytes(&mut nonce)
             .expect("os randomness unavailable for relay token nonce");
         let mut token = Self {
-            node_id: node_id.to_string(),
-            peer_node_id: peer_node_id.to_string(),
+            node_id: node_id.to_owned(),
+            peer_node_id: peer_node_id.to_owned(),
             relay_id,
-            scope: RELAY_TOKEN_SCOPE.to_string(),
+            scope: RELAY_TOKEN_SCOPE.to_owned(),
             issued_at_unix,
             expires_at_unix: issued_at_unix.saturating_add(ttl_secs),
             nonce,
@@ -1824,7 +1824,7 @@ pub fn relay_session_token_to_wire(token: &RelaySessionToken) -> String {
 pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, ControlPlaneError> {
     if wire.trim().is_empty() {
         return Err(ControlPlaneError::Traversal(
-            "relay session token wire is empty".to_string(),
+            "relay session token wire is empty".to_owned(),
         ));
     }
 
@@ -1836,12 +1836,12 @@ pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, C
     for line in wire.lines() {
         if signature_hex.is_some() {
             return Err(ControlPlaneError::Traversal(
-                "relay session token signature must be the final line".to_string(),
+                "relay session token signature must be the final line".to_owned(),
             ));
         }
         let Some((key, value)) = line.split_once('=') else {
             return Err(ControlPlaneError::Traversal(
-                "relay session token line missing key/value separator".to_string(),
+                "relay session token line missing key/value separator".to_owned(),
             ));
         };
         if !is_allowed_relay_session_token_key(key) {
@@ -1853,47 +1853,47 @@ pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, C
             let value = value.trim();
             if value.is_empty() {
                 return Err(ControlPlaneError::Traversal(
-                    "relay session token signature must not be empty".to_string(),
+                    "relay session token signature must not be empty".to_owned(),
                 ));
             }
-            signature_hex = Some(value.to_string());
+            signature_hex = Some(value.to_owned());
             continue;
         }
-        if !seen_keys.insert(key.to_string()) {
+        if !seen_keys.insert(key.to_owned()) {
             return Err(ControlPlaneError::Traversal(format!(
                 "relay session token duplicate key: {key}"
             )));
         }
-        fields.insert(key.to_string(), value.to_string());
+        fields.insert(key.to_owned(), value.to_owned());
         payload.push_str(line);
         payload.push('\n');
     }
 
     let signature_hex = signature_hex.ok_or_else(|| {
-        ControlPlaneError::Traversal("relay session token missing signature".to_string())
+        ControlPlaneError::Traversal("relay session token missing signature".to_owned())
     })?;
     let version = required_relay_token_field(&fields, "version")?;
     if version != "1" {
         return Err(ControlPlaneError::Traversal(
-            "relay session token version must be 1".to_string(),
+            "relay session token version must be 1".to_owned(),
         ));
     }
     let scope = required_relay_token_field(&fields, "scope")?;
     if scope != RELAY_TOKEN_SCOPE {
         return Err(ControlPlaneError::Traversal(
-            "relay session token scope is invalid".to_string(),
+            "relay session token scope is invalid".to_owned(),
         ));
     }
-    let node_id = required_relay_token_field(&fields, "node_id")?.to_string();
-    let peer_node_id = required_relay_token_field(&fields, "peer_node_id")?.to_string();
+    let node_id = required_relay_token_field(&fields, "node_id")?.to_owned();
+    let peer_node_id = required_relay_token_field(&fields, "peer_node_id")?.to_owned();
     if node_id.is_empty() || peer_node_id.is_empty() {
         return Err(ControlPlaneError::Traversal(
-            "relay session token node ids must not be empty".to_string(),
+            "relay session token node ids must not be empty".to_owned(),
         ));
     }
     if node_id == peer_node_id {
         return Err(ControlPlaneError::Traversal(
-            "relay session token requires distinct node and peer".to_string(),
+            "relay session token requires distinct node and peer".to_owned(),
         ));
     }
 
@@ -1903,11 +1903,11 @@ pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, C
         .map_err(|_| ControlPlaneError::Traversal("relay session token nonce invalid".into()))?;
     if nonce == [0u8; 16] {
         return Err(ControlPlaneError::Traversal(
-            "relay session token nonce must not be all zero".to_string(),
+            "relay session token nonce must not be all zero".to_owned(),
         ));
     }
     let signature = decode_hex_to_fixed::<64>(&signature_hex).map_err(|_| {
-        ControlPlaneError::Traversal("relay session token signature invalid".to_string())
+        ControlPlaneError::Traversal("relay session token signature invalid".to_owned())
     })?;
     let issued_at_unix =
         parse_relay_token_u64(required_relay_token_field(&fields, "issued_at_unix")?)?;
@@ -1915,7 +1915,7 @@ pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, C
         parse_relay_token_u64(required_relay_token_field(&fields, "expires_at_unix")?)?;
     if issued_at_unix == 0 || expires_at_unix <= issued_at_unix {
         return Err(ControlPlaneError::Traversal(
-            "relay session token timestamps are invalid".to_string(),
+            "relay session token timestamps are invalid".to_owned(),
         ));
     }
 
@@ -1923,7 +1923,7 @@ pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, C
         node_id,
         peer_node_id,
         relay_id,
-        scope: scope.to_string(),
+        scope: scope.to_owned(),
         issued_at_unix,
         expires_at_unix,
         nonce,
@@ -1936,7 +1936,7 @@ pub fn parse_relay_session_token_wire(wire: &str) -> Result<RelaySessionToken, C
     }
     if token.canonical_payload() != payload {
         return Err(ControlPlaneError::Traversal(
-            "relay session token payload is not canonical".to_string(),
+            "relay session token payload is not canonical".to_owned(),
         ));
     }
     Ok(token)
@@ -2408,26 +2408,26 @@ impl ControlPlaneCore {
     ) -> Result<SignedAutoTunnelBundle, ControlPlaneError> {
         if request.ttl_secs == 0 {
             return Err(ControlPlaneError::Assignment(
-                "auto-tunnel ttl must be greater than zero".to_string(),
+                "auto-tunnel ttl must be greater than zero".to_owned(),
             ));
         }
         if request.ttl_secs > 24 * 60 * 60 {
             return Err(ControlPlaneError::Assignment(
-                "auto-tunnel ttl exceeds max supported value".to_string(),
+                "auto-tunnel ttl exceeds max supported value".to_owned(),
             ));
         }
         if !is_valid_ipv4_or_ipv6_cidr(&request.mesh_cidr) {
             return Err(ControlPlaneError::Assignment(
-                "mesh cidr is invalid".to_string(),
+                "mesh cidr is invalid".to_owned(),
             ));
         }
 
         let target = self.nodes.get(&request.node_id)?.ok_or_else(|| {
-            ControlPlaneError::Assignment("requested node does not exist".to_string())
+            ControlPlaneError::Assignment("requested node does not exist".to_owned())
         })?;
         if target.endpoint.parse::<SocketAddr>().is_err() {
             return Err(ControlPlaneError::Assignment(
-                "requested node endpoint is invalid".to_string(),
+                "requested node endpoint is invalid".to_owned(),
             ));
         }
 
@@ -2441,9 +2441,7 @@ impl ControlPlaneCore {
             .get(target.node_id.as_str())
             .cloned()
             .ok_or_else(|| {
-                ControlPlaneError::Assignment(
-                    "requested node assignment is unavailable".to_string(),
-                )
+                ControlPlaneError::Assignment("requested node assignment is unavailable".to_owned())
             })?;
 
         let mut selected_peers = Vec::new();
@@ -2478,22 +2476,22 @@ impl ControlPlaneCore {
 
         if let Some(exit_node_id) = request.exit_node_id.as_deref() {
             let exit_node = self.nodes.get(exit_node_id)?.ok_or_else(|| {
-                ControlPlaneError::Assignment("exit node does not exist".to_string())
+                ControlPlaneError::Assignment("exit node does not exist".to_owned())
             })?;
             if !self.policy_allows_node_pair(&target, &exit_node) {
                 return Err(ControlPlaneError::Assignment(
-                    "exit node denied by policy".to_string(),
+                    "exit node denied by policy".to_owned(),
                 ));
             }
             bundle_routes.push(AutoTunnelRoute {
-                destination_cidr: "0.0.0.0/0".to_string(),
+                destination_cidr: "0.0.0.0/0".to_owned(),
                 via_node: exit_node.node_id.clone(),
                 kind: AutoTunnelRouteKind::ExitNodeDefault,
             });
             for cidr in &request.lan_routes {
                 if !is_valid_ipv4_or_ipv6_cidr(cidr) {
                     return Err(ControlPlaneError::Assignment(
-                        "lan route cidr is invalid".to_string(),
+                        "lan route cidr is invalid".to_owned(),
                     ));
                 }
                 bundle_routes.push(AutoTunnelRoute {
@@ -2561,7 +2559,7 @@ impl ControlPlaneCore {
         let subject = self
             .nodes
             .get(&request.subject_node_id)?
-            .ok_or_else(|| ControlPlaneError::Dns("subject node does not exist".to_string()))?;
+            .ok_or_else(|| ControlPlaneError::Dns("subject node does not exist".to_owned()))?;
 
         let mut peers = self.nodes.list()?;
         peers.sort_by(|left, right| left.node_id.cmp(&right.node_id));
@@ -2574,11 +2572,11 @@ impl ControlPlaneCore {
             let target = self
                 .nodes
                 .get(&record.target_node_id)?
-                .ok_or_else(|| ControlPlaneError::Dns("target node does not exist".to_string()))?;
+                .ok_or_else(|| ControlPlaneError::Dns("target node does not exist".to_owned()))?;
             if target.node_id != subject.node_id && !self.policy_allows_node_pair(&subject, &target)
             {
                 return Err(ControlPlaneError::Dns(
-                    "dns record target denied by policy".to_string(),
+                    "dns record target denied by policy".to_owned(),
                 ));
             }
 
@@ -2586,10 +2584,10 @@ impl ControlPlaneCore {
                 tunnel_assignments
                     .get(target.node_id.as_str())
                     .ok_or_else(|| {
-                        ControlPlaneError::Dns("target node assignment is unavailable".to_string())
+                        ControlPlaneError::Dns("target node assignment is unavailable".to_owned())
                     })?;
             let expected_ip = host_ip_from_host_cidr(expected_cidr.as_str()).ok_or_else(|| {
-                ControlPlaneError::Dns("target node assignment must be a host cidr".to_string())
+                ControlPlaneError::Dns("target node assignment must be a host cidr".to_owned())
             })?;
             canonical_records.push(DnsZoneRecordInput {
                 label: record.label,
@@ -2620,85 +2618,87 @@ impl ControlPlaneCore {
     ) -> Result<SignedEndpointHintBundle, ControlPlaneError> {
         if request.ttl_secs == 0 {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hint ttl must be greater than zero".to_string(),
+                "endpoint hint ttl must be greater than zero".to_owned(),
             ));
         }
         if request.ttl_secs > 86400 {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hint ttl exceeds max supported value".to_string(),
+                "endpoint hint ttl exceeds max supported value".to_owned(),
             ));
         }
         if request.generated_at_unix == 0 {
             return Err(ControlPlaneError::Traversal(
-                "generated_at_unix must be greater than zero".to_string(),
+                "generated_at_unix must be greater than zero".to_owned(),
             ));
         }
         if request.candidates.is_empty() {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hints require at least one candidate".to_string(),
+                "endpoint hints require at least one candidate".to_owned(),
             ));
         }
         if request.candidates.len() > 8 {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hints exceed max candidate count".to_string(),
+                "endpoint hints exceed max candidate count".to_owned(),
             ));
         }
         if !is_valid_node_id_text(request.source_node_id.as_str()) {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hint source_node_id must not be empty".to_string(),
+                "endpoint hint source_node_id must not be empty".to_owned(),
             ));
         }
         if !is_valid_node_id_text(request.target_node_id.as_str()) {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hint target_node_id must not be empty".to_string(),
+                "endpoint hint target_node_id must not be empty".to_owned(),
             ));
         }
         if request.source_node_id.trim() == request.target_node_id.trim() {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hints require distinct source and target".to_string(),
+                "endpoint hints require distinct source and target".to_owned(),
             ));
         }
 
-        let source = self.nodes.get(&request.source_node_id)?.ok_or_else(|| {
-            ControlPlaneError::Traversal("source node does not exist".to_string())
-        })?;
-        let target = self.nodes.get(&request.target_node_id)?.ok_or_else(|| {
-            ControlPlaneError::Traversal("target node does not exist".to_string())
-        })?;
+        let source = self
+            .nodes
+            .get(&request.source_node_id)?
+            .ok_or_else(|| ControlPlaneError::Traversal("source node does not exist".to_owned()))?;
+        let target = self
+            .nodes
+            .get(&request.target_node_id)?
+            .ok_or_else(|| ControlPlaneError::Traversal("target node does not exist".to_owned()))?;
         if !self.policy_allows_node_pair(&source, &target) {
             return Err(ControlPlaneError::Traversal(
-                "endpoint hints denied by policy".to_string(),
+                "endpoint hints denied by policy".to_owned(),
             ));
         }
 
         let expires_at_unix = request.generated_at_unix.saturating_add(request.ttl_secs);
         if request.generated_at_unix >= expires_at_unix {
             return Err(ControlPlaneError::Traversal(
-                "invalid generated/expires ordering".to_string(),
+                "invalid generated/expires ordering".to_owned(),
             ));
         }
 
         let mut seen_candidates = HashSet::new();
         for candidate in &request.candidates {
             let endpoint = candidate.endpoint.parse::<SocketAddr>().map_err(|_| {
-                ControlPlaneError::Traversal("candidate endpoint is invalid".to_string())
+                ControlPlaneError::Traversal("candidate endpoint is invalid".to_owned())
             })?;
             if endpoint.port() == 0 {
                 return Err(ControlPlaneError::Traversal(
-                    "candidate endpoint port must be non-zero".to_string(),
+                    "candidate endpoint port must be non-zero".to_owned(),
                 ));
             }
             if matches!(candidate.candidate_type, EndpointHintCandidateType::Relay) {
                 let relay_id = candidate.relay_id.as_deref().unwrap_or("").trim();
                 if relay_id.is_empty() {
                     return Err(ControlPlaneError::Traversal(
-                        "relay candidates require relay_id".to_string(),
+                        "relay candidates require relay_id".to_owned(),
                     ));
                 }
                 canonical_relay_id_from_label(relay_id).map_err(ControlPlaneError::Traversal)?;
             } else if candidate.relay_id.is_some() {
                 return Err(ControlPlaneError::Traversal(
-                    "relay_id is only valid for relay candidates".to_string(),
+                    "relay_id is only valid for relay candidates".to_owned(),
                 ));
             }
 
@@ -2707,7 +2707,7 @@ impl ControlPlaneCore {
                 .as_deref()
                 .unwrap_or("")
                 .trim()
-                .to_string();
+                .to_owned();
             let uniqueness = format!(
                 "{}|{}|{}",
                 candidate.candidate_type.as_str(),
@@ -2716,7 +2716,7 @@ impl ControlPlaneCore {
             );
             if !seen_candidates.insert(uniqueness) {
                 return Err(ControlPlaneError::Traversal(
-                    "duplicate endpoint hint candidate".to_string(),
+                    "duplicate endpoint hint candidate".to_owned(),
                 ));
             }
         }
@@ -2747,38 +2747,38 @@ impl ControlPlaneCore {
     ) -> Result<SignedRelayFleetBundle, ControlPlaneError> {
         if request.generated_at_unix == 0 {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet generated_at_unix must be greater than zero".to_string(),
+                "relay fleet generated_at_unix must be greater than zero".to_owned(),
             ));
         }
         if request.ttl_secs == 0 {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet ttl must be greater than zero".to_string(),
+                "relay fleet ttl must be greater than zero".to_owned(),
             ));
         }
         if request.ttl_secs > 300 {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet ttl exceeds max supported value".to_string(),
+                "relay fleet ttl exceeds max supported value".to_owned(),
             ));
         }
         if request.nonce == 0 {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet nonce must be greater than zero".to_string(),
+                "relay fleet nonce must be greater than zero".to_owned(),
             ));
         }
         if request.relays.is_empty() {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet requires at least one relay".to_string(),
+                "relay fleet requires at least one relay".to_owned(),
             ));
         }
         if request.relays.len() > 64 {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet exceeds max relay count".to_string(),
+                "relay fleet exceeds max relay count".to_owned(),
             ));
         }
         let expires_at_unix = request.generated_at_unix.saturating_add(request.ttl_secs);
         if request.generated_at_unix >= expires_at_unix {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet invalid generated/expires ordering".to_string(),
+                "relay fleet invalid generated/expires ordering".to_owned(),
             ));
         }
 
@@ -2786,18 +2786,18 @@ impl ControlPlaneCore {
         let mut seen_endpoints = HashSet::new();
         for relay in &request.relays {
             validate_relay_fleet_node_descriptor(relay)?;
-            let relay_id = relay.relay_id.trim().to_string();
+            let relay_id = relay.relay_id.trim().to_owned();
             if !seen_relay_ids.insert(relay_id) {
                 return Err(ControlPlaneError::Traversal(
-                    "duplicate relay fleet relay_id".to_string(),
+                    "duplicate relay fleet relay_id".to_owned(),
                 ));
             }
             let endpoint = relay.endpoint.parse::<SocketAddr>().map_err(|_| {
-                ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string())
+                ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_owned())
             })?;
             if !seen_endpoints.insert(endpoint) {
                 return Err(ControlPlaneError::Traversal(
-                    "duplicate relay fleet endpoint".to_string(),
+                    "duplicate relay fleet endpoint".to_owned(),
                 ));
             }
         }
@@ -2826,12 +2826,12 @@ impl ControlPlaneCore {
     ) -> Result<RelaySessionToken, ControlPlaneError> {
         if request.requested_at_unix == 0 {
             return Err(ControlPlaneError::Traversal(
-                "relay token requested_at_unix must be greater than zero".to_string(),
+                "relay token requested_at_unix must be greater than zero".to_owned(),
             ));
         }
         if request.ttl_secs == 0 {
             return Err(ControlPlaneError::Traversal(
-                "relay token ttl must be greater than zero".to_string(),
+                "relay token ttl must be greater than zero".to_owned(),
             ));
         }
         if request.ttl_secs > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
@@ -2841,21 +2841,21 @@ impl ControlPlaneCore {
         }
         if request.node_id == request.peer_node_id {
             return Err(ControlPlaneError::Traversal(
-                "relay token requires distinct node and peer".to_string(),
+                "relay token requires distinct node and peer".to_owned(),
             ));
         }
         let relay_id = canonical_relay_id_from_label(&request.relay_id)
             .map_err(ControlPlaneError::Traversal)?;
 
         let source = self.nodes.get(&request.node_id)?.ok_or_else(|| {
-            ControlPlaneError::Traversal("relay token source node does not exist".to_string())
+            ControlPlaneError::Traversal("relay token source node does not exist".to_owned())
         })?;
         let target = self.nodes.get(&request.peer_node_id)?.ok_or_else(|| {
-            ControlPlaneError::Traversal("relay token peer node does not exist".to_string())
+            ControlPlaneError::Traversal("relay token peer node does not exist".to_owned())
         })?;
         if !self.policy_allows_node_pair(&source, &target) {
             return Err(ControlPlaneError::Traversal(
-                "relay token denied by policy".to_string(),
+                "relay token denied by policy".to_owned(),
             ));
         }
 
@@ -2875,65 +2875,65 @@ impl ControlPlaneCore {
     ) -> Result<SignedTraversalCoordinationRecord, ControlPlaneError> {
         if record.issued_at_unix == 0 {
             return Err(ControlPlaneError::Traversal(
-                "coordination issued_at_unix must be greater than zero".to_string(),
+                "coordination issued_at_unix must be greater than zero".to_owned(),
             ));
         }
         if record.probe_start_unix == 0 {
             return Err(ControlPlaneError::Traversal(
-                "coordination probe_start_unix must be greater than zero".to_string(),
+                "coordination probe_start_unix must be greater than zero".to_owned(),
             ));
         }
         if record.issued_at_unix >= record.expires_at_unix {
             return Err(ControlPlaneError::Traversal(
-                "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
+                "coordination expires_at_unix must be greater than issued_at_unix".to_owned(),
             ));
         }
         if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 86400 {
             return Err(ControlPlaneError::Traversal(
-                "coordination ttl exceeds max supported value".to_string(),
+                "coordination ttl exceeds max supported value".to_owned(),
             ));
         }
         if record.probe_start_unix > record.expires_at_unix {
             return Err(ControlPlaneError::Traversal(
-                "coordination probe_start_unix must not exceed expires_at_unix".to_string(),
+                "coordination probe_start_unix must not exceed expires_at_unix".to_owned(),
             ));
         }
         if record.node_a.trim() == record.node_b.trim() {
             return Err(ControlPlaneError::Traversal(
-                "coordination requires distinct node_a and node_b".to_string(),
+                "coordination requires distinct node_a and node_b".to_owned(),
             ));
         }
         if !is_valid_node_id_text(record.node_a.as_str()) {
             return Err(ControlPlaneError::Traversal(
-                "coordination node_a must not be empty".to_string(),
+                "coordination node_a must not be empty".to_owned(),
             ));
         }
         if !is_valid_node_id_text(record.node_b.as_str()) {
             return Err(ControlPlaneError::Traversal(
-                "coordination node_b must not be empty".to_string(),
+                "coordination node_b must not be empty".to_owned(),
             ));
         }
 
         if record.session_id.iter().all(|value| *value == 0) {
             return Err(ControlPlaneError::Traversal(
-                "coordination session_id must not be all zeros".to_string(),
+                "coordination session_id must not be all zeros".to_owned(),
             ));
         }
         if record.nonce.iter().all(|value| *value == 0) {
             return Err(ControlPlaneError::Traversal(
-                "coordination nonce must not be all zeros".to_string(),
+                "coordination nonce must not be all zeros".to_owned(),
             ));
         }
 
         let node_a = self.nodes.get(record.node_a.as_str())?.ok_or_else(|| {
-            ControlPlaneError::Traversal("coordination node_a does not exist".to_string())
+            ControlPlaneError::Traversal("coordination node_a does not exist".to_owned())
         })?;
         let node_b = self.nodes.get(record.node_b.as_str())?.ok_or_else(|| {
-            ControlPlaneError::Traversal("coordination node_b does not exist".to_string())
+            ControlPlaneError::Traversal("coordination node_b does not exist".to_owned())
         })?;
         if !self.policy_allows_node_pair(&node_a, &node_b) {
             return Err(ControlPlaneError::Traversal(
-                "coordination denied by policy".to_string(),
+                "coordination denied by policy".to_owned(),
             ));
         }
 
@@ -3198,7 +3198,7 @@ impl ControlPlaneCore {
 
         if ordered_ids.len() as u32 > MAX_OFFSET {
             return Err(ControlPlaneError::Assignment(
-                "no available tunnel cidr assignment remains".to_string(),
+                "no available tunnel cidr assignment remains".to_owned(),
             ));
         }
 
@@ -3215,7 +3215,7 @@ impl ControlPlaneCore {
                 offset = if offset == MAX_OFFSET { 1 } else { offset + 1 };
                 if offset == start {
                     return Err(ControlPlaneError::Assignment(
-                        "no available tunnel cidr assignment remains".to_string(),
+                        "no available tunnel cidr assignment remains".to_owned(),
                     ));
                 }
             }
@@ -3437,7 +3437,7 @@ fn required_relay_token_field<'a>(
 
 fn parse_relay_token_u64(value: &str) -> Result<u64, ControlPlaneError> {
     value.parse::<u64>().map_err(|_| {
-        ControlPlaneError::Traversal("relay session token timestamp is invalid".to_string())
+        ControlPlaneError::Traversal("relay session token timestamp is invalid".to_owned())
     })
 }
 
@@ -3532,7 +3532,7 @@ fn host_ip_from_host_cidr(value: &str) -> Option<String> {
     if prefix != "32" && prefix != "128" {
         return None;
     }
-    Some(ip.to_string())
+    Some(ip.to_owned())
 }
 
 /// Look up the first occurrence of `key=` in an endpoint-hint payload and
@@ -3590,12 +3590,12 @@ fn serialize_endpoint_hint_payload(
     for (index, candidate) in ordered.iter().enumerate() {
         let endpoint = candidate.endpoint.parse::<SocketAddr>().map_err(|_| {
             ControlPlaneError::Traversal(
-                "candidate endpoint failed canonical serialization".to_string(),
+                "candidate endpoint failed canonical serialization".to_owned(),
             )
         })?;
         if endpoint.port() == 0 {
             return Err(ControlPlaneError::Traversal(
-                "candidate endpoint port must be non-zero".to_string(),
+                "candidate endpoint port must be non-zero".to_owned(),
             ));
         }
 
@@ -3608,13 +3608,13 @@ fn serialize_endpoint_hint_payload(
         if matches!(candidate.candidate_type, EndpointHintCandidateType::Relay) {
             if relay_id.is_empty() {
                 return Err(ControlPlaneError::Traversal(
-                    "relay candidates require relay_id".to_string(),
+                    "relay candidates require relay_id".to_owned(),
                 ));
             }
             canonical_relay_id_from_label(relay_id).map_err(ControlPlaneError::Traversal)?;
         } else if !relay_id.is_empty() {
             return Err(ControlPlaneError::Traversal(
-                "relay_id is only valid for relay candidates".to_string(),
+                "relay_id is only valid for relay candidates".to_owned(),
             ));
         }
 
@@ -3640,44 +3640,44 @@ fn validate_relay_fleet_node_descriptor(
     let relay_id = relay.relay_id.trim();
     if !is_single_line_payload_value(relay_id) {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet relay_id must be a single-line payload value".to_string(),
+            "relay fleet relay_id must be a single-line payload value".to_owned(),
         ));
     }
     canonical_relay_id_from_label(relay_id).map_err(ControlPlaneError::Traversal)?;
     let region = relay.region.trim();
     if region.is_empty() {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet region must not be empty".to_string(),
+            "relay fleet region must not be empty".to_owned(),
         ));
     }
     if !region.is_ascii() || region.len() > 64 {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet region must be bounded ASCII".to_string(),
+            "relay fleet region must be bounded ASCII".to_owned(),
         ));
     }
     if !is_single_line_payload_value(region) {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet region must be a single-line payload value".to_string(),
+            "relay fleet region must be a single-line payload value".to_owned(),
         ));
     }
     let endpoint = relay
         .endpoint
         .parse::<SocketAddr>()
-        .map_err(|_| ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string()))?;
+        .map_err(|_| ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_owned()))?;
     if endpoint.port() == 0 {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet endpoint port must be non-zero".to_string(),
+            "relay fleet endpoint port must be non-zero".to_owned(),
         ));
     }
     if endpoint.ip().is_unspecified() || endpoint.ip().is_loopback() || endpoint.ip().is_multicast()
     {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet endpoint must not use special transport address".to_string(),
+            "relay fleet endpoint must not use special transport address".to_owned(),
         ));
     }
     if relay.capacity == 0 {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet capacity must be greater than zero".to_string(),
+            "relay fleet capacity must be greater than zero".to_owned(),
         ));
     }
     Ok(())
@@ -3720,7 +3720,7 @@ fn serialize_relay_fleet_payload(
     for (index, relay) in relays.iter().enumerate() {
         validate_relay_fleet_node_descriptor(relay)?;
         let endpoint = relay.endpoint.parse::<SocketAddr>().map_err(|_| {
-            ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string())
+            ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_owned())
         })?;
         payload.push_str(&format!("relay.{index}.id={}\n", relay.relay_id.trim()));
         payload.push_str(&format!("relay.{index}.region={}\n", relay.region.trim()));
@@ -3736,7 +3736,7 @@ fn serialize_relay_fleet_payload(
 fn split_signed_relay_fleet_wire(wire: &str) -> Result<(String, String), ControlPlaneError> {
     if wire.trim().is_empty() {
         return Err(ControlPlaneError::Traversal(
-            "relay fleet bundle wire is empty".to_string(),
+            "relay fleet bundle wire is empty".to_owned(),
         ));
     }
     let mut payload = String::new();
@@ -3744,28 +3744,28 @@ fn split_signed_relay_fleet_wire(wire: &str) -> Result<(String, String), Control
     for line in wire.lines() {
         if signature_hex.is_some() {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet bundle signature must be the final line".to_string(),
+                "relay fleet bundle signature must be the final line".to_owned(),
             ));
         }
         let Some((key, value)) = line.split_once('=') else {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet bundle line missing key/value separator".to_string(),
+                "relay fleet bundle line missing key/value separator".to_owned(),
             ));
         };
         if key == "signature" {
             if value.trim().is_empty() {
                 return Err(ControlPlaneError::Traversal(
-                    "relay fleet bundle signature must not be empty".to_string(),
+                    "relay fleet bundle signature must not be empty".to_owned(),
                 ));
             }
-            signature_hex = Some(value.trim().to_string());
+            signature_hex = Some(value.trim().to_owned());
         } else {
             payload.push_str(line);
             payload.push('\n');
         }
     }
     let signature_hex = signature_hex.ok_or_else(|| {
-        ControlPlaneError::Traversal("relay fleet bundle missing signature".to_string())
+        ControlPlaneError::Traversal("relay fleet bundle missing signature".to_owned())
     })?;
     Ok((payload, signature_hex))
 }
@@ -3777,15 +3777,15 @@ fn parse_relay_fleet_payload_fields(
     for line in payload.lines() {
         let Some((key, value)) = line.split_once('=') else {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet payload line missing key/value separator".to_string(),
+                "relay fleet payload line missing key/value separator".to_owned(),
             ));
         };
         if key.is_empty() {
             return Err(ControlPlaneError::Traversal(
-                "relay fleet payload key must not be empty".to_string(),
+                "relay fleet payload key must not be empty".to_owned(),
             ));
         }
-        if fields.insert(key.to_string(), value.to_string()).is_some() {
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
             return Err(ControlPlaneError::Traversal(format!(
                 "duplicate relay fleet payload key {key}"
             )));
@@ -3886,19 +3886,19 @@ fn parse_relay_fleet_descriptors(
         let enabled = parse_relay_fleet_required_bool(fields, &enabled_key)?;
         let ip = addr
             .parse::<std::net::IpAddr>()
-            .map_err(|_| ControlPlaneError::Traversal("invalid relay fleet address".to_string()))?;
+            .map_err(|_| ControlPlaneError::Traversal("invalid relay fleet address".to_owned()))?;
         let port = u16::try_from(port)
-            .map_err(|_| ControlPlaneError::Traversal("invalid relay fleet port".to_string()))?;
+            .map_err(|_| ControlPlaneError::Traversal("invalid relay fleet port".to_owned()))?;
         let endpoint = SocketAddr::new(ip, port).to_string();
         let relay = RelayFleetNodeDescriptor {
             relay_id,
             region,
             endpoint,
             priority: u16::try_from(priority).map_err(|_| {
-                ControlPlaneError::Traversal("invalid relay fleet priority".to_string())
+                ControlPlaneError::Traversal("invalid relay fleet priority".to_owned())
             })?,
             capacity: u32::try_from(capacity).map_err(|_| {
-                ControlPlaneError::Traversal("invalid relay fleet capacity".to_string())
+                ControlPlaneError::Traversal("invalid relay fleet capacity".to_owned())
             })?,
             enabled,
         };
@@ -3923,18 +3923,18 @@ fn validate_relay_fleet_descriptor_set(
     let mut seen_endpoints = HashSet::new();
     for relay in relays {
         validate_relay_fleet_node_descriptor(relay)?;
-        let relay_id = relay.relay_id.trim().to_string();
+        let relay_id = relay.relay_id.trim().to_owned();
         if !seen_relay_ids.insert(relay_id) {
             return Err(ControlPlaneError::Traversal(
-                "duplicate relay fleet relay_id".to_string(),
+                "duplicate relay fleet relay_id".to_owned(),
             ));
         }
         let endpoint = relay.endpoint.parse::<SocketAddr>().map_err(|_| {
-            ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_string())
+            ControlPlaneError::Traversal("relay fleet endpoint is invalid".to_owned())
         })?;
         if !seen_endpoints.insert(endpoint) {
             return Err(ControlPlaneError::Traversal(
-                "duplicate relay fleet endpoint".to_string(),
+                "duplicate relay fleet endpoint".to_owned(),
             ));
         }
     }
@@ -3964,37 +3964,37 @@ fn serialize_traversal_coordination_payload(
         || !is_valid_node_id_text(record.node_b.as_str())
     {
         return Err(ControlPlaneError::Traversal(
-            "coordination node ids must not be empty".to_string(),
+            "coordination node ids must not be empty".to_owned(),
         ));
     }
     if record.node_a.trim() == record.node_b.trim() {
         return Err(ControlPlaneError::Traversal(
-            "coordination requires distinct nodes".to_string(),
+            "coordination requires distinct nodes".to_owned(),
         ));
     }
     if record.issued_at_unix >= record.expires_at_unix {
         return Err(ControlPlaneError::Traversal(
-            "coordination expires_at_unix must be greater than issued_at_unix".to_string(),
+            "coordination expires_at_unix must be greater than issued_at_unix".to_owned(),
         ));
     }
     if record.expires_at_unix.saturating_sub(record.issued_at_unix) > 86400 {
         return Err(ControlPlaneError::Traversal(
-            "coordination ttl exceeds max supported value".to_string(),
+            "coordination ttl exceeds max supported value".to_owned(),
         ));
     }
     if record.probe_start_unix > record.expires_at_unix {
         return Err(ControlPlaneError::Traversal(
-            "coordination probe_start_unix must not exceed expires_at_unix".to_string(),
+            "coordination probe_start_unix must not exceed expires_at_unix".to_owned(),
         ));
     }
     if record.session_id.iter().all(|value| *value == 0) {
         return Err(ControlPlaneError::Traversal(
-            "coordination session_id must not be all zeros".to_string(),
+            "coordination session_id must not be all zeros".to_owned(),
         ));
     }
     if record.nonce.iter().all(|value| *value == 0) {
         return Err(ControlPlaneError::Traversal(
-            "coordination nonce must not be all zeros".to_string(),
+            "coordination nonce must not be all zeros".to_owned(),
         ));
     }
 
@@ -4058,7 +4058,7 @@ mod tests {
         payload.lines().find_map(|line| {
             let (line_key, value) = line.split_once('=')?;
             if line_key == key {
-                Some(value.to_string())
+                Some(value.to_owned())
             } else {
                 None
             }
@@ -4123,10 +4123,10 @@ mod tests {
     fn replay_protection_rejects_nonce_reuse() {
         let mut guard = AuthSurfaceGuard::default();
         let claims = TokenClaims {
-            subject: "alice".to_string(),
+            subject: "alice".to_owned(),
             issued_at_unix: 100,
             expires_at_unix: 120,
-            nonce: "nonce-1".to_string(),
+            nonce: "nonce-1".to_owned(),
         };
 
         assert!(guard.validate_token_and_nonce(&claims, 110).is_ok());
@@ -4137,44 +4137,44 @@ mod tests {
     #[test]
     fn token_claims_ct_eq() {
         let a = TokenClaims {
-            subject: "alice".to_string(),
+            subject: "alice".to_owned(),
             issued_at_unix: 100,
             expires_at_unix: 120,
-            nonce: "nonce-1".to_string(),
+            nonce: "nonce-1".to_owned(),
         };
         let b = TokenClaims {
-            subject: "alice".to_string(),
+            subject: "alice".to_owned(),
             issued_at_unix: 100,
             expires_at_unix: 120,
-            nonce: "nonce-1".to_string(),
+            nonce: "nonce-1".to_owned(),
         };
         assert!(a.ct_eq(&b));
 
         let mut c = b.clone();
-        c.nonce = "nonce-2".to_string();
+        c.nonce = "nonce-2".to_owned();
         assert!(!a.ct_eq(&c));
     }
 
     #[test]
     fn signed_token_claims_ct_eq() {
         let claims = TokenClaims {
-            subject: "alice".to_string(),
+            subject: "alice".to_owned(),
             issued_at_unix: 100,
             expires_at_unix: 120,
-            nonce: "nonce-1".to_string(),
+            nonce: "nonce-1".to_owned(),
         };
         let a = SignedTokenClaims {
             claims: claims.clone(),
-            signature_hex: "deadbeef".to_string(),
+            signature_hex: "deadbeef".to_owned(),
         };
         let b = SignedTokenClaims {
             claims,
-            signature_hex: "deadbeef".to_string(),
+            signature_hex: "deadbeef".to_owned(),
         };
         assert!(a.ct_eq(&b));
 
         let mut c = b.clone();
-        c.signature_hex = "cafebabe".to_string();
+        c.signature_hex = "cafebabe".to_owned();
         assert!(!a.ct_eq(&c));
     }
 
@@ -4183,9 +4183,9 @@ mod tests {
         let store = ThrowawayCredentialStore::default();
         let created = store
             .create(
-                "cred-1".to_string(),
-                "alice".to_string(),
-                "tag:servers".to_string(),
+                "cred-1".to_owned(),
+                "alice".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 30,
             )
@@ -4223,9 +4223,9 @@ mod tests {
         let store = Arc::new(ThrowawayCredentialStore::default());
         store
             .create(
-                "cred-race".to_string(),
-                "alice".to_string(),
-                "tag:servers".to_string(),
+                "cred-race".to_owned(),
+                "alice".to_owned(),
+                "tag:servers".to_owned(),
                 200,
                 120,
             )
@@ -4270,7 +4270,7 @@ mod tests {
 
         let state = TrustState {
             generation: 7,
-            signing_fingerprint: "ed25519:abc123".to_string(),
+            signing_fingerprint: "ed25519:abc123".to_owned(),
             updated_at_unix: 1_000,
         };
 
@@ -4294,9 +4294,9 @@ mod tests {
     fn policy_guard_defaults_to_deny() {
         let guard = PolicyGuard::default();
         let decision = guard.evaluate(&PolicyCheckRequest {
-            source: "group:family".to_string(),
-            destination: "tag:servers".to_string(),
-            protocol: "tcp".to_string(),
+            source: "group:family".to_owned(),
+            destination: "tag:servers".to_owned(),
+            protocol: "tcp".to_owned(),
         });
         assert_eq!(decision, PolicyDecision::Deny);
     }
@@ -4318,9 +4318,9 @@ mod tests {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
         core.credentials
             .create(
-                "cred-enroll".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-enroll".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
@@ -4328,13 +4328,13 @@ mod tests {
 
         let response = core
             .enroll_with_throwaway(EnrollmentRequest {
-                credential_id: "cred-enroll".to_string(),
-                node_id: "node-1".to_string(),
-                hostname: "mini-pc-1".to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: "198.51.100.10:51820".to_string(),
+                credential_id: "cred-enroll".to_owned(),
+                node_id: "node-1".to_owned(),
+                hostname: "mini-pc-1".to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: "198.51.100.10:51820".to_owned(),
                 public_key: [3; 32],
                 now_unix: 120,
             })
@@ -4350,13 +4350,13 @@ mod tests {
         assert_eq!(node.hostname, "mini-pc-1");
 
         let second = core.enroll_with_throwaway(EnrollmentRequest {
-            credential_id: "cred-enroll".to_string(),
-            node_id: "node-2".to_string(),
-            hostname: "mini-pc-2".to_string(),
-            os: "linux".to_string(),
-            tags: vec!["servers".to_string()],
-            owner: "alice@example.local".to_string(),
-            endpoint: "198.51.100.11:51820".to_string(),
+            credential_id: "cred-enroll".to_owned(),
+            node_id: "node-2".to_owned(),
+            hostname: "mini-pc-2".to_owned(),
+            os: "linux".to_owned(),
+            tags: vec!["servers".to_owned()],
+            owner: "alice@example.local".to_owned(),
+            endpoint: "198.51.100.11:51820".to_owned(),
             public_key: [4; 32],
             now_unix: 125,
         });
@@ -4368,22 +4368,22 @@ mod tests {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
         core.credentials
             .create(
-                "cred-sign".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-sign".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
             .expect("credential should be created");
 
         core.enroll_with_throwaway(EnrollmentRequest {
-            credential_id: "cred-sign".to_string(),
-            node_id: "node-sign".to_string(),
-            hostname: "mini-pc-sign".to_string(),
-            os: "linux".to_string(),
-            tags: vec!["servers".to_string()],
-            owner: "alice@example.local".to_string(),
-            endpoint: "198.51.100.20:51820".to_string(),
+            credential_id: "cred-sign".to_owned(),
+            node_id: "node-sign".to_owned(),
+            hostname: "mini-pc-sign".to_owned(),
+            os: "linux".to_owned(),
+            tags: vec!["servers".to_owned()],
+            owner: "alice@example.local".to_owned(),
+            endpoint: "198.51.100.20:51820".to_owned(),
             public_key: [8; 32],
             now_unix: 120,
         })
@@ -4402,8 +4402,8 @@ mod tests {
     fn auto_tunnel_bundle_is_centrally_assigned_and_signed() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -4412,43 +4412,43 @@ mod tests {
 
         core.credentials
             .create(
-                "cred-node-a".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-node-a".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
             .expect("credential should be created");
         core.credentials
             .create(
-                "cred-node-b".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-node-b".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
             .expect("credential should be created");
 
         core.enroll_with_throwaway(EnrollmentRequest {
-            credential_id: "cred-node-a".to_string(),
-            node_id: "node-a".to_string(),
-            hostname: "node-a".to_string(),
-            os: "linux".to_string(),
-            tags: vec!["servers".to_string()],
-            owner: "alice@example.local".to_string(),
-            endpoint: "198.51.100.40:51820".to_string(),
+            credential_id: "cred-node-a".to_owned(),
+            node_id: "node-a".to_owned(),
+            hostname: "node-a".to_owned(),
+            os: "linux".to_owned(),
+            tags: vec!["servers".to_owned()],
+            owner: "alice@example.local".to_owned(),
+            endpoint: "198.51.100.40:51820".to_owned(),
             public_key: [41; 32],
             now_unix: 120,
         })
         .expect("enrollment should succeed");
         core.enroll_with_throwaway(EnrollmentRequest {
-            credential_id: "cred-node-b".to_string(),
-            node_id: "node-b".to_string(),
-            hostname: "node-b".to_string(),
-            os: "linux".to_string(),
-            tags: vec!["servers".to_string()],
-            owner: "alice@example.local".to_string(),
-            endpoint: "198.51.100.41:51820".to_string(),
+            credential_id: "cred-node-b".to_owned(),
+            node_id: "node-b".to_owned(),
+            hostname: "node-b".to_owned(),
+            os: "linux".to_owned(),
+            tags: vec!["servers".to_owned()],
+            owner: "alice@example.local".to_owned(),
+            endpoint: "198.51.100.41:51820".to_owned(),
             public_key: [42; 32],
             now_unix: 121,
         })
@@ -4456,13 +4456,13 @@ mod tests {
 
         let bundle = core
             .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
-                node_id: "node-a".to_string(),
+                node_id: "node-a".to_owned(),
                 generated_at_unix: 200,
                 ttl_secs: 300,
                 nonce: 11,
-                mesh_cidr: "100.64.0.0/10".to_string(),
-                exit_node_id: Some("node-b".to_string()),
-                lan_routes: vec!["192.168.1.0/24".to_string()],
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                exit_node_id: Some("node-b".to_owned()),
+                lan_routes: vec!["192.168.1.0/24".to_owned()],
             })
             .expect("auto tunnel bundle should be emitted");
 
@@ -4496,8 +4496,8 @@ mod tests {
     fn auto_tunnel_bundle_is_policy_gated_and_assignment_is_stable() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "node:node-a".to_string(),
-                dst: "node:node-b".to_string(),
+                src: "node:node-a".to_owned(),
+                dst: "node:node-b".to_owned(),
                 protocol: Protocol::Udp,
                 action: RuleAction::Allow,
             }],
@@ -4511,21 +4511,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -4534,22 +4534,22 @@ mod tests {
 
         let first = core
             .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
-                node_id: "node-a".to_string(),
+                node_id: "node-a".to_owned(),
                 generated_at_unix: 200,
                 ttl_secs: 300,
                 nonce: 22,
-                mesh_cidr: "100.64.0.0/10".to_string(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
                 exit_node_id: None,
                 lan_routes: Vec::new(),
             })
             .expect("bundle should be generated");
         let second = core
             .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
-                node_id: "node-a".to_string(),
+                node_id: "node-a".to_owned(),
                 generated_at_unix: 201,
                 ttl_secs: 300,
                 nonce: 23,
-                mesh_cidr: "100.64.0.0/10".to_string(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
                 exit_node_id: None,
                 lan_routes: Vec::new(),
             })
@@ -4571,8 +4571,8 @@ mod tests {
     fn auto_tunnel_bundle_assignments_are_consistent_across_targets() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -4585,21 +4585,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -4608,22 +4608,22 @@ mod tests {
 
         let bundle_a = core
             .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
-                node_id: "node-a".to_string(),
+                node_id: "node-a".to_owned(),
                 generated_at_unix: 200,
                 ttl_secs: 300,
                 nonce: 31,
-                mesh_cidr: "100.64.0.0/10".to_string(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
                 exit_node_id: None,
                 lan_routes: Vec::new(),
             })
             .expect("bundle should be generated");
         let bundle_b = core
             .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
-                node_id: "node-b".to_string(),
+                node_id: "node-b".to_owned(),
                 generated_at_unix: 200,
                 ttl_secs: 300,
                 nonce: 32,
-                mesh_cidr: "100.64.0.0/10".to_string(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
                 exit_node_id: None,
                 lan_routes: Vec::new(),
             })
@@ -4650,8 +4650,8 @@ mod tests {
     fn auto_tunnel_test_core() -> ControlPlaneCore {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -4663,21 +4663,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -4688,11 +4688,11 @@ mod tests {
 
     fn auto_tunnel_request() -> AutoTunnelBundleRequest {
         AutoTunnelBundleRequest {
-            node_id: "node-a".to_string(),
+            node_id: "node-a".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 300,
             nonce: 17,
-            mesh_cidr: "100.64.0.0/10".to_string(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
             exit_node_id: None,
             lan_routes: Vec::new(),
         }
@@ -4722,7 +4722,7 @@ mod tests {
             .signed_auto_tunnel_bundle(auto_tunnel_request())
             .expect("auto tunnel bundle should be emitted");
         assert!(core.verify_signed_auto_tunnel_bundle(&bundle));
-        bundle.node_id = "node-evil".to_string();
+        bundle.node_id = "node-evil".to_owned();
         assert!(
             !core.verify_signed_auto_tunnel_bundle(&bundle),
             "outer node_id mismatched to signed payload must fail"
@@ -4771,7 +4771,7 @@ mod tests {
             .expect("auto tunnel bundle a should be emitted");
         let bundle_b = core
             .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
-                node_id: "node-b".to_string(),
+                node_id: "node-b".to_owned(),
                 ..auto_tunnel_request()
             })
             .expect("auto tunnel bundle b should be emitted");
@@ -4840,8 +4840,8 @@ mod tests {
     fn dns_zone_bundle_is_signed_and_tamper_detected() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -4854,21 +4854,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -4877,18 +4877,18 @@ mod tests {
 
         let bundle = core
             .signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
-                zone_name: "rustynet".to_string(),
-                subject_node_id: "node-a".to_string(),
+                zone_name: "rustynet".to_owned(),
+                subject_node_id: "node-a".to_owned(),
                 generated_at_unix: 200,
                 ttl_secs: 120,
                 nonce: 41,
                 records: vec![DnsRecordRequest {
-                    label: "nas".to_string(),
-                    target_node_id: "node-b".to_string(),
+                    label: "nas".to_owned(),
+                    target_node_id: "node-b".to_owned(),
                     ttl_secs: 60,
                     rr_type: DnsRecordType::A,
                     target_addr_kind: DnsTargetAddrKind::MeshIpv4,
-                    aliases: vec!["storage".to_string()],
+                    aliases: vec!["storage".to_owned()],
                 }],
             })
             .expect("dns zone bundle should be emitted");
@@ -4920,8 +4920,8 @@ mod tests {
     fn dns_zone_bundle_is_policy_gated_and_alias_collisions_are_rejected() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "node:node-a".to_string(),
-                dst: "node:node-b".to_string(),
+                src: "node:node-a".to_owned(),
+                dst: "node:node-b".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -4935,21 +4935,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -4957,14 +4957,14 @@ mod tests {
         }
 
         let denied = core.signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
-            zone_name: "rustynet".to_string(),
-            subject_node_id: "node-a".to_string(),
+            zone_name: "rustynet".to_owned(),
+            subject_node_id: "node-a".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 120,
             nonce: 42,
             records: vec![DnsRecordRequest {
-                label: "db".to_string(),
-                target_node_id: "node-c".to_string(),
+                label: "db".to_owned(),
+                target_node_id: "node-c".to_owned(),
                 ttl_secs: 60,
                 rr_type: DnsRecordType::A,
                 target_addr_kind: DnsTargetAddrKind::MeshIpv4,
@@ -4974,23 +4974,23 @@ mod tests {
         assert!(matches!(denied, Err(super::ControlPlaneError::Dns(_))));
 
         let collision = core.signed_dns_zone_bundle(SignedDnsZoneBundleRequest {
-            zone_name: "rustynet".to_string(),
-            subject_node_id: "node-a".to_string(),
+            zone_name: "rustynet".to_owned(),
+            subject_node_id: "node-a".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 120,
             nonce: 43,
             records: vec![
                 DnsRecordRequest {
-                    label: "nas".to_string(),
-                    target_node_id: "node-b".to_string(),
+                    label: "nas".to_owned(),
+                    target_node_id: "node-b".to_owned(),
                     ttl_secs: 60,
                     rr_type: DnsRecordType::A,
                     target_addr_kind: DnsTargetAddrKind::MeshIpv4,
-                    aliases: vec!["storage".to_string()],
+                    aliases: vec!["storage".to_owned()],
                 },
                 DnsRecordRequest {
-                    label: "storage".to_string(),
-                    target_node_id: "node-b".to_string(),
+                    label: "storage".to_owned(),
+                    target_node_id: "node-b".to_owned(),
                     ttl_secs: 60,
                     rr_type: DnsRecordType::A,
                     target_addr_kind: DnsTargetAddrKind::MeshIpv4,
@@ -5005,8 +5005,8 @@ mod tests {
     fn endpoint_hint_bundle_is_signed_and_tamper_detected() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -5018,21 +5018,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -5041,22 +5041,22 @@ mod tests {
 
         let bundle = core
             .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
-                source_node_id: "node-a".to_string(),
-                target_node_id: "node-b".to_string(),
+                source_node_id: "node-a".to_owned(),
+                target_node_id: "node-b".to_owned(),
                 generated_at_unix: 200,
                 ttl_secs: 60,
                 nonce: 7,
                 candidates: vec![
                     EndpointHintCandidate {
                         candidate_type: EndpointHintCandidateType::Host,
-                        endpoint: "10.0.0.3:51820".to_string(),
+                        endpoint: "10.0.0.3:51820".to_owned(),
                         relay_id: None,
                         priority: 10,
                     },
                     EndpointHintCandidate {
                         candidate_type: EndpointHintCandidateType::Relay,
-                        endpoint: "203.0.113.44:443".to_string(),
-                        relay_id: Some("relay-eu-1".to_string()),
+                        endpoint: "203.0.113.44:443".to_owned(),
+                        relay_id: Some("relay-eu-1".to_owned()),
                         priority: 20,
                     },
                 ],
@@ -5095,36 +5095,36 @@ mod tests {
             deny_all
                 .credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             deny_all
                 .enroll_with_throwaway(EnrollmentRequest {
-                    credential_id: credential_id.to_string(),
-                    node_id: node_id.to_string(),
-                    hostname: node_id.to_string(),
-                    os: "linux".to_string(),
-                    tags: vec!["servers".to_string()],
-                    owner: "alice@example.local".to_string(),
-                    endpoint: endpoint.to_string(),
+                    credential_id: credential_id.to_owned(),
+                    node_id: node_id.to_owned(),
+                    hostname: node_id.to_owned(),
+                    os: "linux".to_owned(),
+                    tags: vec!["servers".to_owned()],
+                    owner: "alice@example.local".to_owned(),
+                    endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
                 })
                 .expect("enrollment should succeed");
         }
         let denied = deny_all.signed_endpoint_hint_bundle(EndpointHintBundleRequest {
-            source_node_id: "node-a".to_string(),
-            target_node_id: "node-b".to_string(),
+            source_node_id: "node-a".to_owned(),
+            target_node_id: "node-b".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 60,
             nonce: 1,
             candidates: vec![EndpointHintCandidate {
                 candidate_type: EndpointHintCandidateType::Host,
-                endpoint: "10.0.0.2:51820".to_string(),
+                endpoint: "10.0.0.2:51820".to_owned(),
                 relay_id: None,
                 priority: 1,
             }],
@@ -5140,8 +5140,8 @@ mod tests {
             b"control-secret".to_vec(),
             PolicySet {
                 rules: vec![PolicyRule {
-                    src: "*".to_string(),
-                    dst: "*".to_string(),
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
                     protocol: Protocol::Any,
                     action: RuleAction::Allow,
                 }],
@@ -5154,22 +5154,22 @@ mod tests {
             allow_all
                 .credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             allow_all
                 .enroll_with_throwaway(EnrollmentRequest {
-                    credential_id: credential_id.to_string(),
-                    node_id: node_id.to_string(),
-                    hostname: node_id.to_string(),
-                    os: "linux".to_string(),
-                    tags: vec!["servers".to_string()],
-                    owner: "alice@example.local".to_string(),
-                    endpoint: endpoint.to_string(),
+                    credential_id: credential_id.to_owned(),
+                    node_id: node_id.to_owned(),
+                    hostname: node_id.to_owned(),
+                    os: "linux".to_owned(),
+                    tags: vec!["servers".to_owned()],
+                    owner: "alice@example.local".to_owned(),
+                    endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
                 })
@@ -5177,21 +5177,21 @@ mod tests {
         }
 
         let duplicate = allow_all.signed_endpoint_hint_bundle(EndpointHintBundleRequest {
-            source_node_id: "node-c".to_string(),
-            target_node_id: "node-d".to_string(),
+            source_node_id: "node-c".to_owned(),
+            target_node_id: "node-d".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 60,
             nonce: 2,
             candidates: vec![
                 EndpointHintCandidate {
                     candidate_type: EndpointHintCandidateType::Host,
-                    endpoint: "10.2.0.2:51820".to_string(),
+                    endpoint: "10.2.0.2:51820".to_owned(),
                     relay_id: None,
                     priority: 100,
                 },
                 EndpointHintCandidate {
                     candidate_type: EndpointHintCandidateType::Host,
-                    endpoint: "10.2.0.2:51820".to_string(),
+                    endpoint: "10.2.0.2:51820".to_owned(),
                     relay_id: None,
                     priority: 1,
                 },
@@ -5205,14 +5205,14 @@ mod tests {
         );
 
         let relay_missing_id = allow_all.signed_endpoint_hint_bundle(EndpointHintBundleRequest {
-            source_node_id: "node-c".to_string(),
-            target_node_id: "node-d".to_string(),
+            source_node_id: "node-c".to_owned(),
+            target_node_id: "node-d".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 60,
             nonce: 3,
             candidates: vec![EndpointHintCandidate {
                 candidate_type: EndpointHintCandidateType::Relay,
-                endpoint: "203.0.113.55:443".to_string(),
+                endpoint: "203.0.113.55:443".to_owned(),
                 relay_id: None,
                 priority: 1,
             }],
@@ -5227,15 +5227,15 @@ mod tests {
         for relay_id in ["relay-éu-1", "relay-label-too-long", "relay\nx", "relay=x"] {
             let err = allow_all
                 .signed_endpoint_hint_bundle(EndpointHintBundleRequest {
-                    source_node_id: "node-c".to_string(),
-                    target_node_id: "node-d".to_string(),
+                    source_node_id: "node-c".to_owned(),
+                    target_node_id: "node-d".to_owned(),
                     generated_at_unix: 200,
                     ttl_secs: 60,
                     nonce: 4,
                     candidates: vec![EndpointHintCandidate {
                         candidate_type: EndpointHintCandidateType::Relay,
-                        endpoint: "203.0.113.55:443".to_string(),
-                        relay_id: Some(relay_id.to_string()),
+                        endpoint: "203.0.113.55:443".to_owned(),
+                        relay_id: Some(relay_id.to_owned()),
                         priority: 1,
                     }],
                 })
@@ -5257,17 +5257,17 @@ mod tests {
                 nonce: 9,
                 relays: vec![
                     RelayFleetNodeDescriptor {
-                        relay_id: "relay-us-1".to_string(),
-                        region: "us-east".to_string(),
-                        endpoint: "203.0.113.45:443".to_string(),
+                        relay_id: "relay-us-1".to_owned(),
+                        region: "us-east".to_owned(),
+                        endpoint: "203.0.113.45:443".to_owned(),
                         priority: 20,
                         capacity: 1024,
                         enabled: true,
                     },
                     RelayFleetNodeDescriptor {
-                        relay_id: "relay-eu-1".to_string(),
-                        region: "eu-west".to_string(),
-                        endpoint: "203.0.113.44:443".to_string(),
+                        relay_id: "relay-eu-1".to_owned(),
+                        region: "eu-west".to_owned(),
+                        endpoint: "203.0.113.44:443".to_owned(),
                         priority: 10,
                         capacity: 2048,
                         enabled: true,
@@ -5324,9 +5324,9 @@ mod tests {
                 ttl_secs: 60,
                 nonce: 0,
                 relays: vec![RelayFleetNodeDescriptor {
-                    relay_id: "relay-eu-1".to_string(),
-                    region: "eu-west".to_string(),
-                    endpoint: "203.0.113.44:443".to_string(),
+                    relay_id: "relay-eu-1".to_owned(),
+                    region: "eu-west".to_owned(),
+                    endpoint: "203.0.113.44:443".to_owned(),
                     priority: 10,
                     capacity: 1,
                     enabled: true,
@@ -5338,9 +5338,9 @@ mod tests {
         for (relays, expected) in [
             (
                 vec![RelayFleetNodeDescriptor {
-                    relay_id: "relay-éu-1".to_string(),
-                    region: "eu-west".to_string(),
-                    endpoint: "203.0.113.44:443".to_string(),
+                    relay_id: "relay-éu-1".to_owned(),
+                    region: "eu-west".to_owned(),
+                    endpoint: "203.0.113.44:443".to_owned(),
                     priority: 10,
                     capacity: 1,
                     enabled: true,
@@ -5349,9 +5349,9 @@ mod tests {
             ),
             (
                 vec![RelayFleetNodeDescriptor {
-                    relay_id: "relay-eu-1".to_string(),
-                    region: "eu\nwest".to_string(),
-                    endpoint: "203.0.113.44:443".to_string(),
+                    relay_id: "relay-eu-1".to_owned(),
+                    region: "eu\nwest".to_owned(),
+                    endpoint: "203.0.113.44:443".to_owned(),
                     priority: 10,
                     capacity: 1,
                     enabled: true,
@@ -5360,9 +5360,9 @@ mod tests {
             ),
             (
                 vec![RelayFleetNodeDescriptor {
-                    relay_id: "relay-eu-1".to_string(),
+                    relay_id: "relay-eu-1".to_owned(),
                     region: String::new(),
-                    endpoint: "203.0.113.44:443".to_string(),
+                    endpoint: "203.0.113.44:443".to_owned(),
                     priority: 10,
                     capacity: 1,
                     enabled: true,
@@ -5371,9 +5371,9 @@ mod tests {
             ),
             (
                 vec![RelayFleetNodeDescriptor {
-                    relay_id: "relay-eu-1".to_string(),
-                    region: "eu-west".to_string(),
-                    endpoint: "127.0.0.1:443".to_string(),
+                    relay_id: "relay-eu-1".to_owned(),
+                    region: "eu-west".to_owned(),
+                    endpoint: "127.0.0.1:443".to_owned(),
                     priority: 10,
                     capacity: 1,
                     enabled: true,
@@ -5382,9 +5382,9 @@ mod tests {
             ),
             (
                 vec![RelayFleetNodeDescriptor {
-                    relay_id: "relay-eu-1".to_string(),
-                    region: "eu-west".to_string(),
-                    endpoint: "203.0.113.44:443".to_string(),
+                    relay_id: "relay-eu-1".to_owned(),
+                    region: "eu-west".to_owned(),
+                    endpoint: "203.0.113.44:443".to_owned(),
                     priority: 10,
                     capacity: 0,
                     enabled: true,
@@ -5394,17 +5394,17 @@ mod tests {
             (
                 vec![
                     RelayFleetNodeDescriptor {
-                        relay_id: "relay-eu-1".to_string(),
-                        region: "eu-west".to_string(),
-                        endpoint: "203.0.113.44:443".to_string(),
+                        relay_id: "relay-eu-1".to_owned(),
+                        region: "eu-west".to_owned(),
+                        endpoint: "203.0.113.44:443".to_owned(),
                         priority: 10,
                         capacity: 1,
                         enabled: true,
                     },
                     RelayFleetNodeDescriptor {
-                        relay_id: " relay-eu-1 ".to_string(),
-                        region: "eu-west".to_string(),
-                        endpoint: "203.0.113.45:443".to_string(),
+                        relay_id: " relay-eu-1 ".to_owned(),
+                        region: "eu-west".to_owned(),
+                        endpoint: "203.0.113.45:443".to_owned(),
                         priority: 20,
                         capacity: 1,
                         enabled: true,
@@ -5415,17 +5415,17 @@ mod tests {
             (
                 vec![
                     RelayFleetNodeDescriptor {
-                        relay_id: "relay-eu-1".to_string(),
-                        region: "eu-west".to_string(),
-                        endpoint: "203.0.113.44:443".to_string(),
+                        relay_id: "relay-eu-1".to_owned(),
+                        region: "eu-west".to_owned(),
+                        endpoint: "203.0.113.44:443".to_owned(),
                         priority: 10,
                         capacity: 1,
                         enabled: true,
                     },
                     RelayFleetNodeDescriptor {
-                        relay_id: "relay-eu-2".to_string(),
-                        region: "eu-west".to_string(),
-                        endpoint: "203.0.113.44:443".to_string(),
+                        relay_id: "relay-eu-2".to_owned(),
+                        region: "eu-west".to_owned(),
+                        endpoint: "203.0.113.44:443".to_owned(),
                         priority: 20,
                         capacity: 1,
                         enabled: true,
@@ -5455,8 +5455,8 @@ mod tests {
     fn endpoint_hint_test_core() -> ControlPlaneCore {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -5468,21 +5468,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -5493,14 +5493,14 @@ mod tests {
 
     fn endpoint_hint_request() -> EndpointHintBundleRequest {
         EndpointHintBundleRequest {
-            source_node_id: "node-a".to_string(),
-            target_node_id: "node-b".to_string(),
+            source_node_id: "node-a".to_owned(),
+            target_node_id: "node-b".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 60,
             nonce: 17,
             candidates: vec![EndpointHintCandidate {
                 candidate_type: EndpointHintCandidateType::Host,
-                endpoint: "10.0.0.5:51820".to_string(),
+                endpoint: "10.0.0.5:51820".to_owned(),
                 relay_id: None,
                 priority: 10,
             }],
@@ -5511,7 +5511,7 @@ mod tests {
     fn endpoint_hint_signer_rejects_self_addressed_bundle() {
         let core = endpoint_hint_test_core();
         let mut request = endpoint_hint_request();
-        request.target_node_id = "node-a".to_string();
+        request.target_node_id = "node-a".to_owned();
         let result = core.signed_endpoint_hint_bundle(request);
         assert!(
             result
@@ -5527,8 +5527,8 @@ mod tests {
         // bypass of the distinct-source-target check.
         let core = endpoint_hint_test_core();
         let mut request = endpoint_hint_request();
-        request.source_node_id = " node-a ".to_string();
-        request.target_node_id = "node-a".to_string();
+        request.source_node_id = " node-a ".to_owned();
+        request.target_node_id = "node-a".to_owned();
         let result = core.signed_endpoint_hint_bundle(request);
         // Either node-not-found (untrimmed lookup) or distinct-source-target
         // is acceptable; the only unacceptable outcome is a successfully
@@ -5547,7 +5547,7 @@ mod tests {
         assert!(core.signed_endpoint_hint_bundle(empty_source).is_err());
 
         let mut whitespace_target = endpoint_hint_request();
-        whitespace_target.target_node_id = "   ".to_string();
+        whitespace_target.target_node_id = "   ".to_owned();
         assert!(core.signed_endpoint_hint_bundle(whitespace_target).is_err());
     }
 
@@ -5662,7 +5662,7 @@ mod tests {
     fn endpoint_hint_signer_rejects_zero_port() {
         let core = endpoint_hint_test_core();
         let mut request = endpoint_hint_request();
-        request.candidates[0].endpoint = "10.0.0.5:0".to_string();
+        request.candidates[0].endpoint = "10.0.0.5:0".to_owned();
         assert!(
             core.signed_endpoint_hint_bundle(request)
                 .expect_err("port=0 must fail")
@@ -5675,7 +5675,7 @@ mod tests {
     fn endpoint_hint_signer_rejects_unparseable_endpoint() {
         let core = endpoint_hint_test_core();
         let mut request = endpoint_hint_request();
-        request.candidates[0].endpoint = "not-an-address".to_string();
+        request.candidates[0].endpoint = "not-an-address".to_owned();
         assert!(
             core.signed_endpoint_hint_bundle(request)
                 .expect_err("invalid endpoint must fail")
@@ -5688,7 +5688,7 @@ mod tests {
     fn endpoint_hint_signer_rejects_relay_id_on_non_relay_candidate() {
         let core = endpoint_hint_test_core();
         let mut request = endpoint_hint_request();
-        request.candidates[0].relay_id = Some("relay-eu-1".to_string());
+        request.candidates[0].relay_id = Some("relay-eu-1".to_owned());
         request.candidates[0].candidate_type = EndpointHintCandidateType::Host;
         assert!(
             core.signed_endpoint_hint_bundle(request)
@@ -5704,8 +5704,8 @@ mod tests {
         let mut request = endpoint_hint_request();
         request.candidates = vec![EndpointHintCandidate {
             candidate_type: EndpointHintCandidateType::Relay,
-            endpoint: "203.0.113.55:443".to_string(),
-            relay_id: Some("   ".to_string()),
+            endpoint: "203.0.113.55:443".to_owned(),
+            relay_id: Some("   ".to_owned()),
             priority: 1,
         }];
         assert!(
@@ -5722,27 +5722,27 @@ mod tests {
         // relay_id-asc.  Re-arranging input must produce identical bytes.
         let core = endpoint_hint_test_core();
         let request_a = EndpointHintBundleRequest {
-            source_node_id: "node-a".to_string(),
-            target_node_id: "node-b".to_string(),
+            source_node_id: "node-a".to_owned(),
+            target_node_id: "node-b".to_owned(),
             generated_at_unix: 200,
             ttl_secs: 60,
             nonce: 1,
             candidates: vec![
                 EndpointHintCandidate {
                     candidate_type: EndpointHintCandidateType::Host,
-                    endpoint: "10.0.0.4:51820".to_string(),
+                    endpoint: "10.0.0.4:51820".to_owned(),
                     relay_id: None,
                     priority: 5,
                 },
                 EndpointHintCandidate {
                     candidate_type: EndpointHintCandidateType::Relay,
-                    endpoint: "203.0.113.10:443".to_string(),
-                    relay_id: Some("relay-eu-1".to_string()),
+                    endpoint: "203.0.113.10:443".to_owned(),
+                    relay_id: Some("relay-eu-1".to_owned()),
                     priority: 30,
                 },
                 EndpointHintCandidate {
                     candidate_type: EndpointHintCandidateType::ServerReflexive,
-                    endpoint: "198.51.100.5:54321".to_string(),
+                    endpoint: "198.51.100.5:54321".to_owned(),
                     relay_id: None,
                     priority: 30,
                 },
@@ -5865,7 +5865,7 @@ mod tests {
         assert!(!core.verify_signed_endpoint_hint_bundle(&empty_source));
 
         let mut empty_target = bundle.clone();
-        empty_target.target_node_id = "   ".to_string();
+        empty_target.target_node_id = "   ".to_owned();
         assert!(!core.verify_signed_endpoint_hint_bundle(&empty_target));
     }
 
@@ -5880,7 +5880,7 @@ mod tests {
             .signed_endpoint_hint_bundle(endpoint_hint_request())
             .expect("bundle must succeed");
         let mut tampered = bundle.clone();
-        tampered.source_node_id = "node-evil".to_string();
+        tampered.source_node_id = "node-evil".to_owned();
         assert!(
             !core.verify_signed_endpoint_hint_bundle(&tampered),
             "outer source_node_id must match payload"
@@ -5894,7 +5894,7 @@ mod tests {
             .signed_endpoint_hint_bundle(endpoint_hint_request())
             .expect("bundle must succeed");
         let mut tampered = bundle.clone();
-        tampered.target_node_id = "node-evil".to_string();
+        tampered.target_node_id = "node-evil".to_owned();
         assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
     }
 
@@ -5947,7 +5947,7 @@ mod tests {
             .signed_endpoint_hint_bundle(endpoint_hint_request())
             .expect("bundle must succeed");
         let mut tampered = bundle.clone();
-        tampered.signature_hex = "not-hex".to_string();
+        tampered.signature_hex = "not-hex".to_owned();
         assert!(!core.verify_signed_endpoint_hint_bundle(&tampered));
     }
 
@@ -5983,8 +5983,8 @@ mod tests {
         let core_a = endpoint_hint_test_core();
         let policy_b = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -5997,22 +5997,22 @@ mod tests {
             core_b
                 .credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core_b
                 .enroll_with_throwaway(EnrollmentRequest {
-                    credential_id: credential_id.to_string(),
-                    node_id: node_id.to_string(),
-                    hostname: node_id.to_string(),
-                    os: "linux".to_string(),
-                    tags: vec!["servers".to_string()],
-                    owner: "alice@example.local".to_string(),
-                    endpoint: endpoint.to_string(),
+                    credential_id: credential_id.to_owned(),
+                    node_id: node_id.to_owned(),
+                    hostname: node_id.to_owned(),
+                    os: "linux".to_owned(),
+                    tags: vec!["servers".to_owned()],
+                    owner: "alice@example.local".to_owned(),
+                    endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
                 })
@@ -6121,14 +6121,14 @@ mod tests {
     fn dns_zone_verifier_rejects_payload_with_unknown_version() {
         let core = endpoint_hint_test_core();
         let request = SignedDnsZoneBundleRequest {
-            zone_name: "rustynet".to_string(),
-            subject_node_id: "node-a".to_string(),
+            zone_name: "rustynet".to_owned(),
+            subject_node_id: "node-a".to_owned(),
             generated_at_unix: 1_000,
             ttl_secs: 60,
             nonce: 7,
             records: vec![DnsRecordRequest {
-                label: "host".to_string(),
-                target_node_id: "node-a".to_string(),
+                label: "host".to_owned(),
+                target_node_id: "node-a".to_owned(),
                 ttl_secs: 30,
                 rr_type: DnsRecordType::A,
                 target_addr_kind: DnsTargetAddrKind::MeshIpv4,
@@ -6155,9 +6155,9 @@ mod tests {
                 ttl_secs: 60,
                 nonce: 9,
                 relays: vec![RelayFleetNodeDescriptor {
-                    relay_id: "relay-us-1".to_string(),
-                    region: "us-east".to_string(),
-                    endpoint: "203.0.113.45:443".to_string(),
+                    relay_id: "relay-us-1".to_owned(),
+                    region: "us-east".to_owned(),
+                    endpoint: "203.0.113.45:443".to_owned(),
                     priority: 20,
                     capacity: 1024,
                     enabled: true,
@@ -6185,8 +6185,8 @@ mod tests {
         // test below, then mutate the payload's version line.
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -6208,21 +6208,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -6232,8 +6232,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [0x33; 16],
                 probe_start_unix: 205,
-                node_a: "coord-node-x".to_string(),
-                node_b: "coord-node-y".to_string(),
+                node_a: "coord-node-x".to_owned(),
+                node_b: "coord-node-y".to_owned(),
                 issued_at_unix: 200,
                 expires_at_unix: 225,
                 nonce: [0x44; 16],
@@ -6251,8 +6251,8 @@ mod tests {
     fn traversal_coordination_record_is_signed_and_tamper_detected() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "*".to_string(),
-                dst: "*".to_string(),
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -6274,21 +6274,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -6299,8 +6299,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [0x11; 16],
                 probe_start_unix: 205,
-                node_a: "coord-node-a".to_string(),
-                node_b: "coord-node-b".to_string(),
+                node_a: "coord-node-a".to_owned(),
+                node_b: "coord-node-b".to_owned(),
                 issued_at_unix: 200,
                 expires_at_unix: 225,
                 nonce: [0x22; 16],
@@ -6321,8 +6321,8 @@ mod tests {
     fn traversal_coordination_record_enforces_validation_rules() {
         let policy = PolicySet {
             rules: vec![PolicyRule {
-                src: "node:coord-node-a".to_string(),
-                dst: "node:coord-node-b".to_string(),
+                src: "node:coord-node-a".to_owned(),
+                dst: "node:coord-node-b".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
             }],
@@ -6344,21 +6344,21 @@ mod tests {
         ] {
             core.credentials
                 .create(
-                    credential_id.to_string(),
-                    "admin".to_string(),
-                    "tag:servers".to_string(),
+                    credential_id.to_owned(),
+                    "admin".to_owned(),
+                    "tag:servers".to_owned(),
                     100,
                     60,
                 )
                 .expect("credential should be created");
             core.enroll_with_throwaway(EnrollmentRequest {
-                credential_id: credential_id.to_string(),
-                node_id: node_id.to_string(),
-                hostname: node_id.to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: endpoint.to_string(),
+                credential_id: credential_id.to_owned(),
+                node_id: node_id.to_owned(),
+                hostname: node_id.to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
             })
@@ -6369,8 +6369,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [0x33; 16],
                 probe_start_unix: 205,
-                node_a: "coord-node-a".to_string(),
-                node_b: "coord-node-b".to_string(),
+                node_a: "coord-node-a".to_owned(),
+                node_b: "coord-node-b".to_owned(),
                 issued_at_unix: 200,
                 expires_at_unix: 200 + 86401,
                 nonce: [0x44; 16],
@@ -6382,8 +6382,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [0x33; 16],
                 probe_start_unix: 205,
-                node_a: "coord-node-a".to_string(),
-                node_b: "missing-node".to_string(),
+                node_a: "coord-node-a".to_owned(),
+                node_b: "missing-node".to_owned(),
                 issued_at_unix: 200,
                 expires_at_unix: 225,
                 nonce: [0x44; 16],
@@ -6395,8 +6395,8 @@ mod tests {
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
                 session_id: [0x33; 16],
                 probe_start_unix: 205,
-                node_a: "coord-node-a".to_string(),
-                node_b: "coord-node-a".to_string(),
+                node_a: "coord-node-a".to_owned(),
+                node_b: "coord-node-a".to_owned(),
                 issued_at_unix: 200,
                 expires_at_unix: 225,
                 nonce: [0x44; 16],
@@ -6410,8 +6410,8 @@ mod tests {
         let record = TraversalCoordinationRecord {
             session_id: [0x55; 16],
             probe_start_unix: 210,
-            node_a: "node-a".to_string(),
-            node_b: "node-b".to_string(),
+            node_a: "node-a".to_owned(),
+            node_b: "node-b".to_owned(),
             issued_at_unix: 200,
             expires_at_unix: 220,
             nonce: [0x66; 16],
@@ -6429,13 +6429,13 @@ mod tests {
 
         let invalid_scope = store.create_reusable(
             ReusableCredentialRequest {
-                id: "reusable-1".to_string(),
-                creator: "admin".to_string(),
-                scope: "*".to_string(),
+                id: "reusable-1".to_owned(),
+                creator: "admin".to_owned(),
+                scope: "*".to_owned(),
                 created_at_unix: 100,
                 ttl_secs: 600,
                 max_uses: 3,
-                storage_reference: "vault://rustynet/reusable-1".to_string(),
+                storage_reference: "vault://rustynet/reusable-1".to_owned(),
             },
             policy,
         );
@@ -6443,13 +6443,13 @@ mod tests {
 
         let invalid_storage = store.create_reusable(
             ReusableCredentialRequest {
-                id: "reusable-2".to_string(),
-                creator: "admin".to_string(),
-                scope: "tag:servers".to_string(),
+                id: "reusable-2".to_owned(),
+                creator: "admin".to_owned(),
+                scope: "tag:servers".to_owned(),
                 created_at_unix: 100,
                 ttl_secs: 600,
                 max_uses: 3,
-                storage_reference: "plaintext://bad".to_string(),
+                storage_reference: "plaintext://bad".to_owned(),
             },
             policy,
         );
@@ -6460,13 +6460,13 @@ mod tests {
 
         let invalid_ttl = store.create_reusable(
             ReusableCredentialRequest {
-                id: "reusable-3".to_string(),
-                creator: "admin".to_string(),
-                scope: "tag:servers".to_string(),
+                id: "reusable-3".to_owned(),
+                creator: "admin".to_owned(),
+                scope: "tag:servers".to_owned(),
                 created_at_unix: 100,
                 ttl_secs: policy.max_ttl_secs + 1,
                 max_uses: 3,
-                storage_reference: "vault://rustynet/reusable-3".to_string(),
+                storage_reference: "vault://rustynet/reusable-3".to_owned(),
             },
             policy,
         );
@@ -6480,13 +6480,13 @@ mod tests {
         let reusable = store
             .create_reusable(
                 ReusableCredentialRequest {
-                    id: "reusable-ok".to_string(),
-                    creator: "admin".to_string(),
-                    scope: "tag:automation".to_string(),
+                    id: "reusable-ok".to_owned(),
+                    creator: "admin".to_owned(),
+                    scope: "tag:automation".to_owned(),
                     created_at_unix: 100,
                     ttl_secs: 600,
                     max_uses: 3,
-                    storage_reference: "vault://rustynet/reusable-ok".to_string(),
+                    storage_reference: "vault://rustynet/reusable-ok".to_owned(),
                 },
                 policy,
             )
@@ -6506,13 +6506,13 @@ mod tests {
         let policy = ReusableCredentialPolicy::default();
         let result = store.create_reusable(
             ReusableCredentialRequest {
-                id: "reusable-bad-scope".to_string(),
-                creator: "admin".to_string(),
-                scope: "group:all-admins".to_string(),
+                id: "reusable-bad-scope".to_owned(),
+                creator: "admin".to_owned(),
+                scope: "group:all-admins".to_owned(),
                 created_at_unix: 100,
                 ttl_secs: 600,
                 max_uses: 3,
-                storage_reference: "vault://rustynet/reusable-bad-scope".to_string(),
+                storage_reference: "vault://rustynet/reusable-bad-scope".to_owned(),
             },
             policy,
         );
@@ -6524,9 +6524,9 @@ mod tests {
         let store = ThrowawayCredentialStore::default();
         store
             .create(
-                "cred-revoked".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-revoked".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
@@ -6584,8 +6584,8 @@ mod tests {
 
         persistence
             .upsert_user(&super::persistence::UserRow {
-                user_id: "admin".to_string(),
-                email: "admin@example.local".to_string(),
+                user_id: "admin".to_owned(),
+                email: "admin@example.local".to_owned(),
                 mfa_enabled: false,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -6594,26 +6594,26 @@ mod tests {
 
         core.credentials
             .create(
-                "cred-persist".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-persist".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
             .expect("credential should be created");
         persistence
             .insert_credential(&super::persistence::CredentialRow {
-                credential_id: "cred-persist".to_string(),
-                creator_user_id: "admin".to_string(),
-                scope: "tag:servers".to_string(),
-                credential_kind: "throwaway".to_string(),
-                state: "created".to_string(),
+                credential_id: "cred-persist".to_owned(),
+                creator_user_id: "admin".to_owned(),
+                scope: "tag:servers".to_owned(),
+                credential_kind: "throwaway".to_owned(),
+                state: "created".to_owned(),
                 max_uses: 1,
                 uses: 0,
                 expires_at_unix: 160,
                 created_at_unix: 100,
                 updated_at_unix: 100,
-                storage_policy: "throwaway_default".to_string(),
+                storage_policy: "throwaway_default".to_owned(),
             })
             .expect("credential should be persisted before enrollment");
         persistence
@@ -6623,13 +6623,13 @@ mod tests {
         let response = core
             .enroll_with_throwaway_and_persist(
                 EnrollmentRequest {
-                    credential_id: "cred-persist".to_string(),
-                    node_id: "node-persist".to_string(),
-                    hostname: "mini-pc-persist".to_string(),
-                    os: "linux".to_string(),
-                    tags: vec!["servers".to_string()],
-                    owner: "alice@example.local".to_string(),
-                    endpoint: "198.51.100.30:51820".to_string(),
+                    credential_id: "cred-persist".to_owned(),
+                    node_id: "node-persist".to_owned(),
+                    hostname: "mini-pc-persist".to_owned(),
+                    os: "linux".to_owned(),
+                    tags: vec!["servers".to_owned()],
+                    owner: "alice@example.local".to_owned(),
+                    endpoint: "198.51.100.30:51820".to_owned(),
                     public_key: [7; 32],
                     now_unix: 150,
                 },
@@ -6662,9 +6662,9 @@ mod tests {
 
         core.credentials
             .create(
-                "cred-missing-db".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-missing-db".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
@@ -6672,13 +6672,13 @@ mod tests {
 
         let result = core.enroll_with_throwaway_and_persist(
             EnrollmentRequest {
-                credential_id: "cred-missing-db".to_string(),
-                node_id: "node-missing-db".to_string(),
-                hostname: "node-missing-db".to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: "198.51.100.31:51820".to_string(),
+                credential_id: "cred-missing-db".to_owned(),
+                node_id: "node-missing-db".to_owned(),
+                hostname: "node-missing-db".to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: "198.51.100.31:51820".to_owned(),
                 public_key: [9; 32],
                 now_unix: 150,
             },
@@ -6701,8 +6701,8 @@ mod tests {
 
         persistence
             .upsert_user(&super::persistence::UserRow {
-                user_id: "admin".to_string(),
-                email: "admin@example.local".to_string(),
+                user_id: "admin".to_owned(),
+                email: "admin@example.local".to_owned(),
                 mfa_enabled: false,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -6711,38 +6711,38 @@ mod tests {
 
         core.credentials
             .create(
-                "cred-persist-once".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-persist-once".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
             .expect("credential should be created");
         persistence
             .insert_credential(&super::persistence::CredentialRow {
-                credential_id: "cred-persist-once".to_string(),
-                creator_user_id: "admin".to_string(),
-                scope: "tag:servers".to_string(),
-                credential_kind: "throwaway".to_string(),
-                state: "created".to_string(),
+                credential_id: "cred-persist-once".to_owned(),
+                creator_user_id: "admin".to_owned(),
+                scope: "tag:servers".to_owned(),
+                credential_kind: "throwaway".to_owned(),
+                state: "created".to_owned(),
                 max_uses: 1,
                 uses: 0,
                 expires_at_unix: 160,
                 created_at_unix: 100,
                 updated_at_unix: 100,
-                storage_policy: "throwaway_default".to_string(),
+                storage_policy: "throwaway_default".to_owned(),
             })
             .expect("credential should be persisted");
 
         core.enroll_with_throwaway_and_persist(
             EnrollmentRequest {
-                credential_id: "cred-persist-once".to_string(),
-                node_id: "node-persist-once-a".to_string(),
-                hostname: "node-persist-once-a".to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: "198.51.100.33:51820".to_string(),
+                credential_id: "cred-persist-once".to_owned(),
+                node_id: "node-persist-once-a".to_owned(),
+                hostname: "node-persist-once-a".to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: "198.51.100.33:51820".to_owned(),
                 public_key: [11; 32],
                 now_unix: 150,
             },
@@ -6752,13 +6752,13 @@ mod tests {
 
         let second = core.enroll_with_throwaway_and_persist(
             EnrollmentRequest {
-                credential_id: "cred-persist-once".to_string(),
-                node_id: "node-persist-once-b".to_string(),
-                hostname: "node-persist-once-b".to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: "198.51.100.34:51820".to_string(),
+                credential_id: "cred-persist-once".to_owned(),
+                node_id: "node-persist-once-b".to_owned(),
+                hostname: "node-persist-once-b".to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: "198.51.100.34:51820".to_owned(),
                 public_key: [12; 32],
                 now_unix: 151,
             },
@@ -6803,10 +6803,10 @@ mod tests {
     #[test]
     fn token_claims_debug_redacts_sensitive_fields() {
         let claims = TokenClaims {
-            subject: "alice@example.local".to_string(),
+            subject: "alice@example.local".to_owned(),
             issued_at_unix: 100,
             expires_at_unix: 200,
-            nonce: "nonce-secret".to_string(),
+            nonce: "nonce-secret".to_owned(),
         };
         let rendered = format!("{claims:?}");
         assert!(!rendered.contains("alice@example.local"));
@@ -6819,9 +6819,9 @@ mod tests {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
         core.credentials
             .create(
-                "cred-token".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-token".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
@@ -6829,13 +6829,13 @@ mod tests {
 
         let response = core
             .enroll_with_throwaway(EnrollmentRequest {
-                credential_id: "cred-token".to_string(),
-                node_id: "node-token".to_string(),
-                hostname: "mini-pc-token".to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: "198.51.100.60:51820".to_string(),
+                credential_id: "cred-token".to_owned(),
+                node_id: "node-token".to_owned(),
+                hostname: "mini-pc-token".to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: "198.51.100.60:51820".to_owned(),
                 public_key: [60; 32],
                 now_unix: 120,
             })
@@ -6852,7 +6852,7 @@ mod tests {
         assert_eq!(replay.err(), Some(AuthError::ReplayDetected));
 
         let mut tampered = response.access_token.clone();
-        tampered.claims.subject = "mallory@example.local".to_string();
+        tampered.claims.subject = "mallory@example.local".to_owned();
         let tampered_result = core.validate_signed_token_and_nonce(&mut guard, &tampered, 123);
         assert_eq!(
             tampered_result.err(),
@@ -6865,18 +6865,18 @@ mod tests {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
         core.credentials
             .create(
-                "cred-token-a".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-token-a".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
             .expect("credential should be created");
         core.credentials
             .create(
-                "cred-token-b".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-token-b".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
@@ -6884,13 +6884,13 @@ mod tests {
 
         let token_a = core
             .enroll_with_throwaway(EnrollmentRequest {
-                credential_id: "cred-token-a".to_string(),
-                node_id: "node-token-a".to_string(),
-                hostname: "mini-pc-token-a".to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: "198.51.100.60:51820".to_string(),
+                credential_id: "cred-token-a".to_owned(),
+                node_id: "node-token-a".to_owned(),
+                hostname: "mini-pc-token-a".to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: "198.51.100.60:51820".to_owned(),
                 public_key: [61; 32],
                 now_unix: 120,
             })
@@ -6898,13 +6898,13 @@ mod tests {
             .access_token;
         let token_b = core
             .enroll_with_throwaway(EnrollmentRequest {
-                credential_id: "cred-token-b".to_string(),
-                node_id: "node-token-b".to_string(),
-                hostname: "mini-pc-token-b".to_string(),
-                os: "linux".to_string(),
-                tags: vec!["servers".to_string()],
-                owner: "alice@example.local".to_string(),
-                endpoint: "198.51.100.61:51820".to_string(),
+                credential_id: "cred-token-b".to_owned(),
+                node_id: "node-token-b".to_owned(),
+                hostname: "mini-pc-token-b".to_owned(),
+                os: "linux".to_owned(),
+                tags: vec!["servers".to_owned()],
+                owner: "alice@example.local".to_owned(),
+                endpoint: "198.51.100.61:51820".to_owned(),
                 public_key: [62; 32],
                 now_unix: 120,
             })
@@ -6958,9 +6958,9 @@ mod tests {
     fn throwaway_credential_debug_redacts_sensitive_fields() {
         let credential = ThrowawayCredentialStore::default()
             .create(
-                "cred-redact".to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                "cred-redact".to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
@@ -7061,8 +7061,8 @@ mod tests {
             b"control-secret".to_vec(),
             PolicySet {
                 rules: vec![PolicyRule {
-                    src: "*".to_string(),
-                    dst: "*".to_string(),
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
                     protocol: Protocol::Any,
                     action: RuleAction::Allow,
                 }],
@@ -7078,20 +7078,20 @@ mod tests {
     ) {
         core.credentials
             .create(
-                credential_id.to_string(),
-                "admin".to_string(),
-                "tag:servers".to_string(),
+                credential_id.to_owned(),
+                "admin".to_owned(),
+                "tag:servers".to_owned(),
                 100,
                 60,
             )
             .expect("credential should be created");
         core.enroll_with_throwaway(EnrollmentRequest {
-            credential_id: credential_id.to_string(),
-            node_id: node_id.to_string(),
-            hostname: node_id.to_string(),
-            os: "linux".to_string(),
-            tags: vec!["servers".to_string()],
-            owner: "alice@example.local".to_string(),
+            credential_id: credential_id.to_owned(),
+            node_id: node_id.to_owned(),
+            hostname: node_id.to_owned(),
+            os: "linux".to_owned(),
+            tags: vec!["servers".to_owned()],
+            owner: "alice@example.local".to_owned(),
             endpoint: format!("198.51.100.{public_key_byte}:51820"),
             public_key: [public_key_byte; 32],
             now_unix: 120,
@@ -7107,9 +7107,9 @@ mod tests {
 
         let token = core
             .issue_relay_session_token(RelaySessionTokenRequest {
-                node_id: "node-a".to_string(),
-                peer_node_id: "node-b".to_string(),
-                relay_id: " relay-eu-1 ".to_string(),
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: " relay-eu-1 ".to_owned(),
                 requested_at_unix: 500,
                 ttl_secs: 60,
             })
@@ -7138,9 +7138,9 @@ mod tests {
 
         let token = core
             .issue_relay_session_token(RelaySessionTokenRequest {
-                node_id: "node-a".to_string(),
-                peer_node_id: "node-b".to_string(),
-                relay_id: "relay-eu-1".to_string(),
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: "relay-eu-1".to_owned(),
                 requested_at_unix: 500,
                 ttl_secs: 60,
             })
@@ -7190,9 +7190,9 @@ mod tests {
 
         let err = core
             .issue_relay_session_token(RelaySessionTokenRequest {
-                node_id: "node-a".to_string(),
-                peer_node_id: "node-b".to_string(),
-                relay_id: "relay-eu-1".to_string(),
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: "relay-eu-1".to_owned(),
                 requested_at_unix: 500,
                 ttl_secs: 60,
             })
@@ -7210,9 +7210,9 @@ mod tests {
         for (request, expected) in [
             (
                 RelaySessionTokenRequest {
-                    node_id: "node-a".to_string(),
-                    peer_node_id: "node-b".to_string(),
-                    relay_id: "relay-eu-1".to_string(),
+                    node_id: "node-a".to_owned(),
+                    peer_node_id: "node-b".to_owned(),
+                    relay_id: "relay-eu-1".to_owned(),
                     requested_at_unix: 0,
                     ttl_secs: 60,
                 },
@@ -7220,9 +7220,9 @@ mod tests {
             ),
             (
                 RelaySessionTokenRequest {
-                    node_id: "node-a".to_string(),
-                    peer_node_id: "node-b".to_string(),
-                    relay_id: "relay-eu-1".to_string(),
+                    node_id: "node-a".to_owned(),
+                    peer_node_id: "node-b".to_owned(),
+                    relay_id: "relay-eu-1".to_owned(),
                     requested_at_unix: 500,
                     ttl_secs: 0,
                 },
@@ -7230,9 +7230,9 @@ mod tests {
             ),
             (
                 RelaySessionTokenRequest {
-                    node_id: "node-a".to_string(),
-                    peer_node_id: "node-b".to_string(),
-                    relay_id: "relay-eu-1".to_string(),
+                    node_id: "node-a".to_owned(),
+                    peer_node_id: "node-b".to_owned(),
+                    relay_id: "relay-eu-1".to_owned(),
                     requested_at_unix: 500,
                     ttl_secs: MAX_RELAY_SESSION_TOKEN_TTL_SECS + 1,
                 },
@@ -7240,9 +7240,9 @@ mod tests {
             ),
             (
                 RelaySessionTokenRequest {
-                    node_id: "node-a".to_string(),
-                    peer_node_id: "node-a".to_string(),
-                    relay_id: "relay-eu-1".to_string(),
+                    node_id: "node-a".to_owned(),
+                    peer_node_id: "node-a".to_owned(),
+                    relay_id: "relay-eu-1".to_owned(),
                     requested_at_unix: 500,
                     ttl_secs: 60,
                 },
@@ -7250,9 +7250,9 @@ mod tests {
             ),
             (
                 RelaySessionTokenRequest {
-                    node_id: "node-a".to_string(),
-                    peer_node_id: "node-b".to_string(),
-                    relay_id: "relay-éu-1".to_string(),
+                    node_id: "node-a".to_owned(),
+                    peer_node_id: "node-b".to_owned(),
+                    relay_id: "relay-éu-1".to_owned(),
                     requested_at_unix: 500,
                     ttl_secs: 60,
                 },
@@ -7260,9 +7260,9 @@ mod tests {
             ),
             (
                 RelaySessionTokenRequest {
-                    node_id: "node-a".to_string(),
-                    peer_node_id: "missing-peer".to_string(),
-                    relay_id: "relay-eu-1".to_string(),
+                    node_id: "node-a".to_owned(),
+                    peer_node_id: "missing-peer".to_owned(),
+                    relay_id: "relay-eu-1".to_owned(),
                     requested_at_unix: 500,
                     ttl_secs: 60,
                 },

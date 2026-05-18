@@ -159,7 +159,7 @@ pub(crate) fn scan_source_for_forbidden_placeholders(body: &str) -> Vec<(usize, 
             let needle_eq = format!("{{{token}}}");
             let needle_colon = format!("{{{token}:");
             if line.contains(&needle_eq) || line.contains(&needle_colon) {
-                hits.push((idx + 1, (*token).to_string()));
+                hits.push((idx + 1, (*token).to_owned()));
             }
         }
     }
@@ -207,7 +207,7 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
                         hits.push((
                             idx + 1,
                             name.clone(),
-                            "derive(Debug) on secret-bearing type".to_string(),
+                            "derive(Debug) on secret-bearing type".to_owned(),
                         ));
                     }
                     break;
@@ -221,8 +221,8 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
                 if line.contains(&needle) {
                     hits.push((
                         idx + 1,
-                        (*name).to_string(),
-                        "manual impl Debug for secret-bearing type".to_string(),
+                        (*name).to_owned(),
+                        "manual impl Debug for secret-bearing type".to_owned(),
                     ));
                 }
             }
@@ -316,7 +316,7 @@ pub(crate) fn scan_source_for_hex_encoded_secret_log_sites(
             }
             let arg = &line[start..i.min(bytes.len())];
             if let Some(token) = arg_mentions_forbidden_token(arg) {
-                hits.push((idx + 1, format!("hex::encode({arg})"), token.to_string()));
+                hits.push((idx + 1, format!("hex::encode({arg})"), token.to_owned()));
             }
             search_from = i.saturating_add(1);
         }
@@ -334,8 +334,8 @@ pub(crate) fn scan_source_for_hex_encoded_secret_log_sites(
             if !already_flagged {
                 hits.push((
                     idx + 1,
-                    "format!(\"{:02x}…\", …)".to_string(),
-                    token.to_string(),
+                    "format!(\"{:02x}…\", …)".to_owned(),
+                    token.to_owned(),
                 ));
             }
         }
@@ -393,7 +393,7 @@ pub(crate) fn scan_source_for_base64_encoded_secret_log_sites(
                 let arg = &line[start..i.min(bytes.len())];
                 if let Some(token) = arg_mentions_forbidden_token(arg) {
                     let call = format!("{prefix}{arg})");
-                    hits.push((idx + 1, call, token.to_string()));
+                    hits.push((idx + 1, call, token.to_owned()));
                 }
                 search_from = i.saturating_add(1);
             }
@@ -439,7 +439,7 @@ pub(crate) fn scan_source_for_display_on_secret_types(
                         hits.push((
                             idx + 1,
                             name.clone(),
-                            "derive(Display) on secret-bearing type".to_string(),
+                            "derive(Display) on secret-bearing type".to_owned(),
                         ));
                     }
                     break;
@@ -458,15 +458,15 @@ pub(crate) fn scan_source_for_display_on_secret_types(
                 if line.contains(&display_needle) {
                     hits.push((
                         idx + 1,
-                        (*name).to_string(),
-                        "manual impl Display for secret-bearing type".to_string(),
+                        (*name).to_owned(),
+                        "manual impl Display for secret-bearing type".to_owned(),
                     ));
                 }
                 if line.contains(&to_string_needle) {
                     hits.push((
                         idx + 1,
-                        (*name).to_string(),
-                        "manual impl ToString for secret-bearing type".to_string(),
+                        (*name).to_owned(),
+                        "manual impl ToString for secret-bearing type".to_owned(),
                     ));
                 }
             }
@@ -1172,7 +1172,7 @@ pub(crate) fn scan_source_for_secret_material_equality(
             if equality_hit_is_allowlisted(file_path_label, line_no) {
                 continue;
             }
-            hits.push((line_no, (*token).to_string()));
+            hits.push((line_no, (*token).to_owned()));
             // One hit per line is enough; further tokens on the same
             // line would just produce duplicate offender entries.
             break;
@@ -1373,7 +1373,7 @@ pub(crate) fn scan_source_for_deprecated_crypto_imports(body: &str) -> Vec<(usiz
                 if !valid_terminator {
                     continue;
                 }
-                hits.push((line_no, (*crate_name).to_string()));
+                hits.push((line_no, (*crate_name).to_owned()));
                 break;
             }
         }
@@ -1635,7 +1635,7 @@ pub(crate) fn scan_source_for_dbg_macro_on_secret_tokens(body: &str) -> Vec<(usi
             if is_word(before_char) || is_word(after_char) {
                 continue;
             }
-            hits.push((idx + 1, (*token).to_string()));
+            hits.push((idx + 1, (*token).to_owned()));
             break;
         }
     }
@@ -1845,7 +1845,7 @@ pub(crate) fn scan_source_for_panic_macro_placeholder_leaks(
             let needle_eq = format!("{{{token}}}");
             let needle_colon = format!("{{{token}:");
             if line.contains(&needle_eq) || line.contains(&needle_colon) {
-                hits.push((idx + 1, (*token).to_string(), (*macro_name).to_string()));
+                hits.push((idx + 1, (*token).to_owned(), (*macro_name).to_string()));
             }
         }
     }

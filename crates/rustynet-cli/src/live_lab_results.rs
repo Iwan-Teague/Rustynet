@@ -58,7 +58,7 @@ fn parse_worker_result_row(stage_name: &str, row: &[String]) -> Option<LiveLabWo
     }
     if row.len() == 6 {
         return Some(LiveLabWorkerResult {
-            stage_name: stage_name.to_string(),
+            stage_name: stage_name.to_owned(),
             label: row[0].clone(),
             target: row[1].clone(),
             node_id: row[2].clone(),
@@ -121,19 +121,19 @@ mod tests {
         assert_eq!(
             results,
             vec![LiveLabWorkerResult {
-                stage_name: "validate_baseline_runtime".to_string(),
-                label: "client".to_string(),
-                target: "debian@client".to_string(),
-                node_id: "client-1".to_string(),
-                role: "client".to_string(),
+                stage_name: "validate_baseline_runtime".to_owned(),
+                label: "client".to_owned(),
+                target: "debian@client".to_owned(),
+                node_id: "client-1".to_owned(),
+                role: "client".to_owned(),
                 rc: 1,
-                started_at: "2026-04-08T10:00:00Z".to_string(),
-                finished_at: "2026-04-08T10:00:10Z".to_string(),
-                log_path: "/tmp/client.log".to_string(),
-                snapshot_path: "/tmp/snapshot.txt".to_string(),
-                route_policy_path: "/tmp/route.txt".to_string(),
-                dns_state_path: "/tmp/dns.txt".to_string(),
-                primary_failure_reason: "route missing".to_string(),
+                started_at: "2026-04-08T10:00:00Z".to_owned(),
+                finished_at: "2026-04-08T10:00:10Z".to_owned(),
+                log_path: "/tmp/client.log".to_owned(),
+                snapshot_path: "/tmp/snapshot.txt".to_owned(),
+                route_policy_path: "/tmp/route.txt".to_owned(),
+                dns_state_path: "/tmp/dns.txt".to_owned(),
+                primary_failure_reason: "route missing".to_owned(),
             }]
         );
 

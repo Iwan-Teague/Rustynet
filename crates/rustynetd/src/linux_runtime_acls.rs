@@ -82,8 +82,8 @@ pub fn collect_linux_runtime_acl_report() -> LinuxRuntimeAclReport {
         .map(|(path_str, label, mode, owner, group)| {
             let status = inspect_runtime_root_status(path_str, label, *mode, owner, group);
             LinuxRuntimeAclRootEntry {
-                label: (*label).to_string(),
-                path: (*path_str).to_string(),
+                label: (*label).to_owned(),
+                path: (*path_str).to_owned(),
                 status,
             }
         })
@@ -406,8 +406,8 @@ mod tests {
             schema_version: 1,
             overall_ok: true,
             roots: vec![LinuxRuntimeAclRootEntry {
-                label: "state root".to_string(),
-                path: "/var/lib/rustynet".to_string(),
+                label: "state root".to_owned(),
+                path: "/var/lib/rustynet".to_owned(),
                 status: LinuxRuntimeAclRootStatus::Ok,
             }],
         };
@@ -422,10 +422,10 @@ mod tests {
             schema_version: 1,
             overall_ok: false,
             roots: vec![LinuxRuntimeAclRootEntry {
-                label: "state root".to_string(),
-                path: "/var/lib/rustynet".to_string(),
+                label: "state root".to_owned(),
+                path: "/var/lib/rustynet".to_owned(),
                 status: LinuxRuntimeAclRootStatus::Drifted {
-                    reason: "state root mode is 0o755, expected 0o700".to_string(),
+                    reason: "state root mode is 0o755, expected 0o700".to_owned(),
                 },
             }],
         };
@@ -569,15 +569,15 @@ mod tests {
             overall_ok: false,
             roots: vec![
                 LinuxRuntimeAclRootEntry {
-                    label: "state root".to_string(),
-                    path: "/var/lib/rustynet".to_string(),
+                    label: "state root".to_owned(),
+                    path: "/var/lib/rustynet".to_owned(),
                     status: LinuxRuntimeAclRootStatus::Ok,
                 },
                 LinuxRuntimeAclRootEntry {
-                    label: "config root".to_string(),
-                    path: "/etc/rustynet".to_string(),
+                    label: "config root".to_owned(),
+                    path: "/etc/rustynet".to_owned(),
                     status: LinuxRuntimeAclRootStatus::Drifted {
-                        reason: "config root mode is 0o755, expected 0o750".to_string(),
+                        reason: "config root mode is 0o755, expected 0o750".to_owned(),
                     },
                 },
             ],
@@ -602,13 +602,13 @@ mod tests {
             overall_ok: true,
             roots: vec![
                 LinuxRuntimeAclRootEntry {
-                    label: "state root".to_string(),
-                    path: "/var/lib/rustynet".to_string(),
+                    label: "state root".to_owned(),
+                    path: "/var/lib/rustynet".to_owned(),
                     status: LinuxRuntimeAclRootStatus::Ok,
                 },
                 LinuxRuntimeAclRootEntry {
-                    label: "config root".to_string(),
-                    path: "/etc/rustynet".to_string(),
+                    label: "config root".to_owned(),
+                    path: "/etc/rustynet".to_owned(),
                     status: LinuxRuntimeAclRootStatus::Ok,
                 },
             ],
@@ -690,10 +690,10 @@ mod tests {
         // #[serde(tag = "status", rename_all = "snake_case")] contract
         // stays pinned on every variant.
         let entry = LinuxRuntimeAclRootEntry {
-            label: "state root".to_string(),
-            path: "/var/lib/rustynet".to_string(),
+            label: "state root".to_owned(),
+            path: "/var/lib/rustynet".to_owned(),
             status: LinuxRuntimeAclRootStatus::Missing {
-                reason: "off-Linux probe stub".to_string(),
+                reason: "off-Linux probe stub".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");

@@ -140,9 +140,9 @@ mod tests {
             .expect("construction should succeed");
         let ctx = rustynet_backend_api::RuntimeContext {
             local_node: rustynet_backend_api::NodeId::new("test-node").unwrap(),
-            interface_name: "utun9".to_string(),
-            mesh_cidr: "100.64.0.0/10".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "utun9".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         };
         let err = backend.start(ctx).unwrap_err();
         assert!(

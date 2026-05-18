@@ -409,8 +409,7 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
 
     if fail_closed_ssh_allow_enabled && fail_closed_ssh_allow_cidrs.trim().is_empty() {
         return Err(
-            "fail-closed ssh allow enabled but no cidrs supplied (RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS)"
-                .to_string(),
+            "fail-closed ssh allow enabled but no cidrs supplied (RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS)".to_owned(),
         );
     }
 
@@ -431,7 +430,7 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     if egress_interface.trim().is_empty() {
         return Err(
-            "unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_string(),
+            "unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_owned(),
         );
     }
     ensure_interface_exists(egress_interface.as_str())?;
@@ -707,197 +706,197 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     };
 
     let env_entries = vec![
-        ("RUSTYNET_NODE_ID".to_string(), node_id),
-        ("RUSTYNET_NODE_ROLE".to_string(), node_role.clone()),
+        ("RUSTYNET_NODE_ID".to_owned(), node_id),
+        ("RUSTYNET_NODE_ROLE".to_owned(), node_role.clone()),
         (
-            "RUSTYNET_SOCKET".to_string(),
+            "RUSTYNET_SOCKET".to_owned(),
             display_path(socket_path.as_path()),
         ),
         (
-            "RUSTYNET_STATE".to_string(),
+            "RUSTYNET_STATE".to_owned(),
             display_path(state_path.as_path()),
         ),
         (
-            "RUSTYNET_TRUST_EVIDENCE".to_string(),
+            "RUSTYNET_TRUST_EVIDENCE".to_owned(),
             display_path(trust_evidence_path.as_path()),
         ),
         (
-            "RUSTYNET_TRUST_VERIFIER_KEY".to_string(),
+            "RUSTYNET_TRUST_VERIFIER_KEY".to_owned(),
             display_path(trust_verifier_key_path.as_path()),
         ),
         (
-            "RUSTYNET_TRUST_WATERMARK".to_string(),
+            "RUSTYNET_TRUST_WATERMARK".to_owned(),
             display_path(trust_watermark_path.as_path()),
         ),
         (
-            "RUSTYNET_TRUST_SIGNER_KEY".to_string(),
+            "RUSTYNET_TRUST_SIGNER_KEY".to_owned(),
             display_path(trust_signer_key_path.as_path()),
         ),
         (
-            "RUSTYNET_TRUST_AUTO_REFRESH".to_string(),
-            trust_auto_refresh_normalized.to_string(),
+            "RUSTYNET_TRUST_AUTO_REFRESH".to_owned(),
+            trust_auto_refresh_normalized.to_owned(),
         ),
         (
-            "RUSTYNET_ASSIGNMENT_AUTO_REFRESH".to_string(),
-            assignment_auto_refresh_normalized.to_string(),
+            "RUSTYNET_ASSIGNMENT_AUTO_REFRESH".to_owned(),
+            assignment_auto_refresh_normalized.to_owned(),
         ),
         (
-            "RUSTYNET_MEMBERSHIP_SNAPSHOT".to_string(),
+            "RUSTYNET_MEMBERSHIP_SNAPSHOT".to_owned(),
             display_path(membership_snapshot_path.as_path()),
         ),
         (
-            "RUSTYNET_MEMBERSHIP_LOG".to_string(),
+            "RUSTYNET_MEMBERSHIP_LOG".to_owned(),
             display_path(membership_log_path.as_path()),
         ),
         (
-            "RUSTYNET_MEMBERSHIP_WATERMARK".to_string(),
+            "RUSTYNET_MEMBERSHIP_WATERMARK".to_owned(),
             display_path(membership_watermark_path.as_path()),
         ),
         (
-            "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY".to_string(),
+            "RUSTYNET_MEMBERSHIP_OWNER_SIGNING_KEY".to_owned(),
             display_path(membership_owner_signing_key_path.as_path()),
         ),
         (
-            "RUSTYNET_AUTO_TUNNEL_ENFORCE".to_string(),
+            "RUSTYNET_AUTO_TUNNEL_ENFORCE".to_owned(),
             auto_tunnel_enforce_raw,
         ),
         (
-            "RUSTYNET_AUTO_TUNNEL_BUNDLE".to_string(),
+            "RUSTYNET_AUTO_TUNNEL_BUNDLE".to_owned(),
             display_path(auto_tunnel_bundle_path.as_path()),
         ),
         (
-            "RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY".to_string(),
+            "RUSTYNET_AUTO_TUNNEL_VERIFIER_KEY".to_owned(),
             display_path(auto_tunnel_verifier_key_path.as_path()),
         ),
         (
-            "RUSTYNET_AUTO_TUNNEL_WATERMARK".to_string(),
+            "RUSTYNET_AUTO_TUNNEL_WATERMARK".to_owned(),
             display_path(auto_tunnel_watermark_path.as_path()),
         ),
         (
-            "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS".to_string(),
+            "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS".to_owned(),
             auto_tunnel_max_age_secs,
         ),
         (
-            "RUSTYNET_DNS_ZONE_BUNDLE".to_string(),
+            "RUSTYNET_DNS_ZONE_BUNDLE".to_owned(),
             display_path(dns_zone_bundle_path.as_path()),
         ),
         (
-            "RUSTYNET_DNS_ZONE_VERIFIER_KEY".to_string(),
+            "RUSTYNET_DNS_ZONE_VERIFIER_KEY".to_owned(),
             display_path(dns_zone_verifier_key_path.as_path()),
         ),
         (
-            "RUSTYNET_DNS_ZONE_WATERMARK".to_string(),
+            "RUSTYNET_DNS_ZONE_WATERMARK".to_owned(),
             display_path(dns_zone_watermark_path.as_path()),
         ),
         (
-            "RUSTYNET_DNS_ZONE_MAX_AGE_SECS".to_string(),
+            "RUSTYNET_DNS_ZONE_MAX_AGE_SECS".to_owned(),
             dns_zone_max_age_secs,
         ),
-        ("RUSTYNET_DNS_ZONE_NAME".to_string(), dns_zone_name),
+        ("RUSTYNET_DNS_ZONE_NAME".to_owned(), dns_zone_name),
         (
-            "RUSTYNET_DNS_RESOLVER_BIND_ADDR".to_string(),
+            "RUSTYNET_DNS_RESOLVER_BIND_ADDR".to_owned(),
             dns_resolver_bind_addr.to_string(),
         ),
         (
-            "RUSTYNET_TRAVERSAL_BUNDLE".to_string(),
+            "RUSTYNET_TRAVERSAL_BUNDLE".to_owned(),
             display_path(traversal_bundle_path.as_path()),
         ),
         (
-            "RUSTYNET_TRAVERSAL_VERIFIER_KEY".to_string(),
+            "RUSTYNET_TRAVERSAL_VERIFIER_KEY".to_owned(),
             display_path(traversal_verifier_key_path.as_path()),
         ),
         (
-            "RUSTYNET_TRAVERSAL_WATERMARK".to_string(),
+            "RUSTYNET_TRAVERSAL_WATERMARK".to_owned(),
             display_path(traversal_watermark_path.as_path()),
         ),
         (
-            "RUSTYNET_TRAVERSAL_MAX_AGE_SECS".to_string(),
+            "RUSTYNET_TRAVERSAL_MAX_AGE_SECS".to_owned(),
             traversal_max_age_secs,
         ),
         (
-            "RUSTYNET_TRAVERSAL_STUN_SERVERS".to_string(),
+            "RUSTYNET_TRAVERSAL_STUN_SERVERS".to_owned(),
             traversal_stun_servers_raw,
         ),
         (
-            "RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS".to_string(),
+            "RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS".to_owned(),
             traversal_stun_gather_timeout_ms,
         ),
-        ("RUSTYNET_BACKEND".to_string(), backend_mode),
-        ("RUSTYNET_WG_INTERFACE".to_string(), wireguard_interface),
+        ("RUSTYNET_BACKEND".to_owned(), backend_mode),
+        ("RUSTYNET_WG_INTERFACE".to_owned(), wireguard_interface),
         (
-            "RUSTYNET_WG_LISTEN_PORT".to_string(),
+            "RUSTYNET_WG_LISTEN_PORT".to_owned(),
             wireguard_listen_port_raw,
         ),
         (
-            "RUSTYNET_WG_PRIVATE_KEY".to_string(),
+            "RUSTYNET_WG_PRIVATE_KEY".to_owned(),
             display_path(wireguard_private_key_path.as_path()),
         ),
         (
-            "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY".to_string(),
+            "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY".to_owned(),
             display_path(wireguard_encrypted_private_key_path.as_path()),
         ),
         (
-            "RUSTYNET_WG_KEY_PASSPHRASE".to_string(),
+            "RUSTYNET_WG_KEY_PASSPHRASE".to_owned(),
             format!(
                 "/run/credentials/rustynetd.service/{RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME}",
             ),
         ),
         (
-            "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB".to_string(),
+            "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB".to_owned(),
             display_path(wireguard_key_passphrase_credential_blob_path.as_path()),
         ),
         (
-            "RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB".to_string(),
+            "RUSTYNET_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB".to_owned(),
             display_path(signing_key_passphrase_credential_blob_path.as_path()),
         ),
         (
-            "RUSTYNET_WG_PUBLIC_KEY".to_string(),
+            "RUSTYNET_WG_PUBLIC_KEY".to_owned(),
             display_path(wireguard_public_key_path.as_path()),
         ),
         (
-            "RUSTYNET_EGRESS_INTERFACE".to_string(),
+            "RUSTYNET_EGRESS_INTERFACE".to_owned(),
             egress_interface.clone(),
         ),
         (
-            "RUSTYNET_AUTO_PORT_FORWARD_EXIT".to_string(),
+            "RUSTYNET_AUTO_PORT_FORWARD_EXIT".to_owned(),
             auto_port_forward_exit_raw,
         ),
         (
-            "RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS".to_string(),
+            "RUSTYNET_AUTO_PORT_FORWARD_LEASE_SECS".to_owned(),
             auto_port_forward_lease_secs_raw,
         ),
-        ("RUSTYNET_DATAPLANE_MODE".to_string(), dataplane_mode),
+        ("RUSTYNET_DATAPLANE_MODE".to_owned(), dataplane_mode),
         (
-            "RUSTYNET_PRIVILEGED_HELPER_SOCKET".to_string(),
+            "RUSTYNET_PRIVILEGED_HELPER_SOCKET".to_owned(),
             display_path(privileged_helper_socket.as_path()),
         ),
         (
-            "RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS".to_string(),
+            "RUSTYNET_PRIVILEGED_HELPER_TIMEOUT_MS".to_owned(),
             privileged_helper_timeout_ms_raw,
         ),
         (
-            "RUSTYNET_PRIVILEGED_HELPER_ALLOWED_UID".to_string(),
+            "RUSTYNET_PRIVILEGED_HELPER_ALLOWED_UID".to_owned(),
             daemon_uid.as_raw().to_string(),
         ),
         (
-            "RUSTYNET_PRIVILEGED_HELPER_ALLOWED_GID".to_string(),
+            "RUSTYNET_PRIVILEGED_HELPER_ALLOWED_GID".to_owned(),
             daemon_gid.as_raw().to_string(),
         ),
-        ("RUSTYNET_DAEMON_GROUP".to_string(), service_group),
+        ("RUSTYNET_DAEMON_GROUP".to_owned(), service_group),
         (
-            "RUSTYNET_RECONCILE_INTERVAL_MS".to_string(),
+            "RUSTYNET_RECONCILE_INTERVAL_MS".to_owned(),
             reconcile_interval_ms,
         ),
         (
-            "RUSTYNET_MAX_RECONCILE_FAILURES".to_string(),
+            "RUSTYNET_MAX_RECONCILE_FAILURES".to_owned(),
             max_reconcile_failures,
         ),
         (
-            "RUSTYNET_FAIL_CLOSED_SSH_ALLOW".to_string(),
+            "RUSTYNET_FAIL_CLOSED_SSH_ALLOW".to_owned(),
             fail_closed_ssh_allow_raw,
         ),
         (
-            "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS".to_string(),
+            "RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS".to_owned(),
             fail_closed_ssh_allow_cidrs,
         ),
     ];
@@ -1103,14 +1102,14 @@ fn require_root_execution() -> Result<(), String> {
     if Uid::effective().is_root() {
         return Ok(());
     }
-    Err("run as root".to_string())
+    Err("run as root".to_owned())
 }
 
 fn require_linux_host() -> Result<(), String> {
     if cfg!(target_os = "linux") {
         return Ok(());
     }
-    Err("ops install-systemd is only supported on Linux hosts".to_string())
+    Err("ops install-systemd is only supported on Linux hosts".to_owned())
 }
 
 fn resolve_source_root() -> Result<PathBuf, String> {
@@ -1137,8 +1136,7 @@ fn resolve_source_root() -> Result<PathBuf, String> {
     }
 
     Err(
-        "unable to resolve installer source root; set RUSTYNET_INSTALL_SOURCE_ROOT to repository root"
-            .to_string(),
+        "unable to resolve installer source root; set RUSTYNET_INSTALL_SOURCE_ROOT to repository root".to_owned(),
     )
 }
 
@@ -1240,7 +1238,7 @@ pub(crate) fn read_env_file_values(path: &Path) -> Result<HashMap<String, String
                     path.display()
                 )
             })?;
-            values.insert(key.to_string(), parsed);
+            values.insert(key.to_owned(), parsed);
         }
     }
     Ok(values)
@@ -1271,7 +1269,7 @@ fn env_string_or_existing_default(
         Some(value) => Ok(value),
         None => match existing.get(key) {
             Some(value) if !value.is_empty() => Ok(value.clone()),
-            _ => Ok(default.to_string()),
+            _ => Ok(default.to_owned()),
         },
     }
 }
@@ -1294,7 +1292,7 @@ fn env_string_or_existing_required(
 fn env_string_or_default_process(key: &str, default: &str) -> Result<String, String> {
     match env_optional_string(key)? {
         Some(value) => Ok(value),
-        None => Ok(default.to_string()),
+        None => Ok(default.to_owned()),
     }
 }
 
@@ -1371,12 +1369,12 @@ fn parse_dns_resolver_bind_addr_install(value: &str) -> Result<SocketAddr, Strin
         .parse::<SocketAddr>()
         .map_err(|err| format!("invalid dns resolver bind addr: {err}"))?;
     if !addr.ip().is_loopback() {
-        return Err("dns resolver bind addr must be loopback".to_string());
+        return Err("dns resolver bind addr must be loopback".to_owned());
     }
     if !matches!(addr.ip(), IpAddr::V4(_)) {
         return Err(
             "dns resolver bind addr for managed DNS routing must be an IPv4 loopback address"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(addr)
@@ -1399,7 +1397,7 @@ fn detect_default_egress_interface() -> Result<String, String> {
     if let Some(interface) = parse_first_route_interface(output.as_str()) {
         return Ok(interface);
     }
-    Err("unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_string())
+    Err("unable to detect default egress interface; set RUSTYNET_EGRESS_INTERFACE".to_owned())
 }
 
 fn resolve_egress_interface(
@@ -1522,7 +1520,7 @@ fn read_assignment_refresh_exit_node_id(path: &Path) -> Result<Option<String>, S
             raw
         ));
     }
-    Ok(Some(raw.to_string()))
+    Ok(Some(raw.to_owned()))
 }
 
 fn render_assignment_refresh_env_contents(
@@ -1604,9 +1602,9 @@ fn resolve_assignment_refresh_value(
 ) -> Result<String, String> {
     let resolved = explicit
         .or_else(|| existing.get(key).cloned())
-        .unwrap_or_else(|| fallback.unwrap_or_default().to_string())
+        .unwrap_or_else(|| fallback.unwrap_or_default().to_owned())
         .trim()
-        .to_string();
+        .to_owned();
     if resolved.is_empty() {
         return Err(format!(
             "assignment auto-refresh requires {key}; set it explicitly or provide it in {ASSIGNMENT_REFRESH_ENV_DST}"
@@ -1624,7 +1622,7 @@ fn resolve_assignment_refresh_optional_value(
     let Some(raw) = explicit.or_else(|| existing.get(key).cloned()) else {
         return Ok(None);
     };
-    let normalized = raw.trim().to_string();
+    let normalized = raw.trim().to_owned();
     if normalized.is_empty() {
         return Ok(None);
     }
@@ -1646,7 +1644,7 @@ fn resolve_selected_exit_node_id(
     if let Some(value) = preferred_exit_node_id
         && !value.trim().is_empty()
     {
-        return Some(value.to_string());
+        return Some(value.to_owned());
     }
 
     let route_count = fields
@@ -1673,7 +1671,7 @@ fn resolve_selected_exit_node_id(
         let via_node = via_node.trim();
         if destination == DEFAULT_EXIT_ROUTE_CIDR && kind == "exit_default" && !via_node.is_empty()
         {
-            return Some(via_node.to_string());
+            return Some(via_node.to_owned());
         }
     }
 
@@ -1696,7 +1694,7 @@ fn resolve_selected_exit_node_id(
         let kind = kind.trim();
         let via_node = via_node.trim();
         if kind == "exit_default" && !via_node.is_empty() {
-            return Some(via_node.to_string());
+            return Some(via_node.to_owned());
         }
     }
 
@@ -1729,7 +1727,7 @@ fn assignment_peer_endpoint(
         endpoint.parse::<SocketAddr>().map_err(|_| {
             format!("assignment bundle has invalid endpoint for selected exit node {target_node_id}: {endpoint}")
         })?;
-        return Ok(endpoint.to_string());
+        return Ok(endpoint.to_owned());
     }
 
     for (key, value) in fields {
@@ -1747,7 +1745,7 @@ fn assignment_peer_endpoint(
         endpoint.parse::<SocketAddr>().map_err(|_| {
             format!("assignment bundle has invalid endpoint for selected exit node {target_node_id}: {endpoint}")
         })?;
-        return Ok(endpoint.to_string());
+        return Ok(endpoint.to_owned());
     }
 
     Err(format!(
@@ -2098,7 +2096,7 @@ fn scrub_file_contents(path: &Path) -> Result<(), String> {
     let zero_chunk = [0u8; 8192];
     while remaining > 0 {
         let write_len = usize::try_from(std::cmp::min(remaining, zero_chunk.len() as u64))
-            .map_err(|_| "internal length conversion failed".to_string())?;
+            .map_err(|_| "internal length conversion failed".to_owned())?;
         file.write_all(&zero_chunk[..write_len])
             .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
         remaining = remaining.saturating_sub(write_len as u64);
@@ -2220,8 +2218,8 @@ fn run_command_capture(command: &str, args: &[&str]) -> Result<String, String> {
         .map_err(|err| format!("execute {} failed: {err}", format_command(command, args)))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let details = if !stderr.is_empty() { stderr } else { stdout };
         return Err(format!(
             "command failed ({}): {}",
@@ -2257,8 +2255,8 @@ fn run_command_capture_with_env(
         .map_err(|err| format!("execute {} failed: {err}", format_command(command, args)))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let details = if !stderr.is_empty() { stderr } else { stdout };
         return Err(format!(
             "command failed ({}): {}",
@@ -2284,16 +2282,16 @@ fn run_command_checked_with_env(
 }
 
 fn wait_for_unix_socket(path: &Path, attempts: usize, sleep_ms: u64) -> Result<(), String> {
-    let mut last_state = "missing".to_string();
+    let mut last_state = "missing".to_owned();
     for attempt in 1..=attempts {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    last_state = "symlink".to_string();
+                    last_state = "symlink".to_owned();
                 } else if metadata.file_type().is_socket() {
                     return Ok(());
                 } else {
-                    last_state = "not-socket".to_string();
+                    last_state = "not-socket".to_owned();
                 }
             }
             Err(err) => {
@@ -2317,14 +2315,14 @@ fn wait_for_unit_active(unit: &str, attempts: usize, sleep_ms: u64) -> Result<()
             .args(["is-active", unit])
             .output()
             .map_err(|err| format!("execute systemctl is-active {unit} failed: {err}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         last_state = if !stdout.is_empty() {
             stdout
         } else if !stderr.is_empty() {
             stderr
         } else {
-            "unknown".to_string()
+            "unknown".to_owned()
         };
         if output.status.success() && last_state == "active" {
             return Ok(());
@@ -2341,8 +2339,7 @@ fn wait_for_unit_active(unit: &str, attempts: usize, sleep_ms: u64) -> Result<()
 fn ensure_managed_dns_control_plane_ready() -> Result<(), String> {
     if !Path::new("/usr/bin/resolvectl").is_file() {
         return Err(
-            "managed DNS routing requires /usr/bin/resolvectl; install and enable systemd-resolved before running install-systemd"
-                .to_string(),
+            "managed DNS routing requires /usr/bin/resolvectl; install and enable systemd-resolved before running install-systemd".to_owned(),
         );
     }
 
@@ -2381,8 +2378,8 @@ fn run_systemctl_status_with_retry(
 ) -> Result<(), String> {
     let status_args = ["--no-pager", "--full", "status", unit];
     let command_text = format_command("systemctl", &status_args);
-    let mut last_state = "unknown".to_string();
-    let mut last_exit = "unknown".to_string();
+    let mut last_state = "unknown".to_owned();
+    let mut last_exit = "unknown".to_owned();
     for attempt in 1..=attempts {
         let output = Command::new("systemctl")
             .args(status_args)
@@ -2417,15 +2414,15 @@ fn systemctl_unit_active_state(unit: &str) -> Result<String, String> {
         .args(["is-active", unit])
         .output()
         .map_err(|err| format!("execute systemctl is-active {unit} failed: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !stdout.is_empty() {
         return Ok(stdout);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return Ok(stderr);
     }
-    Ok("unknown".to_string())
+    Ok("unknown".to_owned())
 }
 
 fn systemctl_unit_enabled_state(unit: &str) -> Result<String, String> {
@@ -2433,15 +2430,15 @@ fn systemctl_unit_enabled_state(unit: &str) -> Result<String, String> {
         .args(["is-enabled", unit])
         .output()
         .map_err(|err| format!("execute systemctl is-enabled {unit} failed: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !stdout.is_empty() {
         return Ok(stdout);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return Ok(stderr);
     }
-    Ok("unknown".to_string())
+    Ok("unknown".to_owned())
 }
 
 fn systemctl_state_retryable(state: &str) -> bool {
@@ -2452,7 +2449,7 @@ fn systemctl_state_retryable(state: &str) -> bool {
 }
 
 fn wait_for_unit_inactive(unit: &str, attempts: usize, sleep_ms: u64) -> Result<(), String> {
-    let mut last_state = "unknown".to_string();
+    let mut last_state = "unknown".to_owned();
     for attempt in 1..=attempts {
         last_state = systemctl_unit_active_state(unit)?;
         if last_state == "inactive" {
@@ -2478,7 +2475,7 @@ fn wait_for_unit_inactive(unit: &str, attempts: usize, sleep_ms: u64) -> Result<
 
 fn format_command(command: &str, args: &[&str]) -> String {
     if args.is_empty() {
-        return command.to_string();
+        return command.to_owned();
     }
     format!("{} {}", command, args.join(" "))
 }
@@ -2525,7 +2522,7 @@ fn validate_simple_value(key: &str, value: &str) -> Result<(), String> {
 
 fn validate_env_line(key: &str, value: &str) -> Result<(), String> {
     if key.is_empty() {
-        return Err("environment key must not be empty".to_string());
+        return Err("environment key must not be empty".to_owned());
     }
     if key.contains('\n') || key.contains('\r') || key.contains('\0') {
         return Err(format!("environment key contains unsafe characters: {key}"));
@@ -2923,13 +2920,13 @@ mod tests {
     #[test]
     fn resolve_selected_exit_node_prefers_explicit_exit_id() {
         let mut fields = HashMap::new();
-        fields.insert("route_count".to_string(), "1".to_string());
+        fields.insert("route_count".to_owned(), "1".to_owned());
         fields.insert(
-            "route.0.destination_cidr".to_string(),
-            "0.0.0.0/0".to_string(),
+            "route.0.destination_cidr".to_owned(),
+            "0.0.0.0/0".to_owned(),
         );
-        fields.insert("route.0.kind".to_string(), "exit_default".to_string());
-        fields.insert("route.0.via_node".to_string(), "exit-a".to_string());
+        fields.insert("route.0.kind".to_owned(), "exit_default".to_owned());
+        fields.insert("route.0.via_node".to_owned(), "exit-a".to_owned());
 
         let resolved = resolve_selected_exit_node_id(&fields, Some("exit-b"));
         assert_eq!(resolved.as_deref(), Some("exit-b"));
@@ -2938,13 +2935,13 @@ mod tests {
     #[test]
     fn resolve_selected_exit_node_from_default_route() {
         let mut fields = HashMap::new();
-        fields.insert("route_count".to_string(), "1".to_string());
+        fields.insert("route_count".to_owned(), "1".to_owned());
         fields.insert(
-            "route.0.destination_cidr".to_string(),
-            "0.0.0.0/0".to_string(),
+            "route.0.destination_cidr".to_owned(),
+            "0.0.0.0/0".to_owned(),
         );
-        fields.insert("route.0.kind".to_string(), "exit_default".to_string());
-        fields.insert("route.0.via_node".to_string(), "exit-a".to_string());
+        fields.insert("route.0.kind".to_owned(), "exit_default".to_owned());
+        fields.insert("route.0.via_node".to_owned(), "exit-a".to_owned());
 
         let resolved = resolve_selected_exit_node_id(&fields, None);
         assert_eq!(resolved.as_deref(), Some("exit-a"));
@@ -2953,16 +2950,16 @@ mod tests {
     #[test]
     fn assignment_peer_endpoint_resolves_peer_endpoint() {
         let mut fields = HashMap::new();
-        fields.insert("peer_count".to_string(), "2".to_string());
-        fields.insert("peer.0.node_id".to_string(), "entry".to_string());
+        fields.insert("peer_count".to_owned(), "2".to_owned());
+        fields.insert("peer.0.node_id".to_owned(), "entry".to_owned());
         fields.insert(
-            "peer.0.endpoint".to_string(),
-            "192.168.18.50:51820".to_string(),
+            "peer.0.endpoint".to_owned(),
+            "192.168.18.50:51820".to_owned(),
         );
-        fields.insert("peer.1.node_id".to_string(), "final-exit".to_string());
+        fields.insert("peer.1.node_id".to_owned(), "final-exit".to_owned());
         fields.insert(
-            "peer.1.endpoint".to_string(),
-            "192.168.18.49:51820".to_string(),
+            "peer.1.endpoint".to_owned(),
+            "192.168.18.49:51820".to_owned(),
         );
 
         let endpoint =
@@ -2974,12 +2971,12 @@ mod tests {
     fn render_assignment_refresh_env_defaults_target_node_id_and_quotes_values() {
         let mut existing = HashMap::new();
         existing.insert(
-            "RUSTYNET_ASSIGNMENT_NODES".to_string(),
-            "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def".to_string(),
+            "RUSTYNET_ASSIGNMENT_NODES".to_owned(),
+            "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def".to_owned(),
         );
         existing.insert(
-            "RUSTYNET_ASSIGNMENT_ALLOW".to_string(),
-            "client-50|exit-49;exit-49|client-50".to_string(),
+            "RUSTYNET_ASSIGNMENT_ALLOW".to_owned(),
+            "client-50|exit-49;exit-49|client-50".to_owned(),
         );
 
         let rendered =
@@ -3013,12 +3010,12 @@ mod tests {
     fn render_assignment_refresh_env_rejects_invalid_exit_node_id() {
         let mut existing = HashMap::new();
         existing.insert(
-            "RUSTYNET_ASSIGNMENT_NODES".to_string(),
-            "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def".to_string(),
+            "RUSTYNET_ASSIGNMENT_NODES".to_owned(),
+            "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def".to_owned(),
         );
         existing.insert(
-            "RUSTYNET_ASSIGNMENT_ALLOW".to_string(),
-            "client-50|exit-49;exit-49|client-50".to_string(),
+            "RUSTYNET_ASSIGNMENT_ALLOW".to_owned(),
+            "client-50|exit-49;exit-49|client-50".to_owned(),
         );
 
         let err = render_assignment_refresh_env_contents(
@@ -3026,7 +3023,7 @@ mod tests {
             None,
             None,
             None,
-            Some("exit 49".to_string()),
+            Some("exit 49".to_owned()),
             &existing,
         )
         .expect_err("invalid exit node id should fail");

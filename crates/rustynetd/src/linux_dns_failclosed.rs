@@ -219,20 +219,20 @@ pub fn parse_resolv_conf(body: &str) -> (Vec<String>, Vec<String>) {
         if let Some(rest) = trimmed.strip_prefix("nameserver") {
             let value = rest.trim();
             if !value.is_empty() {
-                nameservers.push(value.to_string());
+                nameservers.push(value.to_owned());
             }
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("search") {
             for token in rest.split_ascii_whitespace() {
-                search_domains.push(token.to_string());
+                search_domains.push(token.to_owned());
             }
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("domain") {
             let value = rest.trim();
             if !value.is_empty() {
-                search_domains.push(value.to_string());
+                search_domains.push(value.to_owned());
             }
         }
     }
@@ -281,7 +281,7 @@ fn collect_linux_dns_failclosed_snapshot_inner() -> LinuxDnsFailclosedSnapshot {
 #[cfg(not(target_os = "linux"))]
 fn collect_linux_dns_failclosed_snapshot_inner() -> LinuxDnsFailclosedSnapshot {
     LinuxDnsFailclosedSnapshot {
-        resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_string(),
+        resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_owned(),
         resolv_conf_present: false,
         nameservers: Vec::new(),
         search_domains: Vec::new(),
@@ -341,7 +341,7 @@ pub(crate) fn parse_network_manager_dns_mode(body: &str) -> Option<String> {
                     None => value,
                 };
                 if !value.is_empty() {
-                    return Some(value.to_string());
+                    return Some(value.to_owned());
                 }
             }
         }
@@ -355,10 +355,10 @@ mod tests {
 
     fn loopback_only_snapshot() -> LinuxDnsFailclosedSnapshot {
         LinuxDnsFailclosedSnapshot {
-            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_string(),
+            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_owned(),
             resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_string(), "::1".to_string()],
-            search_domains: vec!["rustynet".to_string()],
+            nameservers: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
+            search_domains: vec!["rustynet".to_owned()],
             loopback_resolver_advertised: true,
             systemd_resolved_stub_present: false,
             network_manager_dns_mode: None,
@@ -375,17 +375,17 @@ search lan rustynet
 domain example.lan
 ";
         let (ns, sd) = parse_resolv_conf(body);
-        assert_eq!(ns, vec!["127.0.0.53".to_string(), "::1".to_string()]);
-        assert!(sd.contains(&"lan".to_string()));
-        assert!(sd.contains(&"rustynet".to_string()));
-        assert!(sd.contains(&"example.lan".to_string()));
+        assert_eq!(ns, vec!["127.0.0.53".to_owned(), "::1".to_owned()]);
+        assert!(sd.contains(&"lan".to_owned()));
+        assert!(sd.contains(&"rustynet".to_owned()));
+        assert!(sd.contains(&"example.lan".to_owned()));
     }
 
     #[test]
     fn parser_skips_comments_and_blank_lines() {
         let body = "\n; classic semicolon comment\n# hash comment\n   \nnameserver 127.0.0.1\n";
         let (ns, _sd) = parse_resolv_conf(body);
-        assert_eq!(ns, vec!["127.0.0.1".to_string()]);
+        assert_eq!(ns, vec!["127.0.0.1".to_owned()]);
     }
 
     #[test]
@@ -397,7 +397,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_external_nameserver() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers.push("8.8.8.8".to_string());
+        snap.nameservers.push("8.8.8.8".to_owned());
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons
@@ -411,7 +411,7 @@ domain example.lan
     fn evaluator_rejects_lan_resolver_address() {
         // RFC1918 LAN router DNS is the most common drift in practice.
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["192.168.1.1".to_string()];
+        snap.nameservers = vec!["192.168.1.1".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons
@@ -424,7 +424,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_unparseable_nameserver_entry() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["not-an-address".to_string()];
+        snap.nameservers = vec!["not-an-address".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.iter().any(|r| r.contains("not a parseable IP")),
@@ -435,7 +435,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_missing_resolv_conf() {
         let snap = LinuxDnsFailclosedSnapshot {
-            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_string(),
+            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_owned(),
             resolv_conf_present: false,
             nameservers: Vec::new(),
             search_domains: Vec::new(),
@@ -480,9 +480,9 @@ domain example.lan
     fn evaluator_aggregates_multiple_drift_reasons() {
         let mut snap = loopback_only_snapshot();
         snap.nameservers = vec![
-            "8.8.8.8".to_string(),
-            "192.168.1.1".to_string(),
-            "garbage".to_string(),
+            "8.8.8.8".to_owned(),
+            "192.168.1.1".to_owned(),
+            "garbage".to_owned(),
         ];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(reasons.len() >= 3, "expected three drifts: {reasons:?}");
@@ -513,7 +513,7 @@ domain example.lan
     #[test]
     fn evaluator_accepts_systemd_resolved_stub_127_0_0_53() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["127.0.0.53".to_string()];
+        snap.nameservers = vec!["127.0.0.53".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.is_empty(),
@@ -526,7 +526,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_ipv4_unspecified_nameserver() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["0.0.0.0".to_string()];
+        snap.nameservers = vec!["0.0.0.0".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons
@@ -540,7 +540,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_ipv6_unspecified_nameserver() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["::".to_string()];
+        snap.nameservers = vec!["::".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.iter().any(|r| r.contains("non-loopback")),
@@ -553,7 +553,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_ipv4_link_local_nameserver() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["169.254.169.254".to_string()];
+        snap.nameservers = vec!["169.254.169.254".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons
@@ -568,7 +568,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_ipv6_link_local_nameserver() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["fe80::1".to_string()];
+        snap.nameservers = vec!["fe80::1".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons
@@ -583,7 +583,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_ipv4_mapped_external_nameserver() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["::ffff:8.8.8.8".to_string()];
+        snap.nameservers = vec!["::ffff:8.8.8.8".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.iter().any(|r| r.contains("non-loopback")),
@@ -595,7 +595,7 @@ domain example.lan
     #[test]
     fn evaluator_accepts_ipv6_loopback_long_form() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["0:0:0:0:0:0:0:1".to_string()];
+        snap.nameservers = vec!["0:0:0:0:0:0:0:1".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.is_empty(),
@@ -610,9 +610,9 @@ domain example.lan
     fn evaluator_accepts_full_127_slash_8_loopback_range() {
         let mut snap = loopback_only_snapshot();
         snap.nameservers = vec![
-            "127.0.0.1".to_string(),
-            "127.0.0.53".to_string(),
-            "127.255.255.254".to_string(),
+            "127.0.0.1".to_owned(),
+            "127.0.0.53".to_owned(),
+            "127.255.255.254".to_owned(),
         ];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
@@ -627,7 +627,7 @@ domain example.lan
     #[test]
     fn evaluator_flags_only_off_loopback_entry_when_mixed() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["127.0.0.53".to_string(), "1.1.1.1".to_string()];
+        snap.nameservers = vec!["127.0.0.53".to_owned(), "1.1.1.1".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert_eq!(
             reasons.len(),
@@ -646,7 +646,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_zoneid_suffixed_link_local() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["fe80::1%eth0".to_string()];
+        snap.nameservers = vec!["fe80::1%eth0".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.iter().any(|r| r.contains("not a parseable IP")),
@@ -660,7 +660,7 @@ domain example.lan
     #[test]
     fn evaluator_rejects_bracketed_ipv6_nameserver() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["[::1]".to_string()];
+        snap.nameservers = vec!["[::1]".to_owned()];
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.iter().any(|r| r.contains("not a parseable IP")),
@@ -675,7 +675,7 @@ domain example.lan
     fn parser_tolerates_leading_whitespace_before_nameserver() {
         let body = "    nameserver 127.0.0.1\n\t nameserver ::1\n";
         let (ns, _sd) = parse_resolv_conf(body);
-        assert_eq!(ns, vec!["127.0.0.1".to_string(), "::1".to_string()]);
+        assert_eq!(ns, vec!["127.0.0.1".to_owned(), "::1".to_owned()]);
     }
 
     /// Parser ignores resolv.conf option lines (`options`, `sortlist`,
@@ -693,7 +693,7 @@ nameserver 127.0.0.1
         let (ns, sd) = parse_resolv_conf(body);
         assert_eq!(
             ns,
-            vec!["127.0.0.1".to_string()],
+            vec!["127.0.0.1".to_owned()],
             "options/sortlist/lookup/family must not pollute nameservers"
         );
         assert!(sd.is_empty(), "search_domains must stay empty: {sd:?}");
@@ -706,7 +706,7 @@ nameserver 127.0.0.1
     fn parser_drops_bare_nameserver_keyword_with_no_address() {
         let body = "nameserver\nnameserver 127.0.0.1\n";
         let (ns, _sd) = parse_resolv_conf(body);
-        assert_eq!(ns, vec!["127.0.0.1".to_string()]);
+        assert_eq!(ns, vec!["127.0.0.1".to_owned()]);
     }
 
     /// Parser does not strip in-line comments after the address — glibc
@@ -721,7 +721,7 @@ nameserver 127.0.0.1
         let (ns, _sd) = parse_resolv_conf(body);
         assert_eq!(ns.len(), 1);
         let reasons = evaluate_linux_dns_failclosed_snapshot(&LinuxDnsFailclosedSnapshot {
-            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_string(),
+            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_owned(),
             resolv_conf_present: true,
             nameservers: ns,
             search_domains: Vec::new(),
@@ -754,7 +754,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_flags_systemd_resolved_stub_race_when_127_0_0_53_present() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["127.0.0.53".to_string()];
+        snap.nameservers = vec!["127.0.0.53".to_owned()];
         snap.systemd_resolved_stub_present = true;
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
@@ -772,7 +772,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_accepts_stub_active_when_resolver_uses_distinct_loopback() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["127.0.0.1".to_string()];
+        snap.nameservers = vec!["127.0.0.1".to_owned()];
         snap.systemd_resolved_stub_present = true;
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
@@ -791,7 +791,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_silent_on_race_when_stub_marker_file_absent() {
         let mut snap = loopback_only_snapshot();
-        snap.nameservers = vec!["127.0.0.53".to_string()];
+        snap.nameservers = vec!["127.0.0.53".to_owned()];
         snap.systemd_resolved_stub_present = false;
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
@@ -809,7 +809,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_accepts_network_manager_dns_none() {
         let mut snap = loopback_only_snapshot();
-        snap.network_manager_dns_mode = Some("none".to_string());
+        snap.network_manager_dns_mode = Some("none".to_owned());
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(reasons.is_empty(), "dns=none must pass: {reasons:?}");
     }
@@ -819,7 +819,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_accepts_network_manager_dns_systemd_resolved() {
         let mut snap = loopback_only_snapshot();
-        snap.network_manager_dns_mode = Some("systemd-resolved".to_string());
+        snap.network_manager_dns_mode = Some("systemd-resolved".to_owned());
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons.is_empty(),
@@ -833,7 +833,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_accepts_network_manager_dns_dnsmasq() {
         let mut snap = loopback_only_snapshot();
-        snap.network_manager_dns_mode = Some("dnsmasq".to_string());
+        snap.network_manager_dns_mode = Some("dnsmasq".to_owned());
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(reasons.is_empty(), "dns=dnsmasq must pass: {reasons:?}");
     }
@@ -844,7 +844,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_flags_network_manager_dns_default_precedence_drift() {
         let mut snap = loopback_only_snapshot();
-        snap.network_manager_dns_mode = Some("default".to_string());
+        snap.network_manager_dns_mode = Some("default".to_owned());
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons
@@ -873,7 +873,7 @@ nameserver 127.0.0.1
     #[test]
     fn evaluator_flags_unknown_network_manager_dns_value() {
         let mut snap = loopback_only_snapshot();
-        snap.network_manager_dns_mode = Some("unbound".to_string());
+        snap.network_manager_dns_mode = Some("unbound".to_owned());
         let reasons = evaluate_linux_dns_failclosed_snapshot(&snap);
         assert!(
             reasons
@@ -910,7 +910,7 @@ nameserver 127.0.0.1
         let body = "[main]\nplugins=keyfile\ndns=systemd-resolved\n";
         assert_eq!(
             parse_network_manager_dns_mode(body),
-            Some("systemd-resolved".to_string())
+            Some("systemd-resolved".to_owned())
         );
     }
 
@@ -926,7 +926,7 @@ nameserver 127.0.0.1
         let body = "[main]\ndns=none # explicit fail-closed\n";
         assert_eq!(
             parse_network_manager_dns_mode(body),
-            Some("none".to_string())
+            Some("none".to_owned())
         );
     }
 
@@ -935,7 +935,7 @@ nameserver 127.0.0.1
         let body = "[main]\ndns =  dnsmasq\n";
         assert_eq!(
             parse_network_manager_dns_mode(body),
-            Some("dnsmasq".to_string())
+            Some("dnsmasq".to_owned())
         );
     }
 
@@ -944,7 +944,7 @@ nameserver 127.0.0.1
         let body = "# comment\n; comment\n[main]\ndns=none\n";
         assert_eq!(
             parse_network_manager_dns_mode(body),
-            Some("none".to_string())
+            Some("none".to_owned())
         );
     }
 
@@ -953,7 +953,7 @@ nameserver 127.0.0.1
         let body = "[Main]\ndns=none\n";
         assert_eq!(
             parse_network_manager_dns_mode(body),
-            Some("none".to_string())
+            Some("none".to_owned())
         );
     }
 }

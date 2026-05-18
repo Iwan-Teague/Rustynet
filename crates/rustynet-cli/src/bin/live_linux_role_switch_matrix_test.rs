@@ -201,7 +201,7 @@ fn run() -> Result<(), String> {
         signed_state_refresh: signed_state_refresh.as_ref(),
     };
 
-    let mut overall_status = "pass".to_string();
+    let mut overall_status = "pass".to_owned();
     for host in [
         HostSwitchSpec {
             host: &config.debian_host,
@@ -261,7 +261,7 @@ fn run() -> Result<(), String> {
     logger.line(format!("role_switch_source={}", config.source_path.display()).as_str())?;
 
     if overall_status != "pass" {
-        return Err("role-switch matrix validation failed".to_string());
+        return Err("role-switch matrix validation failed".to_owned());
     }
 
     Ok(())
@@ -294,17 +294,17 @@ impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
             ssh_identity_file: PathBuf::new(),
-            exit_host: "debian@192.168.18.50".to_string(),
-            exit_node_id: "exit-50".to_string(),
-            debian_host: "debian@192.168.18.65".to_string(),
-            debian_node_id: "client-65".to_string(),
-            ubuntu_host: "ubuntu@192.168.18.52".to_string(),
-            ubuntu_node_id: "client-52".to_string(),
-            fedora_host: "fedora@192.168.18.51".to_string(),
-            fedora_node_id: "client-51".to_string(),
-            mint_host: "mint@192.168.18.53".to_string(),
-            mint_node_id: "client-53".to_string(),
-            ssh_allow_cidrs: "192.168.18.0/24".to_string(),
+            exit_host: "debian@192.168.18.50".to_owned(),
+            exit_node_id: "exit-50".to_owned(),
+            debian_host: "debian@192.168.18.65".to_owned(),
+            debian_node_id: "client-65".to_owned(),
+            ubuntu_host: "ubuntu@192.168.18.52".to_owned(),
+            ubuntu_node_id: "client-52".to_owned(),
+            fedora_host: "fedora@192.168.18.51".to_owned(),
+            fedora_node_id: "client-51".to_owned(),
+            mint_host: "mint@192.168.18.53".to_owned(),
+            mint_node_id: "client-53".to_owned(),
+            ssh_allow_cidrs: "192.168.18.0/24".to_owned(),
             report_path: PathBuf::from("artifacts/phase10/role_switch_matrix_report.json"),
             source_path: PathBuf::from("artifacts/phase10/source/role_switch_matrix.md"),
             log_path: PathBuf::from("artifacts/phase10/source/live_linux_role_switch_matrix.log"),
@@ -356,7 +356,7 @@ impl Config {
         if config.ssh_identity_file.as_os_str().is_empty() {
             return Err(
                 "usage: live_linux_role_switch_matrix_test --ssh-identity-file <path> [options]"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         for (label, value) in [
@@ -397,12 +397,10 @@ fn build_signed_state_refresh_context(
     ) {
         (None, None) => Ok(None),
         (Some(_), None) => Err(
-            "role-switch signed-state refresh requires --dns-zone-env-file when --traversal-env-file is set"
-                .to_string(),
+            "role-switch signed-state refresh requires --dns-zone-env-file when --traversal-env-file is set".to_owned(),
         ),
         (None, Some(_)) => Err(
-            "role-switch signed-state refresh requires --traversal-env-file when --dns-zone-env-file is set"
-                .to_string(),
+            "role-switch signed-state refresh requires --traversal-env-file when --dns-zone-env-file is set".to_owned(),
         ),
         (Some(traversal_env_file), Some(dns_zone_env_file)) => {
             Ok(Some(SignedStateRefreshContext {
@@ -588,7 +586,7 @@ fn process_host(
         || policy_still_enforced != "pass"
         || least_privilege_preserved != "pass"
     {
-        *overall_status = "fail".to_string();
+        *overall_status = "fail".to_owned();
     }
     Ok(())
 }
@@ -1150,7 +1148,7 @@ fn wait_for_client_exit_route_convergence(
             host,
             "ip -4 route get 1.1.1.1 || true",
         )?;
-        last_route = route.trim().to_string();
+        last_route = route.trim().to_owned();
         let combined = if last_route.is_empty() {
             status_line.clone()
         } else {
@@ -1234,7 +1232,7 @@ fn sanitize_path_component(value: &str) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect::<String>()
         .trim_matches('-')
-        .to_string()
+        .to_owned()
 }
 
 fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
@@ -1256,12 +1254,12 @@ fn utc_now_string() -> String {
     if let Some(output) = output
         && output.status.success()
     {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if !text.is_empty() {
             return text;
         }
     }
-    "1970-01-01T00:00:00Z".to_string()
+    "1970-01-01T00:00:00Z".to_owned()
 }
 
 #[cfg(test)]
@@ -1329,17 +1327,17 @@ mod tests {
 
         let mut config = Config {
             ssh_identity_file: PathBuf::from("/tmp/key"),
-            exit_host: "debian@192.168.64.8".to_string(),
-            exit_node_id: "exit-1".to_string(),
-            debian_host: "debian@192.168.64.4".to_string(),
-            debian_node_id: "client-1".to_string(),
-            ubuntu_host: "debian@192.168.64.9".to_string(),
-            ubuntu_node_id: "client-2".to_string(),
-            fedora_host: "debian@192.168.64.10".to_string(),
-            fedora_node_id: "client-3".to_string(),
-            mint_host: "debian@192.168.64.11".to_string(),
-            mint_node_id: "client-4".to_string(),
-            ssh_allow_cidrs: "192.168.64.0/24".to_string(),
+            exit_host: "debian@192.168.64.8".to_owned(),
+            exit_node_id: "exit-1".to_owned(),
+            debian_host: "debian@192.168.64.4".to_owned(),
+            debian_node_id: "client-1".to_owned(),
+            ubuntu_host: "debian@192.168.64.9".to_owned(),
+            ubuntu_node_id: "client-2".to_owned(),
+            fedora_host: "debian@192.168.64.10".to_owned(),
+            fedora_node_id: "client-3".to_owned(),
+            mint_host: "debian@192.168.64.11".to_owned(),
+            mint_node_id: "client-4".to_owned(),
+            ssh_allow_cidrs: "192.168.64.0/24".to_owned(),
             report_path: temp_root.join("report.json"),
             source_path: temp_root.join("source.md"),
             log_path: temp_root.join("role-switch.log"),

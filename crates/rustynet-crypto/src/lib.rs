@@ -800,7 +800,7 @@ pub fn create_provider_attestation(
     let signature = provider.sign_attestation(payload)?;
     Ok(ProviderAttestation {
         provider_kind: provider.kind(),
-        key_identifier: provider.key_identifier().to_string(),
+        key_identifier: provider.key_identifier().to_owned(),
         payload_digest_hex: payload_digest,
         signature_hex: hex_bytes(&signature),
     })
@@ -1327,7 +1327,7 @@ mod tests {
         let manager = KeyCustodyManager::new(
             NoOsSecureStore,
             fallback_directory.clone(),
-            "phase2-passphrase".to_string(),
+            "phase2-passphrase".to_owned(),
             KeyCustodyPermissionPolicy::default(),
         );
 
@@ -1360,7 +1360,7 @@ mod tests {
         let manager = KeyCustodyManager::new(
             NoOsSecureStore,
             fallback_directory.clone(),
-            "phase2-passphrase".to_string(),
+            "phase2-passphrase".to_owned(),
             KeyCustodyPermissionPolicy::default(),
         )
         .with_fallback_policy(OsStoreFallbackPolicy::RequireOsSecureStore);
@@ -1412,7 +1412,7 @@ mod tests {
         let manager = KeyCustodyManager::new(
             NoOsSecureStore,
             std::env::temp_dir().join("rustynet-key-custody-invalid-id"),
-            "phase2-passphrase".to_string(),
+            "phase2-passphrase".to_owned(),
             KeyCustodyPermissionPolicy::default(),
         );
 

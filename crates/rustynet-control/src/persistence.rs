@@ -280,8 +280,8 @@ mod tests {
 
         store
             .upsert_user(&UserRow {
-                user_id: "user-1".to_string(),
-                email: "alice@example.local".to_string(),
+                user_id: "user-1".to_owned(),
+                email: "alice@example.local".to_owned(),
                 mfa_enabled: true,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -290,11 +290,11 @@ mod tests {
 
         store
             .upsert_node(&NodeRow {
-                node_id: "node-1".to_string(),
-                owner_user_id: "user-1".to_string(),
-                hostname: "mini-pc-1".to_string(),
-                os: "linux".to_string(),
-                tags_csv: "servers,exit-capable".to_string(),
+                node_id: "node-1".to_owned(),
+                owner_user_id: "user-1".to_owned(),
+                hostname: "mini-pc-1".to_owned(),
+                os: "linux".to_owned(),
+                tags_csv: "servers,exit-capable".to_owned(),
                 public_key_hex: "aa".repeat(32),
                 last_seen_unix: 120,
                 updated_at_unix: 120,
@@ -330,8 +330,8 @@ mod tests {
 
         store
             .upsert_user(&UserRow {
-                user_id: "user-1".to_string(),
-                email: "alice@example.local".to_string(),
+                user_id: "user-1".to_owned(),
+                email: "alice@example.local".to_owned(),
                 mfa_enabled: true,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -340,17 +340,17 @@ mod tests {
 
         store
             .insert_credential(&CredentialRow {
-                credential_id: "cred-1".to_string(),
-                creator_user_id: "user-1".to_string(),
-                scope: "tag:servers".to_string(),
-                credential_kind: "throwaway".to_string(),
-                state: "created".to_string(),
+                credential_id: "cred-1".to_owned(),
+                creator_user_id: "user-1".to_owned(),
+                scope: "tag:servers".to_owned(),
+                credential_kind: "throwaway".to_owned(),
+                state: "created".to_owned(),
                 max_uses: 1,
                 uses: 0,
                 expires_at_unix: 300,
                 created_at_unix: 100,
                 updated_at_unix: 100,
-                storage_policy: "throwaway_default".to_string(),
+                storage_policy: "throwaway_default".to_owned(),
             })
             .expect("credential insert should succeed");
 

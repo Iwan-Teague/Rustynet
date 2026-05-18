@@ -129,7 +129,7 @@ pub fn canonicalize_dns_zone_name(value: &str) -> Result<String, DnsZoneError> {
     let normalized = canonicalize_dns_relative_name(value)?;
     if normalized.len() > 64 {
         return Err(DnsZoneError::InvalidFormat(
-            "dns zone name exceeds max length".to_string(),
+            "dns zone name exceeds max length".to_owned(),
         ));
     }
     Ok(normalized)
@@ -139,30 +139,30 @@ pub fn canonicalize_dns_relative_name(value: &str) -> Result<String, DnsZoneErro
     let trimmed = value.trim().trim_end_matches('.');
     if trimmed.is_empty() {
         return Err(DnsZoneError::InvalidFormat(
-            "dns name must not be empty".to_string(),
+            "dns name must not be empty".to_owned(),
         ));
     }
     if trimmed.starts_with('.') || trimmed.contains('*') {
         return Err(DnsZoneError::InvalidFormat(
-            "dns name contains forbidden characters".to_string(),
+            "dns name contains forbidden characters".to_owned(),
         ));
     }
     let mut parts = Vec::new();
     for raw_part in trimmed.split('.') {
         if raw_part.is_empty() {
             return Err(DnsZoneError::InvalidFormat(
-                "dns name contains an empty label".to_string(),
+                "dns name contains an empty label".to_owned(),
             ));
         }
         let part = raw_part.to_ascii_lowercase();
         if part.len() > 63 {
             return Err(DnsZoneError::InvalidFormat(
-                "dns label exceeds maximum length".to_string(),
+                "dns label exceeds maximum length".to_owned(),
             ));
         }
         if part.starts_with('-') || part.ends_with('-') {
             return Err(DnsZoneError::InvalidFormat(
-                "dns label must not start or end with '-'".to_string(),
+                "dns label must not start or end with '-'".to_owned(),
             ));
         }
         if !part
@@ -170,7 +170,7 @@ pub fn canonicalize_dns_relative_name(value: &str) -> Result<String, DnsZoneErro
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         {
             return Err(DnsZoneError::InvalidFormat(
-                "dns label contains invalid characters".to_string(),
+                "dns label contains invalid characters".to_owned(),
             ));
         }
         parts.push(part);
@@ -178,7 +178,7 @@ pub fn canonicalize_dns_relative_name(value: &str) -> Result<String, DnsZoneErro
     let joined = parts.join(".");
     if joined.len() > 253 {
         return Err(DnsZoneError::InvalidFormat(
-            "dns name exceeds maximum length".to_string(),
+            "dns name exceeds maximum length".to_owned(),
         ));
     }
     Ok(joined)
@@ -192,14 +192,14 @@ pub fn parse_dns_zone_verifying_key(contents: &str) -> Result<VerifyingKey, DnsZ
     let trimmed = contents.trim();
     if trimmed.is_empty() {
         return Err(DnsZoneError::InvalidFormat(
-            "missing dns zone verifier key".to_string(),
+            "missing dns zone verifier key".to_owned(),
         ));
     }
     let key_line = trimmed
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .ok_or_else(|| DnsZoneError::InvalidFormat("missing dns zone verifier key".to_string()))?;
+        .ok_or_else(|| DnsZoneError::InvalidFormat("missing dns zone verifier key".to_owned()))?;
     let key_bytes = decode_hex_to_fixed::<32>(key_line)?;
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| DnsZoneError::KeyInvalid)
 }
@@ -215,17 +215,17 @@ pub fn build_signed_dns_zone_bundle(
 ) -> Result<SignedDnsZoneBundle, DnsZoneError> {
     if generated_at_unix == 0 {
         return Err(DnsZoneError::InvalidFormat(
-            "generated_at_unix must be greater than zero".to_string(),
+            "generated_at_unix must be greater than zero".to_owned(),
         ));
     }
     if ttl_secs == 0 || ttl_secs > 300 {
         return Err(DnsZoneError::InvalidFormat(
-            "dns zone ttl must be in range 1..=300".to_string(),
+            "dns zone ttl must be in range 1..=300".to_owned(),
         ));
     }
     if records.is_empty() {
         return Err(DnsZoneError::InvalidFormat(
-            "dns zone requires at least one record".to_string(),
+            "dns zone requires at least one record".to_owned(),
         ));
     }
     if records.len() > MAX_RECORD_COUNT {
@@ -238,13 +238,13 @@ pub fn build_signed_dns_zone_bundle(
     let subject_node_id = subject_node_id.trim();
     if subject_node_id.is_empty() {
         return Err(DnsZoneError::InvalidFormat(
-            "subject_node_id must not be empty".to_string(),
+            "subject_node_id must not be empty".to_owned(),
         ));
     }
     let expires_at_unix = generated_at_unix.saturating_add(ttl_secs);
     if generated_at_unix >= expires_at_unix {
         return Err(DnsZoneError::InvalidFormat(
-            "invalid generated/expires ordering".to_string(),
+            "invalid generated/expires ordering".to_owned(),
         ));
     }
 
@@ -264,7 +264,7 @@ pub fn build_signed_dns_zone_bundle(
         generated_at_unix,
         expires_at_unix,
         zone_name,
-        subject_node_id: subject_node_id.to_string(),
+        subject_node_id: subject_node_id.to_owned(),
         nonce,
         records: canonical_records,
     })
@@ -276,7 +276,7 @@ pub fn verify_signed_dns_zone_bundle(
 ) -> Result<(), DnsZoneError> {
     if bundle.generated_at_unix >= bundle.expires_at_unix {
         return Err(DnsZoneError::InvalidFormat(
-            "dns zone bundle has invalid generated/expires ordering".to_string(),
+            "dns zone bundle has invalid generated/expires ordering".to_owned(),
         ));
     }
     let signature_bytes = decode_hex_to_fixed::<64>(&bundle.signature_hex)?;
@@ -313,12 +313,12 @@ pub fn parse_signed_dns_zone_bundle_wire(wire: &str) -> Result<SignedDnsZoneBund
         }
         let (key, value) = raw_line
             .split_once('=')
-            .ok_or_else(|| DnsZoneError::InvalidFormat("invalid dns zone line".to_string()))?;
+            .ok_or_else(|| DnsZoneError::InvalidFormat("invalid dns zone line".to_owned()))?;
         let key = key.trim();
         let value = value.trim();
         if key.is_empty() {
             return Err(DnsZoneError::InvalidFormat(
-                "dns zone field key must not be empty".to_string(),
+                "dns zone field key must not be empty".to_owned(),
             ));
         }
         if key.len() > MAX_KEY_BYTES {
@@ -341,7 +341,7 @@ pub fn parse_signed_dns_zone_bundle_wire(wire: &str) -> Result<SignedDnsZoneBund
                 "unsupported dns zone field: {key}"
             )));
         }
-        if fields.insert(key.to_string(), value.to_string()).is_some() {
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
             return Err(DnsZoneError::InvalidFormat(format!(
                 "duplicate dns zone field: {key}"
             )));
@@ -350,46 +350,46 @@ pub fn parse_signed_dns_zone_bundle_wire(wire: &str) -> Result<SignedDnsZoneBund
 
     if fields.is_empty() {
         return Err(DnsZoneError::InvalidFormat(
-            "dns zone bundle is empty".to_string(),
+            "dns zone bundle is empty".to_owned(),
         ));
     }
 
     let version = fields
         .get("version")
-        .ok_or_else(|| DnsZoneError::InvalidFormat("missing version".to_string()))?;
+        .ok_or_else(|| DnsZoneError::InvalidFormat("missing version".to_owned()))?;
     if version != "1" {
         return Err(DnsZoneError::InvalidFormat(
-            "unsupported dns zone bundle version".to_string(),
+            "unsupported dns zone bundle version".to_owned(),
         ));
     }
 
     let zone_name = canonicalize_dns_zone_name(
         fields
             .get("zone_name")
-            .ok_or_else(|| DnsZoneError::InvalidFormat("missing zone_name".to_string()))?,
+            .ok_or_else(|| DnsZoneError::InvalidFormat("missing zone_name".to_owned()))?,
     )?;
     let subject_node_id = fields
         .get("subject_node_id")
-        .ok_or_else(|| DnsZoneError::InvalidFormat("missing subject_node_id".to_string()))?
+        .ok_or_else(|| DnsZoneError::InvalidFormat("missing subject_node_id".to_owned()))?
         .trim()
-        .to_string();
+        .to_owned();
     if subject_node_id.is_empty() {
         return Err(DnsZoneError::InvalidFormat(
-            "subject_node_id must not be empty".to_string(),
+            "subject_node_id must not be empty".to_owned(),
         ));
     }
     let generated_at_unix = parse_u64_field(&fields, "generated_at_unix")?;
     let expires_at_unix = parse_u64_field(&fields, "expires_at_unix")?;
     if generated_at_unix >= expires_at_unix {
         return Err(DnsZoneError::InvalidFormat(
-            "invalid generated/expires ordering".to_string(),
+            "invalid generated/expires ordering".to_owned(),
         ));
     }
     let nonce = parse_u64_field(&fields, "nonce")?;
     let signature_hex = fields
         .get("signature")
         .cloned()
-        .ok_or_else(|| DnsZoneError::InvalidFormat("missing dns zone signature".to_string()))?;
+        .ok_or_else(|| DnsZoneError::InvalidFormat("missing dns zone signature".to_owned()))?;
     let record_count = parse_usize_field(&fields, "record_count")?;
     if record_count == 0 || record_count > MAX_RECORD_COUNT {
         return Err(DnsZoneError::InvalidFormat(format!(
@@ -399,7 +399,7 @@ pub fn parse_signed_dns_zone_bundle_wire(wire: &str) -> Result<SignedDnsZoneBund
     let expected_field_count = record_count
         .checked_mul(8)
         .and_then(|value| value.checked_add(8))
-        .ok_or_else(|| DnsZoneError::InvalidFormat("dns zone field count overflow".to_string()))?;
+        .ok_or_else(|| DnsZoneError::InvalidFormat("dns zone field count overflow".to_owned()))?;
     if fields.len() != expected_field_count {
         return Err(DnsZoneError::InvalidFormat(format!(
             "dns zone field count mismatch: expected {expected_field_count}, found {}",
@@ -421,13 +421,13 @@ pub fn parse_signed_dns_zone_bundle_wire(wire: &str) -> Result<SignedDnsZoneBund
         }
         if !seen_names.insert(fqdn.clone()) {
             return Err(DnsZoneError::InvalidFormat(
-                "duplicate dns record name".to_string(),
+                "duplicate dns record name".to_owned(),
             ));
         }
 
         let target_node_id = required_indexed_field(&fields, index, "target_node_id")?
             .trim()
-            .to_string();
+            .to_owned();
         if target_node_id.is_empty() {
             return Err(DnsZoneError::InvalidFormat(format!(
                 "record {index} target_node_id must not be empty"
@@ -473,7 +473,7 @@ pub fn parse_signed_dns_zone_bundle_wire(wire: &str) -> Result<SignedDnsZoneBund
             let alias_fqdn = format!("{alias}.{zone_name}");
             if !seen_names.insert(alias_fqdn) {
                 return Err(DnsZoneError::InvalidFormat(
-                    "dns alias collides with another record".to_string(),
+                    "dns alias collides with another record".to_owned(),
                 ));
             }
         }
@@ -537,20 +537,20 @@ fn canonicalize_dns_zone_records(
     for record in records {
         if record.ttl_secs == 0 || record.ttl_secs > 300 {
             return Err(DnsZoneError::InvalidFormat(
-                "dns record ttl must be in range 1..=300".to_string(),
+                "dns record ttl must be in range 1..=300".to_owned(),
             ));
         }
         let label = canonicalize_dns_relative_name(record.label.as_str())?;
         let fqdn = format!("{label}.{zone_name}");
         if !seen_names.insert(fqdn.clone()) {
             return Err(DnsZoneError::InvalidFormat(
-                "duplicate dns record name".to_string(),
+                "duplicate dns record name".to_owned(),
             ));
         }
-        let target_node_id = record.target_node_id.trim().to_string();
+        let target_node_id = record.target_node_id.trim().to_owned();
         if target_node_id.is_empty() {
             return Err(DnsZoneError::InvalidFormat(
-                "target_node_id must not be empty".to_string(),
+                "target_node_id must not be empty".to_owned(),
             ));
         }
         let expected_ip = parse_expected_ip(
@@ -574,7 +574,7 @@ fn canonicalize_dns_zone_records(
             let alias_fqdn = format!("{alias}.{zone_name}");
             if !seen_names.insert(alias_fqdn) {
                 return Err(DnsZoneError::InvalidFormat(
-                    "dns alias collides with another record".to_string(),
+                    "dns alias collides with another record".to_owned(),
                 ));
             }
         }
@@ -819,7 +819,7 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], DnsZone
     let trimmed = encoded.trim();
     if trimmed.len() != N * 2 {
         return Err(DnsZoneError::InvalidFormat(
-            "hex value has invalid length".to_string(),
+            "hex value has invalid length".to_owned(),
         ));
     }
     let raw = trimmed.as_bytes();
@@ -838,7 +838,7 @@ fn decode_hex_nibble(value: u8) -> Result<u8, DnsZoneError> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => Err(DnsZoneError::InvalidFormat(
-            "hex value contains invalid character".to_string(),
+            "hex value contains invalid character".to_owned(),
         )),
     }
 }
@@ -865,11 +865,11 @@ mod tests {
             60,
             42,
             &[DnsZoneRecordInput {
-                label: "nas".to_string(),
-                target_node_id: "node-nas-1".to_string(),
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
                 rr_type: DnsRecordType::A,
                 target_addr_kind: DnsTargetAddrKind::MeshIpv4,
-                expected_ip: ip.to_string(),
+                expected_ip: ip.to_owned(),
                 ttl_secs: 60,
                 aliases: vec![],
             }],
@@ -968,13 +968,13 @@ mod tests {
             60,
             42,
             &[DnsZoneRecordInput {
-                label: "nas".to_string(),
-                target_node_id: "node-nas-1".to_string(),
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
                 rr_type: DnsRecordType::A,
                 target_addr_kind: DnsTargetAddrKind::MeshIpv4,
-                expected_ip: "100.68.1.10".to_string(),
+                expected_ip: "100.68.1.10".to_owned(),
                 ttl_secs: 60,
-                aliases: vec!["storage".to_string()],
+                aliases: vec!["storage".to_owned()],
             }],
         )
         .expect("bundle should build");
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(parsed.zone_name, "rustynet");
         assert_eq!(parsed.records.len(), 1);
         assert_eq!(parsed.records[0].fqdn, "nas.rustynet");
-        assert_eq!(parsed.records[0].aliases, vec!["storage".to_string()]);
+        assert_eq!(parsed.records[0].aliases, vec!["storage".to_owned()]);
     }
 
     #[test]
@@ -1000,22 +1000,22 @@ mod tests {
             7,
             &[
                 DnsZoneRecordInput {
-                    label: "nas".to_string(),
-                    target_node_id: "node-1".to_string(),
+                    label: "nas".to_owned(),
+                    target_node_id: "node-1".to_owned(),
                     rr_type: DnsRecordType::A,
                     target_addr_kind: DnsTargetAddrKind::MeshIpv4,
-                    expected_ip: "100.68.1.10".to_string(),
+                    expected_ip: "100.68.1.10".to_owned(),
                     ttl_secs: 60,
-                    aliases: vec!["backup".to_string()],
+                    aliases: vec!["backup".to_owned()],
                 },
                 DnsZoneRecordInput {
-                    label: "vault".to_string(),
-                    target_node_id: "node-2".to_string(),
+                    label: "vault".to_owned(),
+                    target_node_id: "node-2".to_owned(),
                     rr_type: DnsRecordType::A,
                     target_addr_kind: DnsTargetAddrKind::MeshIpv4,
-                    expected_ip: "100.68.1.11".to_string(),
+                    expected_ip: "100.68.1.11".to_owned(),
                     ttl_secs: 60,
-                    aliases: vec!["nas".to_string()],
+                    aliases: vec!["nas".to_owned()],
                 },
             ],
         )
@@ -1060,11 +1060,11 @@ mod tests {
             60,
             42,
             &[DnsZoneRecordInput {
-                label: "nas".to_string(),
-                target_node_id: "node-nas-1".to_string(),
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
                 rr_type: DnsRecordType::A,
                 target_addr_kind: DnsTargetAddrKind::MeshIpv4,
-                expected_ip: "100.68.1.10".to_string(),
+                expected_ip: "100.68.1.10".to_owned(),
                 ttl_secs: 60,
                 aliases: Vec::new(),
             }],

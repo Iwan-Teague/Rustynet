@@ -48,7 +48,7 @@ pub(crate) fn build_bundle_env(
             .endpoints
             .get(&a.alias)
             .cloned()
-            .unwrap_or_else(|| "0.0.0.0:51820".to_string());
+            .unwrap_or_else(|| "0.0.0.0:51820".to_owned());
         nodes_parts.push(format!("{node_id}|{endpoint}|{}", pubkey.0));
     }
     let nodes_spec = nodes_parts.join(";");
@@ -82,7 +82,7 @@ pub(crate) fn build_bundle_env(
         // Lab pipeline: use a 24-hour TTL so the traversal bundle remains valid through
         // the full pipeline and the reconcile loop.  Production nodes receive fresh
         // traversal bundles from the assignment-refresh timer; the lab distributes once.
-        lines.push("TRAVERSAL_TTL_SECS=86400".to_string());
+        lines.push("TRAVERSAL_TTL_SECS=86400".to_owned());
     }
 
     if matches!(kind, BundleKind::Assignment) {
@@ -90,13 +90,13 @@ pub(crate) fn build_bundle_env(
         // enforce_baseline_runtime even when the pipeline takes several minutes.
         // Production nodes refresh assignments via the assignment-refresh timer and
         // never rely on a single long-lived bundle.
-        lines.push("BUNDLE_TTL_SECS=86400".to_string());
+        lines.push("BUNDLE_TTL_SECS=86400".to_owned());
         let exit_node_id = ctx
             .assignments
             .iter()
             .find(|a| a.role == NodeRole::Exit)
             .and_then(|a| ctx.node_ids.get(&a.alias))
-            .ok_or_else(|| "no exit node_id".to_string())?
+            .ok_or_else(|| "no exit node_id".to_owned())?
             .clone();
         let assignment_parts: Vec<String> = ctx
             .assignments
@@ -132,7 +132,7 @@ pub(crate) fn distribute_bundle_kind(
 ) -> StageOutcome {
     let exit_alias = match ctx.assignments.iter().find(|a| a.role == NodeRole::Exit) {
         Some(a) => a.alias.clone(),
-        None => return StageOutcome::Failed("no Exit node in assignments".to_string()),
+        None => return StageOutcome::Failed("no Exit node in assignments".to_owned()),
     };
 
     let env_content = match build_bundle_env(ctx, &kind) {
@@ -248,11 +248,11 @@ mod tests {
         let mut ctx = OrchestrationContext {
             assignments: vec![
                 NodeRoleAssignment {
-                    alias: "exit-1".to_string(),
+                    alias: "exit-1".to_owned(),
                     role: NodeRole::Exit,
                 },
                 NodeRoleAssignment {
-                    alias: "client-1".to_string(),
+                    alias: "client-1".to_owned(),
                     role: NodeRole::Client,
                 },
             ],
@@ -261,7 +261,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: Some(vec![1, 2, 3]),
@@ -269,17 +269,17 @@ mod tests {
             endpoints: HashMap::new(),
         };
         ctx.node_ids
-            .insert("exit-1".to_string(), "exit-node-id-abc".to_string());
+            .insert("exit-1".to_owned(), "exit-node-id-abc".to_owned());
         ctx.node_ids
-            .insert("client-1".to_string(), "client-node-id-xyz".to_string());
+            .insert("client-1".to_owned(), "client-node-id-xyz".to_owned());
         ctx.collected_pubkeys
-            .insert("exit-1".to_string(), WireguardPublicKey("a".repeat(64)));
+            .insert("exit-1".to_owned(), WireguardPublicKey("a".repeat(64)));
         ctx.collected_pubkeys
-            .insert("client-1".to_string(), WireguardPublicKey("b".repeat(64)));
+            .insert("client-1".to_owned(), WireguardPublicKey("b".repeat(64)));
         ctx.endpoints
-            .insert("exit-1".to_string(), "10.0.0.1:51820".to_string());
+            .insert("exit-1".to_owned(), "10.0.0.1:51820".to_owned());
         ctx.endpoints
-            .insert("client-1".to_string(), "10.0.0.2:51820".to_string());
+            .insert("client-1".to_owned(), "10.0.0.2:51820".to_owned());
         ctx
     }
 
@@ -322,7 +322,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

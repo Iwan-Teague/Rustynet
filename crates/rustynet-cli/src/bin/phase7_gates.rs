@@ -59,7 +59,7 @@ fn run() -> Result<(), i32> {
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "1".to_string());
+        .unwrap_or_else(|| "1".to_owned());
 
     run_cargo(&root_dir, &["fmt", "--all", "--", "--check"], &[])?;
     run_cargo(
@@ -103,15 +103,15 @@ fn run_required_test(
     extra_args: &[&str],
 ) -> Result<(), i32> {
     let mut args = vec![
-        "run".to_string(),
-        "--quiet".to_string(),
-        "-p".to_string(),
-        "rustynet-cli".to_string(),
-        "--bin".to_string(),
-        "run_required_test".to_string(),
-        "--".to_string(),
-        package.to_string(),
-        test_filter.to_string(),
+        "run".to_owned(),
+        "--quiet".to_owned(),
+        "-p".to_owned(),
+        "rustynet-cli".to_owned(),
+        "--bin".to_owned(),
+        "run_required_test".to_owned(),
+        "--".to_owned(),
+        package.to_owned(),
+        test_filter.to_owned(),
     ];
     args.extend(extra_args.iter().map(std::string::ToString::to_string));
     let status = Command::new("cargo")

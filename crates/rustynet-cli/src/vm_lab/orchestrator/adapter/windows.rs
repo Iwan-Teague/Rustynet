@@ -189,7 +189,7 @@ impl NodeAdapter for WindowsNodeAdapter {
             crate::vm_lab::orchestrator::connection::NodeConnection::Ssh { host, .. } => {
                 format!("{host}:51820")
             }
-            _ => "0.0.0.0:51820".to_string(),
+            _ => "0.0.0.0:51820".to_owned(),
         }
     }
 
@@ -224,7 +224,7 @@ impl NodeAdapter for WindowsNodeAdapter {
                     .map_err(|message| AdapterError::Protocol { message })
             }
             BundleKind::Membership => Err(AdapterError::Protocol {
-                message: "Membership bundles are issued via init_membership_snapshot".to_string(),
+                message: "Membership bundles are issued via init_membership_snapshot".to_owned(),
             }),
         }
     }
@@ -266,7 +266,7 @@ mod tests {
         let conn = NodeConnection::ssh(
             "10.0.0.1",
             22,
-            Some("Administrator".to_string()),
+            Some("Administrator".to_owned()),
             PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
         )
@@ -294,11 +294,11 @@ mod tests {
         use crate::vm_lab::orchestrator::source_archive::SourceArchive;
         let ctx = OrchestrationContext::new(
             vec![NodeRoleAssignment {
-                alias: "win-no-workdir".to_string(),
+                alias: "win-no-workdir".to_owned(),
                 role: crate::vm_lab::orchestrator::role::NodeRole::Client,
             }],
             std::path::PathBuf::from("/tmp/report"),
-            "test-network".to_string(),
+            "test-network".to_owned(),
         );
         // SourceArchive::Inline requires actual bytes; use a temp archive.
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -319,9 +319,9 @@ mod tests {
     #[test]
     fn build_validator_script_produces_call_operator() {
         let argv = vec![
-            r"C:\Program Files\RustyNet\rustynetd.exe".to_string(),
-            "windows-runtime-acls-check".to_string(),
-            "--no-fail-on-drift".to_string(),
+            r"C:\Program Files\RustyNet\rustynetd.exe".to_owned(),
+            "windows-runtime-acls-check".to_owned(),
+            "--no-fail-on-drift".to_owned(),
         ];
         let script = build_validator_script(&argv);
         assert!(

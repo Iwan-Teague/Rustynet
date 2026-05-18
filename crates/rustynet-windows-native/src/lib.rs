@@ -33,17 +33,17 @@ pub fn dpapi_protect(
     _scope: WindowsDpapiScope,
     _description: &str,
 ) -> Result<Vec<u8>, String> {
-    Err("Windows DPAPI is only available on Windows hosts".to_string())
+    Err("Windows DPAPI is only available on Windows hosts".to_owned())
 }
 
 #[cfg(not(windows))]
 pub fn dpapi_unprotect(_blob: &[u8]) -> Result<Vec<u8>, String> {
-    Err("Windows DPAPI is only available on Windows hosts".to_string())
+    Err("Windows DPAPI is only available on Windows hosts".to_owned())
 }
 
 #[cfg(not(windows))]
 pub fn inspect_file_sddl(_path: &Path) -> Result<String, String> {
-    Err("Windows ACL inspection is only available on Windows hosts".to_string())
+    Err("Windows ACL inspection is only available on Windows hosts".to_owned())
 }
 
 #[cfg(not(windows))]
@@ -57,13 +57,13 @@ pub fn verify_authenticode_chain(_path: &Path) -> Result<AuthenticodeChainOutcom
     // purposes; the chain check stays Windows-only.
     Err(
         "WinVerifyTrust authenticode chain validation is only available on Windows hosts"
-            .to_string(),
+            .to_owned(),
     )
 }
 
 #[cfg(not(windows))]
 pub fn lookup_account_sid_string(_account_name: &str) -> Result<String, String> {
-    Err("Windows SID lookup is only available on Windows hosts".to_string())
+    Err("Windows SID lookup is only available on Windows hosts".to_owned())
 }
 
 #[cfg(not(windows))]
@@ -76,7 +76,7 @@ pub fn serve_named_pipe_one_message<F>(
 where
     F: FnOnce(Vec<u8>) -> Result<Vec<u8>, String>,
 {
-    Err("Windows named pipes are only available on Windows hosts".to_string())
+    Err("Windows named pipes are only available on Windows hosts".to_owned())
 }
 
 #[cfg(not(windows))]
@@ -86,7 +86,7 @@ pub fn call_named_pipe(
     _max_response_bytes: usize,
     _timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    Err("Windows named pipes are only available on Windows hosts".to_string())
+    Err("Windows named pipes are only available on Windows hosts".to_owned())
 }
 
 #[cfg(windows)]

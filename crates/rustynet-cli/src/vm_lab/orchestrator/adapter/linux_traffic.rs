@@ -179,7 +179,7 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
          | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1 || echo ''",
         SHORT_TIMEOUT,
     )?;
-    let ip = ip.trim().to_string();
+    let ip = ip.trim().to_owned();
     if !ip.is_empty() {
         return Ok(ip);
     }
@@ -191,7 +191,7 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     ssh::parse_status_field(&status, "mesh_ip")
         .or_else(|| ssh::parse_status_field(&status, "wg_ip"))
         .ok_or_else(|| AdapterError::Protocol {
-            message: "mesh IP not found via rustynet0 interface or rustynet status".to_string(),
+            message: "mesh IP not found via rustynet0 interface or rustynet status".to_owned(),
         })
 }
 
@@ -220,7 +220,7 @@ pub fn issue_bundles_to_dir(
         }
         crate::vm_lab::orchestrator::error::BundleKind::Membership => {
             return Err(AdapterError::Protocol {
-                message: "Membership bundles are issued via init_membership_snapshot".to_string(),
+                message: "Membership bundles are issued via init_membership_snapshot".to_owned(),
             });
         }
     };
@@ -349,7 +349,7 @@ fn base64_decode_simple(encoded: &[u8]) -> Result<Vec<u8>, String> {
         .filter(|b| !b.is_ascii_whitespace())
         .collect();
     if filtered.is_empty() {
-        return Err("empty base64 input".to_string());
+        return Err("empty base64 input".to_owned());
     }
     // Lookup table: ASCII byte → 6-bit value (64 = padding, 255 = invalid).
     let mut table = [255u8; 256];
@@ -397,7 +397,7 @@ fn verify_no_key_material(path: &std::path::Path) -> Result<(), AdapterError> {
         })?;
     if !output.status.success() {
         return Err(AdapterError::Io {
-            message: "tar -tzf on collected artifact archive returned non-zero".to_string(),
+            message: "tar -tzf on collected artifact archive returned non-zero".to_owned(),
         });
     }
     let listing = String::from_utf8_lossy(&output.stdout);
@@ -408,7 +408,7 @@ fn verify_no_key_material(path: &std::path::Path) -> Result<(), AdapterError> {
             || entry.ends_with(".key")
         {
             return Err(AdapterError::KeyExclusionViolation {
-                path: entry.to_string(),
+                path: entry.to_owned(),
             });
         }
     }

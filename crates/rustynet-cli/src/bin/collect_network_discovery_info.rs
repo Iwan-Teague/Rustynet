@@ -152,7 +152,7 @@ fn run() -> Result<(), i32> {
     if let Some(override_port) = &config.wg_port_override {
         wg_listen_port = override_port.clone();
     } else if wg_listen_port.is_empty() {
-        wg_listen_port = DEFAULT_WG_PORT.to_string();
+        wg_listen_port = DEFAULT_WG_PORT.to_owned();
     }
 
     log(
@@ -187,7 +187,7 @@ fn run() -> Result<(), i32> {
         .next()
         .and_then(|line| line.split(':').next())
         .unwrap_or_default()
-        .to_string();
+        .to_owned();
     let behind_nat = !public_ip.is_empty() && !first_lan_ip.is_empty() && public_ip != first_lan_ip;
     let port_forwarded_hint = if behind_nat {
         "assumed_no - node is behind NAT; manual port-forward or relay may be required"
@@ -401,25 +401,25 @@ fn parse_args() -> Result<Config, String> {
             "-o" | "--output" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| "missing value for --output".to_string())?;
+                    .ok_or_else(|| "missing value for --output".to_owned())?;
                 config.output_path = Some(PathBuf::from(value));
             }
             "-i" | "--interface" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| "missing value for --interface".to_string())?;
+                    .ok_or_else(|| "missing value for --interface".to_owned())?;
                 config.wg_iface = Some(os_to_string(value, "--interface")?);
             }
             "-p" | "--wg-port" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| "missing value for --wg-port".to_string())?;
+                    .ok_or_else(|| "missing value for --wg-port".to_owned())?;
                 config.wg_port_override = Some(os_to_string(value, "--wg-port")?);
             }
             "-n" | "--node-id" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| "missing value for --node-id".to_string())?;
+                    .ok_or_else(|| "missing value for --node-id".to_owned())?;
                 config.node_id_override = Some(os_to_string(value, "--node-id")?);
             }
             "-q" | "--quiet" => config.quiet = true,
@@ -476,7 +476,7 @@ fn command_exists(command: &str) -> bool {
 fn hostname_value() -> Result<String, String> {
     run_capture("hostname", &["-f"])
         .or_else(|_| run_capture("hostname", &[]))
-        .map(|value| value.trim().to_string())
+        .map(|value| value.trim().to_owned())
 }
 
 fn os_release_value() -> String {
@@ -485,9 +485,9 @@ fn os_release_value() -> String {
         let mut name = String::new();
         for line in text.lines() {
             if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
-                pretty = value.trim_matches('"').to_string();
+                pretty = value.trim_matches('"').to_owned();
             } else if let Some(value) = line.strip_prefix("NAME=") {
-                name = value.trim_matches('"').to_string();
+                name = value.trim_matches('"').to_owned();
             }
         }
         if !pretty.is_empty() {
@@ -498,9 +498,9 @@ fn os_release_value() -> String {
         }
     }
     if let Ok(text) = fs::read_to_string("/etc/issue") {
-        return text.lines().next().unwrap_or("unknown").trim().to_string();
+        return text.lines().next().unwrap_or("unknown").trim().to_owned();
     }
-    "unknown".to_string()
+    "unknown".to_owned()
 }
 
 fn resolve_node_id(config: &Config, host_name: &str) -> String {
@@ -524,7 +524,7 @@ fn resolve_node_id(config: &Config, host_name: &str) -> String {
     {
         return value;
     }
-    host_name.to_string()
+    host_name.to_owned()
 }
 
 fn resolve_node_id_from_runtime_status() -> Option<String> {
@@ -555,7 +555,7 @@ fn command_output_stdout_if_success(output: Output) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if text.is_empty() { None } else { Some(text) }
 }
 
@@ -572,7 +572,7 @@ fn parse_status_field(status_output: &str, field_name: &str) -> Option<String> {
 fn detect_wg_interface(wg_available: bool) -> Option<String> {
     for iface in ["rustynet0", "wg0", "wg1", "rustynet1"] {
         if run_status("ip", &["link", "show", iface]).is_ok() {
-            return Some(iface.to_string());
+            return Some(iface.to_owned());
         }
     }
     if wg_available
@@ -580,7 +580,7 @@ fn detect_wg_interface(wg_available: bool) -> Option<String> {
         && let Some(first) = output.split_whitespace().next()
         && !first.is_empty()
     {
-        return Some(first.to_string());
+        return Some(first.to_owned());
     }
     None
 }
@@ -609,7 +609,7 @@ fn parse_public_key_from_wg_show(text: &str) -> String {
         })
         .and_then(|line| line.split_whitespace().last())
         .unwrap_or_default()
-        .to_string()
+        .to_owned()
 }
 
 fn parse_listen_port_from_wg_show(text: &str) -> String {
@@ -617,7 +617,7 @@ fn parse_listen_port_from_wg_show(text: &str) -> String {
         .find_map(|line| line.strip_prefix("listening port:"))
         .and_then(|line| line.split_whitespace().last())
         .unwrap_or_default()
-        .to_string()
+        .to_owned()
 }
 
 fn ip_interface_addresses(iface: &str) -> Result<String, i32> {
@@ -677,7 +677,7 @@ fn parse_iface_header(line: &str) -> Option<String> {
     if !prefix.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
-    Some(rest.split(':').next()?.to_string())
+    Some(rest.split(':').next()?.to_owned())
 }
 
 fn detect_public_ip(curl_available: bool, wget_available: bool) -> Option<String> {
@@ -700,7 +700,7 @@ fn detect_public_ip(curl_available: bool, wget_available: bool) -> Option<String
         };
         let ip = value.trim();
         if is_ipv4(ip) {
-            return Some(ip.to_string());
+            return Some(ip.to_owned());
         }
     }
     None
@@ -890,7 +890,7 @@ fn run_capture(command: &str, args: &[&str]) -> Result<String, String> {
             status_text(output.status)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn run_status(command: &str, args: &[&str]) -> Result<(), String> {
@@ -911,7 +911,7 @@ fn run_status(command: &str, args: &[&str]) -> Result<(), String> {
 fn read_trimmed_file(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path)
         .ok()
-        .map(|text| text.trim().to_string())
+        .map(|text| text.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
 
@@ -928,7 +928,7 @@ fn normalize_verifier_key_to_b64(value: &str) -> Option<String> {
     if let Some(bytes) = decode_hex_32(trimmed) {
         return Some(encode_base64(bytes.as_slice()));
     }
-    Some(trimmed.to_string())
+    Some(trimmed.to_owned())
 }
 
 fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
@@ -1040,7 +1040,7 @@ fn is_172_private(ip: &str) -> bool {
 fn status_text(status: ExitStatus) -> String {
     status
         .code()
-        .map_or_else(|| "signal".to_string(), |code| code.to_string())
+        .map_or_else(|| "signal".to_owned(), |code| code.to_string())
 }
 
 fn is_ipv4(value: &str) -> bool {

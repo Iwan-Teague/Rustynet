@@ -178,7 +178,7 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
          | awk '{print $2}' | head -1 || echo ''",
         SHORT_TIMEOUT,
     )?;
-    let ip = ip.trim().to_string();
+    let ip = ip.trim().to_owned();
     if !ip.is_empty() {
         return Ok(ip);
     }
@@ -191,7 +191,7 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     ssh::parse_status_field(&status, "mesh_ip")
         .or_else(|| ssh::parse_status_field(&status, "wg_ip"))
         .ok_or_else(|| AdapterError::Protocol {
-            message: "mesh IP not found via ifconfig or rustynet status".to_string(),
+            message: "mesh IP not found via ifconfig or rustynet status".to_owned(),
         })
 }
 
@@ -220,7 +220,7 @@ pub fn issue_bundles_to_dir(
         }
         crate::vm_lab::orchestrator::error::BundleKind::Membership => {
             return Err(AdapterError::Protocol {
-                message: "Membership bundles are issued via init_membership_snapshot".to_string(),
+                message: "Membership bundles are issued via init_membership_snapshot".to_owned(),
             });
         }
     };
@@ -322,7 +322,7 @@ fn base64_decode_simple(encoded: &[u8]) -> Result<Vec<u8>, String> {
         .filter(|b| !b.is_ascii_whitespace())
         .collect();
     if filtered.is_empty() {
-        return Err("empty base64 input".to_string());
+        return Err("empty base64 input".to_owned());
     }
     let mut table = [255u8; 256];
     for (i, ch) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -381,7 +381,7 @@ fn verify_no_key_material_tarball(path: &Path) -> Result<(), AdapterError> {
             || lower.ends_with(".key")
         {
             return Err(AdapterError::KeyExclusionViolation {
-                path: entry.to_string(),
+                path: entry.to_owned(),
             });
         }
     }

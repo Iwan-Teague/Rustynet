@@ -221,32 +221,32 @@ impl TunLifecycle for DirectTunLifecycle {
             self.runner.run(
                 "ip",
                 &[
-                    "tuntap".to_string(),
-                    "add".to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
-                    "mode".to_string(),
-                    "tun".to_string(),
+                    "tuntap".to_owned(),
+                    "add".to_owned(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
+                    "mode".to_owned(),
+                    "tun".to_owned(),
                 ],
             )?;
             self.runner.run(
                 "ip",
                 &[
-                    "address".to_string(),
-                    "add".to_string(),
+                    "address".to_owned(),
+                    "add".to_owned(),
                     context.local_cidr.clone(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
                 ],
             )?;
             self.runner.run(
                 "ip",
                 &[
-                    "link".to_string(),
-                    "set".to_string(),
-                    "up".to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
+                    "link".to_owned(),
+                    "set".to_owned(),
+                    "up".to_owned(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
                 ],
             )?;
 
@@ -342,36 +342,36 @@ impl TunLifecycle for HelperBackedTunLifecycle {
             self.runner.run(
                 "ip",
                 &[
-                    "tuntap".to_string(),
-                    "add".to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
-                    "mode".to_string(),
-                    "tun".to_string(),
-                    "user".to_string(),
+                    "tuntap".to_owned(),
+                    "add".to_owned(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
+                    "mode".to_owned(),
+                    "tun".to_owned(),
+                    "user".to_owned(),
                     self.owner_uid.to_string(),
-                    "group".to_string(),
+                    "group".to_owned(),
                     self.owner_gid.to_string(),
                 ],
             )?;
             self.runner.run(
                 "ip",
                 &[
-                    "address".to_string(),
-                    "add".to_string(),
+                    "address".to_owned(),
+                    "add".to_owned(),
                     context.local_cidr.clone(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
                 ],
             )?;
             self.runner.run(
                 "ip",
                 &[
-                    "link".to_string(),
-                    "set".to_string(),
-                    "up".to_string(),
-                    "dev".to_string(),
-                    interface_name.to_string(),
+                    "link".to_owned(),
+                    "set".to_owned(),
+                    "up".to_owned(),
+                    "dev".to_owned(),
+                    interface_name.to_owned(),
                 ],
             )?;
 
@@ -427,10 +427,10 @@ fn remove_interface_if_present(
     interface_name: &str,
 ) -> Result<(), BackendError> {
     let args = vec![
-        "link".to_string(),
-        "del".to_string(),
-        "dev".to_string(),
-        interface_name.to_string(),
+        "link".to_owned(),
+        "del".to_owned(),
+        "dev".to_owned(),
+        interface_name.to_owned(),
     ];
     match runner.run("ip", &args) {
         Ok(()) => Ok(()),
@@ -614,14 +614,14 @@ impl TunTestState {
     fn record_prepare(&self, interface_name: &str, local_cidr: &str) {
         let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
         inner.prepare_calls += 1;
-        inner.last_interface_name = Some(interface_name.to_string());
-        inner.last_local_cidr = Some(local_cidr.to_string());
+        inner.last_interface_name = Some(interface_name.to_owned());
+        inner.last_local_cidr = Some(local_cidr.to_owned());
     }
 
     fn record_cleanup(&self, interface_name: &str) {
         let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
         inner.cleanup_calls += 1;
-        inner.last_cleanup_interface_name = Some(interface_name.to_string());
+        inner.last_cleanup_interface_name = Some(interface_name.to_owned());
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -643,7 +643,7 @@ impl TunTestState {
     fn record_route_reconcile(&self, interface_name: &str) {
         let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
         inner.route_reconcile_calls += 1;
-        inner.last_route_interface_name = Some(interface_name.to_string());
+        inner.last_route_interface_name = Some(interface_name.to_owned());
     }
 
     fn clear_programmed_routes(&self) {
@@ -1016,11 +1016,11 @@ fn apply_backend_route_plan(
         runner.run(
             "ip",
             &[
-                "route".to_string(),
-                "replace".to_string(),
+                "route".to_owned(),
+                "replace".to_owned(),
                 route.destination_cidr.clone(),
-                "dev".to_string(),
-                interface_name.to_string(),
+                "dev".to_owned(),
+                interface_name.to_owned(),
             ],
         )?;
     }
@@ -1035,11 +1035,11 @@ fn apply_backend_route_plan(
         match runner.run(
             "ip",
             &[
-                "route".to_string(),
-                "del".to_string(),
+                "route".to_owned(),
+                "del".to_owned(),
                 route.destination_cidr.clone(),
-                "dev".to_string(),
-                interface_name.to_string(),
+                "dev".to_owned(),
+                interface_name.to_owned(),
             ],
         ) {
             Ok(()) => {}
@@ -1119,12 +1119,12 @@ fn apply_backend_exit_mode_plan(
         ExitMode::FullTunnel => runner.run(
             "ip",
             &[
-                "rule".to_string(),
-                "add".to_string(),
-                "priority".to_string(),
-                "10000".to_string(),
-                "table".to_string(),
-                "51820".to_string(),
+                "rule".to_owned(),
+                "add".to_owned(),
+                "priority".to_owned(),
+                "10000".to_owned(),
+                "table".to_owned(),
+                "51820".to_owned(),
             ],
         ),
     }
@@ -1135,10 +1135,10 @@ fn clear_backend_exit_rules(runner: &mut dyn WireguardCommandRunner) -> Result<(
         match runner.run(
             "ip",
             &[
-                "rule".to_string(),
-                "del".to_string(),
-                "table".to_string(),
-                "51820".to_string(),
+                "rule".to_owned(),
+                "del".to_owned(),
+                "table".to_owned(),
+                "51820".to_owned(),
             ],
         ) {
             Ok(()) => {}
@@ -1150,12 +1150,12 @@ fn clear_backend_exit_rules(runner: &mut dyn WireguardCommandRunner) -> Result<(
     match runner.run(
         "ip",
         &[
-            "rule".to_string(),
-            "del".to_string(),
-            "priority".to_string(),
-            "10000".to_string(),
-            "table".to_string(),
-            "51820".to_string(),
+            "rule".to_owned(),
+            "del".to_owned(),
+            "priority".to_owned(),
+            "10000".to_owned(),
+            "table".to_owned(),
+            "51820".to_owned(),
         ],
     ) {
         Ok(()) => Ok(()),
@@ -1269,7 +1269,7 @@ mod tests {
 
     impl WireguardCommandRunner for RecordingRunner {
         fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
-            self.commands.push((program.to_string(), args.to_vec()));
+            self.commands.push((program.to_owned(), args.to_vec()));
             Ok(())
         }
 
@@ -1278,7 +1278,7 @@ mod tests {
             program: &str,
             args: &[String],
         ) -> Result<WireguardCommandOutput, BackendError> {
-            self.commands.push((program.to_string(), args.to_vec()));
+            self.commands.push((program.to_owned(), args.to_vec()));
             Ok(WireguardCommandOutput {
                 stdout: String::new(),
                 stderr: String::new(),
@@ -1293,7 +1293,7 @@ mod tests {
 
     impl WireguardCommandRunner for MissingDeleteTableRunner {
         fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
-            self.commands.push((program.to_string(), args.to_vec()));
+            self.commands.push((program.to_owned(), args.to_vec()));
             let is_delete_table = program == "ip"
                 && args
                     == ["rule", "del", "table", "51820"]
@@ -1323,7 +1323,7 @@ mod tests {
 
     fn route(destination_cidr: &str, kind: RouteKind) -> Route {
         Route {
-            destination_cidr: destination_cidr.to_string(),
+            destination_cidr: destination_cidr.to_owned(),
             via_node: NodeId::new("phase1-route-node").expect("valid node id"),
             kind,
         }
@@ -1351,23 +1351,23 @@ mod tests {
             runner.commands,
             vec![
                 (
-                    "ip".to_string(),
+                    "ip".to_owned(),
                     vec![
-                        "route".to_string(),
-                        "replace".to_string(),
-                        "100.64.30.0/24".to_string(),
-                        "dev".to_string(),
-                        "rustynet0".to_string(),
+                        "route".to_owned(),
+                        "replace".to_owned(),
+                        "100.64.30.0/24".to_owned(),
+                        "dev".to_owned(),
+                        "rustynet0".to_owned(),
                     ],
                 ),
                 (
-                    "ip".to_string(),
+                    "ip".to_owned(),
                     vec![
-                        "route".to_string(),
-                        "del".to_string(),
-                        "100.64.20.0/24".to_string(),
-                        "dev".to_string(),
-                        "rustynet0".to_string(),
+                        "route".to_owned(),
+                        "del".to_owned(),
+                        "100.64.20.0/24".to_owned(),
+                        "dev".to_owned(),
+                        "rustynet0".to_owned(),
                     ],
                 ),
             ]
@@ -1382,20 +1382,20 @@ mod tests {
             .expect("exit-mode reconciliation should succeed");
 
         let delete_priority = vec![
-            "rule".to_string(),
-            "del".to_string(),
-            "priority".to_string(),
-            "10000".to_string(),
-            "table".to_string(),
-            "51820".to_string(),
+            "rule".to_owned(),
+            "del".to_owned(),
+            "priority".to_owned(),
+            "10000".to_owned(),
+            "table".to_owned(),
+            "51820".to_owned(),
         ];
         let add_priority = vec![
-            "rule".to_string(),
-            "add".to_string(),
-            "priority".to_string(),
-            "10000".to_string(),
-            "table".to_string(),
-            "51820".to_string(),
+            "rule".to_owned(),
+            "add".to_owned(),
+            "priority".to_owned(),
+            "10000".to_owned(),
+            "table".to_owned(),
+            "51820".to_owned(),
         ];
 
         assert!(

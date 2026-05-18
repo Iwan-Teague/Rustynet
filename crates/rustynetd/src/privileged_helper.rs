@@ -156,7 +156,7 @@ pub struct PrivilegedCommandClient {
 impl PrivilegedCommandClient {
     pub fn new(socket_path: PathBuf, timeout: Duration) -> Result<Self, String> {
         if socket_path.as_os_str().is_empty() {
-            return Err("privileged helper socket path must not be empty".to_string());
+            return Err("privileged helper socket path must not be empty".to_owned());
         }
         #[cfg(windows)]
         {
@@ -164,7 +164,7 @@ impl PrivilegedCommandClient {
         }
         #[cfg(not(windows))]
         if !socket_path.is_absolute() {
-            return Err("privileged helper socket path must be absolute".to_string());
+            return Err("privileged helper socket path must be absolute".to_owned());
         }
         Ok(Self {
             socket_path,
@@ -205,7 +205,7 @@ impl PrivilegedCommandClient {
                 .map_err(|err| format!("privileged helper write-timeout failed: {err}"))?;
 
             let request = HelperRequest {
-                program: program.as_str().to_string(),
+                program: program.as_str().to_owned(),
                 args: args
                     .iter()
                     .map(std::string::ToString::to_string)
@@ -215,7 +215,7 @@ impl PrivilegedCommandClient {
             let response = read_response_frame(&mut stream)?;
             if !response.ok {
                 return Err(response.error.unwrap_or_else(|| {
-                    "privileged helper reported an unknown failure".to_string()
+                    "privileged helper reported an unknown failure".to_owned()
                 }));
             }
             Ok(PrivilegedCommandOutput {
@@ -280,7 +280,7 @@ impl Default for PrivilegedHelperConfig {
 
 pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), String> {
     if config.socket_path.as_os_str().is_empty() {
-        return Err("privileged helper socket path must not be empty".to_string());
+        return Err("privileged helper socket path must not be empty".to_owned());
     }
     #[cfg(windows)]
     {
@@ -294,7 +294,7 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
     }
     #[cfg(not(windows))]
     if !config.socket_path.is_absolute() {
-        return Err("privileged helper socket path must be absolute".to_string());
+        return Err("privileged helper socket path must be absolute".to_owned());
     }
 
     #[cfg(not(windows))]
@@ -337,7 +337,7 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
                 )
             })?;
             if metadata.file_type().is_symlink() {
-                return Err("privileged helper socket path must not be a symlink".to_string());
+                return Err("privileged helper socket path must not be a symlink".to_owned());
             }
             if !metadata.file_type().is_socket() {
                 return Err(format!(
@@ -392,7 +392,7 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
             if !authorized {
                 let _ = write_response(
                     &mut stream,
-                    HelperResponse::error("unauthorized privileged helper peer".to_string()),
+                    HelperResponse::error("unauthorized privileged helper peer".to_owned()),
                 );
                 continue;
             }
@@ -475,13 +475,13 @@ fn read_response_frame(stream: &mut UnixStream) -> Result<HelperResponse, String
 #[cfg(not(windows))]
 fn write_frame(stream: &mut UnixStream, message_type: u8, payload: &[u8]) -> Result<(), String> {
     if payload.is_empty() {
-        return Err("frame payload must not be empty".to_string());
+        return Err("frame payload must not be empty".to_owned());
     }
     if payload.len() > MAX_MESSAGE_BYTES {
-        return Err("frame payload exceeds maximum size".to_string());
+        return Err("frame payload exceeds maximum size".to_owned());
     }
     let payload_len =
-        u32::try_from(payload.len()).map_err(|_| "frame payload length overflow".to_string())?;
+        u32::try_from(payload.len()).map_err(|_| "frame payload length overflow".to_owned())?;
     let mut header = [0u8; HELPER_FRAME_HEADER_BYTES];
     header[..4].copy_from_slice(&HELPER_FRAME_MAGIC);
     header[4] = HELPER_FRAME_VERSION;
@@ -508,7 +508,7 @@ fn read_frame(stream: &mut UnixStream, expected_message_type: u8) -> Result<Vec<
         .read_exact(&mut header)
         .map_err(|err| map_read_exact_error(err, "frame header"))?;
     if header[..4] != HELPER_FRAME_MAGIC {
-        return Err("invalid frame magic".to_string());
+        return Err("invalid frame magic".to_owned());
     }
     if header[4] != HELPER_FRAME_VERSION {
         return Err(format!(
@@ -524,10 +524,10 @@ fn read_frame(stream: &mut UnixStream, expected_message_type: u8) -> Result<Vec<
     }
     let payload_len = u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
     if payload_len == 0 {
-        return Err("frame payload must not be empty".to_string());
+        return Err("frame payload must not be empty".to_owned());
     }
     if payload_len > MAX_MESSAGE_BYTES {
-        return Err("frame payload exceeds maximum size".to_string());
+        return Err("frame payload exceeds maximum size".to_owned());
     }
     let mut payload = vec![0u8; payload_len];
     stream
@@ -536,7 +536,7 @@ fn read_frame(stream: &mut UnixStream, expected_message_type: u8) -> Result<Vec<
     let mut trailing = [0u8; 1];
     match stream.read(&mut trailing) {
         Ok(0) => Ok(payload),
-        Ok(_) => Err("trailing bytes after frame payload".to_string()),
+        Ok(_) => Err("trailing bytes after frame payload".to_owned()),
         Err(err) => Err(format!("read frame trailer failed: {err}")),
     }
 }
@@ -557,7 +557,7 @@ fn encode_helper_request(request: &HelperRequest) -> Result<Vec<u8>, String> {
         MAX_PROGRAM_BYTES,
     )?;
     let arg_count = u16::try_from(request.args.len())
-        .map_err(|_| "argument count exceeds protocol limit".to_string())?;
+        .map_err(|_| "argument count exceeds protocol limit".to_owned())?;
     payload.extend_from_slice(&arg_count.to_be_bytes());
     for arg in &request.args {
         encode_string_field(&mut payload, arg.as_str(), "arg", MAX_ARG_BYTES)?;
@@ -750,7 +750,7 @@ fn decode_fixed<const N: usize>(
 
 fn ensure_payload_consumed(payload: &[u8], cursor: usize) -> Result<(), String> {
     if cursor != payload.len() {
-        return Err("trailing bytes after helper payload".to_string());
+        return Err("trailing bytes after helper payload".to_owned());
     }
     Ok(())
 }
@@ -1139,7 +1139,7 @@ fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
             ";",
             "}",
         ] if is_owned_nat_table_token(table) => Ok(()),
-        _ => Err("unsupported nft add chain argument schema".to_string()),
+        _ => Err("unsupported nft add chain argument schema".to_owned()),
     }
 }
 
@@ -1353,7 +1353,7 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
-        _ => Err("unsupported nft add rule argument schema".to_string()),
+        _ => Err("unsupported nft add rule argument schema".to_owned()),
     }
 }
 
@@ -1420,7 +1420,7 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         ["rule", "del", "table", "51820"] => Ok(()),
         ["rule", "del", "priority", priority, "table", "51820"] if is_u32_token(priority) => Ok(()),
         ["rule", "add", "priority", priority, "table", "51820"] if is_u32_token(priority) => Ok(()),
-        _ => Err("unsupported ip argument schema".to_string()),
+        _ => Err("unsupported ip argument schema".to_owned()),
     }
 }
 
@@ -1452,7 +1452,7 @@ fn validate_nft_args(args: &[&str]) -> Result<(), String> {
         }
         _ if args.starts_with(&["add", "chain"]) => validate_nft_add_chain_args(args),
         _ if args.starts_with(&["add", "rule"]) => validate_nft_add_rule_args(args),
-        _ => Err("unsupported nft argument schema".to_string()),
+        _ => Err("unsupported nft argument schema".to_owned()),
     }
 }
 
@@ -1499,7 +1499,7 @@ fn validate_wg_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
-        _ => Err("unsupported wg argument schema".to_string()),
+        _ => Err("unsupported wg argument schema".to_owned()),
     }
 }
 
@@ -1511,7 +1511,7 @@ fn validate_sysctl_args(args: &[&str]) -> Result<(), String> {
             "-w",
             "net.ipv6.conf.all.disable_ipv6=1" | "net.ipv6.conf.all.disable_ipv6=0",
         ] => Ok(()),
-        _ => Err("unsupported sysctl argument schema".to_string()),
+        _ => Err("unsupported sysctl argument schema".to_owned()),
     }
 }
 
@@ -1533,7 +1533,7 @@ fn validate_ifconfig_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
-        _ => Err("unsupported ifconfig argument schema".to_string()),
+        _ => Err("unsupported ifconfig argument schema".to_owned()),
     }
 }
 
@@ -1577,7 +1577,7 @@ fn validate_route_args(args: &[&str]) -> Result<(), String> {
             interface,
         ] if is_cidr_token(cidr) && is_interface_name(interface) => Ok(()),
         ["-n", "delete", "-inet" | "-inet6", "-net", cidr] if is_cidr_token(cidr) => Ok(()),
-        _ => Err("unsupported route argument schema".to_string()),
+        _ => Err("unsupported route argument schema".to_owned()),
     }
 }
 
@@ -1594,21 +1594,21 @@ fn validate_pfctl_args(args: &[&str]) -> Result<(), String> {
         ["-a", anchor, "-F", "all"] if is_anchor_name_token(anchor) => Ok(()),
         ["-a", anchor, "-f", path] if is_anchor_name_token(anchor) && is_path_token(path) => Ok(()),
         ["-a", anchor, "-s", "rules"] if is_anchor_name_token(anchor) => Ok(()),
-        _ => Err("unsupported pfctl argument schema".to_string()),
+        _ => Err("unsupported pfctl argument schema".to_owned()),
     }
 }
 
 fn validate_wireguard_go_args(args: &[&str]) -> Result<(), String> {
     match args {
         [interface] if is_interface_name(interface) => Ok(()),
-        _ => Err("unsupported wireguard-go argument schema".to_string()),
+        _ => Err("unsupported wireguard-go argument schema".to_owned()),
     }
 }
 
 fn validate_kill_args(args: &[&str]) -> Result<(), String> {
     match args {
         ["-TERM", pid] if pid.parse::<u32>().map(|value| value > 1).unwrap_or(false) => Ok(()),
-        _ => Err("unsupported kill argument schema".to_string()),
+        _ => Err("unsupported kill argument schema".to_owned()),
     }
 }
 
@@ -1997,8 +1997,8 @@ mod tests {
             .expect("read timeout should be set");
 
         let payload = encode_helper_request(&HelperRequest {
-            program: "ip".to_string(),
-            args: vec!["--version".to_string()],
+            program: "ip".to_owned(),
+            args: vec!["--version".to_owned()],
         })
         .expect("request payload should encode");
         let mut frame = helper_request_frame_bytes(&payload, HELPER_FRAME_VERSION);
@@ -2018,8 +2018,8 @@ mod tests {
             .expect("read timeout should be set");
 
         let payload = encode_helper_request(&HelperRequest {
-            program: "ip".to_string(),
-            args: vec!["--version".to_string()],
+            program: "ip".to_owned(),
+            args: vec!["--version".to_owned()],
         })
         .expect("request payload should encode");
         let frame = helper_request_frame_bytes(&payload, HELPER_FRAME_VERSION + 1);
@@ -2058,8 +2058,8 @@ mod tests {
             .expect("read timeout should be set");
 
         let mut payload = encode_helper_request(&HelperRequest {
-            program: "ip".to_string(),
-            args: vec!["--version".to_string()],
+            program: "ip".to_owned(),
+            args: vec!["--version".to_owned()],
         })
         .expect("request payload should encode");
         payload.push(0xff);
@@ -2090,10 +2090,10 @@ mod tests {
         let server = std::thread::spawn(move || {
             let request = read_request(&mut server_stream).expect("request should decode");
             assert_eq!(request.program, "ip");
-            assert_eq!(request.args, vec!["--version".to_string()]);
+            assert_eq!(request.args, vec!["--version".to_owned()]);
             write_response(
                 &mut server_stream,
-                HelperResponse::success(0, "ok".to_string(), String::new()),
+                HelperResponse::success(0, "ok".to_owned(), String::new()),
             )
             .expect("response should encode");
         });
@@ -2101,8 +2101,8 @@ mod tests {
         write_request_frame(
             &mut client_stream,
             &HelperRequest {
-                program: "ip".to_string(),
-                args: vec!["--version".to_string()],
+                program: "ip".to_owned(),
+                args: vec!["--version".to_owned()],
             },
         )
         .expect("request should encode");
@@ -2119,8 +2119,8 @@ mod tests {
     #[test]
     fn fuzzgate_rejects_unknown_tokens_and_shell_metacharacters() {
         let unknown_program = handle_request(HelperRequest {
-            program: "not-a-real-program".to_string(),
-            args: vec!["--version".to_string()],
+            program: "not-a-real-program".to_owned(),
+            args: vec!["--version".to_owned()],
         });
         assert!(!unknown_program.ok);
         assert_eq!(unknown_program.status, None);
@@ -2199,8 +2199,8 @@ mod tests {
         });
         malformed_payloads.push({
             let mut payload = encode_helper_request(&HelperRequest {
-                program: "ip".to_string(),
-                args: vec!["link".to_string()],
+                program: "ip".to_owned(),
+                args: vec!["link".to_owned()],
             })
             .expect("request payload should encode");
             payload.push(0x01);
@@ -2233,35 +2233,35 @@ mod tests {
                 args: vec![],
             },
             HelperRequest {
-                program: "not-real".to_string(),
-                args: vec!["--version".to_string()],
+                program: "not-real".to_owned(),
+                args: vec!["--version".to_owned()],
             },
             HelperRequest {
-                program: "ip".to_string(),
+                program: "ip".to_owned(),
                 args: vec![],
             },
             HelperRequest {
-                program: "ip".to_string(),
+                program: "ip".to_owned(),
                 args: vec![
-                    "route".to_string(),
-                    "replace".to_string(),
-                    "0.0.0.0/0".to_string(),
-                    "via".to_string(),
-                    "203.0.113.1".to_string(),
+                    "route".to_owned(),
+                    "replace".to_owned(),
+                    "0.0.0.0/0".to_owned(),
+                    "via".to_owned(),
+                    "203.0.113.1".to_owned(),
                 ],
             },
             HelperRequest {
-                program: "nft".to_string(),
+                program: "nft".to_owned(),
                 args: vec![
-                    "list".to_string(),
-                    "table".to_string(),
-                    "inet".to_string(),
-                    "$(id)".to_string(),
+                    "list".to_owned(),
+                    "table".to_owned(),
+                    "inet".to_owned(),
+                    "$(id)".to_owned(),
                 ],
             },
             HelperRequest {
-                program: "kill".to_string(),
-                args: vec!["-TERM".to_string(), "1".to_string()],
+                program: "kill".to_owned(),
+                args: vec!["-TERM".to_owned(), "1".to_owned()],
             },
         ];
 
@@ -2284,7 +2284,7 @@ mod tests {
         }
         let err = run_privileged_subprocess(
             Path::new("/bin/sh"),
-            &["-c".to_string(), "sleep 1".to_string()],
+            &["-c".to_owned(), "sleep 1".to_owned()],
             Duration::from_millis(50),
         )
         .expect_err("sleeping subprocess should time out");
@@ -2419,8 +2419,8 @@ mod tests {
         // Build a well-formed payload but tag the frame as a RESPONSE so the
         // server-side request reader (which expects REQUEST) rejects it.
         let payload = encode_helper_request(&HelperRequest {
-            program: "ip".to_string(),
-            args: vec!["--version".to_string()],
+            program: "ip".to_owned(),
+            args: vec!["--version".to_owned()],
         })
         .expect("request payload should encode");
         let mut frame = Vec::new();
@@ -2628,8 +2628,8 @@ mod tests {
         // default. handle_request takes the request directly so the error
         // surface is exercised end-to-end.
         let response = handle_request(HelperRequest {
-            program: "totally-unknown-program".to_string(),
-            args: vec!["--version".to_string()],
+            program: "totally-unknown-program".to_owned(),
+            args: vec!["--version".to_owned()],
         });
         assert!(!response.ok);
         assert!(response.status.is_none());

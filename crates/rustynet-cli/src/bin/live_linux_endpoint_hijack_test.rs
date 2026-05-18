@@ -115,7 +115,7 @@ fn run() -> Result<(), String> {
         print_usage();
         return Err(
             "missing required argument: --ssh-identity-file, --client-host, --rogue-endpoint-ip"
-                .to_string(),
+                .to_owned(),
         );
     }
     rogue_endpoint_ip
@@ -165,7 +165,7 @@ fn run() -> Result<(), String> {
 
     if baseline_status_output.contains("state=FailClosed") {
         return Err(
-            "baseline runtime is already fail-closed; refusing endpoint hijack test".to_string(),
+            "baseline runtime is already fail-closed; refusing endpoint hijack test".to_owned(),
         );
     }
 
@@ -202,7 +202,7 @@ fn run() -> Result<(), String> {
         client_host: client_host.clone(),
         assignment_path: assignment_path.clone(),
         backup_path: Some(backup_path.clone()),
-        watermark_path: "/var/lib/rustynet/rustynetd.assignment.watermark".to_string(),
+        watermark_path: "/var/lib/rustynet/rustynetd.assignment.watermark".to_owned(),
         timer_was_active: assignment_timer_was_active,
     };
 
@@ -297,29 +297,29 @@ fn run() -> Result<(), String> {
     let captured_at_utc = now_utc();
     let captured_at_unix = now_unix();
     let report_args = vec![
-        "--report-path".to_string(),
+        "--report-path".to_owned(),
         report_path.to_string_lossy().to_string(),
-        "--rogue-endpoint-ip".to_string(),
+        "--rogue-endpoint-ip".to_owned(),
         rogue_endpoint_ip.clone(),
-        "--baseline-status".to_string(),
+        "--baseline-status".to_owned(),
         baseline_status_output.clone(),
-        "--baseline-netcheck".to_string(),
+        "--baseline-netcheck".to_owned(),
         baseline_netcheck_output.clone(),
-        "--baseline-endpoints".to_string(),
+        "--baseline-endpoints".to_owned(),
         baseline_endpoints.clone(),
-        "--status-after-hijack".to_string(),
+        "--status-after-hijack".to_owned(),
         status_after_hijack.clone(),
-        "--netcheck-after-hijack".to_string(),
+        "--netcheck-after-hijack".to_owned(),
         netcheck_after_hijack.clone(),
-        "--endpoints-after-hijack".to_string(),
+        "--endpoints-after-hijack".to_owned(),
         endpoints_after_hijack.clone(),
-        "--status-after-recovery".to_string(),
+        "--status-after-recovery".to_owned(),
         status_after_recovery.clone(),
-        "--endpoints-after-recovery".to_string(),
+        "--endpoints-after-recovery".to_owned(),
         endpoints_after_recovery.clone(),
-        "--captured-at-utc".to_string(),
+        "--captured-at-utc".to_owned(),
         captured_at_utc,
-        "--captured-at-unix".to_string(),
+        "--captured-at-unix".to_owned(),
         captured_at_unix,
     ];
     let report_refs = report_args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -392,7 +392,7 @@ fn print_usage() {
 
 fn now_unix() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
-        |_| "0".to_string(),
+        |_| "0".to_owned(),
         |duration| duration.as_secs().to_string(),
     )
 }

@@ -34,7 +34,7 @@ fn run() -> Result<(), i32> {
         eprintln!("error [{}]: {err}", ExitCode::ConfigError);
         ExitCode::ConfigError.as_i32()
     })?;
-    let output_dir = output_dir_arg.unwrap_or_else(|| DEFAULT_OUTPUT_DIR.to_string());
+    let output_dir = output_dir_arg.unwrap_or_else(|| DEFAULT_OUTPUT_DIR.to_owned());
     let output_dir = resolve_path(&root_dir, Path::new(&output_dir));
     fs::create_dir_all(&output_dir).map_err(|err| {
         eprintln!(
@@ -48,15 +48,15 @@ fn run() -> Result<(), i32> {
     let snapshot = env::var("RUSTYNET_MEMBERSHIP_SNAPSHOT_PATH")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_string());
+        .unwrap_or_else(|| DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_owned());
     let log = env::var("RUSTYNET_MEMBERSHIP_LOG_PATH")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_MEMBERSHIP_LOG_PATH.to_string());
+        .unwrap_or_else(|| DEFAULT_MEMBERSHIP_LOG_PATH.to_owned());
     let environment = env::var("RUSTYNET_MEMBERSHIP_EVIDENCE_ENVIRONMENT")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_EVIDENCE_ENVIRONMENT.to_string());
+        .unwrap_or_else(|| DEFAULT_EVIDENCE_ENVIRONMENT.to_owned());
 
     run_membership_generate_evidence(&root_dir, &snapshot, &log, &output_dir, &environment)?;
     verify_artifacts(&output_dir)?;
@@ -202,9 +202,7 @@ fn write_summary_log(root_dir: &Path, output_dir: &Path) -> Result<(), i32> {
     if !timestamp.status.success() {
         return Err(status_code(timestamp.status));
     }
-    let timestamp_text = String::from_utf8_lossy(&timestamp.stdout)
-        .trim()
-        .to_string();
+    let timestamp_text = String::from_utf8_lossy(&timestamp.stdout).trim().to_owned();
     let summary = format!(
         "timestamp_utc={timestamp}\nscenario=approver_compromise_recovery\nconformance=pass\nnegative=pass\nrecovery=pass\naudit_log={}/membership_audit_integrity.log\n",
         output_dir.display(),

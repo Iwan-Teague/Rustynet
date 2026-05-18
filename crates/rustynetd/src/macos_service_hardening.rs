@@ -56,7 +56,7 @@ pub struct MacosServiceHardeningReport {
 pub fn evaluate_macos_service_hardening(observed: &BTreeMap<String, String>) -> Vec<String> {
     let mut reasons: Vec<String> = Vec::new();
     if observed.is_empty() {
-        reasons.push("plist contained no parseable key=value properties".to_string());
+        reasons.push("plist contained no parseable key=value properties".to_owned());
         return reasons;
     }
     for (key, expected) in REVIEWED_PLIST_DIRECTIVES {
@@ -87,17 +87,17 @@ pub fn parse_plist_scalars(xml: &str) -> BTreeMap<String, String> {
             .strip_prefix("<key>")
             .and_then(|s| s.strip_suffix("</key>"))
         {
-            last_key = Some(inner.to_string());
+            last_key = Some(inner.to_owned());
         } else if let Some(key) = last_key.take() {
             if let Some(inner) = line
                 .strip_prefix("<string>")
                 .and_then(|s| s.strip_suffix("</string>"))
             {
-                map.insert(key, inner.to_string());
+                map.insert(key, inner.to_owned());
             } else if line == "<true/>" {
-                map.insert(key, "true".to_string());
+                map.insert(key, "true".to_owned());
             } else if line == "<false/>" {
-                map.insert(key, "false".to_string());
+                map.insert(key, "false".to_owned());
             } else {
                 // dict, array, or other complex type — skip value, leave key consumed
             }
@@ -116,14 +116,14 @@ pub fn build_macos_service_hardening_report(
             evaluate_macos_service_hardening(&observed)
         } else {
             vec![probe_reason.clone().unwrap_or_else(|| {
-                "plist was not read; service hardening posture unknown".to_string()
+                "plist was not read; service hardening posture unknown".to_owned()
             })]
         };
     let overall_ok = probed && drift_reasons.is_empty();
     MacosServiceHardeningReport {
         schema_version: 1,
-        service_label: REVIEWED_SERVICE_LABEL.to_string(),
-        plist_path: REVIEWED_LAUNCHDAEMON_PLIST.to_string(),
+        service_label: REVIEWED_SERVICE_LABEL.to_owned(),
+        plist_path: REVIEWED_LAUNCHDAEMON_PLIST.to_owned(),
         overall_ok,
         probed,
         probe_reason,
@@ -155,7 +155,7 @@ mod tests {
     fn reviewed_property_map() -> BTreeMap<String, String> {
         REVIEWED_PLIST_DIRECTIVES
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
     }
 
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn evaluator_surfaces_username_drift() {
         let mut map = reviewed_property_map();
-        map.insert("UserName".to_string(), "root".to_string());
+        map.insert("UserName".to_owned(), "root".to_owned());
         let reasons = evaluate_macos_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("UserName drifted")),
@@ -249,7 +249,7 @@ mod tests {
     fn build_report_unprobed_marks_overall_fail() {
         let report = build_macos_service_hardening_report(
             false,
-            Some("plist unreadable".to_string()),
+            Some("plist unreadable".to_owned()),
             BTreeMap::new(),
         );
         assert!(!report.overall_ok);
@@ -313,12 +313,12 @@ mod tests {
         // directive drifts, the evaluator surfaces 6 reasons (one
         // per directive), NOT bail at the first miss.
         let mut map = reviewed_property_map();
-        map.insert("UserName".to_string(), "root".to_string());
-        map.insert("GroupName".to_string(), "root".to_string());
-        map.insert("RunAtLoad".to_string(), "false".to_string());
-        map.insert("KeepAlive".to_string(), "false".to_string());
-        map.insert("ProcessType".to_string(), "Interactive".to_string());
-        map.insert("AbandonProcessGroup".to_string(), "true".to_string());
+        map.insert("UserName".to_owned(), "root".to_owned());
+        map.insert("GroupName".to_owned(), "root".to_owned());
+        map.insert("RunAtLoad".to_owned(), "false".to_owned());
+        map.insert("KeepAlive".to_owned(), "false".to_owned());
+        map.insert("ProcessType".to_owned(), "Interactive".to_owned());
+        map.insert("AbandonProcessGroup".to_owned(), "true".to_owned());
         let reasons = evaluate_macos_service_hardening(&map);
         assert_eq!(
             reasons.len(),

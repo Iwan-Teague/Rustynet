@@ -61,7 +61,7 @@ pub fn evaluate_windows_backend_readiness(
 ) -> Result<(), Vec<String>> {
     let mut reasons = Vec::new();
     if entries.is_empty() {
-        reasons.push("backend readiness report contains no entries".to_string());
+        reasons.push("backend readiness report contains no entries".to_owned());
         return Err(reasons);
     }
     for entry in entries {
@@ -150,11 +150,11 @@ fn probe_canonical_binary(label: &str, path: &str) -> WindowsBackendReadinessEnt
 #[cfg(not(windows))]
 fn probe_canonical_binary(label: &str, path: &str) -> WindowsBackendReadinessEntry {
     WindowsBackendReadinessEntry {
-        label: label.to_string(),
-        path: path.to_string(),
+        label: label.to_owned(),
+        path: path.to_owned(),
         present: false,
         probed: false,
-        reason: Some("windows-backend-readiness-check requires a Windows runtime host".to_string()),
+        reason: Some("windows-backend-readiness-check requires a Windows runtime host".to_owned()),
     }
 }
 
@@ -165,22 +165,22 @@ mod tests {
     fn reviewed_present_entries() -> Vec<WindowsBackendReadinessEntry> {
         vec![
             WindowsBackendReadinessEntry {
-                label: "wireguard.exe".to_string(),
-                path: REVIEWED_WIREGUARD_EXE_PATH.to_string(),
+                label: "wireguard.exe".to_owned(),
+                path: REVIEWED_WIREGUARD_EXE_PATH.to_owned(),
                 present: true,
                 probed: true,
                 reason: None,
             },
             WindowsBackendReadinessEntry {
-                label: "wg.exe".to_string(),
-                path: REVIEWED_WG_EXE_PATH.to_string(),
+                label: "wg.exe".to_owned(),
+                path: REVIEWED_WG_EXE_PATH.to_owned(),
                 present: true,
                 probed: true,
                 reason: None,
             },
             WindowsBackendReadinessEntry {
-                label: "netsh.exe".to_string(),
-                path: REVIEWED_NETSH_EXE_PATH.to_string(),
+                label: "netsh.exe".to_owned(),
+                path: REVIEWED_NETSH_EXE_PATH.to_owned(),
                 present: true,
                 probed: true,
                 reason: None,
@@ -220,7 +220,7 @@ mod tests {
     fn evaluator_rejects_unprobed_entry() {
         let mut entries = reviewed_present_entries();
         entries[1].probed = false;
-        entries[1].reason = Some("off-Windows host".to_string());
+        entries[1].reason = Some("off-Windows host".to_owned());
         let reasons =
             evaluate_windows_backend_readiness(&entries).expect_err("unprobed entry must reject");
         assert!(
@@ -236,7 +236,7 @@ mod tests {
         let mut entries = reviewed_present_entries();
         entries[0].present = false;
         entries[1].probed = false;
-        entries[1].reason = Some("probe error".to_string());
+        entries[1].reason = Some("probe error".to_owned());
         let reasons =
             evaluate_windows_backend_readiness(&entries).expect_err("multi-drift must aggregate");
         assert!(reasons.len() >= 2, "expected multiple reasons: {reasons:?}");

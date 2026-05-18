@@ -61,7 +61,7 @@ pub enum WindowsBackendRequest {
 impl WindowsBackendRequest {
     pub fn blocker_reason(&self) -> Option<String> {
         match self {
-            Self::Missing => Some("windows-runtime-backend-not-configured: Windows service host loaded reviewed config, but the env-file did not specify --backend in RUSTYNETD_DAEMON_ARGS_JSON. Windows backend/dataplane support remains unavailable until an operator selects a reviewed Windows backend label.".to_string()),
+            Self::Missing => Some("windows-runtime-backend-not-configured: Windows service host loaded reviewed config, but the env-file did not specify --backend in RUSTYNETD_DAEMON_ARGS_JSON. Windows backend/dataplane support remains unavailable until an operator selects a reviewed Windows backend label.".to_owned()),
             Self::NonWindows(label) => Some(format!(
                 "windows-runtime-backend-not-supported: backend '{label}' is not valid for the Windows service host. Linux and macOS backend modes remain platform-specific and Windows dataplane support is still unavailable on the current branch."
             )),
@@ -92,8 +92,7 @@ pub fn select_host_entry(args: &[String]) -> Result<HostEntrySelection, String> 
     if let Some(service) = service {
         if !remaining.is_empty() {
             return Err(
-                "--windows-service does not accept daemon subcommands or inline daemon flags; use --env-file with RUSTYNETD_DAEMON_ARGS_JSON"
-                    .to_string(),
+                "--windows-service does not accept daemon subcommands or inline daemon flags; use --env-file with RUSTYNETD_DAEMON_ARGS_JSON".to_owned(),
             );
         }
         return Ok(HostEntrySelection::WindowsService(service));
@@ -119,14 +118,14 @@ pub fn strip_windows_service_args(
             "--service-name" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--service-name requires a value".to_string())?;
+                    .ok_or_else(|| "--service-name requires a value".to_owned())?;
                 service_name = Some(value.clone());
                 index += 2;
             }
             "--env-file" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--env-file requires a value".to_string())?;
+                    .ok_or_else(|| "--env-file requires a value".to_owned())?;
                 env_file = Some(PathBuf::from(value));
                 index += 2;
             }
@@ -139,23 +138,22 @@ pub fn strip_windows_service_args(
 
     if !windows_service {
         if service_name.is_some() {
-            return Err("--service-name requires --windows-service".to_string());
+            return Err("--service-name requires --windows-service".to_owned());
         }
         if env_file.is_some() {
-            return Err("--env-file requires --windows-service".to_string());
+            return Err("--env-file requires --windows-service".to_owned());
         }
         return Ok((remaining, None));
     }
 
     let env_file = env_file.ok_or_else(|| {
-        "--windows-service requires --env-file so the Windows SCM host loads reviewed config input"
-            .to_string()
+        "--windows-service requires --env-file so the Windows SCM host loads reviewed config input".to_owned()
     })?;
 
     Ok((
         remaining,
         Some(WindowsServiceOptions {
-            service_name: service_name.unwrap_or_else(|| DEFAULT_WINDOWS_SERVICE_NAME.to_string()),
+            service_name: service_name.unwrap_or_else(|| DEFAULT_WINDOWS_SERVICE_NAME.to_owned()),
             env_file,
         }),
     ))
@@ -224,12 +222,12 @@ pub fn classify_windows_backend_request(args: &[String]) -> Result<WindowsBacken
         match args.get(index).map(String::as_str) {
             Some("--backend") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--backend in RUSTYNETD_DAEMON_ARGS_JSON requires a value".to_string()
+                    "--backend in RUSTYNETD_DAEMON_ARGS_JSON requires a value".to_owned()
                 })?;
                 if backend.is_some() {
                     return Err(
                         "RUSTYNETD_DAEMON_ARGS_JSON must not specify --backend more than once"
-                            .to_string(),
+                            .to_owned(),
                     );
                 }
                 backend = Some(value.clone());
@@ -294,7 +292,7 @@ fn parse_windows_env_file(text: &str) -> Result<BTreeMap<String, String>, String
             ));
         }
         let value = strip_optional_quotes(value.trim())?;
-        variables.insert(key.to_string(), value);
+        variables.insert(key.to_owned(), value);
     }
     Ok(variables)
 }
@@ -316,10 +314,10 @@ fn strip_optional_quotes(value: &str) -> Result<String, String> {
             return Ok(value[1..value.len() - 1].to_string());
         }
         if first == b'"' || first == b'\'' || last == b'"' || last == b'\'' {
-            return Err("mismatched quotes in Windows service env-file value".to_string());
+            return Err("mismatched quotes in Windows service env-file value".to_owned());
         }
     }
-    Ok(value.to_string())
+    Ok(value.to_owned())
 }
 
 pub fn windows_service_help_line() -> &'static str {
@@ -343,7 +341,7 @@ fn run_windows_service_host_impl(
     _prepared: PreparedWindowsServiceHost,
     _daemon_runner: WindowsDaemonArgsRunner,
 ) -> Result<(), String> {
-    Err("--windows-service is only supported on Windows SCM hosts".to_string())
+    Err("--windows-service is only supported on Windows SCM hosts".to_owned())
 }
 
 #[cfg(windows)]
@@ -511,9 +509,9 @@ mod tests {
     #[test]
     fn strip_windows_service_args_returns_standard_args_when_mode_not_requested() {
         let args = vec![
-            "daemon".to_string(),
-            "--backend".to_string(),
-            "linux-wireguard".to_string(),
+            "daemon".to_owned(),
+            "--backend".to_owned(),
+            "linux-wireguard".to_owned(),
         ];
         let (remaining, options) = strip_windows_service_args(&args).expect("args should parse");
         assert_eq!(remaining, args);
@@ -522,33 +520,31 @@ mod tests {
 
     #[test]
     fn strip_windows_service_args_requires_env_file() {
-        let err = strip_windows_service_args(&["--windows-service".to_string()])
+        let err = strip_windows_service_args(&["--windows-service".to_owned()])
             .expect_err("missing env-file should fail");
         assert!(err.contains("--windows-service requires --env-file"));
     }
 
     #[test]
     fn strip_windows_service_args_rejects_env_file_without_service_mode() {
-        let err = strip_windows_service_args(&[
-            "--env-file".to_string(),
-            "/tmp/rustynetd.env".to_string(),
-        ])
-        .expect_err("env-file without service mode should fail");
+        let err =
+            strip_windows_service_args(&["--env-file".to_owned(), "/tmp/rustynetd.env".to_owned()])
+                .expect_err("env-file without service mode should fail");
         assert!(err.contains("--env-file requires --windows-service"));
     }
 
     #[test]
     fn select_host_entry_prefers_windows_service_mode() {
         let selection = select_host_entry(&[
-            "--windows-service".to_string(),
-            "--env-file".to_string(),
-            "/tmp/rustynetd.env".to_string(),
+            "--windows-service".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rustynetd.env".to_owned(),
         ])
         .expect("service mode should parse");
         assert_eq!(
             selection,
             HostEntrySelection::WindowsService(WindowsServiceOptions {
-                service_name: "RustyNet".to_string(),
+                service_name: "RustyNet".to_owned(),
                 env_file: PathBuf::from("/tmp/rustynetd.env"),
             })
         );
@@ -557,10 +553,10 @@ mod tests {
     #[test]
     fn select_host_entry_rejects_inline_daemon_subcommands_for_windows_service() {
         let err = select_host_entry(&[
-            "daemon".to_string(),
-            "--windows-service".to_string(),
-            "--env-file".to_string(),
-            "/tmp/rustynetd.env".to_string(),
+            "daemon".to_owned(),
+            "--windows-service".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rustynetd.env".to_owned(),
         ])
         .expect_err("inline daemon args must be rejected");
         assert!(err.contains("does not accept daemon subcommands"));
@@ -581,7 +577,7 @@ mod tests {
         let input = load_windows_service_runtime_input(&env_path).expect("env file should parse");
         assert_eq!(
             input.daemon_args,
-            vec!["--backend".to_string(), "windows-unsupported".to_string()]
+            vec!["--backend".to_owned(), "windows-unsupported".to_owned()]
         );
     }
 
@@ -605,21 +601,21 @@ mod tests {
     #[test]
     fn classify_windows_backend_request_rejects_linux_backend_labels() {
         let request = classify_windows_backend_request(&[
-            "--backend".to_string(),
-            "linux-wireguard".to_string(),
+            "--backend".to_owned(),
+            "linux-wireguard".to_owned(),
         ])
         .expect("backend classification should parse");
         assert_eq!(
             request,
-            WindowsBackendRequest::NonWindows("linux-wireguard".to_string())
+            WindowsBackendRequest::NonWindows("linux-wireguard".to_owned())
         );
     }
 
     #[test]
     fn classify_windows_backend_request_accepts_explicit_unsupported_windows_label() {
         let request = classify_windows_backend_request(&[
-            "--backend".to_string(),
-            "windows-unsupported".to_string(),
+            "--backend".to_owned(),
+            "windows-unsupported".to_owned(),
         ])
         .expect("backend classification should parse");
         assert_eq!(
@@ -631,8 +627,8 @@ mod tests {
     #[test]
     fn classify_windows_backend_request_accepts_reviewed_wireguard_nt_label() {
         let request = classify_windows_backend_request(&[
-            "--backend".to_string(),
-            "windows-wireguard-nt".to_string(),
+            "--backend".to_owned(),
+            "windows-wireguard-nt".to_owned(),
         ])
         .expect("backend classification should parse");
         assert_eq!(
@@ -644,7 +640,7 @@ mod tests {
     #[test]
     fn classify_windows_backend_request_marks_missing_backend_as_blocked() {
         let request =
-            classify_windows_backend_request(&["--node-id".to_string(), "node-a".to_string()])
+            classify_windows_backend_request(&["--node-id".to_owned(), "node-a".to_owned()])
                 .expect("backend classification should parse");
         assert_eq!(request, WindowsBackendRequest::Missing);
     }
@@ -652,7 +648,7 @@ mod tests {
     #[test]
     fn prepare_windows_service_host_requires_absolute_env_file_path() {
         let err = prepare_windows_service_host(&WindowsServiceOptions {
-            service_name: "RustyNet".to_string(),
+            service_name: "RustyNet".to_owned(),
             env_file: PathBuf::from("relative.env"),
         })
         .expect_err("relative env-file path should fail");

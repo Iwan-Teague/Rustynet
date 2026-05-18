@@ -22,8 +22,7 @@ pub fn parse_windows_backend_mode(value: &str) -> Result<WindowsBackendMode, Str
 pub fn require_supported_windows_backend(mode: WindowsBackendMode) -> Result<(), String> {
     match mode {
         WindowsBackendMode::Unsupported => Err(
-            "windows-runtime-backend-explicitly-unsupported: Windows service/config host is present, but this build does not yet provide an enabled reviewed Windows dataplane/backend for the selected label. 'windows-unsupported' remains the explicit fail-closed backend label and must keep blocking until an operator deliberately selects a reviewed backend."
-                .to_string(),
+            "windows-runtime-backend-explicitly-unsupported: Windows service/config host is present, but this build does not yet provide an enabled reviewed Windows dataplane/backend for the selected label. 'windows-unsupported' remains the explicit fail-closed backend label and must keep blocking until an operator deliberately selects a reviewed backend.".to_owned(),
         ),
         WindowsBackendMode::WireguardNt => Ok(()),
     }

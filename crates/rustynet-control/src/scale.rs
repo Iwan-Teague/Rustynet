@@ -288,12 +288,12 @@ mod tests {
     fn ha_cluster_fails_over_to_next_healthy_replica() {
         let mut cluster = HaCluster::new(vec![
             ControlPlaneReplica {
-                id: "replica-a".to_string(),
+                id: "replica-a".to_owned(),
                 healthy: true,
                 policy_generation: 10,
             },
             ControlPlaneReplica {
-                id: "replica-b".to_string(),
+                id: "replica-b".to_owned(),
                 healthy: true,
                 policy_generation: 9,
             },
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn ha_cluster_rejects_when_no_healthy_replica_exists() {
         let mut cluster = HaCluster::new(vec![ControlPlaneReplica {
-            id: "replica-a".to_string(),
+            id: "replica-a".to_owned(),
             healthy: false,
             policy_generation: 1,
         }]);
@@ -356,14 +356,14 @@ mod tests {
     #[test]
     fn enterprise_auth_validates_issuer_audience_and_mfa() {
         let config = EnterpriseAuthConfig {
-            issuer: "https://id.example.local".to_string(),
-            allowed_audiences: BTreeSet::from(["rustynet-control".to_string()]),
+            issuer: "https://id.example.local".to_owned(),
+            allowed_audiences: BTreeSet::from(["rustynet-control".to_owned()]),
             require_mfa: true,
         };
         let ok = OidcClaims {
-            issuer: "https://id.example.local".to_string(),
-            audience: "rustynet-control".to_string(),
-            subject: "alice".to_string(),
+            issuer: "https://id.example.local".to_owned(),
+            audience: "rustynet-control".to_owned(),
+            subject: "alice".to_owned(),
             mfa_present: true,
         };
         assert!(config.validate_claims(&ok).is_ok());
@@ -382,7 +382,7 @@ mod tests {
     fn trust_hardening_fails_closed_when_state_missing_or_mismatched() {
         let config = TrustHardeningConfig {
             enabled: true,
-            break_glass_secret: "break-glass".to_string(),
+            break_glass_secret: "break-glass".to_owned(),
         };
         let unique_dir = format!(
             "rustynet-trust-hardening-dir-{}",
@@ -412,7 +412,7 @@ mod tests {
             &path,
             &TrustState {
                 generation: 1,
-                signing_fingerprint: "ed25519:trusted".to_string(),
+                signing_fingerprint: "ed25519:trusted".to_owned(),
                 updated_at_unix: 100,
             },
         )
@@ -433,7 +433,7 @@ mod tests {
     fn trust_hardening_disable_requires_break_glass_secret() {
         let mut config = TrustHardeningConfig {
             enabled: true,
-            break_glass_secret: "break-glass".to_string(),
+            break_glass_secret: "break-glass".to_owned(),
         };
         assert_eq!(
             disable_trust_hardening(&mut config, "bad-secret").err(),

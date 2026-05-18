@@ -82,13 +82,13 @@ fn run() -> Result<(), String> {
                 .path()
                 .join("cross_network_direct_remote_exit_report.json")
                 .to_str()
-                .ok_or_else(|| "report path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "report path is not valid utf-8".to_owned())?,
             "--log-path",
             temp_dir
                 .path()
                 .join("cross_network_direct_remote_exit.log")
                 .to_str()
-                .ok_or_else(|| "log path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "log path is not valid utf-8".to_owned())?,
         ],
     )?;
 
@@ -126,13 +126,13 @@ fn run() -> Result<(), String> {
                 .path()
                 .join("cross_network_relay_remote_exit_report.json")
                 .to_str()
-                .ok_or_else(|| "report path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "report path is not valid utf-8".to_owned())?,
             "--log-path",
             temp_dir
                 .path()
                 .join("cross_network_relay_remote_exit.log")
                 .to_str()
-                .ok_or_else(|| "log path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "log path is not valid utf-8".to_owned())?,
         ],
     )?;
 
@@ -170,13 +170,13 @@ fn run() -> Result<(), String> {
                 .path()
                 .join("cross_network_failback_roaming_report.json")
                 .to_str()
-                .ok_or_else(|| "report path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "report path is not valid utf-8".to_owned())?,
             "--log-path",
             temp_dir
                 .path()
                 .join("cross_network_failback_roaming.log")
                 .to_str()
-                .ok_or_else(|| "log path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "log path is not valid utf-8".to_owned())?,
         ],
     )?;
 
@@ -206,13 +206,13 @@ fn run() -> Result<(), String> {
                 .path()
                 .join("cross_network_traversal_adversarial_report.json")
                 .to_str()
-                .ok_or_else(|| "report path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "report path is not valid utf-8".to_owned())?,
             "--log-path",
             temp_dir
                 .path()
                 .join("cross_network_traversal_adversarial.log")
                 .to_str()
-                .ok_or_else(|| "log path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "log path is not valid utf-8".to_owned())?,
         ],
     )?;
 
@@ -244,13 +244,13 @@ fn run() -> Result<(), String> {
                 .path()
                 .join("cross_network_remote_exit_dns_report.json")
                 .to_str()
-                .ok_or_else(|| "report path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "report path is not valid utf-8".to_owned())?,
             "--log-path",
             temp_dir
                 .path()
                 .join("cross_network_remote_exit_dns.log")
                 .to_str()
-                .ok_or_else(|| "log path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "log path is not valid utf-8".to_owned())?,
         ],
     )?;
 
@@ -278,13 +278,13 @@ fn run() -> Result<(), String> {
                 .path()
                 .join("cross_network_remote_exit_soak_report.json")
                 .to_str()
-                .ok_or_else(|| "report path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "report path is not valid utf-8".to_owned())?,
             "--log-path",
             temp_dir
                 .path()
                 .join("cross_network_remote_exit_soak.log")
                 .to_str()
-                .ok_or_else(|| "log path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "log path is not valid utf-8".to_owned())?,
         ],
     )?;
 
@@ -297,13 +297,13 @@ fn run() -> Result<(), String> {
             temp_dir
                 .path()
                 .to_str()
-                .ok_or_else(|| "artifact dir is not valid utf-8".to_string())?,
+                .ok_or_else(|| "artifact dir is not valid utf-8".to_owned())?,
             "--output",
             temp_dir
                 .path()
                 .join("skeleton_validation.md")
                 .to_str()
-                .ok_or_else(|| "output path is not valid utf-8".to_string())?,
+                .ok_or_else(|| "output path is not valid utf-8".to_owned())?,
         ],
     )?;
 

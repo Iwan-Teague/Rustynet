@@ -75,7 +75,7 @@ const REQUIREMENT_ABSENT: &str = "absent";
 pub fn evaluate_windows_key_custody(entries: &[WindowsKeyCustodyEntry]) -> Result<(), Vec<String>> {
     let mut reasons: Vec<String> = Vec::new();
     if entries.is_empty() {
-        reasons.push("key custody report contains no entries".to_string());
+        reasons.push("key custody report contains no entries".to_owned());
         return Err(reasons);
     }
     for entry in entries {
@@ -181,9 +181,9 @@ fn inspect_required_secret_blob(
         Ok(meta) => meta,
         Err(err) => {
             return WindowsKeyCustodyEntry {
-                label: label.to_string(),
+                label: label.to_owned(),
                 path: path.display().to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Missing {
                     reason: format!("{label} must exist on Windows runtime host: {err}"),
                 },
@@ -192,9 +192,9 @@ fn inspect_required_secret_blob(
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: path.display().to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Invalid {
                 reason: format!("{label} must be a regular file, not a symlink or directory"),
                 acl_sddl: String::new(),
@@ -207,9 +207,9 @@ fn inspect_required_secret_blob(
         .ends_with(expected_extension)
     {
         return WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: path.display().to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Invalid {
                 reason: format!("{label} must use the reviewed extension {expected_extension}"),
                 acl_sddl: String::new(),
@@ -220,9 +220,9 @@ fn inspect_required_secret_blob(
         Ok(sddl) => sddl,
         Err(err) => {
             return WindowsKeyCustodyEntry {
-                label: label.to_string(),
+                label: label.to_owned(),
                 path: path.display().to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Invalid {
                     reason: format!("{label} ACL inspection failed: {err}"),
                     acl_sddl: String::new(),
@@ -232,9 +232,9 @@ fn inspect_required_secret_blob(
     };
     if let Err(err) = evaluate_windows_local_secret_acl_sddl(label, sddl.as_str(), false) {
         return WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: path.display().to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Invalid {
                 reason: format!("{label} ACL drift: {err}"),
                 acl_sddl: sddl,
@@ -242,9 +242,9 @@ fn inspect_required_secret_blob(
         };
     }
     WindowsKeyCustodyEntry {
-        label: label.to_string(),
+        label: label.to_owned(),
         path: path.display().to_string(),
-        requirement: REQUIREMENT_PRESENT.to_string(),
+        requirement: REQUIREMENT_PRESENT.to_owned(),
         status: WindowsKeyCustodyEntryStatus::Ok { acl_sddl: sddl },
     }
 }
@@ -253,9 +253,9 @@ fn inspect_forbidden_artifact(label: &str, path_str: &str) -> WindowsKeyCustodyE
     let path = Path::new(path_str);
     match std::fs::symlink_metadata(path) {
         Ok(_) => WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: path.display().to_string(),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Forbidden {
                 reason: format!(
                     "{label} must not exist at rest; encrypted-at-rest custody requires the plaintext form to be absent"
@@ -263,15 +263,15 @@ fn inspect_forbidden_artifact(label: &str, path_str: &str) -> WindowsKeyCustodyE
             },
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: path.display().to_string(),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::AbsentAsExpected,
         },
         Err(err) => WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: path.display().to_string(),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Forbidden {
                 reason: format!(
                     "{label} stat returned an unexpected error; cannot prove absence: {err}"
@@ -287,20 +287,20 @@ mod tests {
 
     fn ok_entry(label: &str) -> WindowsKeyCustodyEntry {
         WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: format!(r"C:\ProgramData\RustyNet\secrets\{label}.dpapi"),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Ok {
-                acl_sddl: "O:S-1-5-80-9999D:P(A;;FA;;;SY)".to_string(),
+                acl_sddl: "O:S-1-5-80-9999D:P(A;;FA;;;SY)".to_owned(),
             },
         }
     }
 
     fn absent_forbidden_entry(label: &str) -> WindowsKeyCustodyEntry {
         WindowsKeyCustodyEntry {
-            label: label.to_string(),
+            label: label.to_owned(),
             path: format!(r"C:\ProgramData\RustyNet\keys\{label}"),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::AbsentAsExpected,
         }
     }
@@ -335,11 +335,11 @@ mod tests {
         entries.insert(
             0,
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Missing {
-                    reason: "file not found".to_string(),
+                    reason: "file not found".to_owned(),
                 },
             },
         );
@@ -360,12 +360,12 @@ mod tests {
             ok_entry("wg public key"),
             absent_forbidden_entry("wg plaintext runtime private key"),
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Invalid {
-                    reason: "ACL drift: world-writable principal".to_string(),
-                    acl_sddl: "O:WDD:(A;;FA;;;WD)".to_string(),
+                    reason: "ACL drift: world-writable principal".to_owned(),
+                    acl_sddl: "O:WDD:(A;;FA;;;WD)".to_owned(),
                 },
             },
         ];
@@ -387,11 +387,11 @@ mod tests {
             ok_entry("wg encrypted private key"),
             ok_entry("wg public key"),
             WindowsKeyCustodyEntry {
-                label: "wg plaintext runtime private key".to_string(),
-                path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_string(),
-                requirement: REQUIREMENT_ABSENT.to_string(),
+                label: "wg plaintext runtime private key".to_owned(),
+                path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_owned(),
+                requirement: REQUIREMENT_ABSENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Forbidden {
-                    reason: "plaintext key file present at rest".to_string(),
+                    reason: "plaintext key file present at rest".to_owned(),
                 },
             },
         ];
@@ -412,9 +412,9 @@ mod tests {
             ok_entry("wg public key"),
             absent_forbidden_entry("wg plaintext runtime private key"),
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::AbsentAsExpected,
             },
         ];
@@ -435,11 +435,11 @@ mod tests {
             ok_entry("wg encrypted private key"),
             ok_entry("wg public key"),
             WindowsKeyCustodyEntry {
-                label: "wg plaintext runtime private key".to_string(),
-                path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_string(),
-                requirement: REQUIREMENT_ABSENT.to_string(),
+                label: "wg plaintext runtime private key".to_owned(),
+                path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_owned(),
+                requirement: REQUIREMENT_ABSENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Ok {
-                    acl_sddl: "O:SYD:(A;;FA;;;SY)".to_string(),
+                    acl_sddl: "O:SYD:(A;;FA;;;SY)".to_owned(),
                 },
             },
         ];
@@ -456,9 +456,9 @@ mod tests {
     #[test]
     fn evaluator_rejects_unknown_requirement_string() {
         let entries = vec![WindowsKeyCustodyEntry {
-            label: "wg key passphrase blob".to_string(),
-            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-            requirement: "maybe".to_string(),
+            label: "wg key passphrase blob".to_owned(),
+            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+            requirement: "maybe".to_owned(),
             status: WindowsKeyCustodyEntryStatus::AbsentAsExpected,
         }];
         let reasons =
@@ -475,28 +475,28 @@ mod tests {
     fn evaluator_aggregates_multiple_drift_reasons() {
         let entries = vec![
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: "p1".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: "p1".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Missing {
-                    reason: "missing".to_string(),
+                    reason: "missing".to_owned(),
                 },
             },
             WindowsKeyCustodyEntry {
-                label: "wg encrypted private key".to_string(),
-                path: "p2".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg encrypted private key".to_owned(),
+                path: "p2".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Invalid {
-                    reason: "acl bad".to_string(),
+                    reason: "acl bad".to_owned(),
                     acl_sddl: String::new(),
                 },
             },
             WindowsKeyCustodyEntry {
-                label: "wg plaintext runtime private key".to_string(),
-                path: "p3".to_string(),
-                requirement: REQUIREMENT_ABSENT.to_string(),
+                label: "wg plaintext runtime private key".to_owned(),
+                path: "p3".to_owned(),
+                requirement: REQUIREMENT_ABSENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Forbidden {
-                    reason: "found".to_string(),
+                    reason: "found".to_owned(),
                 },
             },
         ];
@@ -547,11 +547,11 @@ mod tests {
     /// (the verifier only checks shape, not content).
     fn rotated_passphrase_entry() -> WindowsKeyCustodyEntry {
         WindowsKeyCustodyEntry {
-            label: "wg key passphrase blob".to_string(),
-            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "wg key passphrase blob".to_owned(),
+            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Ok {
-                acl_sddl: reviewed_dpapi_sddl().to_string(),
+                acl_sddl: reviewed_dpapi_sddl().to_owned(),
             },
         }
     }
@@ -581,13 +581,13 @@ mod tests {
     fn evaluator_rejects_rotation_with_world_writable_principal() {
         let entries = vec![
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Invalid {
                     reason: "ACL drift: world-writable principal (Everyone) on rotated blob"
-                        .to_string(),
-                    acl_sddl: "O:S-1-5-80-1234567890D:(A;;FA;;;WD)".to_string(),
+                        .to_owned(),
+                    acl_sddl: "O:S-1-5-80-1234567890D:(A;;FA;;;WD)".to_owned(),
                 },
             },
             ok_entry("wg encrypted private key"),
@@ -613,12 +613,12 @@ mod tests {
     fn evaluator_rejects_rotation_with_unreviewed_owner() {
         let entries = vec![
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Invalid {
-                    reason: "owner drift: rotation completed as wrong principal".to_string(),
-                    acl_sddl: "O:S-1-5-21-1111-2222-3333-1001D:P(A;;FA;;;SY)".to_string(),
+                    reason: "owner drift: rotation completed as wrong principal".to_owned(),
+                    acl_sddl: "O:S-1-5-21-1111-2222-3333-1001D:P(A;;FA;;;SY)".to_owned(),
                 },
             },
             ok_entry("wg encrypted private key"),
@@ -644,11 +644,11 @@ mod tests {
         let entries = vec![
             rotated_passphrase_entry(),
             WindowsKeyCustodyEntry {
-                label: "wg encrypted private key".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.key.enc".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg encrypted private key".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.key.enc".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Missing {
-                    reason: "atomic rename mid-rotation; file briefly missing".to_string(),
+                    reason: "atomic rename mid-rotation; file briefly missing".to_owned(),
                 },
             },
             ok_entry("wg public key"),
@@ -676,11 +676,11 @@ mod tests {
             ok_entry("wg encrypted private key"),
             ok_entry("wg public key"),
             WindowsKeyCustodyEntry {
-                label: "wg plaintext runtime private key".to_string(),
-                path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_string(),
-                requirement: REQUIREMENT_ABSENT.to_string(),
+                label: "wg plaintext runtime private key".to_owned(),
+                path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_owned(),
+                requirement: REQUIREMENT_ABSENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Forbidden {
-                    reason: "rotation tool dropped a plaintext key by mistake".to_string(),
+                    reason: "rotation tool dropped a plaintext key by mistake".to_owned(),
                 },
             },
         ];
@@ -707,13 +707,13 @@ mod tests {
     fn evaluator_rejects_rotation_with_temp_suffix_extension_drift() {
         let entries = vec![
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi.tmp".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi.tmp".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Invalid {
                     reason: "extension drift: post-rotation file ends with .dpapi.tmp not .dpapi"
-                        .to_string(),
-                    acl_sddl: reviewed_dpapi_sddl().to_string(),
+                        .to_owned(),
+                    acl_sddl: reviewed_dpapi_sddl().to_owned(),
                 },
             },
             ok_entry("wg encrypted private key"),
@@ -741,13 +741,13 @@ mod tests {
     fn evaluator_rejects_rotation_that_widened_dacl_to_authenticated_users() {
         let entries = vec![
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Invalid {
                     reason: "ACL drift: rotation tool added Authenticated Users (AU) to DACL"
-                        .to_string(),
-                    acl_sddl: "O:S-1-5-80-1234567890D:P(A;;FA;;;SY)(A;;FR;;;AU)".to_string(),
+                        .to_owned(),
+                    acl_sddl: "O:S-1-5-80-1234567890D:P(A;;FA;;;SY)(A;;FR;;;AU)".to_owned(),
                 },
             },
             ok_entry("wg encrypted private key"),
@@ -773,16 +773,16 @@ mod tests {
             entries: vec![
                 ok_entry("wg key passphrase blob"),
                 WindowsKeyCustodyEntry {
-                    label: "wg plaintext runtime private key".to_string(),
-                    path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_string(),
-                    requirement: REQUIREMENT_ABSENT.to_string(),
+                    label: "wg plaintext runtime private key".to_owned(),
+                    path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_owned(),
+                    requirement: REQUIREMENT_ABSENT.to_owned(),
                     status: WindowsKeyCustodyEntryStatus::Forbidden {
-                        reason: "present".to_string(),
+                        reason: "present".to_owned(),
                     },
                 },
             ],
             drift_reasons: vec![
-                "wg plaintext runtime private key present but must be absent: present".to_string(),
+                "wg plaintext runtime private key present but must be absent: present".to_owned(),
             ],
         };
         let serialized = serde_json::to_string(&report).expect("serialize");
@@ -819,11 +819,11 @@ mod tests {
         // only covered Ok + Forbidden together. Pin the Missing variant
         // explicitly so a future #[serde(rename)] on reason trips this.
         let entry = WindowsKeyCustodyEntry {
-            label: "wg key passphrase blob".to_string(),
-            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "wg key passphrase blob".to_owned(),
+            path: r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi".to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Missing {
-                reason: "file not found".to_string(),
+                reason: "file not found".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -840,12 +840,12 @@ mod tests {
     fn entry_status_invalid_round_trips_through_serde() {
         // Invalid carries reason + acl_sddl; pin both through serde.
         let entry = WindowsKeyCustodyEntry {
-            label: "wg encrypted private key".to_string(),
-            path: r"C:\ProgramData\RustyNet\secrets\wireguard.key.enc".to_string(),
-            requirement: REQUIREMENT_PRESENT.to_string(),
+            label: "wg encrypted private key".to_owned(),
+            path: r"C:\ProgramData\RustyNet\secrets\wireguard.key.enc".to_owned(),
+            requirement: REQUIREMENT_PRESENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::Invalid {
-                reason: "ACL drift".to_string(),
-                acl_sddl: "O:WDD:(A;;FA;;;WD)".to_string(),
+                reason: "ACL drift".to_owned(),
+                acl_sddl: "O:WDD:(A;;FA;;;WD)".to_owned(),
             },
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -864,9 +864,9 @@ mod tests {
         // unit variant explicitly so a future addition of a field
         // (e.g. confirmed_at_unix) trips the test.
         let entry = WindowsKeyCustodyEntry {
-            label: "wg plaintext runtime private key".to_string(),
-            path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_string(),
-            requirement: REQUIREMENT_ABSENT.to_string(),
+            label: "wg plaintext runtime private key".to_owned(),
+            path: r"C:\ProgramData\RustyNet\keys\wireguard.key".to_owned(),
+            requirement: REQUIREMENT_ABSENT.to_owned(),
             status: WindowsKeyCustodyEntryStatus::AbsentAsExpected,
         };
         let body = serde_json::to_string(&entry).expect("serialize");
@@ -898,19 +898,19 @@ mod tests {
         // refactor would silently collapse the operator-facing count.
         let entries = vec![
             WindowsKeyCustodyEntry {
-                label: "wg key passphrase blob".to_string(),
-                path: "p1".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg key passphrase blob".to_owned(),
+                path: "p1".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Missing {
-                    reason: "ENOENT".to_string(),
+                    reason: "ENOENT".to_owned(),
                 },
             },
             WindowsKeyCustodyEntry {
-                label: "wg encrypted private key".to_string(),
-                path: "p2".to_string(),
-                requirement: REQUIREMENT_PRESENT.to_string(),
+                label: "wg encrypted private key".to_owned(),
+                path: "p2".to_owned(),
+                requirement: REQUIREMENT_PRESENT.to_owned(),
                 status: WindowsKeyCustodyEntryStatus::Missing {
-                    reason: "ENOENT".to_string(),
+                    reason: "ENOENT".to_owned(),
                 },
             },
             ok_entry("wg public key"),

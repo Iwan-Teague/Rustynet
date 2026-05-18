@@ -202,7 +202,7 @@ fn canonicalize_report(
                 root,
             )));
         }
-        payload.insert("source_artifacts".to_string(), Value::Array(rebound));
+        payload.insert("source_artifacts".to_owned(), Value::Array(rebound));
     }
 
     if let Some(source_artifact) = payload.get("source_artifact") {
@@ -232,7 +232,7 @@ fn canonicalize_report(
                 .as_path(),
         )?;
         payload.insert(
-            "source_artifact".to_string(),
+            "source_artifact".to_owned(),
             Value::String(normalize_path(canonical_source.as_path(), root)),
         );
     }
@@ -254,7 +254,7 @@ fn canonicalize_report(
 
 fn normalize_source_artifacts(items: &Value, root: &Path) -> Result<Vec<String>, String> {
     let Some(items) = items.as_array() else {
-        return Err("report contains invalid source_artifacts entry".to_string());
+        return Err("report contains invalid source_artifacts entry".to_owned());
     };
     let mut out = Vec::new();
     for item in items {
@@ -262,7 +262,7 @@ fn normalize_source_artifacts(items: &Value, root: &Path) -> Result<Vec<String>,
             .as_str()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "report contains invalid source_artifacts entry".to_string())?;
+            .ok_or_else(|| "report contains invalid source_artifacts entry".to_owned())?;
         let mut source = PathBuf::from(raw);
         if !source.is_absolute() {
             source = root.join(source);
@@ -317,7 +317,7 @@ fn load_json_report(
         root,
     )?;
     payload.insert(
-        "normalized_source_artifacts".to_string(),
+        "normalized_source_artifacts".to_owned(),
         Value::Array(
             normalized_source_artifacts
                 .into_iter()
@@ -483,19 +483,19 @@ impl FreshInstallOsMatrixReportView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "schema_version".to_string(),
+            "schema_version".to_owned(),
             Value::Number(self.schema_version.into()),
         );
         m.insert(
-            "evidence_mode".to_string(),
+            "evidence_mode".to_owned(),
             Value::String(self.evidence_mode),
         );
-        m.insert("environment".to_string(), Value::String(self.environment));
+        m.insert("environment".to_owned(), Value::String(self.environment));
         m.insert(
-            "captured_at_unix".to_string(),
+            "captured_at_unix".to_owned(),
             Value::Number(self.captured_at_unix.into()),
         );
-        m.insert("git_commit".to_string(), Value::String(self.git_commit));
+        m.insert("git_commit".to_owned(), Value::String(self.git_commit));
         m
     }
 }
@@ -819,8 +819,7 @@ pub fn execute_ops_generate_linux_fresh_install_os_matrix_report(
     })?;
     if config.source_mode == "working-tree" && !git_status.trim().is_empty() {
         return Err(
-            "cannot generate commit-bound fresh install OS matrix report from a dirty working tree; commit or stash local changes first"
-                .to_string(),
+            "cannot generate commit-bound fresh install OS matrix report from a dirty working tree; commit or stash local changes first".to_owned(),
         );
     }
 
@@ -902,7 +901,7 @@ pub fn execute_ops_generate_linux_fresh_install_os_matrix_report(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "role-switch report requires non-empty source_artifact".to_string())?;
+        .ok_or_else(|| "role-switch report requires non-empty source_artifact".to_owned())?;
     let mut role_switch_source_path = PathBuf::from(role_switch_source_value);
     if !role_switch_source_path.is_absolute() {
         role_switch_source_path = root.join(role_switch_source_path);
@@ -918,7 +917,7 @@ pub fn execute_ops_generate_linux_fresh_install_os_matrix_report(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if role_switch_time == 0 {
-        return Err("role-switch report requires positive captured_at_unix".to_string());
+        return Err("role-switch report requires positive captured_at_unix".to_owned());
     }
     let two_hop_time = two_hop
         .get("captured_at_unix")
@@ -933,13 +932,13 @@ pub fn execute_ops_generate_linux_fresh_install_os_matrix_report(
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if two_hop_time == 0 || lan_toggle_time == 0 || exit_handoff_time == 0 {
-        return Err("live reports require positive captured_at_unix".to_string());
+        return Err("live reports require positive captured_at_unix".to_owned());
     }
 
     let role_hosts = role_switch
         .get("hosts")
         .and_then(Value::as_object)
-        .ok_or_else(|| "role-switch report requires hosts object".to_string())?;
+        .ok_or_else(|| "role-switch report requires hosts object".to_owned())?;
     for required_os in ["debian13", "ubuntu", "fedora", "mint"] {
         let host_entry = role_hosts
             .get(required_os)
@@ -1247,22 +1246,22 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
         })?;
 
     if typed_report.schema_version != 1 {
-        return Err("fresh install OS matrix report must set schema_version=1".to_string());
+        return Err("fresh install OS matrix report must set schema_version=1".to_owned());
     }
     if typed_report.evidence_mode != "measured" {
-        return Err("fresh install OS matrix report must set evidence_mode=measured".to_string());
+        return Err("fresh install OS matrix report must set evidence_mode=measured".to_owned());
     }
     if typed_report.environment.trim().is_empty() {
         return Err(
             "fresh_install_os_matrix_report requires non-empty string field: environment"
-                .to_string(),
+                .to_owned(),
         );
     }
     let captured_at_unix = typed_report.captured_at_unix;
     if captured_at_unix == 0 {
         return Err(
             "fresh_install_os_matrix_report requires positive integer field: captured_at_unix"
-                .to_string(),
+                .to_owned(),
         );
     }
     validate_timestamp(
@@ -1275,22 +1274,20 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
     let git_commit = typed_report.git_commit.clone();
     if git_commit.trim().is_empty() {
         return Err(
-            "fresh_install_os_matrix_report requires non-empty string field: git_commit"
-                .to_string(),
+            "fresh_install_os_matrix_report requires non-empty string field: git_commit".to_owned(),
         );
     }
     if !is_lower_hex_sha40(git_commit.as_str()) {
         return Err(
             "fresh install OS matrix report git_commit must be a 40-char lowercase hex SHA"
-                .to_string(),
+                .to_owned(),
         );
     }
     let expected_git_commit_arg = config.expected_git_commit.trim().to_ascii_lowercase();
     if !expected_git_commit_arg.is_empty() && !is_lower_hex_sha40(expected_git_commit_arg.as_str())
     {
         return Err(
-            "RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT must be a 40-char lowercase hex SHA when set"
-                .to_string(),
+            "RUSTYNET_FRESH_INSTALL_OS_MATRIX_EXPECTED_GIT_COMMIT must be a 40-char lowercase hex SHA when set".to_owned(),
         );
     }
     let expected_commit = if expected_git_commit_arg.is_empty() {
@@ -1317,7 +1314,7 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
     let payload = typed_report.into_value_map();
     let payload = &payload;
     let source_artifacts = payload.get("source_artifacts").ok_or_else(|| {
-        "fresh_install_os_matrix_report requires non-empty source_artifacts list".to_string()
+        "fresh_install_os_matrix_report requires non-empty source_artifacts list".to_owned()
     })?;
     validate_source_artifact_entries_for_verify(
         source_artifacts,
@@ -1331,7 +1328,7 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
         .get("security_assertions")
         .and_then(Value::as_object)
         .ok_or_else(|| {
-            "fresh install OS matrix report requires security_assertions object".to_string()
+            "fresh install OS matrix report requires security_assertions object".to_owned()
         })?;
     let missing_assertions = required_security_assertions
         .iter()
@@ -1355,10 +1352,10 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
     let scenarios = payload
         .get("scenarios")
         .and_then(Value::as_object)
-        .ok_or_else(|| "fresh install OS matrix report requires scenarios object".to_string())?;
+        .ok_or_else(|| "fresh install OS matrix report requires scenarios object".to_owned())?;
     let required_os_ids = required_os_profiles
         .iter()
-        .map(|(id, _)| (*id).to_string())
+        .map(|(id, _)| (*id).to_owned())
         .collect::<HashSet<_>>();
     let observed_os_ids = scenarios.keys().cloned().collect::<HashSet<_>>();
     if required_os_ids != observed_os_ids {
@@ -1500,22 +1497,22 @@ pub fn execute_ops_verify_linux_fresh_install_os_matrix_readiness(
         }
     }
 
-    Ok("Fresh install OS matrix readiness checks: PASS".to_string())
+    Ok("Fresh install OS matrix readiness checks: PASS".to_owned())
 }
 
 pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
     config: WriteFreshInstallOsMatrixReadinessFixturesConfig,
 ) -> Result<String, String> {
     if config.now_unix == 0 {
-        return Err("fixture now_unix must be positive".to_string());
+        return Err("fixture now_unix must be positive".to_owned());
     }
     let head_commit = config.head_commit.trim().to_ascii_lowercase();
     if !is_lower_hex_sha40(head_commit.as_str()) {
-        return Err("fixture head_commit must be a 40-char lowercase hex SHA".to_string());
+        return Err("fixture head_commit must be a 40-char lowercase hex SHA".to_owned());
     }
     let stale_commit = config.stale_commit.trim().to_ascii_lowercase();
     if !is_lower_hex_sha40(stale_commit.as_str()) {
-        return Err("fixture stale_commit must be a 40-char lowercase hex SHA".to_string());
+        return Err("fixture stale_commit must be a 40-char lowercase hex SHA".to_owned());
     }
 
     let output_dir = resolve_path(config.output_dir.as_path())?;
@@ -1566,7 +1563,7 @@ pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
         .into_iter()
         .map(|os_id| {
             (
-                os_id.to_string(),
+                os_id.to_owned(),
                 json!({
                     "transition": {
                         "from_role": "client",
@@ -1764,8 +1761,8 @@ pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
     let mut stale_two_hop = two_hop_report
         .as_object()
         .cloned()
-        .ok_or_else(|| "fixture two-hop report shape invalid".to_string())?;
-    stale_two_hop.insert("git_commit".to_string(), Value::String(stale_commit));
+        .ok_or_else(|| "fixture two-hop report shape invalid".to_owned())?;
+    stale_two_hop.insert("git_commit".to_owned(), Value::String(stale_commit));
     write_json(
         stale_two_hop_report_path.as_path(),
         &Value::Object(stale_two_hop),
@@ -1775,9 +1772,9 @@ pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
     let mut stale_wrapper = report
         .as_object()
         .cloned()
-        .ok_or_else(|| "fixture readiness report shape invalid".to_string())?;
+        .ok_or_else(|| "fixture readiness report shape invalid".to_owned())?;
     stale_wrapper.insert(
-        "source_artifacts".to_string(),
+        "source_artifacts".to_owned(),
         Value::Array(vec![
             Value::String(absolute_display(bootstrap_log.as_path())),
             Value::String(absolute_display(baseline_log.as_path())),
@@ -1795,15 +1792,15 @@ pub fn execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
     let scenarios = stale_wrapper
         .get_mut("scenarios")
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| "fixture readiness report scenarios missing".to_string())?;
+        .ok_or_else(|| "fixture readiness report scenarios missing".to_owned())?;
     for scenario_payload in scenarios.values_mut() {
         let two_hop_section = scenario_payload
             .as_object_mut()
             .and_then(|entry| entry.get_mut("two_hop"))
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| "fixture scenario two_hop section missing".to_string())?;
+            .ok_or_else(|| "fixture scenario two_hop section missing".to_owned())?;
         two_hop_section.insert(
-            "source_artifacts".to_string(),
+            "source_artifacts".to_owned(),
             Value::Array(vec![
                 Value::String(absolute_display(stale_two_hop_report_path.as_path())),
                 Value::String(absolute_display(two_hop_log.as_path())),
@@ -1851,8 +1848,8 @@ mod tests {
         execute_ops_write_fresh_install_os_matrix_readiness_fixtures(
             WriteFreshInstallOsMatrixReadinessFixturesConfig {
                 output_dir: output_dir.clone(),
-                head_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                stale_commit: "1111111111111111111111111111111111111111".to_string(),
+                head_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                stale_commit: "1111111111111111111111111111111111111111".to_owned(),
                 now_unix: 1_773_300_000,
             },
         )

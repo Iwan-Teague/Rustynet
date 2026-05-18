@@ -15,7 +15,7 @@ impl NodeId {
         if normalized.is_empty() {
             return Err(BackendError::invalid_input("node id must not be empty"));
         }
-        Ok(Self(normalized.to_string()))
+        Ok(Self(normalized.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -226,7 +226,7 @@ pub trait TunnelBackend: Send + Sync {
             "authoritative shared transport round trip unavailable: {}",
             self.transport_socket_identity_blocker().unwrap_or_else(|| {
                 "backend does not expose backend-owned authoritative transport operations"
-                    .to_string()
+                    .to_owned()
             })
         )))
     }
@@ -242,7 +242,7 @@ pub trait TunnelBackend: Send + Sync {
             "authoritative shared transport send unavailable: {}",
             self.transport_socket_identity_blocker().unwrap_or_else(|| {
                 "backend does not expose backend-owned authoritative transport operations"
-                    .to_string()
+                    .to_owned()
             })
         )))
     }

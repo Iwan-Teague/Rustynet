@@ -75,7 +75,7 @@ pub fn evaluate_linux_service_hardening(observed: &BTreeMap<String, String>) -> 
     let mut reasons: Vec<String> = Vec::new();
     if observed.is_empty() {
         reasons
-            .push("systemctl show output contained no parseable key=value properties".to_string());
+            .push("systemctl show output contained no parseable key=value properties".to_owned());
         return reasons;
     }
     for (key, expected) in REVIEWED_HARDENING_DIRECTIVES {
@@ -106,7 +106,7 @@ pub fn parse_systemctl_show_output(body: &str) -> BTreeMap<String, String> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for line in body.lines() {
         if let Some((key, value)) = line.split_once('=') {
-            map.insert(key.trim().to_string(), value.trim().to_string());
+            map.insert(key.trim().to_owned(), value.trim().to_owned());
         }
     }
     map
@@ -121,13 +121,13 @@ pub fn build_linux_service_hardening_report(
         evaluate_linux_service_hardening(&observed)
     } else {
         vec![probe_reason.clone().unwrap_or_else(|| {
-            "systemctl show was not run; service hardening posture unknown".to_string()
+            "systemctl show was not run; service hardening posture unknown".to_owned()
         })]
     };
     let overall_ok = probed && drift_reasons.is_empty();
     LinuxServiceHardeningReport {
         schema_version: 1,
-        service_name: REVIEWED_SERVICE_NAME.to_string(),
+        service_name: REVIEWED_SERVICE_NAME.to_owned(),
         overall_ok,
         probed,
         probe_reason,
@@ -188,8 +188,7 @@ fn run_systemctl_show_probe() -> LinuxServiceHardeningReport {
     build_linux_service_hardening_report(
         false,
         Some(
-            "linux-service-hardening-check requires a Linux runtime host with systemctl"
-                .to_string(),
+            "linux-service-hardening-check requires a Linux runtime host with systemctl".to_owned(),
         ),
         BTreeMap::new(),
     )
@@ -202,7 +201,7 @@ mod tests {
     fn reviewed_property_map() -> BTreeMap<String, String> {
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         for (k, v) in REVIEWED_HARDENING_DIRECTIVES {
-            map.insert((*k).to_string(), (*v).to_string());
+            map.insert((*k).to_owned(), (*v).to_owned());
         }
         map
     }
@@ -250,7 +249,7 @@ mod tests {
     #[test]
     fn evaluator_surfaces_protect_system_drift() {
         let mut map = reviewed_property_map();
-        map.insert("ProtectSystem".to_string(), "false".to_string());
+        map.insert("ProtectSystem".to_owned(), "false".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("ProtectSystem drifted")),
@@ -279,8 +278,8 @@ mod tests {
     fn evaluator_surfaces_capability_bounding_set_drift_when_caps_added() {
         let mut map = reviewed_property_map();
         map.insert(
-            "CapabilityBoundingSet".to_string(),
-            "CAP_NET_ADMIN".to_string(),
+            "CapabilityBoundingSet".to_owned(),
+            "CAP_NET_ADMIN".to_owned(),
         );
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
@@ -294,8 +293,8 @@ mod tests {
     #[test]
     fn evaluator_aggregates_multiple_drifts_in_one_pass() {
         let mut map = reviewed_property_map();
-        map.insert("ProtectSystem".to_string(), "false".to_string());
-        map.insert("LockPersonality".to_string(), "no".to_string());
+        map.insert("ProtectSystem".to_owned(), "false".to_owned());
+        map.insert("LockPersonality".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("ProtectSystem"))
@@ -316,7 +315,7 @@ mod tests {
     fn build_report_unprobed_marks_overall_fail() {
         let report = build_linux_service_hardening_report(
             false,
-            Some("systemctl unavailable".to_string()),
+            Some("systemctl unavailable".to_owned()),
             BTreeMap::new(),
         );
         assert!(!report.overall_ok);
@@ -372,7 +371,7 @@ mod tests {
         // MemoryDenyWriteExecute=yes so the kernel blocks the
         // PROT_WRITE|PROT_EXEC combination.
         let mut map = reviewed_property_map();
-        map.insert("MemoryDenyWriteExecute".to_string(), "no".to_string());
+        map.insert("MemoryDenyWriteExecute".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons
@@ -389,8 +388,8 @@ mod tests {
         // posture requires AmbientCapabilities= empty.
         let mut map = reviewed_property_map();
         map.insert(
-            "AmbientCapabilities".to_string(),
-            "CAP_NET_ADMIN CAP_NET_BIND_SERVICE".to_string(),
+            "AmbientCapabilities".to_owned(),
+            "CAP_NET_ADMIN CAP_NET_BIND_SERVICE".to_owned(),
         );
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
@@ -407,7 +406,7 @@ mod tests {
         // posture regression if the daemon ever writes secrets through
         // a path that doesn't pin its own mode.
         let mut map = reviewed_property_map();
-        map.insert("UMask".to_string(), "0022".to_string());
+        map.insert("UMask".to_owned(), "0022".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("UMask drifted")),
@@ -419,7 +418,7 @@ mod tests {
     fn evaluator_rejects_user_drift_to_root() {
         // The daemon must NOT run as root. The reviewed User=rustynetd.
         let mut map = reviewed_property_map();
-        map.insert("User".to_string(), "root".to_string());
+        map.insert("User".to_owned(), "root".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("User drifted")),
@@ -430,7 +429,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_group_drift_to_root() {
         let mut map = reviewed_property_map();
-        map.insert("Group".to_string(), "root".to_string());
+        map.insert("Group".to_owned(), "root".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("Group drifted")),
@@ -441,7 +440,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_protect_home_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("ProtectHome".to_string(), "no".to_string());
+        map.insert("ProtectHome".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("ProtectHome drifted")),
@@ -452,7 +451,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_protect_kernel_tunables_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("ProtectKernelTunables".to_string(), "no".to_string());
+        map.insert("ProtectKernelTunables".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons
@@ -465,7 +464,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_protect_kernel_modules_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("ProtectKernelModules".to_string(), "no".to_string());
+        map.insert("ProtectKernelModules".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons
@@ -478,7 +477,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_private_tmp_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("PrivateTmp".to_string(), "no".to_string());
+        map.insert("PrivateTmp".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("PrivateTmp drifted")),
@@ -489,7 +488,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_private_devices_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("PrivateDevices".to_string(), "no".to_string());
+        map.insert("PrivateDevices".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("PrivateDevices drifted")),
@@ -503,7 +502,7 @@ mod tests {
         // syscall, which can be used to emulate old kernel quirks
         // (READ_IMPLIES_EXEC etc.) and bypass mitigations.
         let mut map = reviewed_property_map();
-        map.insert("LockPersonality".to_string(), "no".to_string());
+        map.insert("LockPersonality".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons
@@ -516,7 +515,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_restrict_suidsgid_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("RestrictSUIDSGID".to_string(), "no".to_string());
+        map.insert("RestrictSUIDSGID".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons
@@ -529,7 +528,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_restrict_realtime_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("RestrictRealtime".to_string(), "no".to_string());
+        map.insert("RestrictRealtime".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons
@@ -545,8 +544,8 @@ mod tests {
         // a 64-bit kernel, closing a class of mitigation-bypass paths.
         let mut map = reviewed_property_map();
         map.insert(
-            "SystemCallArchitectures".to_string(),
-            "native x86".to_string(),
+            "SystemCallArchitectures".to_owned(),
+            "native x86".to_owned(),
         );
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
@@ -564,7 +563,7 @@ mod tests {
         // the service's mount namespace, which the reviewed posture
         // explicitly forbids.
         let mut map = reviewed_property_map();
-        map.insert("ProtectSystem".to_string(), "full".to_string());
+        map.insert("ProtectSystem".to_owned(), "full".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons.iter().any(|r| r.contains("ProtectSystem drifted")),
@@ -579,7 +578,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_protect_control_groups_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("ProtectControlGroups".to_string(), "no".to_string());
+        map.insert("ProtectControlGroups".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons
@@ -592,7 +591,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_no_new_privileges_drift_to_no() {
         let mut map = reviewed_property_map();
-        map.insert("NoNewPrivileges".to_string(), "no".to_string());
+        map.insert("NoNewPrivileges".to_owned(), "no".to_owned());
         let reasons = evaluate_linux_service_hardening(&map);
         assert!(
             reasons

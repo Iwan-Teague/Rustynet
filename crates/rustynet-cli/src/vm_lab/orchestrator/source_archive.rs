@@ -16,7 +16,7 @@ impl SourceArchive {
         if !path.exists() {
             return Err(AdapterError::InvalidPath {
                 path,
-                reason: "source archive path does not exist".to_string(),
+                reason: "source archive path does not exist".to_owned(),
             });
         }
         Ok(SourceArchive { path })

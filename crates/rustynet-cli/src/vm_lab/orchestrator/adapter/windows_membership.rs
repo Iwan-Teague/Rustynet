@@ -32,12 +32,12 @@ pub fn issue_membership_owner_key(
         path_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH)?,
     );
     let pem = run_remote_ps(conn, &read_script, SHORT_TIMEOUT)?;
-    let pem = pem.trim().to_string();
+    let pem = pem.trim().to_owned();
     if pem.is_empty() {
         return Err(AdapterError::Protocol {
             message: "membership owner public key is empty on remote; \
                       has membership been initialized?"
-                .to_string(),
+                .to_owned(),
         });
     }
     Ok(MembershipOwnerKey {
@@ -144,10 +144,9 @@ pub fn distribute_signed_bundle(
 ) -> Result<(), AdapterError> {
     let (remote_staging, remote_dst) = remote_bundle_paths(&kind);
 
-    let dst_parent = remote_dst.rsplit_once('\\').map_or_else(
-        || WINDOWS_STATE_ROOT.to_string(),
-        |(dir, _)| dir.to_string(),
-    );
+    let dst_parent = remote_dst
+        .rsplit_once('\\')
+        .map_or_else(|| WINDOWS_STATE_ROOT.to_owned(), |(dir, _)| dir.to_owned());
     let ensure_dirs_script = format!(
         "foreach ($d in @({staging_q}, {dst_parent_q})) {{ \
              if (-not (Test-Path -LiteralPath $d)) {{ \
@@ -190,7 +189,7 @@ pub fn distribute_verifier_key(
     let (remote_staging, remote_dst) = windows_verifier_key_paths(&kind);
     let dst_parent = remote_dst
         .rsplit_once('\\')
-        .map_or_else(|| WINDOWS_STATE_ROOT.to_string(), |(d, _)| d.to_string());
+        .map_or_else(|| WINDOWS_STATE_ROOT.to_owned(), |(d, _)| d.to_owned());
     let ensure_dir_script = format!(
         "if (-not (Test-Path -LiteralPath {dst_q})) {{ \
              New-Item -ItemType Directory -Force -Path {dst_q} | Out-Null \
@@ -265,10 +264,10 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
 
 fn hex_32_arg(value: &str) -> Result<String, AdapterError> {
     if NodeMembershipPeer::is_valid_public_key_hex(value) {
-        Ok(value.to_string())
+        Ok(value.to_owned())
     } else {
         Err(AdapterError::Protocol {
-            message: "WireGuard public key must be 64 hex chars".to_string(),
+            message: "WireGuard public key must be 64 hex chars".to_owned(),
         })
     }
 }
@@ -300,7 +299,7 @@ fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
         })
         .map_err(|err| format!("base64 -d spawn failed: {err}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         return Err(format!("base64 -d failed: {stderr}"));
     }
     Ok(output.stdout)

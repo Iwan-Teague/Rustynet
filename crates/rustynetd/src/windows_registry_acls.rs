@@ -76,7 +76,7 @@ pub fn evaluate_windows_registry_acls(
 ) -> Result<(), Vec<String>> {
     let mut reasons: Vec<String> = Vec::new();
     if entries.is_empty() {
-        reasons.push("registry ACL report contains no entries".to_string());
+        reasons.push("registry ACL report contains no entries".to_owned());
         return Err(reasons);
     }
     for entry in entries {
@@ -160,11 +160,10 @@ pub fn collect_windows_registry_acl_report() -> WindowsRegistryAclReport {
         .iter()
         .map(|path| WindowsRegistryKeyEntry {
             label: format!("registry key {path}"),
-            key_path: (*path).to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            key_path: (*path).to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Unobserved {
-                reason: "collector not yet wired (windows-native registry ACL probe is a follow-up slice)"
-                    .to_string(),
+                reason: "collector not yet wired (windows-native registry ACL probe is a follow-up slice)".to_owned(),
             },
         })
         .collect();
@@ -219,11 +218,11 @@ mod tests {
 
     fn ok_required_entry(label: &str, path: &str) -> WindowsRegistryKeyEntry {
         WindowsRegistryKeyEntry {
-            label: label.to_string(),
-            key_path: path.to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: label.to_owned(),
+            key_path: path.to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Ok {
-                acl_sddl: "O:BAG:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)".to_string(),
+                acl_sddl: "O:BAG:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)".to_owned(),
             },
         }
     }
@@ -246,11 +245,11 @@ mod tests {
     #[test]
     fn evaluator_accepts_optional_missing_entry() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNetOptional".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNetOptional".to_string(),
-            requirement: REQUIREMENT_OPTIONAL.to_string(),
+            label: "registry key RustyNetOptional".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNetOptional".to_owned(),
+            requirement: REQUIREMENT_OPTIONAL.to_owned(),
             status: WindowsRegistryKeyAclStatus::Missing {
-                reason: "key not present on this role".to_string(),
+                reason: "key not present on this role".to_owned(),
             },
         }];
         evaluate_windows_registry_acls(&entries).expect("optional + missing must not drift");
@@ -259,11 +258,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_required_missing_entry() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Missing {
-                reason: "RegOpenKeyEx returned ERROR_FILE_NOT_FOUND".to_string(),
+                reason: "RegOpenKeyEx returned ERROR_FILE_NOT_FOUND".to_owned(),
             },
         }];
         let reasons =
@@ -278,11 +277,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_required_unobserved_entry() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Unobserved {
-                reason: "not running on Windows".to_string(),
+                reason: "not running on Windows".to_owned(),
             },
         }];
         let reasons =
@@ -298,12 +297,12 @@ mod tests {
     #[test]
     fn evaluator_rejects_invalid_entry() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Invalid {
-                reason: "DACL inheritance enabled".to_string(),
-                acl_sddl: "O:BAD:(A;;KA;;;SY)".to_string(),
+                reason: "DACL inheritance enabled".to_owned(),
+                acl_sddl: "O:BAD:(A;;KA;;;SY)".to_owned(),
             },
         }];
         let reasons =
@@ -320,11 +319,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_world_writable_grant() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Ok {
-                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KA;;;WD)".to_string(),
+                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KA;;;WD)".to_owned(),
             },
         }];
         let reasons = evaluate_windows_registry_acls(&entries).expect_err("WD grant must drift");
@@ -337,11 +336,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_authenticated_users_grant() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Ok {
-                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KR;;;AU)".to_string(),
+                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KR;;;AU)".to_owned(),
             },
         }];
         let reasons = evaluate_windows_registry_acls(&entries).expect_err("AU grant must drift");
@@ -354,11 +353,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_anonymous_grant() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Ok {
-                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KR;;;AN)".to_string(),
+                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KR;;;AN)".to_owned(),
             },
         }];
         let reasons = evaluate_windows_registry_acls(&entries).expect_err("AN grant must drift");
@@ -371,11 +370,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_builtin_users_grant() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Ok {
-                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KR;;;BU)".to_string(),
+                acl_sddl: "O:BAD:P(A;;KA;;;SY)(A;;KR;;;BU)".to_owned(),
             },
         }];
         let reasons = evaluate_windows_registry_acls(&entries).expect_err("BU grant must drift");
@@ -388,11 +387,11 @@ mod tests {
     #[test]
     fn evaluator_rejects_unknown_requirement_string() {
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: "maybe".to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: "maybe".to_owned(),
             status: WindowsRegistryKeyAclStatus::Ok {
-                acl_sddl: "O:BAD:P(A;;KA;;;SY)".to_string(),
+                acl_sddl: "O:BAD:P(A;;KA;;;SY)".to_owned(),
             },
         }];
         let reasons =
@@ -460,18 +459,18 @@ mod tests {
                     r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet",
                 ),
                 WindowsRegistryKeyEntry {
-                    label: "registry key RustyNetPrivilegedHelper".to_string(),
+                    label: "registry key RustyNetPrivilegedHelper".to_owned(),
                     key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNetPrivilegedHelper"
-                        .to_string(),
-                    requirement: REQUIREMENT_REQUIRED.to_string(),
+                        .to_owned(),
+                    requirement: REQUIREMENT_REQUIRED.to_owned(),
                     status: WindowsRegistryKeyAclStatus::Unobserved {
-                        reason: "off-Windows".to_string(),
+                        reason: "off-Windows".to_owned(),
                     },
                 },
             ],
             drift_reasons: vec![
                 "registry key RustyNetPrivilegedHelper unobserved required key: off-Windows"
-                    .to_string(),
+                    .to_owned(),
             ],
         };
         let serialized = serde_json::to_string(&report).expect("serialize");
@@ -524,11 +523,11 @@ mod tests {
         // trigger drift. Pins the allow-vs-deny discrimination in
         // `sddl_allow_grants_principal`.
         let entries = vec![WindowsRegistryKeyEntry {
-            label: "registry key RustyNet".to_string(),
-            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_string(),
-            requirement: REQUIREMENT_REQUIRED.to_string(),
+            label: "registry key RustyNet".to_owned(),
+            key_path: r"HKLM\SYSTEM\CurrentControlSet\Services\RustyNet".to_owned(),
+            requirement: REQUIREMENT_REQUIRED.to_owned(),
             status: WindowsRegistryKeyAclStatus::Ok {
-                acl_sddl: "O:BAD:P(D;;KA;;;WD)(A;;KA;;;SY)".to_string(),
+                acl_sddl: "O:BAD:P(D;;KA;;;WD)(A;;KA;;;SY)".to_owned(),
             },
         }];
         evaluate_windows_registry_acls(&entries)

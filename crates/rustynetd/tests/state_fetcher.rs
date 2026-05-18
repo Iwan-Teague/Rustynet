@@ -6,7 +6,7 @@ use tempfile::tempdir;
 
 fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
     DaemonConfig {
-        node_id: "node-local".to_string(),
+        node_id: "node-local".to_owned(),
         node_role: NodeRole::Client,
         socket_path: dir.join("sock"),
         state_path: dir.join("state"),
@@ -26,7 +26,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         dns_zone_verifier_key_path: dir.join("dns.pub"),
         dns_zone_watermark_path: dir.join("dns.watermark"),
         dns_zone_max_age_secs: std::num::NonZeroU64::new(300).unwrap(),
-        dns_zone_name: "example.com".to_string(),
+        dns_zone_name: "example.com".to_owned(),
         dns_resolver_bind_addr: "127.0.0.1:5353".parse().unwrap(),
         traversal_bundle_path: dir.join("traversal.bundle"),
         traversal_verifier_key_path: dir.join("traversal.pub"),
@@ -44,7 +44,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         traversal_stun_servers: vec![],
         traversal_stun_gather_timeout_ms: std::num::NonZeroU64::new(2000).unwrap(),
         backend_mode: DaemonBackendMode::InMemory,
-        wg_interface: "wg0".to_string(),
+        wg_interface: "wg0".to_owned(),
         wg_listen_port: 51820,
         wg_private_key_path: None,
         wg_encrypted_private_key_path: None,
@@ -57,9 +57,9 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         relay_session_token_ttl_secs: std::num::NonZeroU64::new(120).unwrap(),
         relay_session_refresh_margin_secs: std::num::NonZeroU64::new(15).unwrap(),
         relay_session_idle_timeout_secs: std::num::NonZeroU64::new(30).unwrap(),
-        egress_interface: "eth0".to_string(),
+        egress_interface: "eth0".to_owned(),
         remote_ops_token_verifier_key_path: None,
-        remote_ops_expected_subject: "admin".to_string(),
+        remote_ops_expected_subject: "admin".to_owned(),
         auto_port_forward_exit: false,
         auto_port_forward_lease_secs: std::num::NonZeroU32::new(3600).unwrap(),
         dataplane_mode: DaemonDataplaneMode::Shell,
@@ -97,10 +97,10 @@ fn fetcher_all_four_types_skip_when_url_unset() {
 fn fetcher_all_four_types_skip_when_remote_urls_are_configured() {
     let dir = tempdir().unwrap();
     let mut cfg = make_test_config(dir.path());
-    cfg.trust_url = Some("http://127.0.0.1:1/trust".to_string());
-    cfg.traversal_url = Some("http://127.0.0.1:1/traversal".to_string());
-    cfg.assignment_url = Some("http://127.0.0.1:1/assignment".to_string());
-    cfg.dns_zone_url = Some("http://127.0.0.1:1/dns".to_string());
+    cfg.trust_url = Some("http://127.0.0.1:1/trust".to_owned());
+    cfg.traversal_url = Some("http://127.0.0.1:1/traversal".to_owned());
+    cfg.assignment_url = Some("http://127.0.0.1:1/assignment".to_owned());
+    cfg.dns_zone_url = Some("http://127.0.0.1:1/dns".to_owned());
 
     let fetcher = StateFetcher::new_from_daemon(&cfg);
 
@@ -125,10 +125,10 @@ fn fetcher_all_four_types_skip_when_remote_urls_are_configured() {
 fn fetcher_skip_does_not_overwrite_existing_local_artifacts() {
     let dir = tempdir().unwrap();
     let mut cfg = make_test_config(dir.path());
-    cfg.trust_url = Some("http://127.0.0.1:1/trust".to_string());
-    cfg.traversal_url = Some("http://127.0.0.1:1/traversal".to_string());
-    cfg.assignment_url = Some("http://127.0.0.1:1/assignment".to_string());
-    cfg.dns_zone_url = Some("http://127.0.0.1:1/dns".to_string());
+    cfg.trust_url = Some("http://127.0.0.1:1/trust".to_owned());
+    cfg.traversal_url = Some("http://127.0.0.1:1/traversal".to_owned());
+    cfg.assignment_url = Some("http://127.0.0.1:1/assignment".to_owned());
+    cfg.dns_zone_url = Some("http://127.0.0.1:1/dns".to_owned());
 
     fs::write(&cfg.trust_evidence_path, "trust-sentinel").unwrap();
     fs::write(&cfg.traversal_bundle_path, "traversal-sentinel").unwrap();

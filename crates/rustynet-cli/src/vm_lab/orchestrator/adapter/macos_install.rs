@@ -102,7 +102,7 @@ pub fn install_daemon(
 
     Ok(InstallReport {
         daemon_path: MACOS_RUSTYNETD_PATH.into(),
-        service_name: MACOS_SERVICE_LABEL.to_string(),
+        service_name: MACOS_SERVICE_LABEL.to_owned(),
     })
 }
 
@@ -116,7 +116,7 @@ pub fn install_daemon_from_workdir(
 ) -> Result<InstallReport, AdapterError> {
     if workdir.is_empty() {
         return Err(AdapterError::Protocol {
-            message: "install_daemon_from_workdir: workdir must not be empty".to_string(),
+            message: "install_daemon_from_workdir: workdir must not be empty".to_owned(),
         });
     }
     let role = ctx
@@ -178,7 +178,7 @@ pub fn install_daemon_from_workdir(
 
     Ok(InstallReport {
         daemon_path: MACOS_RUSTYNETD_PATH.into(),
-        service_name: MACOS_SERVICE_LABEL.to_string(),
+        service_name: MACOS_SERVICE_LABEL.to_owned(),
     })
 }
 
@@ -273,7 +273,7 @@ mod tests {
     fn make_ctx(role: NodeRole) -> OrchestrationContext {
         OrchestrationContext {
             assignments: vec![NodeRoleAssignment {
-                alias: "macos-1".to_string(),
+                alias: "macos-1".to_owned(),
                 role,
             }],
             adapters: HashMap::new(),
@@ -282,7 +282,7 @@ mod tests {
             stage_outcomes: HashMap::new(),
             node_ids: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "test-net".to_string(),
+            network_id: "test-net".to_owned(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,
             mesh_ips: HashMap::new(),

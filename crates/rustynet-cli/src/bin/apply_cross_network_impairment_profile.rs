@@ -24,8 +24,8 @@ fn main() {
 
 fn run() -> Result<(), i32> {
     let mut mode: Option<Mode> = None;
-    let mut profile = DEFAULT_PROFILE.to_string();
-    let mut interface = DEFAULT_INTERFACE.to_string();
+    let mut profile = DEFAULT_PROFILE.to_owned();
+    let mut interface = DEFAULT_INTERFACE.to_owned();
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut index = 0usize;

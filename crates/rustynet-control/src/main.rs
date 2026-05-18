@@ -21,16 +21,16 @@ fn run() -> Result<(), String> {
 fn print_scaffold_ready() -> Result<(), String> {
     let policy = PolicySet {
         rules: vec![PolicyRule {
-            src: "group:family".to_string(),
-            dst: "tag:servers".to_string(),
+            src: "group:family".to_owned(),
+            dst: "tag:servers".to_owned(),
             protocol: Protocol::Any,
             action: RuleAction::Allow,
         }],
     };
 
     let decision = policy.evaluate(&AccessRequest {
-        src: "group:family".to_string(),
-        dst: "tag:servers".to_string(),
+        src: "group:family".to_owned(),
+        dst: "tag:servers".to_owned(),
         protocol: Protocol::Udp,
     });
 

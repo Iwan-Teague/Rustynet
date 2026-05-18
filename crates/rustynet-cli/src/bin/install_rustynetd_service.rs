@@ -23,7 +23,7 @@ fn run() -> Result<(), i32> {
     let rustynet_bin = env::var("RUSTYNET_BIN")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| HARDED_PATH.to_string());
+        .unwrap_or_else(|| HARDED_PATH.to_owned());
     if rustynet_bin != HARDED_PATH {
         // Unit-file integrity / privilege precondition: a non-hardened
         // binary path is a policy reject — installing a service from

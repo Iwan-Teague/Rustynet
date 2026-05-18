@@ -232,7 +232,7 @@ fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
 fn run_key_command(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err(
-            "key subcommand is required (supported: init, migrate, store-passphrase)".to_string(),
+            "key subcommand is required (supported: init, migrate, store-passphrase)".to_owned(),
         );
     }
     match args[0].as_str() {
@@ -251,14 +251,14 @@ fn run_privileged_helper_command(args: &[String]) -> Result<(), String> {
             Some("--socket") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--socket requires a value".to_string())?;
+                    .ok_or_else(|| "--socket requires a value".to_owned())?;
                 config.socket_path = value.into();
                 index += 2;
             }
             Some("--allowed-uid") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--allowed-uid requires a value".to_string())?;
+                    .ok_or_else(|| "--allowed-uid requires a value".to_owned())?;
                 config.allowed_uid = value
                     .parse::<u32>()
                     .map_err(|err| format!("invalid --allowed-uid value: {err}"))?;
@@ -267,7 +267,7 @@ fn run_privileged_helper_command(args: &[String]) -> Result<(), String> {
             Some("--allowed-gid") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--allowed-gid requires a value".to_string())?;
+                    .ok_or_else(|| "--allowed-gid requires a value".to_owned())?;
                 let gid = value
                     .parse::<u32>()
                     .map_err(|err| format!("invalid --allowed-gid value: {err}"))?;
@@ -277,12 +277,12 @@ fn run_privileged_helper_command(args: &[String]) -> Result<(), String> {
             Some("--timeout-ms") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--timeout-ms requires a value".to_string())?;
+                    .ok_or_else(|| "--timeout-ms requires a value".to_owned())?;
                 let timeout_ms = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid --timeout-ms value: {err}"))?;
                 if timeout_ms == 0 {
-                    return Err("--timeout-ms must be greater than zero".to_string());
+                    return Err("--timeout-ms must be greater than zero".to_owned());
                 }
                 config.io_timeout = std::time::Duration::from_millis(timeout_ms);
                 index += 2;
@@ -298,7 +298,7 @@ fn run_windows_runtime_boundary_check_command(args: &[String]) -> Result<(), Str
     #[cfg(not(windows))]
     {
         let _ = args;
-        Err("windows-runtime-boundary-check is only available on Windows hosts".to_string())
+        Err("windows-runtime-boundary-check is only available on Windows hosts".to_owned())
     }
 
     #[cfg(windows)]
@@ -347,26 +347,26 @@ fn run_windows_mesh_status_check_command(args: &[String]) -> Result<(), String> 
             Some("--state-path") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--state-path requires a value".to_string())?;
+                    .ok_or_else(|| "--state-path requires a value".to_owned())?;
                 state_path = Some(std::path::PathBuf::from(value));
                 index += 2;
             }
             Some("--expected-peer-id") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--expected-peer-id requires a value".to_string())?;
+                    .ok_or_else(|| "--expected-peer-id requires a value".to_owned())?;
                 expected_peer_ids.push(value.clone());
                 index += 2;
             }
             Some("--max-age-seconds") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--max-age-seconds requires a value".to_string())?;
+                    .ok_or_else(|| "--max-age-seconds requires a value".to_owned())?;
                 let parsed: i64 = value
                     .parse()
                     .map_err(|err| format!("invalid --max-age-seconds value: {err}"))?;
                 if parsed < 0 {
-                    return Err("--max-age-seconds must be non-negative".to_string());
+                    return Err("--max-age-seconds must be non-negative".to_owned());
                 }
                 max_age_seconds = Some(parsed);
                 index += 2;
@@ -395,7 +395,7 @@ fn run_windows_mesh_status_check_command(args: &[String]) -> Result<(), String> 
             "windows-mesh-status-check failed for {}: {}",
             report.state_path,
             if report.drift_reasons.is_empty() {
-                "no drift_reasons recorded".to_string()
+                "no drift_reasons recorded".to_owned()
             } else {
                 report.drift_reasons.join("; ")
             }
@@ -417,7 +417,7 @@ fn run_windows_authenticode_check_command(args: &[String]) -> Result<(), String>
             Some("--binary-path") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--binary-path requires a value".to_string())?;
+                    .ok_or_else(|| "--binary-path requires a value".to_owned())?;
                 binary_path = Some(std::path::PathBuf::from(value));
                 index += 2;
             }
@@ -442,7 +442,7 @@ fn run_windows_authenticode_check_command(args: &[String]) -> Result<(), String>
             "windows-authenticode-check failed for {}: {}",
             report.binary_path,
             if report.drift_reasons.is_empty() {
-                "no signature present".to_string()
+                "no signature present".to_owned()
             } else {
                 report.drift_reasons.join("; ")
             }
@@ -477,7 +477,7 @@ fn run_windows_key_custody_check_command(args: &[String]) -> Result<(), String> 
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-key-custody-check reported drift in the live RustyNet key custody state"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -509,8 +509,7 @@ fn run_windows_service_hardening_check_command(args: &[String]) -> Result<(), St
     );
     if fail_on_drift && !report.overall_ok {
         return Err(
-            "windows-service-hardening-check reported drift in the live RustyNet service registration"
-                .to_string(),
+            "windows-service-hardening-check reported drift in the live RustyNet service registration".to_owned(),
         );
     }
     Ok(())
@@ -542,7 +541,7 @@ fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String>
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -581,7 +580,7 @@ fn run_windows_registry_acls_check_command(args: &[String]) -> Result<(), String
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-registry-acls-check reported drift on at least one reviewed registry key"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -612,8 +611,7 @@ fn run_linux_service_hardening_check_command(args: &[String]) -> Result<(), Stri
     );
     if fail_on_drift && !report.overall_ok {
         return Err(
-            "linux-service-hardening-check reported drift in the live RustyNet service hardening posture"
-                .to_string(),
+            "linux-service-hardening-check reported drift in the live RustyNet service hardening posture".to_owned(),
         );
     }
     Ok(())
@@ -645,8 +643,7 @@ fn run_linux_dns_failclosed_check_command(args: &[String]) -> Result<(), String>
     );
     if fail_on_drift && !report.overall_ok {
         return Err(
-            "linux-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed posture"
-                .to_string(),
+            "linux-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed posture".to_owned(),
         );
     }
     Ok(())
@@ -679,7 +676,7 @@ fn run_linux_authenticode_check_command(args: &[String]) -> Result<(), String> {
 fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String> {
     use rustynetd::linux_killswitch_boot::collect_linux_killswitch_boot_report;
     let mut fail_on_drift = true;
-    let mut iface_name: String = "rustynet0".to_string();
+    let mut iface_name: String = "rustynet0".to_owned();
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -689,7 +686,7 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
             }
             Some("--iface") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--iface requires a value (e.g. --iface rustynet0)".to_string()
+                    "--iface requires a value (e.g. --iface rustynet0)".to_owned()
                 })?;
                 iface_name = value.clone();
                 index += 2;
@@ -712,7 +709,7 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
         return Err(
             "linux-killswitch-boot-check reported drift; the killswitch is not in a \
              pre-up boot-time-safe state"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -742,7 +739,7 @@ fn run_linux_key_custody_check_command(args: &[String]) -> Result<(), String> {
     if fail_on_drift && !report.overall_ok {
         return Err(
             "linux-key-custody-check reported drift in the live RustyNet key custody state"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -763,26 +760,26 @@ fn run_linux_mesh_status_check_command(args: &[String]) -> Result<(), String> {
             Some("--state-path") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--state-path requires a value".to_string())?;
+                    .ok_or_else(|| "--state-path requires a value".to_owned())?;
                 state_path = Some(std::path::PathBuf::from(value));
                 index += 2;
             }
             Some("--expected-peer-id") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--expected-peer-id requires a value".to_string())?;
+                    .ok_or_else(|| "--expected-peer-id requires a value".to_owned())?;
                 expected_peer_ids.push(value.clone());
                 index += 2;
             }
             Some("--max-age-seconds") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--max-age-seconds requires a value".to_string())?;
+                    .ok_or_else(|| "--max-age-seconds requires a value".to_owned())?;
                 let parsed: i64 = value
                     .parse()
                     .map_err(|err| format!("invalid --max-age-seconds value: {err}"))?;
                 if parsed < 0 {
-                    return Err("--max-age-seconds must be non-negative".to_string());
+                    return Err("--max-age-seconds must be non-negative".to_owned());
                 }
                 max_age_seconds = Some(parsed);
                 index += 2;
@@ -809,7 +806,7 @@ fn run_linux_mesh_status_check_command(args: &[String]) -> Result<(), String> {
             "linux-mesh-status-check failed for {}: {}",
             report.state_path,
             if report.drift_reasons.is_empty() {
-                "no drift_reasons recorded".to_string()
+                "no drift_reasons recorded".to_owned()
             } else {
                 report.drift_reasons.join("; ")
             }
@@ -842,7 +839,7 @@ fn run_linux_runtime_acls_check_command(args: &[String]) -> Result<(), String> {
     if fail_on_drift && !report.overall_ok {
         return Err(
             "linux-runtime-acls-check reported drift on at least one reviewed runtime root"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -872,7 +869,7 @@ fn run_macos_runtime_acls_check_command(args: &[String]) -> Result<(), String> {
     if fail_on_drift && !report.overall_ok {
         return Err(
             "macos-runtime-acls-check reported drift on at least one reviewed runtime root"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -903,8 +900,7 @@ fn run_macos_service_hardening_check_command(args: &[String]) -> Result<(), Stri
     );
     if fail_on_drift && !report.overall_ok {
         return Err(
-            "macos-service-hardening-check reported drift in the live RustyNet service hardening posture"
-                .to_string(),
+            "macos-service-hardening-check reported drift in the live RustyNet service hardening posture".to_owned(),
         );
     }
     Ok(())
@@ -934,7 +930,7 @@ fn run_macos_key_custody_check_command(args: &[String]) -> Result<(), String> {
     if fail_on_drift && !report.overall_ok {
         return Err(
             "macos-key-custody-check reported drift in the live RustyNet key custody state"
-                .to_string(),
+                .to_owned(),
         );
     }
     Ok(())
@@ -978,26 +974,26 @@ fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
             Some("--state-path") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--state-path requires a value".to_string())?;
+                    .ok_or_else(|| "--state-path requires a value".to_owned())?;
                 state_path = Some(std::path::PathBuf::from(value));
                 index += 2;
             }
             Some("--expected-peer-id") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--expected-peer-id requires a value".to_string())?;
+                    .ok_or_else(|| "--expected-peer-id requires a value".to_owned())?;
                 expected_peer_ids.push(value.clone());
                 index += 2;
             }
             Some("--max-age-seconds") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--max-age-seconds requires a value".to_string())?;
+                    .ok_or_else(|| "--max-age-seconds requires a value".to_owned())?;
                 let parsed: i64 = value
                     .parse()
                     .map_err(|err| format!("invalid --max-age-seconds value: {err}"))?;
                 if parsed < 0 {
-                    return Err("--max-age-seconds must be non-negative".to_string());
+                    return Err("--max-age-seconds must be non-negative".to_owned());
                 }
                 max_age_seconds = Some(parsed);
                 index += 2;
@@ -1024,7 +1020,7 @@ fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
             "macos-mesh-status-check failed for {}: {}",
             report.state_path,
             if report.drift_reasons.is_empty() {
-                "no drift_reasons recorded".to_string()
+                "no drift_reasons recorded".to_owned()
             } else {
                 report.drift_reasons.join("; ")
             }
@@ -1059,8 +1055,7 @@ fn run_macos_dns_failclosed_check_command(args: &[String]) -> Result<(), String>
     );
     if fail_on_drift && !report.overall_ok {
         return Err(
-            "macos-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed posture"
-                .to_string(),
+            "macos-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed posture".to_owned(),
         );
     }
     Ok(())
@@ -1138,8 +1133,7 @@ fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), Strin
     );
     if fail_on_drift && !report.overall_ok {
         return Err(
-            "windows-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed state"
-                .to_string(),
+            "windows-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed state".to_owned(),
         );
     }
     Ok(())
@@ -1217,8 +1211,7 @@ fn run_windows_backend_readiness_check_command(args: &[String]) -> Result<(), St
     );
     if fail_on_drift && !report.overall_ok {
         return Err(
-            "windows-backend-readiness-check reported drift; the windows-wireguard-nt backend cannot be enabled until the missing prerequisites are installed"
-                .to_string(),
+            "windows-backend-readiness-check reported drift; the windows-wireguard-nt backend cannot be enabled until the missing prerequisites are installed".to_owned(),
         );
     }
     Ok(())
@@ -1232,10 +1225,10 @@ fn ensure_cli_path_absolute(path: &str, label: &str) -> Result<(), String> {
 }
 
 fn run_key_init(args: &[String]) -> Result<(), String> {
-    let mut runtime_path = DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH.to_string();
-    let mut encrypted_path = DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string();
-    let mut public_path = DEFAULT_WG_PUBLIC_KEY_PATH.to_string();
-    let mut passphrase_path = DEFAULT_WG_KEY_PASSPHRASE_PATH.to_string();
+    let mut runtime_path = DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH.to_owned();
+    let mut encrypted_path = DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned();
+    let mut public_path = DEFAULT_WG_PUBLIC_KEY_PATH.to_owned();
+    let mut passphrase_path = DEFAULT_WG_KEY_PASSPHRASE_PATH.to_owned();
     let mut force = false;
 
     let mut index = 0usize;
@@ -1244,28 +1237,28 @@ fn run_key_init(args: &[String]) -> Result<(), String> {
             Some("--runtime-private-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--runtime-private-key requires a value".to_string())?;
+                    .ok_or_else(|| "--runtime-private-key requires a value".to_owned())?;
                 runtime_path = value.clone();
                 index += 2;
             }
             Some("--encrypted-private-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--encrypted-private-key requires a value".to_string())?;
+                    .ok_or_else(|| "--encrypted-private-key requires a value".to_owned())?;
                 encrypted_path = value.clone();
                 index += 2;
             }
             Some("--public-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--public-key requires a value".to_string())?;
+                    .ok_or_else(|| "--public-key requires a value".to_owned())?;
                 public_path = value.clone();
                 index += 2;
             }
             Some("--passphrase-file") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--passphrase-file requires a value".to_string())?;
+                    .ok_or_else(|| "--passphrase-file requires a value".to_owned())?;
                 passphrase_path = value.clone();
                 index += 2;
             }
@@ -1300,10 +1293,10 @@ fn run_key_init(args: &[String]) -> Result<(), String> {
 
 fn run_key_migrate(args: &[String]) -> Result<(), String> {
     let mut existing_private_key_path = String::new();
-    let mut runtime_path = DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH.to_string();
-    let mut encrypted_path = DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_string();
-    let mut public_path = DEFAULT_WG_PUBLIC_KEY_PATH.to_string();
-    let mut passphrase_path = DEFAULT_WG_KEY_PASSPHRASE_PATH.to_string();
+    let mut runtime_path = DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH.to_owned();
+    let mut encrypted_path = DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned();
+    let mut public_path = DEFAULT_WG_PUBLIC_KEY_PATH.to_owned();
+    let mut passphrase_path = DEFAULT_WG_KEY_PASSPHRASE_PATH.to_owned();
     let mut force = false;
 
     let mut index = 0usize;
@@ -1312,35 +1305,35 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
             Some("--existing-private-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--existing-private-key requires a value".to_string())?;
+                    .ok_or_else(|| "--existing-private-key requires a value".to_owned())?;
                 existing_private_key_path = value.clone();
                 index += 2;
             }
             Some("--runtime-private-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--runtime-private-key requires a value".to_string())?;
+                    .ok_or_else(|| "--runtime-private-key requires a value".to_owned())?;
                 runtime_path = value.clone();
                 index += 2;
             }
             Some("--encrypted-private-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--encrypted-private-key requires a value".to_string())?;
+                    .ok_or_else(|| "--encrypted-private-key requires a value".to_owned())?;
                 encrypted_path = value.clone();
                 index += 2;
             }
             Some("--public-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--public-key requires a value".to_string())?;
+                    .ok_or_else(|| "--public-key requires a value".to_owned())?;
                 public_path = value.clone();
                 index += 2;
             }
             Some("--passphrase-file") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--passphrase-file requires a value".to_string())?;
+                    .ok_or_else(|| "--passphrase-file requires a value".to_owned())?;
                 passphrase_path = value.clone();
                 index += 2;
             }
@@ -1354,7 +1347,7 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
     }
 
     if existing_private_key_path.is_empty() {
-        return Err("--existing-private-key is required".to_string());
+        return Err("--existing-private-key is required".to_owned());
     }
 
     ensure_cli_path_absolute(&existing_private_key_path, "path")?;
@@ -1389,14 +1382,14 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
             Some("--passphrase-file") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--passphrase-file requires a value".to_string())?;
+                    .ok_or_else(|| "--passphrase-file requires a value".to_owned())?;
                 passphrase_path = value.clone();
                 index += 2;
             }
             Some("--keychain-account") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--keychain-account requires a value".to_string())?;
+                    .ok_or_else(|| "--keychain-account requires a value".to_owned())?;
                 keychain_account = Some(value.clone());
                 index += 2;
             }
@@ -1406,7 +1399,7 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
     }
 
     if passphrase_path.is_empty() {
-        return Err("--passphrase-file is required".to_string());
+        return Err("--passphrase-file is required".to_owned());
     }
     ensure_cli_path_absolute(&passphrase_path, "path")?;
 
@@ -1431,94 +1424,94 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--node-id") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--node-id requires a value".to_string())?;
+                    .ok_or_else(|| "--node-id requires a value".to_owned())?;
                 config.node_id = value.clone();
                 index += 2;
             }
             Some("--node-role") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--node-role requires a value".to_string())?;
+                    .ok_or_else(|| "--node-role requires a value".to_owned())?;
                 config.node_role = value.parse::<NodeRole>()?;
                 index += 2;
             }
             Some("--socket") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--socket requires a value".to_string())?;
+                    .ok_or_else(|| "--socket requires a value".to_owned())?;
                 config.socket_path = value.into();
                 index += 2;
             }
             Some("--state") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--state requires a value".to_string())?;
+                    .ok_or_else(|| "--state requires a value".to_owned())?;
                 config.state_path = value.into();
                 index += 2;
             }
             Some("--trust-evidence") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--trust-evidence requires a value".to_string())?;
+                    .ok_or_else(|| "--trust-evidence requires a value".to_owned())?;
                 config.trust_evidence_path = value.into();
                 index += 2;
             }
             Some("--trust-verifier-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--trust-verifier-key requires a value".to_string())?;
+                    .ok_or_else(|| "--trust-verifier-key requires a value".to_owned())?;
                 config.trust_verifier_key_path = value.into();
                 index += 2;
             }
             Some("--trust-max-age-secs") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--trust-max-age-secs requires a value".to_string())?;
+                    .ok_or_else(|| "--trust-max-age-secs requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid trust max age: {err}"))?;
                 config.trust_max_age_secs = NonZeroU64::new(parsed)
-                    .ok_or_else(|| "trust max age must be greater than 0".to_string())?;
+                    .ok_or_else(|| "trust max age must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--trust-watermark") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--trust-watermark requires a value".to_string())?;
+                    .ok_or_else(|| "--trust-watermark requires a value".to_owned())?;
                 config.trust_watermark_path = value.into();
                 index += 2;
             }
             Some("--membership-snapshot") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--membership-snapshot requires a value".to_string())?;
+                    .ok_or_else(|| "--membership-snapshot requires a value".to_owned())?;
                 config.membership_snapshot_path = value.into();
                 index += 2;
             }
             Some("--membership-log") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--membership-log requires a value".to_string())?;
+                    .ok_or_else(|| "--membership-log requires a value".to_owned())?;
                 config.membership_log_path = value.into();
                 index += 2;
             }
             Some("--membership-watermark") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--membership-watermark requires a value".to_string())?;
+                    .ok_or_else(|| "--membership-watermark requires a value".to_owned())?;
                 config.membership_watermark_path = value.into();
                 index += 2;
             }
             Some("--auto-tunnel-enforce") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--auto-tunnel-enforce requires a value".to_string())?;
+                    .ok_or_else(|| "--auto-tunnel-enforce requires a value".to_owned())?;
                 config.auto_tunnel_enforce = match value.as_str() {
                     "true" | "1" | "yes" => true,
                     "false" | "0" | "no" => false,
                     _ => {
                         return Err(
-                            "invalid auto-tunnel-enforce value: expected true/false".to_string()
+                            "invalid auto-tunnel-enforce value: expected true/false".to_owned()
                         );
                     }
                 };
@@ -1527,78 +1520,78 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--auto-tunnel-bundle") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--auto-tunnel-bundle requires a value".to_string())?;
+                    .ok_or_else(|| "--auto-tunnel-bundle requires a value".to_owned())?;
                 config.auto_tunnel_bundle_path = Some(value.into());
                 index += 2;
             }
             Some("--auto-tunnel-verifier-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--auto-tunnel-verifier-key requires a value".to_string())?;
+                    .ok_or_else(|| "--auto-tunnel-verifier-key requires a value".to_owned())?;
                 config.auto_tunnel_verifier_key_path = Some(value.into());
                 index += 2;
             }
             Some("--auto-tunnel-watermark") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--auto-tunnel-watermark requires a value".to_string())?;
+                    .ok_or_else(|| "--auto-tunnel-watermark requires a value".to_owned())?;
                 config.auto_tunnel_watermark_path = Some(value.into());
                 index += 2;
             }
             Some("--auto-tunnel-max-age-secs") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--auto-tunnel-max-age-secs requires a value".to_string())?;
+                    .ok_or_else(|| "--auto-tunnel-max-age-secs requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid auto tunnel max age: {err}"))?;
                 config.auto_tunnel_max_age_secs = NonZeroU64::new(parsed)
-                    .ok_or_else(|| "auto tunnel max age must be greater than 0".to_string())?;
+                    .ok_or_else(|| "auto tunnel max age must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--dns-zone-bundle") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--dns-zone-bundle requires a value".to_string())?;
+                    .ok_or_else(|| "--dns-zone-bundle requires a value".to_owned())?;
                 config.dns_zone_bundle_path = value.into();
                 index += 2;
             }
             Some("--dns-zone-verifier-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--dns-zone-verifier-key requires a value".to_string())?;
+                    .ok_or_else(|| "--dns-zone-verifier-key requires a value".to_owned())?;
                 config.dns_zone_verifier_key_path = value.into();
                 index += 2;
             }
             Some("--dns-zone-watermark") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--dns-zone-watermark requires a value".to_string())?;
+                    .ok_or_else(|| "--dns-zone-watermark requires a value".to_owned())?;
                 config.dns_zone_watermark_path = value.into();
                 index += 2;
             }
             Some("--dns-zone-max-age-secs") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--dns-zone-max-age-secs requires a value".to_string())?;
+                    .ok_or_else(|| "--dns-zone-max-age-secs requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid dns zone max age: {err}"))?;
                 config.dns_zone_max_age_secs = NonZeroU64::new(parsed)
-                    .ok_or_else(|| "dns zone max age must be greater than 0".to_string())?;
+                    .ok_or_else(|| "dns zone max age must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--dns-zone-name") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--dns-zone-name requires a value".to_string())?;
+                    .ok_or_else(|| "--dns-zone-name requires a value".to_owned())?;
                 config.dns_zone_name = value.clone();
                 index += 2;
             }
             Some("--dns-resolver-bind-addr") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--dns-resolver-bind-addr requires a value".to_string())?;
+                    .ok_or_else(|| "--dns-resolver-bind-addr requires a value".to_owned())?;
                 config.dns_resolver_bind_addr = value
                     .parse::<SocketAddr>()
                     .map_err(|err| format!("invalid dns resolver bind addr: {err}"))?;
@@ -1607,35 +1600,35 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--traversal-bundle") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--traversal-bundle requires a value".to_string())?;
+                    .ok_or_else(|| "--traversal-bundle requires a value".to_owned())?;
                 config.traversal_bundle_path = value.into();
                 index += 2;
             }
             Some("--traversal-verifier-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--traversal-verifier-key requires a value".to_string())?;
+                    .ok_or_else(|| "--traversal-verifier-key requires a value".to_owned())?;
                 config.traversal_verifier_key_path = value.into();
                 index += 2;
             }
             Some("--traversal-watermark") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--traversal-watermark requires a value".to_string())?;
+                    .ok_or_else(|| "--traversal-watermark requires a value".to_owned())?;
                 config.traversal_watermark_path = value.into();
                 index += 2;
             }
             Some("--relay-fleet-bundle") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--relay-fleet-bundle requires a value".to_string())?;
+                    .ok_or_else(|| "--relay-fleet-bundle requires a value".to_owned())?;
                 config.relay_fleet_bundle_path = Some(value.into());
                 index += 2;
             }
             Some("--relay-fleet-watermark") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--relay-fleet-watermark requires a value".to_string())?;
+                    .ok_or_else(|| "--relay-fleet-watermark requires a value".to_owned())?;
                 config.relay_fleet_watermark_path = Some(value.into());
                 index += 2;
             }
@@ -1647,12 +1640,12 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--traversal-max-age-secs") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--traversal-max-age-secs requires a value".to_string())?;
+                    .ok_or_else(|| "--traversal-max-age-secs requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid traversal max age: {err}"))?;
                 config.traversal_max_age_secs = NonZeroU64::new(parsed)
-                    .ok_or_else(|| "traversal max age must be greater than 0".to_string())?;
+                    .ok_or_else(|| "traversal max age must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--traversal-stun-servers") => {
@@ -1663,109 +1656,108 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             }
             Some("--traversal-stun-gather-timeout-ms") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--traversal-stun-gather-timeout-ms requires a value".to_string()
+                    "--traversal-stun-gather-timeout-ms requires a value".to_owned()
                 })?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid traversal stun gather timeout: {err}"))?;
                 config.traversal_stun_gather_timeout_ms =
                     NonZeroU64::new(parsed).ok_or_else(|| {
-                        "traversal stun gather timeout must be greater than 0".to_string()
+                        "traversal stun gather timeout must be greater than 0".to_owned()
                     })?;
                 index += 2;
             }
             Some("--traversal-probe-max-candidates") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--traversal-probe-max-candidates requires a value".to_string()
+                    "--traversal-probe-max-candidates requires a value".to_owned()
                 })?;
                 let parsed = value
                     .parse::<usize>()
                     .map_err(|err| format!("invalid traversal probe max candidates: {err}"))?;
                 config.traversal_probe_max_candidates =
                     NonZeroUsize::new(parsed).ok_or_else(|| {
-                        "traversal probe max candidates must be greater than 0".to_string()
+                        "traversal probe max candidates must be greater than 0".to_owned()
                     })?;
                 index += 2;
             }
             Some("--traversal-probe-max-pairs") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--traversal-probe-max-pairs requires a value".to_string())?;
+                    .ok_or_else(|| "--traversal-probe-max-pairs requires a value".to_owned())?;
                 let parsed = value
                     .parse::<usize>()
                     .map_err(|err| format!("invalid traversal probe max pairs: {err}"))?;
-                config.traversal_probe_max_pairs = NonZeroUsize::new(parsed).ok_or_else(|| {
-                    "traversal probe max pairs must be greater than 0".to_string()
-                })?;
+                config.traversal_probe_max_pairs = NonZeroUsize::new(parsed)
+                    .ok_or_else(|| "traversal probe max pairs must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--traversal-probe-rounds") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--traversal-probe-rounds requires a value".to_string())?;
+                    .ok_or_else(|| "--traversal-probe-rounds requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u8>()
                     .map_err(|err| format!("invalid traversal probe rounds: {err}"))?;
                 config.traversal_probe_simultaneous_open_rounds = NonZeroU8::new(parsed)
-                    .ok_or_else(|| "traversal probe rounds must be greater than 0".to_string())?;
+                    .ok_or_else(|| "traversal probe rounds must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--traversal-probe-round-spacing-ms") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--traversal-probe-round-spacing-ms requires a value".to_string()
+                    "--traversal-probe-round-spacing-ms requires a value".to_owned()
                 })?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid traversal probe round spacing: {err}"))?;
                 config.traversal_probe_round_spacing_ms =
                     NonZeroU64::new(parsed).ok_or_else(|| {
-                        "traversal probe round spacing must be greater than 0".to_string()
+                        "traversal probe round spacing must be greater than 0".to_owned()
                     })?;
                 index += 2;
             }
             Some("--traversal-probe-relay-switch-after-failures") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--traversal-probe-relay-switch-after-failures requires a value".to_string()
+                    "--traversal-probe-relay-switch-after-failures requires a value".to_owned()
                 })?;
                 let parsed = value.parse::<u8>().map_err(|err| {
                     format!("invalid traversal probe relay switch threshold: {err}")
                 })?;
                 config.traversal_probe_relay_switch_after_failures = NonZeroU8::new(parsed)
                     .ok_or_else(|| {
-                        "traversal probe relay switch threshold must be greater than 0".to_string()
+                        "traversal probe relay switch threshold must be greater than 0".to_owned()
                     })?;
                 index += 2;
             }
             Some("--traversal-probe-handshake-freshness-secs") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--traversal-probe-handshake-freshness-secs requires a value".to_string()
+                    "--traversal-probe-handshake-freshness-secs requires a value".to_owned()
                 })?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid traversal probe handshake freshness: {err}"))?;
                 config.traversal_probe_handshake_freshness_secs = NonZeroU64::new(parsed)
                     .ok_or_else(|| {
-                        "traversal probe handshake freshness must be greater than 0".to_string()
+                        "traversal probe handshake freshness must be greater than 0".to_owned()
                     })?;
                 index += 2;
             }
             Some("--traversal-probe-reprobe-interval-secs") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--traversal-probe-reprobe-interval-secs requires a value".to_string()
+                    "--traversal-probe-reprobe-interval-secs requires a value".to_owned()
                 })?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid traversal probe reprobe interval: {err}"))?;
                 config.traversal_probe_reprobe_interval_secs =
                     NonZeroU64::new(parsed).ok_or_else(|| {
-                        "traversal probe reprobe interval must be greater than 0".to_string()
+                        "traversal probe reprobe interval must be greater than 0".to_owned()
                     })?;
                 index += 2;
             }
             Some("--backend") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--backend requires a value".to_string())?;
+                    .ok_or_else(|| "--backend requires a value".to_owned())?;
                 config.backend_mode = match value.as_str() {
                     "linux-wireguard" => DaemonBackendMode::LinuxWireguard,
                     "linux-wireguard-userspace-shared" => {
@@ -1794,19 +1786,19 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--wg-interface") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--wg-interface requires a value".to_string())?;
+                    .ok_or_else(|| "--wg-interface requires a value".to_owned())?;
                 config.wg_interface = value.clone();
                 index += 2;
             }
             Some("--wg-listen-port") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--wg-listen-port requires a value".to_string())?;
+                    .ok_or_else(|| "--wg-listen-port requires a value".to_owned())?;
                 let port = value
                     .parse::<u16>()
                     .map_err(|err| format!("invalid --wg-listen-port value: {err}"))?;
                 if port == 0 {
-                    return Err("--wg-listen-port must be in range 1-65535".to_string());
+                    return Err("--wg-listen-port must be in range 1-65535".to_owned());
                 }
                 config.wg_listen_port = port;
                 index += 2;
@@ -1814,34 +1806,34 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--wg-private-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--wg-private-key requires a value".to_string())?;
+                    .ok_or_else(|| "--wg-private-key requires a value".to_owned())?;
                 config.wg_private_key_path = Some(value.into());
                 index += 2;
             }
             Some("--wg-encrypted-private-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--wg-encrypted-private-key requires a value".to_string())?;
+                    .ok_or_else(|| "--wg-encrypted-private-key requires a value".to_owned())?;
                 config.wg_encrypted_private_key_path = Some(value.into());
                 index += 2;
             }
             Some("--wg-key-passphrase") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--wg-key-passphrase requires a value".to_string())?;
+                    .ok_or_else(|| "--wg-key-passphrase requires a value".to_owned())?;
                 config.wg_key_passphrase_path = Some(value.into());
                 index += 2;
             }
             Some("--wg-public-key") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--wg-public-key requires a value".to_string())?;
+                    .ok_or_else(|| "--wg-public-key requires a value".to_owned())?;
                 config.wg_public_key_path = Some(value.into());
                 index += 2;
             }
             Some("--relay-session-local-token-issuer") => {
                 let value = args.get(index + 1).ok_or_else(|| {
-                    "--relay-session-local-token-issuer requires a value".to_string()
+                    "--relay-session-local-token-issuer requires a value".to_owned()
                 })?;
                 config.relay_session_local_token_issuer_enabled = match value.as_str() {
                     "true" | "1" | "yes" => true,
@@ -1849,50 +1841,50 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     _ => {
                         return Err(
                             "invalid relay-session-local-token-issuer value: expected true/false"
-                                .to_string(),
+                                .to_owned(),
                         );
                     }
                 };
                 index += 2;
             }
             Some("--relay-session-token-spool-dir") => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--relay-session-token-spool-dir requires a value".to_string()
-                })?;
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--relay-session-token-spool-dir requires a value".to_owned())?;
                 config.relay_session_token_spool_dir = Some(value.into());
                 index += 2;
             }
             Some("--egress-interface") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--egress-interface requires a value".to_string())?;
+                    .ok_or_else(|| "--egress-interface requires a value".to_owned())?;
                 config.egress_interface = value.clone();
                 index += 2;
             }
             Some("--remote-ops-token-verifier-key") => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    "--remote-ops-token-verifier-key requires a value".to_string()
-                })?;
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--remote-ops-token-verifier-key requires a value".to_owned())?;
                 config.remote_ops_token_verifier_key_path = Some(value.into());
                 index += 2;
             }
             Some("--remote-ops-expected-subject") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--remote-ops-expected-subject requires a value".to_string())?;
+                    .ok_or_else(|| "--remote-ops-expected-subject requires a value".to_owned())?;
                 config.remote_ops_expected_subject = value.clone();
                 index += 2;
             }
             Some("--auto-port-forward-exit") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--auto-port-forward-exit requires a value".to_string())?;
+                    .ok_or_else(|| "--auto-port-forward-exit requires a value".to_owned())?;
                 config.auto_port_forward_exit = match value.as_str() {
                     "true" | "1" | "yes" => true,
                     "false" | "0" | "no" => false,
                     _ => {
                         return Err(
-                            "invalid auto-port-forward-exit value: expected true/false".to_string()
+                            "invalid auto-port-forward-exit value: expected true/false".to_owned()
                         );
                     }
                 };
@@ -1901,25 +1893,25 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--auto-port-forward-lease-secs") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--auto-port-forward-lease-secs requires a value".to_string())?;
+                    .ok_or_else(|| "--auto-port-forward-lease-secs requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u32>()
                     .map_err(|err| format!("invalid auto port-forward lease: {err}"))?;
                 config.auto_port_forward_lease_secs = NonZeroU32::new(parsed).ok_or_else(|| {
-                    "auto-port-forward-lease-secs must be greater than 0".to_string()
+                    "auto-port-forward-lease-secs must be greater than 0".to_owned()
                 })?;
                 index += 2;
             }
             Some("--dataplane-mode") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--dataplane-mode requires a value".to_string())?;
+                    .ok_or_else(|| "--dataplane-mode requires a value".to_owned())?;
                 config.dataplane_mode = match value.as_str() {
                     "shell" => DaemonDataplaneMode::Shell,
                     "hybrid-native" => DaemonDataplaneMode::HybridNative,
                     _ => {
                         return Err(
-                            "invalid dataplane mode: expected shell or hybrid-native".to_string()
+                            "invalid dataplane mode: expected shell or hybrid-native".to_owned()
                         );
                     }
                 };
@@ -1928,67 +1920,66 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             Some("--privileged-helper-socket") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--privileged-helper-socket requires a value".to_string())?;
+                    .ok_or_else(|| "--privileged-helper-socket requires a value".to_owned())?;
                 config.privileged_helper_socket_path = Some(value.into());
                 index += 2;
             }
             Some("--privileged-helper-timeout-ms") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--privileged-helper-timeout-ms requires a value".to_string())?;
+                    .ok_or_else(|| "--privileged-helper-timeout-ms requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid privileged helper timeout: {err}"))?;
-                config.privileged_helper_timeout_ms = NonZeroU64::new(parsed).ok_or_else(|| {
-                    "privileged helper timeout must be greater than 0".to_string()
-                })?;
+                config.privileged_helper_timeout_ms = NonZeroU64::new(parsed)
+                    .ok_or_else(|| "privileged helper timeout must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--max-requests") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--max-requests requires a value".to_string())?;
+                    .ok_or_else(|| "--max-requests requires a value".to_owned())?;
                 let parsed = value
                     .parse::<usize>()
                     .map_err(|err| format!("invalid max requests: {err}"))?;
                 config.max_requests = Some(
                     NonZeroUsize::new(parsed)
-                        .ok_or_else(|| "max requests must be greater than 0".to_string())?,
+                        .ok_or_else(|| "max requests must be greater than 0".to_owned())?,
                 );
                 index += 2;
             }
             Some("--reconcile-interval-ms") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--reconcile-interval-ms requires a value".to_string())?;
+                    .ok_or_else(|| "--reconcile-interval-ms requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u64>()
                     .map_err(|err| format!("invalid reconcile interval: {err}"))?;
                 config.reconcile_interval_ms = NonZeroU64::new(parsed)
-                    .ok_or_else(|| "reconcile interval must be greater than 0".to_string())?;
+                    .ok_or_else(|| "reconcile interval must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--max-reconcile-failures") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--max-reconcile-failures requires a value".to_string())?;
+                    .ok_or_else(|| "--max-reconcile-failures requires a value".to_owned())?;
                 let parsed = value
                     .parse::<u32>()
                     .map_err(|err| format!("invalid max reconcile failures: {err}"))?;
                 config.max_reconcile_failures = NonZeroU32::new(parsed)
-                    .ok_or_else(|| "max reconcile failures must be greater than 0".to_string())?;
+                    .ok_or_else(|| "max reconcile failures must be greater than 0".to_owned())?;
                 index += 2;
             }
             Some("--fail-closed-ssh-allow") => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "--fail-closed-ssh-allow requires a value".to_string())?;
+                    .ok_or_else(|| "--fail-closed-ssh-allow requires a value".to_owned())?;
                 config.fail_closed_ssh_allow = match value.as_str() {
                     "true" | "1" | "yes" => true,
                     "false" | "0" | "no" => false,
                     _ => {
                         return Err(
-                            "invalid fail-closed-ssh-allow value: expected true/false".to_string()
+                            "invalid fail-closed-ssh-allow value: expected true/false".to_owned()
                         );
                     }
                 };
@@ -2052,7 +2043,7 @@ fn run_membership_command(args: &[String]) -> Result<(), String> {
         Some("init") => run_membership_init(&args[1..]),
         Some("add-peer") => run_membership_add_peer(&args[1..]),
         Some(other) => Err(format!("unknown membership subcommand: {other}")),
-        None => Err("membership subcommand required (supported: init, add-peer)".to_string()),
+        None => Err("membership subcommand required (supported: init, add-peer)".to_owned()),
     }
 }
 
@@ -2090,8 +2081,8 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     let mut approver_id = String::new();
     let mut signing_key_path = String::new();
     let mut signing_key_passphrase_path = String::new();
-    let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_string();
-    let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_string();
+    let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_owned();
+    let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_owned();
 
     let mut index = 0usize;
     while index < args.len() {
@@ -2155,25 +2146,25 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     }
 
     if node_id.is_empty() {
-        return Err("--node-id is required".to_string());
+        return Err("--node-id is required".to_owned());
     }
     if node_pubkey_hex.is_empty() {
-        return Err("--node-pubkey-hex is required".to_string());
+        return Err("--node-pubkey-hex is required".to_owned());
     }
     if node_pubkey_hex.len() != 64 || !node_pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("--node-pubkey-hex must be 64 hex characters".to_string());
+        return Err("--node-pubkey-hex must be 64 hex characters".to_owned());
     }
     if owner.is_empty() {
-        return Err("--owner is required".to_string());
+        return Err("--owner is required".to_owned());
     }
     if approver_id.is_empty() {
-        return Err("--approver-id is required".to_string());
+        return Err("--approver-id is required".to_owned());
     }
     if signing_key_path.is_empty() {
-        return Err("--signing-key is required".to_string());
+        return Err("--signing-key is required".to_owned());
     }
     if signing_key_passphrase_path.is_empty() {
-        return Err("--signing-key-passphrase-file is required".to_string());
+        return Err("--signing-key-passphrase-file is required".to_owned());
     }
 
     ensure_cli_path_absolute(&signing_key_path, "signing key path")?;
@@ -2200,7 +2191,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("decrypt signing key failed: {e}"))?
     };
     if secret.len() != 32 {
-        return Err("decrypted signing key must be 32 bytes".to_string());
+        return Err("decrypted signing key must be 32 bytes".to_owned());
     }
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&secret);
@@ -2228,7 +2219,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
         node_pubkey_hex,
         owner,
         status: MembershipNodeStatus::Active,
-        roles: vec!["tag:members".to_string()],
+        roles: vec!["tag:members".to_owned()],
         joined_at_unix: now,
         updated_at_unix: now,
     });
@@ -2253,7 +2244,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
         epoch_new: state.epoch.saturating_add(1),
         created_at_unix: now,
         expires_at_unix,
-        reason_code: "e2e-lab-add".to_string(),
+        reason_code: "e2e-lab-add".to_owned(),
         policy_context: None,
     };
 
@@ -2308,14 +2299,14 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     use zeroize::Zeroize;
 
-    let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_string();
-    let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_string();
-    let mut watermark_path = DEFAULT_MEMBERSHIP_WATERMARK_PATH.to_string();
-    let mut owner_signing_key_path = DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH.to_string();
+    let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_owned();
+    let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_owned();
+    let mut watermark_path = DEFAULT_MEMBERSHIP_WATERMARK_PATH.to_owned();
+    let mut owner_signing_key_path = DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH.to_owned();
     let mut owner_signing_key_passphrase_path =
         std::env::var(MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV).ok();
     let mut node_id = read_hostname_short();
-    let mut network_id = "local-net".to_string();
+    let mut network_id = "local-net".to_owned();
     let mut force = false;
 
     let mut index = 0usize;
@@ -2597,7 +2588,7 @@ fn read_hostname_short() -> String {
         .ok()
         .and_then(|s| s.trim().split('.').next().map(str::to_string))
         .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "local".to_string())
+        .unwrap_or_else(|| "local".to_owned())
 }
 
 fn help_text() -> String {
@@ -2750,7 +2741,7 @@ mod tests {
 
     #[test]
     fn run_windows_runtime_acls_check_command_rejects_unknown_flags() {
-        let err = run_windows_runtime_acls_check_command(&["--bogus".to_string()])
+        let err = run_windows_runtime_acls_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-runtime-acls-check argument"),
@@ -2760,7 +2751,7 @@ mod tests {
 
     #[test]
     fn run_windows_registry_acls_check_command_rejects_unknown_flags() {
-        let err = run_windows_registry_acls_check_command(&["--bogus".to_string()])
+        let err = run_windows_registry_acls_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-registry-acls-check argument"),
@@ -2786,7 +2777,7 @@ mod tests {
     fn run_windows_registry_acls_check_command_no_fail_flag_returns_ok_despite_drift() {
         // Same stub collector + --no-fail-on-drift = the operator
         // wants the JSON without the verdict. Must return Ok.
-        run_windows_registry_acls_check_command(&["--no-fail-on-drift".to_string()])
+        run_windows_registry_acls_check_command(&["--no-fail-on-drift".to_owned()])
             .expect("--no-fail-on-drift must suppress the drift verdict");
     }
 
@@ -2813,7 +2804,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn run_windows_runtime_acls_check_command_no_fail_on_drift_returns_ok_off_windows() {
-        run_windows_runtime_acls_check_command(&["--no-fail-on-drift".to_string()])
+        run_windows_runtime_acls_check_command(&["--no-fail-on-drift".to_owned()])
             .expect("--no-fail-on-drift must allow report-only execution off Windows");
     }
 
@@ -2828,7 +2819,7 @@ mod tests {
 
     #[test]
     fn run_windows_service_hardening_check_command_rejects_unknown_flags() {
-        let err = run_windows_service_hardening_check_command(&["--bogus".to_string()])
+        let err = run_windows_service_hardening_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-service-hardening-check argument"),
@@ -2858,7 +2849,7 @@ mod tests {
 
     #[test]
     fn run_windows_key_custody_check_command_rejects_unknown_flags() {
-        let err = run_windows_key_custody_check_command(&["--bogus".to_string()])
+        let err = run_windows_key_custody_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-key-custody-check argument"),
@@ -2877,7 +2868,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn run_windows_key_custody_check_command_no_fail_on_drift_returns_ok_off_windows() {
-        run_windows_key_custody_check_command(&["--no-fail-on-drift".to_string()])
+        run_windows_key_custody_check_command(&["--no-fail-on-drift".to_owned()])
             .expect("--no-fail-on-drift must allow report-only execution off Windows");
     }
 
@@ -2896,7 +2887,7 @@ mod tests {
 
     #[test]
     fn run_windows_authenticode_check_command_rejects_unknown_flags() {
-        let err = run_windows_authenticode_check_command(&["--bogus".to_string()])
+        let err = run_windows_authenticode_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-authenticode-check argument"),
@@ -2906,7 +2897,7 @@ mod tests {
 
     #[test]
     fn run_windows_authenticode_check_command_rejects_missing_binary_path_value() {
-        let err = run_windows_authenticode_check_command(&["--binary-path".to_string()])
+        let err = run_windows_authenticode_check_command(&["--binary-path".to_owned()])
             .expect_err("missing value must be rejected");
         assert!(
             err.contains("--binary-path requires a value"),
@@ -2917,8 +2908,8 @@ mod tests {
     #[test]
     fn run_windows_authenticode_check_command_fails_closed_for_missing_binary() {
         let err = run_windows_authenticode_check_command(&[
-            "--binary-path".to_string(),
-            "/nonexistent/path/to/rustynetd.exe.does-not-exist".to_string(),
+            "--binary-path".to_owned(),
+            "/nonexistent/path/to/rustynetd.exe.does-not-exist".to_owned(),
         ])
         .expect_err("missing binary must fail with read error");
         assert!(
@@ -2946,7 +2937,7 @@ mod tests {
 
     #[test]
     fn run_windows_mesh_status_check_command_rejects_unknown_flags() {
-        let err = run_windows_mesh_status_check_command(&["--bogus".to_string()])
+        let err = run_windows_mesh_status_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-mesh-status-check argument"),
@@ -2957,8 +2948,8 @@ mod tests {
     #[test]
     fn run_windows_mesh_status_check_command_rejects_negative_max_age() {
         let err = run_windows_mesh_status_check_command(&[
-            "--max-age-seconds".to_string(),
-            "-30".to_string(),
+            "--max-age-seconds".to_owned(),
+            "-30".to_owned(),
         ])
         .expect_err("negative max-age must be rejected");
         assert!(
@@ -2970,8 +2961,8 @@ mod tests {
     #[test]
     fn run_windows_mesh_status_check_command_fails_for_missing_state_file() {
         let err = run_windows_mesh_status_check_command(&[
-            "--state-path".to_string(),
-            "/tmp/rustynet-mesh-status-bin-missing".to_string(),
+            "--state-path".to_owned(),
+            "/tmp/rustynet-mesh-status-bin-missing".to_owned(),
         ])
         .expect_err("missing state must fail-closed");
         assert!(
@@ -2983,9 +2974,9 @@ mod tests {
     #[test]
     fn run_windows_mesh_status_check_command_no_fail_on_drift_allows_missing_state_run() {
         run_windows_mesh_status_check_command(&[
-            "--no-fail-on-drift".to_string(),
-            "--state-path".to_string(),
-            "/tmp/rustynet-mesh-status-bin-missing".to_string(),
+            "--no-fail-on-drift".to_owned(),
+            "--state-path".to_owned(),
+            "/tmp/rustynet-mesh-status-bin-missing".to_owned(),
         ])
         .expect("--no-fail-on-drift must allow report-only execution");
     }
@@ -2993,9 +2984,9 @@ mod tests {
     #[test]
     fn run_windows_authenticode_check_command_no_fail_on_drift_allows_missing_binary_run() {
         run_windows_authenticode_check_command(&[
-            "--no-fail-on-drift".to_string(),
-            "--binary-path".to_string(),
-            "/nonexistent/path/to/rustynetd.exe.does-not-exist".to_string(),
+            "--no-fail-on-drift".to_owned(),
+            "--binary-path".to_owned(),
+            "/nonexistent/path/to/rustynetd.exe.does-not-exist".to_owned(),
         ])
         .expect("--no-fail-on-drift must allow report-only execution even on read failure");
     }
@@ -3011,7 +3002,7 @@ mod tests {
 
     #[test]
     fn run_windows_dns_failclosed_check_command_rejects_unknown_flags() {
-        let err = run_windows_dns_failclosed_check_command(&["--bogus".to_string()])
+        let err = run_windows_dns_failclosed_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-dns-failclosed-check argument"),
@@ -3027,7 +3018,7 @@ mod tests {
         // blocker, so we accept either outcome — the assertion is
         // only that the flag is recognized.
         let err =
-            run_windows_dns_failclosed_check_command(&["--enforce-ipv6-sibling-rules".to_string()])
+            run_windows_dns_failclosed_check_command(&["--enforce-ipv6-sibling-rules".to_owned()])
                 .err()
                 .unwrap_or_default();
         assert!(
@@ -3040,8 +3031,8 @@ mod tests {
     fn run_windows_dns_failclosed_check_command_accepts_combined_flags() {
         // Both flags together must parse cleanly.
         let err = run_windows_dns_failclosed_check_command(&[
-            "--no-fail-on-drift".to_string(),
-            "--enforce-ipv6-sibling-rules".to_string(),
+            "--no-fail-on-drift".to_owned(),
+            "--enforce-ipv6-sibling-rules".to_owned(),
         ])
         .err()
         .unwrap_or_default();
@@ -3055,7 +3046,7 @@ mod tests {
     fn run_windows_dns_failclosed_check_command_accepts_enforce_ra_suppression_flag() {
         // W3 wire-up: --enforce-ra-suppression must parse cleanly.
         let err =
-            run_windows_dns_failclosed_check_command(&["--enforce-ra-suppression".to_string()])
+            run_windows_dns_failclosed_check_command(&["--enforce-ra-suppression".to_owned()])
                 .err()
                 .unwrap_or_default();
         assert!(
@@ -3068,9 +3059,9 @@ mod tests {
     fn run_windows_dns_failclosed_check_command_accepts_all_three_flags() {
         // All three opt-in flags together must parse cleanly.
         let err = run_windows_dns_failclosed_check_command(&[
-            "--no-fail-on-drift".to_string(),
-            "--enforce-ipv6-sibling-rules".to_string(),
-            "--enforce-ra-suppression".to_string(),
+            "--no-fail-on-drift".to_owned(),
+            "--enforce-ipv6-sibling-rules".to_owned(),
+            "--enforce-ra-suppression".to_owned(),
         ])
         .err()
         .unwrap_or_default();
@@ -3117,7 +3108,7 @@ mod tests {
         // smuggle a passing exit out of a host that physically
         // cannot run the probe. This is the difference between an
         // architectural "cannot probe" and a contractual "drift".
-        let err = run_windows_dns_failclosed_check_command(&["--no-fail-on-drift".to_string()])
+        let err = run_windows_dns_failclosed_check_command(&["--no-fail-on-drift".to_owned()])
             .expect_err("collector blocker must surface even with --no-fail-on-drift");
         assert!(
             err.contains("requires a Windows runtime host"),
@@ -3136,7 +3127,7 @@ mod tests {
 
     #[test]
     fn run_windows_killswitch_assert_command_rejects_unknown_flags() {
-        let err = run_windows_killswitch_assert_command(&["--bogus".to_string()])
+        let err = run_windows_killswitch_assert_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown daemon argument") || err.contains("unknown argument"),
@@ -3160,7 +3151,7 @@ mod tests {
 
     #[test]
     fn run_windows_killswitch_assert_command_no_fail_on_drift_reports_unapplied_state() {
-        run_windows_killswitch_assert_command(&["--no-fail-on-drift".to_string()])
+        run_windows_killswitch_assert_command(&["--no-fail-on-drift".to_owned()])
             .expect("--no-fail-on-drift must allow report-only killswitch drift checks");
     }
 
@@ -3175,7 +3166,7 @@ mod tests {
 
     #[test]
     fn run_windows_backend_readiness_check_command_rejects_unknown_flags() {
-        let err = run_windows_backend_readiness_check_command(&["--bogus".to_string()])
+        let err = run_windows_backend_readiness_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
         assert!(
             err.contains("unknown windows-backend-readiness-check argument"),
@@ -3198,22 +3189,22 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn run_windows_backend_readiness_check_command_no_fail_on_drift_off_windows_returns_ok() {
-        run_windows_backend_readiness_check_command(&["--no-fail-on-drift".to_string()])
+        run_windows_backend_readiness_check_command(&["--no-fail-on-drift".to_owned()])
             .expect("--no-fail-on-drift must allow report-only execution off Windows");
     }
 
     #[test]
     fn select_host_entry_routes_windows_service_mode_before_daemon_dispatch() {
         let selection = select_host_entry(&[
-            "--windows-service".to_string(),
-            "--env-file".to_string(),
-            "/tmp/rustynetd.env".to_string(),
+            "--windows-service".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rustynetd.env".to_owned(),
         ])
         .expect("windows service entry should parse");
         assert_eq!(
             selection,
             HostEntrySelection::WindowsService(WindowsServiceOptions {
-                service_name: "RustyNet".to_string(),
+                service_name: "RustyNet".to_owned(),
                 env_file: PathBuf::from("/tmp/rustynetd.env"),
             })
         );
@@ -3221,7 +3212,7 @@ mod tests {
 
     #[test]
     fn parse_daemon_config_allows_empty_fail_closed_cidrs_when_value_is_omitted() {
-        let args = vec!["--fail-closed-ssh-allow-cidrs".to_string()];
+        let args = vec!["--fail-closed-ssh-allow-cidrs".to_owned()];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert!(config.fail_closed_ssh_allow_cidrs.is_empty());
     }
@@ -3229,9 +3220,9 @@ mod tests {
     #[test]
     fn parse_daemon_config_allows_empty_fail_closed_cidrs_when_next_flag_follows() {
         let args = vec![
-            "--fail-closed-ssh-allow-cidrs".to_string(),
-            "--node-id".to_string(),
-            "node-a".to_string(),
+            "--fail-closed-ssh-allow-cidrs".to_owned(),
+            "--node-id".to_owned(),
+            "node-a".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert!(config.fail_closed_ssh_allow_cidrs.is_empty());
@@ -3241,8 +3232,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_parses_explicit_fail_closed_cidrs() {
         let args = vec![
-            "--fail-closed-ssh-allow-cidrs".to_string(),
-            "192.168.0.0/24,fd00::/64".to_string(),
+            "--fail-closed-ssh-allow-cidrs".to_owned(),
+            "192.168.0.0/24,fd00::/64".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert_eq!(
@@ -3261,8 +3252,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_rejects_invalid_fail_closed_cidrs() {
         let args = vec![
-            "--fail-closed-ssh-allow-cidrs".to_string(),
-            "not-a-cidr".to_string(),
+            "--fail-closed-ssh-allow-cidrs".to_owned(),
+            "not-a-cidr".to_owned(),
         ];
         let err = parse_daemon_config(&args).expect_err("invalid cidr should fail parsing");
         assert!(err.contains("invalid --fail-closed-ssh-allow-cidrs value"));
@@ -3271,10 +3262,10 @@ mod tests {
     #[test]
     fn parse_daemon_config_parses_auto_port_forward_settings() {
         let args = vec![
-            "--auto-port-forward-exit".to_string(),
-            "true".to_string(),
-            "--auto-port-forward-lease-secs".to_string(),
-            "1200".to_string(),
+            "--auto-port-forward-exit".to_owned(),
+            "true".to_owned(),
+            "--auto-port-forward-lease-secs".to_owned(),
+            "1200".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert!(config.auto_port_forward_exit);
@@ -3283,7 +3274,7 @@ mod tests {
 
     #[test]
     fn parse_daemon_config_rejects_invalid_auto_port_forward_exit_value() {
-        let args = vec!["--auto-port-forward-exit".to_string(), "maybe".to_string()];
+        let args = vec!["--auto-port-forward-exit".to_owned(), "maybe".to_owned()];
         let err =
             parse_daemon_config(&args).expect_err("invalid auto-port-forward value should fail");
         assert!(err.contains("invalid auto-port-forward-exit value"));
@@ -3291,10 +3282,7 @@ mod tests {
 
     #[test]
     fn parse_daemon_config_rejects_zero_auto_port_forward_lease() {
-        let args = vec![
-            "--auto-port-forward-lease-secs".to_string(),
-            "0".to_string(),
-        ];
+        let args = vec!["--auto-port-forward-lease-secs".to_owned(), "0".to_owned()];
         let err = parse_daemon_config(&args).expect_err("zero lease should fail parsing");
         assert!(err.contains("must be greater than 0"));
     }
@@ -3302,8 +3290,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_parses_local_relay_token_issuer() {
         let args = vec![
-            "--relay-session-local-token-issuer".to_string(),
-            "true".to_string(),
+            "--relay-session-local-token-issuer".to_owned(),
+            "true".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert!(config.relay_session_local_token_issuer_enabled);
@@ -3312,8 +3300,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_parses_relay_session_token_spool_dir() {
         let args = vec![
-            "--relay-session-token-spool-dir".to_string(),
-            "/var/lib/rustynet/relay-token-spool".to_string(),
+            "--relay-session-token-spool-dir".to_owned(),
+            "/var/lib/rustynet/relay-token-spool".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert_eq!(
@@ -3325,8 +3313,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_rejects_invalid_local_relay_token_issuer() {
         let args = vec![
-            "--relay-session-local-token-issuer".to_string(),
-            "maybe".to_string(),
+            "--relay-session-local-token-issuer".to_owned(),
+            "maybe".to_owned(),
         ];
         let err = parse_daemon_config(&args)
             .expect_err("invalid local relay token issuer value should fail");
@@ -3336,36 +3324,36 @@ mod tests {
     #[test]
     fn parse_daemon_config_parses_traversal_settings() {
         let args = vec![
-            "--traversal-bundle".to_string(),
-            "/tmp/rustynet.traversal".to_string(),
-            "--traversal-verifier-key".to_string(),
-            "/tmp/rustynet.traversal.pub".to_string(),
-            "--traversal-watermark".to_string(),
-            "/tmp/rustynet.traversal.watermark".to_string(),
-            "--relay-fleet-bundle".to_string(),
-            "/tmp/rustynet.relay-fleet".to_string(),
-            "--relay-fleet-watermark".to_string(),
-            "/tmp/rustynet.relay-fleet.watermark".to_string(),
-            "--traversal-max-age-secs".to_string(),
-            "90".to_string(),
-            "--traversal-stun-servers".to_string(),
-            "203.0.113.10:3478,198.51.100.20:3478".to_string(),
-            "--traversal-stun-gather-timeout-ms".to_string(),
-            "2500".to_string(),
-            "--traversal-probe-max-candidates".to_string(),
-            "4".to_string(),
-            "--traversal-probe-max-pairs".to_string(),
-            "8".to_string(),
-            "--traversal-probe-rounds".to_string(),
-            "2".to_string(),
-            "--traversal-probe-round-spacing-ms".to_string(),
-            "40".to_string(),
-            "--traversal-probe-relay-switch-after-failures".to_string(),
-            "2".to_string(),
-            "--traversal-probe-handshake-freshness-secs".to_string(),
-            "15".to_string(),
-            "--traversal-probe-reprobe-interval-secs".to_string(),
-            "45".to_string(),
+            "--traversal-bundle".to_owned(),
+            "/tmp/rustynet.traversal".to_owned(),
+            "--traversal-verifier-key".to_owned(),
+            "/tmp/rustynet.traversal.pub".to_owned(),
+            "--traversal-watermark".to_owned(),
+            "/tmp/rustynet.traversal.watermark".to_owned(),
+            "--relay-fleet-bundle".to_owned(),
+            "/tmp/rustynet.relay-fleet".to_owned(),
+            "--relay-fleet-watermark".to_owned(),
+            "/tmp/rustynet.relay-fleet.watermark".to_owned(),
+            "--traversal-max-age-secs".to_owned(),
+            "90".to_owned(),
+            "--traversal-stun-servers".to_owned(),
+            "203.0.113.10:3478,198.51.100.20:3478".to_owned(),
+            "--traversal-stun-gather-timeout-ms".to_owned(),
+            "2500".to_owned(),
+            "--traversal-probe-max-candidates".to_owned(),
+            "4".to_owned(),
+            "--traversal-probe-max-pairs".to_owned(),
+            "8".to_owned(),
+            "--traversal-probe-rounds".to_owned(),
+            "2".to_owned(),
+            "--traversal-probe-round-spacing-ms".to_owned(),
+            "40".to_owned(),
+            "--traversal-probe-relay-switch-after-failures".to_owned(),
+            "2".to_owned(),
+            "--traversal-probe-handshake-freshness-secs".to_owned(),
+            "15".to_owned(),
+            "--traversal-probe-reprobe-interval-secs".to_owned(),
+            "45".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert_eq!(
@@ -3410,7 +3398,7 @@ mod tests {
 
     #[test]
     fn parse_daemon_config_can_disable_relay_fleet() {
-        let args = vec!["--disable-relay-fleet".to_string()];
+        let args = vec!["--disable-relay-fleet".to_owned()];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert!(config.relay_fleet_bundle_path.is_none());
         assert!(config.relay_fleet_watermark_path.is_none());
@@ -3418,7 +3406,7 @@ mod tests {
 
     #[test]
     fn parse_daemon_config_allows_empty_traversal_stun_servers_when_value_is_omitted() {
-        let args = vec!["--traversal-stun-servers".to_string()];
+        let args = vec!["--traversal-stun-servers".to_owned()];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert!(config.traversal_stun_servers.is_empty());
     }
@@ -3426,9 +3414,9 @@ mod tests {
     #[test]
     fn parse_daemon_config_allows_empty_traversal_stun_servers_when_next_flag_follows() {
         let args = vec![
-            "--traversal-stun-servers".to_string(),
-            "--node-id".to_string(),
-            "node-a".to_string(),
+            "--traversal-stun-servers".to_owned(),
+            "--node-id".to_owned(),
+            "node-a".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert!(config.traversal_stun_servers.is_empty());
@@ -3438,8 +3426,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_rejects_invalid_traversal_stun_servers() {
         let args = vec![
-            "--traversal-stun-servers".to_string(),
-            "stun.example.com:3478".to_string(),
+            "--traversal-stun-servers".to_owned(),
+            "stun.example.com:3478".to_owned(),
         ];
         let err = parse_daemon_config(&args).expect_err("invalid server list should fail");
         assert!(err.contains("invalid --traversal-stun-servers value"));
@@ -3448,8 +3436,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_rejects_zero_traversal_stun_gather_timeout() {
         let args = vec![
-            "--traversal-stun-gather-timeout-ms".to_string(),
-            "0".to_string(),
+            "--traversal-stun-gather-timeout-ms".to_owned(),
+            "0".to_owned(),
         ];
         let err = parse_daemon_config(&args).expect_err("zero timeout should fail");
         assert!(err.contains("traversal stun gather timeout must be greater than 0"));
@@ -3458,8 +3446,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_accepts_userspace_shared_backend_values() {
         let linux = parse_daemon_config(&[
-            "--backend".to_string(),
-            "linux-wireguard-userspace-shared".to_string(),
+            "--backend".to_owned(),
+            "linux-wireguard-userspace-shared".to_owned(),
         ])
         .expect("linux userspace-shared backend should parse");
         assert_eq!(
@@ -3468,8 +3456,8 @@ mod tests {
         );
 
         let macos = parse_daemon_config(&[
-            "--backend".to_string(),
-            "macos-wireguard-userspace-shared".to_string(),
+            "--backend".to_owned(),
+            "macos-wireguard-userspace-shared".to_owned(),
         ])
         .expect("macos userspace-shared backend should parse");
         assert_eq!(
@@ -3481,7 +3469,7 @@ mod tests {
     #[test]
     fn parse_daemon_config_accepts_windows_explicit_unsupported_backend_value() {
         let windows =
-            parse_daemon_config(&["--backend".to_string(), "windows-unsupported".to_string()])
+            parse_daemon_config(&["--backend".to_owned(), "windows-unsupported".to_owned()])
                 .expect("windows explicit unsupported backend should parse");
         assert_eq!(windows.backend_mode, DaemonBackendMode::WindowsUnsupported);
     }
@@ -3489,7 +3477,7 @@ mod tests {
     #[test]
     fn parse_daemon_config_accepts_windows_wireguard_nt_backend_value() {
         let windows =
-            parse_daemon_config(&["--backend".to_string(), "windows-wireguard-nt".to_string()])
+            parse_daemon_config(&["--backend".to_owned(), "windows-wireguard-nt".to_owned()])
                 .expect("reviewed windows backend should parse");
         assert_eq!(windows.backend_mode, DaemonBackendMode::WindowsWireguardNt);
     }
@@ -3497,8 +3485,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_rejects_unknown_windows_backend_value() {
         let err = parse_daemon_config(&[
-            "--backend".to_string(),
-            "windows-wireguard-nt-typo".to_string(),
+            "--backend".to_owned(),
+            "windows-wireguard-nt-typo".to_owned(),
         ])
         .expect_err("unknown windows backend should fail");
         assert!(err.contains("windows-unsupported"));
@@ -3508,18 +3496,18 @@ mod tests {
     #[test]
     fn parse_daemon_config_parses_dns_zone_settings() {
         let args = vec![
-            "--dns-zone-bundle".to_string(),
-            "/tmp/rustynet.dns-zone".to_string(),
-            "--dns-zone-verifier-key".to_string(),
-            "/tmp/rustynet.dns-zone.pub".to_string(),
-            "--dns-zone-watermark".to_string(),
-            "/tmp/rustynet.dns-zone.watermark".to_string(),
-            "--dns-zone-max-age-secs".to_string(),
-            "120".to_string(),
-            "--dns-zone-name".to_string(),
-            "mesh.rustynet".to_string(),
-            "--dns-resolver-bind-addr".to_string(),
-            "127.0.0.1:5300".to_string(),
+            "--dns-zone-bundle".to_owned(),
+            "/tmp/rustynet.dns-zone".to_owned(),
+            "--dns-zone-verifier-key".to_owned(),
+            "/tmp/rustynet.dns-zone.pub".to_owned(),
+            "--dns-zone-watermark".to_owned(),
+            "/tmp/rustynet.dns-zone.watermark".to_owned(),
+            "--dns-zone-max-age-secs".to_owned(),
+            "120".to_owned(),
+            "--dns-zone-name".to_owned(),
+            "mesh.rustynet".to_owned(),
+            "--dns-resolver-bind-addr".to_owned(),
+            "127.0.0.1:5300".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert_eq!(
@@ -3570,21 +3558,21 @@ mod tests {
 
     #[test]
     fn parse_daemon_config_rejects_zero_traversal_max_age() {
-        let args = vec!["--traversal-max-age-secs".to_string(), "0".to_string()];
+        let args = vec!["--traversal-max-age-secs".to_owned(), "0".to_owned()];
         let err = parse_daemon_config(&args).expect_err("zero traversal max age should fail");
         assert!(err.contains("traversal max age must be greater than 0"));
     }
 
     #[test]
     fn parse_daemon_config_rejects_zero_dns_zone_max_age() {
-        let args = vec!["--dns-zone-max-age-secs".to_string(), "0".to_string()];
+        let args = vec!["--dns-zone-max-age-secs".to_owned(), "0".to_owned()];
         let err = parse_daemon_config(&args).expect_err("zero dns zone max age should fail");
         assert!(err.contains("dns zone max age must be greater than 0"));
     }
 
     #[test]
     fn parse_daemon_config_rejects_zero_traversal_probe_rounds() {
-        let args = vec!["--traversal-probe-rounds".to_string(), "0".to_string()];
+        let args = vec!["--traversal-probe-rounds".to_owned(), "0".to_owned()];
         let err = parse_daemon_config(&args).expect_err("zero traversal probe rounds should fail");
         assert!(err.contains("traversal probe rounds must be greater than 0"));
     }
@@ -3592,8 +3580,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_rejects_zero_traversal_probe_freshness() {
         let args = vec![
-            "--traversal-probe-handshake-freshness-secs".to_string(),
-            "0".to_string(),
+            "--traversal-probe-handshake-freshness-secs".to_owned(),
+            "0".to_owned(),
         ];
         let err =
             parse_daemon_config(&args).expect_err("zero traversal probe freshness should fail");
@@ -3603,8 +3591,8 @@ mod tests {
     #[test]
     fn parse_daemon_config_rejects_zero_traversal_probe_reprobe_interval() {
         let args = vec![
-            "--traversal-probe-reprobe-interval-secs".to_string(),
-            "0".to_string(),
+            "--traversal-probe-reprobe-interval-secs".to_owned(),
+            "0".to_owned(),
         ];
         let err = parse_daemon_config(&args)
             .expect_err("zero traversal probe reprobe interval should fail");
@@ -3614,10 +3602,10 @@ mod tests {
     #[test]
     fn parse_daemon_config_parses_remote_ops_auth_settings() {
         let args = vec![
-            "--remote-ops-token-verifier-key".to_string(),
-            "/tmp/rustynet.remote-ops.pub".to_string(),
-            "--remote-ops-expected-subject".to_string(),
-            "user:remote-admin".to_string(),
+            "--remote-ops-token-verifier-key".to_owned(),
+            "/tmp/rustynet.remote-ops.pub".to_owned(),
+            "--remote-ops-expected-subject".to_owned(),
+            "user:remote-admin".to_owned(),
         ];
         let config = parse_daemon_config(&args).expect("config should parse");
         assert_eq!(
@@ -3674,7 +3662,7 @@ mod tests {
     fn membership_command_routes_add_peer() {
         // Routing check: run_membership_command dispatches "add-peer" without
         // panicking on argument validation (will fail on missing args, not unknown cmd).
-        let err = super::run_membership_command(&["add-peer".to_string()]).unwrap_err();
+        let err = super::run_membership_command(&["add-peer".to_owned()]).unwrap_err();
         // Should be an argument error, not "unknown membership subcommand".
         assert!(
             !err.contains("unknown membership subcommand"),

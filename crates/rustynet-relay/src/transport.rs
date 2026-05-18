@@ -199,7 +199,7 @@ impl RelayTransport {
 
     pub fn set_max_total_sessions(&mut self, max_total_sessions: usize) -> Result<(), String> {
         if max_total_sessions == 0 {
-            return Err("max total relay sessions must be greater than 0".to_string());
+            return Err("max total relay sessions must be greater than 0".to_owned());
         }
         // Refuse to shrink below the live session count. Silent eviction would
         // be an operator footgun: legitimate sessions disappear without an
@@ -638,7 +638,7 @@ impl RelayTransport {
     fn remove_session_for_pair(&mut self, node_id: &str, peer_node_id: &str) {
         let Some(existing_session_id) = self
             .node_pair_index
-            .get(&(node_id.to_string(), peer_node_id.to_string()))
+            .get(&(node_id.to_owned(), peer_node_id.to_owned()))
             .copied()
         else {
             return;
@@ -807,12 +807,12 @@ fn should_warn_replay_stat_skip(err: &std::io::Error) -> bool {
 
 fn validate_replay_store_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
-        return Err("replay store path must not be empty".to_string());
+        return Err("replay store path must not be empty".to_owned());
     }
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err("replay store path must be a regular file".to_string());
+                return Err("replay store path must be a regular file".to_owned());
             }
             #[cfg(unix)]
             {
@@ -843,7 +843,7 @@ fn validate_replay_store_path(path: &Path) -> Result<(), String> {
         let metadata =
             fs::symlink_metadata(parent).map_err(|err| format!("stat replay store dir: {err}"))?;
         if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-            return Err("replay store parent must be a directory".to_string());
+            return Err("replay store parent must be a directory".to_owned());
         }
         #[cfg(unix)]
         {
@@ -866,7 +866,7 @@ fn persist_nonce_map(path: &Path, nonces: &HashMap<[u8; 16], u64>) -> Result<(),
         .unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
-        .ok_or_else(|| "replay store path missing file name".to_string())?
+        .ok_or_else(|| "replay store path missing file name".to_owned())?
         .to_string_lossy();
     let tmp_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
 
@@ -910,7 +910,7 @@ fn hex_nonce(nonce: &[u8; 16]) -> String {
 
 fn parse_nonce_hex(value: &str) -> Result<[u8; 16], String> {
     if value.len() != 32 {
-        return Err("replay store nonce must be 32 hex characters".to_string());
+        return Err("replay store nonce must be 32 hex characters".to_owned());
     }
     let mut nonce = [0u8; 16];
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
@@ -946,7 +946,7 @@ impl HelloLimiter {
     /// Returns `true` if the hello should be allowed, `false` if rate-limited.
     fn check(&mut self, node_id: &str) -> bool {
         let now = Instant::now();
-        let entry = self.counts.entry(node_id.to_string()).or_insert((0, now));
+        let entry = self.counts.entry(node_id.to_owned()).or_insert((0, now));
 
         // Reset counter if the one-second window has elapsed
         if now.duration_since(entry.1) >= Duration::from_secs(1) {
@@ -1009,8 +1009,8 @@ mod tests {
     /// Build a valid hello that uses a fresh token.
     fn make_hello(signing_key: &SigningKey, node_id: &str, peer_node_id: &str) -> RelayHello {
         RelayHello {
-            node_id: node_id.to_string(),
-            peer_node_id: peer_node_id.to_string(),
+            node_id: node_id.to_owned(),
+            peer_node_id: peer_node_id.to_owned(),
             session_token: make_valid_token(signing_key, node_id, peer_node_id, 60),
         }
     }
@@ -1069,8 +1069,8 @@ mod tests {
         token.signature = [99u8; 64];
 
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
 
@@ -1122,8 +1122,8 @@ mod tests {
         token.signature = sk.sign(payload.as_bytes()).to_bytes();
 
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
 
@@ -1139,8 +1139,8 @@ mod tests {
         let mut transport = make_transport(&sk);
 
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: make_valid_token(&sk, "node-a", "node-b", 200), // > 120 s
         };
 
@@ -1159,8 +1159,8 @@ mod tests {
 
         let token = make_valid_token(&sk, "node-a", "node-b", 60);
         let hello1 = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token.clone(),
         };
         assert!(matches!(
@@ -1169,8 +1169,8 @@ mod tests {
         ));
 
         let hello2 = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
         assert_eq!(
@@ -1207,8 +1207,8 @@ mod tests {
         let replay_store_path = temp_replay_store_path("durable-replay");
         let token = make_valid_token(&sk, "node-a", "node-b", 60);
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token.clone(),
         };
 
@@ -1240,8 +1240,8 @@ mod tests {
         )
         .expect("durable replay store should reload");
         let replay = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
         assert_eq!(
@@ -1323,8 +1323,8 @@ mod tests {
 
         let token = make_valid_token(&sk, "node-a", "node-b", 60);
         let hello = RelayHello {
-            node_id: "attacker".to_string(), // wrong
-            peer_node_id: "node-b".to_string(),
+            node_id: "attacker".to_owned(), // wrong
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
 
@@ -1345,8 +1345,8 @@ mod tests {
         let token = RelaySessionToken::sign(&sk, "node-a", "node-b", other_relay_id, 60);
 
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
 
@@ -1369,10 +1369,10 @@ mod tests {
             .unwrap()
             .as_secs();
         let mut token = RelaySessionToken {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             relay_id: TEST_RELAY_ID,
-            scope: "full_tunnel_admin".to_string(), // wrong
+            scope: "full_tunnel_admin".to_owned(), // wrong
             issued_at_unix: now_unix,
             expires_at_unix: now_unix + 60,
             nonce: [0x11; 16],
@@ -1382,8 +1382,8 @@ mod tests {
         token.signature = sk.sign(payload.as_bytes()).to_bytes();
 
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
 
@@ -1402,8 +1402,8 @@ mod tests {
 
         let token = make_valid_token(&sk, "node-a", "node-b", 60);
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-c".to_string(), // different from token
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-c".to_owned(), // different from token
             session_token: token,
         };
 
@@ -1508,7 +1508,7 @@ mod tests {
 
         // Drain hello budget for "flooder"
         transport.hello_limiter.counts.insert(
-            "flooder".to_string(),
+            "flooder".to_owned(),
             (transport.hello_limiter.max_per_sec, Instant::now()),
         );
 
@@ -1528,7 +1528,7 @@ mod tests {
         transport
             .hello_limiter
             .counts
-            .insert("node-a".to_string(), (1, Instant::now()));
+            .insert("node-a".to_owned(), (1, Instant::now()));
         assert_eq!(
             transport.handle_hello(make_hello(&sk, "node-a", "node-b")),
             RelayHelloResponse::Rejected(RejectReason::RateLimitExceeded)
@@ -1536,7 +1536,7 @@ mod tests {
 
         // Back-date the window so it appears to have expired
         transport.hello_limiter.counts.insert(
-            "node-a".to_string(),
+            "node-a".to_owned(),
             (1, Instant::now() - Duration::from_secs(2)),
         );
 
@@ -2043,8 +2043,8 @@ mod tests {
 
         for wrong_id in mismatches {
             let hello = RelayHello {
-                node_id: wrong_id.to_string(),
-                peer_node_id: "node-b".to_string(),
+                node_id: wrong_id.to_owned(),
+                peer_node_id: "node-b".to_owned(),
                 session_token: token.clone(),
             };
 
@@ -2074,8 +2074,8 @@ mod tests {
 
         for wrong_peer in mismatches {
             let hello = RelayHello {
-                node_id: "node-a".to_string(),
-                peer_node_id: wrong_peer.to_string(),
+                node_id: "node-a".to_owned(),
+                peer_node_id: wrong_peer.to_owned(),
                 session_token: token.clone(),
             };
 
@@ -2113,8 +2113,8 @@ mod tests {
         for wrong_relay_id in relay_ids {
             let token = RelaySessionToken::sign(&sk, "node-a", "node-b", wrong_relay_id, 60);
             let hello = RelayHello {
-                node_id: "node-a".to_string(),
-                peer_node_id: "node-b".to_string(),
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
                 session_token: token,
             };
 
@@ -2297,8 +2297,8 @@ mod tests {
         // Token signed for wrong relay
         let token = RelaySessionToken::sign(&sk, "node-a", "node-b", other_relay_id, 60);
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "node-b".to_string(),
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
             session_token: token,
         };
 
@@ -2319,8 +2319,8 @@ mod tests {
         // Token for "real-node" but hello claims "attacker"
         let token = RelaySessionToken::sign(&sk, "real-node", "peer-b", TEST_RELAY_ID, 60);
         let hello = RelayHello {
-            node_id: "attacker".to_string(), // Mismatch!
-            peer_node_id: "peer-b".to_string(),
+            node_id: "attacker".to_owned(), // Mismatch!
+            peer_node_id: "peer-b".to_owned(),
             session_token: token,
         };
 
@@ -2341,8 +2341,8 @@ mod tests {
         // Token for node-a→peer-b but hello claims node-a→attacker-peer
         let token = RelaySessionToken::sign(&sk, "node-a", "peer-b", TEST_RELAY_ID, 60);
         let hello = RelayHello {
-            node_id: "node-a".to_string(),
-            peer_node_id: "attacker-peer".to_string(), // Mismatch!
+            node_id: "node-a".to_owned(),
+            peer_node_id: "attacker-peer".to_owned(), // Mismatch!
             session_token: token,
         };
 

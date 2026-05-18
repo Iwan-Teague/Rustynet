@@ -465,18 +465,18 @@ pub struct DryRunSystem {
 
 impl DryRunSystem {
     pub fn fail_on(mut self, operation: &str) -> Self {
-        self.fail_operation = Some(operation.to_string());
+        self.fail_operation = Some(operation.to_owned());
         self
     }
 
     fn step(&mut self, operation: &str) -> Result<(), SystemError> {
-        self.operations.push(operation.to_string());
+        self.operations.push(operation.to_owned());
         if self
             .fail_operation
             .as_ref()
             .is_some_and(|candidate| candidate == operation)
         {
-            return Err(SystemError::RollbackFailed(operation.to_string()));
+            return Err(SystemError::RollbackFailed(operation.to_owned()));
         }
         Ok(())
     }
@@ -642,13 +642,12 @@ impl LinuxCommandSystem {
         let interface_name = interface_name.into();
         let egress_interface = egress_interface.into();
         validate_net_device_name(&interface_name)
-            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_owned()))?;
         validate_net_device_name(&egress_interface)
-            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_owned()))?;
         if fail_closed_ssh_allow && fail_closed_ssh_allow_cidrs.is_empty() {
             return Err(SystemError::PrerequisiteCheckFailed(
-                "fail-closed ssh allow is enabled but no management cidrs were provided"
-                    .to_string(),
+                "fail-closed ssh allow is enabled but no management cidrs were provided".to_owned(),
             ));
         }
 
@@ -834,10 +833,10 @@ impl LinuxCommandSystem {
     fn resolve_route_interface_for_ip(&self, target_ip: IpAddr) -> Result<String, SystemError> {
         let mut args = Vec::with_capacity(4);
         if matches!(target_ip, IpAddr::V6(_)) {
-            args.push("-6".to_string());
+            args.push("-6".to_owned());
         }
-        args.push("route".to_string());
-        args.push("get".to_string());
+        args.push("route".to_owned());
+        args.push("get".to_owned());
         args.push(target_ip.to_string());
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self.run_capture(PrivilegedCommandProgram::Ip, &arg_refs)?;
@@ -859,7 +858,7 @@ impl LinuxCommandSystem {
                         "route interface resolution returned invalid interface for {target_ip}: {message}"
                     ))
                 })?;
-                return Ok((*interface).to_string());
+                return Ok((*interface).to_owned());
             }
         }
         Err(SystemError::RouteApplyFailed(format!(
@@ -931,7 +930,7 @@ impl LinuxCommandSystem {
                 .saturating_add(trimmed.matches('{').count())
                 .saturating_sub(trimmed.matches('}').count());
             if trimmed != "}" {
-                lines.push(trimmed.to_string());
+                lines.push(trimmed.to_owned());
             }
             if depth == 0 {
                 return Some(lines);
@@ -1016,7 +1015,7 @@ impl LinuxCommandSystem {
                     }
                     table_v4.as_deref().ok_or_else(|| {
                         SystemError::KillSwitchAssertionFailed(
-                            "missing cached ipv4 route table output".to_string(),
+                            "missing cached ipv4 route table output".to_owned(),
                         )
                     })?
                 }
@@ -1026,7 +1025,7 @@ impl LinuxCommandSystem {
                     }
                     table_v6.as_deref().ok_or_else(|| {
                         SystemError::KillSwitchAssertionFailed(
-                            "missing cached ipv6 route table output".to_string(),
+                            "missing cached ipv6 route table output".to_owned(),
                         )
                     })?
                 }
@@ -1068,7 +1067,7 @@ impl LinuxCommandSystem {
         };
         let ruleset = self.nft_table_output("ip", table, "nft list nat table")?;
         let postrouting = Self::nft_chain_lines(&ruleset, "postrouting").ok_or_else(|| {
-            SystemError::KillSwitchAssertionFailed("nat postrouting chain missing".to_string())
+            SystemError::KillSwitchAssertionFailed("nat postrouting chain missing".to_owned())
         })?;
         self.assert_chain_contains(
             &postrouting,
@@ -1094,20 +1093,20 @@ impl LinuxCommandSystem {
             return Ok(());
         }
         Err(SystemError::KillSwitchAssertionFailed(
-            "ipv4 forwarding is disabled while nat forwarding is active".to_string(),
+            "ipv4 forwarding is disabled while nat forwarding is active".to_owned(),
         ))
     }
 
     fn assert_firewall_ruleset(&self) -> Result<(), SystemError> {
         let table = self.firewall_table.clone().ok_or_else(|| {
-            SystemError::KillSwitchAssertionFailed("killswitch table missing".to_string())
+            SystemError::KillSwitchAssertionFailed("killswitch table missing".to_owned())
         })?;
         let ruleset = self.nft_table_output("inet", table.as_str(), "nft list killswitch table")?;
         let killswitch = Self::nft_chain_lines(&ruleset, "killswitch").ok_or_else(|| {
-            SystemError::KillSwitchAssertionFailed("killswitch chain missing".to_string())
+            SystemError::KillSwitchAssertionFailed("killswitch chain missing".to_owned())
         })?;
         let forward = Self::nft_chain_lines(&ruleset, "forward").ok_or_else(|| {
-            SystemError::KillSwitchAssertionFailed("forward chain missing".to_string())
+            SystemError::KillSwitchAssertionFailed("forward chain missing".to_owned())
         })?;
         self.assert_chain_contains(
             &killswitch,
@@ -1306,15 +1305,15 @@ impl LinuxCommandSystem {
     fn management_bypass_route_args(cidr: &ManagementCidr, route_interface: &str) -> Vec<String> {
         let mut args = Vec::with_capacity(9);
         if cidr.is_ipv6() {
-            args.push("-6".to_string());
+            args.push("-6".to_owned());
         }
-        args.push("route".to_string());
-        args.push("replace".to_string());
+        args.push("route".to_owned());
+        args.push("replace".to_owned());
         args.push(cidr.to_string());
-        args.push("dev".to_string());
-        args.push(route_interface.to_string());
-        args.push("table".to_string());
-        args.push("51820".to_string());
+        args.push("dev".to_owned());
+        args.push(route_interface.to_owned());
+        args.push("table".to_owned());
+        args.push("51820".to_owned());
         args
     }
 
@@ -1325,15 +1324,15 @@ impl LinuxCommandSystem {
         };
         let mut args = Vec::with_capacity(9);
         if matches!(addr, IpAddr::V6(_)) {
-            args.push("-6".to_string());
+            args.push("-6".to_owned());
         }
-        args.push("route".to_string());
-        args.push("replace".to_string());
+        args.push("route".to_owned());
+        args.push("replace".to_owned());
         args.push(endpoint_cidr);
-        args.push("dev".to_string());
-        args.push(route_interface.to_string());
-        args.push("table".to_string());
-        args.push("51820".to_string());
+        args.push("dev".to_owned());
+        args.push(route_interface.to_owned());
+        args.push("table".to_owned());
+        args.push("51820".to_owned());
         args
     }
 
@@ -1343,22 +1342,22 @@ impl LinuxCommandSystem {
         endpoint: SocketAddr,
     ) -> Vec<String> {
         vec![
-            "add".to_string(),
-            "rule".to_string(),
-            "inet".to_string(),
-            table.to_string(),
-            "killswitch".to_string(),
-            "oifname".to_string(),
-            egress_interface.to_string(),
-            nft_family_for_ip(endpoint.ip()).to_string(),
-            "daddr".to_string(),
+            "add".to_owned(),
+            "rule".to_owned(),
+            "inet".to_owned(),
+            table.to_owned(),
+            "killswitch".to_owned(),
+            "oifname".to_owned(),
+            egress_interface.to_owned(),
+            nft_family_for_ip(endpoint.ip()).to_owned(),
+            "daddr".to_owned(),
             endpoint.ip().to_string(),
-            "udp".to_string(),
-            "dport".to_string(),
+            "udp".to_owned(),
+            "dport".to_owned(),
             endpoint.port().to_string(),
-            "accept".to_string(),
-            "comment".to_string(),
-            "rustynet_traversal_bootstrap".to_string(),
+            "accept".to_owned(),
+            "comment".to_owned(),
+            "rustynet_traversal_bootstrap".to_owned(),
         ]
     }
 
@@ -1540,7 +1539,7 @@ impl LinuxCommandSystem {
         for line in output.stdout.lines() {
             let parts = line.split_whitespace().collect::<Vec<_>>();
             if parts.len() == 3 && parts[0] == "table" {
-                tables.push((parts[1].to_string(), parts[2].to_string()));
+                tables.push((parts[1].to_owned(), parts[2].to_owned()));
             }
         }
         Ok(tables)
@@ -1644,7 +1643,7 @@ impl DataplaneSystem for LinuxCommandSystem {
         }
         #[allow(unreachable_code)]
         Err(SystemError::PrerequisiteCheckFailed(
-            "linux command system is only supported on linux".to_string(),
+            "linux command system is only supported on linux".to_owned(),
         ))
     }
 
@@ -1956,7 +1955,7 @@ impl DataplaneSystem for LinuxCommandSystem {
         // the exit node device itself cannot open new connections to the internet
         // while acting as an exit node.
         if let Some((fw_table, egress_iface)) = egress_allow {
-            let nat_name = self.nat_table.as_deref().unwrap_or("").to_string();
+            let nat_name = self.nat_table.as_deref().unwrap_or("").to_owned();
             if let Err(err) = self.run(
                 PrivilegedCommandProgram::Nft,
                 &[
@@ -1999,7 +1998,7 @@ impl DataplaneSystem for LinuxCommandSystem {
         let table = self
             .firewall_table
             .clone()
-            .ok_or_else(|| SystemError::DnsApplyFailed("killswitch table missing".to_string()))?;
+            .ok_or_else(|| SystemError::DnsApplyFailed("killswitch table missing".to_owned()))?;
         self.run(
             PrivilegedCommandProgram::Nft,
             &[
@@ -2170,13 +2169,12 @@ impl MacosCommandSystem {
         let interface_name = interface_name.into();
         let egress_interface = egress_interface.into();
         validate_net_device_name(&interface_name)
-            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_owned()))?;
         validate_net_device_name(&egress_interface)
-            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_owned()))?;
         if fail_closed_ssh_allow && fail_closed_ssh_allow_cidrs.is_empty() {
             return Err(SystemError::PrerequisiteCheckFailed(
-                "fail-closed ssh allow is enabled but no management cidrs were provided"
-                    .to_string(),
+                "fail-closed ssh allow is enabled but no management cidrs were provided".to_owned(),
             ));
         }
         Ok(Self {
@@ -2369,7 +2367,7 @@ impl MacosCommandSystem {
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         let tmp = tmp_path
             .to_str()
-            .ok_or_else(|| SystemError::FirewallApplyFailed("pf temp path utf8".to_string()))?;
+            .ok_or_else(|| SystemError::FirewallApplyFailed("pf temp path utf8".to_owned()))?;
         let apply_result = self.run(
             PrivilegedCommandProgram::Pfctl,
             &["-a", next_anchor.as_str(), "-f", tmp],
@@ -2444,7 +2442,7 @@ impl DataplaneSystem for MacosCommandSystem {
         }
         #[allow(unreachable_code)]
         Err(SystemError::PrerequisiteCheckFailed(
-            "macos command system is only supported on macos".to_string(),
+            "macos command system is only supported on macos".to_owned(),
         ))
     }
 
@@ -2512,7 +2510,7 @@ impl DataplaneSystem for MacosCommandSystem {
 
     fn assert_killswitch(&mut self) -> Result<(), SystemError> {
         let anchor = self.anchor_name.clone().ok_or_else(|| {
-            SystemError::KillSwitchAssertionFailed("pf anchor missing".to_string())
+            SystemError::KillSwitchAssertionFailed("pf anchor missing".to_owned())
         })?;
         let output = self.run_capture(
             PrivilegedCommandProgram::Pfctl,
@@ -2526,7 +2524,7 @@ impl DataplaneSystem for MacosCommandSystem {
         }
         if !output.stdout.contains("block drop out quick all") {
             return Err(SystemError::KillSwitchAssertionFailed(
-                "pf killswitch rule missing".to_string(),
+                "pf killswitch rule missing".to_owned(),
             ));
         }
         if self.dns_protected {
@@ -2537,7 +2535,7 @@ impl DataplaneSystem for MacosCommandSystem {
                 Some(self.interface_name.as_str()),
             ) {
                 return Err(SystemError::KillSwitchAssertionFailed(
-                    "pf dns udp allow rule missing".to_string(),
+                    "pf dns udp allow rule missing".to_owned(),
                 ));
             }
             if !Self::ruleset_contains_dns_rule(
@@ -2547,19 +2545,19 @@ impl DataplaneSystem for MacosCommandSystem {
                 Some(self.interface_name.as_str()),
             ) {
                 return Err(SystemError::KillSwitchAssertionFailed(
-                    "pf dns tcp allow rule missing".to_string(),
+                    "pf dns tcp allow rule missing".to_owned(),
                 ));
             }
             if !Self::ruleset_contains_dns_rule(&output.stdout, "block drop out quick", "udp", None)
             {
                 return Err(SystemError::KillSwitchAssertionFailed(
-                    "pf dns udp block rule missing".to_string(),
+                    "pf dns udp block rule missing".to_owned(),
                 ));
             }
             if !Self::ruleset_contains_dns_rule(&output.stdout, "block drop out quick", "tcp", None)
             {
                 return Err(SystemError::KillSwitchAssertionFailed(
-                    "pf dns tcp block rule missing".to_string(),
+                    "pf dns tcp block rule missing".to_owned(),
                 ));
             }
         }
@@ -2621,12 +2619,12 @@ impl WindowsCommandSystem {
         let interface_name = interface_name.into();
         let egress_interface = egress_interface.into();
         validate_windows_interface_alias(interface_name.as_str())
-            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_owned()))?;
         validate_windows_interface_alias(egress_interface.as_str())
-            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_string()))?;
+            .map_err(|message| SystemError::PrerequisiteCheckFailed(message.to_owned()))?;
         if !dns_resolver_bind_addr.ip().is_loopback() {
             return Err(SystemError::PrerequisiteCheckFailed(
-                "Windows DNS resolver bind addr must stay on loopback".to_string(),
+                "Windows DNS resolver bind addr must stay on loopback".to_owned(),
             ));
         }
         Ok(Self {
@@ -2771,15 +2769,15 @@ impl WindowsCommandSystem {
             ("ipv4", "nexthop=0.0.0.0")
         };
         self.run_netsh_success(&[
-            "interface".to_string(),
-            family.to_string(),
-            "add".to_string(),
-            "route".to_string(),
+            "interface".to_owned(),
+            family.to_owned(),
+            "add".to_owned(),
+            "route".to_owned(),
             format!("prefix={cidr}"),
             format!("interface={}", self.egress_interface),
-            nexthop.to_string(),
-            "store=active".to_string(),
-            "metric=1".to_string(),
+            nexthop.to_owned(),
+            "store=active".to_owned(),
+            "metric=1".to_owned(),
         ])
         .map_err(|err| {
             SystemError::RouteApplyFailed(format!(
@@ -2791,13 +2789,13 @@ impl WindowsCommandSystem {
     fn delete_endpoint_bypass_route(&self, cidr: &str) -> Result<(), SystemError> {
         let family = if cidr.contains(':') { "ipv6" } else { "ipv4" };
         self.run_netsh_success(&[
-            "interface".to_string(),
-            family.to_string(),
-            "delete".to_string(),
-            "route".to_string(),
+            "interface".to_owned(),
+            family.to_owned(),
+            "delete".to_owned(),
+            "route".to_owned(),
             format!("prefix={cidr}"),
             format!("interface={}", self.egress_interface),
-            "store=active".to_string(),
+            "store=active".to_owned(),
         ])
         .map_err(|err| {
             SystemError::RouteApplyFailed(format!(
@@ -2814,7 +2812,7 @@ impl WindowsCommandSystem {
             SystemError::NatApplyFailed(format!("invalid Windows interface alias: {message}"))
         })?;
         let stdout =
-            self.run_powershell_stdout(WINDOWS_PS_GET_FORWARDING, &[interface_alias.to_string()])?;
+            self.run_powershell_stdout(WINDOWS_PS_GET_FORWARDING, &[interface_alias.to_owned()])?;
         WindowsForwardingState::parse(stdout.trim())
     }
 
@@ -2829,8 +2827,8 @@ impl WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_SET_FORWARDING,
             &[
-                interface_alias.to_string(),
-                state.as_powershell_value().to_string(),
+                interface_alias.to_owned(),
+                state.as_powershell_value().to_owned(),
             ],
         )
     }
@@ -2863,7 +2861,7 @@ impl WindowsCommandSystem {
             })?;
         self.run_powershell_success(
             WINDOWS_PS_NEW_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_string()],
+            &[self.nat_name.clone(), mesh_cidr.to_owned()],
         )
         .map_err(|err| {
             SystemError::NatApplyFailed(format!("create Windows NetNat failed: {err}"))
@@ -2871,7 +2869,7 @@ impl WindowsCommandSystem {
 
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_string()],
+            &[self.nat_name.clone(), mesh_cidr.to_owned()],
         )
         .map_err(|err| {
             SystemError::NatApplyFailed(format!("verify Windows NetNat failed: {err}"))
@@ -3020,7 +3018,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_ADD_KS_TUNNEL_RULE,
             &[
-                WINDOWS_KS_RULE_TUNNEL.to_string(),
+                WINDOWS_KS_RULE_TUNNEL.to_owned(),
                 self.interface_name.clone(),
             ],
         )
@@ -3048,20 +3046,20 @@ impl DataplaneSystem for WindowsCommandSystem {
             WINDOWS_KS_RULE_EGRESS,
         ] {
             let _ = self.run_netsh_success(&[
-                "advfirewall".to_string(),
-                "firewall".to_string(),
-                "delete".to_string(),
-                "rule".to_string(),
+                "advfirewall".to_owned(),
+                "firewall".to_owned(),
+                "delete".to_owned(),
+                "rule".to_owned(),
                 format!("name={rule_name}"),
             ]);
         }
         // Restore default allow-inbound/allow-outbound policy.
         self.run_netsh_success(&[
-            "advfirewall".to_string(),
-            "set".to_string(),
-            "allprofiles".to_string(),
-            "firewallpolicy".to_string(),
-            "allowinbound,allowoutbound".to_string(),
+            "advfirewall".to_owned(),
+            "set".to_owned(),
+            "allprofiles".to_owned(),
+            "firewallpolicy".to_owned(),
+            "allowinbound,allowoutbound".to_owned(),
         ])
         .map_err(|err| {
             SystemError::RollbackFailed(format!("restore firewall policy failed: {err}"))
@@ -3217,8 +3215,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         // never-applied-yet case without paying for a PowerShell round trip.
         if !self.firewall_applied {
             return Err(SystemError::KillSwitchAssertionFailed(
-                "Windows advfirewall killswitch is not applied; call apply_firewall_killswitch first"
-                    .to_string(),
+                "Windows advfirewall killswitch is not applied; call apply_firewall_killswitch first".to_owned(),
             ));
         }
         // Defense in depth: verify the OS still has every reviewed
@@ -3232,9 +3229,9 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_KILLSWITCH,
             &[
-                WINDOWS_KS_RULE_LOOPBACK.to_string(),
-                WINDOWS_KS_RULE_TUNNEL.to_string(),
-                WINDOWS_KS_RULE_EGRESS.to_string(),
+                WINDOWS_KS_RULE_LOOPBACK.to_owned(),
+                WINDOWS_KS_RULE_TUNNEL.to_owned(),
+                WINDOWS_KS_RULE_EGRESS.to_owned(),
             ],
         )
         .map_err(|err| {
@@ -3251,14 +3248,14 @@ impl DataplaneSystem for WindowsCommandSystem {
     fn assert_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
         if !self.nat_applied {
             return Err(SystemError::KillSwitchAssertionFailed(
-                "Windows exit-serving NAT has not been applied".to_string(),
+                "Windows exit-serving NAT has not been applied".to_owned(),
             ));
         }
         let mesh_cidr = validate_windows_nat_prefix(mesh_cidr)?;
         self.assert_killswitch()?;
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_string()],
+            &[self.nat_name.clone(), mesh_cidr.to_owned()],
         )
         .map_err(|err| {
             SystemError::KillSwitchAssertionFailed(format!(
@@ -3285,17 +3282,17 @@ impl DataplaneSystem for WindowsCommandSystem {
         // FailClosed: remove tunnel and egress allow rules so even WireGuard traffic
         // is blocked. Only loopback survives.
         let _ = self.run_netsh_success(&[
-            "advfirewall".to_string(),
-            "firewall".to_string(),
-            "delete".to_string(),
-            "rule".to_string(),
+            "advfirewall".to_owned(),
+            "firewall".to_owned(),
+            "delete".to_owned(),
+            "rule".to_owned(),
             format!("name={WINDOWS_KS_RULE_TUNNEL}"),
         ]);
         let _ = self.run_netsh_success(&[
-            "advfirewall".to_string(),
-            "firewall".to_string(),
-            "delete".to_string(),
-            "rule".to_string(),
+            "advfirewall".to_owned(),
+            "firewall".to_owned(),
+            "delete".to_owned(),
+            "rule".to_owned(),
             format!("name={WINDOWS_KS_RULE_EGRESS}"),
         ]);
         Ok(())
@@ -3968,7 +3965,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.ensure_started()?;
 
         let decision = self.policy.evaluate(&ContextualAccessRequest {
-            src: requester.to_string(),
+            src: requester.to_owned(),
             dst: format!("node:{}", node_id.as_str()),
             protocol,
             context: TrafficContext::SharedExit,
@@ -4003,12 +4000,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.advertised_lan_routes
             .entry(node_id)
             .or_default()
-            .insert(cidr.to_string());
+            .insert(cidr.to_owned());
     }
 
     pub fn set_lan_route_acl(&mut self, user: &str, cidr: &str, allowed: bool) {
         self.lan_route_acl
-            .insert((user.to_string(), cidr.to_string()), allowed);
+            .insert((user.to_owned(), cidr.to_owned()), allowed);
     }
 
     pub fn ensure_lan_route_allowed(&self, request: RouteGrantRequest) -> Result<(), Phase10Error> {
@@ -4281,7 +4278,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         self.ensure_started()?;
         if evaluation.handshake_freshness_secs == 0 {
             return Err(Phase10Error::TraversalProbeFailed(
-                "handshake freshness window must be greater than zero".to_string(),
+                "handshake freshness window must be greater than zero".to_owned(),
             ));
         }
         if !self.managed_peers.contains_key(node_id) {
@@ -4320,7 +4317,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             let relay_endpoint = evaluation.relay_endpoint.ok_or_else(|| {
                 Phase10Error::TraversalProbeFailed(
                     "traversal failed closed: no direct candidates and no relay endpoint"
-                        .to_string(),
+                        .to_owned(),
                 )
             })?;
             self.commit_verified_traversal_path_for_peer(node_id, PathMode::Relay)?;
@@ -4351,7 +4348,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                     });
                 }
                 let detail = evaluation.coordination_error.unwrap_or_else(|| {
-                    "validated signed traversal coordination required for direct probe".to_string()
+                    "validated signed traversal coordination required for direct probe".to_owned()
                 });
                 return Err(Phase10Error::TraversalProbeFailed(format!(
                     "traversal failed closed: {detail}"
@@ -4575,7 +4572,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         let event = TransitionEvent {
             from_state: self.state,
             to_state: target,
-            reason: reason.to_string(),
+            reason: reason.to_owned(),
             generation: self.generation,
         };
         self.transitions.push(event);
@@ -4615,11 +4612,11 @@ fn check_peer_membership_active(
     }
     match membership.node_status(node_id.as_str()) {
         MembershipStatus::Active => Ok(()),
-        MembershipStatus::Revoked => Err(Phase10Error::MembershipRevoked(
-            node_id.as_str().to_string(),
-        )),
+        MembershipStatus::Revoked => {
+            Err(Phase10Error::MembershipRevoked(node_id.as_str().to_owned()))
+        }
         MembershipStatus::Unknown => Err(Phase10Error::MembershipNotFound(
-            node_id.as_str().to_string(),
+            node_id.as_str().to_owned(),
         )),
     }
 }
@@ -4817,12 +4814,12 @@ fn validate_windows_nat_prefix(value: &str) -> Result<&str, SystemError> {
         .map_err(SystemError::NatApplyFailed)?;
     if cidr.is_ipv6() {
         return Err(SystemError::NatApplyFailed(
-            "Windows NetNat exit serving currently supports IPv4 mesh CIDRs only".to_string(),
+            "Windows NetNat exit serving currently supports IPv4 mesh CIDRs only".to_owned(),
         ));
     }
     if cidr.prefix == 0 || cidr.prefix > 32 {
         return Err(SystemError::NatApplyFailed(
-            "Windows NetNat mesh CIDR prefix must be 1..=32".to_string(),
+            "Windows NetNat mesh CIDR prefix must be 1..=32".to_owned(),
         ));
     }
     Ok(value)
@@ -4830,10 +4827,10 @@ fn validate_windows_nat_prefix(value: &str) -> Result<&str, SystemError> {
 
 fn windows_powershell_command_args(script: &'static str, args: &[String]) -> Vec<String> {
     let mut command_args = vec![
-        "-NoProfile".to_string(),
-        "-NonInteractive".to_string(),
-        "-Command".to_string(),
-        script.to_string(),
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        script.to_owned(),
     ];
     command_args.extend_from_slice(args);
     command_args
@@ -4853,12 +4850,12 @@ fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemErro
 fn validate_windows_dns_bind_addr(addr: SocketAddr) -> Result<(), SystemError> {
     if !addr.ip().is_loopback() {
         return Err(SystemError::DnsApplyFailed(
-            "Windows DNS protection requires a loopback resolver bind address".to_string(),
+            "Windows DNS protection requires a loopback resolver bind address".to_owned(),
         ));
     }
     if addr.port() != 53 {
         return Err(SystemError::DnsApplyFailed(
-            "Windows DNS protection requires rustynetd to bind the reviewed local resolver on 127.0.0.1:53 because Windows interface DNS settings cannot encode a non-default port".to_string(),
+            "Windows DNS protection requires rustynetd to bind the reviewed local resolver on 127.0.0.1:53 because Windows interface DNS settings cannot encode a non-default port".to_owned(),
         ));
     }
     Ok(())
@@ -4871,30 +4868,30 @@ fn windows_dns_set_args(
 ) -> Result<Vec<String>, SystemError> {
     if !dns_server.is_loopback() {
         return Err(SystemError::DnsApplyFailed(
-            "Windows DNS protection only supports reviewed loopback resolvers".to_string(),
+            "Windows DNS protection only supports reviewed loopback resolvers".to_owned(),
         ));
     }
     Ok(vec![
-        "interface".to_string(),
-        "ipv4".to_string(),
-        "set".to_string(),
-        "dnsservers".to_string(),
+        "interface".to_owned(),
+        "ipv4".to_owned(),
+        "set".to_owned(),
+        "dnsservers".to_owned(),
         format!("name={interface_name}"),
-        "source=static".to_string(),
+        "source=static".to_owned(),
         format!("address={dns_server}"),
-        "validate=no".to_string(),
+        "validate=no".to_owned(),
     ])
 }
 
 #[allow(dead_code)]
 fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
     vec![
-        "interface".to_string(),
-        "ipv4".to_string(),
-        "delete".to_string(),
-        "dnsservers".to_string(),
+        "interface".to_owned(),
+        "ipv4".to_owned(),
+        "delete".to_owned(),
+        "dnsservers".to_owned(),
         format!("name={interface_name}"),
-        "all".to_string(),
+        "all".to_owned(),
     ]
 }
 
@@ -4904,11 +4901,11 @@ fn windows_dns_clear_args(interface_name: &str) -> Vec<String> {
 /// permit each kind of traffic that should be allowed to leave the host.
 fn windows_firewall_block_outbound_policy_args() -> Vec<String> {
     vec![
-        "advfirewall".to_string(),
-        "set".to_string(),
-        "allprofiles".to_string(),
-        "firewallpolicy".to_string(),
-        "allowinbound,blockoutbound".to_string(),
+        "advfirewall".to_owned(),
+        "set".to_owned(),
+        "allprofiles".to_owned(),
+        "firewallpolicy".to_owned(),
+        "allowinbound,blockoutbound".to_owned(),
     ]
 }
 
@@ -4917,15 +4914,15 @@ fn windows_firewall_block_outbound_policy_args() -> Vec<String> {
 /// IPC and the health-check probe keep working under the global outbound block.
 fn windows_firewall_allow_loopback_args(rule_name: &str) -> Vec<String> {
     vec![
-        "advfirewall".to_string(),
-        "firewall".to_string(),
-        "add".to_string(),
-        "rule".to_string(),
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "add".to_owned(),
+        "rule".to_owned(),
         format!("name={rule_name}"),
-        "dir=out".to_string(),
-        "action=allow".to_string(),
-        "localip=127.0.0.0/8".to_string(),
-        "remoteip=127.0.0.0/8".to_string(),
+        "dir=out".to_owned(),
+        "action=allow".to_owned(),
+        "localip=127.0.0.0/8".to_owned(),
+        "remoteip=127.0.0.0/8".to_owned(),
     ]
 }
 
@@ -4936,13 +4933,13 @@ fn windows_firewall_allow_loopback_args(rule_name: &str) -> Vec<String> {
 /// any leak past one of them would bypass the killswitch.
 fn windows_firewall_allow_interfacetype_args(rule_name: &str, iface_type: &str) -> Vec<String> {
     vec![
-        "advfirewall".to_string(),
-        "firewall".to_string(),
-        "add".to_string(),
-        "rule".to_string(),
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "add".to_owned(),
+        "rule".to_owned(),
         format!("name={rule_name}"),
-        "dir=out".to_string(),
-        "action=allow".to_string(),
+        "dir=out".to_owned(),
+        "action=allow".to_owned(),
         format!("interfacetype={iface_type}"),
     ]
 }
@@ -4954,16 +4951,16 @@ fn windows_firewall_allow_interfacetype_args(rule_name: &str, iface_type: &str) 
 /// `<proto> dport 53 oifname != $tunnel drop`.
 fn windows_dns_block_lan_args(rule_name: &str, protocol: &str) -> Vec<String> {
     vec![
-        "advfirewall".to_string(),
-        "firewall".to_string(),
-        "add".to_string(),
-        "rule".to_string(),
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "add".to_owned(),
+        "rule".to_owned(),
         format!("name={rule_name}"),
-        "dir=out".to_string(),
-        "action=block".to_string(),
+        "dir=out".to_owned(),
+        "action=block".to_owned(),
         format!("protocol={protocol}"),
-        "remoteport=53".to_string(),
-        "interfacetype=lan".to_string(),
+        "remoteport=53".to_owned(),
+        "interfacetype=lan".to_owned(),
     ]
 }
 
@@ -4972,10 +4969,10 @@ fn windows_dns_block_lan_args(rule_name: &str, protocol: &str) -> Vec<String> {
 /// rollback.
 fn windows_firewall_delete_rule_args(rule_name: &str) -> Vec<String> {
     vec![
-        "advfirewall".to_string(),
-        "firewall".to_string(),
-        "delete".to_string(),
-        "rule".to_string(),
+        "advfirewall".to_owned(),
+        "firewall".to_owned(),
+        "delete".to_owned(),
+        "rule".to_owned(),
         format!("name={rule_name}"),
     ]
 }
@@ -4989,14 +4986,14 @@ fn windows_firewall_delete_rule_args(rule_name: &str) -> Vec<String> {
 /// preserved by `Command::args()` without any shell interpolation.
 fn windows_ipv6_egress_disable_args(egress_interface: &str) -> Vec<String> {
     vec![
-        "interface".to_string(),
-        "ipv6".to_string(),
-        "set".to_string(),
-        "interface".to_string(),
-        egress_interface.to_string(),
-        "routerdiscovery=disabled".to_string(),
-        "advertise=disabled".to_string(),
-        "store=active".to_string(),
+        "interface".to_owned(),
+        "ipv6".to_owned(),
+        "set".to_owned(),
+        "interface".to_owned(),
+        egress_interface.to_owned(),
+        "routerdiscovery=disabled".to_owned(),
+        "advertise=disabled".to_owned(),
+        "store=active".to_owned(),
     ]
 }
 
@@ -5006,14 +5003,14 @@ fn windows_ipv6_egress_disable_args(egress_interface: &str) -> Vec<String> {
 /// `*=enabled`.
 fn windows_ipv6_egress_rollback_args(egress_interface: &str) -> Vec<String> {
     vec![
-        "interface".to_string(),
-        "ipv6".to_string(),
-        "set".to_string(),
-        "interface".to_string(),
-        egress_interface.to_string(),
-        "routerdiscovery=enabled".to_string(),
-        "advertise=enabled".to_string(),
-        "store=active".to_string(),
+        "interface".to_owned(),
+        "ipv6".to_owned(),
+        "set".to_owned(),
+        "interface".to_owned(),
+        egress_interface.to_owned(),
+        "routerdiscovery=enabled".to_owned(),
+        "advertise=enabled".to_owned(),
+        "store=active".to_owned(),
     ]
 }
 
@@ -5059,7 +5056,7 @@ impl Phase10PerfMeasurement {
     fn validate(self) -> Result<(), SystemError> {
         if self.soak_test_hours == 0 {
             return Err(SystemError::PrerequisiteCheckFailed(
-                "soak_test_hours must be greater than zero".to_string(),
+                "soak_test_hours must be greater than zero".to_owned(),
             ));
         }
         for (name, value) in [
@@ -5098,7 +5095,7 @@ pub fn write_phase10_perf_report(
     measurements.validate()?;
     if environment.trim().is_empty() {
         return Err(SystemError::PrerequisiteCheckFailed(
-            "environment must not be empty".to_string(),
+            "environment must not be empty".to_owned(),
         ));
     }
 
@@ -5208,25 +5205,25 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "interface".to_string(),
-                "ipv4".to_string(),
-                "set".to_string(),
-                "dnsservers".to_string(),
-                "name=rustynet0".to_string(),
-                "source=static".to_string(),
-                "address=127.0.0.1".to_string(),
-                "validate=no".to_string(),
+                "interface".to_owned(),
+                "ipv4".to_owned(),
+                "set".to_owned(),
+                "dnsservers".to_owned(),
+                "name=rustynet0".to_owned(),
+                "source=static".to_owned(),
+                "address=127.0.0.1".to_owned(),
+                "validate=no".to_owned(),
             ]
         );
         assert_eq!(
             windows_dns_clear_args("rustynet0"),
             vec![
-                "interface".to_string(),
-                "ipv4".to_string(),
-                "delete".to_string(),
-                "dnsservers".to_string(),
-                "name=rustynet0".to_string(),
-                "all".to_string(),
+                "interface".to_owned(),
+                "ipv4".to_owned(),
+                "delete".to_owned(),
+                "dnsservers".to_owned(),
+                "name=rustynet0".to_owned(),
+                "all".to_owned(),
             ]
         );
     }
@@ -5238,16 +5235,16 @@ mod tests {
         assert_eq!(
             windows_dns_block_lan_args(WINDOWS_DNS_RULE_BLOCK_LAN_UDP, "udp"),
             vec![
-                "advfirewall".to_string(),
-                "firewall".to_string(),
-                "add".to_string(),
-                "rule".to_string(),
+                "advfirewall".to_owned(),
+                "firewall".to_owned(),
+                "add".to_owned(),
+                "rule".to_owned(),
                 format!("name={WINDOWS_DNS_RULE_BLOCK_LAN_UDP}"),
-                "dir=out".to_string(),
-                "action=block".to_string(),
-                "protocol=udp".to_string(),
-                "remoteport=53".to_string(),
-                "interfacetype=lan".to_string(),
+                "dir=out".to_owned(),
+                "action=block".to_owned(),
+                "protocol=udp".to_owned(),
+                "remoteport=53".to_owned(),
+                "interfacetype=lan".to_owned(),
             ]
         );
         // TCP/53 LAN block — without it an app that opted into TCP DNS could
@@ -5255,16 +5252,16 @@ mod tests {
         assert_eq!(
             windows_dns_block_lan_args(WINDOWS_DNS_RULE_BLOCK_LAN_TCP, "tcp"),
             vec![
-                "advfirewall".to_string(),
-                "firewall".to_string(),
-                "add".to_string(),
-                "rule".to_string(),
+                "advfirewall".to_owned(),
+                "firewall".to_owned(),
+                "add".to_owned(),
+                "rule".to_owned(),
                 format!("name={WINDOWS_DNS_RULE_BLOCK_LAN_TCP}"),
-                "dir=out".to_string(),
-                "action=block".to_string(),
-                "protocol=tcp".to_string(),
-                "remoteport=53".to_string(),
-                "interfacetype=lan".to_string(),
+                "dir=out".to_owned(),
+                "action=block".to_owned(),
+                "protocol=tcp".to_owned(),
+                "remoteport=53".to_owned(),
+                "interfacetype=lan".to_owned(),
             ]
         );
     }
@@ -5291,11 +5288,11 @@ mod tests {
         assert_eq!(
             windows_firewall_delete_rule_args("RustyNetTest-Rule"),
             vec![
-                "advfirewall".to_string(),
-                "firewall".to_string(),
-                "delete".to_string(),
-                "rule".to_string(),
-                "name=RustyNetTest-Rule".to_string(),
+                "advfirewall".to_owned(),
+                "firewall".to_owned(),
+                "delete".to_owned(),
+                "rule".to_owned(),
+                "name=RustyNetTest-Rule".to_owned(),
             ]
         );
     }
@@ -5311,11 +5308,11 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "advfirewall".to_string(),
-                "set".to_string(),
-                "allprofiles".to_string(),
-                "firewallpolicy".to_string(),
-                "allowinbound,blockoutbound".to_string(),
+                "advfirewall".to_owned(),
+                "set".to_owned(),
+                "allprofiles".to_owned(),
+                "firewallpolicy".to_owned(),
+                "allowinbound,blockoutbound".to_owned(),
             ]
         );
         // Static guards: never accidentally swap to "allow,allow" or drop the
@@ -5394,7 +5391,7 @@ mod tests {
         // Verify runtime argv passes rule name and alias as separate arguments.
         let args = windows_powershell_command_args(
             WINDOWS_PS_ADD_KS_TUNNEL_RULE,
-            &[WINDOWS_KS_RULE_TUNNEL.to_string(), "rustynet0".to_string()],
+            &[WINDOWS_KS_RULE_TUNNEL.to_owned(), "rustynet0".to_owned()],
         );
         assert_eq!(args[0], "-NoProfile");
         assert_eq!(args[2], "-Command");
@@ -5479,14 +5476,14 @@ mod tests {
         assert_eq!(
             windows_ipv6_egress_disable_args("Ethernet"),
             vec![
-                "interface".to_string(),
-                "ipv6".to_string(),
-                "set".to_string(),
-                "interface".to_string(),
-                "Ethernet".to_string(),
-                "routerdiscovery=disabled".to_string(),
-                "advertise=disabled".to_string(),
-                "store=active".to_string(),
+                "interface".to_owned(),
+                "ipv6".to_owned(),
+                "set".to_owned(),
+                "interface".to_owned(),
+                "Ethernet".to_owned(),
+                "routerdiscovery=disabled".to_owned(),
+                "advertise=disabled".to_owned(),
+                "store=active".to_owned(),
             ]
         );
 
@@ -5494,14 +5491,14 @@ mod tests {
         assert_eq!(
             windows_ipv6_egress_rollback_args("Ethernet"),
             vec![
-                "interface".to_string(),
-                "ipv6".to_string(),
-                "set".to_string(),
-                "interface".to_string(),
-                "Ethernet".to_string(),
-                "routerdiscovery=enabled".to_string(),
-                "advertise=enabled".to_string(),
-                "store=active".to_string(),
+                "interface".to_owned(),
+                "ipv6".to_owned(),
+                "set".to_owned(),
+                "interface".to_owned(),
+                "Ethernet".to_owned(),
+                "routerdiscovery=enabled".to_owned(),
+                "advertise=enabled".to_owned(),
+                "store=active".to_owned(),
             ]
         );
     }
@@ -5853,8 +5850,8 @@ mod tests {
     fn allow_shared_exit_policy() -> ContextualPolicySet {
         ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
-                src: "user:alice".to_string(),
-                dst: "*".to_string(),
+                src: "user:alice".to_owned(),
+                dst: "*".to_owned(),
                 protocol: Protocol::Any,
                 action: RuleAction::Allow,
                 contexts: vec![TrafficContext::SharedExit],
@@ -5879,16 +5876,16 @@ mod tests {
                 port: 51820,
             },
             public_key: [9; 32],
-            allowed_ips: vec!["100.100.20.2/32".to_string()],
+            allowed_ips: vec!["100.100.20.2/32".to_owned()],
         }
     }
 
     fn test_runtime_context() -> RuntimeContext {
         RuntimeContext {
             local_node: NodeId::new("node-a").expect("node should parse"),
-            interface_name: "rustynet0".to_string(),
-            mesh_cidr: "100.64.0.0/10".to_string(),
-            local_cidr: "100.64.0.1/32".to_string(),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
         }
     }
 
@@ -6244,7 +6241,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -6276,7 +6273,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -6293,7 +6290,7 @@ mod tests {
             controller
                 .system
                 .operations
-                .contains(&"assert_exit_policy:full_tunnel".to_string()),
+                .contains(&"assert_exit_policy:full_tunnel".to_owned()),
             "phase 10 must assert measured full-tunnel truth before claiming ExitActive"
         );
     }
@@ -6318,7 +6315,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -6361,7 +6358,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -6408,7 +6405,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -6461,7 +6458,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -6511,7 +6508,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -6527,7 +6524,7 @@ mod tests {
         assert_eq!(controller.current_exit_mode(), ExitMode::FullTunnel);
         assert_eq!(controller.backend.exit_mode, ExitMode::FullTunnel);
         assert!(
-            set_ops.contains(&"assert_exit_policy:full_tunnel".to_string()),
+            set_ops.contains(&"assert_exit_policy:full_tunnel".to_owned()),
             "exit selection must assert measured full-tunnel truth"
         );
 
@@ -6539,7 +6536,7 @@ mod tests {
         assert_eq!(controller.current_exit_mode(), ExitMode::Off);
         assert_eq!(controller.backend.exit_mode, ExitMode::Off);
         assert!(
-            clear_ops.contains(&"assert_exit_policy:off".to_string()),
+            clear_ops.contains(&"assert_exit_policy:off".to_owned()),
             "exit clearing must assert measured off-mode truth"
         );
     }
@@ -6561,7 +6558,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: peer_id.clone(),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -6579,10 +6576,10 @@ mod tests {
         let ops = &controller.system.operations[op_start..];
 
         assert!(
-            ops.contains(&"rollback_routes".to_string())
-                && ops.contains(&"apply_peer_endpoint_bypass_routes".to_string())
-                && ops.contains(&"apply_routes".to_string())
-                && ops.contains(&"assert_exit_policy:full_tunnel".to_string()),
+            ops.contains(&"rollback_routes".to_owned())
+                && ops.contains(&"apply_peer_endpoint_bypass_routes".to_owned())
+                && ops.contains(&"apply_routes".to_owned())
+                && ops.contains(&"assert_exit_policy:full_tunnel".to_owned()),
             "peer revocation must rebuild owned routes and re-assert measured full-tunnel truth"
         );
     }
@@ -6603,7 +6600,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -6841,7 +6838,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -6867,7 +6864,7 @@ mod tests {
             test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![Route {
-                destination_cidr: "100.100.20.0/24".to_string(),
+                destination_cidr: "100.100.20.0/24".to_owned(),
                 via_node: NodeId::new("node-b").expect("node should parse"),
                 kind: RouteKind::Mesh,
             }],
@@ -6902,7 +6899,7 @@ mod tests {
             test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![Route {
-                destination_cidr: "100.100.20.0/24".to_string(),
+                destination_cidr: "100.100.20.0/24".to_owned(),
                 via_node: NodeId::new("node-b").expect("node should parse"),
                 kind: RouteKind::Mesh,
             }],
@@ -6949,8 +6946,8 @@ mod tests {
         let args = windows_powershell_command_args(
             WINDOWS_PS_NEW_NAT,
             &[
-                "RustyNetExit-rustynet0".to_string(),
-                "100.64.0.0/10".to_string(),
+                "RustyNetExit-rustynet0".to_owned(),
+                "100.64.0.0/10".to_owned(),
             ],
         );
 
@@ -7256,9 +7253,9 @@ mod tests {
         let args = windows_powershell_command_args(
             WINDOWS_PS_ASSERT_KILLSWITCH,
             &[
-                WINDOWS_KS_RULE_LOOPBACK.to_string(),
-                WINDOWS_KS_RULE_TUNNEL.to_string(),
-                WINDOWS_KS_RULE_EGRESS.to_string(),
+                WINDOWS_KS_RULE_LOOPBACK.to_owned(),
+                WINDOWS_KS_RULE_TUNNEL.to_owned(),
+                WINDOWS_KS_RULE_EGRESS.to_owned(),
             ],
         );
         assert_eq!(args[0], "-NoProfile");
@@ -7397,7 +7394,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7418,14 +7415,14 @@ mod tests {
         assert_eq!(controller.current_exit_mode(), ExitMode::Off);
         assert_eq!(controller.backend.exit_mode, ExitMode::Off);
         assert!(
-            shutdown_ops.contains(&"rollback_nat_forwarding".to_string()),
+            shutdown_ops.contains(&"rollback_nat_forwarding".to_owned()),
             "shutdown must remove exit-serving NAT/forwarding state"
         );
         assert!(
-            shutdown_ops.contains(&"rollback_dns_protection".to_string())
-                && shutdown_ops.contains(&"rollback_firewall".to_string())
-                && shutdown_ops.contains(&"rollback_routes".to_string())
-                && shutdown_ops.contains(&"rollback_ipv6_egress".to_string()),
+            shutdown_ops.contains(&"rollback_dns_protection".to_owned())
+                && shutdown_ops.contains(&"rollback_firewall".to_owned())
+                && shutdown_ops.contains(&"rollback_routes".to_owned())
+                && shutdown_ops.contains(&"rollback_ipv6_egress".to_owned()),
             "shutdown must rollback owned DNS, firewall, route, and IPv6 controls; ops={shutdown_ops:?}"
         );
     }
@@ -7446,7 +7443,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7457,7 +7454,7 @@ mod tests {
             )
             .expect("exit-serving apply should succeed");
 
-        controller.system.fail_operation = Some("rollback_nat_forwarding".to_string());
+        controller.system.fail_operation = Some("rollback_nat_forwarding".to_owned());
         let err = controller
             .shutdown()
             .expect_err("cleanup failure must be surfaced");
@@ -7492,7 +7489,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7510,7 +7507,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7526,12 +7523,12 @@ mod tests {
         assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
         assert_eq!(controller.current_exit_mode(), ExitMode::Off);
         assert!(
-            second_apply_ops.contains(&"rollback_nat_forwarding".to_string()),
+            second_apply_ops.contains(&"rollback_nat_forwarding".to_owned()),
             "turning off exit serving must remove old NAT/forwarding state"
         );
         assert!(
-            second_apply_ops.contains(&"rollback_dns_protection".to_string())
-                && second_apply_ops.contains(&"rollback_ipv6_egress".to_string()),
+            second_apply_ops.contains(&"rollback_dns_protection".to_owned())
+                && second_apply_ops.contains(&"rollback_ipv6_egress".to_owned()),
             "turning off protected controls must rollback stale DNS/IPv6 state; ops={second_apply_ops:?}"
         );
         assert!(
@@ -7558,7 +7555,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7569,7 +7566,7 @@ mod tests {
             )
             .expect("exit-serving apply should succeed");
 
-        controller.system.fail_operation = Some("apply_firewall_killswitch".to_string());
+        controller.system.fail_operation = Some("apply_firewall_killswitch".to_owned());
         let second_apply_start = controller.system.operations.len();
         let err = controller
             .apply_dataplane_generation(
@@ -7577,7 +7574,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7595,9 +7592,9 @@ mod tests {
         assert_eq!(controller.state(), DataplaneState::FailClosed);
         let second_apply_ops = &controller.system.operations[second_apply_start..];
         assert!(
-            second_apply_ops.contains(&"rollback_nat_forwarding".to_string())
-                && second_apply_ops.contains(&"rollback_dns_protection".to_string())
-                && second_apply_ops.contains(&"rollback_ipv6_egress".to_string()),
+            second_apply_ops.contains(&"rollback_nat_forwarding".to_owned())
+                && second_apply_ops.contains(&"rollback_dns_protection".to_owned())
+                && second_apply_ops.contains(&"rollback_ipv6_egress".to_owned()),
             "failed role change must still retire obsolete exit controls before fail-close; ops={second_apply_ops:?}"
         );
 
@@ -7608,9 +7605,9 @@ mod tests {
             .expect("shutdown after failed reapply should not replay stale exit rollback markers");
         let shutdown_ops = &controller.system.operations[shutdown_start..];
         assert!(
-            !shutdown_ops.contains(&"rollback_nat_forwarding".to_string())
-                && !shutdown_ops.contains(&"rollback_dns_protection".to_string())
-                && !shutdown_ops.contains(&"rollback_ipv6_egress".to_string()),
+            !shutdown_ops.contains(&"rollback_nat_forwarding".to_owned())
+                && !shutdown_ops.contains(&"rollback_dns_protection".to_owned())
+                && !shutdown_ops.contains(&"rollback_ipv6_egress".to_owned()),
             "shutdown must not replay stale exit-control rollback after failed reapply; ops={shutdown_ops:?}"
         );
         assert_eq!(controller.state(), DataplaneState::Init);
@@ -7632,7 +7629,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7643,14 +7640,14 @@ mod tests {
             )
             .expect("exit-serving apply should succeed");
 
-        controller.system.fail_operation = Some("apply_firewall_killswitch".to_string());
+        controller.system.fail_operation = Some("apply_firewall_killswitch".to_owned());
         controller
             .apply_dataplane_generation(
                 trust_ok(),
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7669,9 +7666,9 @@ mod tests {
             .expect("shutdown after failed same-role reapply should cleanup live exit controls");
         let shutdown_ops = &controller.system.operations[shutdown_start..];
         assert!(
-            shutdown_ops.contains(&"rollback_nat_forwarding".to_string())
-                && shutdown_ops.contains(&"rollback_dns_protection".to_string())
-                && shutdown_ops.contains(&"rollback_ipv6_egress".to_string()),
+            shutdown_ops.contains(&"rollback_nat_forwarding".to_owned())
+                && shutdown_ops.contains(&"rollback_dns_protection".to_owned())
+                && shutdown_ops.contains(&"rollback_ipv6_egress".to_owned()),
             "shutdown must still cleanup live previous exit controls after failed same-role reapply; ops={shutdown_ops:?}"
         );
         assert_eq!(controller.state(), DataplaneState::Init);
@@ -7692,7 +7689,7 @@ mod tests {
             test_runtime_context(),
             vec![sample_peer("node-b")],
             vec![Route {
-                destination_cidr: "0.0.0.0/0".to_string(),
+                destination_cidr: "0.0.0.0/0".to_owned(),
                 via_node: NodeId::new("node-b").expect("node should parse"),
                 kind: RouteKind::ExitNodeDefault,
             }],
@@ -7731,7 +7728,7 @@ mod tests {
                     test_runtime_context(),
                     vec![sample_peer("node-b")],
                     vec![Route {
-                        destination_cidr: "100.100.20.0/24".to_string(),
+                        destination_cidr: "100.100.20.0/24".to_owned(),
                         via_node: NodeId::new("node-b").expect("node should parse"),
                         kind: RouteKind::Mesh,
                     }],
@@ -7774,7 +7771,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7793,7 +7790,7 @@ mod tests {
             test_runtime_context(),
             vec![sample_peer("node-c")],
             vec![Route {
-                destination_cidr: "0.0.0.0/0".to_string(),
+                destination_cidr: "0.0.0.0/0".to_owned(),
                 via_node: NodeId::new("node-c").expect("node should parse"),
                 kind: RouteKind::ExitNodeDefault,
             }],
@@ -7834,7 +7831,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -7883,7 +7880,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7933,7 +7930,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -7965,7 +7962,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "0.0.0.0/0".to_string(),
+                    destination_cidr: "0.0.0.0/0".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::ExitNodeDefault,
                 }],
@@ -7981,8 +7978,8 @@ mod tests {
         controller.set_lan_route_acl("user:alice", "192.168.1.0/24", true);
 
         let denied = controller.ensure_lan_route_allowed(RouteGrantRequest {
-            user: "user:alice".to_string(),
-            cidr: "192.168.1.0/24".to_string(),
+            user: "user:alice".to_owned(),
+            cidr: "192.168.1.0/24".to_owned(),
             protocol: Protocol::Tcp,
             context: TrafficContext::SharedExit,
         });
@@ -7991,8 +7988,8 @@ mod tests {
         controller.set_lan_access(true);
         controller
             .ensure_lan_route_allowed(RouteGrantRequest {
-                user: "user:alice".to_string(),
-                cidr: "192.168.1.0/24".to_string(),
+                user: "user:alice".to_owned(),
+                cidr: "192.168.1.0/24".to_owned(),
                 protocol: Protocol::Tcp,
                 context: TrafficContext::SharedExit,
             })
@@ -8024,7 +8021,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8101,7 +8098,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8132,7 +8129,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8206,7 +8203,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8276,7 +8273,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8351,7 +8348,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8424,7 +8421,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8461,7 +8458,7 @@ mod tests {
                     coordination_schedule: None,
                     coordination_error: Some(
                         "validated traversal coordination for peer node-b is unavailable"
-                            .to_string(),
+                            .to_owned(),
                     ),
                 },
             )
@@ -8494,7 +8491,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -8531,7 +8528,7 @@ mod tests {
                     coordination_schedule: None,
                     coordination_error: Some(
                         "validated traversal coordination for peer node-b is unavailable"
-                            .to_string(),
+                            .to_owned(),
                     ),
                 },
             )
@@ -8567,7 +8564,7 @@ mod tests {
             &[TransitionEvent {
                 from_state: DataplaneState::Init,
                 to_state: DataplaneState::ControlTrusted,
-                reason: "test".to_string(),
+                reason: "test".to_owned(),
                 generation: 0,
             }],
         )
@@ -8605,13 +8602,13 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "route".to_string(),
-                "replace".to_string(),
-                "192.168.18.0/24".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
-                "table".to_string(),
-                "51820".to_string(),
+                "route".to_owned(),
+                "replace".to_owned(),
+                "192.168.18.0/24".to_owned(),
+                "dev".to_owned(),
+                "enp0s8".to_owned(),
+                "table".to_owned(),
+                "51820".to_owned(),
             ]
         );
     }
@@ -8623,14 +8620,14 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-6".to_string(),
-                "route".to_string(),
-                "replace".to_string(),
-                "fd00::/64".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
-                "table".to_string(),
-                "51820".to_string(),
+                "-6".to_owned(),
+                "route".to_owned(),
+                "replace".to_owned(),
+                "fd00::/64".to_owned(),
+                "dev".to_owned(),
+                "enp0s8".to_owned(),
+                "table".to_owned(),
+                "51820".to_owned(),
             ]
         );
     }
@@ -9323,13 +9320,13 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "route".to_string(),
-                "replace".to_string(),
-                "192.168.18.40/32".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
-                "table".to_string(),
-                "51820".to_string(),
+                "route".to_owned(),
+                "replace".to_owned(),
+                "192.168.18.40/32".to_owned(),
+                "dev".to_owned(),
+                "enp0s8".to_owned(),
+                "table".to_owned(),
+                "51820".to_owned(),
             ]
         );
     }
@@ -9346,22 +9343,22 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "add".to_string(),
-                "rule".to_string(),
-                "inet".to_string(),
-                "rustynet_g1".to_string(),
-                "killswitch".to_string(),
-                "oifname".to_string(),
-                "enp0s1".to_string(),
-                "ip".to_string(),
-                "daddr".to_string(),
-                "203.0.113.10".to_string(),
-                "udp".to_string(),
-                "dport".to_string(),
-                "3478".to_string(),
-                "accept".to_string(),
-                "comment".to_string(),
-                "rustynet_traversal_bootstrap".to_string(),
+                "add".to_owned(),
+                "rule".to_owned(),
+                "inet".to_owned(),
+                "rustynet_g1".to_owned(),
+                "killswitch".to_owned(),
+                "oifname".to_owned(),
+                "enp0s1".to_owned(),
+                "ip".to_owned(),
+                "daddr".to_owned(),
+                "203.0.113.10".to_owned(),
+                "udp".to_owned(),
+                "dport".to_owned(),
+                "3478".to_owned(),
+                "accept".to_owned(),
+                "comment".to_owned(),
+                "rustynet_traversal_bootstrap".to_owned(),
             ]
         );
     }
@@ -9375,14 +9372,14 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-6".to_string(),
-                "route".to_string(),
-                "replace".to_string(),
-                "fd00::10/128".to_string(),
-                "dev".to_string(),
-                "enp0s8".to_string(),
-                "table".to_string(),
-                "51820".to_string(),
+                "-6".to_owned(),
+                "route".to_owned(),
+                "replace".to_owned(),
+                "fd00::10/128".to_owned(),
+                "dev".to_owned(),
+                "enp0s8".to_owned(),
+                "table".to_owned(),
+                "51820".to_owned(),
             ]
         );
     }
@@ -9432,8 +9429,8 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                "com.apple/rustynet_g1".to_string(),
-                "com.apple/rustynet_g77".to_string()
+                "com.apple/rustynet_g1".to_owned(),
+                "com.apple/rustynet_g77".to_owned()
             ]
         );
     }
@@ -9931,7 +9928,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node"),
                     kind: RouteKind::Mesh,
                 }],
@@ -9980,7 +9977,7 @@ mod tests {
         // ACL invariant: measured off-mode proof must appear after the transition.
         let new_ops = &controller.system.operations[ops_before..];
         assert!(
-            new_ops.contains(&"assert_exit_policy:off".to_string()),
+            new_ops.contains(&"assert_exit_policy:off".to_owned()),
             "assert_exit_policy:off must be called during direct→relay transition; ops={new_ops:?}"
         );
 
@@ -10023,7 +10020,7 @@ mod tests {
         // ACL invariant: measured off-mode proof must be called on relay→direct too.
         let new_ops = &controller.system.operations[ops_before..];
         assert!(
-            new_ops.contains(&"assert_exit_policy:off".to_string()),
+            new_ops.contains(&"assert_exit_policy:off".to_owned()),
             "assert_exit_policy:off must be called during relay→direct transition; ops={new_ops:?}"
         );
 
@@ -10040,7 +10037,7 @@ mod tests {
             controller
                 .system
                 .operations
-                .contains(&"apply_firewall_killswitch".to_string()),
+                .contains(&"apply_firewall_killswitch".to_owned()),
             "apply_firewall_killswitch must be called during initial generation apply"
         );
 
@@ -10053,7 +10050,7 @@ mod tests {
             controller
                 .system
                 .operations
-                .contains(&"assert_exit_policy:off".to_string()),
+                .contains(&"assert_exit_policy:off".to_owned()),
             "assert_exit_policy:off must appear after first path transition"
         );
 
@@ -10101,7 +10098,7 @@ mod tests {
         let new_ops = &controller.system.operations[ops_before..];
         assert_eq!(controller.current_exit_mode(), ExitMode::FullTunnel);
         assert!(
-            new_ops.contains(&"assert_exit_policy:full_tunnel".to_string()),
+            new_ops.contains(&"assert_exit_policy:full_tunnel".to_owned()),
             "managed-peer endpoint reconfiguration must assert the controller's current full-tunnel policy"
         );
     }
@@ -10173,7 +10170,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -10187,12 +10184,12 @@ mod tests {
         let ops = &controller.system.operations[start..];
 
         assert!(
-            ops.contains(&"hard_disable_ipv6_egress".to_string()),
+            ops.contains(&"hard_disable_ipv6_egress".to_owned()),
             "ipv6_parity_supported=false on Linux exit MUST hard-disable \
              ipv6 egress at the kernel; missing in ops={ops:?}"
         );
         assert!(
-            ops.contains(&"apply_nat_forwarding".to_string()),
+            ops.contains(&"apply_nat_forwarding".to_owned()),
             "exit-serving apply must program IPv4 NAT (ip family) — ops={ops:?}"
         );
     }
@@ -10214,7 +10211,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -10228,7 +10225,7 @@ mod tests {
         let ops = &controller.system.operations[start..];
 
         assert!(
-            !ops.contains(&"hard_disable_ipv6_egress".to_string()),
+            !ops.contains(&"hard_disable_ipv6_egress".to_owned()),
             "ipv6_parity_supported=true must NOT also hard-disable \
              ipv6 egress (the caller is asserting parity is programmed \
              elsewhere); ops={ops:?}"
@@ -10252,7 +10249,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -10266,7 +10263,7 @@ mod tests {
         let ops = &controller.system.operations[start..];
 
         assert!(
-            ops.contains(&"hard_disable_ipv6_egress".to_string()),
+            ops.contains(&"hard_disable_ipv6_egress".to_owned()),
             "full-tunnel mode with ipv6_parity_supported=false MUST hard-disable \
              ipv6 egress (the kernel is the only barrier against IPv6 leaks since \
              there is no ip6 nat sibling); missing in ops={ops:?}"
@@ -10294,7 +10291,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -10391,7 +10388,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -10410,7 +10407,7 @@ mod tests {
                 test_runtime_context(),
                 vec![sample_peer("node-b")],
                 vec![Route {
-                    destination_cidr: "100.100.20.0/24".to_string(),
+                    destination_cidr: "100.100.20.0/24".to_owned(),
                     via_node: NodeId::new("node-b").expect("node should parse"),
                     kind: RouteKind::Mesh,
                 }],
@@ -10424,7 +10421,7 @@ mod tests {
         let second_ops = &controller.system.operations[second_start..];
 
         assert!(
-            second_ops.contains(&"rollback_ipv6_egress".to_string()),
+            second_ops.contains(&"rollback_ipv6_egress".to_owned()),
             "flipping ipv6_parity_supported false→true must rollback the \
              kernel disable; ops={second_ops:?}"
         );

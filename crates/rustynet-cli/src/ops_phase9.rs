@@ -140,7 +140,7 @@ fn env_optional_string(key: &str) -> Result<Option<String>, String> {
             if trimmed.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(trimmed.to_string()))
+                Ok(Some(trimmed.to_owned()))
             }
         }
         Err(std::env::VarError::NotPresent) => Ok(None),
@@ -157,7 +157,7 @@ fn required_env_string(key: &str) -> Result<String, String> {
 fn resolve_path(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("path must not be empty".to_string());
+        return Err("path must not be empty".to_owned());
     }
     let path = PathBuf::from(trimmed);
     if path.is_absolute() {
@@ -169,7 +169,7 @@ fn resolve_path(raw: &str) -> Result<PathBuf, String> {
 }
 
 fn path_from_env_or_default(key: &str, default: &str) -> Result<PathBuf, String> {
-    let raw = env_optional_string(key)?.unwrap_or_else(|| default.to_string());
+    let raw = env_optional_string(key)?.unwrap_or_else(|| default.to_owned());
     resolve_path(raw.as_str())
 }
 
@@ -215,10 +215,10 @@ fn decode_hex_to_fixed<const N: usize>(value: &str) -> Result<[u8; N], String> {
         let offset = index * 2;
         let hi = (bytes[offset] as char)
             .to_digit(16)
-            .ok_or_else(|| "invalid hex character".to_string())?;
+            .ok_or_else(|| "invalid hex character".to_owned())?;
         let lo = (bytes[offset + 1] as char)
             .to_digit(16)
-            .ok_or_else(|| "invalid hex character".to_string())?;
+            .ok_or_else(|| "invalid hex character".to_owned())?;
         *slot = ((hi << 4) | lo) as u8;
     }
     Ok(out)
@@ -405,7 +405,7 @@ fn load_key_hex_from_secure_path(path: &Path, label: &str) -> Result<String, Str
     if normalized.is_empty() {
         return Err(format!("{label} must not be empty: {}", path.display()));
     }
-    Ok(normalized.to_string())
+    Ok(normalized.to_owned())
 }
 
 fn phase10_provenance_dir_from_env_or_default() -> Result<PathBuf, String> {
@@ -499,7 +499,7 @@ fn ensure_phase10_provenance_keypair_exists() -> Result<(), String> {
             write_phase10_provenance_keypair(signing_key_path.as_path(), verifier_key_path.as_path())
         }
         _ => Err(
-            "phase10 provenance key material is incomplete: signing and verifier keys must either both exist or both be absent".to_string(),
+            "phase10 provenance key material is incomplete: signing and verifier keys must either both exist or both be absent".to_owned(),
         ),
     }
 }
@@ -535,28 +535,28 @@ fn load_phase10_verifier_key() -> Result<VerifyingKey, String> {
 
 fn validate_phase10_host_identity(host_identity: &str) -> Result<String, String> {
     if host_identity.len() > 128 {
-        return Err("phase10 provenance host identity must be <= 128 characters".to_string());
+        return Err("phase10 provenance host identity must be <= 128 characters".to_owned());
     }
     if !host_identity
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'))
     {
-        return Err("phase10 provenance host identity contains unsupported characters".to_string());
+        return Err("phase10 provenance host identity contains unsupported characters".to_owned());
     }
-    Ok(host_identity.to_string())
+    Ok(host_identity.to_owned())
 }
 
 fn phase10_host_identity_from_env_or_default() -> Result<String, String> {
     match env_optional_string(PHASE10_PROVENANCE_HOST_ID_ENV)? {
         Some(value) => validate_phase10_host_identity(value.as_str()),
-        None => Ok(DEFAULT_PHASE10_PROVENANCE_HOST_ID.to_string()),
+        None => Ok(DEFAULT_PHASE10_PROVENANCE_HOST_ID.to_owned()),
     }
 }
 
 fn validate_release_track(value: &str) -> Result<String, String> {
     let normalized = value.trim();
     match normalized {
-        "unstable" | "canary" | "stable" | "internal" | "beta" => Ok(normalized.to_string()),
+        "unstable" | "canary" | "stable" | "internal" | "beta" => Ok(normalized.to_owned()),
         _ => Err(format!("unsupported release track: {normalized}")),
     }
 }
@@ -640,14 +640,14 @@ fn release_sbom_sha256_path_from_env_or_default() -> Result<PathBuf, String> {
 fn release_track_from_env_or_default() -> Result<String, String> {
     match env_optional_string(RELEASE_TRACK_ENV)? {
         Some(value) => validate_release_track(value.as_str()),
-        None => Ok(DEFAULT_RELEASE_TRACK.to_string()),
+        None => Ok(DEFAULT_RELEASE_TRACK.to_owned()),
     }
 }
 
 fn release_host_identity_from_env_or_default() -> Result<String, String> {
     match env_optional_string(RELEASE_HOST_ID_ENV)? {
         Some(value) => validate_phase10_host_identity(value.as_str()),
-        None => Ok(DEFAULT_RELEASE_HOST_ID.to_string()),
+        None => Ok(DEFAULT_RELEASE_HOST_ID.to_owned()),
     }
 }
 
@@ -792,7 +792,7 @@ fn ensure_release_provenance_keypair_exists() -> Result<(), String> {
             verifier_key_path.as_path(),
         ),
         _ => Err(
-            "release provenance key material is incomplete: signing and verifier keys must either both exist or both be absent".to_string(),
+            "release provenance key material is incomplete: signing and verifier keys must either both exist or both be absent".to_owned(),
         ),
     }
 }
@@ -1071,11 +1071,11 @@ impl Phase9DrDrillView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "executed_at_utc".to_string(),
+            "executed_at_utc".to_owned(),
             Value::String(self.executed_at_utc),
         );
         if let Some(mode) = self.evidence_mode {
-            m.insert("evidence_mode".to_string(), Value::String(mode));
+            m.insert("evidence_mode".to_owned(), Value::String(mode));
         }
         m
     }
@@ -1098,11 +1098,11 @@ impl Phase9IncidentDrillView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "executed_at_utc".to_string(),
+            "executed_at_utc".to_owned(),
             Value::String(self.executed_at_utc),
         );
         if let Some(mode) = self.evidence_mode {
-            m.insert("evidence_mode".to_string(), Value::String(mode));
+            m.insert("evidence_mode".to_owned(), Value::String(mode));
         }
         m
     }
@@ -1124,11 +1124,11 @@ impl Phase9SloWindowView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         m.insert(
-            "window_end_utc".to_string(),
+            "window_end_utc".to_owned(),
             Value::String(self.window_end_utc),
         );
         if let Some(mode) = self.evidence_mode {
-            m.insert("evidence_mode".to_string(), Value::String(mode));
+            m.insert("evidence_mode".to_owned(), Value::String(mode));
         }
         m
     }
@@ -1165,13 +1165,13 @@ impl Phase9PerformanceSampleView {
     fn into_value_map(self) -> Map<String, Value> {
         let mut m = self.extra;
         if let Some(measured) = self.measured_at_utc {
-            m.insert("measured_at_utc".to_string(), Value::String(measured));
+            m.insert("measured_at_utc".to_owned(), Value::String(measured));
         }
         if let Some(legacy) = self.timestamp_utc {
-            m.insert("timestamp_utc".to_string(), Value::String(legacy));
+            m.insert("timestamp_utc".to_owned(), Value::String(legacy));
         }
         if let Some(mode) = self.evidence_mode {
-            m.insert("evidence_mode".to_string(), Value::String(mode));
+            m.insert("evidence_mode".to_owned(), Value::String(mode));
         }
         m
     }
@@ -1258,7 +1258,7 @@ fn run_logged_command(
 }
 
 fn phase9_backend_leakage_pattern() -> String {
-    "(wireguard|wg[-_]|wgctrl)".to_string()
+    "(wireguard|wg[-_]|wgctrl)".to_owned()
 }
 
 fn run_phase9_backend_probes(
@@ -1545,7 +1545,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
 
     let backend_probe_status = run_phase9_backend_probes(source_dir.as_path(), run_backend_probes)?;
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
 
     let compatibility_source = source_dir.join("compatibility_policy.json");
     let compatibility_policy =
@@ -1572,7 +1572,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         .and_then(Value::as_array)
         .is_none_or(std::vec::Vec::is_empty)
     {
-        return Err("crypto deprecation schedule requires non-empty entries".to_string());
+        return Err("crypto deprecation schedule requires non-empty entries".to_owned());
     }
 
     // X2: typed-view migration of slo_windows.ndjson. `window_end_utc`
@@ -1592,7 +1592,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         let window_end = entry_map
             .get("window_end_utc")
             .and_then(Value::as_str)
-            .ok_or_else(|| "missing or invalid UTC field: slo latest window_end_utc".to_string())?;
+            .ok_or_else(|| "missing or invalid UTC field: slo latest window_end_utc".to_owned())?;
         let timestamp = parse_utc_to_unix(window_end, "slo latest window_end_utc")?;
         if latest_slo
             .as_ref()
@@ -1602,7 +1602,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         }
     }
     let (slo_latest_timestamp, slo_latest) =
-        latest_slo.ok_or_else(|| "no entries in ndjson source: slo_windows.ndjson".to_string())?;
+        latest_slo.ok_or_else(|| "no entries in ndjson source: slo_windows.ndjson".to_owned())?;
     phase9_enforce_timestamp_freshness(slo_latest_timestamp, "latest slo window", now_unix)?;
 
     // X2: typed-view migration of performance_samples.ndjson. The
@@ -1616,14 +1616,14 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
     )?;
     let mut performance_entries_sorted = Vec::new();
     for (index, entry) in performance_typed_entries.into_iter().enumerate() {
-        let resolved = entry.resolved_timestamp_utc().to_string();
+        let resolved = entry.resolved_timestamp_utc().to_owned();
         let entry_map = entry.into_value_map();
         phase9_require_measured_mode(
             &entry_map,
             format!("performance_samples.ndjson entry {index}").as_str(),
         )?;
         if resolved.is_empty() {
-            return Err("missing or invalid UTC field: performance timestamp".to_string());
+            return Err("missing or invalid UTC field: performance timestamp".to_owned());
         }
         let timestamp = parse_utc_to_unix(resolved.as_str(), "performance timestamp")?;
         performance_entries_sorted.push((timestamp, entry_map));
@@ -1631,10 +1631,10 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
     performance_entries_sorted.sort_by_key(|(timestamp, _)| *timestamp);
     let (performance_start, _) = performance_entries_sorted
         .first()
-        .ok_or_else(|| "no entries in ndjson source: performance_samples.ndjson".to_string())?;
+        .ok_or_else(|| "no entries in ndjson source: performance_samples.ndjson".to_owned())?;
     let (performance_end, performance_latest) = performance_entries_sorted
         .last()
-        .ok_or_else(|| "no entries in ndjson source: performance_samples.ndjson".to_string())?;
+        .ok_or_else(|| "no entries in ndjson source: performance_samples.ndjson".to_owned())?;
     phase9_enforce_timestamp_freshness(*performance_end, "latest performance sample", now_unix)?;
     let soak_test_hours = ((*performance_end - *performance_start) as f64) / 3600.0;
     let soak_test_hours = (soak_test_hours * 1000.0).round() / 1000.0;
@@ -1696,7 +1696,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
             .get("executed_at_utc")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                "missing or invalid UTC field: incident latest executed_at_utc".to_string()
+                "missing or invalid UTC field: incident latest executed_at_utc".to_owned()
             })?;
         let timestamp = parse_utc_to_unix(executed_at, "incident latest executed_at_utc")?;
         if latest_incident
@@ -1707,7 +1707,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         }
     }
     let (incident_latest_timestamp, incident_latest) = latest_incident
-        .ok_or_else(|| "no entries in ndjson source: incident_drills.ndjson".to_string())?;
+        .ok_or_else(|| "no entries in ndjson source: incident_drills.ndjson".to_owned())?;
     phase9_enforce_timestamp_freshness(
         incident_latest_timestamp,
         "latest incident drill",
@@ -1736,7 +1736,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         let executed_at = entry_map
             .get("executed_at_utc")
             .and_then(Value::as_str)
-            .ok_or_else(|| "missing or invalid UTC field: dr latest executed_at_utc".to_string())?;
+            .ok_or_else(|| "missing or invalid UTC field: dr latest executed_at_utc".to_owned())?;
         let timestamp = parse_utc_to_unix(executed_at, "dr latest executed_at_utc")?;
         if latest_dr
             .as_ref()
@@ -1746,7 +1746,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         }
     }
     let (dr_latest_timestamp, dr_latest) =
-        latest_dr.ok_or_else(|| "no entries in ndjson source: dr_drills.ndjson".to_string())?;
+        latest_dr.ok_or_else(|| "no entries in ndjson source: dr_drills.ndjson".to_owned())?;
     phase9_enforce_timestamp_freshness(dr_latest_timestamp, "latest dr drill", now_unix)?;
 
     let backend_review_source = source_dir.join("backend_security_review.json");
@@ -1759,11 +1759,11 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
         .get("additional_backend_paths")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            "backend_security_review.json requires non-empty additional_backend_paths".to_string()
+            "backend_security_review.json requires non-empty additional_backend_paths".to_owned()
         })?;
     if additional_paths_values.is_empty() {
         return Err(
-            "backend_security_review.json requires non-empty additional_backend_paths".to_string(),
+            "backend_security_review.json requires non-empty additional_backend_paths".to_owned(),
         );
     }
     let mut additional_paths = Vec::with_capacity(additional_paths_values.len());
@@ -1772,8 +1772,8 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
             .as_str()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "backend additional path must be non-empty string".to_string())?;
-        additional_paths.push(path_value.to_string());
+            .ok_or_else(|| "backend additional path must be non-empty string".to_owned())?;
+        additional_paths.push(path_value.to_owned());
     }
 
     let backend_leakage_pattern = phase9_backend_leakage_pattern();
@@ -1871,8 +1871,7 @@ pub fn execute_ops_collect_phase9_raw_evidence() -> Result<String, String> {
             || backend_probe_status.protocol_leakage_detected)
     {
         return Err(
-            "backend agility probe controls failed; raw evidence written but collection is failing closed"
-                .to_string(),
+            "backend agility probe controls failed; raw evidence written but collection is failing closed".to_owned(),
         );
     }
 
@@ -2222,7 +2221,7 @@ fn phase10_validate_required_perf_metrics(
             ));
         }
         if required_metric_names.contains(&name) {
-            seen.insert(name.to_string());
+            seen.insert(name.to_owned());
         }
     }
     let missing = required_metric_names
@@ -2537,7 +2536,7 @@ fn build_release_provenance_document(
     let sbom_digest_value =
         read_sha256_digest_file(Path::new(sbom_digest_path.as_str()), "release sbom digest")?;
     if sbom_digest_value != sbom_sha256 {
-        return Err("release sbom digest file does not match sbom content digest".to_string());
+        return Err("release sbom digest file does not match sbom content digest".to_owned());
     }
     let artifact_size_bytes = fs::metadata(Path::new(artifact_path.as_str()))
         .map_err(|err| format!("inspect release artifact metadata failed: {err}"))?
@@ -2677,10 +2676,10 @@ fn verify_phase10_provenance_document(
         "phase10 provenance attestation",
     )? != PHASE10_PROVENANCE_SCHEMA_VERSION
     {
-        return Err("phase10 provenance attestation schema_version mismatch".to_string());
+        return Err("phase10 provenance attestation schema_version mismatch".to_owned());
     }
     if object_string_field(&document, "phase", "phase10 provenance attestation")? != "phase10" {
-        return Err("phase10 provenance attestation must set phase=phase10".to_string());
+        return Err("phase10 provenance attestation must set phase=phase10".to_owned());
     }
     let generated_at_unix = object_u64_field(
         &document,
@@ -2688,22 +2687,20 @@ fn verify_phase10_provenance_document(
         "phase10 provenance attestation",
     )?;
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
     let generated_at = i64::try_from(generated_at_unix)
-        .map_err(|_| "generated_at_unix out of range".to_string())?;
+        .map_err(|_| "generated_at_unix out of range".to_owned())?;
     if generated_at > now_unix + 300 {
-        return Err(
-            "phase10 provenance attestation generated_at_unix is in the future".to_string(),
-        );
+        return Err("phase10 provenance attestation generated_at_unix is in the future".to_owned());
     }
     if now_unix - generated_at > max_provenance_age_seconds {
-        return Err("phase10 provenance attestation is stale".to_string());
+        return Err("phase10 provenance attestation is stale".to_owned());
     }
 
     let host_identity =
         object_string_field(&document, "host_identity", "phase10 provenance attestation")?;
     if host_identity != expected_host_identity {
-        return Err("phase10 provenance host identity mismatch".to_string());
+        return Err("phase10 provenance host identity mismatch".to_owned());
     }
     let command_digest = object_string_field(
         &document,
@@ -2712,7 +2709,7 @@ fn verify_phase10_provenance_document(
     )?;
     let expected_command_digest = sha256_hex(PHASE10_PROVENANCE_COMMAND_LITERAL.as_bytes());
     if command_digest != expected_command_digest {
-        return Err("phase10 provenance command digest mismatch".to_string());
+        return Err("phase10 provenance command digest mismatch".to_owned());
     }
     let signer_key_id =
         object_string_field(&document, "signer_key_id", "phase10 provenance attestation")?;
@@ -2722,28 +2719,28 @@ fn verify_phase10_provenance_document(
         "phase10 provenance attestation",
     )?;
     if verifier_key_hex != hex_encode(verifier_key.as_bytes()) {
-        return Err("phase10 provenance verifier key mismatch".to_string());
+        return Err("phase10 provenance verifier key mismatch".to_owned());
     }
 
     let mut expected = std::collections::BTreeMap::new();
     for (label, role, path, is_json) in phase10_expected_provenance_entries(source_dir, out_dir) {
         let canonical = canonical_file_display(path.as_path(), label)?;
-        expected.insert(label.to_string(), (role.to_string(), canonical, is_json));
+        expected.insert(label.to_owned(), (role.to_owned(), canonical, is_json));
     }
 
     let entries = document
         .get("entries")
         .and_then(Value::as_array)
-        .ok_or_else(|| "phase10 provenance attestation missing entries array".to_string())?;
+        .ok_or_else(|| "phase10 provenance attestation missing entries array".to_owned())?;
     if entries.len() != expected.len() {
-        return Err("phase10 provenance attestation entry count mismatch".to_string());
+        return Err("phase10 provenance attestation entry count mismatch".to_owned());
     }
 
     let mut seen = std::collections::BTreeSet::new();
     for entry in entries {
         let entry_obj = entry
             .as_object()
-            .ok_or_else(|| "phase10 provenance entry must be a JSON object".to_string())?;
+            .ok_or_else(|| "phase10 provenance entry must be a JSON object".to_owned())?;
         let label = object_string_field(entry_obj, "label", "phase10 provenance entry")?;
         if !seen.insert(label.clone()) {
             return Err(format!(
@@ -2824,7 +2821,7 @@ fn verify_phase10_provenance_document(
     }
 
     if seen.len() != expected.len() {
-        return Err("phase10 provenance attestation missing required entries".to_string());
+        return Err("phase10 provenance attestation missing required entries".to_owned());
     }
     Ok(())
 }
@@ -2851,10 +2848,10 @@ fn verify_release_provenance_document(
         "release provenance attestation",
     )? != RELEASE_PROVENANCE_SCHEMA_VERSION
     {
-        return Err("release provenance schema_version mismatch".to_string());
+        return Err("release provenance schema_version mismatch".to_owned());
     }
     if object_string_field(&provenance, "phase", "release provenance attestation")? != "release" {
-        return Err("release provenance must set phase=release".to_string());
+        return Err("release provenance must set phase=release".to_owned());
     }
 
     let generated_at_unix = object_u64_field(
@@ -2863,14 +2860,14 @@ fn verify_release_provenance_document(
         "release provenance attestation",
     )?;
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
     let generated_at = i64::try_from(generated_at_unix)
-        .map_err(|_| "release provenance generated_at_unix out of range".to_string())?;
+        .map_err(|_| "release provenance generated_at_unix out of range".to_owned())?;
     if generated_at > now_unix + 300 {
-        return Err("release provenance generated_at_unix is in the future".to_string());
+        return Err("release provenance generated_at_unix is in the future".to_owned());
     }
     if now_unix - generated_at > inputs.max_provenance_age_seconds {
-        return Err("release provenance attestation is stale".to_string());
+        return Err("release provenance attestation is stale".to_owned());
     }
 
     let host_identity = object_string_field(
@@ -2879,7 +2876,7 @@ fn verify_release_provenance_document(
         "release provenance attestation",
     )?;
     if host_identity != inputs.expected_host_identity {
-        return Err("release provenance host identity mismatch".to_string());
+        return Err("release provenance host identity mismatch".to_owned());
     }
 
     let release_track = object_string_field(
@@ -2889,7 +2886,7 @@ fn verify_release_provenance_document(
     )?;
     let release_track = validate_release_track(release_track.as_str())?;
     if release_track != expected_release_track {
-        return Err("release provenance release_track mismatch".to_string());
+        return Err("release provenance release_track mismatch".to_owned());
     }
 
     let command_digest = object_string_field(
@@ -2899,7 +2896,7 @@ fn verify_release_provenance_document(
     )?;
     let expected_command_digest = sha256_hex(RELEASE_PROVENANCE_COMMAND_LITERAL.as_bytes());
     if command_digest != expected_command_digest {
-        return Err("release provenance command digest mismatch".to_string());
+        return Err("release provenance command digest mismatch".to_owned());
     }
 
     let signer_key_id = object_string_field(
@@ -2913,7 +2910,7 @@ fn verify_release_provenance_document(
         "release provenance attestation",
     )?;
     if verifier_key_hex != hex_encode(inputs.verifier_key.as_bytes()) {
-        return Err("release provenance verifier key mismatch".to_string());
+        return Err("release provenance verifier key mismatch".to_owned());
     }
 
     let artifact_path = object_string_field(
@@ -2924,7 +2921,7 @@ fn verify_release_provenance_document(
     let expected_artifact =
         canonical_file_display(inputs.expected_artifact_path, "release artifact")?;
     if artifact_path != expected_artifact {
-        return Err("release provenance artifact path mismatch".to_string());
+        return Err("release provenance artifact path mismatch".to_owned());
     }
     let artifact_sha256 = object_string_field(
         &provenance,
@@ -2933,7 +2930,7 @@ fn verify_release_provenance_document(
     )?;
     let actual_artifact_sha256 = sha256_file_hex(Path::new(artifact_path.as_str()))?;
     if artifact_sha256 != actual_artifact_sha256 {
-        return Err("release provenance artifact digest mismatch".to_string());
+        return Err("release provenance artifact digest mismatch".to_owned());
     }
     let artifact_size_bytes = object_u64_field(
         &provenance,
@@ -2944,20 +2941,20 @@ fn verify_release_provenance_document(
         .map_err(|err| format!("inspect release artifact metadata failed: {err}"))?
         .len();
     if artifact_size_bytes != actual_artifact_size {
-        return Err("release provenance artifact size mismatch".to_string());
+        return Err("release provenance artifact size mismatch".to_owned());
     }
 
     let sbom_path =
         object_string_field(&provenance, "sbom_path", "release provenance attestation")?;
     let expected_sbom = canonical_file_display(inputs.expected_sbom_path, "release sbom")?;
     if sbom_path != expected_sbom {
-        return Err("release provenance sbom path mismatch".to_string());
+        return Err("release provenance sbom path mismatch".to_owned());
     }
     let sbom_sha256 =
         object_string_field(&provenance, "sbom_sha256", "release provenance attestation")?;
     let actual_sbom_sha256 = sha256_file_hex(Path::new(sbom_path.as_str()))?;
     if sbom_sha256 != actual_sbom_sha256 {
-        return Err("release provenance sbom digest mismatch".to_string());
+        return Err("release provenance sbom digest mismatch".to_owned());
     }
 
     let sbom_digest_path = object_string_field(
@@ -2968,7 +2965,7 @@ fn verify_release_provenance_document(
     let expected_sbom_digest =
         canonical_file_display(inputs.expected_sbom_digest_path, "release sbom digest")?;
     if sbom_digest_path != expected_sbom_digest {
-        return Err("release provenance sbom digest path mismatch".to_string());
+        return Err("release provenance sbom digest path mismatch".to_owned());
     }
     let sbom_digest_value = object_string_field(
         &provenance,
@@ -2978,7 +2975,7 @@ fn verify_release_provenance_document(
     let actual_sbom_digest_value =
         read_sha256_digest_file(Path::new(sbom_digest_path.as_str()), "release sbom digest")?;
     if sbom_digest_value != actual_sbom_digest_value || sbom_digest_value != sbom_sha256 {
-        return Err("release provenance sbom digest value mismatch".to_string());
+        return Err("release provenance sbom digest value mismatch".to_owned());
     }
 
     let signature_hex = object_string_field(
@@ -3007,7 +3004,7 @@ fn verify_release_provenance_document(
     inputs
         .verifier_key
         .verify(payload.as_bytes(), &signature)
-        .map_err(|_| "release provenance signature verification failed".to_string())?;
+        .map_err(|_| "release provenance signature verification failed".to_owned())?;
     Ok(())
 }
 
@@ -3060,11 +3057,11 @@ fn phase9_parse_measured_artifact_document(
 fn phase6_report_captured_at_unix(report_path: &Path) -> Result<u64, String> {
     let report = read_json_object(report_path, "phase6 parity report")?;
     if report.get("gate_passed").is_some() {
-        return Err("phase6 parity report must not include gate_passed field".to_string());
+        return Err("phase6 parity report must not include gate_passed field".to_owned());
     }
     let evidence_mode = object_string_field(&report, "evidence_mode", "phase6 parity report")?;
     if evidence_mode != "measured" {
-        return Err("phase6 parity report must set evidence_mode=measured".to_string());
+        return Err("phase6 parity report must set evidence_mode=measured".to_owned());
     }
     let _ = object_string_field(&report, "environment", "phase6 parity report")?;
     phase9_validate_source_artifacts_field(&report, "phase6 parity report")?;
@@ -3285,10 +3282,10 @@ fn verify_phase6_parity_attestation_document(
     if object_u64_field(&attestation, "schema_version", "phase6 parity attestation")?
         != PHASE6_PARITY_ATTESTATION_SCHEMA_VERSION
     {
-        return Err("phase6 parity attestation schema_version mismatch".to_string());
+        return Err("phase6 parity attestation schema_version mismatch".to_owned());
     }
     if object_string_field(&attestation, "phase", "phase6 parity attestation")? != "phase6" {
-        return Err("phase6 parity attestation must set phase=phase6".to_string());
+        return Err("phase6 parity attestation must set phase=phase6".to_owned());
     }
 
     let generated_at_unix = object_u64_field(
@@ -3297,20 +3294,20 @@ fn verify_phase6_parity_attestation_document(
         "phase6 parity attestation",
     )?;
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
     let generated_at = i64::try_from(generated_at_unix)
-        .map_err(|_| "phase6 parity generated_at_unix out of range".to_string())?;
+        .map_err(|_| "phase6 parity generated_at_unix out of range".to_owned())?;
     if generated_at > now_unix + 300 {
-        return Err("phase6 parity generated_at_unix is in the future".to_string());
+        return Err("phase6 parity generated_at_unix is in the future".to_owned());
     }
     if now_unix - generated_at > inputs.max_attestation_age_seconds {
-        return Err("phase6 parity attestation is stale".to_string());
+        return Err("phase6 parity attestation is stale".to_owned());
     }
 
     let host_identity =
         object_string_field(&attestation, "host_identity", "phase6 parity attestation")?;
     if host_identity != inputs.expected_host_identity {
-        return Err("phase6 parity host identity mismatch".to_string());
+        return Err("phase6 parity host identity mismatch".to_owned());
     }
 
     let command_digest = object_string_field(
@@ -3320,7 +3317,7 @@ fn verify_phase6_parity_attestation_document(
     )?;
     let expected_command_digest = sha256_hex(PHASE6_PARITY_ATTESTATION_COMMAND_LITERAL.as_bytes());
     if command_digest != expected_command_digest {
-        return Err("phase6 parity command digest mismatch".to_string());
+        return Err("phase6 parity command digest mismatch".to_owned());
     }
 
     let signer_key_id =
@@ -3328,7 +3325,7 @@ fn verify_phase6_parity_attestation_document(
     let expected_signer_fingerprint = sha256_hex(inputs.verifier_key.as_bytes());
     let expected_signer_key_id = format!("ed25519:{}", &expected_signer_fingerprint[..16]);
     if signer_key_id != expected_signer_key_id {
-        return Err("phase6 parity signer key id mismatch".to_string());
+        return Err("phase6 parity signer key id mismatch".to_owned());
     }
     let verifier_key_hex = object_string_field(
         &attestation,
@@ -3336,12 +3333,12 @@ fn verify_phase6_parity_attestation_document(
         "phase6 parity attestation",
     )?;
     if verifier_key_hex != hex_encode(inputs.verifier_key.as_bytes()) {
-        return Err("phase6 parity verifier key mismatch".to_string());
+        return Err("phase6 parity verifier key mismatch".to_owned());
     }
 
     let git_commit = object_string_field(&attestation, "git_commit", "phase6 parity attestation")?;
     if git_commit != inputs.expected_git_commit {
-        return Err("phase6 parity git commit mismatch".to_string());
+        return Err("phase6 parity git commit mismatch".to_owned());
     }
 
     let report_path =
@@ -3349,13 +3346,13 @@ fn verify_phase6_parity_attestation_document(
     let expected_report =
         canonical_file_display(inputs.expected_report_path, "phase6 parity report")?;
     if report_path != expected_report {
-        return Err("phase6 parity report path mismatch".to_string());
+        return Err("phase6 parity report path mismatch".to_owned());
     }
     let report_sha256 =
         object_string_field(&attestation, "report_sha256", "phase6 parity attestation")?;
     let actual_report_sha256 = sha256_file_hex(Path::new(report_path.as_str()))?;
     if report_sha256 != actual_report_sha256 {
-        return Err("phase6 parity report digest mismatch".to_string());
+        return Err("phase6 parity report digest mismatch".to_owned());
     }
 
     let report_captured_at_unix = object_u64_field(
@@ -3364,17 +3361,17 @@ fn verify_phase6_parity_attestation_document(
         "phase6 parity attestation",
     )?;
     let report_captured_at = i64::try_from(report_captured_at_unix)
-        .map_err(|_| "phase6 parity report_captured_at_unix out of range".to_string())?;
+        .map_err(|_| "phase6 parity report_captured_at_unix out of range".to_owned())?;
     if report_captured_at > now_unix + 300 {
-        return Err("phase6 parity report_captured_at_unix is in the future".to_string());
+        return Err("phase6 parity report_captured_at_unix is in the future".to_owned());
     }
     if now_unix - report_captured_at > inputs.max_attestation_age_seconds {
-        return Err("phase6 parity report_captured_at_unix is stale".to_string());
+        return Err("phase6 parity report_captured_at_unix is stale".to_owned());
     }
     let observed_report_captured_at =
         phase6_report_captured_at_unix(Path::new(report_path.as_str()))?;
     if report_captured_at_unix != observed_report_captured_at {
-        return Err("phase6 parity report captured_at_unix mismatch".to_string());
+        return Err("phase6 parity report captured_at_unix mismatch".to_owned());
     }
 
     let signature_hex =
@@ -3396,7 +3393,7 @@ fn verify_phase6_parity_attestation_document(
     inputs
         .verifier_key
         .verify(payload.as_bytes(), &signature)
-        .map_err(|_| "phase6 parity signature verification failed".to_string())?;
+        .map_err(|_| "phase6 parity signature verification failed".to_owned())?;
     Ok(())
 }
 
@@ -3435,7 +3432,7 @@ fn build_phase9_evidence_attestation_document(
             ));
         }
         artifacts.push(Phase9EvidenceArtifactEntry {
-            name: (*name).to_string(),
+            name: (*name).to_owned(),
             artifact_path: canonical_path,
             artifact_sha256,
             captured_at_unix,
@@ -3500,10 +3497,10 @@ fn verify_phase9_evidence_attestation_document(
         "phase9 evidence attestation",
     )? != PHASE9_EVIDENCE_ATTESTATION_SCHEMA_VERSION
     {
-        return Err("phase9 evidence attestation schema_version mismatch".to_string());
+        return Err("phase9 evidence attestation schema_version mismatch".to_owned());
     }
     if object_string_field(&attestation, "phase", "phase9 evidence attestation")? != "phase9" {
-        return Err("phase9 evidence attestation must set phase=phase9".to_string());
+        return Err("phase9 evidence attestation must set phase=phase9".to_owned());
     }
 
     let generated_at_unix = object_u64_field(
@@ -3512,20 +3509,20 @@ fn verify_phase9_evidence_attestation_document(
         "phase9 evidence attestation",
     )?;
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
     let generated_at = i64::try_from(generated_at_unix)
-        .map_err(|_| "phase9 evidence generated_at_unix out of range".to_string())?;
+        .map_err(|_| "phase9 evidence generated_at_unix out of range".to_owned())?;
     if generated_at > now_unix + 300 {
-        return Err("phase9 evidence generated_at_unix is in the future".to_string());
+        return Err("phase9 evidence generated_at_unix is in the future".to_owned());
     }
     if now_unix - generated_at > inputs.max_attestation_age_seconds {
-        return Err("phase9 evidence attestation is stale".to_string());
+        return Err("phase9 evidence attestation is stale".to_owned());
     }
 
     let host_identity =
         object_string_field(&attestation, "host_identity", "phase9 evidence attestation")?;
     if host_identity != inputs.expected_host_identity {
-        return Err("phase9 evidence host identity mismatch".to_string());
+        return Err("phase9 evidence host identity mismatch".to_owned());
     }
 
     let command_digest = object_string_field(
@@ -3536,7 +3533,7 @@ fn verify_phase9_evidence_attestation_document(
     let expected_command_digest =
         sha256_hex(PHASE9_EVIDENCE_ATTESTATION_COMMAND_LITERAL.as_bytes());
     if command_digest != expected_command_digest {
-        return Err("phase9 evidence command digest mismatch".to_string());
+        return Err("phase9 evidence command digest mismatch".to_owned());
     }
 
     let signer_key_id =
@@ -3544,7 +3541,7 @@ fn verify_phase9_evidence_attestation_document(
     let expected_signer_fingerprint = sha256_hex(inputs.verifier_key.as_bytes());
     let expected_signer_key_id = format!("ed25519:{}", &expected_signer_fingerprint[..16]);
     if signer_key_id != expected_signer_key_id {
-        return Err("phase9 evidence signer key id mismatch".to_string());
+        return Err("phase9 evidence signer key id mismatch".to_owned());
     }
     let verifier_key_hex = object_string_field(
         &attestation,
@@ -3552,13 +3549,13 @@ fn verify_phase9_evidence_attestation_document(
         "phase9 evidence attestation",
     )?;
     if verifier_key_hex != hex_encode(inputs.verifier_key.as_bytes()) {
-        return Err("phase9 evidence verifier key mismatch".to_string());
+        return Err("phase9 evidence verifier key mismatch".to_owned());
     }
 
     let git_commit =
         object_string_field(&attestation, "git_commit", "phase9 evidence attestation")?;
     if git_commit != inputs.expected_git_commit {
-        return Err("phase9 evidence git commit mismatch".to_string());
+        return Err("phase9 evidence git commit mismatch".to_owned());
     }
     let environment =
         object_string_field(&attestation, "environment", "phase9 evidence attestation")?;
@@ -3566,9 +3563,9 @@ fn verify_phase9_evidence_attestation_document(
     let entries = attestation
         .get("artifacts")
         .and_then(Value::as_array)
-        .ok_or_else(|| "phase9 evidence attestation missing artifacts array".to_string())?;
+        .ok_or_else(|| "phase9 evidence attestation missing artifacts array".to_owned())?;
     if entries.len() != PHASE9_REQUIRED_ARTIFACTS.len() {
-        return Err("phase9 evidence attestation artifact count mismatch".to_string());
+        return Err("phase9 evidence attestation artifact count mismatch".to_owned());
     }
 
     let mut expected_paths = std::collections::BTreeMap::new();
@@ -3577,14 +3574,14 @@ fn verify_phase9_evidence_attestation_document(
             inputs.expected_out_dir.join(name).as_path(),
             "phase9 evidence artifact",
         )?;
-        expected_paths.insert((*name).to_string(), expected_path);
+        expected_paths.insert((*name).to_owned(), expected_path);
     }
 
     let mut seen = std::collections::BTreeSet::new();
     let mut observed_entries = std::collections::BTreeMap::new();
     for entry in entries {
         let entry_object = entry.as_object().ok_or_else(|| {
-            "phase9 evidence attestation artifact entry must be object".to_string()
+            "phase9 evidence attestation artifact entry must be object".to_owned()
         })?;
         let name = object_string_field(entry_object, "name", "phase9 evidence artifact entry")?;
         if !seen.insert(name.clone()) {
@@ -3660,7 +3657,7 @@ fn verify_phase9_evidence_attestation_document(
     }
 
     if seen.len() != PHASE9_REQUIRED_ARTIFACTS.len() {
-        return Err("phase9 evidence attestation missing required artifacts".to_string());
+        return Err("phase9 evidence attestation missing required artifacts".to_owned());
     }
 
     let mut ordered_entries = Vec::with_capacity(PHASE9_REQUIRED_ARTIFACTS.len());
@@ -3673,7 +3670,7 @@ fn verify_phase9_evidence_attestation_document(
         ordered_entries.push(entry);
     }
     if !observed_entries.is_empty() {
-        return Err("phase9 evidence attestation contains unexpected artifacts".to_string());
+        return Err("phase9 evidence attestation contains unexpected artifacts".to_owned());
     }
 
     let signature_hex =
@@ -3694,7 +3691,7 @@ fn verify_phase9_evidence_attestation_document(
     inputs
         .verifier_key
         .verify(payload.as_bytes(), &signature)
-        .map_err(|_| "phase9 evidence signature verification failed".to_string())?;
+        .map_err(|_| "phase9 evidence signature verification failed".to_owned())?;
     Ok(())
 }
 
@@ -3705,7 +3702,7 @@ fn write_phase9_evidence_attestation(out_dir: &Path, environment: &str) -> Resul
     let derived_verifier_key = signing_key.verifying_key();
     if derived_verifier_key.as_bytes() != verifier_key.as_bytes() {
         return Err(
-            "phase9 evidence key mismatch: signing key does not match verifier key".to_string(),
+            "phase9 evidence key mismatch: signing key does not match verifier key".to_owned(),
         );
     }
 
@@ -3734,7 +3731,7 @@ pub fn write_phase6_parity_evidence_attestation(report_path: &Path) -> Result<()
     let derived_verifier_key = signing_key.verifying_key();
     if derived_verifier_key.as_bytes() != verifier_key.as_bytes() {
         return Err(
-            "phase6 parity key mismatch: signing key does not match verifier key".to_string(),
+            "phase6 parity key mismatch: signing key does not match verifier key".to_owned(),
         );
     }
 
@@ -3791,9 +3788,9 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         DEFAULT_PHASE9_MAX_SOURCE_AGE_SECONDS as u64,
     )?;
     let max_evidence_age_seconds = i64::try_from(max_evidence_age_seconds)
-        .map_err(|_| "RUSTYNET_PHASE9_MAX_EVIDENCE_AGE_SECONDS is too large".to_string())?;
+        .map_err(|_| "RUSTYNET_PHASE9_MAX_EVIDENCE_AGE_SECONDS is too large".to_owned())?;
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
 
     let compatibility_policy_path = out_dir.join("compatibility_policy.json");
     let compatibility_policy =
@@ -3814,14 +3811,14 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         .and_then(Value::as_object)
         .ok_or_else(|| {
             "compatibility policy requires minimum_supported_client and latest_server objects"
-                .to_string()
+                .to_owned()
         })?;
     let latest_server = compatibility_policy
         .get("latest_server")
         .and_then(Value::as_object)
         .ok_or_else(|| {
             "compatibility policy requires minimum_supported_client and latest_server objects"
-                .to_string()
+                .to_owned()
         })?;
     let minimum_major = phase9_require_integer(
         minimum_supported_client,
@@ -3839,8 +3836,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         phase9_require_integer(latest_server, "minor", "compatibility_policy latest_server")?;
     if (minimum_major, minimum_minor) > (latest_major, latest_minor) {
         return Err(
-            "compatibility policy invalid: minimum client is greater than latest server"
-                .to_string(),
+            "compatibility policy invalid: minimum client is greater than latest server".to_owned(),
         );
     }
     if phase9_require_number(
@@ -3849,14 +3845,14 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "compatibility_policy",
     )? <= 0.0
     {
-        return Err("compatibility policy invalid: deprecation window must be > 0".to_string());
+        return Err("compatibility policy invalid: deprecation window must be > 0".to_owned());
     }
     let insecure_mode = compatibility_policy
         .get("insecure_compatibility_mode")
         .and_then(Value::as_object)
         .ok_or_else(|| {
             "compatibility policy invalid: insecure_compatibility_mode object is required"
-                .to_string()
+                .to_owned()
         })?;
     if phase9_require_bool(
         insecure_mode,
@@ -3865,7 +3861,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
     )? {
         return Err(
             "compatibility policy invalid: insecure compatibility default must be disabled"
-                .to_string(),
+                .to_owned(),
         );
     }
     if !phase9_require_bool(
@@ -3878,7 +3874,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "compatibility_policy insecure_compatibility_mode",
     )? {
         return Err(
-            "compatibility policy invalid: risk acceptance + auto-expiry are mandatory".to_string(),
+            "compatibility policy invalid: risk acceptance + auto-expiry are mandatory".to_owned(),
         );
     }
 
@@ -3895,7 +3891,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
     let window_start_unix = parse_utc_to_unix(window_start.as_str(), "slo window_start_utc")?;
     let window_end_unix = parse_utc_to_unix(window_end.as_str(), "slo window_end_utc")?;
     if window_end_unix <= window_start_unix {
-        return Err("slo gate failed: window_end_utc must be after window_start_utc".to_string());
+        return Err("slo gate failed: window_end_utc must be after window_start_utc".to_owned());
     }
     if phase9_require_number(
         &slo,
@@ -3903,7 +3899,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "slo_error_budget_report",
     )? < phase9_require_number(&slo, "availability_slo_percent", "slo_error_budget_report")?
     {
-        return Err("slo gate failed: measured availability below target".to_string());
+        return Err("slo gate failed: measured availability below target".to_owned());
     }
     if phase9_require_number(
         &slo,
@@ -3914,7 +3910,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "max_error_budget_consumed_percent",
         "slo_error_budget_report",
     )? {
-        return Err("slo gate failed: error budget over-consumed".to_string());
+        return Err("slo gate failed: error budget over-consumed".to_owned());
     }
 
     let performance_path = out_dir.join("performance_budget_report.json");
@@ -3931,10 +3927,10 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "performance_budget_report",
     )? > 2.0
     {
-        return Err("performance gate failed: idle CPU above 2%".to_string());
+        return Err("performance gate failed: idle CPU above 2%".to_owned());
     }
     if phase9_require_number(&performance, "idle_memory_mb", "performance_budget_report")? > 120.0 {
-        return Err("performance gate failed: idle memory above 120 MB".to_string());
+        return Err("performance gate failed: idle memory above 120 MB".to_owned());
     }
     if phase9_require_number(
         &performance,
@@ -3942,7 +3938,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "performance_budget_report",
     )? > 5.0
     {
-        return Err("performance gate failed: reconnect above 5 seconds".to_string());
+        return Err("performance gate failed: reconnect above 5 seconds".to_owned());
     }
     if phase9_require_number(
         &performance,
@@ -3950,7 +3946,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "performance_budget_report",
     )? > 2.0
     {
-        return Err("performance gate failed: route apply p95 above 2 seconds".to_string());
+        return Err("performance gate failed: route apply p95 above 2 seconds".to_owned());
     }
     if phase9_require_number(
         &performance,
@@ -3958,10 +3954,10 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "performance_budget_report",
     )? > 15.0
     {
-        return Err("performance gate failed: throughput overhead above 15%".to_string());
+        return Err("performance gate failed: throughput overhead above 15%".to_owned());
     }
     if phase9_require_number(&performance, "soak_test_hours", "performance_budget_report")? < 24.0 {
-        return Err("performance gate failed: soak test duration under 24 hours".to_string());
+        return Err("performance gate failed: soak test duration under 24 hours".to_owned());
     }
 
     let incident_path = out_dir.join("incident_drill_report.json");
@@ -3976,17 +3972,17 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         phase9_require_string(&incident, "executed_at_utc", "incident_drill_report")?;
     let _ = parse_utc_to_unix(incident_executed_at.as_str(), "incident executed_at_utc")?;
     if !phase9_require_bool(&incident, "postmortem_completed", "incident_drill_report")? {
-        return Err("incident gate failed: postmortem not completed".to_string());
+        return Err("incident gate failed: postmortem not completed".to_owned());
     }
     if !phase9_require_bool(&incident, "action_items_closed", "incident_drill_report")? {
-        return Err("incident gate failed: action items not closed".to_string());
+        return Err("incident gate failed: action items not closed".to_owned());
     }
     if !phase9_require_bool(
         &incident,
         "oncall_readiness_confirmed",
         "incident_drill_report",
     )? {
-        return Err("incident gate failed: on-call readiness not confirmed".to_string());
+        return Err("incident gate failed: on-call readiness not confirmed".to_owned());
     }
 
     let dr_path = out_dir.join("dr_failover_report.json");
@@ -4000,20 +3996,20 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
     let dr_executed_at = phase9_require_string(&dr, "executed_at_utc", "dr_failover_report")?;
     let _ = parse_utc_to_unix(dr_executed_at.as_str(), "dr executed_at_utc")?;
     if phase9_require_integer(&dr, "region_count", "dr_failover_report")? < 2 {
-        return Err("dr gate failed: fewer than two regions validated".to_string());
+        return Err("dr gate failed: fewer than two regions validated".to_owned());
     }
     if phase9_require_number(&dr, "measured_rpo_minutes", "dr_failover_report")?
         > phase9_require_number(&dr, "rpo_target_minutes", "dr_failover_report")?
     {
-        return Err("dr gate failed: RPO target not met".to_string());
+        return Err("dr gate failed: RPO target not met".to_owned());
     }
     if phase9_require_number(&dr, "measured_rto_minutes", "dr_failover_report")?
         > phase9_require_number(&dr, "rto_target_minutes", "dr_failover_report")?
     {
-        return Err("dr gate failed: RTO target not met".to_string());
+        return Err("dr gate failed: RTO target not met".to_owned());
     }
     if !phase9_require_bool(&dr, "restore_integrity_verified", "dr_failover_report")? {
-        return Err("dr gate failed: restore integrity not verified".to_string());
+        return Err("dr gate failed: restore integrity not verified".to_owned());
     }
 
     let backend_path = out_dir.join("backend_agility_report.json");
@@ -4027,19 +4023,19 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
     let default_backend =
         phase9_require_string(&backend, "default_backend", "backend_agility_report")?;
     if !default_backend.eq_ignore_ascii_case("wireguard") {
-        return Err("backend agility gate failed: default backend must be wireguard".to_string());
+        return Err("backend agility gate failed: default backend must be wireguard".to_owned());
     }
     let additional_backend_paths = backend
         .get("additional_backend_paths")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             "backend agility gate failed: at least one additional backend path is required"
-                .to_string()
+                .to_owned()
         })?;
     if additional_backend_paths.is_empty() {
         return Err(
             "backend agility gate failed: at least one additional backend path is required"
-                .to_string(),
+                .to_owned(),
         );
     }
     for value in additional_backend_paths {
@@ -4048,7 +4044,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
             .map(str::trim)
             .filter(|entry| !entry.is_empty())
             .ok_or_else(|| {
-                "backend agility gate failed: invalid additional backend path entry".to_string()
+                "backend agility gate failed: invalid additional backend path entry".to_owned()
             })?;
         if phase9_contains_any_case_insensitive(path, &["stub", "fake", "mock", "simulat"]) {
             return Err(format!(
@@ -4069,38 +4065,38 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         }
     }
     if !phase9_require_bool(&backend, "conformance_passed", "backend_agility_report")? {
-        return Err("backend agility gate failed: conformance not passed".to_string());
+        return Err("backend agility gate failed: conformance not passed".to_owned());
     }
     if !phase9_require_bool(
         &backend,
         "security_review_complete",
         "backend_agility_report",
     )? {
-        return Err("backend agility gate failed: security review incomplete".to_string());
+        return Err("backend agility gate failed: security review incomplete".to_owned());
     }
     if !phase9_require_bool(
         &backend,
         "wireguard_is_adapter_boundary",
         "backend_agility_report",
     )? {
-        return Err("backend agility gate failed: wireguard boundary not preserved".to_string());
+        return Err("backend agility gate failed: wireguard boundary not preserved".to_owned());
     }
     if phase9_require_bool(
         &backend,
         "protocol_leakage_detected",
         "backend_agility_report",
     )? {
-        return Err("backend agility gate failed: protocol leakage detected".to_string());
+        return Err("backend agility gate failed: protocol leakage detected".to_owned());
     }
     let evidence_commands = backend
         .get("evidence_commands")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            "backend agility gate failed: evidence_commands must be a non-empty list".to_string()
+            "backend agility gate failed: evidence_commands must be a non-empty list".to_owned()
         })?;
     if evidence_commands.is_empty() {
         return Err(
-            "backend agility gate failed: evidence_commands must be a non-empty list".to_string(),
+            "backend agility gate failed: evidence_commands must be a non-empty list".to_owned(),
         );
     }
     for value in evidence_commands {
@@ -4109,12 +4105,12 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
             .map(str::trim)
             .filter(|entry| !entry.is_empty())
             .ok_or_else(|| {
-                "backend agility gate failed: invalid command in evidence_commands".to_string()
+                "backend agility gate failed: invalid command in evidence_commands".to_owned()
             })?;
         if phase9_contains_any_case_insensitive(command, &["backend-stub", "stub-backend"]) {
             return Err(
                 "backend agility gate failed: stub backend command is not valid evidence"
-                    .to_string(),
+                    .to_owned(),
             );
         }
     }
@@ -4130,14 +4126,14 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
     let entries = crypto
         .get("entries")
         .and_then(Value::as_array)
-        .ok_or_else(|| "crypto schedule gate failed: no deprecation entries present".to_string())?;
+        .ok_or_else(|| "crypto schedule gate failed: no deprecation entries present".to_owned())?;
     if entries.is_empty() {
-        return Err("crypto schedule gate failed: no deprecation entries present".to_string());
+        return Err("crypto schedule gate failed: no deprecation entries present".to_owned());
     }
     for entry in entries {
         let entry_obj = entry
             .as_object()
-            .ok_or_else(|| "crypto schedule gate failed: invalid entry type".to_string())?;
+            .ok_or_else(|| "crypto schedule gate failed: invalid entry type".to_owned())?;
         let deprecates_at = phase9_require_string(
             entry_obj,
             "deprecates_at_utc",
@@ -4153,8 +4149,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         let removal_at_unix = parse_utc_to_unix(removal_at.as_str(), "crypto removal_at_utc")?;
         if removal_at_unix <= deprecates_at_unix {
             return Err(
-                "crypto schedule gate failed: removal timestamp must be after deprecation timestamp"
-                    .to_string(),
+                "crypto schedule gate failed: removal timestamp must be after deprecation timestamp".to_owned(),
             );
         }
     }
@@ -4165,7 +4160,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
     )? {
         return Err(
             "crypto schedule gate failed: insecure exceptions must be disabled by default"
-                .to_string(),
+                .to_owned(),
         );
     }
     if !phase9_require_bool(
@@ -4174,7 +4169,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "crypto_deprecation_schedule",
     )? {
         return Err(
-            "crypto schedule gate failed: exceptions must require risk acceptance".to_string(),
+            "crypto schedule gate failed: exceptions must require risk acceptance".to_owned(),
         );
     }
     if !phase9_require_bool(
@@ -4182,7 +4177,7 @@ pub fn execute_ops_verify_phase9_readiness() -> Result<String, String> {
         "exceptions_auto_expire",
         "crypto_deprecation_schedule",
     )? {
-        return Err("crypto schedule gate failed: exceptions must auto-expire".to_string());
+        return Err("crypto schedule gate failed: exceptions must auto-expire".to_owned());
     }
 
     Ok(format!(
@@ -4229,11 +4224,11 @@ pub fn execute_ops_generate_phase9_artifacts() -> Result<String, String> {
         ensure_regular_file(source.as_path(), "raw phase9 evidence input")?;
         let mut document = read_json_object(source.as_path(), "raw phase9 evidence")?;
         document.remove("gate_passed");
-        document.insert("evidence_mode".to_string(), json!("measured"));
-        document.insert("captured_at_unix".to_string(), json!(captured_at_unix));
-        document.insert("environment".to_string(), json!(environment.as_str()));
+        document.insert("evidence_mode".to_owned(), json!("measured"));
+        document.insert("captured_at_unix".to_owned(), json!(captured_at_unix));
+        document.insert("environment".to_owned(), json!(environment.as_str()));
         document.insert(
-            "source_artifacts".to_string(),
+            "source_artifacts".to_owned(),
             json!([source.display().to_string()]),
         );
 
@@ -4271,7 +4266,7 @@ pub fn execute_ops_write_phase10_hp2_traversal_reports(
 
     let environment = config.environment.trim();
     if environment.is_empty() {
-        return Err("phase10 HP2 environment label must not be empty".to_string());
+        return Err("phase10 HP2 environment label must not be empty".to_owned());
     }
 
     let captured_at_unix = unix_now();
@@ -4353,13 +4348,13 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
         DEFAULT_PHASE10_MAX_SOURCE_AGE_SECONDS,
     )?;
     let max_source_age_seconds = i64::try_from(max_source_age_seconds)
-        .map_err(|_| "RUSTYNET_PHASE10_MAX_SOURCE_AGE_SECONDS is too large".to_string())?;
+        .map_err(|_| "RUSTYNET_PHASE10_MAX_SOURCE_AGE_SECONDS is too large".to_owned())?;
     let max_provenance_age_seconds = env_u64_with_default(
         "RUSTYNET_PHASE10_MAX_PROVENANCE_AGE_SECONDS",
         DEFAULT_PHASE10_MAX_PROVENANCE_AGE_SECONDS,
     )?;
     let max_provenance_age_seconds = i64::try_from(max_provenance_age_seconds)
-        .map_err(|_| "RUSTYNET_PHASE10_MAX_PROVENANCE_AGE_SECONDS is too large".to_string())?;
+        .map_err(|_| "RUSTYNET_PHASE10_MAX_PROVENANCE_AGE_SECONDS is too large".to_owned())?;
     ensure_phase10_provenance_keypair_exists()?;
     let provenance_host_identity = phase10_host_identity_from_env_or_default()?;
     let provenance_signing_key = load_phase10_signing_key()?;
@@ -4367,7 +4362,7 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
     let derived_verifier_key = provenance_signing_key.verifying_key();
     if derived_verifier_key.as_bytes() != provenance_verifier_key.as_bytes() {
         return Err(
-            "phase10 provenance key mismatch: signing key does not match verifier key".to_string(),
+            "phase10 provenance key mismatch: signing key does not match verifier key".to_owned(),
         );
     }
 
@@ -4379,10 +4374,10 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
     })?;
 
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
     let captured_at_unix = now_unix;
     let captured_at_unix_u64 =
-        u64::try_from(captured_at_unix).map_err(|_| "captured_at_unix out of range".to_string())?;
+        u64::try_from(captured_at_unix).map_err(|_| "captured_at_unix out of range".to_owned())?;
 
     let mut netns_payload = read_json_object(
         source_dir.join("netns_e2e_report.json").as_path(),
@@ -4563,12 +4558,12 @@ pub fn execute_ops_generate_phase10_artifacts() -> Result<String, String> {
         ),
     ] {
         payload.remove("gate_passed");
-        payload.insert("phase".to_string(), json!("phase10"));
-        payload.insert("evidence_mode".to_string(), json!("measured"));
-        payload.insert("environment".to_string(), json!(environment.as_str()));
-        payload.insert("captured_at_unix".to_string(), json!(captured_at_unix));
+        payload.insert("phase".to_owned(), json!("phase10"));
+        payload.insert("evidence_mode".to_owned(), json!("measured"));
+        payload.insert("environment".to_owned(), json!(environment.as_str()));
+        payload.insert("captured_at_unix".to_owned(), json!(captured_at_unix));
         payload.insert(
-            "source_artifacts".to_string(),
+            "source_artifacts".to_owned(),
             json!([source.display().to_string()]),
         );
         let target = out_dir.join(filename);
@@ -4629,7 +4624,7 @@ pub fn execute_ops_verify_phase10_provenance() -> Result<String, String> {
         DEFAULT_PHASE10_MAX_PROVENANCE_AGE_SECONDS,
     )?;
     let max_provenance_age_seconds = i64::try_from(max_provenance_age_seconds)
-        .map_err(|_| "RUSTYNET_PHASE10_MAX_PROVENANCE_AGE_SECONDS is too large".to_string())?;
+        .map_err(|_| "RUSTYNET_PHASE10_MAX_PROVENANCE_AGE_SECONDS is too large".to_owned())?;
     let host_identity = phase10_host_identity_from_env_or_default()?;
     let verifier_key = load_phase10_verifier_key()?;
     verify_phase10_provenance_document(
@@ -4652,9 +4647,9 @@ pub fn execute_ops_verify_phase10_readiness() -> Result<String, String> {
         DEFAULT_PHASE10_MAX_SOURCE_AGE_SECONDS,
     )?;
     let max_evidence_age_seconds_i64 = i64::try_from(max_evidence_age_seconds)
-        .map_err(|_| "RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS is too large".to_string())?;
+        .map_err(|_| "RUSTYNET_PHASE10_MAX_EVIDENCE_AGE_SECONDS is too large".to_owned())?;
     let now_unix =
-        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_string())?;
+        i64::try_from(unix_now()).map_err(|_| "current unix time out of range".to_owned())?;
 
     let netns_path = artifact_dir.join("netns_e2e_report.json");
     let leak_path = artifact_dir.join("leak_test_report.json");
@@ -4816,7 +4811,7 @@ pub fn execute_ops_verify_phase10_readiness() -> Result<String, String> {
         MAX_PHASE10_STATE_LOG_SOURCE_BYTES,
     )?;
     if !contains_generation_marker(state_log.as_str()) {
-        return Err("state_transition_audit.log missing generation entries".to_string());
+        return Err("state_transition_audit.log missing generation entries".to_owned());
     }
 
     let cross_network_expected_git_commit =
@@ -4901,7 +4896,7 @@ pub fn execute_ops_sign_release_artifact() -> Result<String, String> {
     let derived_verifier_key = signing_key.verifying_key();
     if derived_verifier_key.as_bytes() != verifier_key.as_bytes() {
         return Err(
-            "release provenance key mismatch: signing key does not match verifier key".to_string(),
+            "release provenance key mismatch: signing key does not match verifier key".to_owned(),
         );
     }
 
@@ -5238,7 +5233,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
         execute_ops_write_phase10_hp2_traversal_reports(WritePhase10Hp2TraversalReportsConfig {
             source_dir: source_dir.clone(),
-            environment: "ci".to_string(),
+            environment: "ci".to_owned(),
             path_selection_log: path_log.clone(),
             probe_security_log: probe_log.clone(),
         })
@@ -6071,15 +6066,15 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
     #[test]
     fn phase9_dr_drill_view_into_value_map_round_trips_all_fields() {
         let view = super::Phase9DrDrillView {
-            executed_at_utc: "2026-05-01T00:00:00Z".to_string(),
-            evidence_mode: Some("measured".to_string()),
+            executed_at_utc: "2026-05-01T00:00:00Z".to_owned(),
+            evidence_mode: Some("measured".to_owned()),
             extra: {
                 let mut m = serde_json::Map::new();
                 m.insert(
-                    "drill_id".to_string(),
-                    serde_json::Value::String("dr-1".to_string()),
+                    "drill_id".to_owned(),
+                    serde_json::Value::String("dr-1".to_owned()),
                 );
-                m.insert("region_count".to_string(), serde_json::Value::from(3));
+                m.insert("region_count".to_owned(), serde_json::Value::from(3));
                 m
             },
         };
@@ -6106,7 +6101,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
     #[test]
     fn phase9_dr_drill_view_into_value_map_omits_none_evidence_mode() {
         let view = super::Phase9DrDrillView {
-            executed_at_utc: "2026-05-01T00:00:00Z".to_string(),
+            executed_at_utc: "2026-05-01T00:00:00Z".to_owned(),
             evidence_mode: None,
             extra: serde_json::Map::new(),
         };
@@ -6165,13 +6160,13 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
     #[test]
     fn phase9_incident_drill_view_into_value_map_round_trips() {
         let view = super::Phase9IncidentDrillView {
-            executed_at_utc: "2026-05-01T00:00:00Z".to_string(),
-            evidence_mode: Some("measured".to_string()),
+            executed_at_utc: "2026-05-01T00:00:00Z".to_owned(),
+            evidence_mode: Some("measured".to_owned()),
             extra: {
                 let mut m = serde_json::Map::new();
                 m.insert(
-                    "ticket".to_string(),
-                    serde_json::Value::String("INC-42".to_string()),
+                    "ticket".to_owned(),
+                    serde_json::Value::String("INC-42".to_owned()),
                 );
                 m
             },
@@ -6231,8 +6226,8 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
     #[test]
     fn phase9_slo_window_view_into_value_map_round_trips() {
         let view = super::Phase9SloWindowView {
-            window_end_utc: "2026-05-01T00:00:00Z".to_string(),
-            evidence_mode: Some("measured".to_string()),
+            window_end_utc: "2026-05-01T00:00:00Z".to_owned(),
+            evidence_mode: Some("measured".to_owned()),
             extra: serde_json::Map::new(),
         };
         let map = view.into_value_map();
@@ -6314,12 +6309,12 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
     #[test]
     fn phase9_performance_sample_view_into_value_map_preserves_both_aliases() {
         let view = super::Phase9PerformanceSampleView {
-            measured_at_utc: Some("2026-05-01T01:00:00Z".to_string()),
-            timestamp_utc: Some("2026-05-01T00:00:00Z".to_string()),
-            evidence_mode: Some("measured".to_string()),
+            measured_at_utc: Some("2026-05-01T01:00:00Z".to_owned()),
+            timestamp_utc: Some("2026-05-01T00:00:00Z".to_owned()),
+            evidence_mode: Some("measured".to_owned()),
             extra: {
                 let mut m = serde_json::Map::new();
-                m.insert("idle_cpu_percent".to_string(), serde_json::Value::from(0.1));
+                m.insert("idle_cpu_percent".to_owned(), serde_json::Value::from(0.1));
                 m
             },
         };

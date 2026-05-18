@@ -28,7 +28,7 @@ fn run() -> Result<(), i32> {
     let gate_threads = env::var("RUSTYNET_GATE_TEST_THREADS")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "1".to_string());
+        .unwrap_or_else(|| "1".to_owned());
 
     run_command(&root_dir, "cargo", &["fmt", "--all", "--", "--check"], &[])?;
     run_command(
@@ -82,7 +82,7 @@ fn run() -> Result<(), i32> {
     let parity_environment = env::var("RUSTYNET_PHASE6_PARITY_ENVIRONMENT")
         .ok()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "ci".to_string());
+        .unwrap_or_else(|| "ci".to_owned());
 
     if cfg!(target_os = "macos")
         || env::var("RUSTYNET_PHASE6_COLLECT_PARITY").ok().as_deref() == Some("1")

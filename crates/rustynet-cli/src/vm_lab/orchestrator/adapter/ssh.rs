@@ -127,7 +127,7 @@ pub fn run_remote(
             message: format!("SSH spawn failed for {host}: {message}"),
         })?;
     if !output.status.success() {
-        let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         // Windows PowerShell over OpenSSH frequently writes diagnostic
         // detail to stdout (CLIXML stream / Write-Host). When stderr is
         // empty, fall back to a tail of stdout so the operator sees
@@ -183,7 +183,7 @@ pub fn run_remote(
         });
     }
     String::from_utf8(output.stdout)
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim().to_owned())
         .map_err(|err| AdapterError::Protocol {
             message: format!("remote output was not valid UTF-8: {err}"),
         })

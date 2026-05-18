@@ -120,13 +120,12 @@ pub fn evaluate_windows_service_hardening(
         if !argv_tail.iter().any(|arg| arg == "--windows-service") {
             reasons.push(
                 "service argv must include --windows-service so the SCM host path is taken"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         if !argv_tail.iter().any(|arg| arg == "--env-file") {
             reasons.push(
-                "service argv must include --env-file so daemon args are read from the reviewed env-file (no inline daemon flags)"
-                    .to_string(),
+                "service argv must include --env-file so daemon args are read from the reviewed env-file (no inline daemon flags)".to_owned(),
             );
         }
         for arg in argv_tail {
@@ -164,20 +163,18 @@ pub fn evaluate_windows_service_hardening(
 
     if snapshot.interactive_process {
         reasons.push(
-            "service must not carry SERVICE_INTERACTIVE_PROCESS; the hardened profile is non-interactive"
-                .to_string(),
+            "service must not carry SERVICE_INTERACTIVE_PROCESS; the hardened profile is non-interactive".to_owned(),
         );
     }
 
     if snapshot.failure_action_count == 0 {
         reasons.push(
-            "service must have at least one configured failure action so the SCM can recover the daemon after crash"
-                .to_string(),
+            "service must have at least one configured failure action so the SCM can recover the daemon after crash".to_owned(),
         );
     }
 
     if snapshot.binary_path_acl_sddl.trim().is_empty() {
-        reasons.push("service binary ACL SDDL is empty; cannot verify lockdown".to_string());
+        reasons.push("service binary ACL SDDL is empty; cannot verify lockdown".to_owned());
     } else if let Err(err) = evaluate_windows_runtime_acl_sddl(
         "service binary",
         snapshot.binary_path_acl_sddl.as_str(),
@@ -256,8 +253,7 @@ pub fn collect_windows_service_hardening_snapshot()
     #[cfg(not(windows))]
     {
         Err(
-            "windows-service-hardening-check is only available on Windows hosts; the snapshot collector requires Win32 SCM access"
-                .to_string(),
+            "windows-service-hardening-check is only available on Windows hosts; the snapshot collector requires Win32 SCM access".to_owned(),
         )
     }
     #[cfg(windows)]
@@ -353,25 +349,25 @@ mod tests {
     use super::*;
 
     fn reviewed_binary_acl_sddl() -> String {
-        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string()
+        "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned()
     }
 
     fn reviewed_snapshot() -> WindowsServiceHardeningSnapshot {
         WindowsServiceHardeningSnapshot {
             schema_version: 1,
-            service_name: REVIEWED_WINDOWS_SERVICE_NAME.to_string(),
+            service_name: REVIEWED_WINDOWS_SERVICE_NAME.to_owned(),
             binary_image_path: format!(
                 "\"{REVIEWED_WINDOWS_INSTALL_ROOT}\\{REVIEWED_WINDOWS_BINARY_FILE_NAME}\" --windows-service --env-file C:\\ProgramData\\RustyNet\\config\\rustynetd.env"
             ),
             binary_image_argv: vec![
                 format!("{REVIEWED_WINDOWS_INSTALL_ROOT}\\{REVIEWED_WINDOWS_BINARY_FILE_NAME}"),
-                "--windows-service".to_string(),
-                "--env-file".to_string(),
-                r"C:\ProgramData\RustyNet\config\rustynetd.env".to_string(),
+                "--windows-service".to_owned(),
+                "--env-file".to_owned(),
+                r"C:\ProgramData\RustyNet\config\rustynetd.env".to_owned(),
             ],
-            start_name: "LocalSystem".to_string(),
-            service_sid_type: "unrestricted".to_string(),
-            start_type: "auto_start".to_string(),
+            start_name: "LocalSystem".to_owned(),
+            service_sid_type: "unrestricted".to_owned(),
+            start_type: "auto_start".to_owned(),
             interactive_process: false,
             failure_action_count: 3,
             binary_path_acl_sddl: reviewed_binary_acl_sddl(),
@@ -387,8 +383,8 @@ mod tests {
     #[test]
     fn evaluator_accepts_nt_service_account_with_restricted_sid() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.start_name = r"NT SERVICE\RustyNet".to_string();
-        snapshot.service_sid_type = "restricted".to_string();
+        snapshot.start_name = r"NT SERVICE\RustyNet".to_owned();
+        snapshot.service_sid_type = "restricted".to_owned();
         evaluate_windows_service_hardening(&snapshot)
             .expect("NT SERVICE virtual account with restricted SID must validate");
     }
@@ -408,7 +404,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_wrong_service_name() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.service_name = "RogueService".to_string();
+        snapshot.service_name = "RogueService".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("wrong service name must fail");
         assert!(
@@ -422,7 +418,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_binary_outside_reviewed_install_root() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.binary_image_argv[0] = r"C:\Tools\rustynetd.exe".to_string();
+        snapshot.binary_image_argv[0] = r"C:\Tools\rustynetd.exe".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("binary outside install root must fail");
         assert!(
@@ -449,8 +445,8 @@ mod tests {
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_image_argv = vec![
             format!("{REVIEWED_WINDOWS_INSTALL_ROOT}\\{REVIEWED_WINDOWS_BINARY_FILE_NAME}"),
-            "--env-file".to_string(),
-            r"C:\ProgramData\RustyNet\config\rustynetd.env".to_string(),
+            "--env-file".to_owned(),
+            r"C:\ProgramData\RustyNet\config\rustynetd.env".to_owned(),
         ];
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("missing --windows-service must fail");
@@ -467,7 +463,7 @@ mod tests {
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_image_argv = vec![
             format!("{REVIEWED_WINDOWS_INSTALL_ROOT}\\{REVIEWED_WINDOWS_BINARY_FILE_NAME}"),
-            "--windows-service".to_string(),
+            "--windows-service".to_owned(),
         ];
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("missing --env-file must fail");
@@ -482,10 +478,10 @@ mod tests {
     #[test]
     fn evaluator_rejects_inline_daemon_flags() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.binary_image_argv.push("--backend".to_string());
+        snapshot.binary_image_argv.push("--backend".to_owned());
         snapshot
             .binary_image_argv
-            .push("windows-wireguard-nt".to_string());
+            .push("windows-wireguard-nt".to_owned());
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("inline daemon flag must fail");
         assert!(
@@ -499,7 +495,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_unreviewed_account() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.start_name = ".\\Administrator".to_string();
+        snapshot.start_name = ".\\Administrator".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("unreviewed account must fail");
         assert!(
@@ -513,7 +509,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_sid_type_none() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.service_sid_type = "none".to_string();
+        snapshot.service_sid_type = "none".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("service SID type none must fail");
         assert!(
@@ -555,7 +551,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_drifted_binary_acl() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.binary_path_acl_sddl = "O:BAG:BAD:(A;;FA;;;WD)".to_string();
+        snapshot.binary_path_acl_sddl = "O:BAG:BAD:(A;;FA;;;WD)".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("drifted binary ACL must fail");
         assert!(
@@ -572,7 +568,7 @@ mod tests {
         // binary; would expose `rustynetd.exe` to any local user.
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_path_acl_sddl =
-            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_string();
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("WD principal in binary ACL must fail");
         assert!(
@@ -587,7 +583,7 @@ mod tests {
         // reviewed SY+BA principal set on the service binary.
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_path_acl_sddl =
-            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)".to_string();
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("AU principal in binary ACL must fail");
         assert!(
@@ -602,7 +598,7 @@ mod tests {
         // SY+BA principal set on the service binary.
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_path_acl_sddl =
-            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_string();
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BU)".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("BU principal in binary ACL must fail");
         assert!(
@@ -617,7 +613,7 @@ mod tests {
         // can launch the daemon under the service SID. An ACL that grants
         // only Builtin Administrators is rejected with a precise reason.
         let mut snapshot = reviewed_snapshot();
-        snapshot.binary_path_acl_sddl = "O:BAG:BAD:P(A;;FA;;;BA)".to_string();
+        snapshot.binary_path_acl_sddl = "O:BAG:BAD:P(A;;FA;;;BA)".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("binary ACL missing SY principal must fail");
         assert!(
@@ -634,7 +630,7 @@ mod tests {
         // so operators can audit and update the binary under
         // C:\Program Files\RustyNet during normal break-glass procedures.
         let mut snapshot = reviewed_snapshot();
-        snapshot.binary_path_acl_sddl = "O:BAG:BAD:P(A;;FA;;;SY)".to_string();
+        snapshot.binary_path_acl_sddl = "O:BAG:BAD:P(A;;FA;;;SY)".to_owned();
         let reasons = evaluate_windows_service_hardening(&snapshot)
             .expect_err("binary ACL missing BA principal must fail");
         assert!(
@@ -653,7 +649,7 @@ mod tests {
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_path_acl_sddl =
             "O:S-1-5-21-1234567890-1234567890-1234567890-1001G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
-                .to_string();
+                .to_owned();
         let reasons =
             evaluate_windows_service_hardening(&snapshot).expect_err("unreviewed owner must fail");
         assert!(
@@ -672,7 +668,7 @@ mod tests {
         // the lab-image install pinned the owner to that SID.
         let mut snapshot = reviewed_snapshot();
         snapshot.binary_path_acl_sddl =
-            "O:S-1-5-80-1234567890-1234567890G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_string();
+            "O:S-1-5-80-1234567890-1234567890G:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned();
         evaluate_windows_service_hardening(&snapshot).expect("service-SID owner must be accepted");
     }
 
@@ -727,8 +723,8 @@ mod tests {
     #[test]
     fn evaluator_aggregates_all_drift_reasons() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.start_name = ".\\Administrator".to_string();
-        snapshot.service_sid_type = "none".to_string();
+        snapshot.start_name = ".\\Administrator".to_owned();
+        snapshot.service_sid_type = "none".to_owned();
         snapshot.interactive_process = true;
         snapshot.failure_action_count = 0;
         let reasons =
@@ -746,7 +742,7 @@ mod tests {
     #[test]
     fn build_report_marks_overall_not_ok_with_drift_reasons() {
         let mut snapshot = reviewed_snapshot();
-        snapshot.start_name = ".\\Administrator".to_string();
+        snapshot.start_name = ".\\Administrator".to_owned();
         let report = build_windows_service_hardening_report(snapshot);
         assert!(!report.overall_ok);
         assert!(!report.drift_reasons.is_empty());
@@ -760,10 +756,10 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                r"C:\Program Files\RustyNet\rustynetd.exe".to_string(),
-                "--windows-service".to_string(),
-                "--env-file".to_string(),
-                r"C:\ProgramData\RustyNet\config\rustynetd.env".to_string(),
+                r"C:\Program Files\RustyNet\rustynetd.exe".to_owned(),
+                "--windows-service".to_owned(),
+                "--env-file".to_owned(),
+                r"C:\ProgramData\RustyNet\config\rustynetd.env".to_owned(),
             ]
         );
     }
@@ -776,10 +772,10 @@ mod tests {
         assert_eq!(
             argv,
             vec![
-                r"C:\bin\rustynetd.exe".to_string(),
-                "--windows-service".to_string(),
-                "--env-file".to_string(),
-                "env.txt".to_string(),
+                r"C:\bin\rustynetd.exe".to_owned(),
+                "--windows-service".to_owned(),
+                "--env-file".to_owned(),
+                "env.txt".to_owned(),
             ]
         );
     }

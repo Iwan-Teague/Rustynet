@@ -174,7 +174,7 @@ impl NodeAdapter for LinuxNodeAdapter {
             crate::vm_lab::orchestrator::connection::NodeConnection::Ssh { host, .. } => {
                 format!("{host}:51820")
             }
-            _ => "0.0.0.0:51820".to_string(),
+            _ => "0.0.0.0:51820".to_owned(),
         }
     }
 
@@ -211,7 +211,7 @@ mod tests {
         let conn = NodeConnection::ssh(
             "10.0.0.1",
             22,
-            Some("debian".to_string()),
+            Some("debian".to_owned()),
             PathBuf::from("/id_rsa"),
             f.path().to_path_buf(),
         )

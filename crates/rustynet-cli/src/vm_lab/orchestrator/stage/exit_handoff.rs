@@ -26,7 +26,7 @@ impl OrchestrationStage for ExitHandoffStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let exit_alias = match ctx.assignments.iter().find(|a| a.role == NodeRole::Exit) {
             Some(a) => a.alias.clone(),
-            None => return StageOutcome::Failed("no Exit node in assignments".to_string()),
+            None => return StageOutcome::Failed("no Exit node in assignments".to_owned()),
         };
         match ctx.adapters.get(exit_alias.as_str()) {
             Some(adapter) => match adapter.issue_membership_owner_key() {
@@ -52,7 +52,7 @@ mod tests {
             report_dir: std::env::temp_dir(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

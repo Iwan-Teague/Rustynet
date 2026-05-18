@@ -459,7 +459,7 @@ fn run() -> Result<(), String> {
     )?;
 
     let dns_zone_name =
-        env::var("RUSTYNET_DNS_ZONE_NAME").unwrap_or_else(|_| "rustynet".to_string());
+        env::var("RUSTYNET_DNS_ZONE_NAME").unwrap_or_else(|_| "rustynet".to_owned());
     ensure_safe_token("dns-zone-name", dns_zone_name.as_str())?;
     let dns_zone_env = workspace.path().join("rn_issue_twohop_dns_zone.env");
     write_file(&dns_zone_env, "")?;
@@ -893,10 +893,10 @@ fn run() -> Result<(), String> {
         "wg show rustynet0 endpoints || true",
     )?;
     let entry_managed_peer_endpoints =
-        status_field(&entry_status, "managed_peer_endpoints").unwrap_or_else(|| "none".to_string());
+        status_field(&entry_status, "managed_peer_endpoints").unwrap_or_else(|| "none".to_owned());
     let entry_managed_peer_endpoints_error =
         status_field(&entry_status, "managed_peer_endpoints_error")
-            .unwrap_or_else(|| "none".to_string());
+            .unwrap_or_else(|| "none".to_owned());
     let client_plaintext_check = no_plaintext_passphrase_check(
         &config.ssh_identity_file,
         &work_known_hosts,
@@ -1043,7 +1043,7 @@ fn run() -> Result<(), String> {
     write_file(&config.report_path, &report)?;
     logger.line(format!("[two-hop] report written: {}", config.report_path.display()).as_str())?;
     if !overall {
-        return Err("two-hop validation failed".to_string());
+        return Err("two-hop validation failed".to_owned());
     }
 
     Ok(())
@@ -1071,15 +1071,15 @@ impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
             ssh_identity_file: PathBuf::new(),
-            final_exit_host: "debian@192.168.18.49".to_string(),
-            client_host: "debian@192.168.18.65".to_string(),
-            entry_host: "ubuntu@192.168.18.52".to_string(),
-            second_client_host: "fedora@192.168.18.51".to_string(),
-            final_exit_node_id: "exit-49".to_string(),
-            client_node_id: "client-65".to_string(),
-            entry_node_id: "client-52".to_string(),
-            second_client_node_id: "client-51".to_string(),
-            ssh_allow_cidrs: "192.168.18.0/24".to_string(),
+            final_exit_host: "debian@192.168.18.49".to_owned(),
+            client_host: "debian@192.168.18.65".to_owned(),
+            entry_host: "ubuntu@192.168.18.52".to_owned(),
+            second_client_host: "fedora@192.168.18.51".to_owned(),
+            final_exit_node_id: "exit-49".to_owned(),
+            client_node_id: "client-65".to_owned(),
+            entry_node_id: "client-52".to_owned(),
+            second_client_node_id: "client-51".to_owned(),
+            ssh_allow_cidrs: "192.168.18.0/24".to_owned(),
             report_path: PathBuf::from("artifacts/phase10/live_linux_two_hop_report.json"),
             log_path: PathBuf::from("artifacts/phase10/source/live_linux_two_hop.log"),
             pinned_known_hosts_file: None,
@@ -1120,7 +1120,7 @@ impl Config {
 
         if config.ssh_identity_file.as_os_str().is_empty() {
             return Err(
-                "usage: live_linux_two_hop_test --ssh-identity-file <path> [options]".to_string(),
+                "usage: live_linux_two_hop_test --ssh-identity-file <path> [options]".to_owned(),
             );
         }
         for (label, value) in [
@@ -1438,12 +1438,12 @@ fn utc_now_string() -> String {
     if let Some(output) = output
         && output.status.success()
     {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if !text.is_empty() {
             return text;
         }
     }
-    "1970-01-01T00:00:00Z".to_string()
+    "1970-01-01T00:00:00Z".to_owned()
 }
 
 #[cfg(test)]
@@ -1453,11 +1453,11 @@ mod tests {
         let status = "node_id=client-2 managed_peer_endpoints=client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820 managed_peer_endpoints_error=none";
         assert_eq!(
             super::status_field(status, "managed_peer_endpoints"),
-            Some("client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820".to_string())
+            Some("client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820".to_owned())
         );
         assert_eq!(
             super::status_field(status, "managed_peer_endpoints_error"),
-            Some("none".to_string())
+            Some("none".to_owned())
         );
     }
 
@@ -1530,15 +1530,15 @@ mod tests {
     fn two_hop_runtime_ready_requires_expected_exit_chain_and_routes() {
         let config = super::Config {
             ssh_identity_file: std::path::PathBuf::from("/tmp/key"),
-            final_exit_host: "debian@192.168.64.22".to_string(),
-            client_host: "debian@192.168.64.24".to_string(),
-            entry_host: "debian@192.168.64.26".to_string(),
-            second_client_host: "debian@192.168.64.29".to_string(),
-            final_exit_node_id: "exit-1".to_string(),
-            client_node_id: "client-1".to_string(),
-            entry_node_id: "client-2".to_string(),
-            second_client_node_id: "client-4".to_string(),
-            ssh_allow_cidrs: "192.168.64.0/24".to_string(),
+            final_exit_host: "debian@192.168.64.22".to_owned(),
+            client_host: "debian@192.168.64.24".to_owned(),
+            entry_host: "debian@192.168.64.26".to_owned(),
+            second_client_host: "debian@192.168.64.29".to_owned(),
+            final_exit_node_id: "exit-1".to_owned(),
+            client_node_id: "client-1".to_owned(),
+            entry_node_id: "client-2".to_owned(),
+            second_client_node_id: "client-4".to_owned(),
+            ssh_allow_cidrs: "192.168.64.0/24".to_owned(),
             report_path: std::path::PathBuf::from("/tmp/report.json"),
             log_path: std::path::PathBuf::from("/tmp/report.log"),
             pinned_known_hosts_file: None,

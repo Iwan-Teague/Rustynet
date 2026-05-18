@@ -50,7 +50,7 @@ impl OrchestrationStage for PreflightStage {
             .spawn()
             .is_err()
         {
-            return StageOutcome::Failed("ssh binary not found in PATH".to_string());
+            return StageOutcome::Failed("ssh binary not found in PATH".to_owned());
         }
 
         // 3. exactly one exit node
@@ -78,7 +78,7 @@ mod tests {
     fn make_ctx_with_exit(tmp_dir: &std::path::Path) -> OrchestrationContext {
         OrchestrationContext {
             assignments: vec![NodeRoleAssignment {
-                alias: "exit-1".to_string(),
+                alias: "exit-1".to_owned(),
                 role: NodeRole::Exit,
             }],
             adapters: HashMap::new(),
@@ -86,7 +86,7 @@ mod tests {
             report_dir: tmp_dir.to_path_buf(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,
@@ -111,7 +111,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = OrchestrationContext {
             assignments: vec![NodeRoleAssignment {
-                alias: "client-1".to_string(),
+                alias: "client-1".to_owned(),
                 role: NodeRole::Client,
             }],
             adapters: HashMap::new(),
@@ -119,7 +119,7 @@ mod tests {
             report_dir: tmp.path().to_path_buf(),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
-            network_id: "net".to_string(),
+            network_id: "net".to_owned(),
             node_ids: HashMap::new(),
             ssh_allow_cidrs: String::new(),
             membership_snapshot: None,

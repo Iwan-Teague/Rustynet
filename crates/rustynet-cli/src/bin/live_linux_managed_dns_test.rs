@@ -114,7 +114,7 @@ fn run() -> Result<(), String> {
         ],
     )?;
     let current_exit_node = parse_status_field(&client_status_before, "exit_node")
-        .ok_or_else(|| "unable to parse exit_node from client rustynet status".to_string())?;
+        .ok_or_else(|| "unable to parse exit_node from client rustynet status".to_owned())?;
     logger.line(
         format!(
             "[managed-dns] client runtime exit selection before bundle refresh: exit_node={current_exit_node}"
@@ -209,7 +209,7 @@ fn run() -> Result<(), String> {
             &["mktemp", "/tmp/rn-dns-zone-passphrase.XXXXXX"],
         )?
         .trim()
-        .to_string();
+        .to_owned();
     ctx.run_root(
         &config.signer_host,
         &[
@@ -828,16 +828,16 @@ impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
             ssh_identity_file: String::new(),
-            signer_host: "debian@192.168.18.49".to_string(),
-            client_host: "ubuntu@192.168.18.52".to_string(),
-            signer_node_id: "exit-49".to_string(),
-            client_node_id: "client-52".to_string(),
-            ssh_allow_cidrs: "192.168.18.0/24".to_string(),
+            signer_host: "debian@192.168.18.49".to_owned(),
+            client_host: "ubuntu@192.168.18.52".to_owned(),
+            signer_node_id: "exit-49".to_owned(),
+            client_node_id: "client-52".to_owned(),
+            ssh_allow_cidrs: "192.168.18.0/24".to_owned(),
             report_path: PathBuf::from("artifacts/phase10/source/managed_dns_report.json"),
             log_path: PathBuf::from("artifacts/phase10/source/managed_dns_report.log"),
-            zone_name: "rustynet".to_string(),
-            dns_interface: "rustynet0".to_string(),
-            dns_bind_addr: "127.0.0.1:53535".to_string(),
+            zone_name: "rustynet".to_owned(),
+            dns_interface: "rustynet0".to_owned(),
+            dns_bind_addr: "127.0.0.1:53535".to_owned(),
             managed_peers: Vec::new(),
         };
 
@@ -870,7 +870,7 @@ impl Config {
         if config.ssh_identity_file.is_empty() {
             return Err(
                 "usage: live_linux_managed_dns_test --ssh-identity-file <path> [options]"
-                    .to_string(),
+                    .to_owned(),
             );
         }
         Ok(config)
@@ -887,14 +887,14 @@ impl Config {
     fn dns_server(&self) -> String {
         self.dns_bind_addr.split_once(':').map_or_else(
             || self.dns_bind_addr.clone(),
-            |(server, _)| server.to_string(),
+            |(server, _)| server.to_owned(),
         )
     }
 
     fn dns_port(&self) -> String {
         self.dns_bind_addr
             .split_once(':')
-            .map_or_else(|| "53535".to_string(), |(_, port)| port.to_string())
+            .map_or_else(|| "53535".to_owned(), |(_, port)| port.to_owned())
     }
 }
 
@@ -917,7 +917,7 @@ fn validate_targets(config: &Config) -> Result<(), String> {
         ("signer-node-id", config.signer_node_id.as_str()),
         ("client-node-id", config.client_node_id.as_str()),
     ] {
-        if !seen_node_ids.insert(value.to_string()) {
+        if !seen_node_ids.insert(value.to_owned()) {
             return Err(format!("{label} is duplicated: {value}"));
         }
     }
@@ -925,7 +925,7 @@ fn validate_targets(config: &Config) -> Result<(), String> {
         ("signer-host", config.signer_host.as_str()),
         ("client-host", config.client_host.as_str()),
     ] {
-        if !seen_hosts.insert(value.to_string()) {
+        if !seen_hosts.insert(value.to_owned()) {
             return Err(format!("{label} is duplicated: {value}"));
         }
     }
@@ -948,7 +948,7 @@ fn validate_targets(config: &Config) -> Result<(), String> {
     let _ = config
         .dns_bind_addr
         .split_once(':')
-        .ok_or_else(|| "dns-bind-addr must be <ip:port>".to_string())?
+        .ok_or_else(|| "dns-bind-addr must be <ip:port>".to_owned())?
         .1
         .parse::<u16>()
         .map_err(|err| format!("invalid dns-bind-addr port: {err}"))?;
@@ -1409,8 +1409,7 @@ fn build_authorized_allow_spec(
     pairs.dedup();
     if pairs.is_empty() {
         return Err(
-            "managed DNS traversal issuance requires at least one authorized allow pair"
-                .to_string(),
+            "managed DNS traversal issuance requires at least one authorized allow pair".to_owned(),
         );
     }
     Ok(pairs.join(";"))
@@ -1457,14 +1456,14 @@ fn managed_dns_base_records(
 ) -> Vec<ManagedDnsRecordTemplate> {
     vec![
         ManagedDnsRecordTemplate {
-            label: MANAGED_LABEL.to_string(),
-            target_node_id: signer_node_id.to_string(),
+            label: MANAGED_LABEL.to_owned(),
+            target_node_id: signer_node_id.to_owned(),
             ttl_secs: 300,
-            aliases: vec![MANAGED_ALIAS.to_string()],
+            aliases: vec![MANAGED_ALIAS.to_owned()],
         },
         ManagedDnsRecordTemplate {
-            label: "client".to_string(),
-            target_node_id: client_node_id.to_string(),
+            label: "client".to_owned(),
+            target_node_id: client_node_id.to_owned(),
             ttl_secs: 300,
             aliases: Vec::new(),
         },
@@ -1491,7 +1490,7 @@ fn managed_dns_replay_records(
             "managed DNS replay probe alias already present: {REPLAY_PROBE_ALIAS}"
         ));
     }
-    signer_record.aliases.push(REPLAY_PROBE_ALIAS.to_string());
+    signer_record.aliases.push(REPLAY_PROBE_ALIAS.to_owned());
     Ok(replay_records)
 }
 
@@ -1542,9 +1541,9 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
         if let Some(value) = line.strip_prefix("node_id=") {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                return Err("assignment bundle node_id must not be empty".to_string());
+                return Err("assignment bundle node_id must not be empty".to_owned());
             }
-            node_id = Some(trimmed.to_string());
+            node_id = Some(trimmed.to_owned());
             continue;
         }
         if let Some((prefix, value)) = line.split_once('=')
@@ -1557,13 +1556,13 @@ fn parse_assignment_authority_scope(bundle: &str) -> Result<AssignmentAuthorityS
                     "assignment bundle peer id must not be empty: {prefix}"
                 ));
             }
-            peer_node_ids.push(trimmed.to_string());
+            peer_node_ids.push(trimmed.to_owned());
         }
     }
     peer_node_ids.sort();
     peer_node_ids.dedup();
     Ok(AssignmentAuthorityScope {
-        node_id: node_id.ok_or_else(|| "assignment bundle is missing node_id".to_string())?,
+        node_id: node_id.ok_or_else(|| "assignment bundle is missing node_id".to_owned())?,
         peer_node_ids,
     })
 }
@@ -1581,7 +1580,7 @@ fn rewrite_bundle_line_value(
             updated.push(format!("{prefix}{new_value}"));
             replaced = true;
         } else {
-            updated.push(line.to_string());
+            updated.push(line.to_owned());
         }
     }
     if !replaced {
@@ -1599,16 +1598,16 @@ fn rewrite_bundle_signature(bundle: &str, fill: &str) -> Result<String, String> 
         if !replaced && line.starts_with("signature=") {
             let hex = line.trim_start_matches("signature=");
             if hex.is_empty() {
-                return Err("dns bundle signature line must not be empty".to_string());
+                return Err("dns bundle signature line must not be empty".to_owned());
             }
             updated.push(format!("signature={}", fill.repeat(hex.len())));
             replaced = true;
         } else {
-            updated.push(line.to_string());
+            updated.push(line.to_owned());
         }
     }
     if !replaced {
-        return Err("dns bundle is missing signature line".to_string());
+        return Err("dns bundle is missing signature line".to_owned());
     }
     Ok(updated.join("\n") + "\n")
 }
@@ -1862,7 +1861,7 @@ where
     }
     Err(format!(
         "{label} failed after {attempts} attempts: {}",
-        last_err.unwrap_or_else(|| "retry exhausted".to_string())
+        last_err.unwrap_or_else(|| "retry exhausted".to_owned())
     ))
 }
 
@@ -1900,9 +1899,9 @@ fn wait_for_dns_inspect_state(
     Err(format!(
         "managed DNS inspect did not converge on {client_host}: {}",
         last_output
-            .map(|output| output.trim().to_string())
+            .map(|output| output.trim().to_owned())
             .filter(|output| !output.is_empty())
-            .unwrap_or_else(|| "empty output".to_string())
+            .unwrap_or_else(|| "empty output".to_owned())
     ))
 }
 
@@ -2067,11 +2066,11 @@ fn render_remote_output(output: &Output) -> String {
     if !stderr.is_empty() && !stdout.is_empty() {
         format!("{stderr} (stdout: {stdout})")
     } else if !stderr.is_empty() {
-        stderr.to_string()
+        stderr.to_owned()
     } else if !stdout.is_empty() {
         format!("stdout: {stdout}")
     } else {
-        "remote command exited non-zero without output".to_string()
+        "remote command exited non-zero without output".to_owned()
     }
 }
 
@@ -2081,7 +2080,7 @@ fn json_field(root_dir: &Path, payload: &str, field: &str) -> Result<String, Str
         "read-json-field",
         &["--payload", payload, "--field", field],
     )
-    .map(|value| value.trim().to_string())
+    .map(|value| value.trim().to_owned())
 }
 
 fn extract_managed_dns_expected_ip(
@@ -2094,7 +2093,7 @@ fn extract_managed_dns_expected_ip(
         "extract-managed-dns-expected-ip",
         &["--fqdn", fqdn, "--inspect-output", inspect_output],
     )
-    .map(|value| value.trim().to_string())
+    .map(|value| value.trim().to_owned())
 }
 
 fn write_env_file(path: &Path, entries: &[(&str, &str)]) -> Result<(), String> {
@@ -2124,7 +2123,7 @@ fn validate_env_key(key: &str) -> Result<(), String> {
 
 fn quote_env_value(value: &str) -> Result<String, String> {
     if value.contains('\0') || value.contains('\n') || value.contains('\r') {
-        return Err("env value must not contain newline or NUL characters".to_string());
+        return Err("env value must not contain newline or NUL characters".to_owned());
     }
     let mut quoted = String::from("\"");
     for ch in value.chars() {
@@ -2197,8 +2196,8 @@ fn parse_managed_peer_spec(value: &str) -> Result<ManagedPeerSpec, String> {
         ));
     }
     Ok(ManagedPeerSpec {
-        node_id: node_id.to_string(),
-        host: host.to_string(),
+        node_id: node_id.to_owned(),
+        host: host.to_owned(),
     })
 }
 
@@ -2215,12 +2214,12 @@ fn utc_now_string() -> String {
     if let Some(output) = output
         && output.status.success()
     {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         if !text.is_empty() {
             return text;
         }
     }
-    "1970-01-01T00:00:00Z".to_string()
+    "1970-01-01T00:00:00Z".to_owned()
 }
 
 fn unix_now() -> u64 {
@@ -2242,7 +2241,7 @@ fn git_commit(root_dir: &Path) -> String {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .trim()
             .to_lowercase(),
-        _ => "unknown".to_string(),
+        _ => "unknown".to_owned(),
     }
 }
 
@@ -2291,17 +2290,17 @@ mod tests {
 
     fn base_config() -> Config {
         Config {
-            ssh_identity_file: "/tmp/rn-test-key".to_string(),
-            signer_host: "debian@192.168.64.22".to_string(),
-            client_host: "debian@192.168.64.24".to_string(),
-            signer_node_id: "exit-1".to_string(),
-            client_node_id: "client-1".to_string(),
-            ssh_allow_cidrs: "192.168.64.0/24".to_string(),
+            ssh_identity_file: "/tmp/rn-test-key".to_owned(),
+            signer_host: "debian@192.168.64.22".to_owned(),
+            client_host: "debian@192.168.64.24".to_owned(),
+            signer_node_id: "exit-1".to_owned(),
+            client_node_id: "client-1".to_owned(),
+            ssh_allow_cidrs: "192.168.64.0/24".to_owned(),
             report_path: PathBuf::from("/tmp/managed_dns_report.json"),
             log_path: PathBuf::from("/tmp/managed_dns_report.log"),
-            zone_name: "rustynet".to_string(),
-            dns_interface: "rustynet0".to_string(),
-            dns_bind_addr: "127.0.0.1:53535".to_string(),
+            zone_name: "rustynet".to_owned(),
+            dns_interface: "rustynet0".to_owned(),
+            dns_bind_addr: "127.0.0.1:53535".to_owned(),
             managed_peers: Vec::new(),
         }
     }
@@ -2327,8 +2326,8 @@ mod tests {
     fn validate_targets_rejects_duplicate_managed_peer_node_id() {
         let mut config = base_config();
         config.managed_peers.push(ManagedPeerSpec {
-            node_id: "client-1".to_string(),
-            host: "debian@192.168.64.26".to_string(),
+            node_id: "client-1".to_owned(),
+            host: "debian@192.168.64.26".to_owned(),
         });
         let err = validate_targets(&config).expect_err("duplicate node id must fail");
         assert!(
@@ -2341,8 +2340,8 @@ mod tests {
     fn validate_targets_rejects_duplicate_managed_peer_host() {
         let mut config = base_config();
         config.managed_peers.push(ManagedPeerSpec {
-            node_id: "client-2".to_string(),
-            host: "debian@192.168.64.22".to_string(),
+            node_id: "client-2".to_owned(),
+            host: "debian@192.168.64.22".to_owned(),
         });
         let err = validate_targets(&config).expect_err("duplicate host must fail");
         assert!(
@@ -2367,20 +2366,20 @@ mod tests {
     #[test]
     fn sorted_node_host_pairs_returns_deterministic_order() {
         let mut host_by_node = HashMap::new();
-        host_by_node.insert("client-3".to_string(), "debian@192.168.64.28".to_string());
-        host_by_node.insert("exit-1".to_string(), "debian@192.168.64.22".to_string());
-        host_by_node.insert("client-1".to_string(), "debian@192.168.64.24".to_string());
-        host_by_node.insert("client-2".to_string(), "debian@192.168.64.26".to_string());
+        host_by_node.insert("client-3".to_owned(), "debian@192.168.64.28".to_owned());
+        host_by_node.insert("exit-1".to_owned(), "debian@192.168.64.22".to_owned());
+        host_by_node.insert("client-1".to_owned(), "debian@192.168.64.24".to_owned());
+        host_by_node.insert("client-2".to_owned(), "debian@192.168.64.26".to_owned());
 
         let ordered = sorted_node_host_pairs(&host_by_node);
 
         assert_eq!(
             ordered,
             vec![
-                ("client-1".to_string(), "debian@192.168.64.24".to_string()),
-                ("client-2".to_string(), "debian@192.168.64.26".to_string()),
-                ("client-3".to_string(), "debian@192.168.64.28".to_string()),
-                ("exit-1".to_string(), "debian@192.168.64.22".to_string()),
+                ("client-1".to_owned(), "debian@192.168.64.24".to_owned()),
+                ("client-2".to_owned(), "debian@192.168.64.26".to_owned()),
+                ("client-3".to_owned(), "debian@192.168.64.28".to_owned()),
+                ("exit-1".to_owned(), "debian@192.168.64.22".to_owned()),
             ]
         );
     }
@@ -2388,17 +2387,17 @@ mod tests {
     #[test]
     fn managed_dns_distribution_targets_excludes_client_host() {
         let mut host_by_node = HashMap::new();
-        host_by_node.insert("exit-1".to_string(), "debian@192.168.64.22".to_string());
-        host_by_node.insert("client-1".to_string(), "debian@192.168.64.24".to_string());
-        host_by_node.insert("client-2".to_string(), "debian@192.168.64.26".to_string());
+        host_by_node.insert("exit-1".to_owned(), "debian@192.168.64.22".to_owned());
+        host_by_node.insert("client-1".to_owned(), "debian@192.168.64.24".to_owned());
+        host_by_node.insert("client-2".to_owned(), "debian@192.168.64.26".to_owned());
 
         let targets = managed_dns_distribution_targets(&host_by_node, "debian@192.168.64.24");
 
         assert_eq!(
             targets,
             vec![
-                ("client-2".to_string(), "debian@192.168.64.26".to_string()),
-                ("exit-1".to_string(), "debian@192.168.64.22".to_string()),
+                ("client-2".to_owned(), "debian@192.168.64.26".to_owned()),
+                ("exit-1".to_owned(), "debian@192.168.64.22".to_owned()),
             ]
         );
     }
@@ -2420,7 +2419,7 @@ signature=test
         assert_eq!(scope.node_id, "client-2");
         assert_eq!(
             scope.peer_node_ids,
-            vec!["client-1".to_string(), "exit-1".to_string()]
+            vec!["client-1".to_owned(), "exit-1".to_owned()]
         );
     }
 
@@ -2439,14 +2438,14 @@ peer.0.node_id=exit-1
     fn managed_dns_replay_records_adds_probe_alias_to_signer_record() {
         let records = vec![
             ManagedDnsRecordTemplate {
-                label: "exit".to_string(),
-                target_node_id: "exit-1".to_string(),
+                label: "exit".to_owned(),
+                target_node_id: "exit-1".to_owned(),
                 ttl_secs: 300,
-                aliases: vec!["gateway".to_string()],
+                aliases: vec!["gateway".to_owned()],
             },
             ManagedDnsRecordTemplate {
-                label: "client".to_string(),
-                target_node_id: "client-1".to_string(),
+                label: "client".to_owned(),
+                target_node_id: "client-1".to_owned(),
                 ttl_secs: 300,
                 aliases: Vec::new(),
             },
@@ -2457,7 +2456,7 @@ peer.0.node_id=exit-1
 
         assert_eq!(
             replay[0].aliases,
-            vec!["gateway".to_string(), "gatewayreplay".to_string()]
+            vec!["gateway".to_owned(), "gatewayreplay".to_owned()]
         );
         assert!(replay[1].aliases.is_empty());
     }

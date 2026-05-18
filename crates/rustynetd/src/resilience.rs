@@ -80,7 +80,7 @@ pub fn persist_session_snapshot(
         snapshot
             .selected_exit_node
             .clone()
-            .unwrap_or_else(|| "none".to_string())
+            .unwrap_or_else(|| "none".to_owned())
     ));
     body.push_str(&format!(
         "lan_access_enabled={}\n",
@@ -136,7 +136,7 @@ pub fn load_session_snapshot(
             selected_exit_node = Some(if value == "none" {
                 None
             } else {
-                Some(value.to_string())
+                Some(value.to_owned())
             });
             body_without_digest.push_str(line);
             body_without_digest.push('\n');
@@ -153,7 +153,7 @@ pub fn load_session_snapshot(
             continue;
         }
         if let Some(value) = line.strip_prefix("digest=") {
-            digest = Some(value.to_string());
+            digest = Some(value.to_owned());
             continue;
         }
         return Err(ResilienceError::InvalidFormat);
@@ -324,8 +324,8 @@ mod tests {
     fn session_snapshot_persist_restore_detects_tampering() {
         let snapshot = SessionStateSnapshot {
             timestamp_unix: 200,
-            peer_ids: vec!["node-a".to_string(), "node-b".to_string()],
-            selected_exit_node: Some("node-exit".to_string()),
+            peer_ids: vec!["node-a".to_owned(), "node-b".to_owned()],
+            selected_exit_node: Some("node-exit".to_owned()),
             lan_access_enabled: true,
         };
         let unique = format!(
@@ -522,7 +522,7 @@ mod tests {
         // sentinel string is accidentally treated as a literal node id.
         let snapshot = SessionStateSnapshot {
             timestamp_unix: 100,
-            peer_ids: vec!["peer-a".to_string()],
+            peer_ids: vec!["peer-a".to_owned()],
             selected_exit_node: None,
             lan_access_enabled: true,
         };
@@ -570,8 +570,8 @@ mod tests {
         let writer = thread::spawn(move || {
             let snapshot = SessionStateSnapshot {
                 timestamp_unix: 2_000,
-                peer_ids: vec!["node-lock".to_string()],
-                selected_exit_node: Some("exit-lock".to_string()),
+                peer_ids: vec!["node-lock".to_owned()],
+                selected_exit_node: Some("exit-lock".to_owned()),
                 lan_access_enabled: true,
             };
             persist_session_snapshot(&snapshot, &*writer_path)
