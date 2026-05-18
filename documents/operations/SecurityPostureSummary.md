@@ -140,7 +140,7 @@ Modules with typed views landed:
 |---------------------------------------------------|------------------------------------------------------------------------------|
 | `cargo fmt --all -- --check`                       | format consistency                                                           |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | lint cleanliness with warnings-as-errors                  |
-| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2916 tests as of 2026-05-18 post-cycle-74)      |
+| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2921 tests as of 2026-05-18 post-cycle-84)      |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
 | `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 615 pinned tests)   |
