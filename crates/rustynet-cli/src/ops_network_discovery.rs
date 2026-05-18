@@ -1260,7 +1260,7 @@ mod tests {
 
     /// Wrong-type `type` slot rejected. Previously the silent
     /// `.unwrap_or_default()` returned empty string, surfacing as
-    /// "type must be host/server_reflexive/relay" — conflated with
+    /// "type must be `host/server_reflexive/relay`" — conflated with
     /// missing or wrong-type. Typed view catches wrong-type first.
     #[test]
     fn endpoint_candidate_view_rejects_wrong_type_kind() {
@@ -1276,7 +1276,7 @@ mod tests {
 
     /// Missing optional slots deserialise to `None`. The validator
     /// keeps emitting the legacy per-field errors (e.g.
-    /// "endpoint_candidates[i].endpoint must be a string") via the
+    /// "`endpoint_candidates`[i].endpoint must be a string") via the
     /// downstream check on `view.endpoint.is_none()`.
     #[test]
     fn endpoint_candidate_view_accepts_missing_optional_slots() {

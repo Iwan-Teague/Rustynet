@@ -24,7 +24,7 @@ an app-layer management channel reviewed against security minimum bar.";
 
 /// Build a `NodeAdapter` for the given platform using `conn` as its transport.
 /// `alias` must match the `NodeRoleAssignment::alias` for this node.
-/// `remote_workdir` is the path to the RustyNet source tree on the remote host;
+/// `remote_workdir` is the path to the `RustyNet` source tree on the remote host;
 /// required for Windows `install_daemon`, populated from inventory `rustynet_src_dir`.
 ///
 /// Error precedence:

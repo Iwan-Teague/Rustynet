@@ -672,7 +672,7 @@ fn parse_expected_ip(
 }
 
 /// Returns true for IPv4 ranges that are universally inappropriate as
-/// a mesh-peer expected_ip — irrespective of operator network choices.
+/// a mesh-peer `expected_ip` — irrespective of operator network choices.
 /// The list is intentionally narrow: loopback, link-local APIPA, and
 /// the three RFC 5737 documentation ranges. RFC1918 ranges (10/8,
 /// 172.16-31/16, 192.168/16) are NOT rejected here because some

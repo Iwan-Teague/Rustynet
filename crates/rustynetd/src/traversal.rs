@@ -1475,7 +1475,7 @@ pub struct EndpointChangeEvent {
 /// Tracks routable (non-loopback, non-link-local) addresses per underlay
 /// interface.  Interfaces whose names start with a prefix listed in
 /// `ignored_prefixes` are excluded — set this to `["rustynet"]` to prevent
-/// the WireGuard tunnel address from triggering spurious events.
+/// the `WireGuard` tunnel address from triggering spurious events.
 pub struct EndpointMonitor {
     last_seen_addrs: BTreeMap<String, Vec<IpAddr>>,
     ignored_prefixes: Vec<String>,
@@ -2764,7 +2764,7 @@ mod tests {
         assert!(ev.new_addrs.is_empty());
     }
 
-    /// B2-a: Address changes on the WireGuard tunnel interface (`rustynet0`)
+    /// B2-a: Address changes on the `WireGuard` tunnel interface (`rustynet0`)
     /// must be silently ignored — they are not underlay mobility events.
     #[test]
     fn test_b2a_rustynet_interface_changes_ignored() {

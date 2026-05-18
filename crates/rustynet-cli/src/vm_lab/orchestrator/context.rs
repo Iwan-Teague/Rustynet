@@ -20,23 +20,23 @@ pub struct OrchestrationContext {
     pub report_dir: PathBuf,
     /// Accumulated per-stage outcomes.
     pub stage_outcomes: HashMap<StageId, StageOutcome>,
-    /// Collected WireGuard public keys, keyed by node alias.
+    /// Collected `WireGuard` public keys, keyed by node alias.
     pub collected_pubkeys: HashMap<String, WireguardPublicKey>,
     /// Mesh network identifier passed to the bootstrap env.
     pub network_id: String,
     /// Pre-generated node IDs, keyed by alias.
-    /// Populated by the Preflight / PrepareSourceArchive stage before
+    /// Populated by the Preflight / `PrepareSourceArchive` stage before
     /// `install_daemon` runs. If absent for an alias, `install_daemon`
     /// falls back to `<alias>-bootstrap`.
     pub node_ids: HashMap<String, String>,
     /// CIDRs that SSH is allowed from (passed to bootstrap env as
     /// `SSH_ALLOW_CIDRS`). Empty string means no restriction at bootstrap.
     pub ssh_allow_cidrs: String,
-    /// Membership snapshot bytes collected from exit node during MembershipInit.
+    /// Membership snapshot bytes collected from exit node during `MembershipInit`.
     pub membership_snapshot: Option<Vec<u8>>,
-    /// WireGuard mesh IPs per alias, collected during CollectPubkeys.
+    /// `WireGuard` mesh IPs per alias, collected during `CollectPubkeys`.
     pub mesh_ips: HashMap<String, String>,
-    /// WireGuard endpoint (host:port) per alias, collected during CollectPubkeys.
+    /// `WireGuard` endpoint (host:port) per alias, collected during `CollectPubkeys`.
     pub endpoints: HashMap<String, String>,
 }
 

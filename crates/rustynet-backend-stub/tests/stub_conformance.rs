@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! TunnelBackend conformance suite run against StubBackend.
+//! `TunnelBackend` conformance suite run against `StubBackend`.
 //!
 //! Each test scenario mirrors the equivalent test in
 //! `rustynet-backend-api/tests/backend_contract.rs`.  Both files must be kept

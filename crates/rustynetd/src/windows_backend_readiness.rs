@@ -6,7 +6,7 @@
 //! backend depends on are present on the Windows host before the
 //! daemon attempts to bring up tunnels:
 //!
-//! * `wireguard.exe` from the official WireGuard for Windows installer
+//! * `wireguard.exe` from the official `WireGuard` for Windows installer
 //!   (`https://www.wireguard.com/install/`) at the canonical path
 //!   `C:\Program Files\WireGuard\wireguard.exe`. The daemon's
 //!   `WindowsWireguardBackend` shells out to this binary for every
@@ -20,7 +20,7 @@
 //!
 //! When any required binary is missing the report's `overall_ok`
 //! is false and the daemon-side install helper / orchestrator can
-//! surface a precise blocker reason ("install WireGuard for Windows
+//! surface a precise blocker reason ("install `WireGuard` for Windows
 //! before switching the env file to `--backend windows-wireguard-nt`").
 //!
 //! The collector is cross-platform: off-Windows hosts get an

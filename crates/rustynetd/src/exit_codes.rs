@@ -218,7 +218,7 @@ mod tests {
     }
 
     /// Numeric codes must NOT collide with each other — a future
-    /// refactor that accidentally maps BadArgs and ConfigError to the
+    /// refactor that accidentally maps `BadArgs` and `ConfigError` to the
     /// same number must trip a named failure.
     #[test]
     fn numeric_codes_are_pairwise_distinct() {

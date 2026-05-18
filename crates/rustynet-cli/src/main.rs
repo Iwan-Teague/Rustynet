@@ -17606,7 +17606,7 @@ mod tests {
 
     /// Missing optional slots deserialise to `None`. The validator's
     /// per-field checks still produce the legacy error messages for
-    /// missing fields (e.g. "must set evidence_mode=measured").
+    /// missing fields (e.g. "must set `evidence_mode=measured`").
     #[test]
     fn phase6_probe_metadata_view_accepts_missing_optional_slots() {
         let payload = serde_json::json!({});
@@ -17639,7 +17639,7 @@ mod tests {
 
     /// Wrong-type `evidence_mode` slot rejected at the typed layer.
     /// Was silent via `.and_then(Value::as_str) -> None`, surfacing
-    /// as "must set evidence_mode=measured" (indistinguishable from
+    /// as "must set `evidence_mode=measured`" (indistinguishable from
     /// missing). Typed view now distinguishes them.
     #[test]
     fn phase6_probe_metadata_view_rejects_wrong_type_evidence_mode() {

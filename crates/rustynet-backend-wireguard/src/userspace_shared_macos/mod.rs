@@ -5,7 +5,7 @@ use rustynet_backend_api::{
 
 pub(crate) const MACOS_USERSPACE_SHARED_BACKEND_MODE: &str = "macos-wireguard-userspace-shared";
 
-/// Phase 1 scaffolding for the macOS boringtun userspace WireGuard backend.
+/// Phase 1 scaffolding for the macOS boringtun userspace `WireGuard` backend.
 ///
 /// Declares shared-transport intent by not overriding
 /// `transport_socket_identity_blocker()` (the default returns `None`), signaling

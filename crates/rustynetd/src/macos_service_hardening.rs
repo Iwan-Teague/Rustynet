@@ -13,12 +13,12 @@
 //! parse the plist file directly.
 //!
 //! Reviewed hardening keys (from the reviewed plist):
-//!   UserName        = rustynetd
-//!   GroupName       = rustynetd
-//!   RunAtLoad       = true
-//!   KeepAlive       = true
-//!   ProcessType     = Background
-//!   AbandonProcessGroup = false
+//!   `UserName`        = rustynetd
+//!   `GroupName`       = rustynetd
+//!   `RunAtLoad`       = true
+//!   `KeepAlive`       = true
+//!   `ProcessType`     = Background
+//!   `AbandonProcessGroup` = false
 //!
 //! Wired through the CLI as `rustynetd macos-service-hardening-check`.
 //! The orchestrator's `MacosDaemonProbe` dispatches `ServiceHardening` here.

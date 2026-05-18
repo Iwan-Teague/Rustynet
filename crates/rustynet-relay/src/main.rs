@@ -8,7 +8,7 @@
 //! # Architecture
 //!
 //! The relay uses **allocated-port demultiplexing**:
-//! - A control port receives RelayHello messages and allocates sessions
+//! - A control port receives `RelayHello` messages and allocates sessions
 //! - Each session gets a unique allocated port for ciphertext forwarding
 //! - Inbound packets on allocated ports are forwarded to the paired session
 //!
@@ -18,7 +18,7 @@
 //! - Signed tokens: ed25519 signatures from control plane
 //! - Constant-time auth: no timing side channels
 //! - Replay protection: nonce tracking
-//! - Session binding: tokens bound to (node_id, peer_node_id, relay_id)
+//! - Session binding: tokens bound to (`node_id`, `peer_node_id`, `relay_id`)
 //! - Rate limiting: per-node packet and hello rate limits
 //!
 //! # Usage
@@ -225,7 +225,7 @@ mod daemon {
         }
     }
 
-    /// Wire format constants matching relay_client.rs
+    /// Wire format constants matching `relay_client.rs`
     const RELAY_HELLO_MSG_TYPE: u8 = 0x01;
     const RELAY_HELLO_ACK_MSG_TYPE: u8 = 0x02;
     const RELAY_REJECT_MSG_TYPE: u8 = 0x03;
@@ -441,7 +441,7 @@ mod daemon {
             }
         }
 
-        /// Handles a RelayHello message.
+        /// Handles a `RelayHello` message.
         async fn handle_hello(&self, data: &[u8], from_addr: SocketAddr) -> Result<(), String> {
             let hello = parse_relay_hello(data)?;
 
@@ -670,7 +670,7 @@ mod daemon {
         }
     }
 
-    /// Parses a RelayHello from wire format.
+    /// Parses a `RelayHello` from wire format.
     fn parse_relay_hello(data: &[u8]) -> Result<rustynet_relay::transport::RelayHello, String> {
         if data.is_empty() || data[0] != RELAY_HELLO_MSG_TYPE {
             return Err("not a hello message".to_owned());
@@ -726,7 +726,7 @@ mod daemon {
         })
     }
 
-    /// Parses a RelaySessionToken from wire format.
+    /// Parses a `RelaySessionToken` from wire format.
     fn parse_relay_token(data: &[u8]) -> Result<rustynet_control::RelaySessionToken, String> {
         use rustynet_control::RelaySessionToken;
 
@@ -831,7 +831,7 @@ mod daemon {
         })
     }
 
-    /// Serializes a RelayHelloAck for wire transmission.
+    /// Serializes a `RelayHelloAck` for wire transmission.
     fn serialize_relay_hello_ack(session_id: SessionId, allocated_port: u16) -> Vec<u8> {
         let mut buf = Vec::with_capacity(19);
         buf.push(RELAY_HELLO_ACK_MSG_TYPE);

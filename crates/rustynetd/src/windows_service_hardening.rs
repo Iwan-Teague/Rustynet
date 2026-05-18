@@ -28,7 +28,7 @@ pub const REVIEWED_WINDOWS_BINARY_FILE_NAME: &str = "rustynetd.exe";
 /// the reviewed install relies on.
 const REVIEWED_SERVICE_SID_TYPES: &[&str] = &["unrestricted", "restricted"];
 
-/// Allowed account names. Reviewed install runs as LocalSystem; service
+/// Allowed account names. Reviewed install runs as `LocalSystem`; service
 /// accounts in the `NT SERVICE\` namespace are also accepted because they
 /// represent dedicated virtual SIDs. Anything else (Administrator, custom
 /// users) is rejected.
@@ -207,7 +207,7 @@ pub fn build_windows_service_hardening_report(
     }
 }
 
-/// Best-effort argv split for a Windows ImagePath string. Handles a single
+/// Best-effort argv split for a Windows `ImagePath` string. Handles a single
 /// double-quoted executable path followed by space-separated args. Does not
 /// implement full Windows command-line escaping; that is acceptable because
 /// the reviewed install always emits a quoted exe followed by simple flag

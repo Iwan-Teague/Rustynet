@@ -21,12 +21,12 @@ const VALIDATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 
 /// Windows node adapter — W5.2 implementation.
 /// Dispatches all operations via SSH using `NodeConnection::Ssh` and
-/// PowerShell encoded commands.
+/// `PowerShell` encoded commands.
 #[derive(Debug)]
 pub struct WindowsNodeAdapter {
     conn: NodeConnection,
     alias: String,
-    /// Path to the RustyNet source tree on the remote Windows host,
+    /// Path to the `RustyNet` source tree on the remote Windows host,
     /// used by `install_daemon`. Populated from inventory `rustynet_src_dir`.
     workdir: Option<String>,
 }
@@ -232,8 +232,8 @@ impl NodeAdapter for WindowsNodeAdapter {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Build a PowerShell script that invokes the validator binary.
-/// argv must be [daemon_path, subcommand, ...flags] as produced by
+/// Build a `PowerShell` script that invokes the validator binary.
+/// argv must be [`daemon_path`, subcommand, ...flags] as produced by
 /// `WindowsDaemonProbe::build_argv`.
 fn build_validator_script(argv: &[String]) -> String {
     use crate::vm_lab::orchestrator::adapter::windows_install::ps_quote;

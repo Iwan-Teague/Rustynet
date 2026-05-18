@@ -29,7 +29,7 @@ impl StateMachineRunner {
     }
 
     /// Execute all stages in dependency order, applying skip-cascade.
-    /// Returns a list of (StageId, StageOutcome) in execution order.
+    /// Returns a list of (`StageId`, `StageOutcome`) in execution order.
     pub fn run(&self, ctx: &mut OrchestrationContext) -> Vec<(StageId, StageOutcome)> {
         let ordered = topological_order(&self.stages);
         let mut results: Vec<(StageId, StageOutcome)> = Vec::new();

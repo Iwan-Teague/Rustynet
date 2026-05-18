@@ -10,7 +10,7 @@ use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, Tunnel
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Read the WireGuard public key from the macOS state root.
+/// Read the `WireGuard` public key from the macOS state root.
 /// Returns the base64-encoded key decoded to hex.
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
     let pub_key_path = format!("{MACOS_KEYS_DIR}/wireguard.pub");
@@ -31,7 +31,7 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
     decode_wireguard_pubkey_to_hex(trimmed).map_err(|err| AdapterError::Protocol { message: err })
 }
 
-/// Read the local node_id from the running daemon via `rustynet status`.
+/// Read the local `node_id` from the running daemon via `rustynet status`.
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     let output = ssh::run_remote(
         conn,
@@ -86,7 +86,7 @@ pub fn probe_denied_peer(
     }
 }
 
-/// Collect active WireGuard tunnels via `wg show`.
+/// Collect active `WireGuard` tunnels via `wg show`.
 pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, AdapterError> {
     let output = ssh::run_remote(
         conn,
@@ -168,7 +168,7 @@ pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Collect the WireGuard mesh IP from the running daemon interface or status.
+/// Collect the `WireGuard` mesh IP from the running daemon interface or status.
 pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     let ip = ssh::run_remote(
         conn,

@@ -132,8 +132,8 @@ pub fn validate_windows_local_secret_acl(path: &Path, label: &str) -> Result<(),
 ///
 /// All reviewed roots under `C:\ProgramData\RustyNet` must (a) exist, (b) be
 /// directories, (c) carry a protected DACL with no broader-than-reviewed
-/// principals, (d) grant LocalSystem and Builtin Administrators, and (e) be
-/// owned by LocalSystem, Builtin Administrators, or a service SID.
+/// principals, (d) grant `LocalSystem` and Builtin Administrators, and (e) be
+/// owned by `LocalSystem`, Builtin Administrators, or a service SID.
 ///
 /// The daemon refuses to start when any root drifts. This is a fail-closed
 /// gate; missing roots are treated as drift and rejected. The Windows service
@@ -886,7 +886,7 @@ mod tests {
 
     // ---- W4: runtime-ACL drift extension -----------------------------
 
-    /// Deny ACE for LocalSystem must reject: even with a paired allow
+    /// Deny ACE for `LocalSystem` must reject: even with a paired allow
     /// ACE, the deny halts service start because Windows evaluates
     /// ACEs in order and short-circuits on the first match. Before
     /// this slice the verifier silently passed.
@@ -977,7 +977,7 @@ mod tests {
             .expect("SDDL without SACL must validate");
     }
 
-    /// Anonymous-owner SID (S-1-5-7) must reject. Only LocalSystem,
+    /// Anonymous-owner SID (S-1-5-7) must reject. Only `LocalSystem`,
     /// Builtin Administrators, or a service SID (S-1-5-80-*) are
     /// reviewed owners. Anonymous would allow ownership transfer.
     #[test]
@@ -1046,7 +1046,7 @@ mod tests {
         );
     }
 
-    /// schema_version on the diagnostic report must stay at 1.
+    /// `schema_version` on the diagnostic report must stay at 1.
     /// Bumping it must be a deliberate change with a paired migration.
     #[test]
     fn windows_runtime_acl_report_schema_version_pinned_at_one() {
@@ -1129,10 +1129,10 @@ mod tests {
 
     /// Anonymous (`AN`) allow ACE on the *runtime* evaluator must
     /// be rejected via the owner whitelist: even though `AN` is not
-    /// in FORBIDDEN_WELL_KNOWN_SDDL_PRINCIPALS today (so the
+    /// in `FORBIDDEN_WELL_KNOWN_SDDL_PRINCIPALS` today (so the
     /// protected-DACL helper does not flag the allow ACE itself),
     /// the runtime evaluator's owner check rejects any owner that
-    /// is not LocalSystem / Builtin Administrators / service SID.
+    /// is not `LocalSystem` / Builtin Administrators / service SID.
     /// Pin that the anonymous-owner shape is rejected end-to-end so
     /// any future refactor that softens the owner whitelist trips
     /// a named drift failure.
@@ -1181,7 +1181,7 @@ mod tests {
         );
     }
 
-    /// Reviewed posture: service SID owner + LocalSystem and
+    /// Reviewed posture: service SID owner + `LocalSystem` and
     /// Builtin Administrators allow ACEs validate cleanly on a
     /// DPAPI blob (file, not directory). Anchors the happy path so
     /// any future tightening that breaks the canonical secret-ACL

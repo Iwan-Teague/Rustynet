@@ -10,7 +10,7 @@
 //! underlay. The mitigation tracked by this slice is a dedicated
 //! verifier the systemd unit can invoke as `ExecStartPre` (and that
 //! a future boot-time service can invoke before `network-online.target`)
-//! to refuse to bring the WireGuard interface up unless the
+//! to refuse to bring the `WireGuard` interface up unless the
 //! killswitch is already in place.
 //!
 //! This module owns the pure evaluator + the typed report shape. The
@@ -63,7 +63,7 @@ pub struct LinuxKillswitchBootSnapshot {
     /// (Linux runtime host, nft binary present, `/sys/class/net`
     /// readable). False off-Linux or when the inspection couldn't
     /// run. The evaluator surfaces a clear blocker when this is
-    /// false so the off-platform case doesn't claim overall_ok.
+    /// false so the off-platform case doesn't claim `overall_ok`.
     #[serde(default = "default_host_observable_true")]
     pub host_observable: bool,
     /// True iff the reviewed family + table pair appears in the
@@ -85,7 +85,7 @@ pub struct LinuxKillswitchBootSnapshot {
     pub tunnel_interface_name: String,
 }
 
-/// Default value for the host_observable field on old JSON that
+/// Default value for the `host_observable` field on old JSON that
 /// predates the field — assume true so existing snapshots keep their
 /// previous meaning. The off-Linux collector explicitly sets false.
 fn default_host_observable_true() -> bool {
@@ -249,7 +249,7 @@ pub(crate) fn parse_nft_ruleset_for_killswitch(body: &str) -> (bool, Vec<String>
 /// "could not observe; requires a Linux runtime host" via a
 /// `table_present=false` + matching drift reason in the evaluator.
 ///
-/// `iface_name` is the WireGuard tunnel interface the daemon will
+/// `iface_name` is the `WireGuard` tunnel interface the daemon will
 /// bring up. If unknown to the caller, pass the reviewed default.
 pub fn collect_linux_killswitch_boot_report(iface_name: &str) -> LinuxKillswitchBootReport {
     collect_linux_killswitch_boot_report_inner(iface_name)

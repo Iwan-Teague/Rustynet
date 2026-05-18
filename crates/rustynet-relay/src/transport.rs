@@ -239,10 +239,10 @@ impl RelayTransport {
     /// 3. TTL bound check (max 120 s)
     /// 4. Token freshness / expiry
     /// 5. Replay nonce check
-    /// 6. `node_id` binding (ct_eq: hello.node_id == token.node_id)
-    /// 7. `peer_node_id` binding (ct_eq: hello.peer_node_id == token.peer_node_id)
-    /// 8. `relay_id` binding (ct_eq: token.relay_id == self.relay_id)
-    /// 9. Scope enforcement (token.scope == "forward_ciphertext_only")
+    /// 6. `node_id` binding (`ct_eq`: `hello.node_id` == `token.node_id`)
+    /// 7. `peer_node_id` binding (`ct_eq`: `hello.peer_node_id` == `token.peer_node_id`)
+    /// 8. `relay_id` binding (`ct_eq`: `token.relay_id` == `self.relay_id`)
+    /// 9. Scope enforcement (token.scope == "`forward_ciphertext_only`")
     /// 10. Global session capacity
     /// 11. Per-node session capacity
     /// 12. Daemon-supplied allocated port validation

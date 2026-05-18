@@ -459,7 +459,7 @@ fn resolve_artifact_path_for_verify(
 /// - `git_commit: String` — must deserialize as a string; the
 ///   downstream check still enforces the SHA-40 hex shape.
 ///
-/// Everything else (security_assertions, scenarios, source_artifacts,
+/// Everything else (`security_assertions`, scenarios, `source_artifacts`,
 /// etc.) rides through `#[serde(flatten)] extra: Map<String, Value>`
 /// so the downstream Map-walking validation logic keeps working.
 /// `into_value_map` re-injects the typed fields so the caller sees

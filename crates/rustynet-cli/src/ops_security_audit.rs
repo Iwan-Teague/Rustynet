@@ -1115,7 +1115,7 @@ mod tests {
 
     /// Clean fixture: a valid report payload deserialises into the
     /// typed view; every typed slot populates; dynamic dependent
-    /// fields (phase, hosts, evidence, dns_bind_addr) ride through
+    /// fields (phase, hosts, evidence, `dns_bind_addr`) ride through
     /// `#[serde(flatten)] extra`.
     #[test]
     fn security_audit_report_payload_view_accepts_clean_payload() {

@@ -130,7 +130,7 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
     /// the adapter is not yet enumerated by the OS.
     ///
     /// Non-empty stdout from `wg show <tunnel>` is the canonical signal that
-    /// the adapter is present and WireGuard has attached to it.
+    /// the adapter is present and `WireGuard` has attached to it.
     fn wait_for_tunnel_ready(&mut self) -> Result<(), BackendError> {
         const TUNNEL_READY_TIMEOUT_SECS: u64 = 30;
         const TUNNEL_READY_RETRY_INTERVAL_MS: u64 = 1000;

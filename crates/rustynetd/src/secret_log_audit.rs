@@ -1577,7 +1577,7 @@ fn deprecated_crypto_import_scanner_flags_use_blowfish() {
 
 /// Pure scan helper for `dbg!(<expr>)` calls whose `<expr>` contains
 /// any forbidden secret-bearing identifier from
-/// `FORBIDDEN_PLACEHOLDER_TOKENS`. Returns (line_number, token).
+/// `FORBIDDEN_PLACEHOLDER_TOKENS`. Returns (`line_number`, token).
 pub(crate) fn scan_source_for_dbg_macro_on_secret_tokens(body: &str) -> Vec<(usize, String)> {
     let mut hits: Vec<(usize, String)> = Vec::new();
     for (idx, line) in body.lines().enumerate() {
@@ -1782,7 +1782,7 @@ const PANIC_MACRO_NAMES: &[&str] = &[
 
 /// Pure scan helper for panic-shape macro calls whose format string
 /// interpolates a forbidden secret-bearing identifier. Returns
-/// (line_number, matched_token, matched_macro_name) tuples.
+/// (`line_number`, `matched_token`, `matched_macro_name`) tuples.
 pub(crate) fn scan_source_for_panic_macro_placeholder_leaks(
     body: &str,
 ) -> Vec<(usize, String, String)> {

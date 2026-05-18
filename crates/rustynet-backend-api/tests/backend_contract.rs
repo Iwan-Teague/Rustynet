@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! TunnelBackend contract test suite.
+//! `TunnelBackend` contract test suite.
 //!
 //! This file defines both a reusable `run_conformance_suite` harness (tested
 //! here against an inline `ContractBackend`) and individual named contract
-//! tests that are also run against the real StubBackend in
+//! tests that are also run against the real `StubBackend` in
 //! `rustynet-backend-stub/tests/stub_conformance.rs`.
 //!
 //! Any crate that ships a `TunnelBackend` implementation should run this
@@ -195,11 +195,11 @@ pub fn nid(name: &str) -> NodeId {
 
 // ── Reusable conformance harness ─────────────────────────────────────────────
 
-/// Run the full TunnelBackend conformance suite against `backend`.
+/// Run the full `TunnelBackend` conformance suite against `backend`.
 ///
 /// Returns a list of `(test_name, Ok(())|Err(String))`. Panics on first
 /// failure so test output is clear. Intended for use from integration test
-/// files of crates that implement TunnelBackend.
+/// files of crates that implement `TunnelBackend`.
 pub fn run_conformance_suite<B: TunnelBackend>(mut backend: B) {
     contract_not_running_rejects_mutations(&mut backend);
     contract_start_is_idempotent_reject(&mut backend);

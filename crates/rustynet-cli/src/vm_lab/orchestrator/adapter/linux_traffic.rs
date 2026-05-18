@@ -8,7 +8,7 @@ use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, Tunnel
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Collect WireGuard public key from `/var/lib/rustynet/keys/wireguard.pub`.
+/// Collect `WireGuard` public key from `/var/lib/rustynet/keys/wireguard.pub`.
 /// Returns the base64-encoded key as a hex string (32-byte decode → hex).
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
     let raw = ssh::run_remote(
@@ -25,7 +25,7 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
     Ok(hex)
 }
 
-/// Read the local node_id from the running daemon via `rustynet status`.
+/// Read the local `node_id` from the running daemon via `rustynet status`.
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     // /run/rustynet/ is mode 770 root:rustynetd; the daemon control socket
     // is unreadable to a non-root SSH user, so the status query needs sudo.
@@ -75,7 +75,7 @@ pub fn probe_denied_peer(
     }
 }
 
-/// Collect list of active WireGuard tunnels from `wg show all latest-handshakes`.
+/// Collect list of active `WireGuard` tunnels from `wg show all latest-handshakes`.
 pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, AdapterError> {
     let output = ssh::run_remote(
         conn,
@@ -171,7 +171,7 @@ pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Collect the WireGuard mesh IP from the running daemon interface or status.
+/// Collect the `WireGuard` mesh IP from the running daemon interface or status.
 pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     let ip = ssh::run_remote(
         conn,
@@ -340,7 +340,7 @@ fn decode_wireguard_pubkey_to_hex(value: &str) -> Result<String, String> {
 }
 
 /// Minimal base64 decode that handles the standard alphabet (A-Z, a-z, 0-9, +, /).
-/// Used for the 44-char WireGuard key (32 bytes → 44 base64 chars with `=` padding).
+/// Used for the 44-char `WireGuard` key (32 bytes → 44 base64 chars with `=` padding).
 fn base64_decode_simple(encoded: &[u8]) -> Result<Vec<u8>, String> {
     // Filter out whitespace.
     let filtered: Vec<u8> = encoded

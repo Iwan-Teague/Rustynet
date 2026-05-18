@@ -644,7 +644,7 @@ pub fn validate_vm_lab_target_topology(
     VmLabTopologyValidation::Ok
 }
 
-/// Evaluate a composite scope (Orchestrate / RepoSync / Suite) by evaluating
+/// Evaluate a composite scope (Orchestrate / `RepoSync` / Suite) by evaluating
 /// each constituent sub-context with the Slice-1 evaluator and folding the
 /// results through [`merge_vm_lab_capability_records`].
 ///
@@ -946,7 +946,7 @@ pub fn execute_ops_vm_lab_report_capabilities(
 }
 
 /// Canonical relative artifact path inside the report dir, per
-/// VmLabCapabilityReportingPlan Slice 3.
+/// `VmLabCapabilityReportingPlan` Slice 3.
 pub const PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH: &str = "state/platform_capabilities.json";
 
 /// Render the platform capabilities JSON artifact body for a set of records.
@@ -969,7 +969,7 @@ pub const PLATFORM_CAPABILITIES_ARTIFACT_RELATIVE_PATH: &str = "state/platform_c
 ///
 /// The encoder uses only enum-label and reason-code byte sequences that are
 /// already validated as ASCII (lowercase kebab-case for reason codes,
-/// PascalCase for scope/status labels), plus the JSON-escaped `message` field.
+/// `PascalCase` for scope/status labels), plus the JSON-escaped `message` field.
 /// `\\` and `"` are the only escapes we need to handle today; control
 /// characters never appear in evaluator-produced messages by construction
 /// (see the `reason_codes_use_kebab_case_lowercase_ascii` and message
@@ -1119,7 +1119,7 @@ impl VmLabCapabilityFailureContext {
 ///     bootstrap_phase: <phase|none>
 /// ```
 ///
-/// For Supported / PartiallySupported records the headline stays the same
+/// For Supported / `PartiallySupported` records the headline stays the same
 /// (it documents the bundle's origin, not a positive assertion); the
 /// per-status status field communicates the actual outcome.
 pub fn render_vm_lab_capability_failure_block(ctx: &VmLabCapabilityFailureContext) -> String {
@@ -1218,7 +1218,7 @@ impl VmLabCapabilityPrecondition {
 /// [`validate_vm_lab_target_topology`], and the Slice-1 evaluator — into a
 /// single fail-closed entry point that wrapper sites can call before any
 /// mutation begins. This is the canonical wrapper-precondition helper
-/// foreseen by VmLabCapabilityReportingPlan's cookbook
+/// foreseen by `VmLabCapabilityReportingPlan`'s cookbook
 /// (`validate_vm_lab_capability_preconditions`).
 ///
 /// Behaviour:

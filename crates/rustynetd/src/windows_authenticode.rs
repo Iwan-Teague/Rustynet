@@ -14,7 +14,7 @@
 //! 2. **Chain validation (W2.1b)** — call Win32 `WinVerifyTrust` with
 //!    `WINTRUST_ACTION_GENERIC_VERIFY_V2` and chain-revocation enabled
 //!    (`WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT`). This validates the
-//!    full PKCS#7 SignedData payload, the certificate chain back to a
+//!    full PKCS#7 `SignedData` payload, the certificate chain back to a
 //!    trusted root, the file hash against `SpcIndirectData`, and any
 //!    counter-signature timestamps. Windows-only; off-Windows the chain
 //!    status surfaces as `NotEvaluated` and `overall_ok` is false (the
@@ -34,14 +34,14 @@ const PE_OPTIONAL_HEADER_MAGIC_PE32: u16 = 0x010b;
 const PE_OPTIONAL_HEADER_MAGIC_PE32_PLUS: u16 = 0x020b;
 const PE_OPTIONAL_HEADER_DATA_DIRECTORY_INDEX_SECURITY: usize = 4;
 
-/// Reviewed Authenticode certificate revision (WIN_CERT_REVISION_2_0).
+/// Reviewed Authenticode certificate revision (`WIN_CERT_REVISION_2_0`).
 const WIN_CERT_REVISION_2_0: u16 = 0x0200;
-/// Reviewed Authenticode certificate type (WIN_CERT_TYPE_PKCS_SIGNED_DATA).
+/// Reviewed Authenticode certificate type (`WIN_CERT_TYPE_PKCS_SIGNED_DATA`).
 const WIN_CERT_TYPE_PKCS_SIGNED_DATA: u16 = 0x0002;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsAuthenticodeCertificateEntry {
-    /// Length of the WIN_CERTIFICATE structure in bytes (header + payload).
+    /// Length of the `WIN_CERTIFICATE` structure in bytes (header + payload).
     pub length: u32,
     pub revision: u16,
     pub certificate_type: u16,
@@ -80,7 +80,7 @@ pub struct WindowsAuthenticodeReport {
     pub binary_path: String,
     pub binary_size_bytes: u64,
     pub overall_ok: bool,
-    /// True when at least one PKCS-signed WIN_CERTIFICATE entry was parsed
+    /// True when at least one PKCS-signed `WIN_CERTIFICATE` entry was parsed
     /// successfully; false otherwise.
     pub signature_present: bool,
     pub certificate_table_offset: Option<u32>,

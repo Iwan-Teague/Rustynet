@@ -10,12 +10,12 @@ pub enum WindowsDpapiScope {
 }
 
 /// Outcome of a `verify_authenticode_chain` call. Variants:
-/// - `Verified`: WinVerifyTrust returned `S_OK` for the
+/// - `Verified`: `WinVerifyTrust` returned `S_OK` for the
 ///   `WINTRUST_ACTION_GENERIC_VERIFY_V2` policy with chain
 ///   revocation enabled. The signing certificate's full chain is
-///   trusted, the file digest matches the SpcIndirectData, and any
+///   trusted, the file digest matches the `SpcIndirectData`, and any
 ///   counter-signature timestamps are valid.
-/// - `Untrusted`: WinVerifyTrust returned a non-zero HRESULT. The
+/// - `Untrusted`: `WinVerifyTrust` returned a non-zero HRESULT. The
 ///   `reason` carries the canonical error label (e.g.
 ///   `TRUST_E_NOSIGNATURE`, `CERT_E_UNTRUSTEDROOT`,
 ///   `CERT_E_REVOKED`, `TRUST_E_BAD_DIGEST`) and `hresult` carries

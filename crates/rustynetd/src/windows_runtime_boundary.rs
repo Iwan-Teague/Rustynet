@@ -209,8 +209,8 @@ pub fn run_windows_runtime_boundary_check(
 }
 
 /// Run `op` against a freshly-spawned named-pipe server, retrying when the
-/// underlying call returns Windows error 2 (ERROR_FILE_NOT_FOUND).  Used by
-/// the boundary check to absorb the spawn -> first CreateNamedPipeW latency
+/// underlying call returns Windows error 2 (`ERROR_FILE_NOT_FOUND`).  Used by
+/// the boundary check to absorb the spawn -> first `CreateNamedPipeW` latency
 /// without depending on platform-specific filesystem probing.
 fn wait_for_pipe_then<T>(
     timeout: Duration,

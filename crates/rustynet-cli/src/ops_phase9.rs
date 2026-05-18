@@ -1082,7 +1082,7 @@ impl Phase9DrDrillView {
 }
 
 /// X2: Phase A typed view for one line of `incident_drills.ndjson`.
-/// Same `executed_at_utc` reviewed contract as Phase9DrDrillView —
+/// Same `executed_at_utc` reviewed contract as `Phase9DrDrillView` —
 /// the two streams share a UTC-timestamp field name and downstream
 /// helper surface.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -5946,8 +5946,8 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
     // ---- X2: Phase9DrDrillView typed-view migration coverage ------------
 
-    /// A clean dr_drills.ndjson line deserializes into the typed view
-    /// with executed_at_utc + extra fields preserved.
+    /// A clean `dr_drills.ndjson` line deserializes into the typed view
+    /// with `executed_at_utc` + extra fields preserved.
     #[test]
     fn phase9_dr_drill_view_accepts_clean_line() {
         let path = ndjson_temp_path("dr-typed-clean");
@@ -5973,7 +5973,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         let _ = fs::remove_file(&path);
     }
 
-    /// Missing executed_at_utc must fail-closed at deserialization
+    /// Missing `executed_at_utc` must fail-closed at deserialization
     /// time with a precise per-line error — the typed boundary is
     /// the whole point of the migration.
     #[test]
@@ -6001,7 +6001,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         let _ = fs::remove_file(&path);
     }
 
-    /// executed_at_utc that is present but not a string must
+    /// `executed_at_utc` that is present but not a string must
     /// fail-closed (e.g. someone wrote a unix timestamp number by
     /// mistake).
     #[test]
@@ -6034,7 +6034,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         let _ = fs::remove_file(&path);
     }
 
-    /// evidence_mode is optional — its absence must be silently ok.
+    /// `evidence_mode` is optional — its absence must be silently ok.
     /// Pin this so a future tightening of the typed view that flips
     /// `Option<String>` to `String` is a deliberate breaking change.
     #[test]
@@ -6053,7 +6053,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         let _ = fs::remove_file(&path);
     }
 
-    /// into_value_map round-trips the entry plus the typed fields
+    /// `into_value_map` round-trips the entry plus the typed fields
     /// back into the legacy `Map<String, Value>` shape that
     /// downstream helpers walk. The bridge must be lossless across
     /// the typed boundary.
@@ -6088,7 +6088,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
         );
     }
 
-    /// into_value_map omits evidence_mode when the typed view's
+    /// `into_value_map` omits `evidence_mode` when the typed view's
     /// `evidence_mode` is `None`. Pin so downstream `as_str()`
     /// readers see the same shape as the legacy
     /// `read_ndjson_objects` path.
