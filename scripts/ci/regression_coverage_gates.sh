@@ -20,10 +20,15 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: regression_coverage_gates.sh [--platform <linux|macos|windows|all>] [--verbose]
+usage: regression_coverage_gates.sh [--platform <linux|macos|windows|shared|all>] [--verbose]
 
 Options:
-  --platform   Restrict checks to one platform group. Default: all.
+  --platform   Restrict checks to one group. Default: all.
+                  linux   — Linux-specific verifier modules
+                  macos   — macOS-specific verifier modules
+                  windows — Windows-specific verifier modules
+                  shared  — platform-agnostic audit modules
+                  all     — every group
   --verbose    Echo the cargo invocations and per-module counts.
   -h, --help   This message.
 USAGE
@@ -55,9 +60,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${PLATFORM}" in
-  all|linux|macos|windows) ;;
+  all|linux|macos|windows|shared) ;;
   *)
-    echo "regression_coverage_gates: --platform must be linux|macos|windows|all (got ${PLATFORM})" >&2
+    echo "regression_coverage_gates: --platform must be linux|macos|windows|shared|all (got ${PLATFORM})" >&2
     exit 64
     ;;
 esac
@@ -98,6 +103,19 @@ LINUX_FLOORS=(
   # New module from L8: 21 tests pinning the boot-time killswitch
   # invariant (evaluator + nft-ruleset parser + off-Linux blocker).
   "linux_killswitch_boot:21"
+)
+
+# Shared (platform-agnostic) audit floors. These cover modules that
+# do not gate on a single host's verifier surface; instead they audit
+# the workspace source itself. The X3 secret-log-audit static scanner
+# (forbidden-token / Debug-derive / hex-encode / base64-encode /
+# Display-impl on secret types / secret-material equality) lives here.
+SHARED_FLOORS=(
+  # secret_log_audit pinned at the current self-test count. The
+  # module's tests pin the scanner's positive + negative shapes;
+  # silently dropping any of them would let a real secret-leak
+  # pattern slip past the audit on a future workspace sweep.
+  "secret_log_audit:35"
 )
 
 # macOS coverage floors. macOS is a control-plane platform today, not
@@ -251,6 +269,12 @@ fi
 
 if [[ "${PLATFORM}" == "windows" || "${PLATFORM}" == "all" ]]; then
   if ! run_group "windows" "${WINDOWS_FLOORS[@]}"; then
+    OVERALL=1
+  fi
+fi
+
+if [[ "${PLATFORM}" == "shared" || "${PLATFORM}" == "all" ]]; then
+  if ! run_group "shared" "${SHARED_FLOORS[@]}"; then
     OVERALL=1
   fi
 fi
