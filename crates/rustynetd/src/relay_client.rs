@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -324,8 +324,16 @@ pub struct RelayClient {
     sessions: HashMap<NodeId, RelayClientSession>,
     /// Configuration for relay behavior.
     config: RelayClientConfig,
-    /// The UDP socket used for relay communication.
-    socket: Option<UdpSocket>,
+    /// True when the daemon has explicitly attached this client to the
+    /// authoritative WireGuard transport socket. The relay client does
+    /// NOT own a UDP socket of its own — D3 in the dataplane execution
+    /// plan pins that relay and direct frames flow on the same UDP
+    /// socket. This flag asserts that wiring has happened; production
+    /// callers MUST set it via [`RelayClient::attach_authoritative_transport`]
+    /// before issuing relay traffic, and they MUST use the closure-
+    /// based `_with_round_trip` / `_with_sender` methods to drive the
+    /// authoritative transport.
+    attached_to_authoritative_transport: bool,
     #[cfg(test)]
     scripted_establishments: VecDeque<Result<u16, RelayClientError>>,
     #[cfg(test)]
@@ -353,7 +361,7 @@ impl RelayClient {
             token_issuer,
             sessions: HashMap::new(),
             config,
-            socket: None,
+            attached_to_authoritative_transport: false,
             #[cfg(test)]
             scripted_establishments: VecDeque::new(),
             #[cfg(test)]
@@ -366,23 +374,44 @@ impl RelayClient {
         self.config.local_port
     }
 
-    /// Binds the relay client to a local socket.
+    /// Assert that this RelayClient is wired into the WireGuard backend's
+    /// authoritative UDP transport socket — the same socket the direct
+    /// path uses. The supplied `wg_listen_port` is the port that
+    /// transport is bound to.
     ///
-    /// This must be called only with an authoritative transport socket owned by
-    /// the selected backend transport path, or by a test harness explicitly
-    /// modeling that authority. A second socket bound to the same local port is
-    /// not sufficient.
-    pub fn bind(&mut self, socket: UdpSocket) -> Result<(), RelayClientError> {
-        socket.set_read_timeout(Some(self.config.recv_timeout))?;
-        socket.set_write_timeout(Some(self.config.recv_timeout))?;
-        self.socket = Some(socket);
+    /// D3 in the dataplane execution plan pins that relay and direct
+    /// frames flow on the same UDP socket. This method is the typed
+    /// hand-off: the caller (the daemon's reconcile loop) calls it after
+    /// the WireGuard backend has bound its transport. The relay client
+    /// will then drive traffic through the supplied closure path
+    /// (`_with_round_trip`, `_with_sender`) — never through a private
+    /// ephemeral socket.
+    ///
+    /// Validates that `wg_listen_port` matches the configured
+    /// `local_port` if one was supplied. Returns an error otherwise so
+    /// a misconfiguration fails closed rather than silently using a
+    /// different port.
+    pub fn attach_authoritative_transport(
+        &mut self,
+        wg_listen_port: u16,
+    ) -> Result<(), RelayClientError> {
+        if let Some(configured) = self.config.local_port
+            && configured != wg_listen_port
+        {
+            return Err(RelayClientError::AuthoritativeTransport(format!(
+                "configured relay local_port {configured} does not match WireGuard transport port {wg_listen_port}; \
+                 the relay path must share the WG transport socket per D3"
+            )));
+        }
+        self.attached_to_authoritative_transport = true;
         Ok(())
     }
 
-    /// Returns true when the relay client has an authoritative transport socket
-    /// bound for live relay control traffic.
+    /// True when the relay client has been attached to an authoritative
+    /// transport via [`attach_authoritative_transport`] (or marked bound
+    /// in a test harness).
     pub fn is_bound(&self) -> bool {
-        self.socket.is_some() || {
+        self.attached_to_authoritative_transport || {
             #[cfg(test)]
             {
                 self.bound_override
@@ -431,30 +460,20 @@ impl RelayClient {
                 },
             );
         }
+        let _ = (peer_node_id, relay_addr, relay_id, ttl_secs);
 
-        let socket = self
-            .socket
-            .as_ref()
-            .ok_or_else(|| {
-                RelayClientError::Io(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "relay socket not bound",
-                ))
-            })?
-            .try_clone()?;
-        self.establish_session_with_round_trip(
-            peer_node_id,
-            relay_addr,
-            relay_id,
-            ttl_secs,
-            |target, hello_bytes, timeout| {
-                socket.send_to(hello_bytes, target)?;
-                recv_relay_response_with_deadline(relay_addr, timeout, |remaining, buf| {
-                    socket.set_read_timeout(Some(remaining))?;
-                    socket.recv_from(buf)
-                })
-            },
-        )
+        // D3: relay and direct frames flow on the same UDP socket. The
+        // RelayClient does NOT own a socket — production callers must
+        // use `establish_session_with_round_trip` and pass the
+        // authoritative transport closure (the daemon's controller
+        // wires this in reconcile.rs). Reaching this branch outside a
+        // scripted test means the caller violated the D3 contract.
+        Err(RelayClientError::AuthoritativeTransport(
+            "RelayClient::establish_session called without an authoritative transport — \
+             production callers must use establish_session_with_round_trip and supply the \
+             WireGuard backend's authoritative transport closure (D3 contract)"
+                .to_owned(),
+        ))
     }
 
     pub fn establish_session_with_round_trip<F>(
@@ -652,34 +671,16 @@ impl RelayClient {
     ///
     /// # Returns
     /// `Ok(())` if the keepalive was sent successfully.
-    pub fn send_keepalive(&mut self, peer_node_id: &NodeId) -> Result<(), RelayClientError> {
-        let session = self
-            .sessions
-            .get(peer_node_id)
-            .ok_or(RelayClientError::NoRelayAvailable)?;
-
-        let socket = self
-            .socket
-            .as_ref()
-            .ok_or_else(|| {
-                RelayClientError::Io(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "relay socket not bound",
-                ))
-            })?
-            .try_clone()?;
-
-        // Keepalive is a minimal packet to the allocated port.
-        // Use a simple format: [KEEPALIVE_MSG_TYPE, session_id[0..4]]
-        // This is enough to keep NAT mappings alive without being a full hello.
-        let mut keepalive = [0u8; 5];
-        keepalive[0] = RELAY_KEEPALIVE_MSG_TYPE;
-        keepalive[1..5].copy_from_slice(&session.session_id.as_bytes()[0..4]);
-
-        self.send_keepalive_with_sender(peer_node_id, |target, keepalive| {
-            socket.send_to(keepalive, target)?;
-            Ok(())
-        })
+    pub fn send_keepalive(&mut self, _peer_node_id: &NodeId) -> Result<(), RelayClientError> {
+        // D3: relay frames flow on the WireGuard backend's authoritative
+        // UDP socket. Use `send_keepalive_with_sender` and pass the
+        // controller's authoritative_transport_send closure instead.
+        Err(RelayClientError::AuthoritativeTransport(
+            "RelayClient::send_keepalive called without an authoritative transport — \
+             production callers must use send_keepalive_with_sender and supply the \
+             WireGuard backend's authoritative transport sender (D3 contract)"
+                .to_owned(),
+        ))
     }
 
     pub fn send_keepalive_with_sender<F>(
@@ -707,24 +708,6 @@ impl RelayClient {
         }
 
         Ok(())
-    }
-
-    /// Sends keepalives to all sessions that need them.
-    ///
-    /// Returns the number of keepalives sent and any errors encountered.
-    pub fn send_all_keepalives(&mut self) -> (usize, Vec<(NodeId, RelayClientError)>) {
-        let peers_needing_keepalive = self.sessions_needing_keepalive();
-        let mut sent = 0;
-        let mut errors = Vec::new();
-
-        for peer_id in peers_needing_keepalive {
-            match self.send_keepalive(&peer_id) {
-                Ok(()) => sent += 1,
-                Err(e) => errors.push((peer_id, e)),
-            }
-        }
-
-        (sent, errors)
     }
 
     /// Returns sessions with tokens expiring soon.
@@ -778,6 +761,7 @@ const RELAY_HELLO_ACK_MSG_TYPE: u8 = 0x02;
 const RELAY_REJECT_MSG_TYPE: u8 = 0x03;
 const RELAY_KEEPALIVE_MSG_TYPE: u8 = 0x04;
 
+#[cfg(test)]
 fn recv_relay_response_with_deadline<F>(
     relay_addr: SocketAddr,
     timeout: Duration,
@@ -2253,6 +2237,107 @@ mod tests {
         assert!(
             !client.is_bound(),
             "configured local port must not be treated as an authoritative transport socket"
+        );
+    }
+
+    #[test]
+    fn relay_client_attach_authoritative_transport_marks_bound() {
+        // D3 pin: the relay client is bound when (and only when) the
+        // daemon explicitly attaches it to the WireGuard backend's
+        // authoritative transport socket. No separate ephemeral
+        // socket is involved.
+        let signing_key = Arc::new(SigningKey::from_bytes(&[123u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        assert!(
+            !client.is_bound(),
+            "fresh client must not be bound until authoritative transport is attached"
+        );
+        client
+            .attach_authoritative_transport(51820)
+            .expect("attach succeeds when no port mismatch");
+        assert!(
+            client.is_bound(),
+            "after attach_authoritative_transport, is_bound() must return true"
+        );
+    }
+
+    #[test]
+    fn relay_client_attach_authoritative_transport_rejects_port_mismatch() {
+        // D3 pin: if the relay client config carries a `local_port`,
+        // attach must verify it matches the WG transport port the
+        // daemon supplies. A mismatch indicates a misconfiguration
+        // (the relay client was wired to a different socket than the
+        // direct path) — fail closed.
+        let signing_key = Arc::new(SigningKey::from_bytes(&[124u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig {
+                local_port: Some(51820),
+                ..Default::default()
+            },
+        );
+        let err = client
+            .attach_authoritative_transport(40000)
+            .expect_err("port mismatch must be rejected");
+        match err {
+            RelayClientError::AuthoritativeTransport(msg) => {
+                assert!(
+                    msg.contains("51820") && msg.contains("40000"),
+                    "error must surface both ports for diagnostics, got: {msg}"
+                );
+            }
+            other => panic!("expected AuthoritativeTransport, got {other:?}"),
+        }
+        assert!(
+            !client.is_bound(),
+            "after a rejected attach, the client must remain unbound"
+        );
+    }
+
+    #[test]
+    fn relay_client_establish_session_without_authoritative_transport_fails_closed() {
+        // D3 pin: production callers must use
+        // `establish_session_with_round_trip`. The convenience
+        // `establish_session` method MUST refuse to fall back to a
+        // private socket — it returns AuthoritativeTransport instead.
+        let signing_key = Arc::new(SigningKey::from_bytes(&[125u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let err = client
+            .establish_session(&peer_id, relay_addr, [0xAA; 16], 60)
+            .expect_err("must refuse without authoritative transport");
+        assert!(
+            matches!(err, RelayClientError::AuthoritativeTransport(_)),
+            "expected AuthoritativeTransport, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn relay_client_send_keepalive_without_authoritative_transport_fails_closed() {
+        // D3 pin counterpart for the keepalive path.
+        let signing_key = Arc::new(SigningKey::from_bytes(&[126u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let err = client
+            .send_keepalive(&peer_id)
+            .expect_err("must refuse without authoritative transport");
+        assert!(
+            matches!(err, RelayClientError::AuthoritativeTransport(_)),
+            "expected AuthoritativeTransport, got: {err:?}"
         );
     }
 

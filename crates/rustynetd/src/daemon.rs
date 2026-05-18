@@ -2927,7 +2927,21 @@ impl DaemonRuntime {
             max_clock_skew_secs: TrustPolicy::default().max_clock_skew_secs,
         };
         let backend = DaemonBackend::from_config(config)?;
-        let relay_client = load_relay_client(config)?;
+        let mut relay_client = load_relay_client(config)?;
+        // D3: the relay client and the direct path share the same UDP
+        // transport socket — the WG backend's authoritative transport.
+        // Attach the relay client to it explicitly so it can refuse to
+        // bind a private socket later in its lifetime. The actual
+        // packet plumbing happens via the controller's
+        // authoritative_transport_send / _round_trip closures.
+        if let Some(client) = relay_client.as_mut()
+            && let Err(err) = client.attach_authoritative_transport(config.wg_listen_port)
+        {
+            return Err(DaemonError::InvalidConfig(format!(
+                "relay client failed to attach to WireGuard authoritative transport on port {}: {err}",
+                config.wg_listen_port
+            )));
+        }
         let relay_fleet = load_optional_relay_fleet(config, trust_policy)?;
         let transport_socket_identity_blocker = backend
             .transport_socket_identity_blocker()
