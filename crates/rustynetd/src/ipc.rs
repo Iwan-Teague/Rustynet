@@ -217,6 +217,24 @@ pub fn read_command_envelope<R: std::io::Read>(
         let content = parts[0];
         let signature_hex = parts[1];
 
+        // **Security**: reject odd-length hex strings BEFORE entering
+        // the slice loop. The original code did `signature_hex[i..i + 2]`
+        // which would panic on slice-out-of-bounds when `len % 2 != 0`
+        // and `i = len - 1`. A crafted IPC envelope with an odd-length
+        // signature= field could panic the daemon. Fail-closed here.
+        if !signature_hex.len().is_multiple_of(2) {
+            return Err(RemoteOpsEnvelopeParseError::InvalidSignatureHex(format!(
+                "signature hex length {} is not a multiple of 2",
+                signature_hex.len()
+            )));
+        }
+        // Also reject anything that isn't ASCII — the str-slice into a
+        // multi-byte UTF-8 codepoint would panic on a non-char-boundary.
+        if !signature_hex.is_ascii() {
+            return Err(RemoteOpsEnvelopeParseError::InvalidSignatureHex(
+                "signature hex contains non-ASCII characters".to_owned(),
+            ));
+        }
         let signature = (0..signature_hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&signature_hex[i..i + 2], 16))
@@ -263,7 +281,7 @@ pub fn read_command_envelope<R: std::io::Read>(
 
 #[cfg(test)]
 mod tests {
-    use super::{IpcCommand, IpcResponse, parse_command, validate_cidr};
+    use super::{IpcCommand, IpcResponse, parse_command, read_command_envelope, validate_cidr};
 
     #[test]
     fn parse_and_wire_roundtrip_for_mutating_command() {
@@ -308,5 +326,37 @@ mod tests {
         assert!(validate_cidr("fd00::/64"));
         assert!(!validate_cidr("192.168.1.0/24; rm -rf /"));
         assert!(!validate_cidr("not-a-cidr"));
+    }
+
+    #[test]
+    fn read_command_envelope_rejects_odd_length_signature_hex_without_panicking() {
+        // Security pin: a crafted IPC envelope with an odd-length
+        // `signature=` field would previously hit
+        // `signature_hex[i..i + 2]` slice-out-of-bounds and panic
+        // the daemon. Must fail gracefully.
+        let bad_odd = b"remote-op-v1 subject=foo nonce=1 command=status signature=abc\n";
+        let err = read_command_envelope(&bad_odd[..])
+            .expect_err("odd-length signature hex must surface as error");
+        let display = format!("{err:?}");
+        assert!(
+            display.contains("multiple of 2") || display.contains("InvalidSignatureHex"),
+            "diagnostic should describe the odd-length problem, got: {display}"
+        );
+    }
+
+    #[test]
+    fn read_command_envelope_rejects_non_ascii_signature_hex_without_panicking() {
+        // Security pin: a `signature=` value containing multi-byte
+        // UTF-8 codepoints would previously panic when slicing on
+        // a non-char-boundary. Must fail gracefully.
+        let envelope: Vec<u8> =
+            b"remote-op-v1 subject=foo nonce=1 command=status signature=ab\xc3\xa9\n".to_vec();
+        let err =
+            read_command_envelope(&envelope[..]).expect_err("non-ASCII signature hex must error");
+        let display = format!("{err:?}");
+        assert!(
+            display.contains("non-ASCII") || display.contains("InvalidSignatureHex"),
+            "diagnostic should describe the non-ASCII problem, got: {display}"
+        );
     }
 }
