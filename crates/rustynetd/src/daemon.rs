@@ -7636,12 +7636,29 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                             let authorized = if parsed.is_mutating() {
                                 match (peer_uid(&stream), peer_gid(&stream)) {
                                     (Some(peer_uid), Some(peer_gid)) => {
-                                        // allow root uid, socket owner uid, or socket owner gid (e.g., rustynet group)
+                                        // Allow root uid, socket owner uid, or — only when
+                                        // we can authoritatively read the socket's owner gid —
+                                        // a peer in that owner group.
+                                        //
+                                        // The previous shape used
+                                        // `socket_owner_gid(...).unwrap_or(0)` which collapsed
+                                        // a socket-metadata read failure into a gid=0
+                                        // comparison. That meant any peer running with gid=0
+                                        // could be silently authorized whenever the daemon
+                                        // failed to stat its own socket (e.g. the socket file
+                                        // got removed mid-flight by a hostile recovery). We
+                                        // now fail-closed on the metadata-read failure: if we
+                                        // cannot resolve the owner gid, the gid arm is
+                                        // refused entirely and only the uid arms can grant
+                                        // mutation.
+                                        let owner_gid_match =
+                                            match socket_owner_gid(&config.socket_path) {
+                                                Ok(owner_gid) => peer_gid == owner_gid,
+                                                Err(_) => false,
+                                            };
                                         peer_uid == 0
                                             || peer_uid == socket_owner_uid
-                                            || peer_gid
-                                                == socket_owner_gid(&config.socket_path)
-                                                    .unwrap_or(0)
+                                            || owner_gid_match
                                     }
                                     (Some(peer_uid), None) => {
                                         peer_uid == 0 || peer_uid == socket_owner_uid
@@ -14254,6 +14271,28 @@ mod tests {
             "unexpected error shape: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the IPC mutation-authorization path must not silently
+    /// fall back to comparing the peer gid against 0 when `socket_owner_gid`
+    /// fails to read the socket's metadata. A `.unwrap_or(0)` shape would
+    /// authorize any peer running with gid=0 (root group) whenever the
+    /// daemon's own socket file could not be stat'd — a real condition under
+    /// concurrent socket recovery / file replacement. We pin the fail-closed
+    /// shape by source-grep so a future refactor cannot reintroduce it.
+    #[test]
+    fn ipc_mutation_auth_does_not_collapse_unresolvable_gid_to_zero() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/daemon.rs"))
+            .expect("daemon source readable");
+        // Build the dangerous needle from chunks so the test's own source
+        // does not match it.
+        let dangerous = ["socket_owner_gid", "(&config.socket_path).unwrap_or(0)"].concat();
+        assert!(
+            !body.contains(&dangerous),
+            "IPC peer-gid authorization must fail-closed when the socket gid \
+             cannot be read; do not collapse to gid=0"
+        );
     }
 
     /// Regression: the trust/bundle loader path must NOT contain the old
