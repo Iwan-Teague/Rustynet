@@ -373,9 +373,12 @@ pub fn accept_bundle_with_now(
     verify_signature(bundle, verifying_key)?;
     let drift = bundle.timestamp_unix as i128 - now_unix as i128;
     if drift.unsigned_abs() > freshness_window_secs as u128 {
-        return Err(GossipError::TimestampOutsideWindow {
-            drift_secs: drift as i64,
-        });
+        // Saturating-cast i128 → i64 so a pathological skew (timestamp
+        // close to u64::MAX) reports a clamped sentinel rather than a
+        // wrapped negative value. Cosmetic — the rejection itself is
+        // correct either way.
+        let drift_secs = drift.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        return Err(GossipError::TimestampOutsideWindow { drift_secs });
     }
     if let Some(last) = state.highest_accepted(&bundle.source_node_id)
         && bundle.sequence <= last

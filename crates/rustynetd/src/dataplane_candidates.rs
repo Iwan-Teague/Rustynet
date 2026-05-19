@@ -9,11 +9,14 @@
 //! This module is the producer side of that endpoint list. It surfaces:
 //!
 //! * [`enumerate_local_host_candidates`] — walks `getifaddrs(2)` on
-//!   Linux/macOS and classifies each address by family + scope.
-//!   Returns the routable subset (excludes loopback, link-local,
-//!   unspecified, broadcast, and on IPv6 also ULA/private and
-//!   unique-local). Windows is stubbed (empty list); a follow-up
-//!   slice can wire `GetAdaptersAddresses` via a dedicated crate.
+//!   Linux/macOS and returns EVERY interface address with its
+//!   classified scope. This includes loopback, link-local, multicast
+//!   etc.  Callers that want only the routable subset must filter
+//!   via `LocalHostCandidate::is_gossip_worthy()` or use
+//!   [`gather_gossip_worthy_host_candidates`] which does the filter
+//!   and ICE-priority sort in one call. Windows is stubbed (empty
+//!   list); a follow-up slice can wire `GetAdaptersAddresses` via a
+//!   dedicated crate.
 //!
 //! * [`gather_srflx_candidates`] — given a [`StunClient`], a list of
 //!   IPv4 STUN server URLs, and a list of IPv6 STUN server URLs,
@@ -175,6 +178,12 @@ pub fn classify_ip(addr: IpAddr) -> AddressScope {
 /// Per-platform interface enumeration. On Linux/macOS uses
 /// `nix::ifaddrs::getifaddrs`. On Windows returns an empty list — the
 /// follow-up slice will wire GetAdaptersAddresses.
+///
+/// Returns the FULL list of classified addresses including
+/// non-routable scopes (loopback, link-local, multicast). Callers
+/// that want only the gossip-worthy subset should use
+/// [`gather_gossip_worthy_host_candidates`], which filters and
+/// sorts in one call.
 pub fn enumerate_local_host_candidates() -> Vec<LocalHostCandidate> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
