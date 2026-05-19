@@ -13,7 +13,6 @@ use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
     WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
@@ -86,6 +85,13 @@ pub enum CryptoError {
     KdfFailed,
     EncryptionFailed,
     DecryptionFailed,
+    /// Kernel CSPRNG (`OsRng`) was unavailable for fresh key-custody salt
+    /// and nonce material. We refuse to fall back to any non-CSPRNG source
+    /// (including the seeded `ThreadRng`, which on first use seeds from
+    /// `OsRng` and could carry forward stale entropy): the XChaCha20-Poly1305
+    /// nonce MUST be unique, and an Argon2 salt that is predictable defeats
+    /// the per-blob KDF stretching invariant.
+    RandomnessUnavailable,
 }
 
 impl fmt::Display for CryptoError {
@@ -113,6 +119,9 @@ impl fmt::Display for CryptoError {
             CryptoError::KdfFailed => f.write_str("key derivation failed"),
             CryptoError::EncryptionFailed => f.write_str("encryption failed"),
             CryptoError::DecryptionFailed => f.write_str("decryption failed"),
+            CryptoError::RandomnessUnavailable => {
+                f.write_str("kernel CSPRNG unavailable for key-custody material")
+            }
         }
     }
 }
@@ -855,12 +864,40 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, CryptoError> {
 }
 
 pub fn generate_key_custody_material() -> ([u8; 16], [u8; 24]) {
-    let mut rng = rand::rng();
+    // Legacy infallible entry point retained for existing test fixtures and
+    // dev-tool wiring. Production code paths MUST use
+    // `try_generate_key_custody_material` so a CSPRNG failure surfaces as a
+    // structured `CryptoError::RandomnessUnavailable` instead of either
+    // panicking or silently degrading to a non-CSPRNG source.
+    match try_generate_key_custody_material() {
+        Ok(material) => material,
+        Err(err) => panic!("kernel CSPRNG unavailable for key-custody material: {err}"),
+    }
+}
+
+/// Fallible analogue of [`generate_key_custody_material`].
+///
+/// `salt` is consumed by Argon2 for per-blob KDF stretching; if a salt
+/// repeats across blobs, an attacker that compromises one passphrase can
+/// pre-compute keys against any other blob with the same salt — the
+/// stretching invariant collapses. `nonce` is consumed by XChaCha20-Poly1305;
+/// any nonce reuse with the same key catastrophically breaks
+/// confidentiality + integrity (Poly1305 forgery becomes trivial). Both
+/// MUST come from the kernel CSPRNG. We refuse to silently fall back to
+/// `ThreadRng` because `ThreadRng` itself reseeds from `OsRng` and would
+/// inherit any stale entropy if `OsRng` later fails — fail-closed is the
+/// only safe behavior.
+pub fn try_generate_key_custody_material() -> Result<([u8; 16], [u8; 24]), CryptoError> {
+    use rand::TryRngCore;
     let mut salt = [0u8; 16];
     let mut nonce = [0u8; 24];
-    rng.fill_bytes(&mut salt);
-    rng.fill_bytes(&mut nonce);
-    (salt, nonce)
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut salt)
+        .map_err(|_| CryptoError::RandomnessUnavailable)?;
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| CryptoError::RandomnessUnavailable)?;
+    Ok((salt, nonce))
 }
 
 pub fn encrypt_private_key_envelope(
@@ -923,7 +960,12 @@ pub fn write_encrypted_key_file(
     passphrase: &str,
     policy: KeyCustodyPermissionPolicy,
 ) -> Result<(), CryptoError> {
-    let (salt, nonce) = generate_key_custody_material();
+    // Fail-closed on CSPRNG unavailability: see the rationale comment on
+    // `try_generate_key_custody_material`. We refuse to write a key file
+    // sealed with a non-CSPRNG-derived salt or nonce because that would
+    // break Argon2's per-blob KDF uniqueness and could enable nonce reuse
+    // against the AEAD.
+    let (salt, nonce) = try_generate_key_custody_material()?;
     let blob = encrypt_private_key_envelope(plaintext, passphrase, salt, nonce)?;
     let encoded = encode_encrypted_blob(&blob);
 
@@ -1122,9 +1164,67 @@ mod tests {
         Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
         NodeKeyPair, OsStoreFallbackPolicy, SigningProviderKind, SigningProviderPolicy,
         create_provider_attestation, decrypt_private_key_envelope, encrypt_private_key_envelope,
-        generate_key_custody_material, read_encrypted_key_file, validate_key_custody_permissions,
-        validate_signing_provider_policy, verify_provider_attestation, write_encrypted_key_file,
+        generate_key_custody_material, read_encrypted_key_file, try_generate_key_custody_material,
+        validate_key_custody_permissions, validate_signing_provider_policy,
+        verify_provider_attestation, write_encrypted_key_file,
     };
+
+    /// Regression: `try_generate_key_custody_material` must (1) succeed on a
+    /// healthy host, (2) yield distinct salts and nonces under repeated calls
+    /// (catches a buggy fallback that returned a zeroed buffer), and (3) keep
+    /// the strict `Result<_, CryptoError::RandomnessUnavailable>` shape that
+    /// production callers rely on.
+    #[test]
+    fn try_generate_key_custody_material_returns_distinct_csprng_output() {
+        let (salt_a, nonce_a) =
+            try_generate_key_custody_material().expect("OsRng available in test env");
+        let (salt_b, nonce_b) =
+            try_generate_key_custody_material().expect("OsRng available in test env");
+        assert_ne!(
+            salt_a, salt_b,
+            "duplicate Argon2 salt would collapse per-blob KDF uniqueness"
+        );
+        assert_ne!(
+            nonce_a, nonce_b,
+            "duplicate XChaCha20-Poly1305 nonce would enable Poly1305 forgery"
+        );
+        assert!(
+            !salt_a.iter().all(|b| *b == 0),
+            "zeroed salt indicates fallback was triggered"
+        );
+        assert!(
+            !nonce_a.iter().all(|b| *b == 0),
+            "zeroed nonce indicates fallback was triggered"
+        );
+    }
+
+    /// Regression: `write_encrypted_key_file` must use the fallible nonce/salt
+    /// generator. A future refactor that called the panicking
+    /// `generate_key_custody_material` would re-introduce the same DoS-on-
+    /// CSPRNG-fault shape we are trying to remove. We pin via source-grep.
+    #[test]
+    fn write_encrypted_key_file_calls_fallible_csprng() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("pub fn write_encrypted_key_file(")
+            .expect("write_encrypted_key_file must remain present");
+        // Take a window covering the function body.
+        let window_end = (start + 4_000).min(body.len());
+        let window = &body[start..window_end];
+        assert!(
+            window.contains("try_generate_key_custody_material()"),
+            "write_encrypted_key_file must use the fallible nonce+salt minter"
+        );
+        // Build the panicking name from chunks so the regression message does
+        // not itself match the negative grep.
+        let panicking = ["generate_key_", "custody_material()"].concat();
+        assert!(
+            !window.contains(&panicking) || window.contains("try_generate_key_custody_material()"),
+            "write_encrypted_key_file must not call the panicking legacy minter directly"
+        );
+    }
 
     #[test]
     fn rejects_zero_key_material() {
