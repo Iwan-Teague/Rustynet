@@ -104,6 +104,13 @@ pub enum GossipError {
     SequenceNotMonotonic { last_seen: u64, presented: u64 },
     /// Too many candidates packed into a single bundle.
     TooManyCandidates { presented: usize, max: usize },
+    /// One or more candidate endpoints have non-gossip-worthy scope
+    /// (loopback, link-local, multicast, broadcast, unspecified, or
+    /// the IPv6 documentation prefix). A peer claiming such addresses
+    /// as its own reachability is either misconfigured or trying to
+    /// redirect our connect-attempt traffic to a local service or
+    /// multicast group. Fail closed.
+    UnreachableCandidate { addr: String },
     /// Couldn't compute the current Unix timestamp (clock before
     /// UNIX_EPOCH). Should never happen on a healthy host.
     TimestampUnavailable,
@@ -130,6 +137,10 @@ impl std::fmt::Display for GossipError {
             GossipError::TooManyCandidates { presented, max } => write!(
                 f,
                 "gossip bundle carries too many candidates ({presented}; max {max})"
+            ),
+            GossipError::UnreachableCandidate { addr } => write!(
+                f,
+                "gossip bundle carries a non-gossip-worthy candidate address {addr}"
             ),
             GossipError::TimestampUnavailable => write!(
                 f,
@@ -348,6 +359,40 @@ pub fn accept_bundle(
     accept_bundle_with_now(bundle, known_peers, state, freshness_window_secs, now)
 }
 
+/// Reject a gossip bundle whose candidate set includes any address
+/// the receiver should not even attempt to connect to. The signature
+/// check above proves the candidates came from the claimed peer, but
+/// a compromised peer (or an honest peer with a broken candidate
+/// gatherer) shouldn't be able to redirect our connect-attempt
+/// traffic to localhost services, multicast groups, or other
+/// non-public destinations.
+///
+/// Accepted scopes: Global and Private (RFC 1918 / RFC 4193 ULA).
+/// Rejected scopes: Loopback, LinkLocal, Multicast, Broadcast,
+/// Unspecified, and the IPv6 documentation prefix (folded into
+/// Unspecified by `classify_ipv6`).
+fn reject_unreachable_candidates(candidates: &CandidateSet) -> Result<(), GossipError> {
+    use crate::dataplane_candidates::{AddressScope, classify_ip};
+    let all_addrs = candidates
+        .v4_host
+        .iter()
+        .chain(candidates.v6_host.iter())
+        .copied()
+        .chain(candidates.v4_srflx.iter().map(std::net::SocketAddr::ip))
+        .chain(candidates.v6_srflx.iter().map(std::net::SocketAddr::ip));
+    for ip in all_addrs {
+        match classify_ip(ip) {
+            AddressScope::Global | AddressScope::Private => {}
+            scope => {
+                return Err(GossipError::UnreachableCandidate {
+                    addr: format!("{ip} (scope: {scope:?})"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Test-friendly variant taking an explicit "now". Production
 /// callers use [`accept_bundle`].
 pub fn accept_bundle_with_now(
@@ -371,6 +416,16 @@ pub fn accept_bundle_with_now(
         .get(&bundle.source_node_id)
         .ok_or(GossipError::UnknownSource)?;
     verify_signature(bundle, verifying_key)?;
+    // Defense-in-depth: every candidate IP must be a scope we'd
+    // willingly connect to. A malicious peer cannot bypass this
+    // because the signature is verified above — but if a peer is
+    // compromised, the gossip is constrained to advertising
+    // public-style addresses. Specifically: reject loopback,
+    // link-local, multicast, broadcast, unspecified, and the IPv6
+    // documentation prefix. Private (RFC 1918 / RFC 4193 ULA) is
+    // allowed because same-LAN peer reachability is a legitimate
+    // case.
+    reject_unreachable_candidates(&bundle.candidates)?;
     let drift = bundle.timestamp_unix as i128 - now_unix as i128;
     if drift.unsigned_abs() > freshness_window_secs as u128 {
         // Saturating-cast i128 → i64 so a pathological skew (timestamp
@@ -678,6 +733,96 @@ mod tests {
         state.record(key, 2);
         assert_eq!(state.highest_accepted(&key), Some(7));
         assert_eq!(state.source_count(), 1);
+    }
+
+    #[test]
+    fn accept_bundle_rejects_loopback_candidate() {
+        // Security pin: a malicious peer (or one whose candidate
+        // gatherer is buggy) could gossip 127.0.0.1:51820 as a
+        // reachable endpoint. Accepting it would redirect our
+        // connect-attempt traffic to localhost. Reject.
+        let signing_key = deterministic_signing_key(20);
+        let verifying_key = signing_key.verifying_key();
+        let mut state = SeenSequenceState::new();
+        let mut known = HashMap::new();
+        known.insert(verifying_key.to_bytes(), verifying_key);
+
+        let mut candidates = CandidateSet::default();
+        candidates.v4_srflx.push(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            51820,
+        ));
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, candidates).unwrap();
+        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
+            .expect_err("loopback srflx must be rejected");
+        match err {
+            GossipError::UnreachableCandidate { addr } => {
+                assert!(
+                    addr.contains("127.0.0.1"),
+                    "error should name the offending address; got: {addr}"
+                );
+            }
+            other => panic!("expected UnreachableCandidate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_bundle_rejects_link_local_and_multicast_candidates() {
+        let signing_key = deterministic_signing_key(21);
+        let verifying_key = signing_key.verifying_key();
+        let mut state = SeenSequenceState::new();
+        let mut known = HashMap::new();
+        known.insert(verifying_key.to_bytes(), verifying_key);
+
+        // Multicast srflx: an attacker advertising 224.0.0.1 could
+        // weaponise our connect-attempt traffic into a multicast
+        // flood. Reject.
+        let mut multi = CandidateSet::default();
+        multi.v4_srflx.push(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            5353,
+        ));
+        let bundle = mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, multi).unwrap();
+        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
+            .expect_err("multicast must be rejected");
+        assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
+
+        // Link-local v4 host candidate (169.254/16) — useless to a
+        // remote peer and could leak interface naming.
+        let mut ll = CandidateSet::default();
+        ll.v4_host.push(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)));
+        let bundle = mint_bundle_with_timestamp(&signing_key, 2, 1_700_000_000, ll).unwrap();
+        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
+            .expect_err("link-local must be rejected");
+        assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
+
+        // Link-local v6 (fe80::/10) too.
+        let mut ll6 = CandidateSet::default();
+        ll6.v6_host
+            .push(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)));
+        let bundle = mint_bundle_with_timestamp(&signing_key, 3, 1_700_000_000, ll6).unwrap();
+        let err = accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
+            .expect_err("v6 link-local must be rejected");
+        assert!(matches!(err, GossipError::UnreachableCandidate { .. }));
+    }
+
+    #[test]
+    fn accept_bundle_allows_private_and_global_candidates() {
+        // The complement of the rejection tests: legitimate Private
+        // (RFC 1918 / RFC 4193 ULA) and Global candidates must be
+        // accepted. Same-LAN peer reachability is a legitimate case.
+        let signing_key = deterministic_signing_key(22);
+        let verifying_key = signing_key.verifying_key();
+        let mut state = SeenSequenceState::new();
+        let mut known = HashMap::new();
+        known.insert(verifying_key.to_bytes(), verifying_key);
+
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
+                .unwrap();
+        accept_bundle_with_now(&bundle, &known, &mut state, 300, 1_700_000_000)
+            .expect("sample (private + global) candidates accepted");
     }
 
     #[test]
