@@ -215,15 +215,24 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
             }
         }
         // Pattern 2: `impl …Debug for <SecretType>`.
+        // Require an identifier boundary AFTER the type name so
+        // `Debug for Foo` does not falsely match `Debug for FooError`.
         if trimmed.starts_with("impl ") && line.contains("Debug for ") {
             for name in secret_type_names {
                 let needle = format!("Debug for {name}");
-                if line.contains(&needle) {
-                    hits.push((
-                        idx + 1,
-                        (*name).to_owned(),
-                        "manual impl Debug for secret-bearing type".to_owned(),
-                    ));
+                if let Some(pos) = line.find(&needle) {
+                    let after = line[pos + needle.len()..].chars().next();
+                    let is_boundary = match after {
+                        None => true,
+                        Some(ch) => !(ch.is_alphanumeric() || ch == '_'),
+                    };
+                    if is_boundary {
+                        hits.push((
+                            idx + 1,
+                            (*name).to_owned(),
+                            "manual impl Debug for secret-bearing type".to_owned(),
+                        ));
+                    }
                 }
             }
         }
@@ -235,6 +244,13 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
 /// forbidden across the crate. Kept narrow to the canonical
 /// passphrase / runtime-key wrappers; if a future module introduces
 /// a new wrapper, add it here.
+///
+/// `EnrollmentToken` and `MappingLease` are intentionally NOT in
+/// this list because they ship custom redacting `Debug` impls that
+/// the audit's substring-based matcher cannot distinguish from a
+/// dangerous one. Their redaction is pinned instead by unit tests:
+/// `enrollment_token_debug_output_redacts_tag_and_token_id` and
+/// `mapping_lease_debug_output_redacts_pcp_nonce`.
 const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     "PassphraseMaterial",
     "WrappedKeyMaterial",
@@ -455,19 +471,33 @@ pub(crate) fn scan_source_for_display_on_secret_types(
             for name in secret_type_names {
                 let display_needle = format!("Display for {name}");
                 let to_string_needle = format!("ToString for {name}");
-                if line.contains(&display_needle) {
-                    hits.push((
-                        idx + 1,
-                        (*name).to_owned(),
-                        "manual impl Display for secret-bearing type".to_owned(),
-                    ));
+                if let Some(pos) = line.find(&display_needle) {
+                    let after = line[pos + display_needle.len()..].chars().next();
+                    let is_boundary = match after {
+                        None => true,
+                        Some(ch) => !(ch.is_alphanumeric() || ch == '_'),
+                    };
+                    if is_boundary {
+                        hits.push((
+                            idx + 1,
+                            (*name).to_owned(),
+                            "manual impl Display for secret-bearing type".to_owned(),
+                        ));
+                    }
                 }
-                if line.contains(&to_string_needle) {
-                    hits.push((
-                        idx + 1,
-                        (*name).to_owned(),
-                        "manual impl ToString for secret-bearing type".to_owned(),
-                    ));
+                if let Some(pos) = line.find(&to_string_needle) {
+                    let after = line[pos + to_string_needle.len()..].chars().next();
+                    let is_boundary = match after {
+                        None => true,
+                        Some(ch) => !(ch.is_alphanumeric() || ch == '_'),
+                    };
+                    if is_boundary {
+                        hits.push((
+                            idx + 1,
+                            (*name).to_owned(),
+                            "manual impl ToString for secret-bearing type".to_owned(),
+                        ));
+                    }
                 }
             }
         }

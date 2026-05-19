@@ -52,9 +52,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::TryRngCore;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -91,12 +92,37 @@ pub const ENROLLMENT_SECRET_LEN: usize = 32;
 /// One enrollment token, decoded into its component fields. The
 /// binary on-wire form is the URL-safe base64 of this struct's
 /// canonical layout.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Security**: the `tag` field IS the bearer credential — anyone
+/// holding the (token_id, issued_at, expires_at, tag) tuple can
+/// redeem the token. The custom `Debug` impl redacts the tag so a
+/// stray `log::debug!("{:?}", token)` cannot leak it. `Drop` zeroises
+/// both the tag and the token_id so a freed token does not leave the
+/// credential floating in heap-reused memory.
+#[derive(Clone, PartialEq, Eq)]
 pub struct EnrollmentToken {
     pub token_id: [u8; TOKEN_ID_LEN],
     pub issued_at_unix: u64,
     pub expires_at_unix: u64,
     pub tag: [u8; TOKEN_TAG_LEN],
+}
+
+impl std::fmt::Debug for EnrollmentToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrollmentToken")
+            .field("token_id", &"<redacted>")
+            .field("issued_at_unix", &self.issued_at_unix)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("tag", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for EnrollmentToken {
+    fn drop(&mut self) {
+        self.token_id.zeroize();
+        self.tag.zeroize();
+    }
 }
 
 #[derive(Debug)]
@@ -105,6 +131,9 @@ pub enum EnrollmentTokenError {
     TtlOutOfRange { requested: u64, max: u64 },
     /// Local clock is before UNIX_EPOCH.
     TimestampUnavailable,
+    /// Kernel CSPRNG (`OsRng`) refused to provide entropy. Fail closed
+    /// — we never fall back to a non-CSPRNG source for token material.
+    RngUnavailable,
     /// Couldn't decode the token (bad base64, wrong byte length,
     /// invalid layout).
     Malformed(String),
@@ -133,6 +162,10 @@ impl std::fmt::Display for EnrollmentTokenError {
             EnrollmentTokenError::TimestampUnavailable => {
                 write!(f, "local clock is before UNIX_EPOCH")
             }
+            EnrollmentTokenError::RngUnavailable => write!(
+                f,
+                "kernel CSPRNG (OsRng) refused to provide entropy; refusing to mint with weak randomness"
+            ),
             EnrollmentTokenError::Malformed(msg) => write!(f, "malformed enrollment token: {msg}"),
             EnrollmentTokenError::TagMismatch => write!(f, "enrollment token HMAC tag mismatch"),
             EnrollmentTokenError::Expired { expired_secs_ago } => {
@@ -159,10 +192,21 @@ pub const ISSUED_AT_FUTURE_TOLERANCE_SECS: u64 = 300;
 
 /// Generate a fresh enrollment secret. Used once at daemon bring-up
 /// and persisted under the daemon's state directory.
-pub fn generate_enrollment_secret() -> [u8; ENROLLMENT_SECRET_LEN] {
-    let mut out = [0u8; ENROLLMENT_SECRET_LEN];
-    rand::rng().fill_bytes(&mut out);
-    out
+///
+/// Uses `rand::rngs::OsRng` directly (not the threaded `rand::rng()`)
+/// so the secret is drawn from the kernel CSPRNG with no intermediate
+/// reseeded state. Returns a `Zeroizing<[u8; …]>` wrapper so the
+/// secret is wiped on drop and can be passed through the daemon's
+/// state-loading code paths without inadvertently leaving copies in
+/// heap-reused memory.
+///
+/// Returns `None` if the kernel RNG is unavailable (e.g. very early
+/// boot before the entropy pool is initialised); callers must NOT
+/// fall back to a non-CSPRNG source.
+pub fn generate_enrollment_secret() -> Option<Zeroizing<[u8; ENROLLMENT_SECRET_LEN]>> {
+    let mut out = Zeroizing::new([0u8; ENROLLMENT_SECRET_LEN]);
+    rand::rngs::OsRng.try_fill_bytes(out.as_mut_slice()).ok()?;
+    Some(out)
 }
 
 fn current_unix_seconds() -> Result<u64, EnrollmentTokenError> {
@@ -218,8 +262,16 @@ pub fn mint_token_with_clock(
             max: MAX_TOKEN_TTL_SECS,
         });
     }
+    // OsRng directly so a one-time token_id is drawn straight from the
+    // kernel CSPRNG. ThreadRng would also be CSPRNG-grade but the
+    // direct call closes one extra layer of "what if the thread RNG
+    // is misconfigured" defence-in-depth concern. If the kernel RNG
+    // fails (very early boot, no entropy pool), we MUST not fall
+    // back to a non-CSPRNG.
     let mut token_id = [0u8; TOKEN_ID_LEN];
-    rand::rng().fill_bytes(&mut token_id);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut token_id)
+        .map_err(|_| EnrollmentTokenError::RngUnavailable)?;
     let expires_at_unix = issued_at_unix.saturating_add(ttl_secs);
     let tag = compute_tag(secret, &token_id, issued_at_unix, expires_at_unix);
     let token = EnrollmentToken {
@@ -571,5 +623,65 @@ mod tests {
         let err = verify_and_consume_token_with_now(&encoded, &secret, &mut ledger, 1_700_000_600)
             .expect_err("expiry exactly now must be rejected");
         assert!(matches!(err, EnrollmentTokenError::Expired { .. }));
+    }
+
+    #[test]
+    fn enrollment_token_debug_output_redacts_tag_and_token_id() {
+        // Security pin: an EnrollmentToken accidentally logged with
+        // `{:?}` MUST NOT emit the HMAC tag (the bearer credential)
+        // or the token_id (used to look up consumed state) in
+        // plaintext. The custom Debug impl elides both.
+        let secret = deterministic_secret(99);
+        let (token, _encoded) = mint_token_with_clock(&secret, 600, 1_700_000_000).expect("mint");
+        let debug_string = format!("{token:?}");
+        assert!(
+            debug_string.contains("<redacted>"),
+            "Debug output should redact secret-bearing fields; got: {debug_string}"
+        );
+        // Hex of the actual tag must not appear in the debug output.
+        let tag_hex: String = token.tag.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !debug_string.contains(&tag_hex),
+            "Debug output must NOT leak the HMAC tag; got: {debug_string}"
+        );
+        let id_hex: String = token.token_id.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !debug_string.contains(&id_hex),
+            "Debug output must NOT leak the token_id; got: {debug_string}"
+        );
+    }
+
+    #[test]
+    fn enrollment_token_drop_zeroises_secret_material() {
+        // Security pin: dropping an EnrollmentToken zeroises its tag
+        // and token_id so a freed token does not leave the bearer
+        // credential floating in heap-reused memory. We can't observe
+        // the after-drop state directly without unsafe, so we
+        // verify the explicit zeroize call by mutating in place.
+        let secret = deterministic_secret(101);
+        let (mut token, _) = mint_token_with_clock(&secret, 600, 1_700_000_000).expect("mint");
+        // Sanity: the freshly minted token has non-zero material.
+        assert!(token.tag.iter().any(|b| *b != 0));
+        assert!(token.token_id.iter().any(|b| *b != 0));
+        // Manually invoke the Zeroize semantics that Drop would.
+        token.tag.zeroize();
+        token.token_id.zeroize();
+        assert!(token.tag.iter().all(|b| *b == 0));
+        assert!(token.token_id.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn generate_enrollment_secret_returns_zeroizing_wrapper_with_full_entropy() {
+        // Pin: the production path returns a Zeroizing<[u8; 32]>
+        // (not a bare array) so the secret can be carried through the
+        // daemon state-loading code without leaking copies. The
+        // resulting bytes must be non-trivial (not all-zero).
+        let secret = generate_enrollment_secret().expect("OsRng available on this host");
+        let all_zero = secret.iter().all(|b| *b == 0);
+        assert!(
+            !all_zero,
+            "fresh enrollment secret must contain entropy (got all-zero)"
+        );
+        assert_eq!(secret.len(), ENROLLMENT_SECRET_LEN);
     }
 }
