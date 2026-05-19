@@ -347,6 +347,15 @@ fn stun_server_resolves_in_family(url: &str, family: AddressFamily) -> bool {
 /// Gather a complete [`CandidateSet`] — local host candidates from
 /// `getifaddrs(2)` + srflx candidates from both v4 and v6 STUN
 /// servers.
+///
+/// **Security**: the STUN-returned mapped endpoint is filtered to
+/// gossip-worthy scope (Global or Private) before being added to the
+/// set. This is the OUTBOUND mirror of the inbound
+/// `reject_unreachable_candidates` check in `peer_gossip`. A hijacked
+/// STUN server returning a bogus mapping (e.g.
+/// `127.0.0.1:5353`, `224.0.0.1:80`) would otherwise have us announce
+/// that as our reachable endpoint to peers — fail-closed by dropping
+/// the candidate at gather time.
 pub fn gather_candidate_set(
     v4_stun_servers: &[String],
     v6_stun_servers: &[String],
@@ -361,12 +370,28 @@ pub fn gather_candidate_set(
         }
     }
     for r in gather_srflx_for_family(AddressFamily::V4, v4_stun_servers, stun_timeout) {
-        set.v4_srflx.push(r.mapped_endpoint);
+        if is_gossip_worthy_endpoint(r.mapped_endpoint) {
+            set.v4_srflx.push(r.mapped_endpoint);
+        }
     }
     for r in gather_srflx_for_family(AddressFamily::V6, v6_stun_servers, stun_timeout) {
-        set.v6_srflx.push(r.mapped_endpoint);
+        if is_gossip_worthy_endpoint(r.mapped_endpoint) {
+            set.v6_srflx.push(r.mapped_endpoint);
+        }
     }
     set
+}
+
+/// True when a `SocketAddr` is acceptable as a peer-announced srflx
+/// candidate — scope must be Global or Private. Loopback, link-local,
+/// multicast, broadcast, unspecified, and the IPv6 documentation
+/// prefix are rejected so a hijacked STUN server cannot redirect
+/// peers at our local services or multicast groups.
+fn is_gossip_worthy_endpoint(addr: SocketAddr) -> bool {
+    matches!(
+        classify_ip(addr.ip()),
+        AddressScope::Global | AddressScope::Private
+    )
 }
 
 #[cfg(test)]
@@ -744,7 +769,15 @@ mod tests {
     }
 
     #[test]
-    fn gather_candidate_set_combines_host_and_srflx_for_both_families() {
+    fn gather_candidate_set_drops_loopback_srflx_from_hijacked_stun() {
+        // Security pin: a loopback-only STUN echo (which our test
+        // infrastructure must use — there's no public Internet in
+        // CI) reports the requester's loopback address as the
+        // mapped endpoint. The outbound scope filter in
+        // `gather_candidate_set` MUST drop these — otherwise a
+        // hijacked-or-misconfigured STUN server could trick the
+        // daemon into announcing a loopback srflx to peers, who
+        // would attempt connect-back into our own host's services.
         let v4_stun = spawn_local_stun_echo("127.0.0.1:0");
         let v6_stun = spawn_local_stun_echo("[::1]:0");
         let set = gather_candidate_set(
@@ -752,10 +785,12 @@ mod tests {
             &[v6_stun.to_string()],
             Duration::from_secs(2),
         );
-        assert_eq!(set.v4_srflx.len(), 1);
-        assert_eq!(set.v6_srflx.len(), 1);
-        assert!(matches!(set.v4_srflx[0], SocketAddr::V4(_)));
-        assert!(matches!(set.v6_srflx[0], SocketAddr::V6(_)));
+        assert_eq!(set.v4_srflx.len(), 0, "loopback srflx must be filtered out");
+        assert_eq!(
+            set.v6_srflx.len(),
+            0,
+            "v6 loopback srflx must be filtered out"
+        );
         // Host candidates depend on the test box's network — we can't
         // assert their count, but we can assert they're all
         // gossip-worthy (no loopback, no link-local).
@@ -766,5 +801,31 @@ mod tests {
                 "host candidate {ip:?} should be gossip-worthy but scope is {scope:?}"
             );
         }
+    }
+
+    #[test]
+    fn is_gossip_worthy_endpoint_accepts_global_and_private_rejects_local() {
+        // Direct unit pin of the outbound filter.
+        let global_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 51820);
+        let private_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 51820);
+        let global_v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        assert!(is_gossip_worthy_endpoint(global_v4));
+        assert!(is_gossip_worthy_endpoint(private_v4));
+        assert!(is_gossip_worthy_endpoint(global_v6));
+
+        let loopback_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 51820);
+        let ll_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), 51820);
+        let multicast = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)), 5353);
+        let ll_v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        assert!(!is_gossip_worthy_endpoint(loopback_v4));
+        assert!(!is_gossip_worthy_endpoint(ll_v4));
+        assert!(!is_gossip_worthy_endpoint(multicast));
+        assert!(!is_gossip_worthy_endpoint(ll_v6));
     }
 }
