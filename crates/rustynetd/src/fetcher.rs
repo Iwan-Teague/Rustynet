@@ -13,6 +13,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
+/// Hard cap on the HTTP response body the fetcher will consume.
+///
+/// A hijacked or malicious `control_endpoint` could otherwise push
+/// gigabytes of data to exhaust daemon memory via the unbounded
+/// `read_to_end`. Real signed bundles are well under 1 MB
+/// (membership snapshots, traversal bundles, trust bundles) — the
+/// 4 MB cap leaves generous slack while bounding the worst-case
+/// allocation.
+pub const MAX_FETCHER_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Parse an HTTP/1.x status line and extract the numeric status code.
+/// Returns `InvalidResponse` if the line doesn't follow the
+/// `HTTP/<v> <code> <reason>` shape.
+fn parse_http_status_code(status_line: &str) -> Result<u16, FetchError> {
+    let mut parts = status_line.splitn(3, ' ');
+    let _version = parts.next();
+    let code_str = parts.next().ok_or_else(|| {
+        FetchError::InvalidResponse("http response missing status code".to_owned())
+    })?;
+    code_str
+        .parse::<u16>()
+        .map_err(|e| FetchError::InvalidResponse(format!("malformed HTTP status code: {e}")))
+}
+
 #[derive(Debug, Clone)]
 pub enum FetchError {
     Network(String),
@@ -107,6 +131,15 @@ impl StateFetcher {
     fn http_get_raw(&self, url: &str) -> Result<Vec<u8>, FetchError> {
         // Minimal HTTP/1.1 GET implementation using std::net::TcpStream
         let url = url.trim();
+        // **Security**: reject control characters in the URL so a
+        // hijacked-or-malicious `control_endpoint` config value
+        // cannot inject extra HTTP headers via CR/LF (would be
+        // smuggled into `Host: {host}` or `GET {path}`).
+        if url.chars().any(|c| c.is_control()) {
+            return Err(FetchError::Network(
+                "control endpoint URL contains a control character; refusing".to_owned(),
+            ));
+        }
         if !url.starts_with("http://") {
             return Err(FetchError::Network(
                 "only http:// URLs are supported in this minimal fetcher".to_owned(),
@@ -134,7 +167,7 @@ impl StateFetcher {
         let socket_addrs = addr
             .to_socket_addrs()
             .map_err(|e| FetchError::Network(format!("resolve failed: {e}")))?;
-        let mut stream = match socket_addrs.into_iter().next() {
+        let stream = match socket_addrs.into_iter().next() {
             Some(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(3))
                 .map_err(|_| FetchError::Network("network unreachable".to_owned()))?,
             None => {
@@ -148,22 +181,44 @@ impl StateFetcher {
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
         let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-        stream
+        (&stream)
             .write_all(request.as_bytes())
             .map_err(|e| FetchError::Network(format!("write failed: {e}")))?;
 
+        // **Security**: cap the response body at `MAX_FETCHER_BODY_BYTES`.
+        // Unbounded `read_to_end` would let a hijacked or malicious
+        // control endpoint exhaust daemon memory by pushing GBs.
+        // `Read::take(cap + 1)` lets us detect a body that exceeds
+        // the cap without ever allocating beyond `cap + 1` bytes.
         let mut buf = Vec::new();
-        stream
+        (&stream)
+            .take(MAX_FETCHER_BODY_BYTES as u64 + 1)
             .read_to_end(&mut buf)
             .map_err(|e| FetchError::Network(format!("read failed: {e}")))?;
-
-        if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            Ok(buf.split_off(idx + 4))
-        } else {
-            Err(FetchError::InvalidResponse(
-                "malformed http response".to_owned(),
-            ))
+        if buf.len() > MAX_FETCHER_BODY_BYTES {
+            return Err(FetchError::InvalidResponse(format!(
+                "response body exceeds {MAX_FETCHER_BODY_BYTES}-byte cap; refusing to consume"
+            )));
         }
+
+        // Parse the response shape: status line + headers + body.
+        // Validate the status code to a 2xx success before trusting
+        // the body — a hijacked endpoint returning 500 + signed
+        // garbage would otherwise reach the signature verifier.
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| FetchError::InvalidResponse("malformed http response".to_owned()))?;
+        let head_bytes = &buf[..header_end];
+        let head = String::from_utf8_lossy(head_bytes);
+        let status_line = head.lines().next().unwrap_or("");
+        let status_code = parse_http_status_code(status_line)?;
+        if !(200..=299).contains(&status_code) {
+            return Err(FetchError::Network(format!(
+                "control endpoint returned HTTP {status_code}; refusing to trust body"
+            )));
+        }
+        Ok(buf.split_off(header_end + 4))
     }
 
     fn verify_signature(&self, bundle: &SignedBundle) -> Result<(), String> {
