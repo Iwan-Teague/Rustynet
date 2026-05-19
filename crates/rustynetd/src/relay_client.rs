@@ -128,13 +128,21 @@ impl RelaySessionTokenIssuer for LocalRelaySessionTokenIssuer {
         relay_id: [u8; 16],
         ttl_secs: u64,
     ) -> Result<RelaySessionToken, RelayClientError> {
-        Ok(RelaySessionToken::sign(
+        // Fail-closed on CSPRNG unavailability: the relay-session token nonce
+        // is the anti-replay key for the relay's nonce store, so a predictable
+        // or degraded-entropy nonce would let an attacker replay a captured
+        // token or collide with another peer's session. We surface the
+        // structured error as a `RelayClientError::TokenSigning` so the
+        // daemon's session-establishment loop can retry on transient faults
+        // instead of crashing.
+        RelaySessionToken::try_sign(
             &self.signing_key,
             node_id.as_str(),
             peer_node_id.as_str(),
             relay_id,
             ttl_secs,
-        ))
+        )
+        .map_err(|err| RelayClientError::TokenSigning(err.to_string()))
     }
 }
 
