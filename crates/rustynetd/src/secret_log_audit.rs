@@ -754,6 +754,45 @@ pub struct PassphraseMaterial {
     );
 }
 
+#[test]
+fn debug_scanner_does_not_false_match_suffixed_type_name() {
+    // Regression pin: prior versions used naive `contains()` on the
+    // needle "Debug for PassphraseMaterial". An impl for a type with
+    // a name that has the canonical type as a PREFIX (e.g.
+    // `PassphraseMaterialError`) would falsely match. The fix added
+    // an identifier-boundary check after the type name. This test
+    // pins that fix forward.
+    let body = r#"
+impl std::fmt::Debug for PassphraseMaterialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PassphraseMaterialError")
+    }
+}
+"#;
+    let hits = scan_source_for_debug_on_secret_types(body, FORBIDDEN_DEBUG_SECRET_TYPES);
+    assert!(
+        hits.is_empty(),
+        "audit must not false-match `Debug for PassphraseMaterialError` against the `PassphraseMaterial` allowlist entry: {hits:?}"
+    );
+}
+
+#[test]
+fn display_scanner_does_not_false_match_suffixed_type_name() {
+    // Same regression pin for the Display scanner.
+    let body = r#"
+impl std::fmt::Display for SigningKeyMaterialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "signing key material error")
+    }
+}
+"#;
+    let hits = scan_source_for_display_on_secret_types(body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+    assert!(
+        hits.is_empty(),
+        "audit must not false-match `Display for SigningKeyMaterialError` against the `SigningKeyMaterial` allowlist entry: {hits:?}"
+    );
+}
+
 // ---- Hex-encoder workspace sweep + self-tests ----------------------
 
 #[test]
