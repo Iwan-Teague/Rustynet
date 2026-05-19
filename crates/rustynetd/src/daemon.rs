@@ -8894,15 +8894,8 @@ fn load_trust_evidence(
     }
 
     let verifying_key = load_verifying_key(verifier_key_path)?;
-    enforce_text_artifact_size_limit(path, "trust evidence", MAX_TRUST_EVIDENCE_BYTES)
+    let content = read_text_artifact_bounded(path, "trust evidence", MAX_TRUST_EVIDENCE_BYTES)
         .map_err(TrustBootstrapError::InvalidFormat)?;
-    let content =
-        fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_TRUST_EVIDENCE_BYTES {
-        return Err(TrustBootstrapError::InvalidFormat(format!(
-            "trust evidence exceeds maximum size of {MAX_TRUST_EVIDENCE_BYTES} bytes"
-        )));
-    }
     let mut version: Option<u8> = None;
     let mut tls13_valid: Option<bool> = None;
     let mut signed_control_valid: Option<bool> = None;
@@ -9085,19 +9078,41 @@ fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
     )
 }
 
-fn enforce_text_artifact_size_limit(
+/// Read a text artifact from disk with a hard upper bound enforced inside the
+/// read loop, eliminating the TOCTOU window between a separate `fs::metadata`
+/// size check and a subsequent `fs::read_to_string`.
+///
+/// Threat: every signed-bundle / verifier-key loader on the trust path used
+/// to (1) `fs::metadata` the file, (2) compare to a configured maximum, then
+/// (3) `fs::read_to_string` it. An attacker (or even an admin-owned tool
+/// rotating a file) that swapped the file between (1) and (3) — symlink
+/// retargeting, inode replacement, or simply growing the file — could feed
+/// the loader an unbounded byte stream, exhausting memory on a long-running
+/// daemon. The post-read length check fired too late: by then the entire
+/// large buffer was already in memory.
+///
+/// This helper opens the file once and reads at most `max_bytes + 1` bytes
+/// using `Read::take`. If the resulting buffer length exceeds `max_bytes`
+/// (i.e. the file is bigger than the cap), we surface the same
+/// "exceeds maximum size" error shape callers already log. The buffer is
+/// bounded BEFORE memory is committed, closing the TOCTOU window.
+fn read_text_artifact_bounded(
     path: &Path,
     artifact_name: &str,
     max_bytes: usize,
-) -> Result<(), String> {
-    let metadata =
-        fs::metadata(path).map_err(|err| format!("{artifact_name} metadata read failed: {err}"))?;
-    if metadata.len() > max_bytes as u64 {
+) -> Result<String, String> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|err| format!("{artifact_name} open failed: {err}"))?;
+    let mut buf = String::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_string(&mut buf)
+        .map_err(|err| format!("{artifact_name} read failed: {err}"))?;
+    if buf.len() > max_bytes {
         return Err(format!(
             "{artifact_name} exceeds maximum size of {max_bytes} bytes"
         ));
     }
-    Ok(())
+    Ok(buf)
 }
 
 fn parse_limited_key_value_line(
@@ -9301,15 +9316,9 @@ fn decode_hex_nibble(value: u8) -> Result<u8, TrustBootstrapError> {
 }
 
 fn load_verifying_key(path: &Path) -> Result<VerifyingKey, TrustBootstrapError> {
-    enforce_text_artifact_size_limit(path, "trust verifier key", MAX_BUNDLE_VERIFIER_KEY_BYTES)
-        .map_err(TrustBootstrapError::InvalidFormat)?;
     let content =
-        fs::read_to_string(path).map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
-        return Err(TrustBootstrapError::InvalidFormat(format!(
-            "trust verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
-        )));
-    }
+        read_text_artifact_bounded(path, "trust verifier key", MAX_BUNDLE_VERIFIER_KEY_BYTES)
+            .map_err(TrustBootstrapError::InvalidFormat)?;
     let key_line = content
         .lines()
         .map(str::trim)
@@ -9320,20 +9329,12 @@ fn load_verifying_key(path: &Path) -> Result<VerifyingKey, TrustBootstrapError> 
 }
 
 fn load_remote_ops_access_token_verifying_key(path: &Path) -> Result<VerifyingKey, DaemonError> {
-    enforce_text_artifact_size_limit(
+    let content = read_text_artifact_bounded(
         path,
         "remote ops token verifier key",
         MAX_BUNDLE_VERIFIER_KEY_BYTES,
     )
     .map_err(DaemonError::InvalidConfig)?;
-    let content = fs::read_to_string(path).map_err(|err| {
-        DaemonError::InvalidConfig(format!("read remote ops verifier key: {err}"))
-    })?;
-    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
-        return Err(DaemonError::InvalidConfig(format!(
-            "remote ops token verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
-        )));
-    }
     let key_line = content
         .lines()
         .map(str::trim)
@@ -9596,15 +9597,9 @@ fn load_auto_tunnel_bundle(
     }
 
     let verifying_key = load_auto_tunnel_verifying_key(verifier_key_path)?;
-    enforce_text_artifact_size_limit(path, "auto-tunnel bundle", MAX_AUTO_TUNNEL_BUNDLE_BYTES)
-        .map_err(AutoTunnelBootstrapError::InvalidFormat)?;
     let content =
-        fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_AUTO_TUNNEL_BUNDLE_BYTES {
-        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
-            "auto-tunnel bundle exceeds maximum size of {MAX_AUTO_TUNNEL_BUNDLE_BYTES} bytes"
-        )));
-    }
+        read_text_artifact_bounded(path, "auto-tunnel bundle", MAX_AUTO_TUNNEL_BUNDLE_BYTES)
+            .map_err(AutoTunnelBootstrapError::InvalidFormat)?;
 
     let mut payload = String::new();
     let mut signature_hex: Option<String> = None;
@@ -9925,19 +9920,12 @@ fn load_auto_tunnel_bundle(
 }
 
 fn load_auto_tunnel_verifying_key(path: &Path) -> Result<VerifyingKey, AutoTunnelBootstrapError> {
-    enforce_text_artifact_size_limit(
+    let content = read_text_artifact_bounded(
         path,
         "auto-tunnel verifier key",
         MAX_BUNDLE_VERIFIER_KEY_BYTES,
     )
     .map_err(AutoTunnelBootstrapError::InvalidFormat)?;
-    let content =
-        fs::read_to_string(path).map_err(|err| AutoTunnelBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
-        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
-            "auto-tunnel verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
-        )));
-    }
     let key_line = content
         .lines()
         .map(str::trim)
@@ -10140,10 +10128,8 @@ fn load_dns_zone_bundle(
     }
 
     let verifying_key = load_dns_zone_verifying_key(verifier_key_path)?;
-    enforce_text_artifact_size_limit(path, "dns zone bundle", MAX_DNS_ZONE_BUNDLE_BYTES)
+    let content = read_text_artifact_bounded(path, "dns zone bundle", MAX_DNS_ZONE_BUNDLE_BYTES)
         .map_err(DnsZoneBootstrapError::InvalidFormat)?;
-    let content =
-        fs::read_to_string(path).map_err(|err| DnsZoneBootstrapError::Io(err.to_string()))?;
     let bundle = parse_signed_dns_zone_bundle_wire(&content).map_err(map_dns_zone_parse_error)?;
     verify_dns_zone_bundle(&bundle, &verifying_key).map_err(map_dns_zone_parse_error)?;
     if bundle.zone_name != expected_zone_name {
@@ -10208,15 +10194,9 @@ fn load_dns_zone_bundle(
 }
 
 fn load_dns_zone_verifying_key(path: &Path) -> Result<VerifyingKey, DnsZoneBootstrapError> {
-    enforce_text_artifact_size_limit(path, "dns zone verifier key", MAX_BUNDLE_VERIFIER_KEY_BYTES)
-        .map_err(DnsZoneBootstrapError::InvalidFormat)?;
     let content =
-        fs::read_to_string(path).map_err(|err| DnsZoneBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
-        return Err(DnsZoneBootstrapError::InvalidFormat(format!(
-            "dns zone verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
-        )));
-    }
+        read_text_artifact_bounded(path, "dns zone verifier key", MAX_BUNDLE_VERIFIER_KEY_BYTES)
+            .map_err(DnsZoneBootstrapError::InvalidFormat)?;
     parse_dns_zone_verifying_key(&content).map_err(map_dns_zone_parse_error)
 }
 
@@ -10515,16 +10495,8 @@ fn load_relay_fleet_bundle(
 }
 
 fn read_relay_fleet_bundle_content(path: &Path) -> Result<String, TraversalBootstrapError> {
-    enforce_text_artifact_size_limit(path, "relay fleet bundle", MAX_RELAY_FLEET_BUNDLE_BYTES)
-        .map_err(TraversalBootstrapError::InvalidFormat)?;
-    let content =
-        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_RELAY_FLEET_BUNDLE_BYTES {
-        return Err(TraversalBootstrapError::InvalidFormat(format!(
-            "relay fleet bundle exceeds maximum size of {MAX_RELAY_FLEET_BUNDLE_BYTES} bytes"
-        )));
-    }
-    Ok(content)
+    read_text_artifact_bounded(path, "relay fleet bundle", MAX_RELAY_FLEET_BUNDLE_BYTES)
+        .map_err(TraversalBootstrapError::InvalidFormat)
 }
 
 fn validate_relay_fleet_bundle_wire_shape(content: &str) -> Result<(), TraversalBootstrapError> {
@@ -10574,16 +10546,8 @@ fn validate_relay_fleet_bundle_wire_shape(content: &str) -> Result<(), Traversal
 }
 
 fn read_traversal_bundle_content(path: &Path) -> Result<String, TraversalBootstrapError> {
-    enforce_text_artifact_size_limit(path, "traversal bundle", MAX_TRAVERSAL_BUNDLE_BYTES)
-        .map_err(TraversalBootstrapError::InvalidFormat)?;
-    let content =
-        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_TRAVERSAL_BUNDLE_BYTES {
-        return Err(TraversalBootstrapError::InvalidFormat(format!(
-            "traversal bundle exceeds maximum size of {MAX_TRAVERSAL_BUNDLE_BYTES} bytes"
-        )));
-    }
-    Ok(content)
+    read_text_artifact_bounded(path, "traversal bundle", MAX_TRAVERSAL_BUNDLE_BYTES)
+        .map_err(TraversalBootstrapError::InvalidFormat)
 }
 
 fn split_traversal_bundle_sections(content: &str) -> Result<Vec<String>, TraversalBootstrapError> {
@@ -11438,19 +11402,12 @@ fn is_global_unicast_ipv6(value: std::net::Ipv6Addr) -> bool {
 }
 
 fn load_traversal_verifying_key(path: &Path) -> Result<VerifyingKey, TraversalBootstrapError> {
-    enforce_text_artifact_size_limit(
+    let content = read_text_artifact_bounded(
         path,
         "traversal verifier key",
         MAX_BUNDLE_VERIFIER_KEY_BYTES,
     )
     .map_err(TraversalBootstrapError::InvalidFormat)?;
-    let content =
-        fs::read_to_string(path).map_err(|err| TraversalBootstrapError::Io(err.to_string()))?;
-    if content.len() > MAX_BUNDLE_VERIFIER_KEY_BYTES {
-        return Err(TraversalBootstrapError::InvalidFormat(format!(
-            "traversal verifier key exceeds maximum size of {MAX_BUNDLE_VERIFIER_KEY_BYTES} bytes"
-        )));
-    }
     let key_line = content
         .lines()
         .map(str::trim)
@@ -14267,6 +14224,60 @@ mod tests {
         assert!(
             window.contains(".unwrap_or(Duration::ZERO)"),
             "maybe_trigger_endpoint_change_refresh must saturate to UNIX epoch on clock skew"
+        );
+    }
+
+    /// Regression: `read_text_artifact_bounded` must enforce its byte cap
+    /// *inside* the read loop via `Read::take`, not as a separate `metadata`
+    /// pre-check. Otherwise a file swapped between `metadata` and
+    /// `read_to_string` (symlink retargeting or in-place growth) could feed
+    /// the trust loaders an unbounded byte stream and exhaust memory before
+    /// the post-read length check fires. Verifies both happy path and the
+    /// "file too big" fail path.
+    #[test]
+    fn read_text_artifact_bounded_enforces_cap_during_read() {
+        let dir = secure_test_dir("read-text-artifact-bounded");
+        let small_path = dir.join("ok.txt");
+        std::fs::write(&small_path, b"hello world\n").expect("seed small artifact");
+        let body = super::read_text_artifact_bounded(&small_path, "test artifact", 1024)
+            .expect("under-cap read should succeed");
+        assert_eq!(body, "hello world\n");
+
+        // Write a file larger than the cap and verify the helper rejects it.
+        let big_path = dir.join("too-big.txt");
+        let big = vec![b'x'; 32];
+        std::fs::write(&big_path, &big).expect("seed oversized artifact");
+        let err = super::read_text_artifact_bounded(&big_path, "test artifact", 16)
+            .expect_err("over-cap read must fail closed");
+        assert!(
+            err.contains("exceeds maximum size"),
+            "unexpected error shape: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: the trust/bundle loader path must NOT contain the old
+    /// stat-pre-check + separate `fs::read_to_string` shape. That shape has
+    /// a TOCTOU window where an attacker can swap the file between the size
+    /// pre-check and the unbounded read.
+    #[test]
+    fn trust_bundle_loaders_use_bounded_reader_only() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(crate_root.join("src/daemon.rs"))
+            .expect("daemon source readable");
+        // Build the dead-fn needle from chunks so this test's own source does
+        // not match it (both the search call and the failure message).
+        let dead_fn = ["enforce_text_artifact_", "size_limit"].concat();
+        assert!(
+            !source.contains(&dead_fn),
+            "the retired pre-check helper `{dead_fn}` reappeared; its TOCTOU \
+             window between the metadata-stat and the subsequent unbounded \
+             read must stay closed",
+        );
+        // And the bounded reader must be the function we keep.
+        assert!(
+            source.contains("fn read_text_artifact_bounded("),
+            "`read_text_artifact_bounded` helper must remain present"
         );
     }
 
