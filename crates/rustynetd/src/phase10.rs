@@ -4893,10 +4893,76 @@ fn windows_powershell_command_args(script: &'static str, args: &[String]) -> Vec
 }
 
 fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemError> {
-    let path = Path::new(raw);
-    if !path.is_absolute() {
+    // `Path::is_absolute` is platform-specific: on Linux/macOS it would reject
+    // legitimate Windows paths like `C:\Windows\System32\netsh.exe` because
+    // they do not start with `/`. We use an OS-portable check so that the
+    // validator (and its regression tests) run consistently on every host.
+    // A Windows absolute path is either a drive-letter path (`X:\…`) or a UNC
+    // path (`\\server\share\…`).
+    let is_drive_absolute = raw
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && raw
+            .get(1..3)
+            .map(|sep| sep == ":\\" || sep == ":/")
+            .unwrap_or(false);
+    let is_unc = raw.starts_with(r"\\") || raw.starts_with("//");
+    if !(is_drive_absolute || is_unc) {
         return Err(SystemError::PrerequisiteCheckFailed(format!(
             "{label} binary path must be absolute: {raw}"
+        )));
+    }
+    // Path-traversal and metacharacter defense. The daemon-on-Windows resolves
+    // these from an environment variable so an installer compromise (or a
+    // misconfigured service unit) cannot point the daemon at, e.g.,
+    // `C:\Windows\System32\..\..\Temp\evil.exe`. We also reject forward slashes
+    // since Win32 path canonicalization treats them as separators but the
+    // System32 substring check below uses the canonical backslash form, and
+    // reject non-ASCII / control characters so malicious bytes cannot smuggle
+    // additional path components through the command line.
+    if !raw.is_ascii() {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must be ASCII: {raw}"
+        )));
+    }
+    if raw.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must not contain control characters: {raw}"
+        )));
+    }
+    if raw.contains("..") {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must not contain `..`: {raw}"
+        )));
+    }
+    if raw.contains('/') {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must use backslash separators: {raw}"
+        )));
+    }
+    // Require the executable to live inside the Windows system directory.
+    // The daemon runs as SYSTEM via a Windows service, so the netsh.exe and
+    // powershell.exe it shells out to MUST come from the Microsoft-shipped
+    // `\Windows\System32\` (or `\Windows\SysWOW64\` for 32-bit binaries on
+    // 64-bit hosts). Permitting an arbitrary absolute path lets anyone with
+    // write access to the service environment substitute a malicious binary
+    // that runs with the daemon's elevated token — equivalent to RCE as
+    // SYSTEM.
+    let lower = raw.to_ascii_lowercase();
+    let inside_system_root = lower.contains(r"\windows\system32\")
+        || lower.contains(r"\windows\syswow64\")
+        || lower.contains(r"\windows\sysnative\");
+    if !inside_system_root {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must live under `\\Windows\\System32\\`, \
+             `\\Windows\\SysWOW64\\`, or `\\Windows\\Sysnative\\`: {raw}"
+        )));
+    }
+    if !lower.ends_with(".exe") {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must end in `.exe`: {raw}"
         )));
     }
     Ok(())
@@ -5246,6 +5312,52 @@ mod tests {
     use rustynet_policy::{ContextualPolicyRule, RuleAction};
 
     use super::*;
+
+    #[test]
+    fn validate_windows_binary_path_requires_system_root_and_exe() {
+        // Accept canonical System32 path (case-insensitive); accept SysWOW64.
+        super::validate_windows_binary_path(r"C:\Windows\System32\netsh.exe", "netsh")
+            .expect("default System32 path must validate");
+        super::validate_windows_binary_path(r"c:\windows\system32\powershell.exe", "powershell")
+            .expect("lowercase System32 path must validate");
+        super::validate_windows_binary_path(
+            r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+            "powershell",
+        )
+        .expect("SysWOW64-rooted PowerShell must validate");
+        // Reject path-traversal smuggling out of System32.
+        let err = super::validate_windows_binary_path(
+            r"C:\Windows\System32\..\..\Users\Public\evil.exe",
+            "netsh",
+        )
+        .expect_err("`..` traversal must fail closed");
+        assert!(err.to_string().contains("`..`"));
+        // Reject paths outside the trusted system root.
+        let err = super::validate_windows_binary_path(r"D:\tools\netsh.exe", "netsh")
+            .expect_err("paths outside System32 must fail closed");
+        assert!(err.to_string().contains("\\System32\\"));
+        // Reject non-.exe targets so a renamed shim can't be substituted.
+        let err = super::validate_windows_binary_path(r"C:\Windows\System32\netsh", "netsh")
+            .expect_err("missing .exe extension must fail closed");
+        assert!(err.to_string().contains("`.exe`"));
+        // Reject relative paths.
+        let err = super::validate_windows_binary_path(r"netsh.exe", "netsh")
+            .expect_err("relative paths must fail closed");
+        assert!(err.to_string().contains("absolute"));
+        // Reject control characters and non-ASCII.
+        let err =
+            super::validate_windows_binary_path("C:\\Windows\\System32\\netsh\x00.exe", "netsh")
+                .expect_err("embedded NUL must fail closed");
+        assert!(err.to_string().contains("control characters"));
+        let err = super::validate_windows_binary_path("C:\\Windows\\System32\\nеtsh.exe", "netsh")
+            .expect_err("non-ASCII (Cyrillic 'е') homoglyph attack must fail closed");
+        assert!(err.to_string().contains("ASCII"));
+        // Reject forward slashes (Win32 accepts them but our System32 substring
+        // matcher uses backslashes; require canonical form).
+        let err = super::validate_windows_binary_path("C:/Windows/System32/netsh.exe", "netsh")
+            .expect_err("forward slashes must fail closed");
+        assert!(err.to_string().contains("backslash"));
+    }
 
     #[test]
     fn write_pf_rules_temp_file_fails_when_target_path_already_exists() {
