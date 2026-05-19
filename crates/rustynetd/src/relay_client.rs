@@ -898,11 +898,21 @@ fn read_preissued_relay_token(path: &Path) -> Result<RelaySessionToken, RelayCli
     })
 }
 
+/// Wall-clock seconds since UNIX_EPOCH.
+///
+/// **Security**: previously used `.expect(...)` which would panic
+/// the daemon process if the system clock had been rolled back
+/// before UNIX_EPOCH (boards with no RTC during very early boot,
+/// misconfigured NTP, operator-run `date --set=...`). Now returns
+/// 0 on failure, which makes any relay session token's
+/// `expires_at_unix > 0` look already-expired — fail-closed. The
+/// daemon stays up; the keepalive/relay paths just refuse to mint
+/// new tokens until the clock recovers.
 fn current_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock must be after UNIX_EPOCH")
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Serializes a `RelayHello` message for wire transmission.
