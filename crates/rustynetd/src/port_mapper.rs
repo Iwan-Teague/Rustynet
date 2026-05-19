@@ -1266,6 +1266,13 @@ const UPNP_MSEARCH_MX_SECS: u8 = 2;
 /// Practical SSDP discovery wait: how long we listen for responses.
 const UPNP_SSDP_DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Hard cap on the number of distinct LOCATION URLs we accept from
+/// SSDP M-SEARCH responses. A real LAN has at most one or two IGDs;
+/// any host responding with more than this many distinct URLs is
+/// either misconfigured or trying to DoS our `discover_one` path by
+/// making us spend timeout × N seconds on bogus HTTP fetches.
+pub const MAX_SSDP_DISCOVERED_DEVICES: usize = 4;
+
 /// Build an SSDP M-SEARCH HTTP-over-UDP request body for an IGD search.
 ///
 /// Wire format (UPnP Device Architecture v1.1 §1.3.2):
@@ -1831,9 +1838,22 @@ fn ssdp_collect_responses(
     wait_duration: Duration,
 ) -> Result<Vec<SsdpDiscoveredDevice>, PortMapperError> {
     let mut devices: Vec<SsdpDiscoveredDevice> = Vec::new();
-    let deadline = Instant::now() + wait_duration;
+    // **Security**: `Instant::now() + wait_duration` would panic on
+    // overflow if a caller passes a huge wait. Use `checked_add` with
+    // `Instant::now()` fallback so the loop exits immediately on
+    // overflow rather than crashing the daemon.
+    let deadline = Instant::now()
+        .checked_add(wait_duration)
+        .unwrap_or_else(Instant::now);
     let mut buf = [0u8; 2048];
     loop {
+        // **Security**: cap the device list size. An attacker on the
+        // LAN flooding M-SEARCH responses with distinct LOCATION URLs
+        // could otherwise force `discover_one` to spend
+        // (per-device HTTP timeout) × N seconds on bogus fetches.
+        if devices.len() >= MAX_SSDP_DISCOVERED_DEVICES {
+            break;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -3667,6 +3687,43 @@ destination: default
             !msg.contains('\r') && !msg.contains('\n') && !msg.contains('\x1b'),
             "sanitisation must strip CR/LF/ESC from gateway-controlled error description; got: {msg:?}"
         );
+    }
+
+    #[test]
+    fn ssdp_collect_responses_caps_devices_at_max_to_block_flood_dos() {
+        // Security pin: a hostile LAN host could flood SSDP M-SEARCH
+        // responses with many distinct LOCATION URLs. Without the
+        // cap, the subsequent discover_one would spend
+        // (HTTP-timeout) × N seconds on bogus device-description
+        // fetches. The cap (`MAX_SSDP_DISCOVERED_DEVICES`) bounds
+        // the work.
+        let listener = UdpSocket::bind("127.0.0.1:0").expect("bind probe gateway scout");
+        let recv_addr = listener.local_addr().expect("local_addr");
+
+        // Spawn a "hostile" sender that floods many distinct
+        // responses at the probe socket.
+        let flood_count = MAX_SSDP_DISCOVERED_DEVICES + 10;
+        let sender_handle = std::thread::spawn(move || {
+            let sender = UdpSocket::bind("127.0.0.1:0").expect("bind hostile sender");
+            for i in 0..flood_count {
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nLOCATION: http://192.0.2.{}/rootDesc.xml\r\n\r\n",
+                    i + 1
+                );
+                let _ = sender.send_to(resp.as_bytes(), recv_addr);
+            }
+        });
+
+        let devices = ssdp_collect_responses(&listener, Duration::from_millis(500))
+            .expect("collect succeeds");
+        assert!(
+            devices.len() <= MAX_SSDP_DISCOVERED_DEVICES,
+            "device list must be capped at {}; got {}",
+            MAX_SSDP_DISCOVERED_DEVICES,
+            devices.len()
+        );
+
+        sender_handle.join().ok();
     }
 
     #[test]
