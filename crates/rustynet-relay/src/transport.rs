@@ -619,6 +619,20 @@ impl RelayTransport {
             eprintln!("relay nonce-store prune failed: {err}");
         }
 
+        // Prune rate-limiter token buckets that no longer correspond to any
+        // active session. `RateLimiter::check_packet` allocates a fresh bucket
+        // on the first packet for any new `node_id`; without this prune, a
+        // steady churn of distinct `node_id`s would grow the bucket map
+        // without bound (memory-exhaustion DoS). Tying bucket lifetime to
+        // session lifetime caps the bucket count by `max_total_sessions`.
+        let active_nodes: std::collections::HashSet<String> = self
+            .sessions
+            .values()
+            .map(|session| session.node_id.clone())
+            .collect();
+        self.rate_limiter
+            .retain_active_nodes(|node_id| active_nodes.contains(node_id));
+
         removed
     }
 
@@ -2020,6 +2034,40 @@ mod tests {
         }
         transport.cleanup_idle_sessions();
         assert_eq!(transport.session_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_idle_sessions_evicts_orphan_rate_limiter_buckets() {
+        // Regression: before this hook, `RateLimiter::check_packet` allocated
+        // a fresh bucket on every distinct `node_id` and nothing ever
+        // evicted, so a relay seeing a steady churn of distinct nodes would
+        // grow `RateLimiter::buckets` without bound (memory-exhaustion DoS).
+        // The cleanup tick must now drop any bucket whose `node_id` has no
+        // active session.
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        // Accept a session, drive one packet through it to allocate a bucket,
+        // then mark the session idle and run cleanup. The bucket should be
+        // evicted alongside the session.
+        let from_addr = observed_addr([198, 51, 100, 27], 41_000);
+        let ack =
+            accept_hello_from_with_port(&mut transport, &sk, "node-a", "node-b", from_addr, 50_001);
+        let session_id = ack.session_id;
+        let payload = vec![0u8; 64];
+        let _ = transport.forward_packet(session_id, &payload, from_addr);
+        assert_eq!(transport.rate_limiter.bucket_count(), 1);
+
+        for s in transport.sessions.values_mut() {
+            s.last_packet_at = Instant::now() - Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS + 1);
+        }
+        transport.cleanup_idle_sessions();
+        assert_eq!(transport.session_count(), 0);
+        assert_eq!(
+            transport.rate_limiter.bucket_count(),
+            0,
+            "orphaned rate-limiter buckets must not survive session eviction"
+        );
     }
 
     // ── Constant-time security regression tests ───────────────────────────────
