@@ -3790,9 +3790,15 @@ impl DaemonRuntime {
         match self.traversal_last_endpoint_fingerprint.as_deref() {
             Some(previous) if previous == fingerprint.as_str() => {}
             Some(_) => {
+                // Fail-soft clock read: a wall-clock set before 1970 (clock
+                // skew or a container with a misconfigured TZ) would otherwise
+                // panic the long-running runtime loop on every endpoint
+                // refresh, taking down the whole daemon. `unix_now()` already
+                // saturates to 0; we use the same shape inline here so the
+                // call site stays self-contained.
                 let now_unix = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or(Duration::ZERO)
                     .as_secs();
                 if let Some(last) = self.traversal_last_endpoint_change_unix {
                     if now_unix < last.saturating_add(MIN_ENDPOINT_CHANGE_STABILITY_SECS) {
@@ -14225,6 +14231,43 @@ mod tests {
                 .expect("secure test directory permissions should be set")
         };
         dir
+    }
+
+    /// Regression: `maybe_trigger_endpoint_change_refresh` previously called
+    /// `SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()`,
+    /// which panics on any wall-clock set before 1970 (clock skew, containers
+    /// with misconfigured time, jails without a proper RTC). That panic would
+    /// crash the daemon's runtime loop on every endpoint refresh, taking the
+    /// process down for what should be a transient anomaly. The current shape
+    /// must instead saturate to 0 (matching the existing `unix_now()`
+    /// helper).
+    #[test]
+    fn maybe_trigger_endpoint_change_refresh_clock_read_is_fail_soft() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(crate_root.join("src/daemon.rs"))
+            .expect("daemon source readable");
+        let start = source
+            .find("fn maybe_trigger_endpoint_change_refresh")
+            .expect("maybe_trigger_endpoint_change_refresh must exist in source");
+        // Take the next ~40 lines as the function body window.
+        let end = start + 2_000;
+        let window = &source[start..end.min(source.len())];
+        let needle = [
+            ".duration_since(UNIX_EPOCH)",
+            "\n",
+            "                    .unwrap()",
+        ]
+        .concat();
+        assert!(
+            !window.contains(&needle),
+            "maybe_trigger_endpoint_change_refresh must use `.unwrap_or(Duration::ZERO)` on \
+             the UNIX_EPOCH duration, not `.unwrap()`; a pre-1970 wall clock would otherwise \
+             crash the runtime loop on every endpoint refresh"
+        );
+        assert!(
+            window.contains(".unwrap_or(Duration::ZERO)"),
+            "maybe_trigger_endpoint_change_refresh must saturate to UNIX epoch on clock skew"
+        );
     }
 
     #[test]
