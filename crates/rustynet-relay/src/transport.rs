@@ -85,6 +85,11 @@ pub enum RejectReason {
     ReplayStoreUnavailable,
     /// Daemon supplied an invalid allocated relay data port.
     InvalidAllocatedPort,
+    /// Kernel CSPRNG was unavailable while minting the session id. We refuse
+    /// to fall back to a less random source because the session id namespaces
+    /// the forwarding map; a predictable id would let one peer hijack
+    /// another's relay session.
+    SessionIdRandomnessUnavailable,
 }
 
 /// Session establishment request from a node to the relay.
@@ -269,7 +274,13 @@ impl RelayTransport {
         // Allocate session
         self.remove_session_for_pair(&hello.node_id, &hello.peer_node_id);
 
-        let session_id = SessionId::generate();
+        let session_id = match SessionId::try_generate() {
+            Ok(id) => id,
+            Err(err) => {
+                eprintln!("Relay hello rejected: session id CSPRNG unavailable: {err}");
+                return RelayHelloResponse::Rejected(RejectReason::SessionIdRandomnessUnavailable);
+            }
+        };
 
         let session = RelaySession {
             session_id,
