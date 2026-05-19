@@ -1187,7 +1187,7 @@ const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
     ),
     (
         "crates/rustynet-relay/src/transport.rs",
-        371,
+        382,
         "public-scope label string equality on relay hello (relay token scope is a public domain string, not secret material)",
     ),
 ];
