@@ -322,10 +322,7 @@ impl RelayTransport {
         }
 
         // Check 4: Token freshness / expiry
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now_unix = now_unix();
 
         if hello
             .session_token
@@ -433,10 +430,7 @@ impl RelayTransport {
         session_id: SessionId,
         from_addr: SocketAddr,
     ) -> Result<bool, RelayForwardError> {
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now_unix = now_unix();
 
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return Err(RelayForwardError::SessionNotFound);
@@ -488,10 +482,7 @@ impl RelayTransport {
             return Ok(None);
         }
 
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now_unix = now_unix();
 
         let Some(session) = self.sessions.get(&session_id) else {
             return Err(RelayForwardError::SessionNotFound);
@@ -577,10 +568,7 @@ impl RelayTransport {
         let now = Instant::now();
         let idle_threshold = Duration::from_secs(IDLE_SESSION_TIMEOUT_SECS);
         let half_open_threshold = Duration::from_secs(HALF_OPEN_SESSION_TIMEOUT_SECS);
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now_unix = now_unix();
 
         let mut to_remove = Vec::new();
 
@@ -773,11 +761,21 @@ impl NonceStore {
     }
 }
 
+/// Wall-clock seconds since UNIX_EPOCH.
+///
+/// **Security**: `SystemTime::now() < UNIX_EPOCH` is rare but real on
+/// boards with no RTC during very early boot, on systems whose clock
+/// was rolled back by a misconfigured NTP, or by an operator running
+/// `date --set=...`. The previous version of this helper used
+/// `.expect(...)` which would panic and crash the relay process
+/// every time a peer presented a hello. We now return 0 on failure,
+/// which makes any token's `expires_at > 0` look already-expired —
+/// fail-closed.
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock must be after UNIX_EPOCH")
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Pure helper that clamps an operator-supplied clock-skew tolerance to the
@@ -2475,6 +2473,25 @@ mod tests {
         const _: () = assert!(
             MAX_RELAY_TTL_SECS + MAX_CLOCK_SKEW_TOLERANCE_SECS <= NONCE_RETENTION_SECS,
             "skew + ttl must never exceed nonce retention or replay window reopens"
+        );
+    }
+
+    #[test]
+    fn now_unix_returns_positive_on_healthy_clock_not_panic() {
+        // Security pin: `now_unix()` previously used `.expect(...)`,
+        // which would panic when `SystemTime::now() < UNIX_EPOCH`
+        // (early boot before NTP sync, clock rollback, broken RTC).
+        // The fail-closed replacement returns 0 in that case and a
+        // sensible positive value otherwise. We can't easily force
+        // the negative branch in a unit test, but we can confirm
+        // the function:
+        //   * doesn't panic
+        //   * returns a recent-looking value on the test host
+        let now = now_unix();
+        // Sanity: > 2025-01-01 (1_735_689_600). Test runs in 2026+.
+        assert!(
+            now > 1_735_689_600,
+            "now_unix() should return a 2025+ value on a healthy clock; got {now}"
         );
     }
 
