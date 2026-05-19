@@ -33,6 +33,29 @@ impl RateLimiter {
 
         bucket.check_and_consume(1, packet_size_bytes * 8)
     }
+
+    /// Drop token buckets whose `node_id` is no longer represented by any
+    /// active session.
+    ///
+    /// The bucket map grew unboundedly before this hook existed because
+    /// `check_packet` allocated on every fresh `node_id` and nothing ever
+    /// evicted. A long-running relay that saw a steady churn of distinct
+    /// `node_id`s (legitimate identity rotation or a peer flooding hellos
+    /// with rotated tokens) would gradually exhaust memory. Pruning here on
+    /// the same cadence as session-cleanup keeps the bucket count bounded
+    /// by the number of active sessions.
+    pub fn retain_active_nodes<F>(&mut self, mut is_active: F)
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.buckets
+            .retain(|node_id, _| is_active(node_id.as_str()));
+    }
+
+    #[cfg(test)]
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
 }
 
 #[derive(Debug, Clone)]
