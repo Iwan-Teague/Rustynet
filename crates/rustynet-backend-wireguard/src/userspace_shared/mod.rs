@@ -3153,4 +3153,95 @@ mod tests {
         backend.shutdown().expect("shutdown should succeed");
         let _ = fs::remove_file(private_key_path);
     }
+
+    // Regression pin: the four debug-recording buffers in engine.rs and runtime.rs
+    // (`recorded_peer_ciphertext_ingress`, `recorded_tunnel_plaintext_packets`,
+    // `recorded_authoritative_operations`, `recorded_peer_ciphertext_egress`) are
+    // observability fixtures consumed only by `cfg(test)` runtime requests. If any
+    // future change removes the `cfg(test)` gate from the push sites, production
+    // builds would silently retain unbounded ciphertext/plaintext history per
+    // datagram, allowing a slow-DoS via memory exhaustion and leaking the
+    // plaintext of every tunneled packet for the process lifetime. This test
+    // greps the source so the gating cannot regress without an explicit update.
+    #[test]
+    fn debug_recording_pushes_remain_gated_behind_cfg_test() {
+        struct Required {
+            path: &'static str,
+            field_anchor: &'static str,
+        }
+        let workspace_root = workspace_root();
+        let required = [
+            Required {
+                path: "crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs",
+                field_anchor: "self.recorded_peer_ciphertext_ingress",
+            },
+            Required {
+                path: "crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs",
+                field_anchor: "recorded_tunnel_plaintext_packets.push",
+            },
+            Required {
+                path: "crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs",
+                field_anchor: "self.recorded_authoritative_operations",
+            },
+            Required {
+                path: "crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs",
+                field_anchor: "self.recorded_peer_ciphertext_egress",
+            },
+        ];
+        for required_site in required {
+            let body = fs::read_to_string(workspace_root.join(required_site.path))
+                .expect("backend wireguard source should be readable for regression pin");
+            let lines: Vec<&str> = body.lines().collect();
+            // A "push site" is a field reference where either the same line or the
+            // immediately following line contains `.push(`. Skip field declarations
+            // and `Vec::new()` initializers.
+            let mut push_sites: Vec<usize> = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                if !line.contains(required_site.field_anchor) {
+                    continue;
+                }
+                if line.contains("Vec::new") || line.contains("Vec<") {
+                    continue;
+                }
+                let same_line_push = line.contains(".push(") || line.contains(".push (");
+                let next_line_push = lines
+                    .get(idx + 1)
+                    .map(|next| next.trim_start().starts_with(".push("))
+                    .unwrap_or(false);
+                if same_line_push || next_line_push {
+                    push_sites.push(idx);
+                }
+            }
+            assert!(
+                !push_sites.is_empty(),
+                "expected to find at least one push site for `{}` in `{}`",
+                required_site.field_anchor,
+                required_site.path,
+            );
+            for push_idx in push_sites {
+                let start = push_idx.saturating_sub(10);
+                let preceding_cfg_test = lines[start..push_idx]
+                    .iter()
+                    .any(|prior| prior.contains("#[cfg(test)]"));
+                assert!(
+                    preceding_cfg_test,
+                    "expected `#[cfg(test)]` to gate push of `{}` in `{}` near line {}; \
+                     unbounded growth would leak ciphertext/plaintext history and enable \
+                     a memory-exhaustion DoS",
+                    required_site.field_anchor,
+                    required_site.path,
+                    push_idx + 1,
+                );
+            }
+        }
+    }
+
+    fn workspace_root() -> PathBuf {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        crate_dir
+            .parent()
+            .and_then(|crates_dir| crates_dir.parent())
+            .map(PathBuf::from)
+            .expect("workspace root should resolve from CARGO_MANIFEST_DIR")
+    }
 }

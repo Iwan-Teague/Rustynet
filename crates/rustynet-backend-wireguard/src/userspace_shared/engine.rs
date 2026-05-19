@@ -9,6 +9,7 @@ use base64::prelude::*;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use rustynet_backend_api::{BackendError, NodeId, PeerConfig, SocketEndpoint};
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg_attr(not(test), allow(dead_code))]
 const MAX_ENCRYPTED_PACKET_BYTES: usize = 65_535 + 32;
@@ -79,31 +80,41 @@ struct AllowedIpNetwork {
 
 impl UserspaceEngine {
     pub(crate) fn from_private_key_file(path: &Path) -> Result<Self, BackendError> {
-        let encoded_private_key = fs::read_to_string(path).map_err(|err| {
-            BackendError::internal(format!(
-                "linux userspace-shared private key read failed for {}: {err}",
-                path.display()
-            ))
-        })?;
-        let trimmed_private_key = encoded_private_key.trim();
-        let decoded_private_key = BASE64_STANDARD
-            .decode(trimmed_private_key.as_bytes())
-            .map_err(|err| {
+        // Secret-material hygiene: the on-disk base64 blob and the decoded 32-byte
+        // scalar are WireGuard static private key material. Wrap intermediates in
+        // `Zeroizing` so any heap-resident copy is overwritten when dropped, and
+        // explicitly zeroize the stack-resident `[u8; 32]` after handing a copy to
+        // `StaticSecret::from` (the array is `Copy`; the cast does not consume).
+        let encoded_private_key: Zeroizing<String> =
+            Zeroizing::new(fs::read_to_string(path).map_err(|err| {
                 BackendError::internal(format!(
-                    "linux userspace-shared private key decode failed for {}: {err}",
+                    "linux userspace-shared private key read failed for {}: {err}",
                     path.display()
                 ))
-            })?;
-        let private_key_bytes: [u8; 32] =
-            decoded_private_key.try_into().map_err(|bytes: Vec<u8>| {
-                BackendError::internal(format!(
-                    "linux userspace-shared private key length invalid for {}: expected 32 bytes after base64 decode, got {}",
-                    path.display(),
-                    bytes.len()
-                ))
-            })?;
+            })?);
+        let trimmed_private_key = encoded_private_key.trim();
+        let decoded_private_key: Zeroizing<Vec<u8>> = Zeroizing::new(
+            BASE64_STANDARD
+                .decode(trimmed_private_key.as_bytes())
+                .map_err(|err| {
+                    BackendError::internal(format!(
+                        "linux userspace-shared private key decode failed for {}: {err}",
+                        path.display()
+                    ))
+                })?,
+        );
+        if decoded_private_key.len() != 32 {
+            return Err(BackendError::internal(format!(
+                "linux userspace-shared private key length invalid for {}: expected 32 bytes after base64 decode, got {}",
+                path.display(),
+                decoded_private_key.len()
+            )));
+        }
+        let mut private_key_bytes: [u8; 32] = [0u8; 32];
+        private_key_bytes.copy_from_slice(&decoded_private_key);
 
         let local_static_private = StaticSecret::from(private_key_bytes);
+        private_key_bytes.zeroize();
         let local_static_public = PublicKey::from(&local_static_private);
 
         Ok(Self {
@@ -218,14 +229,27 @@ impl UserspaceEngine {
         transport_generation: u64,
     ) -> Result<EngineProcessingOutcome, BackendError> {
         let matched_node_id = self.find_node_id_by_endpoint(remote_addr);
-        self.recorded_peer_ciphertext_ingress
-            .push(RecordedPeerCiphertextIngress {
-                node_id: matched_node_id.clone(),
-                local_addr,
-                remote_addr,
-                payload: payload.clone(),
-                transport_generation,
-            });
+        // Unbounded-growth guard: `recorded_peer_ciphertext_ingress` is a test-only
+        // observability buffer; persisting every datagram in production would let an
+        // attacker exhaust memory via a packet flood and would also retain a
+        // long-lived plaintext+ciphertext history that the runtime never reads.
+        #[cfg(test)]
+        {
+            let _ = local_addr;
+            self.recorded_peer_ciphertext_ingress
+                .push(RecordedPeerCiphertextIngress {
+                    node_id: matched_node_id.clone(),
+                    local_addr,
+                    remote_addr,
+                    payload: payload.clone(),
+                    transport_generation,
+                });
+        }
+        #[cfg(not(test))]
+        {
+            let _ = local_addr;
+            let _ = transport_generation;
+        }
 
         let Some(node_id) = matched_node_id else {
             return Ok(EngineProcessingOutcome::default());
@@ -429,21 +453,39 @@ fn handle_single_tunn_result(
                 });
         }
         TunnResult::WriteToTunnelV4(packet, _src_addr) => {
-            let recorded_packet = RecordedTunnelPlaintextPacket {
-                node_id: node_id.clone(),
-                packet: packet.to_vec(),
-                transport_generation,
-            };
-            recorded_tunnel_plaintext_packets.push(recorded_packet);
+            // Unbounded-growth guard: production code never reads
+            // `recorded_tunnel_plaintext_packets`; appending every plaintext frame
+            // would retain the cleartext of every tunneled packet and grow without
+            // bound. Keep the recording behind `cfg(test)` for assertion fixtures.
+            #[cfg(test)]
+            {
+                let recorded_packet = RecordedTunnelPlaintextPacket {
+                    node_id: node_id.clone(),
+                    packet: packet.to_vec(),
+                    transport_generation,
+                };
+                recorded_tunnel_plaintext_packets.push(recorded_packet);
+            }
+            #[cfg(not(test))]
+            {
+                let _ = (&recorded_tunnel_plaintext_packets, transport_generation);
+            }
             outcome.tunnel_plaintext_packets.push(packet.to_vec());
         }
         TunnResult::WriteToTunnelV6(packet, _src_addr) => {
-            let recorded_packet = RecordedTunnelPlaintextPacket {
-                node_id: node_id.clone(),
-                packet: packet.to_vec(),
-                transport_generation,
-            };
-            recorded_tunnel_plaintext_packets.push(recorded_packet);
+            #[cfg(test)]
+            {
+                let recorded_packet = RecordedTunnelPlaintextPacket {
+                    node_id: node_id.clone(),
+                    packet: packet.to_vec(),
+                    transport_generation,
+                };
+                recorded_tunnel_plaintext_packets.push(recorded_packet);
+            }
+            #[cfg(not(test))]
+            {
+                let _ = (&recorded_tunnel_plaintext_packets, transport_generation);
+            }
             outcome.tunnel_plaintext_packets.push(packet.to_vec());
         }
     }

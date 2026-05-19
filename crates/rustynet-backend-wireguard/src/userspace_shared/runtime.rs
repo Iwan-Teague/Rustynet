@@ -24,6 +24,7 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 type ReplySender<T> = SyncSender<Result<T, BackendError>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum RecordedAuthoritativeTransportOperationKind {
     RoundTrip,
     Send,
@@ -548,6 +549,12 @@ impl RuntimeState {
 
             let local_addr = self.authoritative_socket.local_addr()?;
             let transport_generation = self.authoritative_socket.transport_generation();
+            // Unbounded-growth guard: `recorded_authoritative_operations` is only
+            // consumed by test fixtures (see `DebugRecordedAuthoritativeOperations`
+            // which is itself `#[cfg(test)]`). Pushing on every round-trip in
+            // production builds would let any peer that reaches the authoritative
+            // socket grow the buffer without bound.
+            #[cfg(test)]
             self.recorded_authoritative_operations
                 .push(RecordedAuthoritativeTransportOperation {
                     kind: RecordedAuthoritativeTransportOperationKind::RoundTrip,
@@ -557,6 +564,10 @@ impl RuntimeState {
                     timeout: Some(timeout),
                     transport_generation,
                 });
+            #[cfg(not(test))]
+            {
+                let _ = (local_addr, transport_generation, &timeout);
+            }
             self.authoritative_socket.send_to(remote_addr, &payload)?;
             Ok(OutstandingRoundTripState {
                 remote_addr,
@@ -584,6 +595,10 @@ impl RuntimeState {
         payload: Vec<u8>,
     ) -> Result<AuthoritativeTransportIdentity, BackendError> {
         let identity = self.authoritative_identity()?;
+        // Unbounded-growth guard: see analogous block in
+        // `start_authoritative_round_trip`. The send-side recording is only used by
+        // test fixtures and must not retain ciphertext payloads in production.
+        #[cfg(test)]
         self.recorded_authoritative_operations
             .push(RecordedAuthoritativeTransportOperation {
                 kind: RecordedAuthoritativeTransportOperationKind::Send,
@@ -752,6 +767,11 @@ impl RuntimeState {
         let local_addr = self.authoritative_socket.local_addr()?;
         let transport_generation = self.authoritative_socket.transport_generation();
         for packet in outcome.outbound_ciphertext_packets {
+            // Unbounded-growth guard: `recorded_peer_ciphertext_egress` is read only
+            // by `DebugRecordedPeerCiphertextEgress` (cfg(test)). Persisting every
+            // outbound ciphertext frame in production would grow without bound and
+            // keep a peer's ciphertext history in memory for the process lifetime.
+            #[cfg(test)]
             self.recorded_peer_ciphertext_egress
                 .push(RecordedPeerCiphertextEgress {
                     local_addr,
@@ -761,6 +781,10 @@ impl RuntimeState {
                 });
             self.authoritative_socket
                 .send_to(packet.remote_addr, &packet.payload)?;
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (local_addr, transport_generation);
         }
         for packet in outcome.tunnel_plaintext_packets {
             self.tun_device.send_packet(&packet)?;
