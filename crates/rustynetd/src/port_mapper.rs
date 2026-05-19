@@ -484,7 +484,7 @@ impl PortMapper for NatPmpClient {
             external_port,
             external_addr: IpAddr::V4(external_addr),
             protocol: PortMappingProtocol::NatPmp,
-            expires_at: Instant::now() + Duration::from_secs(u64::from(lifetime_secs)),
+            expires_at: expires_at_from_lifetime(lifetime_secs),
             pcp_nonce: None,
         })
     }
@@ -519,7 +519,7 @@ impl PortMapper for NatPmpClient {
             external_port,
             external_addr: IpAddr::V4(external_addr),
             protocol: PortMappingProtocol::NatPmp,
-            expires_at: Instant::now() + Duration::from_secs(u64::from(granted_lifetime)),
+            expires_at: expires_at_from_lifetime(granted_lifetime),
             pcp_nonce: None,
         })
     }
@@ -1006,8 +1006,7 @@ impl PortMapper for PcpClient {
             external_port: fields.external_port,
             external_addr: fields.external_addr,
             protocol: PortMappingProtocol::Pcp,
-            expires_at: Instant::now()
-                + Duration::from_secs(u64::from(fields.granted_lifetime_secs)),
+            expires_at: expires_at_from_lifetime(fields.granted_lifetime_secs),
             pcp_nonce: Some(nonce),
         })
     }
@@ -1049,8 +1048,7 @@ impl PortMapper for PcpClient {
             external_port: fields.external_port,
             external_addr: fields.external_addr,
             protocol: PortMappingProtocol::Pcp,
-            expires_at: Instant::now()
-                + Duration::from_secs(u64::from(fields.granted_lifetime_secs)),
+            expires_at: expires_at_from_lifetime(fields.granted_lifetime_secs),
             pcp_nonce: Some(nonce),
         })
     }
@@ -1432,6 +1430,28 @@ pub fn build_soap_envelope(
          </u:{action}>\
          </s:Body></s:Envelope>\r\n"
     )
+}
+
+/// Maximum lease lifetime we'll accept from any gateway, in seconds.
+/// RFC 6887 §11.1 says "Recommended Lifetime SHOULD NOT exceed 24
+/// hours" and RFC 6886 §3.3 implicitly bounds the field at u32::MAX
+/// seconds (136 years). A hostile or buggy gateway returning a huge
+/// lifetime would, without this cap, cause `Instant::now() + Duration`
+/// to potentially overflow the platform's Instant representation and
+/// panic the daemon. We clamp at 24 hours so the math always fits and
+/// a degenerate gateway response cannot DoS the process.
+pub const MAX_GATEWAY_LEASE_SECS: u32 = 24 * 60 * 60;
+
+/// Compute the absolute expiry for a mapping lease, clamping the
+/// gateway-supplied lifetime at [`MAX_GATEWAY_LEASE_SECS`] and using
+/// `Instant::checked_add` to fail closed (never panic) on overflow.
+/// Falls back to `Instant::now()` if the addition would overflow,
+/// which forces an immediate refresh — much better than crashing.
+fn expires_at_from_lifetime(lifetime_secs: u32) -> Instant {
+    let clamped = lifetime_secs.min(MAX_GATEWAY_LEASE_SECS);
+    Instant::now()
+        .checked_add(Duration::from_secs(u64::from(clamped)))
+        .unwrap_or_else(Instant::now)
 }
 
 /// Sanitise an attacker-controlled string before embedding it in an
@@ -2011,7 +2031,7 @@ impl PortMapper for UpnpIgdClient {
             external_port: internal_port,
             external_addr,
             protocol: PortMappingProtocol::UpnpIgd,
-            expires_at: Instant::now() + Duration::from_secs(u64::from(lease_duration_secs)),
+            expires_at: expires_at_from_lifetime(lease_duration_secs),
             pcp_nonce: None,
         })
     }
@@ -3644,6 +3664,34 @@ destination: default
             !msg.contains('\r') && !msg.contains('\n') && !msg.contains('\x1b'),
             "sanitisation must strip CR/LF/ESC from gateway-controlled error description; got: {msg:?}"
         );
+    }
+
+    #[test]
+    fn expires_at_from_lifetime_clamps_huge_values_and_never_panics() {
+        // Security pin: a hostile gateway returning `granted_lifetime
+        // = u32::MAX` would, before the clamp, compute
+        // `Instant::now() + Duration::from_secs(4_294_967_295)` which
+        // could panic on platforms where the Instant representation
+        // cannot hold the result. The clamp at MAX_GATEWAY_LEASE_SECS
+        // keeps the arithmetic safely inside the representable range.
+        let now = Instant::now();
+        let huge = expires_at_from_lifetime(u32::MAX);
+        let zero = expires_at_from_lifetime(0);
+        let small = expires_at_from_lifetime(60);
+
+        // Huge clamps to MAX_GATEWAY_LEASE_SECS (24h).
+        let huge_dur = huge.saturating_duration_since(now);
+        assert!(
+            huge_dur.as_secs() <= u64::from(MAX_GATEWAY_LEASE_SECS) + 1,
+            "u32::MAX lifetime must clamp to MAX_GATEWAY_LEASE_SECS; got {}s",
+            huge_dur.as_secs()
+        );
+        // Zero is `now` (or a few microseconds later from the
+        // checked_add side-trip).
+        assert!(zero.saturating_duration_since(now) <= Duration::from_millis(50));
+        // Small passes through.
+        let small_dur = small.saturating_duration_since(now);
+        assert!(small_dur.as_secs() >= 59 && small_dur.as_secs() <= 61);
     }
 
     #[test]
