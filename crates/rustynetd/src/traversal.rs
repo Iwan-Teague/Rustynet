@@ -1432,12 +1432,21 @@ pub fn schedule_proactive_refresh(
     margin_secs: u64,
     jitter_max_secs: u64,
 ) -> Instant {
+    // Fail-soft on CSPRNG failure: jitter exists only to prevent a thundering
+    // herd of refreshes across nodes that bootstrapped at the same time; it is
+    // not a security primitive. Falling back to zero jitter on a transient OS
+    // randomness failure keeps the long-running daemon alive at the cost of a
+    // brief loss of refresh decorrelation. (Compare with the relay session-id
+    // path, which fails closed because a predictable id is exploitable.)
     let jitter_secs = if jitter_max_secs > 0 {
         let mut buf = [0u8; 8];
-        rand::rngs::OsRng
-            .try_fill_bytes(&mut buf)
-            .expect("os randomness unavailable for traversal refresh jitter");
-        u64::from_le_bytes(buf) % jitter_max_secs
+        match rand::rngs::OsRng.try_fill_bytes(&mut buf) {
+            Ok(()) => u64::from_le_bytes(buf) % jitter_max_secs,
+            Err(err) => {
+                eprintln!("traversal refresh jitter skipped: OS randomness unavailable: {err}");
+                0
+            }
+        }
     } else {
         0
     };
@@ -2681,6 +2690,46 @@ mod tests {
                 "scheduled too early: {scheduled_from_now:?}"
             );
         }
+    }
+
+    /// Regression: a previous revision of `schedule_proactive_refresh` called
+    /// `OsRng::try_fill_bytes(...).expect(...)` for the jitter buffer. A CSPRNG
+    /// failure (early-boot, jail without /dev/urandom, hardware fault) would
+    /// then crash the long-running daemon's traversal scheduler. The current
+    /// implementation must instead fall back to zero jitter and log. We pin
+    /// this two ways:
+    ///   1. Source-grep `traversal.rs` to ensure no `expect(` follows
+    ///      `try_fill_bytes` inside `schedule_proactive_refresh` ever returns.
+    ///   2. Make sure `jitter_max_secs = 0` never invokes the CSPRNG branch
+    ///      (it would be a panic if `OsRng` were unavailable, which we cannot
+    ///      simulate without injection).
+    #[test]
+    fn schedule_proactive_refresh_does_not_panic_on_csprng_unavailability() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(crate_root.join("src/traversal.rs"))
+            .expect("traversal source readable");
+        // The fixed implementation must contain the recovery arm.
+        assert!(
+            source.contains("traversal refresh jitter skipped"),
+            "schedule_proactive_refresh must fail-soft to zero jitter on CSPRNG failure; \
+             the recovery `eprintln!` marker is missing — a regression would re-introduce a \
+             daemon panic on any transient OS-randomness fault"
+        );
+        // And must not still contain the old panicking `expect` call.
+        // We look for the exact bytes of the original expect message; if
+        // someone re-introduces it, this guard fires. Build the needle
+        // from chunks so this test's own source does not match it.
+        let needle = ["os randomness unavailable", " for traversal refresh jitter"].concat();
+        let panicking_pattern = format!(".expect(\"{needle}\")");
+        assert!(
+            !source.contains(&panicking_pattern),
+            "the previous panicking expect on the jitter CSPRNG call has reappeared"
+        );
+
+        // jitter_max_secs = 0 is the no-CSPRNG path; verify it never invokes
+        // anything that could panic by running it under the usual env.
+        let expires_at = SystemTime::now() + Duration::from_secs(300);
+        let _ = schedule_proactive_refresh(expires_at, 60, 0);
     }
 
     /// B3-a: When `expires_at` is already past the margin (or in the past),
