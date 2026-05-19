@@ -8497,7 +8497,13 @@ fn detect_default_egress_interface(tunnel_alias: &str) -> Result<String, String>
     // Use PowerShell Get-NetRoute to find the lowest-metric default-route interface
     // that is not the WireGuard tunnel adapter.  The tunnel alias is passed as a
     // PowerShell script parameter so it is never interpolated into the script body.
-    let output = Command::new("powershell.exe")
+    //
+    // Resolve `powershell.exe` from an absolute path under `\Windows\System32\`
+    // rather than letting Win32's PATH search find it. A daemon running as
+    // SYSTEM with a permissive PATH (e.g., user-writable directory injected
+    // by an installer) would otherwise execute an attacker-controlled
+    // `powershell.exe` with the daemon's elevated token.
+    let output = Command::new(crate::phase10::DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH)
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -14271,6 +14277,36 @@ mod tests {
             "unexpected error shape: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: no production callsite may invoke `powershell.exe` by
+    /// bare program name. Win32's `CreateProcess` resolves bare names via
+    /// the daemon's PATH, so a permissive PATH (or one tainted by a
+    /// compromised installer) would silently substitute an attacker-
+    /// controlled `powershell.exe` with the daemon's SYSTEM token. All
+    /// PowerShell invocations must resolve through the absolute
+    /// `\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` path
+    /// pinned by `DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH`.
+    #[test]
+    fn powershell_invocations_never_use_bare_program_name() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = [
+            crate_root.join("src/daemon.rs"),
+            crate_root.join("src/windows_dns_failclosed.rs"),
+        ];
+        // Build the bare-name needle as a literal token-call shape so this
+        // assert's own source body does not match the negative grep.
+        let bare_invocation = ["Command::new(\"powe", "rshell.exe\")"].concat();
+        for source_path in sources {
+            let body = std::fs::read_to_string(&source_path).expect("source file readable");
+            assert!(
+                !body.contains(&bare_invocation),
+                "{}: bare-name `Command::new(\"powershell.exe\")` reappeared; \
+                 resolve PowerShell from `\\Windows\\System32\\` via \
+                 `DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH` instead",
+                source_path.display(),
+            );
+        }
     }
 
     /// Regression: the IPC mutation-authorization path must not silently

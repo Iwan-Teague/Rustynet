@@ -451,7 +451,11 @@ pub fn build_windows_dns_failclosed_report(
 pub fn collect_windows_dns_failclosed_snapshot() -> Result<WindowsDnsFailclosedSnapshot, String> {
     use std::process::Command;
 
-    let output = Command::new("powershell.exe")
+    // Resolve `powershell.exe` from `\Windows\System32\` rather than relying
+    // on Win32's PATH search. A daemon running as SYSTEM with a permissive
+    // PATH would otherwise execute an attacker-controlled `powershell.exe`
+    // with the daemon's elevated token.
+    let output = Command::new(crate::phase10::DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH)
         .args([
             "-NoLogo",
             "-NoProfile",
