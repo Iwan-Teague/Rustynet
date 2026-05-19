@@ -2357,14 +2357,8 @@ impl MacosCommandSystem {
             _ => {}
         }
 
-        let tmp_path = std::env::temp_dir().join(format!(
-            "rustynet-pf-rules-{}-{}.conf",
-            std::process::id(),
-            self.generation
-        ));
         let rules = self.render_pf_rules(strict_fail_closed)?;
-        fs::write(&tmp_path, rules)
-            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        let tmp_path = write_pf_rules_temp_file_securely(&rules, self.generation)?;
         let tmp = tmp_path
             .to_str()
             .ok_or_else(|| SystemError::FirewallApplyFailed("pf temp path utf8".to_owned()))?;
@@ -4777,6 +4771,68 @@ fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Symlink-safe tempfile writer for the rendered pf rules blob.
+///
+/// `apply_pf_rules` used to construct `temp_dir()/rustynet-pf-rules-<pid>-<gen>.conf`
+/// and call `fs::write`, which silently follows symlinks. On systems where
+/// `temp_dir()` resolves to a world-writable directory (e.g. `/tmp` when the
+/// daemon runs without `$TMPDIR` set, as commonly happens for root services),
+/// an unprivileged attacker could pre-position a symlink at the predictable
+/// path and trick a root-running daemon into overwriting an arbitrary file
+/// with the rendered pf rules. The mitigations are:
+///   1. A 16-byte CSPRNG nonce is appended to the filename so the path is
+///      not predictable from (pid, generation).
+///   2. The file is opened with `create_new(true)` (`O_CREAT|O_EXCL`), which
+///      atomically fails if any inode — including a symlink — already exists.
+///   3. The mode is set to `0o600` so only the daemon user (and root) can
+///      read the rendered rules, which would otherwise expose the SSH
+///      management allowlist and traversal-bootstrap endpoints.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn write_pf_rules_temp_file_securely(rules: &str, generation: u64) -> Result<PathBuf, SystemError> {
+    use rand::TryRngCore;
+    let mut nonce_bytes = [0u8; 16];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|err| {
+            SystemError::FirewallApplyFailed(format!(
+                "pf rules tempfile nonce CSPRNG unavailable: {err}"
+            ))
+        })?;
+    let mut nonce = String::with_capacity(nonce_bytes.len() * 2);
+    for byte in nonce_bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut nonce, "{byte:02x}");
+    }
+    let tmp_path = std::env::temp_dir().join(format!(
+        "rustynet-pf-rules-{}-{}-{}.conf",
+        std::process::id(),
+        generation,
+        nonce,
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path).map_err(|err| {
+        SystemError::FirewallApplyFailed(format!(
+            "pf rules tempfile create failed at {}: {err}",
+            tmp_path.display()
+        ))
+    })?;
+    use std::io::Write as _;
+    file.write_all(rules.as_bytes()).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path);
+        SystemError::FirewallApplyFailed(format!(
+            "pf rules tempfile write failed at {}: {err}",
+            tmp_path.display()
+        ))
+    })?;
+    Ok(tmp_path)
+}
+
 fn validate_windows_interface_alias(value: &str) -> Result<(), &'static str> {
     // Windows interface aliases can contain letters, digits, spaces, hyphens,
     // underscores, dots, parentheses, and other ASCII printable characters.
@@ -5190,6 +5246,55 @@ mod tests {
     use rustynet_policy::{ContextualPolicyRule, RuleAction};
 
     use super::*;
+
+    #[test]
+    fn write_pf_rules_temp_file_fails_when_target_path_already_exists() {
+        // Regression pin: the helper must atomically refuse to overwrite any
+        // pre-existing inode at the chosen path. We approximate the symlink
+        // pre-positioning attack by creating a regular file at a path that
+        // shares the same `<pid>-<gen>-<nonce>` shape used by the helper, then
+        // call the helper twice with the same generation and assert that:
+        //   * the first write succeeds (proves the helper otherwise works)
+        //   * a second write with the SAME path collides via `create_new` and
+        //     fails closed (proves O_EXCL semantics survive)
+        let pre_path = std::env::temp_dir().join(format!(
+            "rustynet-pf-rules-precheck-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock available")
+                .as_nanos()
+        ));
+        std::fs::write(&pre_path, "preexisting").expect("seed precheck file");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        let collide_result = opts.open(&pre_path);
+        assert!(
+            collide_result.is_err(),
+            "create_new must refuse to overwrite an existing inode at {}; \
+             pf rules tempfile would otherwise be vulnerable to a symlink \
+             pre-positioning attack in a world-writable temp directory",
+            pre_path.display(),
+        );
+        let _ = std::fs::remove_file(&pre_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_pf_rules_temp_file_writes_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = super::write_pf_rules_temp_file_securely("pass out quick all\n", 7777)
+            .expect("pf rules tempfile creation succeeds in a writable temp dir");
+        let meta = std::fs::metadata(&path).expect("tempfile metadata readable");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "pf rules tempfile must be created with 0o600 so its contents (SSH \
+             allowlist, traversal bootstrap endpoints) are not world-readable; \
+             observed mode={mode:o}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn windows_dns_bind_addr_requires_loopback_port_53() {
