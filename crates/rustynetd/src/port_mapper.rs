@@ -1434,6 +1434,38 @@ pub fn build_soap_envelope(
     )
 }
 
+/// Sanitise an attacker-controlled string before embedding it in an
+/// error variant that may end up in operator logs.
+///
+/// Gateway-supplied fields (uPnP `errorDescription`, `errorCode`,
+/// `NewExternalIPAddress`, etc.) come from packets a hostile LAN
+/// device can send to us. Without sanitisation a malicious gateway
+/// could embed CR/LF to inject misleading lines into the daemon's
+/// log file, or terminal escape sequences to hijack the cursor of
+/// an operator tailing the log.
+///
+/// Policy: truncate to a fixed cap and replace every control
+/// character with a single `?` placeholder. The cap (200 bytes) is
+/// generous for legitimate error descriptions; nothing useful in a
+/// real uPnP fault is longer than this.
+fn sanitize_log_excerpt(input: &str) -> String {
+    const MAX_LEN: usize = 200;
+    let truncated = if input.len() > MAX_LEN {
+        // Truncate on a char boundary to keep `String::from_utf8` happy.
+        let mut end = MAX_LEN;
+        while !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        &input[..end]
+    } else {
+        input
+    };
+    truncated
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// XML-text escape — covers the five named entities required by XML 1.0
 /// for character data.
 fn xml_escape(s: &str) -> String {
@@ -1474,13 +1506,20 @@ pub fn parse_soap_response(response: &str) -> Result<&str, PortMapperError> {
     let body = &response[body_start..];
     if body.contains("<s:Fault") || body.contains("Fault>") {
         // Try to extract UPnPError/errorCode for a structured message.
-        let code = extract_inner_text(body, "errorCode")
+        // **Security**: both fields are attacker-controlled (a hostile
+        // LAN gateway can put any string here). Sanitise before
+        // embedding in an error variant that will end up in operator
+        // logs — without this, the gateway can inject CR/LF or
+        // terminal escapes that mislead anyone tailing the log.
+        let raw_code = extract_inner_text(body, "errorCode")
             .unwrap_or("unknown")
             .trim();
-        let description = extract_inner_text(body, "errorDescription")
+        let raw_description = extract_inner_text(body, "errorDescription")
             .unwrap_or("(no errorDescription)")
             .trim();
-        return Err(map_upnp_error_code(code, description));
+        let code = sanitize_log_excerpt(raw_code);
+        let description = sanitize_log_excerpt(raw_description);
+        return Err(map_upnp_error_code(&code, &description));
     }
     Ok(body)
 }
@@ -1661,7 +1700,12 @@ fn split_http_status_and_body(response: &str) -> Result<(u16, &str), PortMapperE
     let _version = parts.next();
     let code = parts.next().unwrap_or("0");
     let status = code.parse::<u16>().map_err(|e| {
-        PortMapperError::InvalidResponse(format!("could not parse HTTP status code {code}: {e}"))
+        // **Security**: `code` is gateway-controlled. Sanitise before
+        // logging via the error-string path.
+        PortMapperError::InvalidResponse(format!(
+            "could not parse HTTP status code {}: {e}",
+            sanitize_log_excerpt(code)
+        ))
     })?;
     Ok((status, body))
 }
@@ -2023,8 +2067,15 @@ impl UpnpIgdClient {
                     "GetExternalIPAddress response did not contain NewExternalIPAddress".to_owned(),
                 )
             })?;
+        // **Security**: `ip` is gateway-controlled (extracted from the
+        // SOAP response body). Sanitise before embedding in the error
+        // string so a hostile gateway cannot inject log content via
+        // a malformed `<NewExternalIPAddress>` value.
         ip.parse::<IpAddr>().map_err(|e| {
-            PortMapperError::InvalidResponse(format!("could not parse external IP {ip}: {e}"))
+            PortMapperError::InvalidResponse(format!(
+                "could not parse external IP {}: {e}",
+                sanitize_log_excerpt(ip)
+            ))
         })
     }
 }
@@ -3541,6 +3592,57 @@ destination: default
         assert!(
             !debug_string.contains("ab, ab, ab") && !debug_string.to_lowercase().contains("0xab"),
             "Debug output must NOT leak the nonce bytes; got: {debug_string}"
+        );
+    }
+
+    #[test]
+    fn sanitize_log_excerpt_replaces_control_chars_and_caps_length() {
+        // CR/LF mapped to `?` so a hostile gateway cannot inject log
+        // lines via SOAP fault descriptions.
+        let evil = "Bad\r\nFAKE: log line";
+        let clean = sanitize_log_excerpt(evil);
+        assert!(!clean.contains('\r'));
+        assert!(!clean.contains('\n'));
+        assert_eq!(clean, "Bad??FAKE: log line");
+
+        // Terminal escape sequence redacted.
+        let escape = "Hello\x1b[2JWorld";
+        let clean = sanitize_log_excerpt(escape);
+        assert!(!clean.contains('\x1b'));
+
+        // Length cap.
+        let huge = "x".repeat(1000);
+        let clean = sanitize_log_excerpt(&huge);
+        assert!(
+            clean.len() <= 200,
+            "sanitiser must cap length; got {}",
+            clean.len()
+        );
+
+        // ASCII printable passes through unchanged within the cap.
+        let plain = "OnlyPermanentLeasesSupported";
+        assert_eq!(sanitize_log_excerpt(plain), plain);
+    }
+
+    #[test]
+    fn upnp_soap_fault_with_injected_newlines_in_description_is_sanitised() {
+        // Pin: a hostile gateway response that embeds CR/LF in the
+        // SOAP `<errorDescription>` MUST NOT cause those characters
+        // to appear verbatim in the error message we propagate to
+        // operator logs.
+        let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/xml\r\n\r\n\
+            <?xml version=\"1.0\"?>\
+            <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+            <s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>\
+            <detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\">\
+            <errorCode>501</errorCode>\
+            <errorDescription>Boom\r\nFAKE: log line\x1b[2J</errorDescription>\
+            </UPnPError></detail></s:Fault></s:Body></s:Envelope>";
+        let err = parse_soap_response(resp).expect_err("fault should be surfaced");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains('\r') && !msg.contains('\n') && !msg.contains('\x1b'),
+            "sanitisation must strip CR/LF/ESC from gateway-controlled error description; got: {msg:?}"
         );
     }
 

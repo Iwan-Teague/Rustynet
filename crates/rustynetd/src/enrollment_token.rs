@@ -296,10 +296,19 @@ pub fn encode_token(token: &EnrollmentToken) -> String {
 
 /// Decode a URL-safe-base64 token back into its component fields.
 /// Pure parser — does not validate the HMAC tag or the expiry.
+///
+/// **Security**: the intermediate `Vec<u8>` from the base64 decode
+/// carries the HMAC tag (bearer credential). We wrap it in
+/// `Zeroizing<Vec<u8>>` so the buffer is wiped before its allocation
+/// returns to the heap allocator — otherwise the tag would briefly
+/// reside in heap-reused memory between the decode and the field
+/// copies completing.
 pub fn decode_token(encoded: &str) -> Result<EnrollmentToken, EnrollmentTokenError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded.trim())
-        .map_err(|e| EnrollmentTokenError::Malformed(format!("base64 decode: {e}")))?;
+    let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(encoded.trim())
+            .map_err(|e| EnrollmentTokenError::Malformed(format!("base64 decode: {e}")))?,
+    );
     if bytes.len() != TOKEN_BINARY_LEN {
         return Err(EnrollmentTokenError::Malformed(format!(
             "expected {TOKEN_BINARY_LEN} bytes after base64 decode, got {}",
