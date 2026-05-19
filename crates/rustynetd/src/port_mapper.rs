@@ -43,7 +43,6 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-use rand::RngCore;
 use subtle::ConstantTimeEq;
 
 /// Wire protocols a `MappingLease` can be granted over.
@@ -718,17 +717,21 @@ impl PcpClient {
     /// client SHOULD generate a unique, cryptographically random nonce"
     /// — predictable nonces would let off-path attackers issue
     /// `lifetime=0` deletes and tear down our mapping. Draw directly
-    /// from the kernel CSPRNG (`OsRng`); on the rare host where the
-    /// entropy pool is unavailable, fall back to the threaded RNG so
-    /// the daemon's bring-up still completes (the LAN-side attacker
-    /// surface for PCP is already very small).
-    fn fresh_nonce() -> [u8; PCP_NONCE_LEN] {
+    /// from the kernel CSPRNG (`OsRng`). Fail-closed (no ThreadRng
+    /// fallback) because ThreadRng also seeds from OsRng on first
+    /// use; a host where OsRng is unavailable would panic inside
+    /// ThreadRng anyway. Returning a typed error is the cleaner
+    /// shape — the caller surfaces an `Io` PortMapperError that
+    /// the daemon logs and the keepalive fallback covers.
+    fn fresh_nonce() -> Result<[u8; PCP_NONCE_LEN], PortMapperError> {
         use rand::TryRngCore;
         let mut nonce = [0u8; PCP_NONCE_LEN];
-        if rand::rngs::OsRng.try_fill_bytes(&mut nonce).is_err() {
-            rand::rng().fill_bytes(&mut nonce);
-        }
-        nonce
+        rand::rngs::OsRng.try_fill_bytes(&mut nonce).map_err(|e| {
+            PortMapperError::Io(format!(
+                "kernel CSPRNG (OsRng) refused entropy for PCP Mapping Nonce: {e}"
+            ))
+        })?;
+        Ok(nonce)
     }
 
     /// Encode a MAP request (60 bytes total).
@@ -982,7 +985,7 @@ impl PortMapper for PcpClient {
             ));
         }
         let client_ip = self.discover_local_addr()?;
-        let nonce = Self::fresh_nonce();
+        let nonce = Self::fresh_nonce()?;
         // Suggested external IP = all zeros — per RFC 6887 §11.1 this
         // means "any address" and tells the gateway to pick whatever
         // external IP it controls. We rely on STUN (D2) for the
