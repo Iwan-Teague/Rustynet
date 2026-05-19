@@ -294,19 +294,40 @@ pub fn encode_token(token: &EnrollmentToken) -> String {
     URL_SAFE_NO_PAD.encode(&buf)
 }
 
+/// Pre-decode length cap on the URL-safe-base64 token string. A
+/// valid token is exactly `TOKEN_BINARY_LEN` (64) bytes, which
+/// base64-no-pad encodes to `ceil(64 * 4 / 3) = 86` ASCII chars.
+/// We add a small slack (the operator might paste with leading/
+/// trailing whitespace) and reject anything substantially larger
+/// without spending memory on the decode. Stops a hostile peer
+/// from forcing us to allocate ~750 KB of plaintext for a 1 MB
+/// junk input.
+const MAX_ENCODED_TOKEN_LEN: usize = 128;
+
 /// Decode a URL-safe-base64 token back into its component fields.
 /// Pure parser — does not validate the HMAC tag or the expiry.
 ///
-/// **Security**: the intermediate `Vec<u8>` from the base64 decode
-/// carries the HMAC tag (bearer credential). We wrap it in
-/// `Zeroizing<Vec<u8>>` so the buffer is wiped before its allocation
-/// returns to the heap allocator — otherwise the tag would briefly
-/// reside in heap-reused memory between the decode and the field
-/// copies completing.
+/// **Security**:
+/// * Rejects inputs longer than [`MAX_ENCODED_TOKEN_LEN`] BEFORE
+///   the base64 decode allocates, so a 1 MB hostile input fails
+///   in O(1) rather than O(input_len).
+/// * The intermediate `Vec<u8>` from the base64 decode carries the
+///   HMAC tag (bearer credential). We wrap it in
+///   `Zeroizing<Vec<u8>>` so the buffer is wiped before its
+///   allocation returns to the heap allocator — otherwise the tag
+///   would briefly reside in heap-reused memory between the decode
+///   and the field copies completing.
 pub fn decode_token(encoded: &str) -> Result<EnrollmentToken, EnrollmentTokenError> {
+    let trimmed = encoded.trim();
+    if trimmed.len() > MAX_ENCODED_TOKEN_LEN {
+        return Err(EnrollmentTokenError::Malformed(format!(
+            "encoded token exceeds {MAX_ENCODED_TOKEN_LEN}-byte cap ({} bytes); refusing to decode",
+            trimmed.len()
+        )));
+    }
     let bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
         URL_SAFE_NO_PAD
-            .decode(encoded.trim())
+            .decode(trimmed)
             .map_err(|e| EnrollmentTokenError::Malformed(format!("base64 decode: {e}")))?,
     );
     if bytes.len() != TOKEN_BINARY_LEN {
@@ -616,6 +637,30 @@ mod tests {
         // Idempotent: recording twice doesn't break the count.
         ledger.record_consumed(id);
         assert_eq!(ledger.consumed_count(), 1);
+    }
+
+    #[test]
+    fn decode_token_rejects_oversized_input_before_decoding() {
+        // Security pin: a hostile peer can hand the daemon a huge
+        // base64-shaped blob (e.g. 1 MB of A's). Without the
+        // pre-decode length cap, base64 decoding would allocate
+        // ~750 KB before the length check fires. The cap rejects
+        // the input in O(1) instead.
+        let secret = deterministic_secret(99);
+        let mut ledger = ConsumedTokenLedger::new();
+        let one_megabyte = "A".repeat(1_000_000);
+        let err =
+            verify_and_consume_token_with_now(&one_megabyte, &secret, &mut ledger, 1_700_000_000)
+                .expect_err("oversized input must be rejected without full decode");
+        match err {
+            EnrollmentTokenError::Malformed(msg) => {
+                assert!(
+                    msg.contains("cap") || msg.contains("byte"),
+                    "diagnostic should mention the cap/byte limit; got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed (oversize), got: {other:?}"),
+        }
     }
 
     #[test]
