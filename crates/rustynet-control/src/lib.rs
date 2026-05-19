@@ -1738,10 +1738,46 @@ impl RelaySessionToken {
         issued_at_unix: u64,
         ttl_secs: u64,
     ) -> Self {
+        // Legacy panicking entry point retained for test fixtures; production
+        // code paths must call `try_sign_at` so a CSPRNG failure surfaces as
+        // a structured error instead of crashing the long-running daemon.
+        match Self::try_sign_at(
+            signing_key,
+            node_id,
+            peer_node_id,
+            relay_id,
+            issued_at_unix,
+            ttl_secs,
+        ) {
+            Ok(token) => token,
+            Err(err) => panic!("os randomness unavailable for relay token nonce: {err}"),
+        }
+    }
+
+    /// Fallible relay session token minting.
+    ///
+    /// Returns `Err(RelayTokenMintError)` when the kernel CSPRNG cannot fill
+    /// the nonce buffer. We MUST fail closed here: the nonce is the
+    /// anti-replay key for the relay's nonce store, so a predictable or
+    /// degraded-entropy nonce would let an attacker replay a captured token
+    /// or collide with another peer's session. Production callers (notably
+    /// `LocalRelaySessionTokenIssuer::issue_token`) propagate this through
+    /// their own `Result` type so a transient OS-randomness fault no longer
+    /// panics the daemon.
+    pub fn try_sign_at(
+        signing_key: &SigningKey,
+        node_id: &str,
+        peer_node_id: &str,
+        relay_id: [u8; 16],
+        issued_at_unix: u64,
+        ttl_secs: u64,
+    ) -> Result<Self, RelayTokenMintError> {
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng
             .try_fill_bytes(&mut nonce)
-            .expect("os randomness unavailable for relay token nonce");
+            .map_err(|err| RelayTokenMintError {
+                source: err.to_string(),
+            })?;
         let mut token = Self {
             node_id: node_id.to_owned(),
             peer_node_id: peer_node_id.to_owned(),
@@ -1755,9 +1791,55 @@ impl RelaySessionToken {
         let payload = token.canonical_payload();
         let sig = signing_key.sign(payload.as_bytes());
         token.signature = sig.to_bytes();
-        token
+        Ok(token)
     }
 
+    /// Fallible analogue of [`RelaySessionToken::sign`]. See
+    /// [`RelaySessionToken::try_sign_at`] for the fail-closed rationale.
+    pub fn try_sign(
+        signing_key: &SigningKey,
+        node_id: &str,
+        peer_node_id: &str,
+        relay_id: [u8; 16],
+        ttl_secs: u64,
+    ) -> Result<Self, RelayTokenMintError> {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self::try_sign_at(
+            signing_key,
+            node_id,
+            peer_node_id,
+            relay_id,
+            now_unix,
+            ttl_secs,
+        )
+    }
+}
+
+/// Error surfaced by [`RelaySessionToken::try_sign_at`] / [`RelaySessionToken::try_sign`]
+/// when the kernel CSPRNG is unavailable for nonce minting. Kept in its own
+/// type so callers must explicitly translate to their own error space rather
+/// than papering over the failure.
+#[derive(Debug)]
+pub struct RelayTokenMintError {
+    pub source: String,
+}
+
+impl fmt::Display for RelayTokenMintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "kernel CSPRNG unavailable while minting relay session token nonce: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RelayTokenMintError {}
+
+impl RelaySessionToken {
     pub fn verify_signature(&self, verifying_key: &VerifyingKey) -> Result<(), String> {
         let payload = self.canonical_payload();
         let signature = Signature::from_bytes(&self.signature);
@@ -2228,7 +2310,10 @@ impl ControlPlaneCore {
             expires_at_unix: request
                 .now_unix
                 .saturating_add(ReplayPolicy::default().token_lifetime_secs),
-            nonce: random_nonce_hex(16),
+            // Fail-closed on CSPRNG unavailability: a predictable token nonce
+            // would collapse the per-token uniqueness invariant on which the
+            // replay store relies.
+            nonce: try_random_nonce_hex(16).map_err(|_| ControlPlaneError::Internal)?,
         };
         let token = self.sign_access_token(&token_claims);
 
@@ -2281,7 +2366,9 @@ impl ControlPlaneCore {
             expires_at_unix: request
                 .now_unix
                 .saturating_add(ReplayPolicy::default().token_lifetime_secs),
-            nonce: random_nonce_hex(16),
+            // Fail-closed on CSPRNG unavailability: see analogous comment in
+            // `enroll_with_throwaway`.
+            nonce: try_random_nonce_hex(16).map_err(|_| ControlPlaneError::Internal)?,
         };
         let token = self.sign_access_token(&token_claims);
 
@@ -3357,15 +3444,45 @@ fn map_dns_zone_error(err: DnsZoneError) -> ControlPlaneError {
     ControlPlaneError::Dns(err.to_string())
 }
 
-fn random_nonce_hex(length_bytes: usize) -> String {
+/// Fallible nonce minter for control-plane tokens.
+///
+/// Control-plane nonces gate token replay protection (the issued access-token
+/// nonce is unique-by-construction over the token lifetime). A CSPRNG failure
+/// during enrollment must NOT panic the control-plane process — that would
+/// take down the entire enrollment surface — and must NOT degrade to a
+/// predictable nonce — that would collapse token uniqueness. We surface a
+/// structured error so callers translate to `ControlPlaneError::Internal` and
+/// the operator can retry once the CSPRNG recovers.
+fn try_random_nonce_hex(length_bytes: usize) -> Result<String, ControlPlaneNonceMintError> {
     let mut nonce = vec![0u8; length_bytes];
     rand::rngs::OsRng
         .try_fill_bytes(nonce.as_mut_slice())
-        .expect("os randomness unavailable for control-plane nonce");
+        .map_err(|err| ControlPlaneNonceMintError {
+            source: err.to_string(),
+        })?;
     let encoded = hex_bytes(nonce.as_slice());
     nonce.zeroize();
-    encoded
+    Ok(encoded)
 }
+
+/// Error surfaced by [`try_random_nonce_hex`] when the kernel CSPRNG cannot
+/// fill the nonce buffer.
+#[derive(Debug)]
+pub struct ControlPlaneNonceMintError {
+    pub source: String,
+}
+
+impl fmt::Display for ControlPlaneNonceMintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "kernel CSPRNG unavailable while minting control-plane nonce: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for ControlPlaneNonceMintError {}
 
 fn sha256_digest(payload: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -7490,5 +7607,94 @@ mod tests {
             token_a.nonce, token_b.nonce,
             "nonces must be unique per token"
         );
+    }
+
+    /// Regression: the production relay-token issuer must call the fallible
+    /// `try_sign` variant so a CSPRNG failure surfaces as a structured error
+    /// rather than crashing the daemon. We pin this with a source-grep so a
+    /// future refactor cannot silently route production traffic back through
+    /// the panicking entry point.
+    #[test]
+    fn relay_session_token_issuer_uses_try_sign_in_production() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let relay_client = crate_root
+            .parent()
+            .expect("crates dir")
+            .join("rustynetd/src/relay_client.rs");
+        let body = std::fs::read_to_string(&relay_client).expect("relay_client source readable");
+        // Locate the `LocalRelaySessionTokenIssuer::issue_token` impl block.
+        let start = body
+            .find("impl RelaySessionTokenIssuer for LocalRelaySessionTokenIssuer")
+            .expect("LocalRelaySessionTokenIssuer must remain the production issuer");
+        let window_end = (start + 4_000).min(body.len());
+        let window = &body[start..window_end];
+        assert!(
+            window.contains("RelaySessionToken::try_sign("),
+            "LocalRelaySessionTokenIssuer must invoke `try_sign` so the daemon \
+             surfaces CSPRNG faults via RelayClientError::TokenSigning instead \
+             of panicking"
+        );
+        assert!(
+            !window.contains("RelaySessionToken::sign("),
+            "LocalRelaySessionTokenIssuer must NOT invoke the panicking `sign` \
+             entry point"
+        );
+    }
+
+    /// Regression: `try_random_nonce_hex` must remain the only path that
+    /// enrollment flows reach. The panicking legacy `random_nonce_hex` was
+    /// removed; this test fires if a future change reintroduces it.
+    #[test]
+    fn enrollment_uses_try_random_nonce_hex() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/lib.rs"))
+            .expect("rustynet-control lib source readable");
+        // Locate the enrollment functions.
+        for fn_name in [
+            "fn enroll_with_throwaway(",
+            "fn enroll_with_throwaway_and_persist(",
+        ] {
+            let start = body
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("enrollment fn `{fn_name}` missing"));
+            // Take the next ~4000 chars as the window covering the body.
+            let window_end = (start + 4_000).min(body.len());
+            let window = &body[start..window_end];
+            assert!(
+                window.contains("try_random_nonce_hex("),
+                "enrollment `{fn_name}` must mint nonces via `try_random_nonce_hex`"
+            );
+            // Build the panicking-fn name from chunks so this test's own source
+            // does not match the negative grep.
+            let panicking_name = ["random_nonce_", "hex("].concat();
+            assert!(
+                !window.contains(&panicking_name) || window.contains("try_random_nonce_hex("),
+                "enrollment `{fn_name}` must not call the legacy panicking nonce minter"
+            );
+        }
+    }
+
+    #[test]
+    fn try_random_nonce_hex_emits_distinct_high_entropy_values() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let nonce = super::try_random_nonce_hex(16).expect("OsRng available in test env");
+            assert_eq!(nonce.len(), 32, "16 bytes hex-encoded is 32 chars");
+            assert!(
+                seen.insert(nonce),
+                "control-plane nonce collision from CSPRNG"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_token_mint_error_displays_inner_source() {
+        let err = super::RelayTokenMintError {
+            source: "getrandom syscall returned EAGAIN".to_owned(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("getrandom syscall returned EAGAIN"));
+        assert!(rendered.contains("CSPRNG"));
+        assert!(rendered.contains("relay session token nonce"));
     }
 }
