@@ -1705,10 +1705,21 @@ impl RelaySessionToken {
         relay_id: [u8; 16],
         ttl_secs: u64,
     ) -> Self {
+        // **Security**: previously used `.expect(...)` which would
+        // panic the daemon on a pre-UNIX_EPOCH clock (broken RTC,
+        // misconfigured NTP, operator-run clock rollback). Now
+        // returns 0 on failure. The resulting token has
+        // `issued_at = 0, expires_at = ttl_secs`, which a relay with
+        // a healthy clock will reject as already-expired (it sees
+        // `expires_at < now`) — fail-closed against the relay
+        // accepting bogus tokens. If both client and relay have a
+        // failed clock the token is honoured for at most
+        // `MAX_RELAY_TTL_SECS` seconds, which is the operator-
+        // configured cap on relay-session lifetime.
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock must be after UNIX_EPOCH")
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         Self::sign_at(
             signing_key,
             node_id,
