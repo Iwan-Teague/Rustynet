@@ -241,6 +241,15 @@ const RELAY_FLEET_WATERMARK_PATH_ENV: &str = "RUSTYNET_RELAY_FLEET_WATERMARK_PAT
 /// path, but production deployments must set it via the systemd
 /// unit file).
 pub(crate) const GOSSIP_WATERMARK_PATH_ENV: &str = "RUSTYNET_GOSSIP_WATERMARK";
+/// D2.7 — env var matching the `--enrollment-secret` CLI flag. The
+/// daemon loads a 32-byte HMAC secret from this path at bootstrap
+/// (with strict-permissions verification). Both this and
+/// `RUSTYNET_ENROLLMENT_LEDGER` must be set together; setting one
+/// without the other surfaces as a typed config error in the
+/// daemon's IPC handler when `enrollment consume` is invoked.
+pub(crate) const ENROLLMENT_SECRET_PATH_ENV: &str = "RUSTYNET_ENROLLMENT_SECRET";
+/// D2.7 — env var matching the `--enrollment-ledger` CLI flag.
+pub(crate) const ENROLLMENT_LEDGER_PATH_ENV: &str = "RUSTYNET_ENROLLMENT_LEDGER";
 #[cfg(not(windows))]
 pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone";
 #[cfg(windows)]
@@ -1044,6 +1053,16 @@ pub struct DaemonConfig {
     /// production daemons set this via `--gossip-watermark` or
     /// `RUSTYNET_GOSSIP_WATERMARK`.
     pub gossip_watermark_path: Option<PathBuf>,
+    /// D2.7: file holding the 32-byte HMAC enrollment secret. The
+    /// daemon mints + verifies tokens against this key. `None`
+    /// disables enrollment-token IPC verbs (a daemon launched
+    /// without it will reject `enrollment consume` with a typed
+    /// "not configured" error).
+    pub enrollment_secret_path: Option<PathBuf>,
+    /// D2.7: per-host spool for the consumed-token ledger. Required
+    /// when `enrollment_secret_path` is set so single-use semantics
+    /// survive daemon restarts.
+    pub enrollment_ledger_path: Option<PathBuf>,
     pub auto_tunnel_enforce: bool,
     pub auto_tunnel_bundle_path: Option<PathBuf>,
     pub auto_tunnel_verifier_key_path: Option<PathBuf>,
@@ -1120,6 +1139,8 @@ impl Default for DaemonConfig {
             membership_log_path: PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH),
             membership_watermark_path: PathBuf::from(DEFAULT_MEMBERSHIP_WATERMARK_PATH),
             gossip_watermark_path: std::env::var_os(GOSSIP_WATERMARK_PATH_ENV).map(PathBuf::from),
+            enrollment_secret_path: std::env::var_os(ENROLLMENT_SECRET_PATH_ENV).map(PathBuf::from),
+            enrollment_ledger_path: std::env::var_os(ENROLLMENT_LEDGER_PATH_ENV).map(PathBuf::from),
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_BUNDLE_PATH)),
             auto_tunnel_verifier_key_path: Some(PathBuf::from(
@@ -2781,6 +2802,11 @@ struct DaemonRuntime {
     next_gossip_mint_at: Option<Instant>,
     gossip_node: Option<crate::gossip_runtime::GossipNode>,
     gossip_transport: Option<crate::gossip_transport::GossipTransport>,
+    /// D2.7 — paths into which the enrollment-token IPC handler
+    /// reads the HMAC secret and writes the consumed-token ledger.
+    /// `None` disables the `enrollment consume` verb entirely.
+    enrollment_secret_path: Option<PathBuf>,
+    enrollment_ledger_path: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3128,6 +3154,8 @@ impl DaemonRuntime {
             // fail-closed defaults.
             gossip_node: None,
             gossip_transport: None,
+            enrollment_secret_path: config.enrollment_secret_path.clone(),
+            enrollment_ledger_path: config.enrollment_ledger_path.clone(),
         })
     }
 
@@ -6260,6 +6288,14 @@ impl DaemonRuntime {
                     Err(err) => IpcResponse::err(err),
                 }
             }
+            IpcCommand::EnrollmentConsume {
+                token,
+                pubkey_b64,
+                push_addr,
+            } => match self.handle_enrollment_consume(&token, &pubkey_b64, &push_addr) {
+                Ok(summary) => IpcResponse::ok(summary),
+                Err(err) => IpcResponse::err(err),
+            },
             IpcCommand::Unknown(raw) => IpcResponse::err(format!("unknown command: {raw}")),
         }
     }
@@ -6390,6 +6426,93 @@ impl DaemonRuntime {
             )),
             Err(other) => Err(format!("gossip ingest failed: {other}")),
         }
+    }
+
+    /// D2.7 — IPC entry point for the operator-driven enrollment
+    /// consume flow. Decodes the three-token wire payload, runs the
+    /// [`crate::enrollment_consume::consume_and_register_peer`]
+    /// orchestrator under `PushAddressPolicy::Strict`, and reports a
+    /// fixed-vocabulary summary on success. Every reject maps to a
+    /// fixed error string so a non-operator caller cannot extract
+    /// per-step state (which check failed, drift secs, etc.).
+    fn handle_enrollment_consume(
+        &mut self,
+        encoded_token: &str,
+        pubkey_b64: &str,
+        push_addr_str: &str,
+    ) -> Result<String, String> {
+        use base64::Engine;
+        let secret_path = self
+            .enrollment_secret_path
+            .as_deref()
+            .ok_or_else(|| "enrollment subsystem not configured (no secret path)".to_owned())?;
+        let ledger_path = self
+            .enrollment_ledger_path
+            .as_deref()
+            .ok_or_else(|| "enrollment subsystem not configured (no ledger path)".to_owned())?;
+        let node = self
+            .gossip_node
+            .as_mut()
+            .ok_or_else(|| "gossip subsystem not attached".to_owned())?;
+        let secret = crate::enrollment_token::load_secret(secret_path)
+            .map_err(|err| format!("enrollment secret load failed: {err}"))?;
+        let mut ledger = crate::enrollment_token::load_ledger(ledger_path)
+            .map_err(|err| format!("enrollment ledger load failed: {err}"))?;
+        // Decode the enrollee's 32-byte verifying key. Reject any
+        // input that isn't exactly 32 bytes after base64 decode.
+        let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(pubkey_b64.as_bytes())
+            .map_err(|_| "enrollee pubkey base64 decode failed".to_owned())?;
+        if pubkey_bytes.len() != 32 {
+            return Err(format!(
+                "enrollee pubkey must be 32 bytes after base64 decode (got {})",
+                pubkey_bytes.len()
+            ));
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&pubkey_bytes);
+        let enrollee_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+            .map_err(|_| "enrollee pubkey is not a valid Ed25519 verifying key".to_owned())?;
+        let push_addr: SocketAddr = push_addr_str
+            .parse()
+            .map_err(|err| format!("enrollee push address parse failed: {err}"))?;
+        let outcome = crate::enrollment_consume::consume_and_register_peer(
+            encoded_token,
+            &secret,
+            &mut ledger,
+            Some(ledger_path),
+            enrollee_pubkey,
+            push_addr,
+            node,
+            crate::enrollment_consume::PushAddressPolicy::Strict,
+        )
+        .map_err(|err| match err {
+            crate::enrollment_consume::ConsumeError::Token(_) => {
+                "enrollment token rejected".to_owned()
+            }
+            crate::enrollment_consume::ConsumeError::LedgerWriteFailed(_) => {
+                "enrollment ledger persistence failed".to_owned()
+            }
+            crate::enrollment_consume::ConsumeError::UnreachablePushAddress(_) => {
+                "enrollment push address scope rejected".to_owned()
+            }
+        })?;
+        // Mirror the canonical state back so any subsequent IPC
+        // call sees the updated peer table.
+        self.gossip_sequence = node.gossip_sequence;
+        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
+        // 8-byte hex prefix of the enrollee's node id — fixed-vocab
+        // identifier, no PII.
+        let prefix: String = outcome
+            .enrollee_node_id
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Ok(format!(
+            "enrollment accepted node={prefix} expires_at_unix={}",
+            outcome.token_expires_at_unix
+        ))
     }
 
     fn rotate_local_key_material(&mut self) -> Result<String, String> {
@@ -16907,6 +17030,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -17946,6 +18071,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18147,6 +18274,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18313,6 +18442,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18467,6 +18598,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18616,6 +18749,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18766,6 +18901,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18926,6 +19063,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19031,6 +19170,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19183,6 +19324,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19356,6 +19499,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19466,6 +19611,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19564,6 +19711,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19700,6 +19849,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19828,6 +19979,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19914,6 +20067,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20061,6 +20216,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20145,6 +20302,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20262,6 +20421,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20615,6 +20776,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             traversal_bundle_path: traversal_bundle_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
             traversal_watermark_path: traversal_watermark_path.clone(),
@@ -20667,6 +20830,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             traversal_bundle_path: traversal_bundle_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
             traversal_watermark_path: traversal_watermark_path.clone(),
@@ -20750,6 +20915,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20832,6 +20999,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20933,6 +21102,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
             traversal_watermark_path: traversal_watermark_path.clone(),
@@ -20997,6 +21168,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
@@ -22196,6 +22369,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             node_role: NodeRole::Client,
@@ -22255,6 +22430,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             node_role: NodeRole::Client,
@@ -22305,6 +22482,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             node_role: NodeRole::BlindExit,
@@ -22397,6 +22576,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22506,6 +22687,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -22551,6 +22734,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
@@ -22607,6 +22792,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -22675,6 +22862,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22764,6 +22953,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22856,6 +23047,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22959,6 +23152,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -23034,6 +23229,8 @@ mod tests {
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
             gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),

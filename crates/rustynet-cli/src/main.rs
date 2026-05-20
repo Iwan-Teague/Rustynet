@@ -123,6 +123,12 @@ enum CliCommand {
     KeyRevoke,
     Assignment(Box<AssignmentCommand>),
     Membership(Box<MembershipCommand>),
+    /// D2.7 — enrollment-token operator surface: `rustynet
+    /// enrollment {mint, verify, consume}`. Mint and Verify run
+    /// locally against a secret file the operator owns; Consume
+    /// goes through the daemon IPC socket because it mutates the
+    /// daemon's gossip routing table.
+    Enrollment(Box<EnrollmentCliCommand>),
     Trust(Box<TrustCommand>),
     Ops(Box<OpsCommand>),
     Node(NodeCommand),
@@ -295,6 +301,38 @@ enum MembershipCommand {
         now_unix: u64,
         output_dir: PathBuf,
         environment: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollmentCliCommand {
+    /// `rustynet enrollment mint --secret <path> --ttl <secs>
+    /// [--output <path>]` — generates a fresh URL-safe-base64 token
+    /// under the daemon's HMAC secret. Prints to stdout (or writes
+    /// to `--output`).
+    Mint {
+        secret_path: PathBuf,
+        ttl_secs: u64,
+        output_path: Option<PathBuf>,
+    },
+    /// `rustynet enrollment verify --secret <path> [--ledger
+    /// <path>] --token <encoded>` — non-mutating sanity check.
+    /// Reports `valid` + remaining seconds, or a typed reject.
+    /// When `--ledger` is supplied the report includes whether the
+    /// token has already been redeemed.
+    Verify {
+        secret_path: PathBuf,
+        ledger_path: Option<PathBuf>,
+        token: String,
+    },
+    /// `rustynet enrollment consume --token <encoded> --pubkey
+    /// <b64> --push-addr <ip:port>` — sends the IPC `enrollment
+    /// consume` verb to the running daemon. The daemon loads the
+    /// secret + ledger from its configured paths.
+    Consume {
+        token: String,
+        pubkey_b64: String,
+        push_addr: String,
     },
 }
 
@@ -1381,6 +1419,10 @@ fn parse_command(args: &[String]) -> CliCommand {
         },
         [cmd, rest @ ..] if cmd == "membership" => match parse_membership_command(rest) {
             Ok(command) => CliCommand::Membership(Box::new(command)),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "enrollment" => match parse_enrollment_command(rest) {
+            Ok(command) => CliCommand::Enrollment(Box::new(command)),
             Err(_) => CliCommand::Help,
         },
         [cmd, rest @ ..] if cmd == "trust" => match parse_trust_command(rest) {
@@ -4061,6 +4103,63 @@ fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String
     }
 }
 
+fn parse_enrollment_command(args: &[String]) -> Result<EnrollmentCliCommand, String> {
+    if args.is_empty() {
+        return Err("enrollment subcommand is required".to_owned());
+    }
+    let subcommand = args[0].as_str();
+    let parser = OptionParser::parse(&args[1..])?;
+    match subcommand {
+        "mint" => {
+            let secret = parser
+                .required("--secret")
+                .map_err(|_| "--secret <path> is required".to_owned())?;
+            let ttl_secs = parser
+                .required("--ttl")
+                .map_err(|_| "--ttl <secs> is required".to_owned())?
+                .parse::<u64>()
+                .map_err(|_| "--ttl must be a non-negative integer".to_owned())?;
+            let output_path = parser.optional_path("--output");
+            Ok(EnrollmentCliCommand::Mint {
+                secret_path: PathBuf::from(secret),
+                ttl_secs,
+                output_path,
+            })
+        }
+        "verify" => {
+            let secret = parser
+                .required("--secret")
+                .map_err(|_| "--secret <path> is required".to_owned())?;
+            let token = parser
+                .required("--token")
+                .map_err(|_| "--token <encoded> is required".to_owned())?;
+            let ledger_path = parser.optional_path("--ledger");
+            Ok(EnrollmentCliCommand::Verify {
+                secret_path: PathBuf::from(secret),
+                ledger_path,
+                token,
+            })
+        }
+        "consume" => {
+            let token = parser
+                .required("--token")
+                .map_err(|_| "--token <encoded> is required".to_owned())?;
+            let pubkey_b64 = parser
+                .required("--pubkey")
+                .map_err(|_| "--pubkey <b64> is required".to_owned())?;
+            let push_addr = parser
+                .required("--push-addr")
+                .map_err(|_| "--push-addr <ip:port> is required".to_owned())?;
+            Ok(EnrollmentCliCommand::Consume {
+                token,
+                pubkey_b64,
+                push_addr,
+            })
+        }
+        _ => Err(format!("unknown enrollment subcommand: {subcommand}")),
+    }
+}
+
 fn parse_trust_command(args: &[String]) -> Result<TrustCommand, String> {
     if args.is_empty() {
         return Err("trust subcommand is required".to_owned());
@@ -4312,6 +4411,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Traversal(command) => execute_traversal(*command),
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
+        CliCommand::Enrollment(command) => execute_enrollment(*command),
         CliCommand::Trust(command) => execute_trust(*command),
         CliCommand::Ops(command) => execute_ops(*command),
         CliCommand::Node(command) => execute_node(command),
@@ -4983,6 +5083,76 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             output_dir,
             environment,
         } => emit_membership_evidence(paths, now_unix, output_dir, environment),
+    }
+}
+
+fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
+    use rustynetd::enrollment_token::{inspect_token, load_ledger, load_secret, mint_token};
+    match command {
+        EnrollmentCliCommand::Mint {
+            secret_path,
+            ttl_secs,
+            output_path,
+        } => {
+            let secret = load_secret(&secret_path).map_err(|err| err.to_string())?;
+            let (_token, encoded) = mint_token(&secret, ttl_secs).map_err(|err| err.to_string())?;
+            if let Some(path) = output_path {
+                std::fs::write(&path, format!("{encoded}\n")).map_err(|err| err.to_string())?;
+                Ok(format!("enrollment token written to {}", path.display()))
+            } else {
+                // Print the token alone (no extra prose) so it can be
+                // captured cleanly into a variable or QR code.
+                Ok(encoded)
+            }
+        }
+        EnrollmentCliCommand::Verify {
+            secret_path,
+            ledger_path,
+            token,
+        } => {
+            let secret = load_secret(&secret_path).map_err(|err| err.to_string())?;
+            let ledger = match ledger_path.as_deref() {
+                Some(path) => load_ledger(path).map_err(|err| err.to_string())?,
+                None => rustynetd::enrollment_token::ConsumedTokenLedger::new(),
+            };
+            let inspect = inspect_token(&token, &secret, &ledger).map_err(|err| err.to_string())?;
+            // Stable, machine-friendly verify output: one space-
+            // separated key=value line. The operator can grep for
+            // `valid=true` / `valid=false` without parsing prose.
+            let valid_flag = !inspect.already_consumed;
+            Ok(format!(
+                "valid={valid_flag} issued_at_unix={} expires_at_unix={} remaining_secs={} already_consumed={}",
+                inspect.issued_at_unix,
+                inspect.expires_at_unix,
+                inspect.remaining_secs,
+                inspect.already_consumed,
+            ))
+        }
+        EnrollmentCliCommand::Consume {
+            token,
+            pubkey_b64,
+            push_addr,
+        } => {
+            // Consume requires the daemon's enrollment secret +
+            // ledger paths and the running daemon's gossip
+            // subsystem, so it goes through IPC. The daemon-side
+            // handler maps every per-step reject to a fixed-
+            // vocabulary error string.
+            match send_command(IpcCommand::EnrollmentConsume {
+                token,
+                pubkey_b64,
+                push_addr,
+            }) {
+                Ok(response) => {
+                    if response.ok {
+                        Ok(response.message)
+                    } else {
+                        Err(response.message)
+                    }
+                }
+                Err(err) => Err(format!("daemon unreachable: {err}")),
+            }
+        }
     }
 }
 
@@ -13063,6 +13233,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::Traversal(_)
         | CliCommand::Assignment(_)
         | CliCommand::Membership(_)
+        | CliCommand::Enrollment(_)
         | CliCommand::Trust(_)
         | CliCommand::Ops(_)
         | CliCommand::Node(_)

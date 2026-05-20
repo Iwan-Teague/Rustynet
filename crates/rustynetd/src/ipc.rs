@@ -60,6 +60,18 @@ pub enum IpcCommand {
     PushGossipBundle {
         wire_bytes: Vec<u8>,
     },
+    /// D2.7 enrollment-token consume entry point. The operator passes
+    /// the token (URL-safe base64), the enrollee's Ed25519 verifying
+    /// key (URL-safe base64 of 32 bytes), and the enrollee's gossip
+    /// push address (`ip:port`). The daemon runs
+    /// `enrollment_consume::consume_and_register_peer` under
+    /// `PushAddressPolicy::Strict`, persists the ledger, and
+    /// registers the enrollee in the gossip subsystem.
+    EnrollmentConsume {
+        token: String,
+        pubkey_b64: String,
+        push_addr: String,
+    },
     Unknown(String),
 }
 
@@ -76,6 +88,7 @@ impl IpcCommand {
                 | IpcCommand::KeyRotate
                 | IpcCommand::KeyRevoke
                 | IpcCommand::PushGossipBundle { .. }
+                | IpcCommand::EnrollmentConsume { .. }
         )
     }
 
@@ -99,6 +112,11 @@ impl IpcCommand {
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wire_bytes)
                 )
             }
+            IpcCommand::EnrollmentConsume {
+                token,
+                pubkey_b64,
+                push_addr,
+            } => format!("enrollment consume {token} {pubkey_b64} {push_addr}"),
             IpcCommand::Unknown(raw) => raw.clone(),
         }
     }
@@ -163,6 +181,22 @@ pub fn parse_command(raw: &str) -> IpcCommand {
         }
         [cmd, subcmd] if cmd == "key" && subcmd == "rotate" => IpcCommand::KeyRotate,
         [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => IpcCommand::KeyRevoke,
+        [cmd, subcmd, token, pubkey_b64, push_addr]
+            if cmd == "enrollment" && subcmd == "consume" =>
+        {
+            // D2.7 — `enrollment consume <token> <pubkey-b64> <addr:port>`.
+            // The token, pubkey, and address are all bytes/text the
+            // operator paste-edits; the daemon-side handler validates
+            // each individually before mutating any state. We
+            // intentionally do NOT pre-validate them here so a
+            // malformed input surfaces as a typed daemon-side error
+            // rather than a generic Unknown dispatch.
+            IpcCommand::EnrollmentConsume {
+                token: token.clone(),
+                pubkey_b64: pubkey_b64.clone(),
+                push_addr: push_addr.clone(),
+            }
+        }
         [cmd, subcmd, payload_b64] if cmd == "gossip" && subcmd == "push" => {
             // D2.5: the third token is the URL-safe-base64-no-pad
             // encoding of a serialised GossipBundle. The bundle
@@ -402,6 +436,38 @@ mod tests {
                 assert_eq!(wire_bytes, bundle_bytes);
             }
             other => panic!("expected PushGossipBundle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_and_wire_round_trips_enrollment_consume() {
+        // D2.7 wire-form pin: the verb must round-trip a 3-token
+        // payload (token, pubkey-b64, push-addr) exactly. Any
+        // future re-ordering or whitespace mishandling would break
+        // the CLI ↔ daemon contract.
+        let cmd = IpcCommand::EnrollmentConsume {
+            token: "abcDEF123-_".to_owned(),
+            pubkey_b64: "uvwXYZ456__".to_owned(),
+            push_addr: "10.0.0.5:51821".to_owned(),
+        };
+        let wire = cmd.as_wire();
+        assert!(
+            wire.starts_with("enrollment consume "),
+            "wire form must start with the verb prefix; got: {wire}"
+        );
+        assert!(cmd.is_mutating(), "EnrollmentConsume must be mutating");
+        let parsed = parse_command(&wire);
+        match parsed {
+            IpcCommand::EnrollmentConsume {
+                token,
+                pubkey_b64,
+                push_addr,
+            } => {
+                assert_eq!(token, "abcDEF123-_");
+                assert_eq!(pubkey_b64, "uvwXYZ456__");
+                assert_eq!(push_addr, "10.0.0.5:51821");
+            }
+            other => panic!("expected EnrollmentConsume, got {other:?}"),
         }
     }
 

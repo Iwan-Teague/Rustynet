@@ -18,6 +18,8 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         membership_log_path: dir.join("membership.log"),
         membership_watermark_path: dir.join("membership.watermark"),
         gossip_watermark_path: None,
+        enrollment_secret_path: None,
+        enrollment_ledger_path: None,
         auto_tunnel_enforce: false,
         auto_tunnel_bundle_path: Some(dir.join("assignment.bundle")),
         auto_tunnel_verifier_key_path: Some(dir.join("assignment.pub")),
