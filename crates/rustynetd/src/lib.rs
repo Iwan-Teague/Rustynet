@@ -34,6 +34,8 @@ pub mod resilience;
 pub mod secret_log_audit;
 pub mod stun_client;
 pub mod traversal;
+#[cfg(unix)]
+pub mod unix_shutdown_signals;
 pub mod windows_authenticode;
 pub mod windows_backend_gate;
 pub mod windows_backend_readiness;

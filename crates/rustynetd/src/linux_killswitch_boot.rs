@@ -26,8 +26,15 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
-/// Reviewed Linux killswitch table name. Pinned to the same value the
-/// Phase 10 programming uses so the verifier reads the right table.
+/// Reviewed Linux killswitch table name. The runtime programs the
+/// killswitch under a generation-rotated form `inet rustynet_g<N>`
+/// (see `phase10::LiveSystem::firewall_table_name`) so it can swap
+/// between generations atomically without opening a leak window. The
+/// verifier accepts that rotated form as well as the canonical bare
+/// `inet rustynet` — see `line_is_reviewed_table_header` for the
+/// matcher. This constant remains the canonical name reported in
+/// drift messages so operators see a stable identifier regardless of
+/// which generation slot is currently live.
 pub const REVIEWED_KILLSWITCH_TABLE: &str = "rustynet";
 
 /// Reviewed Linux killswitch family (nftables `inet` family covers
@@ -178,14 +185,38 @@ pub fn build_linux_killswitch_boot_report(
     }
 }
 
+/// Returns true iff `trimmed_line` opens a nftables table block for
+/// the reviewed killswitch table — either the canonical bare form
+/// `table inet rustynet {` or the generation-rotated form
+/// `table inet rustynet_g<N> {` (one or more ASCII digits after `_g`).
+/// Anything else, including unrelated tables that happen to start
+/// with `rustynet` (e.g. `rustynet_nat_g1`), is rejected.
+pub(crate) fn line_is_reviewed_table_header(trimmed_line: &str) -> bool {
+    let prefix = format!("table {REVIEWED_KILLSWITCH_FAMILY} {REVIEWED_KILLSWITCH_TABLE}");
+    let Some(after_name) = trimmed_line.strip_prefix(prefix.as_str()) else {
+        return false;
+    };
+    if let Some(rest) = after_name.strip_prefix("_g") {
+        // Generation-rotated form: require one or more digits, then `{`.
+        let digit_count = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_count == 0 {
+            return false;
+        }
+        return rest[digit_count..].trim_start().starts_with('{');
+    }
+    // Canonical bare form: name must end here — next non-whitespace is `{`.
+    let next = after_name.chars().next();
+    matches!(next, Some(' ') | Some('\t') | Some('{')) && after_name.trim_start().starts_with('{')
+}
+
 /// Parse `nft list ruleset` text and extract the chains found under
-/// the reviewed `inet rustynet` table. Returns the table-present
-/// flag, the chain names in source order, and any matched rule
-/// fragments from the `killswitch` chain. Exposed (crate-visible) so
-/// tests can pin the parser without shelling out to `nft`.
+/// the reviewed killswitch table (`inet rustynet` or `inet
+/// rustynet_g<N>`). Returns the table-present flag, the chain names
+/// in source order, and any matched rule fragments from the
+/// `killswitch` chain. Exposed (crate-visible) so tests can pin the
+/// parser without shelling out to `nft`.
 #[allow(dead_code)]
 pub(crate) fn parse_nft_ruleset_for_killswitch(body: &str) -> (bool, Vec<String>, Vec<String>) {
-    let table_header = format!("table {REVIEWED_KILLSWITCH_FAMILY} {REVIEWED_KILLSWITCH_TABLE} {{");
     let mut in_table = false;
     let mut in_killswitch_chain = false;
     let mut brace_depth: i32 = 0;
@@ -198,7 +229,7 @@ pub(crate) fn parse_nft_ruleset_for_killswitch(body: &str) -> (bool, Vec<String>
         let trimmed = line.trim_start();
         // Find the reviewed table header.
         if !in_table {
-            if trimmed.starts_with(&table_header) {
+            if line_is_reviewed_table_header(trimmed) {
                 in_table = true;
                 table_present = true;
                 brace_depth = 1;
@@ -621,6 +652,85 @@ table inet rustynet {
         assert!(!present);
         assert!(chains.is_empty());
         assert!(frags.is_empty());
+    }
+
+    #[test]
+    fn parser_accepts_generation_rotated_table_name() {
+        // The runtime's `phase10::LiveSystem::firewall_table_name`
+        // programs the killswitch under a generation-rotated form
+        // (`rustynet_g<N>`) so it can swap between generations
+        // atomically. The verifier must accept that rotated form;
+        // otherwise every post-apply state would falsely report
+        // "table missing" and any unit restart would hit the L8
+        // leak-window drift gate even though the killswitch is in
+        // fact programmed.
+        let body = r#"
+table inet rustynet_g5 {
+        chain killswitch {
+                type filter hook output priority 0; policy drop;
+                oifname "lo" accept
+                ct state established,related accept
+        }
+        chain forward {
+                type filter hook forward priority 0; policy drop;
+        }
+}
+"#;
+        let (present, chains, frags) = parse_nft_ruleset_for_killswitch(body);
+        assert!(
+            present,
+            "rotated `rustynet_g<N>` table must be detected as the reviewed killswitch"
+        );
+        assert!(chains.iter().any(|c| c == "killswitch"));
+        assert!(chains.iter().any(|c| c == "forward"));
+        assert_eq!(frags.len(), 2, "both reviewed fragments must match");
+    }
+
+    #[test]
+    fn parser_rejects_lookalike_table_names() {
+        // Tables that share the `rustynet` prefix but are NOT the
+        // reviewed killswitch (e.g. the NAT table `rustynet_nat_g1`,
+        // or a typo'd `rustynetfoo`) must not be conflated.
+        let body = r#"
+table ip rustynet_nat_g1 {
+        chain postrouting { type nat hook postrouting priority 100; }
+}
+table inet rustynet_nat_g1 {
+        chain killswitch { oifname "lo" accept }
+}
+table inet rustynetfoo {
+        chain killswitch { oifname "lo" accept }
+}
+"#;
+        let (present, chains, frags) = parse_nft_ruleset_for_killswitch(body);
+        assert!(
+            !present,
+            "lookalike tables must not be matched as the reviewed killswitch: chains={chains:?} frags={frags:?}"
+        );
+    }
+
+    #[test]
+    fn header_matcher_pins_exact_grammar() {
+        // Canonical form.
+        assert!(line_is_reviewed_table_header("table inet rustynet {"));
+        // Generation-rotated forms.
+        assert!(line_is_reviewed_table_header("table inet rustynet_g0 {"));
+        assert!(line_is_reviewed_table_header("table inet rustynet_g7 {"));
+        assert!(line_is_reviewed_table_header("table inet rustynet_g42 {"));
+        // Tab between name and `{` is acceptable (nft pretty-prints
+        // with spaces but custom dumps may use tabs).
+        assert!(line_is_reviewed_table_header("table inet rustynet_g1\t{"));
+        // Negatives: wrong family, wrong base name, missing brace,
+        // missing digits, lookalike prefix.
+        assert!(!line_is_reviewed_table_header("table ip rustynet {"));
+        assert!(!line_is_reviewed_table_header(
+            "table inet rustynet_nat_g1 {"
+        ));
+        assert!(!line_is_reviewed_table_header("table inet rustynetfoo {"));
+        assert!(!line_is_reviewed_table_header("table inet rustynet_g {"));
+        assert!(!line_is_reviewed_table_header("table inet rustynet_gX {"));
+        assert!(!line_is_reviewed_table_header("table inet rustynet"));
+        assert!(!line_is_reviewed_table_header("# table inet rustynet {"));
     }
 
     #[test]

@@ -7574,6 +7574,22 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
     #[cfg(not(windows))]
     {
+        // Install the Unix shutdown-signal handlers before the daemon
+        // binds any kernel-side state. The handle is polled on every
+        // loop iteration so the SIGTERM/SIGINT path can break out of
+        // the main loop and run `controller.shutdown()` — matching
+        // the Windows SCM stop branch above. Without this scaffolding
+        // `systemctl restart` would SIGKILL the daemon after the
+        // unit's stop-timeout, leaving the L8 boot-time killswitch
+        // boot-check (linux_killswitch_boot_check) staring at a
+        // tunnel interface that is up but with no programmed
+        // killswitch table — i.e. a leak window.
+        let shutdown_signals = crate::unix_shutdown_signals::install_unix_shutdown_signals()
+            .map_err(|err| {
+                DaemonError::Io(format!(
+                    "install unix shutdown signal handlers failed: {err}"
+                ))
+            })?;
         if let Some(parent) = config.socket_path.parent() {
             fs::create_dir_all(parent).map_err(|err| DaemonError::Io(err.to_string()))?;
             match fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
@@ -7623,6 +7639,25 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         let mut dns_buffer = [0u8; 1536];
 
         loop {
+            // SIGTERM / SIGINT graceful-shutdown gate. Polled before
+            // any I/O so a signal delivered mid-iteration is honored
+            // promptly. The shutdown body mirrors the Windows SCM
+            // stop branch: best-effort `controller.shutdown()`, log
+            // any rollback errors, then break to the post-loop key
+            // scrub. Failing to call `shutdown` here is what caused
+            // the L8 leak-window regression where the next start hit
+            // `linux-killswitch-boot-check reported drift` because
+            // the tunnel interface was still up but the killswitch
+            // table had vanished during the ungraceful kill.
+            if shutdown_signals.requested() {
+                if let Err(err) = runtime.controller.shutdown() {
+                    log::error!(
+                        "unix shutdown-signal-triggered controller shutdown encountered errors (best-effort): {err}"
+                    );
+                }
+                break;
+            }
+
             let mut processed_io = false;
             match listener.accept() {
                 Ok((stream, _)) => {
