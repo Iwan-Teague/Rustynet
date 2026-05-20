@@ -391,6 +391,286 @@ impl ConsumedTokenLedger {
         // file and prune at startup. This stub is documented as a
         // follow-up.
     }
+
+    /// Iterate every consumed token_id. Used by the spool writer.
+    /// Order is unspecified — callers that need a deterministic
+    /// on-disk layout should sort the result.
+    pub fn iter_consumed(&self) -> impl Iterator<Item = &[u8; TOKEN_ID_LEN]> {
+        self.inner.iter()
+    }
+}
+
+/// Errors surfaced by the ledger and secret spool helpers.
+#[derive(Debug)]
+pub enum EnrollmentSpoolError {
+    /// File I/O failure (read/write/rename). Carries a sanitised
+    /// message — the actual path is NOT included so a leaked daemon
+    /// log cannot reveal the spool layout to a reader who shouldn't
+    /// have it.
+    Io(String),
+    /// File structure is malformed: wrong version byte, truncated
+    /// length, non-hex token id, etc. Fail-closed.
+    Corrupt(&'static str),
+}
+
+impl std::fmt::Display for EnrollmentSpoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnrollmentSpoolError::Io(msg) => write!(f, "enrollment spool i/o: {msg}"),
+            EnrollmentSpoolError::Corrupt(reason) => {
+                write!(f, "enrollment spool corrupt: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EnrollmentSpoolError {}
+
+/// Wire-format version byte for the on-disk ledger spool. Bumped
+/// only on schema change; an older daemon reading a newer file
+/// rejects fail-closed.
+const LEDGER_WIRE_VERSION: u8 = 1;
+
+/// Read a consumed-token ledger from disk. Returns `Ok(default)`
+/// when the file is absent (fresh daemon). Returns
+/// `Err(Corrupt)` on any structural mismatch.
+pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, EnrollmentSpoolError> {
+    use std::fs;
+    if !path.exists() {
+        return Ok(ConsumedTokenLedger::new());
+    }
+    let content =
+        fs::read_to_string(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    let mut version: Option<u8> = None;
+    let mut ledger = ConsumedTokenLedger::new();
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(EnrollmentSpoolError::Corrupt(
+                "ledger line missing key/value separator",
+            ));
+        };
+        match key {
+            "version" => {
+                version = value.parse::<u8>().ok();
+            }
+            "consumed" => {
+                // consumed=<hex32>,<hex32>,...  (32 hex chars per id
+                // because TOKEN_ID_LEN is 16 bytes = 32 hex chars)
+                if value.is_empty() {
+                    continue;
+                }
+                for entry in value.split(',') {
+                    if entry.len() != TOKEN_ID_LEN * 2 {
+                        return Err(EnrollmentSpoolError::Corrupt(
+                            "ledger consumed entry has wrong hex length",
+                        ));
+                    }
+                    let mut id = [0u8; TOKEN_ID_LEN];
+                    for (i, chunk) in entry.as_bytes().chunks(2).enumerate() {
+                        let hex = std::str::from_utf8(chunk).map_err(|_| {
+                            EnrollmentSpoolError::Corrupt("ledger consumed entry is not ASCII")
+                        })?;
+                        id[i] = u8::from_str_radix(hex, 16).map_err(|_| {
+                            EnrollmentSpoolError::Corrupt("ledger consumed entry is not valid hex")
+                        })?;
+                    }
+                    ledger.record_consumed(id);
+                }
+            }
+            _ => {
+                return Err(EnrollmentSpoolError::Corrupt(
+                    "ledger file contains unknown key",
+                ));
+            }
+        }
+    }
+    if version != Some(LEDGER_WIRE_VERSION) {
+        return Err(EnrollmentSpoolError::Corrupt(
+            "ledger file version mismatch",
+        ));
+    }
+    Ok(ledger)
+}
+
+/// Atomically write the consumed-token ledger. Mirrors the membership
+/// watermark spool pattern: write to a temp file, fsync, rename. The
+/// parent directory is locked to 0o700 on Unix; the file itself is
+/// 0o600.
+pub fn write_ledger(
+    path: &std::path::Path,
+    ledger: &ConsumedTokenLedger,
+) -> Result<(), EnrollmentSpoolError> {
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let mut payload = String::new();
+    payload.push_str(&format!("version={LEDGER_WIRE_VERSION}\n"));
+    payload.push_str("consumed=");
+    let mut entries: Vec<[u8; TOKEN_ID_LEN]> = ledger.iter_consumed().copied().collect();
+    entries.sort();
+    let mut first = true;
+    for id in entries {
+        if !first {
+            payload.push(',');
+        }
+        first = false;
+        for byte in id {
+            payload.push_str(&format!("{byte:02x}"));
+        }
+    }
+    payload.push('\n');
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp = options
+        .open(&temp_path)
+        .map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    if let Err(err) = temp.write_all(payload.as_bytes()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EnrollmentSpoolError::Io(err.to_string()));
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EnrollmentSpoolError::Io(err.to_string()));
+    }
+    drop(temp);
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EnrollmentSpoolError::Io(err.to_string()));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent_dir =
+            fs::File::open(parent).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+        parent_dir
+            .sync_all()
+            .map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Read a 32-byte enrollment secret from disk. The file must be
+/// EXACTLY [`ENROLLMENT_SECRET_LEN`] bytes — neither hex nor base64.
+/// Returns a `Zeroizing` wrapper so the secret is wiped on drop.
+///
+/// Security:
+///
+/// * On Unix the file's permissions are checked: world/group access
+///   is refused (the daemon would never have written such a file
+///   itself, and reading it would mean a misconfigured deployment).
+/// * The size cap rejects oversized inputs in O(1) — a hostile
+///   replacement file cannot force the daemon to allocate megabytes
+///   of plaintext before the length check fires.
+pub fn load_secret(
+    path: &std::path::Path,
+) -> Result<Zeroizing<[u8; ENROLLMENT_SECRET_LEN]>, EnrollmentSpoolError> {
+    use std::fs;
+    use std::io::Read;
+    let metadata = fs::metadata(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    if metadata.len() as usize != ENROLLMENT_SECRET_LEN {
+        return Err(EnrollmentSpoolError::Corrupt(
+            "enrollment secret file size mismatch (must be exactly 32 bytes)",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        // Allow 0o400 (read-only owner) or 0o600 (read/write owner).
+        // Anything that grants group/world access is a misconfiguration;
+        // fail-closed so the operator notices.
+        if mode & 0o077 != 0 {
+            return Err(EnrollmentSpoolError::Corrupt(
+                "enrollment secret file has group/world permission bits set",
+            ));
+        }
+    }
+    let mut file = fs::File::open(path).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    let mut buf = Zeroizing::new([0u8; ENROLLMENT_SECRET_LEN]);
+    file.read_exact(buf.as_mut_slice())
+        .map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    Ok(buf)
+}
+
+/// Write a 32-byte enrollment secret atomically with 0o600 perms on
+/// Unix. Used by daemon bring-up to persist a freshly-generated
+/// secret. Refuses to overwrite an existing file (fail-closed: a
+/// secret rotation must explicitly delete the old file first).
+pub fn write_secret(
+    path: &std::path::Path,
+    secret: &[u8; ENROLLMENT_SECRET_LEN],
+) -> Result<(), EnrollmentSpoolError> {
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    if path.exists() {
+        return Err(EnrollmentSpoolError::Corrupt(
+            "enrollment secret file already exists; refusing to overwrite",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let temp_path = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temp = options
+        .open(&temp_path)
+        .map_err(|err| EnrollmentSpoolError::Io(err.to_string()))?;
+    if let Err(err) = temp.write_all(secret) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EnrollmentSpoolError::Io(err.to_string()));
+    }
+    if let Err(err) = temp.sync_all() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EnrollmentSpoolError::Io(err.to_string()));
+    }
+    drop(temp);
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EnrollmentSpoolError::Io(err.to_string()));
+    }
+    Ok(())
 }
 
 /// Verify + consume a token in one atomic operation.
@@ -451,6 +731,75 @@ pub fn verify_and_consume_token_with_now(
     }
     ledger.record_consumed(token.token_id);
     Ok(token)
+}
+
+/// Inspect-only variant of [`verify_and_consume_token`]. Decodes
+/// the token, verifies the HMAC tag, checks the freshness window,
+/// and reports whether the token has already been consumed — but
+/// makes NO change to the ledger. Used by the `rustynet enrollment
+/// verify` CLI verb so an operator can sanity-check a token without
+/// burning it.
+///
+/// The returned [`TokenInspection`] is a strict-typed report — the
+/// caller MUST treat any non-`Valid` outcome as a reject. We do not
+/// return `Result::Err` for the `AlreadyConsumed` branch because the
+/// "already consumed" status is intentionally observable here: it's
+/// the whole point of `verify`.
+pub fn inspect_token(
+    encoded: &str,
+    secret: &[u8; ENROLLMENT_SECRET_LEN],
+    ledger: &ConsumedTokenLedger,
+) -> Result<TokenInspection, EnrollmentTokenError> {
+    let now = current_unix_seconds()?;
+    inspect_token_with_now(encoded, secret, ledger, now)
+}
+
+/// Test-friendly variant of [`inspect_token`].
+pub fn inspect_token_with_now(
+    encoded: &str,
+    secret: &[u8; ENROLLMENT_SECRET_LEN],
+    ledger: &ConsumedTokenLedger,
+    now_unix: u64,
+) -> Result<TokenInspection, EnrollmentTokenError> {
+    let token = decode_token(encoded)?;
+    let expected = compute_tag(
+        secret,
+        &token.token_id,
+        token.issued_at_unix,
+        token.expires_at_unix,
+    );
+    if expected.ct_eq(&token.tag).unwrap_u8() != 1 {
+        return Err(EnrollmentTokenError::TagMismatch);
+    }
+    if token.issued_at_unix > now_unix.saturating_add(ISSUED_AT_FUTURE_TOLERANCE_SECS) {
+        return Err(EnrollmentTokenError::IssuedInFuture {
+            drift_secs: token.issued_at_unix - now_unix,
+        });
+    }
+    if token.expires_at_unix <= now_unix {
+        return Err(EnrollmentTokenError::Expired {
+            expired_secs_ago: now_unix - token.expires_at_unix,
+        });
+    }
+    let already_consumed = ledger.was_consumed(&token.token_id);
+    let remaining_secs = token.expires_at_unix.saturating_sub(now_unix);
+    Ok(TokenInspection {
+        issued_at_unix: token.issued_at_unix,
+        expires_at_unix: token.expires_at_unix,
+        remaining_secs,
+        already_consumed,
+    })
+}
+
+/// Verdict from [`inspect_token`]. Never carries the secret-bearing
+/// `tag` / `token_id` fields — those stay inside `EnrollmentToken`
+/// and are zeroised on drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenInspection {
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub remaining_secs: u64,
+    pub already_consumed: bool,
 }
 
 #[cfg(test)]
@@ -722,6 +1071,129 @@ mod tests {
         token.token_id.zeroize();
         assert!(token.tag.iter().all(|b| *b == 0));
         assert!(token.token_id.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn inspect_token_does_not_mutate_ledger_on_valid_input() {
+        // The verify-only path must NOT mark the token as consumed
+        // — otherwise an operator running `rustynet enrollment
+        // verify` would accidentally burn a token they were just
+        // checking. Pin this distinction strictly.
+        let secret = deterministic_secret(40);
+        let mut ledger = ConsumedTokenLedger::new();
+        let (_, encoded) = mint_token_with_clock(&secret, 600, 1_700_000_000).expect("mint");
+        let inspect = inspect_token_with_now(&encoded, &secret, &ledger, 1_700_000_300)
+            .expect("inspect succeeds");
+        assert!(!inspect.already_consumed);
+        assert_eq!(inspect.remaining_secs, 300);
+        assert_eq!(
+            ledger.consumed_count(),
+            0,
+            "inspect must not mutate the ledger"
+        );
+        // Now actually consume it, then inspect again — the
+        // already_consumed flag must flip.
+        verify_and_consume_token_with_now(&encoded, &secret, &mut ledger, 1_700_000_300)
+            .expect("consume");
+        let inspect_after = inspect_token_with_now(&encoded, &secret, &ledger, 1_700_000_350)
+            .expect("inspect after consume");
+        assert!(
+            inspect_after.already_consumed,
+            "inspect must report already_consumed=true once the ledger has the id"
+        );
+    }
+
+    #[test]
+    fn inspect_token_returns_tag_mismatch_under_wrong_secret() {
+        let issuer = deterministic_secret(41);
+        let attacker = deterministic_secret(42);
+        let ledger = ConsumedTokenLedger::new();
+        let (_, encoded) = mint_token_with_clock(&issuer, 600, 1_700_000_000).expect("mint");
+        let err = inspect_token_with_now(&encoded, &attacker, &ledger, 1_700_000_300)
+            .expect_err("inspect under wrong secret must reject");
+        assert!(matches!(err, EnrollmentTokenError::TagMismatch));
+    }
+
+    #[test]
+    fn ledger_spool_round_trips_consumed_entries() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("enrollment.ledger");
+        let mut ledger = ConsumedTokenLedger::new();
+        ledger.record_consumed([0xa1u8; TOKEN_ID_LEN]);
+        ledger.record_consumed([0xb2u8; TOKEN_ID_LEN]);
+        write_ledger(&path, &ledger).expect("write ok");
+        let loaded = load_ledger(&path).expect("load ok");
+        assert_eq!(loaded.consumed_count(), 2);
+        assert!(loaded.was_consumed(&[0xa1u8; TOKEN_ID_LEN]));
+        assert!(loaded.was_consumed(&[0xb2u8; TOKEN_ID_LEN]));
+    }
+
+    #[test]
+    fn ledger_spool_returns_empty_when_file_absent() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("missing.ledger");
+        let loaded = load_ledger(&path).expect("absent ok");
+        assert_eq!(loaded.consumed_count(), 0);
+    }
+
+    #[test]
+    fn ledger_spool_rejects_wrong_version() {
+        use std::fs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("bad.ledger");
+        fs::write(&path, b"version=99\nconsumed=\n").expect("write");
+        let err = load_ledger(&path).expect_err("wrong version must reject");
+        assert!(matches!(err, EnrollmentSpoolError::Corrupt(_)));
+    }
+
+    #[test]
+    fn secret_file_round_trips_via_load_and_write() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("enrollment.secret");
+        let secret = deterministic_secret(0x5a);
+        write_secret(&path, &secret).expect("write secret");
+        let loaded = load_secret(&path).expect("load secret");
+        assert_eq!(loaded.as_slice(), secret.as_slice());
+    }
+
+    #[test]
+    fn secret_file_refuses_to_overwrite_existing() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("enrollment.secret");
+        let s = deterministic_secret(0x5b);
+        write_secret(&path, &s).expect("first write");
+        let err = write_secret(&path, &s).expect_err("second write must refuse");
+        assert!(matches!(err, EnrollmentSpoolError::Corrupt(_)));
+    }
+
+    #[test]
+    fn secret_file_rejects_wrong_size() {
+        use std::fs;
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("short.secret");
+        fs::write(&path, [1u8; 10]).expect("write short");
+        let err = load_secret(&path).expect_err("wrong size must reject");
+        assert!(matches!(err, EnrollmentSpoolError::Corrupt(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_rejects_group_or_world_readable_permissions() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("lax.secret");
+        fs::write(&path, [0u8; ENROLLMENT_SECRET_LEN]).expect("write secret bytes");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod 0o644");
+        let err = load_secret(&path).expect_err("lax perms must reject");
+        assert!(matches!(err, EnrollmentSpoolError::Corrupt(_)));
     }
 
     #[test]
