@@ -6,6 +6,8 @@ pub mod dataplane_candidates;
 pub mod enrollment_token;
 pub mod exit_codes;
 pub mod fetcher;
+pub mod gossip_runtime;
+pub mod gossip_transport;
 pub mod ice_priority;
 pub mod peer_gossip;
 
