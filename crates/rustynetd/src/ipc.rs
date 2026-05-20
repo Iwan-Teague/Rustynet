@@ -50,6 +50,16 @@ pub enum IpcCommand {
     RouteAdvertise(String),
     KeyRotate,
     KeyRevoke,
+    /// D2.5 push-loop entry point. Carries the already-serialised
+    /// wire bytes of a [`crate::peer_gossip::GossipBundle`]; the
+    /// daemon hands them straight to `deserialise_bundle` +
+    /// `accept_bundle`. NB: the IPC envelope's outer signature (when
+    /// present via `remote-op-v1`) is irrelevant for authenticity —
+    /// the bundle carries its own Ed25519 signature, and that is the
+    /// only authority the daemon trusts.
+    PushGossipBundle {
+        wire_bytes: Vec<u8>,
+    },
     Unknown(String),
 }
 
@@ -65,6 +75,7 @@ impl IpcCommand {
                 | IpcCommand::RouteAdvertise(_)
                 | IpcCommand::KeyRotate
                 | IpcCommand::KeyRevoke
+                | IpcCommand::PushGossipBundle { .. }
         )
     }
 
@@ -81,6 +92,13 @@ impl IpcCommand {
             IpcCommand::RouteAdvertise(cidr) => format!("route advertise {cidr}"),
             IpcCommand::KeyRotate => "key rotate".to_owned(),
             IpcCommand::KeyRevoke => "key revoke".to_owned(),
+            IpcCommand::PushGossipBundle { wire_bytes } => {
+                use base64::Engine;
+                format!(
+                    "gossip push {}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wire_bytes)
+                )
+            }
             IpcCommand::Unknown(raw) => raw.clone(),
         }
     }
@@ -145,6 +163,21 @@ pub fn parse_command(raw: &str) -> IpcCommand {
         }
         [cmd, subcmd] if cmd == "key" && subcmd == "rotate" => IpcCommand::KeyRotate,
         [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => IpcCommand::KeyRevoke,
+        [cmd, subcmd, payload_b64] if cmd == "gossip" && subcmd == "push" => {
+            // D2.5: the third token is the URL-safe-base64-no-pad
+            // encoding of a serialised GossipBundle. The bundle
+            // itself carries its own Ed25519 signature; we therefore
+            // only need to surface the raw wire bytes here and let
+            // the daemon's accept_bundle path do all real
+            // verification. A malformed base64 dispatches as
+            // `Unknown` so the daemon answers with an explicit error
+            // string instead of silently accepting empty input.
+            use base64::Engine;
+            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) {
+                Ok(wire_bytes) => IpcCommand::PushGossipBundle { wire_bytes },
+                Err(_) => IpcCommand::Unknown(raw.trim().to_owned()),
+            }
+        }
         _ => IpcCommand::Unknown(raw.trim().to_owned()),
     }
 }
@@ -341,6 +374,47 @@ mod tests {
         assert!(
             display.contains("multiple of 2") || display.contains("InvalidSignatureHex"),
             "diagnostic should describe the odd-length problem, got: {display}"
+        );
+    }
+
+    #[test]
+    fn parse_and_wire_round_trips_push_gossip_bundle() {
+        // Round-trip pin for the D2.5 IPC verb. The wire form uses
+        // URL-safe base64 with no padding so the third token never
+        // contains '+', '/', or '=' — all of which would split-
+        // whitespace OK but historically confuse hand-typed clients.
+        let bundle_bytes = vec![1u8, 2, 3, 4, 0xff, 0, 7, 8];
+        let cmd = IpcCommand::PushGossipBundle {
+            wire_bytes: bundle_bytes.clone(),
+        };
+        let wire = cmd.as_wire();
+        assert!(
+            wire.starts_with("gossip push "),
+            "wire form must start with the verb prefix; got: {wire}"
+        );
+        assert!(
+            cmd.is_mutating(),
+            "PushGossipBundle must classify as mutating"
+        );
+        let parsed = parse_command(&wire);
+        match parsed {
+            IpcCommand::PushGossipBundle { wire_bytes } => {
+                assert_eq!(wire_bytes, bundle_bytes);
+            }
+            other => panic!("expected PushGossipBundle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_rejects_malformed_base64_for_gossip_push() {
+        // A `gossip push <not-base64>` envelope must fall through to
+        // Unknown so the daemon answers with an explicit error
+        // string. Specifically: must NOT silently produce a
+        // PushGossipBundle with an empty wire payload.
+        let parsed = parse_command("gossip push !@#$%not-base64");
+        assert!(
+            matches!(parsed, IpcCommand::Unknown(_)),
+            "malformed base64 must dispatch as Unknown; got {parsed:?}"
         );
     }
 

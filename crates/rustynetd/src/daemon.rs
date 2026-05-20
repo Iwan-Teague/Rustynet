@@ -234,6 +234,13 @@ const DEFAULT_RELAY_SESSION_REFRESH_MARGIN_SECS: u64 = 15;
 const DEFAULT_RELAY_SESSION_IDLE_TIMEOUT_SECS: u64 = 30;
 const RELAY_FLEET_BUNDLE_PATH_ENV: &str = "RUSTYNET_RELAY_FLEET_BUNDLE_PATH";
 const RELAY_FLEET_WATERMARK_PATH_ENV: &str = "RUSTYNET_RELAY_FLEET_WATERMARK_PATH";
+/// D2.5 — env var matching the `--gossip-watermark` CLI flag. The
+/// daemon binary's arg parser reads either source; if neither is
+/// set, the gossip spool is `None` and the gossip subsystem runs
+/// purely in-memory (an acceptable default for the development
+/// path, but production deployments must set it via the systemd
+/// unit file).
+pub(crate) const GOSSIP_WATERMARK_PATH_ENV: &str = "RUSTYNET_GOSSIP_WATERMARK";
 #[cfg(not(windows))]
 pub const DEFAULT_DNS_ZONE_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone";
 #[cfg(windows)]
@@ -1032,6 +1039,11 @@ pub struct DaemonConfig {
     pub membership_snapshot_path: PathBuf,
     pub membership_log_path: PathBuf,
     pub membership_watermark_path: PathBuf,
+    /// D2.5: per-host spool for the gossip sequence + seen-source
+    /// ledger. `None` disables gossip persistence (test default);
+    /// production daemons set this via `--gossip-watermark` or
+    /// `RUSTYNET_GOSSIP_WATERMARK`.
+    pub gossip_watermark_path: Option<PathBuf>,
     pub auto_tunnel_enforce: bool,
     pub auto_tunnel_bundle_path: Option<PathBuf>,
     pub auto_tunnel_verifier_key_path: Option<PathBuf>,
@@ -1107,6 +1119,7 @@ impl Default for DaemonConfig {
             membership_snapshot_path: PathBuf::from(DEFAULT_MEMBERSHIP_SNAPSHOT_PATH),
             membership_log_path: PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH),
             membership_watermark_path: PathBuf::from(DEFAULT_MEMBERSHIP_WATERMARK_PATH),
+            gossip_watermark_path: std::env::var_os(GOSSIP_WATERMARK_PATH_ENV).map(PathBuf::from),
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_BUNDLE_PATH)),
             auto_tunnel_verifier_key_path: Some(PathBuf::from(
@@ -2753,6 +2766,21 @@ struct DaemonRuntime {
     exit_port_forward_last_error: Option<String>,
     #[cfg(target_os = "linux")]
     exit_port_forward_lease: Option<ExitPortForwardLease>,
+    // D2.5 — peer-distributed signed-bundle gossip. Direct fields
+    // for the local sequence counter and the per-source replay
+    // watermark (mirroring the user spec verbatim), plus the
+    // encapsulated runtime that owns the signing key, the registered
+    // peer routing entries, and the spool I/O. The wrapping
+    // `Option<GossipNode>` is `None` when the daemon is launched
+    // without a configured gossip signing key — fail-closed default
+    // so production paths that haven't been migrated yet are
+    // unaffected.
+    gossip_sequence: u64,
+    seen_gossip_sequences: crate::peer_gossip::SeenSequenceState,
+    last_minted_bundle: Option<crate::peer_gossip::GossipBundle>,
+    next_gossip_mint_at: Option<Instant>,
+    gossip_node: Option<crate::gossip_runtime::GossipNode>,
+    gossip_transport: Option<crate::gossip_transport::GossipTransport>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3089,6 +3117,17 @@ impl DaemonRuntime {
             exit_port_forward_last_error: None,
             #[cfg(target_os = "linux")]
             exit_port_forward_lease: None,
+            gossip_sequence: 0,
+            seen_gossip_sequences: crate::peer_gossip::SeenSequenceState::new(),
+            last_minted_bundle: None,
+            next_gossip_mint_at: None,
+            // D2.5: the runtime fields are wired in by
+            // `attach_gossip_runtime`; we leave them None at
+            // construction so daemon paths that haven't been
+            // migrated yet are unaffected and keep their existing
+            // fail-closed defaults.
+            gossip_node: None,
+            gossip_transport: None,
         })
     }
 
@@ -3888,6 +3927,157 @@ impl DaemonRuntime {
         } else {
             ("ok", "none".to_owned())
         }
+    }
+
+    /// Build a [`crate::dataplane_candidates::CandidateSet`] from
+    /// already-cached state — host enumerations from
+    /// `local_host_candidates` and STUN observations from
+    /// `local_stun_candidates`. The mint loop calls this every
+    /// reconcile; the inputs are refreshed on their own slower
+    /// cadences (host: bootstrap + reconcile; srflx:
+    /// `DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS`). This avoids
+    /// re-running STUN on every reconcile, which would be O(peer-
+    /// count * STUN-server-count) per minute.
+    pub fn build_candidate_set_from_cache(&self) -> crate::dataplane_candidates::CandidateSet {
+        use crate::dataplane_candidates::{AddressScope, CandidateSet, classify_ip};
+        let mut set = CandidateSet::default();
+        for ips in self.local_host_candidates.values() {
+            for ip in ips {
+                let scope = classify_ip(*ip);
+                if !matches!(scope, AddressScope::Global | AddressScope::Private) {
+                    continue;
+                }
+                match ip {
+                    IpAddr::V4(_) => set.v4_host.push(*ip),
+                    IpAddr::V6(_) => set.v6_host.push(*ip),
+                }
+            }
+        }
+        for sa in &self.local_stun_candidates {
+            let scope = classify_ip(sa.ip());
+            if !matches!(scope, AddressScope::Global | AddressScope::Private) {
+                continue;
+            }
+            match sa {
+                SocketAddr::V4(_) => set.v4_srflx.push(*sa),
+                SocketAddr::V6(_) => set.v6_srflx.push(*sa),
+            }
+        }
+        // Hard-cap the result to MAX_CANDIDATES_PER_BUNDLE so a
+        // host with an unusually-large interface enumeration can't
+        // produce a bundle that mint_bundle would refuse.
+        while set.len() > crate::peer_gossip::MAX_CANDIDATES_PER_BUNDLE {
+            if !set.v4_host.is_empty() {
+                set.v4_host.pop();
+            } else if !set.v6_host.is_empty() {
+                set.v6_host.pop();
+            } else if !set.v4_srflx.is_empty() {
+                set.v4_srflx.pop();
+            } else if !set.v6_srflx.is_empty() {
+                set.v6_srflx.pop();
+            } else {
+                break;
+            }
+        }
+        set
+    }
+
+    /// Builder-style attachment of the D2.5 gossip subsystem. The
+    /// integration test in `tests/gossip_three_peer_mesh.rs` drives
+    /// the underlying `GossipNode` and `GossipTransport` directly
+    /// rather than through `DaemonRuntime`, so this entry point is
+    /// not exercised in-process today; it is the public attachment
+    /// point for the next slice that wires production daemons with
+    /// a real gossip signing key (D2.7 enrollment-token follow-up).
+    /// Marked `allow(dead_code)` deliberately — the alternative
+    /// (deleting the method) would force the production wiring
+    /// slice to re-add this exact surface.
+    #[allow(dead_code)]
+    pub fn attach_gossip_runtime(
+        &mut self,
+        node: crate::gossip_runtime::GossipNode,
+        transport: crate::gossip_transport::GossipTransport,
+    ) {
+        self.gossip_sequence = node.gossip_sequence;
+        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
+        self.last_minted_bundle = node.last_minted_bundle.clone();
+        self.next_gossip_mint_at = node.next_gossip_mint_at;
+        self.gossip_node = Some(node);
+        self.gossip_transport = Some(transport);
+    }
+
+    /// Periodic hook: drain any pending gossip datagrams from the
+    /// transport and route them through the ingestion path
+    /// (signature + freshness + replay + scope checks, plus epidemic
+    /// re-push to other peers on accept).
+    ///
+    /// Called once per main-loop iteration after the SIGTERM gate
+    /// and before the reconcile timer. Strictly non-blocking — a
+    /// `Duration::ZERO` timeout makes this a one-shot try_recv per
+    /// iteration so the gossip path can't starve the rest of the
+    /// loop.
+    pub fn drain_gossip_inbound(&mut self) {
+        let Some(node) = self.gossip_node.as_mut() else {
+            return;
+        };
+        let Some(transport) = self.gossip_transport.as_ref() else {
+            return;
+        };
+        // Cap iterations so a flood of bundles can't keep the main
+        // loop stuck in this branch — the remaining bundles will be
+        // drained on the next iteration.
+        const MAX_DRAIN_PER_ITERATION: usize = 16;
+        for _ in 0..MAX_DRAIN_PER_ITERATION {
+            match transport.recv_bundle(Duration::ZERO) {
+                Ok(Some((sender, bundle))) => {
+                    let now_unix = unix_now();
+                    let _ = node.ingest_inbound_bundle(Some(sender), bundle, transport, now_unix);
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    log::warn!("gossip_recv_error reason={err}");
+                    break;
+                }
+            }
+        }
+        // Mirror the canonical state back onto DaemonRuntime so
+        // status queries and other call sites that read these
+        // fields see the latest values.
+        self.gossip_sequence = node.gossip_sequence;
+        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
+        self.last_minted_bundle = node.last_minted_bundle.clone();
+        self.next_gossip_mint_at = node.next_gossip_mint_at;
+    }
+
+    /// Periodic hook: if the local CandidateSet has changed since
+    /// the last mint, OR the heartbeat timer has elapsed, mint a
+    /// fresh signed bundle and push it to every registered peer.
+    ///
+    /// Wired into the reconcile cadence so the broadcast happens at
+    /// the same rate as the existing reconcile loop. The mint
+    /// itself is cheap (one Ed25519 sign + N socket writes); the
+    /// expensive part is `gather_candidate_set` which talks to STUN
+    /// — that runs on its own slower cadence
+    /// (`DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS`).
+    pub fn maybe_run_gossip_mint(&mut self, candidates: crate::dataplane_candidates::CandidateSet) {
+        let Some(node) = self.gossip_node.as_mut() else {
+            return;
+        };
+        let Some(transport) = self.gossip_transport.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let now_unix = unix_now();
+        match node.maybe_mint_and_broadcast(now, now_unix, candidates, transport) {
+            Ok(_) => {}
+            Err(err) => {
+                log::warn!("gossip_mint_failed reason={err}");
+            }
+        }
+        self.gossip_sequence = node.gossip_sequence;
+        self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
+        self.last_minted_bundle = node.last_minted_bundle.clone();
+        self.next_gossip_mint_at = node.next_gossip_mint_at;
     }
 
     fn poll_stun_results(&mut self) {
@@ -6059,6 +6249,17 @@ impl DaemonRuntime {
                 Ok(message) => IpcResponse::ok(message),
                 Err(err) => IpcResponse::err(err),
             },
+            IpcCommand::PushGossipBundle { wire_bytes } => {
+                // D2.5 IPC entry point. Hand the already-serialised
+                // bytes to the gossip ingestion path; that path is
+                // the same one used by the UDP transport, so the
+                // signature + freshness + replay checks happen
+                // exactly once and in one place.
+                match self.ingest_inbound_gossip_bundle(&wire_bytes, None) {
+                    Ok(summary) => IpcResponse::ok(summary),
+                    Err(err) => IpcResponse::err(err),
+                }
+            }
             IpcCommand::Unknown(raw) => IpcResponse::err(format!("unknown command: {raw}")),
         }
     }
@@ -6145,6 +6346,50 @@ impl DaemonRuntime {
             ));
         }
         set_interface_down(&self.wg_interface)
+    }
+
+    /// D2.5 — IPC entry point for inbound gossip bundles. Hands the
+    /// serialised wire bytes through the same ingestion path that
+    /// the UDP transport drives, so the signature + replay + scope
+    /// checks happen in exactly one place.
+    ///
+    /// Returns a one-line summary suitable for the IPC response on
+    /// accept; an error string on reject. Per the privacy retention
+    /// policy this string MUST NOT include the bundle's candidate
+    /// list — only the 8-byte source prefix and the GossipError
+    /// variant name.
+    fn ingest_inbound_gossip_bundle(
+        &mut self,
+        wire_bytes: &[u8],
+        sender: Option<SocketAddr>,
+    ) -> Result<String, String> {
+        let Some(node) = self.gossip_node.as_mut() else {
+            return Err("gossip subsystem not configured for this daemon".to_owned());
+        };
+        let Some(transport) = self.gossip_transport.as_ref() else {
+            return Err("gossip transport not bound".to_owned());
+        };
+        let now_unix = unix_now();
+        match node.ingest_wire_bundle(sender, wire_bytes, transport, now_unix) {
+            Ok(summary) => {
+                let id_prefix: String = summary
+                    .source_node_id
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
+                Ok(format!(
+                    "gossip accepted source={id_prefix} seq={}",
+                    summary.sequence
+                ))
+            }
+            Err(crate::gossip_runtime::GossipNodeError::Bundle(err)) => Err(format!(
+                "gossip rejected: {}",
+                crate::gossip_runtime::error_kind(&err)
+            )),
+            Err(other) => Err(format!("gossip ingest failed: {other}")),
+        }
     }
 
     fn rotate_local_key_material(&mut self) -> Result<String, String> {
@@ -7549,6 +7794,14 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             runtime.maybe_preexpiry_refresh_traversal(now_unix);
             runtime.poll_endpoint_monitor_and_maybe_refresh();
             runtime.maybe_trigger_endpoint_change_refresh();
+            // D2.5: drain any pending inbound gossip and, on the
+            // reconcile cadence, mint a fresh bundle if the local
+            // CandidateSet has drifted or the heartbeat timer has
+            // elapsed. Both calls are no-ops when the gossip
+            // subsystem hasn't been attached (fail-closed default).
+            runtime.drain_gossip_inbound();
+            let cached_candidates = runtime.build_candidate_set_from_cache();
+            runtime.maybe_run_gossip_mint(cached_candidates);
 
             if config
                 .max_requests
@@ -7757,6 +8010,14 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             runtime.maybe_preexpiry_refresh_traversal(now_unix);
             runtime.poll_endpoint_monitor_and_maybe_refresh();
             runtime.maybe_trigger_endpoint_change_refresh();
+            // D2.5: drain any pending inbound gossip and, on the
+            // reconcile cadence, mint a fresh bundle if the local
+            // CandidateSet has drifted or the heartbeat timer has
+            // elapsed. Both calls are no-ops when the gossip
+            // subsystem hasn't been attached (fail-closed default).
+            runtime.drain_gossip_inbound();
+            let cached_candidates = runtime.build_candidate_set_from_cache();
+            runtime.maybe_run_gossip_mint(cached_candidates);
 
             if config
                 .max_requests
@@ -16645,6 +16906,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -17683,6 +17945,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -17883,6 +18146,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18048,6 +18312,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18201,6 +18466,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18349,6 +18615,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18498,6 +18765,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18657,6 +18925,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18761,6 +19030,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -18912,6 +19182,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19084,6 +19355,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19193,6 +19465,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19290,6 +19563,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19425,6 +19699,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19552,6 +19827,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19637,6 +19913,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19783,6 +20060,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19866,6 +20144,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -19982,6 +20261,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20334,6 +20614,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             traversal_bundle_path: traversal_bundle_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
             traversal_watermark_path: traversal_watermark_path.clone(),
@@ -20385,6 +20666,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             traversal_bundle_path: traversal_bundle_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
             traversal_watermark_path: traversal_watermark_path.clone(),
@@ -20467,6 +20749,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20548,6 +20831,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -20648,6 +20932,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
             traversal_watermark_path: traversal_watermark_path.clone(),
@@ -20711,6 +20996,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
@@ -21909,6 +22195,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             node_role: NodeRole::Client,
@@ -21967,6 +22254,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             node_role: NodeRole::Client,
@@ -22016,6 +22304,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             node_role: NodeRole::BlindExit,
@@ -22107,6 +22396,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22215,6 +22505,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -22259,6 +22550,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: false,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
@@ -22314,6 +22606,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
         };
@@ -22381,6 +22674,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22469,6 +22763,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22560,6 +22855,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22662,6 +22958,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),
@@ -22736,6 +23033,7 @@ mod tests {
             membership_snapshot_path: membership_snapshot_path.clone(),
             membership_log_path: membership_log_path.clone(),
             membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(assignment_path.clone()),
             auto_tunnel_verifier_key_path: Some(assignment_verifier_path.clone()),

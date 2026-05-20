@@ -48,12 +48,36 @@
 //!   for the same logical bundle and break verification.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use crate::dataplane_candidates::CandidateSet;
+
+/// Wire-format version byte for [`serialise_bundle`] / [`deserialise_bundle`].
+/// A bundle whose first byte does not equal this constant is rejected hard;
+/// future protocol changes must bump this byte and add a new branch.
+pub const GOSSIP_BUNDLE_WIRE_VERSION: u8 = 1;
+
+/// Hard cap on a single gossip datagram (header + candidates +
+/// signature). With the strictest layout this fits comfortably in a
+/// single UDP datagram (no IP fragmentation under normal MTU) and
+/// covers the worst case of [`MAX_CANDIDATES_PER_BUNDLE`] candidates.
+/// Datagrams larger than this are dropped on both send and receive.
+pub const MAX_GOSSIP_DATAGRAM_BYTES: usize = 4 * 1024;
+
+/// Fixed-layout wire constants used by `serialise_bundle` /
+/// `deserialise_bundle`. Centralised so any future drift between
+/// encoder and decoder is impossible.
+const WIRE_VERSION_OFFSET: usize = 0;
+const WIRE_SOURCE_OFFSET: usize = 1;
+const WIRE_SEQUENCE_OFFSET: usize = 33;
+const WIRE_TIMESTAMP_OFFSET: usize = 41;
+const WIRE_COUNTS_OFFSET: usize = 49;
+const WIRE_CANDIDATES_OFFSET: usize = 65;
+const WIRE_CANDIDATE_STRIDE: usize = 18;
+const WIRE_SIGNATURE_LEN: usize = 64;
 
 /// Magic prefix mixed into the signing pre-image. Domain separation:
 /// guarantees that a signature on a gossip bundle cannot be replayed
@@ -114,6 +138,21 @@ pub enum GossipError {
     /// Couldn't compute the current Unix timestamp (clock before
     /// UNIX_EPOCH). Should never happen on a healthy host.
     TimestampUnavailable,
+    /// Bundle's wire-format version byte did not equal
+    /// [`GOSSIP_BUNDLE_WIRE_VERSION`]. A future protocol bump must add
+    /// a new branch; the current decoder rejects unknown versions
+    /// hard so a downgrade attack cannot trick us into accepting a
+    /// weaker layout.
+    WireVersionMismatch { expected: u8, presented: u8 },
+    /// Bundle bytes ended before all fixed-layout fields could be
+    /// read. Distinct from `WireMalformed` so the diagnostic names
+    /// the actual condition.
+    WireTruncated { needed: usize, available: usize },
+    /// Bundle bytes were structurally malformed (e.g. a v4 lane
+    /// carried 16 bytes that were not in the v4-mapped-IPv6 prefix
+    /// form). Carries a fixed-vocabulary diagnostic so logging stays
+    /// safe.
+    WireMalformed(&'static str),
 }
 
 impl std::fmt::Display for GossipError {
@@ -146,6 +185,20 @@ impl std::fmt::Display for GossipError {
                 f,
                 "local clock is before UNIX_EPOCH; cannot compute timestamp"
             ),
+            GossipError::WireVersionMismatch {
+                expected,
+                presented,
+            } => write!(
+                f,
+                "gossip bundle wire version mismatch (expected {expected}, presented {presented})"
+            ),
+            GossipError::WireTruncated { needed, available } => write!(
+                f,
+                "gossip bundle wire truncated (needed {needed}, available {available})"
+            ),
+            GossipError::WireMalformed(reason) => {
+                write!(f, "gossip bundle wire malformed: {reason}")
+            }
         }
     }
 }
@@ -188,6 +241,14 @@ impl SeenSequenceState {
     /// Number of distinct sources we've ever accepted a bundle from.
     pub fn source_count(&self) -> usize {
         self.inner.len()
+    }
+
+    /// Iterate `(source_id, highest_accepted_sequence)` pairs. Used
+    /// by the gossip watermark spool to serialise the per-source
+    /// ledger. The order is unspecified — callers that need a
+    /// deterministic spool layout should sort the result.
+    pub fn iter_pairs_for_spool(&self) -> impl Iterator<Item = (&[u8; 32], &u64)> {
+        self.inner.iter()
     }
 }
 
@@ -445,6 +506,230 @@ pub fn accept_bundle_with_now(
     }
     state.record(bundle.source_node_id, bundle.sequence);
     Ok(())
+}
+
+/// Serialise a [`GossipBundle`] into a fixed-layout wire form. The
+/// version byte at offset 0 is [`GOSSIP_BUNDLE_WIRE_VERSION`]; an
+/// unknown version causes [`deserialise_bundle`] to reject hard
+/// (no silent downgrade).
+///
+/// Layout (big-endian numbers):
+///
+/// * `[0]` — version byte (=1)
+/// * `[1..33]` — source node id (32 bytes)
+/// * `[33..41]` — sequence (u64)
+/// * `[41..49]` — timestamp unix seconds (u64)
+/// * `[49..53]` — v4_host count (u32)
+/// * `[53..57]` — v6_host count (u32)
+/// * `[57..61]` — v4_srflx count (u32)
+/// * `[61..65]` — v6_srflx count (u32)
+/// * `[65..]` — candidate slots, 18 bytes each: 16-byte v6-mapped
+///   octets + 2-byte port (BE). For host slots the port field is
+///   always zero; for srflx slots it carries the observed port.
+/// * `[end-64..end]` — 64-byte Ed25519 signature (separated from the
+///   signing pre-image: the pre-image uses the canonical form defined
+///   in [`signing_preimage`], the wire trailer is the raw signature).
+///
+/// Pre-condition: the bundle's total candidate count must already
+/// satisfy [`MAX_CANDIDATES_PER_BUNDLE`]; bundles that violate it
+/// cannot have been produced by [`mint_bundle`] and the deserialiser
+/// rejects them on read.
+pub fn serialise_bundle(bundle: &GossipBundle) -> Vec<u8> {
+    let count = bundle.candidates.v4_host.len()
+        + bundle.candidates.v6_host.len()
+        + bundle.candidates.v4_srflx.len()
+        + bundle.candidates.v6_srflx.len();
+    let mut out = Vec::with_capacity(
+        WIRE_CANDIDATES_OFFSET + count * WIRE_CANDIDATE_STRIDE + WIRE_SIGNATURE_LEN,
+    );
+    out.push(GOSSIP_BUNDLE_WIRE_VERSION);
+    out.extend_from_slice(&bundle.source_node_id);
+    out.extend_from_slice(&bundle.sequence.to_be_bytes());
+    out.extend_from_slice(&bundle.timestamp_unix.to_be_bytes());
+    out.extend_from_slice(&(bundle.candidates.v4_host.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(bundle.candidates.v6_host.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(bundle.candidates.v4_srflx.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(bundle.candidates.v6_srflx.len() as u32).to_be_bytes());
+    for ip in &bundle.candidates.v4_host {
+        out.extend_from_slice(&ip_to_v6_octets(*ip));
+        out.extend_from_slice(&0u16.to_be_bytes());
+    }
+    for ip in &bundle.candidates.v6_host {
+        out.extend_from_slice(&ip_to_v6_octets(*ip));
+        out.extend_from_slice(&0u16.to_be_bytes());
+    }
+    for sa in &bundle.candidates.v4_srflx {
+        out.extend_from_slice(&ip_to_v6_octets(sa.ip()));
+        out.extend_from_slice(&sa.port().to_be_bytes());
+    }
+    for sa in &bundle.candidates.v6_srflx {
+        out.extend_from_slice(&ip_to_v6_octets(sa.ip()));
+        out.extend_from_slice(&sa.port().to_be_bytes());
+    }
+    out.extend_from_slice(&bundle.signature.to_bytes());
+    out
+}
+
+/// Inverse of [`serialise_bundle`]. Strictly version-gated, length-
+/// checked, and family-checked. Does NOT verify the signature or the
+/// freshness window — that is [`accept_bundle`]'s job. Returns one of
+/// the `Wire*` `GossipError` variants on malformed input.
+pub fn deserialise_bundle(bytes: &[u8]) -> Result<GossipBundle, GossipError> {
+    if bytes.len() > MAX_GOSSIP_DATAGRAM_BYTES {
+        return Err(GossipError::WireMalformed(
+            "datagram exceeds MAX_GOSSIP_DATAGRAM_BYTES",
+        ));
+    }
+    if bytes.len() < WIRE_CANDIDATES_OFFSET + WIRE_SIGNATURE_LEN {
+        return Err(GossipError::WireTruncated {
+            needed: WIRE_CANDIDATES_OFFSET + WIRE_SIGNATURE_LEN,
+            available: bytes.len(),
+        });
+    }
+    let presented_version = bytes[WIRE_VERSION_OFFSET];
+    if presented_version != GOSSIP_BUNDLE_WIRE_VERSION {
+        return Err(GossipError::WireVersionMismatch {
+            expected: GOSSIP_BUNDLE_WIRE_VERSION,
+            presented: presented_version,
+        });
+    }
+    let mut source_node_id = [0u8; 32];
+    source_node_id.copy_from_slice(&bytes[WIRE_SOURCE_OFFSET..WIRE_SOURCE_OFFSET + 32]);
+    let sequence = u64::from_be_bytes(
+        bytes[WIRE_SEQUENCE_OFFSET..WIRE_SEQUENCE_OFFSET + 8]
+            .try_into()
+            .expect("slice length is 8"),
+    );
+    let timestamp_unix = u64::from_be_bytes(
+        bytes[WIRE_TIMESTAMP_OFFSET..WIRE_TIMESTAMP_OFFSET + 8]
+            .try_into()
+            .expect("slice length is 8"),
+    );
+    let v4_host_count = u32::from_be_bytes(
+        bytes[WIRE_COUNTS_OFFSET..WIRE_COUNTS_OFFSET + 4]
+            .try_into()
+            .expect("slice length is 4"),
+    ) as usize;
+    let v6_host_count = u32::from_be_bytes(
+        bytes[WIRE_COUNTS_OFFSET + 4..WIRE_COUNTS_OFFSET + 8]
+            .try_into()
+            .expect("slice length is 4"),
+    ) as usize;
+    let v4_srflx_count = u32::from_be_bytes(
+        bytes[WIRE_COUNTS_OFFSET + 8..WIRE_COUNTS_OFFSET + 12]
+            .try_into()
+            .expect("slice length is 4"),
+    ) as usize;
+    let v6_srflx_count = u32::from_be_bytes(
+        bytes[WIRE_COUNTS_OFFSET + 12..WIRE_COUNTS_OFFSET + 16]
+            .try_into()
+            .expect("slice length is 4"),
+    ) as usize;
+    let total_count = v4_host_count
+        .checked_add(v6_host_count)
+        .and_then(|s| s.checked_add(v4_srflx_count))
+        .and_then(|s| s.checked_add(v6_srflx_count))
+        .ok_or(GossipError::WireMalformed("candidate count overflow"))?;
+    if total_count > MAX_CANDIDATES_PER_BUNDLE {
+        return Err(GossipError::TooManyCandidates {
+            presented: total_count,
+            max: MAX_CANDIDATES_PER_BUNDLE,
+        });
+    }
+    let body_end = WIRE_CANDIDATES_OFFSET
+        .checked_add(
+            total_count
+                .checked_mul(WIRE_CANDIDATE_STRIDE)
+                .ok_or(GossipError::WireMalformed("candidate length overflow"))?,
+        )
+        .ok_or(GossipError::WireMalformed("candidate offset overflow"))?;
+    let needed = body_end
+        .checked_add(WIRE_SIGNATURE_LEN)
+        .ok_or(GossipError::WireMalformed("wire size overflow"))?;
+    if bytes.len() != needed {
+        return Err(GossipError::WireTruncated {
+            needed,
+            available: bytes.len(),
+        });
+    }
+    let mut cursor = WIRE_CANDIDATES_OFFSET;
+    let mut v4_host = Vec::with_capacity(v4_host_count);
+    for _ in 0..v4_host_count {
+        let ip = read_v4_lane_octets(&bytes[cursor..cursor + 16])?;
+        v4_host.push(IpAddr::V4(ip));
+        cursor += WIRE_CANDIDATE_STRIDE;
+    }
+    let mut v6_host = Vec::with_capacity(v6_host_count);
+    for _ in 0..v6_host_count {
+        let ip = read_v6_lane_octets(&bytes[cursor..cursor + 16])?;
+        v6_host.push(IpAddr::V6(ip));
+        cursor += WIRE_CANDIDATE_STRIDE;
+    }
+    let mut v4_srflx = Vec::with_capacity(v4_srflx_count);
+    for _ in 0..v4_srflx_count {
+        let ip = read_v4_lane_octets(&bytes[cursor..cursor + 16])?;
+        let port = u16::from_be_bytes([bytes[cursor + 16], bytes[cursor + 17]]);
+        v4_srflx.push(SocketAddr::new(IpAddr::V4(ip), port));
+        cursor += WIRE_CANDIDATE_STRIDE;
+    }
+    let mut v6_srflx = Vec::with_capacity(v6_srflx_count);
+    for _ in 0..v6_srflx_count {
+        let ip = read_v6_lane_octets(&bytes[cursor..cursor + 16])?;
+        let port = u16::from_be_bytes([bytes[cursor + 16], bytes[cursor + 17]]);
+        v6_srflx.push(SocketAddr::new(IpAddr::V6(ip), port));
+        cursor += WIRE_CANDIDATE_STRIDE;
+    }
+    let mut signature_bytes = [0u8; WIRE_SIGNATURE_LEN];
+    signature_bytes.copy_from_slice(&bytes[body_end..body_end + WIRE_SIGNATURE_LEN]);
+    let signature = Signature::from_bytes(&signature_bytes);
+    Ok(GossipBundle {
+        source_node_id,
+        sequence,
+        timestamp_unix,
+        candidates: CandidateSet {
+            v4_host,
+            v6_host,
+            v4_srflx,
+            v6_srflx,
+        },
+        signature,
+    })
+}
+
+/// Read a v4 lane's 16-byte octets and reconstruct the embedded
+/// [`Ipv4Addr`]. Rejects octets that aren't in the v4-mapped IPv6
+/// prefix shape (`::ffff:X.X.X.X`) so a malformed wire can't sneak an
+/// arbitrary v6 address into a v4 lane.
+fn read_v4_lane_octets(octets: &[u8]) -> Result<Ipv4Addr, GossipError> {
+    if octets.len() != 16 {
+        return Err(GossipError::WireMalformed("v4 lane octets wrong length"));
+    }
+    if octets[0..10] != [0u8; 10] || octets[10] != 0xff || octets[11] != 0xff {
+        return Err(GossipError::WireMalformed(
+            "v4 lane is not v4-mapped IPv6 prefix",
+        ));
+    }
+    Ok(Ipv4Addr::new(
+        octets[12], octets[13], octets[14], octets[15],
+    ))
+}
+
+/// Read a v6 lane's 16-byte octets and return an [`Ipv6Addr`].
+/// Rejects octets that happen to be in the v4-mapped prefix form
+/// (`::ffff:X.X.X.X`) so a malformed wire can't sneak a v4 address
+/// into a v6 lane.
+fn read_v6_lane_octets(octets: &[u8]) -> Result<Ipv6Addr, GossipError> {
+    if octets.len() != 16 {
+        return Err(GossipError::WireMalformed("v6 lane octets wrong length"));
+    }
+    if octets[0..10] == [0u8; 10] && octets[10] == 0xff && octets[11] == 0xff {
+        return Err(GossipError::WireMalformed(
+            "v6 lane carries v4-mapped IPv6 prefix",
+        ));
+    }
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(octets);
+    Ok(Ipv6Addr::from(buf))
 }
 
 /// Pure helper: extract every endpoint (host + srflx, v4 + v6) from a
@@ -846,5 +1131,150 @@ mod tests {
                 .unwrap();
         accept_bundle_with_now(&future, &known, &mut state, 300, 1_700_000_300)
             .expect("boundary future timestamp accepted");
+    }
+
+    #[test]
+    fn serialise_then_deserialise_round_trips_round_trips_a_random_bundle() {
+        // Round-trip pin: every signed field must survive
+        // serialise/deserialise unchanged, and the signature trailer
+        // must survive byte-for-byte (so verify_signature still
+        // succeeds after the round trip).
+        let signing_key = deterministic_signing_key(30);
+        let verifying_key = signing_key.verifying_key();
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 42, 1_700_000_000, sample_candidates())
+                .expect("mint succeeds");
+        let wire = serialise_bundle(&bundle);
+        assert_eq!(
+            wire[WIRE_VERSION_OFFSET], GOSSIP_BUNDLE_WIRE_VERSION,
+            "wire version byte must be at offset 0"
+        );
+        let decoded = deserialise_bundle(&wire).expect("deserialise succeeds");
+        assert_eq!(decoded.source_node_id, bundle.source_node_id);
+        assert_eq!(decoded.sequence, bundle.sequence);
+        assert_eq!(decoded.timestamp_unix, bundle.timestamp_unix);
+        assert_eq!(decoded.candidates, bundle.candidates);
+        assert_eq!(decoded.signature.to_bytes(), bundle.signature.to_bytes());
+        // Defense-in-depth: a round-tripped bundle must still pass
+        // signature verification under the originator's key.
+        verify_signature(&decoded, &verifying_key)
+            .expect("signature must verify after wire round-trip");
+    }
+
+    #[test]
+    fn deserialise_rejects_wrong_version_byte() {
+        let signing_key = deterministic_signing_key(31);
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
+                .expect("mint succeeds");
+        let mut wire = serialise_bundle(&bundle);
+        wire[WIRE_VERSION_OFFSET] = GOSSIP_BUNDLE_WIRE_VERSION.wrapping_add(1);
+        let err = deserialise_bundle(&wire).expect_err("must reject unknown version");
+        match err {
+            GossipError::WireVersionMismatch {
+                expected,
+                presented,
+            } => {
+                assert_eq!(expected, GOSSIP_BUNDLE_WIRE_VERSION);
+                assert_eq!(presented, GOSSIP_BUNDLE_WIRE_VERSION.wrapping_add(1));
+            }
+            other => panic!("expected WireVersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialise_rejects_truncated_bundle() {
+        let signing_key = deterministic_signing_key(32);
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
+                .expect("mint succeeds");
+        let wire = serialise_bundle(&bundle);
+        // Lop off the last byte of the signature — must report a
+        // strictly-typed truncation error, not panic.
+        let truncated = &wire[..wire.len() - 1];
+        let err = deserialise_bundle(truncated).expect_err("must reject truncated wire");
+        assert!(
+            matches!(err, GossipError::WireTruncated { .. }),
+            "expected WireTruncated, got {err:?}"
+        );
+        // Also: bytes shorter than the fixed header must report
+        // WireTruncated, not WireMalformed (the header-size pre-check
+        // is the only sane place for the early exit).
+        let header_only = &wire[..WIRE_CANDIDATES_OFFSET - 1];
+        let err = deserialise_bundle(header_only).expect_err("header-truncated must reject");
+        assert!(
+            matches!(err, GossipError::WireTruncated { .. }),
+            "expected WireTruncated for header-only truncation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn serialise_size_is_bounded_by_max_candidates_per_bundle() {
+        // A maximally-packed legal bundle must fit inside the
+        // MAX_GOSSIP_DATAGRAM_BYTES envelope. This pins the math: any
+        // future bump of MAX_CANDIDATES_PER_BUNDLE that would push us
+        // past the datagram cap fails this test.
+        let signing_key = deterministic_signing_key(33);
+        let mut candidates = CandidateSet::default();
+        for i in 0..MAX_CANDIDATES_PER_BUNDLE as u32 {
+            // Use distinct private-range v4 addresses so all
+            // candidates pass the scope filter.
+            let a = ((i / 256) % 256) as u8;
+            let b = (i % 256) as u8;
+            candidates
+                .v4_host
+                .push(IpAddr::V4(Ipv4Addr::new(10, 0, a, b)));
+        }
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, candidates).expect("mint");
+        let wire = serialise_bundle(&bundle);
+        assert!(
+            wire.len() <= MAX_GOSSIP_DATAGRAM_BYTES,
+            "max-packed bundle ({} bytes) exceeds MAX_GOSSIP_DATAGRAM_BYTES ({})",
+            wire.len(),
+            MAX_GOSSIP_DATAGRAM_BYTES
+        );
+        let expected = WIRE_CANDIDATES_OFFSET
+            + MAX_CANDIDATES_PER_BUNDLE * WIRE_CANDIDATE_STRIDE
+            + WIRE_SIGNATURE_LEN;
+        assert_eq!(
+            wire.len(),
+            expected,
+            "wire size must equal fixed header + N*stride + signature"
+        );
+    }
+
+    #[test]
+    fn deserialise_rejects_oversized_datagram() {
+        // A datagram larger than MAX_GOSSIP_DATAGRAM_BYTES must be
+        // rejected without panic — the receive path enforces the same
+        // cap so a malicious peer cannot exhaust verifier memory.
+        let blob = vec![0u8; MAX_GOSSIP_DATAGRAM_BYTES + 1];
+        let err = deserialise_bundle(&blob).expect_err("oversized datagram must reject");
+        assert!(
+            matches!(err, GossipError::WireMalformed(_)),
+            "expected WireMalformed for oversized datagram, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deserialise_rejects_v4_lane_with_non_mapped_octets() {
+        // A wire whose v4 lane carries 16 bytes that are NOT in the
+        // v4-mapped IPv6 prefix form is malformed. Without this
+        // strict check a producer could sneak an arbitrary v6 address
+        // into a v4 slot and bypass downstream family-typed logic.
+        let signing_key = deterministic_signing_key(34);
+        let bundle =
+            mint_bundle_with_timestamp(&signing_key, 1, 1_700_000_000, sample_candidates())
+                .expect("mint");
+        let mut wire = serialise_bundle(&bundle);
+        // sample_candidates() puts one v4_host first; corrupt its
+        // octets so the v4-mapped prefix bytes are wrong.
+        wire[WIRE_CANDIDATES_OFFSET] = 0xab;
+        let err = deserialise_bundle(&wire).expect_err("must reject malformed v4 lane");
+        assert!(
+            matches!(err, GossipError::WireMalformed(_)),
+            "expected WireMalformed, got {err:?}"
+        );
     }
 }
