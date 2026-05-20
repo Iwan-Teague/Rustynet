@@ -2754,6 +2754,41 @@ mod tests {
     }
 
     #[test]
+    fn rustynetd_service_template_wires_graceful_shutdown_signal_path_and_failsafe_cleanup() {
+        // The Unix signal handler installed in
+        // rustynetd::unix_shutdown_signals only matters if systemd
+        // actually gives the daemon time to handle SIGTERM and then
+        // scrubs leftover kernel state in case the daemon dies
+        // ungracefully. Both invariants live in the unit file:
+        // `TimeoutStopSec` bounds the graceful window, and the
+        // `disconnect-cleanup` ExecStopPost is the fail-safe that
+        // prevents the L8 boot-time killswitch check from refusing
+        // the next start because the tunnel interface is still up
+        // after a crash. Removing either is a silent regression of
+        // the live-lab restart story, so pin them here.
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let service_template =
+            std::fs::read_to_string(repo_root.join("scripts/systemd/rustynetd.service"))
+                .expect("rustynetd service template should be readable");
+        assert!(
+            service_template.contains("TimeoutStopSec="),
+            "rustynetd service template must bound the SIGTERM-to-SIGKILL window so graceful shutdown actually runs"
+        );
+        assert!(
+            service_template
+                .contains("ExecStopPost=-/usr/local/bin/rustynet ops disconnect-cleanup"),
+            "rustynetd service template must run the kernel-state scrubber after the daemon exits so a panic or SIGKILL cannot leave the tunnel interface up without its killswitch table"
+        );
+        // The leading `-` is load-bearing: it tells systemd to
+        // ignore the ExecStopPost exit code so a clean shutdown
+        // (nothing to clean) cannot mask the daemon's exit status.
+        assert!(
+            service_template.contains("ExecStopPost=-/"),
+            "rustynetd service template must mark ExecStopPost with the systemd `-` ignore-failure prefix"
+        );
+    }
+
+    #[test]
     fn privileged_helper_service_template_preserves_tun_device_access_for_helper_owned_setup() {
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let service_template = std::fs::read_to_string(
