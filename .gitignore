@@ -19,6 +19,14 @@ __pycache__/
 # Existing tracked artifact files remain tracked until explicitly removed from the index.
 /artifacts/**
 !/artifacts/**/.gitkeep
+# Live-lab report directories written by `ops vm-lab-setup-live-lab` and
+# `ops vm-lab-run-live-lab` land here (state/live-lab-<UTC>/). They are
+# local-only evidence — the run wrapper refuses to generate the
+# commit-bound fresh-install OS matrix report from a dirty tree, so
+# leaving these dirs untracked would otherwise hard-fail every live lab
+# run with `cannot generate commit-bound … report from a dirty working
+# tree`.
+/state/**
 /profiles/live_lab/*.env
 /profiles/live_lab/generated_vm_lab_*_known_hosts
 !/profiles/live_lab/default_four_node.env
