@@ -316,7 +316,40 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
 - **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
 - **Cross-platform note.** Linux + macOS roles all land in D12 (except macOS `blind_exit`, which stays Linux-only). Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
-- **Status (2026-05-21).** **D12.a + D12.b + D12.e complete (pre-D11.a surface).**
+- **Status (2026-05-21).** **D12.a + D12.b + D12.c (start.sh) + D12.e complete (pre-D11.a surface).**
+
+  D12.c lands the wizard surface in `start.sh`: the initial-setup role prompt now offers all six presets (`anchor`, `admin`, `exit`, `relay`, `client`, `blind_exit`) via the new `prompt_role_preset` helper. New tracking var `SETUP_ROLE_PRESET` records the operator's preset choice; the existing `NODE_ROLE` primary axis (`admin`/`client`/`blind_exit`) is derived deterministically by the new `normalize_role_preset` helper.
+
+  Preset → NODE_ROLE primary mapping:
+  - `client` → `client`
+  - `admin` / `exit` / `relay` / `anchor` → `admin` (presets that need capabilities ride on admin primary today)
+  - `blind_exit` → `blind_exit`
+
+  Per-preset wizard behaviour:
+  - `client` / `admin` / `blind_exit` — same flow as before, with the existing confirmation prompts (admin requires confirmation, blind_exit requires explicit irreversibility ack on first setup, blind_exit is Linux-only).
+  - `exit` — operator gets a follow-up notice with the exact `rustynet role set exit` / `rustynet route advertise 0.0.0.0/0` invocations to run post-setup.
+  - `relay` / `anchor` — operator gets a clear, non-blocking notice that the role requires the D11.a capability schema (queued). The device is provisioned as `admin` primary today with `SETUP_ROLE_PRESET` recorded so the daemon will auto-elevate once D11.a lands. Tracking pointer to the dataplane plan included.
+
+  Post-setup role-switch wizard surface is intentionally narrower: only `admin ↔ client` is permitted from the wizard (matches the existing local-only transition the daemon supports without restart-required IPC). Other transitions (`exit`/`relay`/`anchor`) explicitly redirect to `rustynet role set <preset>` so the orchestrator runs through the D12.b CLI path and emits a D12.e audit-log entry. Blind-exit lock-out preserved.
+
+  `SETUP_ROLE_PRESET` added to the `is_allowed_config_key` allowlist so the wizard's env-file persistence path accepts it (and existing env-file roundtrip tests cover it).
+
+  Defaults: when an existing setup is loaded with no `SETUP_ROLE_PRESET` set but a known `NODE_ROLE`, `normalize_role_preset` accepts the unset preset state (no coercion) and the wizard derives a sensible default from `NODE_ROLE` on the next prompt. New installs always set the preset explicitly.
+
+  Operator-menu mirror (`rustynet operator menu`) deferred: the CLI verbs `rustynet role list`, `rustynet role status`, `rustynet role set <preset>`, and `rustynet role transition-check --to <preset>` from D12.b are already the canonical post-setup surface and the operator menu can be extended in a follow-up slice without changing wizard semantics.
+
+  Mobile read-only role indicator deferred: mobile is `client (mobile)` only per the taxonomy doc; the FFI surface will mirror this in the mobile crate split (`rustynet-mobile-core`) when mobile work resumes per `documents/mobile/RustynetMobileRoadmap_2026-04-17.md` M3.
+
+  Gates green:
+  - `bash -n start.sh` (syntax)
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test --workspace --all-targets --all-features` (no regressions across 1335 lib tests + 30 role_cli + 14 role_audit + 2 RouteRetract)
+  - `./scripts/ci/membership_gates.sh` PASS
+
+  D12.d (service deploy/undeploy) remains queued.
+
+  D12.e + D12.b + D12.a status:
 
   D12.e lands `crates/rustynet-control/src/role_audit.rs` (~550 lines impl + 14 tests). Every role transition (success, blocked, mid-execution failure) and every capability mutation attempt emits an append-only audit entry via the orchestrator in `main.rs::execute_role_plan` + `execute_capability`. The chain shape mirrors the existing membership audit log (`verify_membership_log_chain`): each entry binds to the previous via `previous_hash`, and `entry_hash = sha256(index | previous_hash | event_canonical_payload_hex)`. Tampering with any field invalidates the chain from that position forward — confirmed by six negative tests (entry_hash tamper, payload tamper, previous_hash tamper, reorder, insert, plus all-positive read/append/verify cycles).
 

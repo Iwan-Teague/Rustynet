@@ -54,6 +54,15 @@ AUTO_REFRESH_TRUST="0"
 DEVICE_NODE_ID="$(hostname -s 2>/dev/null || echo rustynet-node)"
 SETUP_COMPLETE="0"
 NODE_ROLE=""
+# D12.c — operator-selected role preset (one of the six in
+# documents/operations/active/NodeRoleTaxonomy_2026-05-21.md).
+# NODE_ROLE remains the primary local axis (admin|client|blind_exit)
+# for daemon dispatch; SETUP_ROLE_PRESET records the named composition
+# the operator picked so post-setup orchestration can queue
+# preset-specific follow-up actions (e.g. advertise 0.0.0.0/0 for the
+# exit preset, surface the D11.a queued-capability notice for relay /
+# anchor).
+SETUP_ROLE_PRESET=""
 MANUAL_PEER_OVERRIDE="0"
 DEFAULT_LAUNCH_PROFILE="menu"
 AUTO_LAUNCH_ON_START="0"
@@ -182,6 +191,72 @@ normalize_node_role() {
     print_warn "blind_exit role is supported only on Linux hosts. Reverting to client role."
     NODE_ROLE="client"
   fi
+  normalize_role_preset
+}
+
+# D12.c — validate SETUP_ROLE_PRESET and ensure it stays consistent
+# with NODE_ROLE. The preset is the operator-facing name; NODE_ROLE
+# is the daemon-side primary axis. They must agree on:
+#   client      → primary=client
+#   admin       → primary=admin
+#   exit        → primary=admin   (exit-serving capability layered on)
+#   blind_exit  → primary=blind_exit
+#   relay       → primary=admin   (relay capability — gated by D11.a)
+#   anchor      → primary=admin   (anchor capabilities — gated by D11.a)
+normalize_role_preset() {
+  case "${SETUP_ROLE_PRESET}" in
+    ""|anchor|admin|exit|relay|client|blind_exit) ;;
+    *)
+      print_warn "Invalid SETUP_ROLE_PRESET='${SETUP_ROLE_PRESET}', clearing."
+      SETUP_ROLE_PRESET=""
+      ;;
+  esac
+
+  # If preset is set, ensure NODE_ROLE matches the preset's primary
+  # mapping. Preset is the source of truth when both are set.
+  if [[ -n "${SETUP_ROLE_PRESET}" ]]; then
+    local expected_primary=""
+    case "${SETUP_ROLE_PRESET}" in
+      client) expected_primary="client" ;;
+      blind_exit) expected_primary="blind_exit" ;;
+      admin|exit|relay|anchor) expected_primary="admin" ;;
+    esac
+    if [[ "${NODE_ROLE}" != "${expected_primary}" ]]; then
+      print_warn "NODE_ROLE='${NODE_ROLE}' does not match SETUP_ROLE_PRESET='${SETUP_ROLE_PRESET}'; coercing to '${expected_primary}'."
+      NODE_ROLE="${expected_primary}"
+    fi
+  fi
+}
+
+# D12.c — render the six user-selectable presets defined in
+# documents/operations/active/NodeRoleTaxonomy_2026-05-21.md and
+# read the operator's choice. The prompt is platform-aware:
+# blind_exit is masked off on non-Linux hosts, and relay / anchor
+# are explicitly marked as gated by D11.a so the operator
+# understands the dependency before picking one.
+prompt_role_preset() {
+  local __out_var="$1"
+  local __default_preset="${2:-admin}"
+
+  print_info "Select the role for this device. Six presets are available:"
+  print_info "  1) anchor      — always-on home box: gossip seed + relay + bundle-pull + enrollment endpoint"
+  print_info "                    [gated by D11.a capability schema; selecting today configures the closest primary"
+  print_info "                     (admin) and records the preset for activation when D11.a lands]"
+  print_info "  2) admin       — admin workstation: full operational console; no extra mesh duties"
+  print_info "  3) exit        — internet egress for other peers (advertises 0.0.0.0/0)"
+  print_info "  4) relay       — encrypted UDP forwarding for peers that cannot direct-connect"
+  print_info "                    [gated by D11.a capability schema; selecting today configures the closest primary"
+  print_info "                     (admin) and records the preset for activation when D11.a lands]"
+  print_info "  5) client      — uses the mesh; hosts nothing"
+  if is_linux_host; then
+    print_info "  6) blind_exit  — hardened final-hop exit (Linux only; IMMUTABLE — factory reset to change)"
+  else
+    print_info "  6) blind_exit  — (blocked: Linux-only)"
+  fi
+
+  local __selected=""
+  prompt_default __selected "Role preset (anchor|admin|exit|relay|client|blind_exit)" "${__default_preset}"
+  printf -v "${__out_var}" '%s' "${__selected}"
 }
 
 is_admin_role() {
@@ -257,7 +332,7 @@ enforce_role_policy_defaults() {
 is_allowed_config_key() {
   local key="$1"
   case "${key}" in
-    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|TRAVERSAL_BUNDLE_PATH|TRAVERSAL_VERIFIER_KEY_PATH|TRAVERSAL_WATERMARK_PATH|TRAVERSAL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|AUTO_PORT_FORWARD_EXIT|AUTO_PORT_FORWARD_LEASE_SECS|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|EXIT_CHAIN_HOPS|EXIT_CHAIN_ENTRY_NODE_ID|EXIT_CHAIN_FINAL_NODE_ID|HOST_PROFILE)
+    SOCKET_PATH|STATE_PATH|TRUST_EVIDENCE_PATH|TRUST_VERIFIER_KEY_PATH|TRUST_WATERMARK_PATH|AUTO_TUNNEL_ENFORCE|AUTO_TUNNEL_BUNDLE_PATH|AUTO_TUNNEL_VERIFIER_KEY_PATH|AUTO_TUNNEL_WATERMARK_PATH|AUTO_TUNNEL_MAX_AGE_SECS|TRAVERSAL_BUNDLE_PATH|TRAVERSAL_VERIFIER_KEY_PATH|TRAVERSAL_WATERMARK_PATH|TRAVERSAL_MAX_AGE_SECS|WG_INTERFACE|WG_LISTEN_PORT|AUTO_PORT_FORWARD_EXIT|AUTO_PORT_FORWARD_LEASE_SECS|WG_PRIVATE_KEY_PATH|WG_ENCRYPTED_PRIVATE_KEY_PATH|WG_KEY_PASSPHRASE_PATH|WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH|WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT|WG_PUBLIC_KEY_PATH|EGRESS_INTERFACE|MEMBERSHIP_SNAPSHOT_PATH|MEMBERSHIP_LOG_PATH|MEMBERSHIP_WATERMARK_PATH|MEMBERSHIP_OWNER_SIGNING_KEY_PATH|BACKEND_MODE|DATAPLANE_MODE|PRIVILEGED_HELPER_SOCKET_PATH|PRIVILEGED_HELPER_TIMEOUT_MS|RECONCILE_INTERVAL_MS|MAX_RECONCILE_FAILURES|FAIL_CLOSED_SSH_ALLOW|FAIL_CLOSED_SSH_ALLOW_CIDRS|TRUST_SIGNER_KEY_PATH|AUTO_REFRESH_TRUST|DEVICE_NODE_ID|SETUP_COMPLETE|NODE_ROLE|SETUP_ROLE_PRESET|MANUAL_PEER_OVERRIDE|MANUAL_PEER_AUDIT_LOG|DEFAULT_LAUNCH_PROFILE|AUTO_LAUNCH_ON_START|AUTO_LAUNCH_EXIT_NODE_ID|AUTO_LAUNCH_LAN_MODE|EXIT_CHAIN_HOPS|EXIT_CHAIN_ENTRY_NODE_ID|EXIT_CHAIN_FINAL_NODE_ID|HOST_PROFILE)
       return 0
       ;;
     *)
@@ -3259,45 +3334,121 @@ configure_values() {
     return 1
   fi
   prompt_default DEVICE_NODE_ID "Local device node id (used for display)" "${DEVICE_NODE_ID}"
-  role_prompt="Node role (admin|client)"
-  if [[ "${SETUP_COMPLETE}" != "1" ]]; then
-    role_prompt="Node role (admin|client|blind_exit)"
+
+  # D12.c — six-preset role surface, replacing the previous
+  # three-option (admin|client|blind_exit) prompt. The preset is
+  # the operator-facing name; the underlying daemon primary axis
+  # (NODE_ROLE = admin|client|blind_exit) is derived
+  # deterministically by normalize_role_preset.
+  default_preset="${SETUP_ROLE_PRESET}"
+  if [[ -z "${default_preset}" ]]; then
+    case "${NODE_ROLE}" in
+      blind_exit) default_preset="blind_exit" ;;
+      client) default_preset="client" ;;
+      admin) default_preset="admin" ;;
+      *) default_preset="admin" ;;
+    esac
   fi
-  prompt_default selected_role "${role_prompt}" "${NODE_ROLE}"
-  case "${selected_role}" in
-    admin|client|blind_exit) ;;
-    *)
-      print_err "Unsupported node role '${selected_role}'. Expected admin, client, or blind_exit."
-      return 1
-      ;;
-  esac
-  if [[ "${selected_role}" == "blind_exit" ]] && ! is_linux_host; then
-    print_err "blind_exit role is supported only on Linux hosts."
-    return 1
-  fi
-  if [[ "${SETUP_COMPLETE}" == "1" && "${selected_role}" != "${previous_role}" ]]; then
-    if [[ "${selected_role}" == "blind_exit" || "${previous_role}" == "blind_exit" ]]; then
-      print_blind_exit_lock_notice
+
+  if [[ "${SETUP_COMPLETE}" == "1" ]]; then
+    # Post-setup role changes via the wizard support only the
+    # local-only primary toggle (admin ↔ client). All other preset
+    # transitions go through `rustynet role set <preset>` so they
+    # emit role_audit chain entries via D12.e + (when D11.a lands)
+    # signed-membership update records via D12.b orchestrator.
+    role_prompt="Node role (admin|client)"
+    prompt_default selected_role "${role_prompt}" "${NODE_ROLE}"
+    case "${selected_role}" in
+      admin|client) ;;
+      blind_exit)
+        print_blind_exit_lock_notice
+        return 1
+        ;;
+      exit|relay|anchor)
+        print_warn "Post-setup transition to '${selected_role}' must go through 'rustynet role set ${selected_role}'."
+        print_info "That CLI verb writes a role_transitions audit-log entry and (for capability-bearing presets) emits a signed-membership update record for the admin to sign + apply."
+        return 1
+        ;;
+      *)
+        print_err "Unsupported node role '${selected_role}'. Post-setup options: admin, client."
+        return 1
+        ;;
+    esac
+    if [[ "${selected_role}" != "${previous_role}" ]]; then
+      if [[ "${selected_role}" == "blind_exit" || "${previous_role}" == "blind_exit" ]]; then
+        print_blind_exit_lock_notice
+        return 1
+      fi
+      print_warn "Role changes after setup must use 'Switch node role (guided client/admin transition)'."
+      selected_role="${previous_role}"
+    fi
+    NODE_ROLE="${selected_role}"
+    SETUP_ROLE_PRESET="${selected_role}"
+    normalize_node_role
+  else
+    # Initial setup: present the full six-preset surface.
+    prompt_role_preset selected_preset "${default_preset}"
+    case "${selected_preset}" in
+      anchor|admin|exit|relay|client|blind_exit) ;;
+      *)
+        print_err "Unsupported role preset '${selected_preset}'. Expected one of: anchor, admin, exit, relay, client, blind_exit."
+        return 1
+        ;;
+    esac
+    if [[ "${selected_preset}" == "blind_exit" ]] && ! is_linux_host; then
+      print_err "blind_exit preset is supported only on Linux hosts."
       return 1
     fi
-    print_warn "Role changes after setup must use 'Switch node role (guided client/admin transition)'."
-    selected_role="${previous_role}"
+    SETUP_ROLE_PRESET="${selected_preset}"
+    case "${selected_preset}" in
+      client) NODE_ROLE="client" ;;
+      admin|exit|relay|anchor) NODE_ROLE="admin" ;;
+      blind_exit) NODE_ROLE="blind_exit" ;;
+    esac
+    normalize_node_role
+
+    case "${SETUP_ROLE_PRESET}" in
+      exit)
+        print_info "Preset 'exit' selected. Primary role set to 'admin'. After setup completes, advertise the default route to activate exit-serving:"
+        print_info "  rustynet role set exit"
+        print_info "  (or:  rustynet route advertise 0.0.0.0/0  for the underlying IPC verb)"
+        ;;
+      relay)
+        print_warn "Preset 'relay' selected. The relay role requires the D11.a capability schema (membership-bundle node_capabilities field). That schema is queued."
+        print_info "This device will run as 'admin' primary today; once D11.a lands, the daemon will read SETUP_ROLE_PRESET=relay and elevate to relay-serving automatically."
+        print_info "Tracking: documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md (D11.a)"
+        ;;
+      anchor)
+        print_warn "Preset 'anchor' selected. The anchor role requires the D11.a capability schema (membership-bundle node_capabilities field). That schema is queued."
+        print_info "This device will run as 'admin' primary today; once D11.a lands, the daemon will read SETUP_ROLE_PRESET=anchor and activate the five anchor.* capabilities automatically."
+        print_info "Tracking: documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md (D11.a, D11.b, D11.c, D11.d)"
+        ;;
+      *) ;;
+    esac
   fi
-  NODE_ROLE="${selected_role}"
-  normalize_node_role
+
   if is_admin_role; then
     confirm_default="n"
     if [[ "${previous_role}" == "admin" ]]; then
       confirm_default="y"
     fi
-    if ! prompt_yes_no "Confirm admin role for this node (full control-plane privileges)" "${confirm_default}"; then
-      print_warn "Admin role confirmation declined. Reverting to client role."
+    confirm_prompt="Confirm admin role for this node (full control-plane privileges)"
+    case "${SETUP_ROLE_PRESET}" in
+      exit) confirm_prompt="Confirm 'exit' preset for this node (primary=admin, post-setup advertises 0.0.0.0/0)" ;;
+      relay) confirm_prompt="Confirm 'relay' preset for this node (primary=admin; relay capability gated by D11.a)" ;;
+      anchor) confirm_prompt="Confirm 'anchor' preset for this node (primary=admin; anchor capabilities gated by D11.a)" ;;
+      *) ;;
+    esac
+    if ! prompt_yes_no "${confirm_prompt}" "${confirm_default}"; then
+      print_warn "Admin/preset confirmation declined. Reverting to client role."
       NODE_ROLE="client"
+      SETUP_ROLE_PRESET="client"
     fi
   elif is_blind_exit_role && [[ "${SETUP_COMPLETE}" != "1" ]]; then
-    if ! prompt_yes_no "Confirm blind_exit role (immutable after setup; least-knowledge mode)" "n"; then
+    if ! prompt_yes_no "Confirm blind_exit preset (IMMUTABLE after setup; least-knowledge mode; factory reset required to change)" "n"; then
       print_warn "Blind-exit role confirmation declined. Reverting to client role."
       NODE_ROLE="client"
+      SETUP_ROLE_PRESET="client"
     fi
   fi
 
