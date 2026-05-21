@@ -767,6 +767,12 @@ pub enum TraversalDecisionReason {
     NoDirectCandidatesRelayArmed,
     DirectProbeExhaustedRelayArmed,
     DirectProbeExhaustedFailClosed,
+    /// D5.5 — the ICE-pair race runner sent every pair in a round
+    /// concurrently and observed a fresh handshake before the round
+    /// budget elapsed. The winning pair (selected by RFC 8445 pair
+    /// priority + endpoint attribution when the runtime provides
+    /// it) is carried in the `Direct` variant's `endpoint` field.
+    IcePairRaceHandshakeObserved,
 }
 
 impl TraversalDecisionReason {
@@ -783,6 +789,9 @@ impl TraversalDecisionReason {
             }
             TraversalDecisionReason::DirectProbeExhaustedFailClosed => {
                 "direct_probe_exhausted_fail_closed"
+            }
+            TraversalDecisionReason::IcePairRaceHandshakeObserved => {
+                "ice_pair_race_handshake_observed"
             }
         }
     }
@@ -845,6 +854,16 @@ impl CoordinationReplayWindow {
 pub trait SimultaneousOpenRuntime {
     fn send_probe(&mut self, endpoint: SocketEndpoint, round: u8) -> Result<(), TraversalError>;
     fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError>;
+    /// D5.5 — endpoint attribution for the ICE-pair race runner. A
+    /// runtime that can report which specific remote endpoint
+    /// completed the most-recent handshake returns it here so the
+    /// race runner can return the winning pair, not just "some
+    /// handshake landed". The default `Ok(None)` keeps the existing
+    /// sequential `execute_simultaneous_open` path working
+    /// unchanged for runtimes that don't track per-endpoint state.
+    fn handshake_endpoint(&mut self) -> Result<Option<SocketEndpoint>, TraversalError> {
+        Ok(None)
+    }
 }
 
 pub trait SimultaneousOpenWaiter {
@@ -1350,6 +1369,185 @@ impl TraversalEngine {
             },
             attempts: plan.pairs.len(),
             latest_handshake_unix: observed_latest,
+            waited_for_start: schedule.wait_duration,
+        })
+    }
+
+    /// D5.5 — parallel ICE-pair race.
+    ///
+    /// Differences from `execute_simultaneous_open`:
+    ///
+    /// 1. Pair ordering uses the RFC 8445 §6.1.2.3 pair-priority
+    ///    formula via `crate::ice_priority::generate_candidate_pairs`,
+    ///    parameterised by the deterministic controlling/controlled
+    ///    role decided from the lex-min of the two node IDs.
+    /// 2. Each round sends ALL pairs concurrently (back-to-back
+    ///    `send_probe` calls in priority order) BEFORE checking the
+    ///    handshake state, so a marginal-NAT path that needs multiple
+    ///    simultaneous outbound packets to punch through has the
+    ///    chance the existing serial loop denies it.
+    /// 3. The winning endpoint is identified by `handshake_endpoint`
+    ///    (runtime-extension method) when available, falling back to
+    ///    the highest-priority pair we just probed in that round so
+    ///    the back-compat default (`Ok(None)`) still produces a
+    ///    sensible Direct decision.
+    ///
+    /// All other behaviour — relay fallback, fail-closed exhaustion,
+    /// freshness window — mirrors `execute_simultaneous_open`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_ice_pair_race<R: SimultaneousOpenRuntime, W: SimultaneousOpenWaiter>(
+        &self,
+        runtime: &mut R,
+        waiter: &mut W,
+        schedule: CoordinationSchedule,
+        local_candidates: &[TraversalCandidate],
+        remote_candidates: &[TraversalCandidate],
+        local_node_id: &[u8; 32],
+        remote_node_id: &[u8; 32],
+        relay_endpoint: Option<SocketEndpoint>,
+        now_unix: u64,
+        handshake_freshness_secs: u64,
+    ) -> Result<SimultaneousOpenResult, TraversalError> {
+        if handshake_freshness_secs == 0 {
+            return Err(TraversalError::InvalidConfig(
+                "handshake freshness window must be greater than zero",
+            ));
+        }
+        waiter.wait(schedule.wait_duration);
+
+        let local_direct: Vec<TraversalCandidate> = local_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.source.direct_eligible())
+            .collect();
+        let remote_direct: Vec<TraversalCandidate> = remote_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.source.direct_eligible())
+            .collect();
+        if local_direct.is_empty() || remote_direct.is_empty() {
+            return self.relay_or_fail_closed_for_race(
+                &schedule,
+                relay_endpoint,
+                runtime,
+                0,
+                0,
+                TraversalDecisionReason::NoDirectCandidatesRelayArmed,
+            );
+        }
+        let local_prioritised =
+            crate::ice_priority::prioritize_traversal_candidates(&local_direct, "local");
+        let remote_prioritised =
+            crate::ice_priority::prioritize_traversal_candidates(&remote_direct, "remote");
+        let role = crate::ice_priority::decide_role(local_node_id, remote_node_id);
+        let mut pairs = crate::ice_priority::generate_candidate_pairs(
+            &local_prioritised,
+            &remote_prioritised,
+            role,
+        );
+        if pairs.is_empty() {
+            return self.relay_or_fail_closed_for_race(
+                &schedule,
+                relay_endpoint,
+                runtime,
+                0,
+                0,
+                TraversalDecisionReason::NoDirectCandidatesRelayArmed,
+            );
+        }
+        pairs.truncate(self.config.max_probe_pairs);
+
+        let mut observed_latest = runtime.latest_handshake_unix()?;
+        let mut total_attempts = 0usize;
+        let mut elapsed = Duration::ZERO;
+        for round in 0..self.config.simultaneous_open_rounds {
+            let round_delay = Duration::from_millis(
+                self.config
+                    .round_spacing_ms
+                    .saturating_mul(u64::from(round)),
+            );
+            if round_delay > elapsed {
+                waiter.wait(round_delay - elapsed);
+                elapsed = round_delay;
+            }
+            // Fire ALL pairs of this round before polling — this is
+            // the core of the "parallel" race. Each probe is one
+            // outbound datagram; sending them back-to-back lets the
+            // remote side observe simultaneous binding requests, which
+            // is what marginal-NAT topologies need to succeed.
+            for pair in &pairs {
+                runtime.send_probe(
+                    crate::ice_priority::socket_addr_to_socket_endpoint(pair.remote.addr),
+                    round,
+                )?;
+                total_attempts = total_attempts.saturating_add(1);
+            }
+            let latest = runtime.latest_handshake_unix()?;
+            if handshake_advanced(observed_latest, latest)
+                && handshake_is_fresh(latest, now_unix, handshake_freshness_secs)
+            {
+                let winning_endpoint = match runtime.handshake_endpoint()? {
+                    Some(endpoint) => endpoint,
+                    None => {
+                        crate::ice_priority::socket_addr_to_socket_endpoint(pairs[0].remote.addr)
+                    }
+                };
+                return Ok(SimultaneousOpenResult {
+                    decision: TraversalDecision::Direct {
+                        endpoint: winning_endpoint,
+                        reason: TraversalDecisionReason::IcePairRaceHandshakeObserved,
+                    },
+                    attempts: total_attempts,
+                    latest_handshake_unix: latest,
+                    waited_for_start: schedule.wait_duration,
+                });
+            }
+            observed_latest = match (observed_latest, latest) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (Some(value), None) => Some(value),
+                (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+        }
+
+        self.relay_or_fail_closed_for_race(
+            &schedule,
+            relay_endpoint,
+            runtime,
+            total_attempts,
+            self.config.simultaneous_open_rounds,
+            TraversalDecisionReason::DirectProbeExhaustedRelayArmed,
+        )
+    }
+
+    fn relay_or_fail_closed_for_race<R: SimultaneousOpenRuntime>(
+        &self,
+        schedule: &CoordinationSchedule,
+        relay_endpoint: Option<SocketEndpoint>,
+        runtime: &mut R,
+        attempts: usize,
+        rounds_used: u8,
+        relay_reason: TraversalDecisionReason,
+    ) -> Result<SimultaneousOpenResult, TraversalError> {
+        if let Some(endpoint) = relay_endpoint {
+            return Ok(SimultaneousOpenResult {
+                decision: TraversalDecision::Relay {
+                    endpoint,
+                    reason: relay_reason,
+                    rounds: rounds_used,
+                },
+                attempts,
+                latest_handshake_unix: runtime.latest_handshake_unix()?,
+                waited_for_start: schedule.wait_duration,
+            });
+        }
+        Ok(SimultaneousOpenResult {
+            decision: TraversalDecision::FailClosed {
+                reason: TraversalDecisionReason::DirectProbeExhaustedFailClosed,
+                rounds: rounds_used,
+            },
+            attempts,
+            latest_handshake_unix: runtime.latest_handshake_unix()?,
             waited_for_start: schedule.wait_duration,
         })
     }
