@@ -7,6 +7,7 @@ mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
 mod ops_install_systemd;
+mod ops_install_systemd_relay;
 mod ops_live_lab_failure_digest;
 mod ops_live_lab_orchestrator;
 mod ops_network_discovery;
@@ -865,6 +866,13 @@ enum OpsCommand {
     GeneratePlatformParityReport,
     CollectPlatformParityBundle,
     InstallSystemd,
+    /// D12.d — install / uninstall the rustynet-relay sibling
+    /// systemd unit. Used by the role-transition orchestrator
+    /// when entering / leaving relay or anchor presets, and
+    /// available as a standalone operator verb today.
+    InstallSystemdRelay {
+        config: ops_install_systemd_relay::InstallRelayConfig,
+    },
     InstallWindowsService,
     InstallWindowsRelayService,
     UninstallWindowsRelayService,
@@ -3684,6 +3692,42 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::InstallSystemd)
         }
+        "install-systemd-relay" => {
+            // D12.d — `rustynet ops install-systemd-relay [--uninstall] [--dry-run]`.
+            // Default mode is install+enable. `--uninstall` flips to
+            // disable+remove. `--dry-run` plans the work without
+            // touching disk or invoking systemctl (useful in CI).
+            let mut mode = ops_install_systemd_relay::RelayUnitMode::InstallAndEnable;
+            let mut dry_run = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--uninstall" => {
+                        mode = ops_install_systemd_relay::RelayUnitMode::DisableAndRemove;
+                    }
+                    "--dry-run" => dry_run = true,
+                    other => {
+                        return Err(format!(
+                            "ops install-systemd-relay: unknown flag {other:?} (expected --uninstall or --dry-run)"
+                        ));
+                    }
+                }
+            }
+            let config = match mode {
+                ops_install_systemd_relay::RelayUnitMode::InstallAndEnable => {
+                    ops_install_systemd_relay::InstallRelayConfig {
+                        dry_run,
+                        ..ops_install_systemd_relay::InstallRelayConfig::default_install()
+                    }
+                }
+                ops_install_systemd_relay::RelayUnitMode::DisableAndRemove => {
+                    ops_install_systemd_relay::InstallRelayConfig {
+                        dry_run,
+                        ..ops_install_systemd_relay::InstallRelayConfig::default_uninstall()
+                    }
+                }
+            };
+            Ok(OpsCommand::InstallSystemdRelay { config })
+        }
         "install-windows-service" => {
             if args.len() != 1 {
                 return Err("ops install-windows-service does not accept options".to_owned());
@@ -5954,6 +5998,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::GeneratePlatformParityReport => execute_ops_generate_platform_parity_report(),
         OpsCommand::CollectPlatformParityBundle => execute_ops_collect_platform_parity_bundle(),
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
+        OpsCommand::InstallSystemdRelay { config } => {
+            ops_install_systemd_relay::execute_install_relay(config)
+                .map(|report| report.summary())
+        }
         OpsCommand::InstallWindowsService => ops_e2e::execute_ops_install_windows_service(),
         OpsCommand::InstallWindowsRelayService => {
             ops_e2e::execute_ops_install_windows_relay_service()
