@@ -45,7 +45,10 @@
 use std::cmp::Ordering;
 use std::net::{IpAddr, SocketAddr};
 
+use rustynet_backend_api::SocketEndpoint;
+
 use crate::dataplane_candidates::{AddressScope, CandidateSet, classify_ip};
+use crate::traversal::{CandidateSource, TraversalCandidate};
 
 /// Single-component-id assumption: WireGuard is one UDP flow.
 const COMPONENT_ID: u32 = 1;
@@ -220,6 +223,70 @@ fn make_candidate(addr: SocketAddr, kind: CandidateKind, foundation: &str) -> Pr
         priority: ice_priority(kind, addr.ip()),
         foundation: foundation.to_owned(),
     }
+}
+
+/// Map a `traversal::CandidateSource` to the corresponding ICE
+/// candidate kind. The two enums carry the same set of values
+/// (Host / ServerReflexive / Relay) but live in different crates
+/// for historical reasons; this conversion is the single place
+/// where the mapping is asserted so a future addition can't drift.
+pub fn candidate_kind_from_traversal_source(source: CandidateSource) -> CandidateKind {
+    match source {
+        CandidateSource::Host => CandidateKind::Host,
+        CandidateSource::ServerReflexive => CandidateKind::ServerReflexive,
+        CandidateSource::Relay => CandidateKind::Relay,
+    }
+}
+
+/// Convert a `SocketEndpoint` (from `rustynet-backend-api`) into a
+/// `std::net::SocketAddr`. Both representations share the same
+/// (ip, port) shape; the conversion is mechanical and is reused
+/// by `prioritize_traversal_candidates` below.
+fn socket_endpoint_to_socket_addr(endpoint: SocketEndpoint) -> SocketAddr {
+    SocketAddr::new(endpoint.addr, endpoint.port)
+}
+
+/// Convert `SocketAddr` back into `SocketEndpoint`. Used by the
+/// ICE-pair runner so the surviving pair can be reported in the
+/// existing `TraversalDecision::Direct` shape without changing
+/// downstream consumers.
+pub fn socket_addr_to_socket_endpoint(addr: SocketAddr) -> SocketEndpoint {
+    SocketEndpoint {
+        addr: addr.ip(),
+        port: addr.port(),
+    }
+}
+
+/// Build a prioritised candidate list from a slice of
+/// `TraversalCandidate` (the on-the-wire shape carried by the
+/// signed traversal-bundle and the gossip bundle). The
+/// `default_foundation_prefix` is mixed into each candidate's
+/// foundation so a local-vs-remote pair can be deduplicated by
+/// foundation correctly: two candidates from the same side that
+/// share a (kind, family) lane collapse to one foundation entry,
+/// per RFC 8445 §5.1.1.3 / §6.1.2.4.
+pub fn prioritize_traversal_candidates(
+    candidates: &[TraversalCandidate],
+    default_foundation_prefix: &str,
+) -> Vec<PrioritizedCandidate> {
+    let mut out = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let kind = candidate_kind_from_traversal_source(candidate.source);
+        let addr = socket_endpoint_to_socket_addr(candidate.endpoint);
+        let family = match addr.ip() {
+            IpAddr::V4(_) => "v4",
+            IpAddr::V6(_) => "v6",
+        };
+        let foundation = format!("{default_foundation_prefix}-{}-{family}", kind.label());
+        out.push(PrioritizedCandidate {
+            addr,
+            kind,
+            priority: ice_priority(kind, addr.ip()),
+            foundation,
+        });
+    }
+    out.sort_by(|a, b| b.priority.cmp(&a.priority));
+    out
 }
 
 /// One candidate pair with its computed pair-priority. Used by the
