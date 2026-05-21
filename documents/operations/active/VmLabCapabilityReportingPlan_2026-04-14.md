@@ -1,6 +1,8 @@
 # VM Lab Capability Reporting Plan
 
-**Status:** Active planning document. Slices 1, 3, and 4 complete; Slice 2 in
+**Status:** Active planning document. Slices 1, 2, 3, 4 complete as of 2026-05-21.
+
+(Older summary line, kept for historical context:) Slices 1, 3, and 4 complete; Slice 2 in
 partial-rollout (RustOrchestrator reject site wired through the umbrella
 validator). All 14 cookbook helpers (reusable building blocks + security-first
 set) are landed and tested; see the Slice 2 entry for the full catalog.
@@ -191,7 +193,7 @@ Use the evaluator in the top-level wrappers.
 - replace coarse error text with capability-derived messages
 - preserve current Linux-only execution boundaries
 
-**Status (2026-05-14): partial.** The most prominent coarse-text reject in
+**Status (2026-05-21): complete.** The most prominent coarse-text reject in
 the wrapper trait surface — `RustOrchestrator::execute_live_lab`'s
 heterogeneous-topology rejection in
 `crates/rustynet-cli/src/vm_lab/mod.rs` — is now derived from the Slice-1
@@ -203,12 +205,22 @@ capability summary (e.g. `scope=RunLiveLab status=Unsupported
 reason_code=topology-mismatch message=...` for mixed topologies, or
 `reason_code=linux-shell-orchestrator-only` for pure-non-Linux topologies),
 so downstream tooling can grep on the stable capability reason code
-instead of the free-form prose. Enforcement is unchanged: the trait
-boundary still fails closed for any non-Linux target. The profile-time
-gate `ensure_live_lab_profile_capabilities` (W4.1 vocabulary) remains
-untouched and continues to do the per-stage capability gating it already
-does; folding that gate into the Slice-1 vocabulary is left for a later
-pass.
+instead of the free-form prose. The profile-time gate
+`ensure_live_lab_profile_capabilities` (W4.1 vocabulary) now also routes
+its per-blocked-target detail through the Slice-1 evaluator: each
+`role=X target=Y missing=cap1,cap2` segment is suffixed with
+`reason_code=linux-shell-orchestrator-only` (or the equivalent canonical
+reason code for the target's `VmGuestPlatform` under the `RunLiveLab`
+scope), so downstream tooling can grep on the stable capability reason
+code at the per-target gate too. Enforcement is unchanged: the trait
+boundary still fails closed for any non-Linux target, and the
+`missing=...` capability label list is preserved alongside for
+per-capability remediation. Three new tests in `vm_lab::tests` pin the
+new format: homogeneous Linux profile passes the gate, Windows client
+rejects with `reason_code=linux-shell-orchestrator-only` + posix-shell in
+the missing list, and macOS client rejects with the same canonical
+reason code (the Linux-only kernel features are the blocking
+capabilities).
 
 Cookbook helpers landed as part of Slices 1-4 and Slice-2 follow-up
 (`crates/rustynet-cli/src/vm_lab/capability.rs`):

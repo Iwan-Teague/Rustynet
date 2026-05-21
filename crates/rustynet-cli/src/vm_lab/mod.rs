@@ -13714,30 +13714,96 @@ fn live_lab_targets_missing_capabilities(
     Ok(blocked)
 }
 
+/// Per-blocked-target shape returned by
+/// [`live_lab_targets_missing_capabilities_with_platform`]. Distinct
+/// type alias (rather than an inline tuple) so the clippy
+/// `type_complexity` gate stays clean. Fields: `(role, target,
+/// guest_platform, missing_capabilities)`.
+#[allow(dead_code)]
+type BlockedTargetWithPlatform = (String, String, VmGuestPlatform, Vec<LiveLabStageCapability>);
+
+/// Same shape as [`live_lab_targets_missing_capabilities`] but also
+/// carries the target's `VmGuestPlatform` so callers can derive the
+/// canonical Slice-1 `VmLabPlatform` for capability evaluation
+/// without re-walking the profile. Used by
+/// `ensure_live_lab_profile_capabilities` so the per-target reject
+/// message can embed the stable Slice-1 reason code.
+#[allow(dead_code)]
+fn live_lab_targets_missing_capabilities_with_platform(
+    profile: &LiveLabProfile,
+    required: &[LiveLabStageCapability],
+) -> Result<Vec<BlockedTargetWithPlatform>, String> {
+    let mut blocked = Vec::new();
+    for (role, target, platform_profile) in configured_live_lab_target_platform_profiles(profile)? {
+        let caps = target_capabilities(platform_profile);
+        let missing: Vec<LiveLabStageCapability> = required
+            .iter()
+            .copied()
+            .filter(|cap| !caps.contains(cap))
+            .collect();
+        if !missing.is_empty() {
+            blocked.push((role, target, platform_profile.platform, missing));
+        }
+    }
+    Ok(blocked)
+}
+
 /// Capability-driven gate. Orchestrator entry points call this with
 /// the per-stage-set required-capability list; a non-empty
 /// `missing` list rejects with a precise per-target reason. The
 /// `command_name` is included in the rejection blocker for
 /// downstream diagnose-live-lab-failure ergonomics.
+///
+/// Slice-2 follow-up (VmLabCapabilityReportingPlan_2026-04-14.md):
+/// each per-target detail now also embeds the canonical Slice-1
+/// `reason_code` derived from `evaluate_vm_lab_capability` under the
+/// `RunLiveLab` scope. Downstream tooling (diagnose-live-lab-failure,
+/// CI grep, operator dashboards) can pattern-match on the stable
+/// reason-code namespace instead of the free-form `missing=...`
+/// label set; the `missing=...` set is preserved alongside for
+/// per-capability remediation.
 #[allow(dead_code)]
 fn ensure_live_lab_profile_capabilities(
     profile: &LiveLabProfile,
     required: &[LiveLabStageCapability],
     command_name: &str,
 ) -> Result<(), String> {
-    let blocked = live_lab_targets_missing_capabilities(profile, required)?;
+    use crate::vm_lab::capability::{
+        VmLabCapabilityContext, VmLabCapabilityScope, VmLabPlatform, VmLabSourceMode,
+        evaluate_vm_lab_capability,
+    };
+    let blocked = live_lab_targets_missing_capabilities_with_platform(profile, required)?;
     if blocked.is_empty() {
         return Ok(());
     }
     let rendered = blocked
         .into_iter()
-        .map(|(role, target, missing)| {
+        .map(|(role, target, guest_platform, missing)| {
             let labels = missing
                 .iter()
                 .map(|cap| cap.as_str())
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("role={role} target={target} missing={labels}")
+            let lab_platform = VmLabPlatform::from(guest_platform);
+            let ctx = VmLabCapabilityContext {
+                scope: VmLabCapabilityScope::RunLiveLab,
+                platform: lab_platform,
+                // The gate is invoked BEFORE any source-mode-specific
+                // dispatch so the source-mode is irrelevant for the
+                // canonical reason-code derivation. Use the
+                // conservative `LocalHead` value (the default
+                // operator-side mode) so the evaluator emits a
+                // stable result regardless of how the orchestrator
+                // is wired downstream.
+                source_mode: VmLabSourceMode::LocalHead,
+                bootstrap_phase: None,
+                mixed_platform_topology: false,
+            };
+            let record = evaluate_vm_lab_capability(ctx);
+            format!(
+                "role={role} target={target} missing={labels} reason_code={}",
+                record.reason_code,
+            )
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -28377,6 +28443,134 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         for (cap, label) in pairs {
             assert_eq!(cap.as_str(), *label);
         }
+    }
+
+    /// Build a `LiveLabProfile` with the minimum required keys for
+    /// the capability gate. Both targets get an explicit platform
+    /// profile so `live_lab_targets_missing_capabilities_with_platform`
+    /// can resolve every per-role attribute.
+    fn live_lab_profile_for_capabilities_test(
+        exit_platform: super::VmGuestPlatform,
+        client_platform: super::VmGuestPlatform,
+    ) -> super::LiveLabProfile {
+        use std::collections::BTreeMap;
+        let mut values: BTreeMap<String, String> = BTreeMap::new();
+        for (prefix, platform) in [("EXIT", exit_platform), ("CLIENT", client_platform)] {
+            let (remote_shell, exec_mode, service_manager) = match platform {
+                super::VmGuestPlatform::Linux => ("posix", "linux_bash", "systemd"),
+                super::VmGuestPlatform::Windows => {
+                    ("powershell", "windows_powershell", "windows_service")
+                }
+                super::VmGuestPlatform::Macos => ("posix", "macos_posix", "launchd"),
+                super::VmGuestPlatform::Ios | super::VmGuestPlatform::Android => {
+                    ("unsupported", "unsupported", "unsupported")
+                }
+            };
+            values.insert(
+                format!("{prefix}_TARGET"),
+                format!("{}-host", platform.as_str()),
+            );
+            values.insert(format!("{prefix}_PLATFORM"), platform.as_str().to_owned());
+            values.insert(format!("{prefix}_REMOTE_SHELL"), remote_shell.to_owned());
+            values.insert(format!("{prefix}_GUEST_EXEC_MODE"), exec_mode.to_owned());
+            values.insert(
+                format!("{prefix}_SERVICE_MANAGER"),
+                service_manager.to_owned(),
+            );
+        }
+        super::LiveLabProfile { values }
+    }
+
+    #[test]
+    fn ensure_live_lab_profile_capabilities_embeds_canonical_reason_code_for_windows_client() {
+        // Slice-2 follow-up: blocked targets must carry the stable
+        // Slice-1 reason code so downstream tooling can grep on it.
+        // A Windows client under the Linux-bash orchestrator is the
+        // canonical reject case — its capability profile lacks
+        // PosixShell/Systemd/LinuxBashGuestExec, and the Slice-1
+        // evaluator returns `linux-shell-orchestrator-only`.
+        let profile = live_lab_profile_for_capabilities_test(
+            super::VmGuestPlatform::Linux,
+            super::VmGuestPlatform::Windows,
+        );
+        let err = super::ensure_live_lab_profile_capabilities(
+            &profile,
+            super::LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES,
+            "vm-lab-test-command",
+        )
+        .expect_err("Windows client must be rejected by Linux-only gate");
+        assert!(
+            err.contains("vm-lab-test-command"),
+            "rejection must carry the command_name; got: {err}"
+        );
+        assert!(
+            err.contains("role=client"),
+            "rejection must identify the blocked role; got: {err}"
+        );
+        assert!(
+            err.contains("target=windows-host"),
+            "rejection must identify the blocked target; got: {err}"
+        );
+        assert!(
+            err.contains("reason_code=linux-shell-orchestrator-only"),
+            "rejection must embed the canonical Slice-1 reason code; got: {err}"
+        );
+        // The pre-existing `missing=...` label list MUST also be
+        // preserved so per-capability remediation tooling still
+        // works.
+        assert!(
+            err.contains("missing="),
+            "rejection must still carry the legacy per-capability label list; got: {err}"
+        );
+        assert!(
+            err.contains("posix-shell"),
+            "Windows client must report posix-shell as a missing capability; got: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_live_lab_profile_capabilities_accepts_homogeneous_linux_profile() {
+        // The gate is a NO-OP for a homogeneous Linux profile — the
+        // happy path of the existing wrapper. Pinning this guards
+        // against an accidental over-rejection from the Slice-2
+        // wiring.
+        let profile = live_lab_profile_for_capabilities_test(
+            super::VmGuestPlatform::Linux,
+            super::VmGuestPlatform::Linux,
+        );
+        super::ensure_live_lab_profile_capabilities(
+            &profile,
+            super::LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES,
+            "vm-lab-test-command",
+        )
+        .expect("homogeneous Linux profile must satisfy the Linux-only gate");
+    }
+
+    #[test]
+    fn ensure_live_lab_profile_capabilities_rejects_macos_target_with_reason_code() {
+        // macOS targets have PosixShell but lack the Linux-only
+        // kernel features (nftables, systemd-resolved). The Slice-1
+        // canonical reason code for a non-Linux platform under the
+        // RunLiveLab scope is the same `linux-shell-orchestrator-only`
+        // marker the wrapper rejection already uses.
+        let profile = live_lab_profile_for_capabilities_test(
+            super::VmGuestPlatform::Linux,
+            super::VmGuestPlatform::Macos,
+        );
+        let err = super::ensure_live_lab_profile_capabilities(
+            &profile,
+            super::LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES,
+            "vm-lab-test-command",
+        )
+        .expect_err("macOS client must be rejected by Linux-only gate");
+        assert!(
+            err.contains("role=client"),
+            "rejection must identify the blocked role; got: {err}"
+        );
+        assert!(
+            err.contains("reason_code=linux-shell-orchestrator-only"),
+            "rejection must embed the canonical Slice-1 reason code; got: {err}"
+        );
     }
 
     #[test]
