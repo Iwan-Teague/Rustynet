@@ -6,8 +6,9 @@ This folder contains the current implementation ledgers, active plans, and activ
 
 Start with these when you need current status, remaining work, or the public implementation ledger:
 
-- [RustynetDataplaneExecutionPlan_2026-05-18.md](./RustynetDataplaneExecutionPlan_2026-05-18.md) — source-of-truth plan for the cross-network dataplane track (peer-distributed coord, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, anchor-role formalisation); supersedes nothing but is the active ledger for D2-D11 work
-- [AnchorNodeRoleDesign_2026-05-21.md](./AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11): role definition, what already exists in code, what needs building, per-platform host capability (Linux/macOS/Windows host; iOS/Android consume), refactor inventory, security controls
+- [RustynetDataplaneExecutionPlan_2026-05-18.md](./RustynetDataplaneExecutionPlan_2026-05-18.md) — source-of-truth plan for the cross-network dataplane track (peer-distributed coord, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, anchor-role formalisation, 6-role user-selectable surface); supersedes nothing but is the active ledger for D2-D12 work
+- [NodeRoleTaxonomy_2026-05-21.md](./NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the six user-selectable node roles (D12): `relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`; preset compositions; transition matrix; per-platform eligibility
+- [AnchorNodeRoleDesign_2026-05-21.md](./AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11; one of the six presets in the taxonomy doc): role definition, what already exists in code, what needs building, per-platform host capability (Linux/macOS/Windows host; iOS/Android consume), refactor inventory, security controls
 - [MasterWorkPlan_2026-03-22.md](./MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - [OpenWorkIndex_2026-04-17.md](./OpenWorkIndex_2026-04-17.md)
@@ -26,6 +27,7 @@ phase checklists that finished (Phase 1, 2, 3, 5) have moved to
 ## Active Plans And Backlogs
 
 - [AnchorNodeRoleDesign_2026-05-21.md](./AnchorNodeRoleDesign_2026-05-21.md)
+- [NodeRoleTaxonomy_2026-05-21.md](./NodeRoleTaxonomy_2026-05-21.md)
 - [CrossNetworkRemoteExitNodePlan_2026-03-16.md](./CrossNetworkRemoteExitNodePlan_2026-03-16.md)
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
 - [DiagnosticFunctionsRoadmap.md](./DiagnosticFunctionsRoadmap.md)

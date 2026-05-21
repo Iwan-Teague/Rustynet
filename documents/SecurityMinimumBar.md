@@ -228,6 +228,86 @@ method (unit test, integration test, negative test, or gate). The
 anchor design document §8 maps controls to enforcement points and
 §10 maps to gates.
 
+## 6.D) Node Role Transition Controls
+
+The six user-selectable node roles (`relay`, `anchor`, `exit`,
+`blind_exit`, `client`, `admin`; canonical taxonomy:
+[`operations/active/NodeRoleTaxonomy_2026-05-21.md`](./operations/active/NodeRoleTaxonomy_2026-05-21.md))
+have non-negotiable transition controls beyond the general signed-state
+floor in §6.B.
+
+Required controls for every role transition:
+
+1. **Transition matrix validated fail-closed.** The role-preset table
+   in `crates/rustynet-control/src/role_presets.rs` is the
+   authoritative source for which transitions are allowed
+   (`local` / `signed` / `blocked` / `irrev`). Blocked transitions
+   MUST be rejected by `validate_transition` and never reach
+   side-effect execution.
+
+2. **BlindExit irreversibility.** A node currently in role
+   `blind_exit` MUST refuse every other-role transition without an
+   explicit factory-reset operator step that wipes node identity +
+   re-enrolls. The wizard surface MUST require typed confirmation
+   (not just Enter) when entering or leaving `blind_exit`. This
+   matches the existing immutable-blind-exit security posture.
+
+3. **Capability changes require owner signature.** Any role
+   transition that changes Axis-2 mesh capabilities
+   (`serves_exit`, `serves_relay`, `anchor.*`) MUST emit an unsigned
+   `MembershipUpdateRecord` for the membership owner to sign + apply.
+   Local-only acceptance of capability changes is forbidden.
+
+4. **Service deploy precedes capability advertisement.** When a
+   transition adds `serves_relay` (or anchor's
+   `relay_colocation`), the platform-specific service installer
+   MUST successfully deploy and verify `rustynet-relay` BEFORE the
+   signed bundle is emitted. Failure to deploy MUST abort the
+   transition and preserve previous state.
+
+5. **Service undeploy precedes capability revocation.** When a
+   transition removes `serves_relay` (or revokes the anchor
+   `relay_colocation`), the installer MUST successfully stop and
+   remove the relay service BEFORE the signed revocation bundle is
+   emitted. Failure to undeploy MUST keep the previous state and
+   raise a fail-closed alarm.
+
+6. **Tamper-evident transition audit.** Every role transition
+   (successful, failed, or aborted) MUST emit an append-only audit
+   log entry with: timestamp, from-role, to-role, side-effects
+   attempted, outcome, operator id where available. The audit log
+   MUST satisfy §3 control 9 (tamper-evident, append-only,
+   retention-bound).
+
+7. **Exit-serving NAT activation is fail-closed on revocation.**
+   When a transition revokes `serves_exit`, the daemon MUST tear
+   down forwarding + NAT before the capability is removed from
+   local state. Forwarding/NAT residue after revocation is a
+   release-blocking defect.
+
+8. **Mobile role lock.** iOS and Android FFI surfaces MUST refuse
+   any `role set` request targeting anything other than `client`.
+   Mobile daemon-equivalent MUST advertise only `client`
+   capabilities on every snapshot reload.
+
+9. **Platform-blocked roles fail closed.** On platforms where a
+   role is gated behind dataplane parity work (today: all
+   non-client roles on Windows; `blind_exit` on macOS), the
+   wizard MUST grey out the blocked role and `rustynet role set`
+   MUST return an explicit `platform-blocked` error rather than
+   silently proceeding with a partial-effect transition.
+
+10. **Read-only status available to all primary roles.**
+    `rustynet role status` and `rustynet capability list` MUST be
+    available to `Client` and `BlindExit` primary roles so
+    operators can verify resolved role state without elevation.
+
+Enforcement points map to verification tests in
+`scripts/ci/role_taxonomy_gates.sh`,
+`scripts/ci/role_transition_audit_gates.sh`, and
+`scripts/ci/blind_exit_irreversibility_gates.sh` (new gates added
+in D12).
+
 ## 7) Phase Mapping
 - Phase 1: baseline standards and threat model defined.
 - Phase 2: auth/enrollment abuse controls + key custody baseline + atomic one-time key handling.

@@ -156,6 +156,7 @@ The plan executes in four tracks. Alpha is sequential and is the critical path. 
 8. **D5** — Linux ↔ Linux cross-LAN baseline evidence
 9. **D5.5** — ICE-style candidate prioritisation
 10. **D11** — Anchor node role formalisation (canonical design: [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md))
+11. **D12** — Node role taxonomy + 6-role user-selectable surface (canonical design: [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md))
 
 (The non-monotonic numbering — D2.3, D2.4, D2.5, D2.7 sitting between D2 and D5 — preserves cross-references to earlier brainstorm conversations. The numbers are labels, not sort keys; execute in the order above.)
 
@@ -301,6 +302,21 @@ starting script, and archive the resulting artifacts under
 - **Depends on.** D2.5 (gossip), D4 (relay), D2.7 (enrollment), D5.5 (ICE pair race). Anchor builds on these but does not modify them.
 - **Cross-platform note.** Linux + macOS land in D11. Windows anchor is deferred behind D7/D9 (same dataplane-parity prerequisite as Windows-as-exit). iOS + Android land the consume-only `anchor_bundle_pull_client` in `rustynet-mobile-core` as part of mobile roadmap M3 — see [`../../mobile/RustynetMobileRoadmap_2026-04-17.md`](../../mobile/RustynetMobileRoadmap_2026-04-17.md).
 
+### D12 — Node role taxonomy + 6-role user-selectable surface (Track Alpha)
+
+- **Scope.** Cement six user-selectable per-device roles (`relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`) into a single CLI verb + wizard surface. Internal data model stays two-axis (primary local `NodeRole` + composable signed capabilities); presets are named compositions. Add `rustynet role {set, status, list, transition-check}` and `rustynet capability {add, remove, list}` verbs. Replace `start.sh` 3-role prompt with 6-role prompt; mirror in `rustynet operator menu`. Add service-deploy/undeploy orchestration for `relay`/`anchor` presets (Linux systemd, macOS launchd, Windows SCM gated on D7/D9). Add transition audit logging.
+- **Files.** `crates/rustynet-control/src/role_presets.rs` (new — preset table + transition validator), `crates/rustynet-control/src/membership.rs` (extend `NodeCapabilities` with `serves_exit`, `serves_relay`, etc.), `crates/rustynet-cli/src/main.rs` + new `crates/rustynet-cli/src/role_set.rs` (CLI verbs + orchestrator), `crates/rustynetd/src/daemon.rs` (new IPC commands), `crates/rustynet-cli/src/ops_install_systemd.rs` (relay co-deploy + undeploy), `start.sh` (6-role prompt).
+- **Sub-slices** (mapped 1:1 to [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md) §8):
+  - **D12.a** — Preset table + transition validator (prerequisite for the rest).
+  - **D12.b** — CLI surface (`role` + `capability` verbs).
+  - **D12.c** — Wizard surface (start.sh + operator menu + mobile read-only indicator).
+  - **D12.d** — Service deploy / undeploy (Linux + macOS; Windows gated on D7/D9).
+  - **D12.e** — Audit + transition logging.
+- **Pass criterion.** `rustynet role set anchor` on clean Debian 13 install brings the host to a working anchor (relay co-deployed, capability signed in membership). `rustynet role set client` (admin signs revocation) brings it back to clean client (relay undeployed). `rustynet role set blind_exit` configures hardened final-hop exit with irreversibility prompt + audit trail. Wizard shows 6 roles with correct per-platform gating. Mobile `client (mobile)` indicator is read-only on iOS + Android. Every transition emits tamper-evident audit log entry.
+- **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
+- **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
+- **Cross-platform note.** Linux + macOS roles all land in D12 (except macOS `blind_exit`, which stays Linux-only). Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
+
 ### D6 — Windows readiness + node-id fix (Track Beta)
 
 - **Scope.** Per `WindowsExitAndRelayDeltaPlan_2026-05-10.md` §3.3. Replace the broken `rustynet.exe status` call in the orchestrator's Windows readiness path with a real readiness check (SCM `Running` state + parse of `RUSTYNETD_DAEMON_ARGS_JSON` for `--node-id` from `C:\ProgramData\RustyNet\config\rustynetd.env`).
@@ -393,6 +409,7 @@ This plan is "done" when:
 
 - D2 through D5.5 all pass their per-phase pass criteria, and D5/D5.5 artifacts exist pinned to a commit SHA in `artifacts/cross_network/<commit>/`.
 - D11 passes its pass criterion on Linux and macOS (Windows anchor deferred behind D7/D9 by design).
+- D12 passes its pass criterion on Linux and macOS (Windows non-client roles deferred behind D7/D9 by design; mobile is `client (mobile)` only).
 - D6 passes its pass criterion against `windows-utm-1`.
 - D7 + D9 artifacts exist pinned to a commit SHA in `artifacts/windows_exit/<commit>/`.
 - D10 has updated the posture documents.

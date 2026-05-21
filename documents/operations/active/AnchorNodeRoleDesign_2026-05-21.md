@@ -3,6 +3,7 @@
 - Date: 2026-05-21
 - Status: active (design source-of-truth for the anchor-node role)
 - Owner: Rustynet
+- Parent doc: [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md) — anchor is one of the six user-selectable node-role presets cemented in the taxonomy doc. This document is the deep dive for the `anchor` preset specifically.
 - Supersedes nothing. Complements [`RustynetDataplaneExecutionPlan_2026-05-18.md`](./RustynetDataplaneExecutionPlan_2026-05-18.md) §2.3 (relay) and §2.4 (enrollment) by formalising the runtime role that ties them together. Adds D11 to the dataplane phase queue (§7 here).
 
 ---
@@ -378,6 +379,7 @@ The anchor role is "done" when:
 
 ## 13) Cross-references
 
+- [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md) — parent doc. Anchor is one of six user-selectable presets; this document is the deep dive.
 - [`RustynetDataplaneExecutionPlan_2026-05-18.md`](./RustynetDataplaneExecutionPlan_2026-05-18.md) — adds D11 in §5.1; anchor builds on D2-D5.5 primitives.
 - [`PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md`](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md) — anchor co-locates the relay this plan formalises.
 - [`MasterWorkPlan_2026-03-22.md`](./MasterWorkPlan_2026-03-22.md) — anchor is downstream of cross-network track; ledger updated when D11 lands.

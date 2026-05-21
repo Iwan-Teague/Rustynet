@@ -97,6 +97,40 @@ Purpose: provide a single current-state view of platform capability, security po
 | Exit-node selection readiness probe UX | Membership+tunnel probe in `SELECT EXIT NODE`; current selection marker + connect/disconnect quick action | Same menu behavior on macOS host profile (compat runtime) | Implemented | `start.sh:3711-3774`, `start.sh:4257-4327` |
 | Additional non-simulated backend implementation | Not present in-tree beyond WireGuard | Not present in-tree beyond WireGuard | Needs more work (policy/code discrepancy) | `crates/rustynet-backend-wireguard/src/lib.rs:54`, `crates/rustynet-backend-stub/src/lib.rs:38` |
 
+## Node Role Eligibility (Cross-Platform Truth)
+
+The six user-selectable node roles (canonical taxonomy:
+`documents/operations/active/NodeRoleTaxonomy_2026-05-21.md`) have
+per-platform host eligibility. Roles gated behind future dataplane
+work are listed honestly here even when wizard UX shows them as
+"locked".
+
+| Role | Linux | macOS | Windows | iOS | Android |
+| --- | --- | --- | --- | --- | --- |
+| `client` | yes | yes | yes (today: `runtime-host-capable only`; full client when D7/D9 land) | yes | yes |
+| `admin` | yes | yes | yes (gated on D7/D9 same as Windows client) | no | no |
+| `exit` | yes | yes (admin-installed network tools required) | yes (gated on D7 NetNat + killswitch evidence) | no | no |
+| `blind_exit` | yes | no (PF-based killswitch parity work needed) | no (not in current dataplane plan) | no | no |
+| `relay` | yes | yes (`rustynet-relay` builds on macOS) | yes (gated on D7/D9; `rustynet-relay` already builds with SCM feature) | no | no |
+| `anchor` | yes | yes | yes (gated on D7/D9) | no (consume-only) | no (consume-only) |
+
+Notes:
+
+- Mobile (iOS + Android) is `client` only by OS constraint
+  (lifecycle suspension, address instability, sandboxing). Mobile
+  shows a read-only "Role: client (mobile)" indicator. See
+  `documents/mobile/RustynetMobileArchitectureDesign_2026-04-17.md`.
+- Windows non-client roles all land together when D7/D9 in the
+  dataplane execution plan land. Today every Windows non-client
+  role fails closed at the wizard surface with an explicit
+  "platform-blocked" message.
+- macOS `blind_exit` is intentionally blocked. `start.sh` enforces
+  blind-exit-is-Linux-only.
+- The `anchor` row here is the higher-level role-eligibility view.
+  The earlier two anchor-capability rows in the Capability Matrix
+  (host capability + bundle-pull client) remain accurate at the
+  capability level.
+
 ## Anchor Node Role (Cross-Platform Truth)
 
 The anchor node role (canonical design:

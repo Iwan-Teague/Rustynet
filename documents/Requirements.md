@@ -115,8 +115,11 @@ Primary goal:
 - lan-access toggle
 - dns inspect
 - route advertise
+- role set / status / list / transition-check (six user-selectable presets)
+- capability add / remove / list (advanced; power users only)
 - anchor advertise / list / pull-bundle / init / status
 - Lightweight web admin UI (phase 6) for policy and node management.
+- Six user-selectable node roles per device — `relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin` — exposed through `start.sh`, `rustynet operator menu`, and `rustynet role set`. Each preset maps to a complete composition of local primary role + signed mesh capabilities. Canonical taxonomy + transition matrix: [`operations/active/NodeRoleTaxonomy_2026-05-21.md`](./operations/active/NodeRoleTaxonomy_2026-05-21.md).
 - Anchor-aware setup wizard (`rustynet anchor init` and `start.sh` role choice) so operators can stand up an always-on home node with relay co-deployment in a single guided step. See [`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](./operations/active/AnchorNodeRoleDesign_2026-05-21.md) §5.4 for the wizard contract.
 
 ### 3.8 Observability

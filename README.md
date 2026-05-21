@@ -18,7 +18,8 @@ If you are implementing or reviewing work in this repository, start here:
 
 Primary execution ledgers:
 
-- [documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md](./documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md) — D2-D11 dataplane track including anchor-node role formalisation
+- [documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md](./documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md) — D2-D12 dataplane track including anchor-node role formalisation + 6-role user-selectable surface
+- [documents/operations/active/NodeRoleTaxonomy_2026-05-21.md](./documents/operations/active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the 6 user-selectable per-device roles (`relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`)
 - [documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md](./documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md) — canonical anchor-node role design (per-platform implementation + refactor inventory)
 - [documents/operations/active/MasterWorkPlan_2026-03-22.md](./documents/operations/active/MasterWorkPlan_2026-03-22.md)
 - [documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)

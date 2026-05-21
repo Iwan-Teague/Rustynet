@@ -36,8 +36,9 @@ Move a document into `operations/done/` when it is historical evidence rather th
 See [active/README.md](./active/README.md) for the current list.
 
 The primary execution ledgers are:
-- [active/RustynetDataplaneExecutionPlan_2026-05-18.md](./active/RustynetDataplaneExecutionPlan_2026-05-18.md) — source-of-truth for the cross-network dataplane track (D2-D11): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, anchor-role formalisation. Read this first for "what are we building and why."
-- [active/AnchorNodeRoleDesign_2026-05-21.md](./active/AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11): per-platform host capability, refactor inventory, security controls.
+- [active/RustynetDataplaneExecutionPlan_2026-05-18.md](./active/RustynetDataplaneExecutionPlan_2026-05-18.md) — source-of-truth for the cross-network dataplane track (D2-D12): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, anchor-role formalisation, 6-role user-selectable surface. Read this first for "what are we building and why."
+- [active/NodeRoleTaxonomy_2026-05-21.md](./active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the six user-selectable node roles (D12): preset compositions, transition matrix, per-platform eligibility.
+- [active/AnchorNodeRoleDesign_2026-05-21.md](./active/AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11; one of the six presets in the taxonomy doc): per-platform host capability, refactor inventory, security controls.
 - [active/MasterWorkPlan_2026-03-22.md](./active/MasterWorkPlan_2026-03-22.md)
 - [active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 
