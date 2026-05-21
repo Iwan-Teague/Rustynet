@@ -15727,12 +15727,26 @@ fn execute_role(cmd: RoleCommand) -> Result<String, String> {
 /// `role_cli::plan_concrete_actions`. The planner is pure; this
 /// function is the only place that touches the filesystem or sends
 /// IPC for role transitions.
+///
+/// Every outcome (blocked, succeeded, failed-mid-execution) emits a
+/// tamper-evident entry to the role-transition audit log via
+/// [`emit_role_audit`] — D12.e in the dataplane execution plan.
 fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
+    use rustynet_control::role_audit::{RoleTransitionEvent, RoleTransitionOutcome};
+
     match plan {
-        role_cli::RoleSetPlan::Blocked { from, to, error } => Err(format!(
-            "transition {from} → {to} blocked: {}",
-            error.user_message()
-        )),
+        role_cli::RoleSetPlan::Blocked { from, to, error } => {
+            emit_role_audit(&RoleTransitionEvent::PresetTransition {
+                from,
+                to,
+                outcome: RoleTransitionOutcome::Blocked,
+                error_category: Some(role_cli::role_cli_error_category(&error)),
+            });
+            Err(format!(
+                "transition {from} → {to} blocked: {}",
+                error.user_message()
+            ))
+        }
         role_cli::RoleSetPlan::Allowed {
             from,
             to,
@@ -15742,8 +15756,20 @@ fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
         } => {
             let mut summary = format!("transition planned: {from} → {to}\n");
             for action in &actions {
-                let action_summary = execute_role_action(action)?;
-                summary.push_str(&format!("  applied: {action_summary}\n"));
+                match execute_role_action(action) {
+                    Ok(action_summary) => {
+                        summary.push_str(&format!("  applied: {action_summary}\n"));
+                    }
+                    Err(err) => {
+                        emit_role_audit(&RoleTransitionEvent::PresetTransition {
+                            from,
+                            to,
+                            outcome: RoleTransitionOutcome::Failed,
+                            error_category: Some("side_effect_failed"),
+                        });
+                        return Err(err);
+                    }
+                }
             }
             if !followup_instructions.is_empty() {
                 summary.push_str("follow-up:\n");
@@ -15751,8 +15777,43 @@ fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
                     summary.push_str(&format!("  - {instruction}\n"));
                 }
             }
+            emit_role_audit(&RoleTransitionEvent::PresetTransition {
+                from,
+                to,
+                outcome: RoleTransitionOutcome::Succeeded,
+                error_category: None,
+            });
             Ok(summary)
         }
+    }
+}
+
+/// Timestamp helper for role-transition audit log entries. Uses
+/// system clock; on systems with unreliable clocks the timestamp is
+/// operator-visible only — the audit log's hash chain doesn't
+/// depend on it for integrity.
+fn audit_timestamp_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Append a role-transition audit entry. Failures are surfaced as a
+/// non-fatal stderr warning — audit logging is operator-visible
+/// evidence, not a security gate that should block legitimate role
+/// changes when the log path is temporarily unavailable. The chain
+/// integrity verifier (`role_audit::verify_role_audit_chain`) is
+/// what catches tampering after the fact.
+fn emit_role_audit(event: &rustynet_control::role_audit::RoleTransitionEvent) {
+    let path = role_cli::resolve_audit_log_path();
+    if let Err(err) =
+        rustynet_control::role_audit::append_role_audit_entry(&path, audit_timestamp_unix(), event)
+    {
+        eprintln!(
+            "[warn] role-transition audit log append failed (path={}): {err}",
+            path.display()
+        );
     }
 }
 
@@ -15897,15 +15958,26 @@ fn execute_capability(cmd: CapabilityCommand) -> Result<String, String> {
             // membership-bundle node_capabilities schema. Refuse
             // cleanly with a pointer to the design doc — this is
             // the same dependency-blocked path the planner uses
-            // for relay/anchor presets.
-            let _ = cap; // Capability type used for typed parse.
-            let placeholder_target = match cmd {
-                CapabilityCommand::Add(c) => c,
-                CapabilityCommand::Remove(c) => c,
+            // for relay/anchor presets. The audit entry records
+            // the attempt so an operator-visible event exists for
+            // every mutation attempt, even the blocked ones.
+            use rustynet_control::role_audit::{
+                CapabilityMutationKind, RoleTransitionEvent, RoleTransitionOutcome,
+            };
+            let (target_cap, mutation_kind) = match cmd {
+                CapabilityCommand::Add(c) => (c, CapabilityMutationKind::Add),
+                CapabilityCommand::Remove(c) => (c, CapabilityMutationKind::Remove),
                 CapabilityCommand::List => unreachable!(),
             };
+            emit_role_audit(&RoleTransitionEvent::CapabilityMutation {
+                capability: target_cap,
+                mutation: mutation_kind,
+                outcome: RoleTransitionOutcome::Blocked,
+                error_category: Some("blocked_by_capability_schema"),
+            });
+            let _ = cap; // Capability type used for typed parse.
             Err(format!(
-                "capability mutation for {placeholder_target} requires the D11.a capability schema (membership-bundle node_capabilities field). \
+                "capability mutation for {target_cap} requires the D11.a capability schema (membership-bundle node_capabilities field). \
                  That schema is queued; this verb will activate when D11.a lands. \
                  See documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md (D11.a)."
             ))
