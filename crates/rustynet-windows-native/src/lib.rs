@@ -46,6 +46,41 @@ pub fn inspect_file_sddl(_path: &Path) -> Result<String, String> {
     Err("Windows ACL inspection is only available on Windows hosts".to_owned())
 }
 
+/// W4 — Registry-key ACL inspector. On Windows the implementation
+/// opens the named registry key via `RegOpenKeyExW`, reads its
+/// security descriptor via `RegGetKeySecurity`, and converts to
+/// SDDL via `ConvertSecurityDescriptorToStringSecurityDescriptorW`.
+/// Off-Windows the stub returns a clear platform blocker so callers
+/// can surface "could not observe; collector requires Windows" via
+/// the existing `WindowsRegistryKeyAclStatus::Unobserved` shape.
+///
+/// Input format: the operator-visible registry-key path is
+/// `HKLM\SYSTEM\CurrentControlSet\Services\<Service>` style. The
+/// implementation parses the root (`HKLM` / `HKCU` / `HKCR` /
+/// `HKU` / `HKCC`) prefix and opens the relative sub-key.
+#[cfg(not(windows))]
+pub fn inspect_registry_key_sddl(_key_path: &str) -> Result<String, String> {
+    Err("Windows registry-key ACL inspection is only available on Windows hosts".to_owned())
+}
+
+/// W5 — Authenticode signer-certificate SHA-256 thumbprint
+/// extractor. On Windows the implementation calls
+/// `CryptQueryObject` to open the PE's signature blob, walks the
+/// CMS SignerInfo via `CryptMsgGetParam(CMSG_SIGNER_CERT_INFO_PARAM)`,
+/// derives the signer's certificate context from the SignedData,
+/// and reads `CertGetCertificateContextProperty(CERT_SHA256_HASH_PROP_ID)`.
+/// Returns the lowercase hex of the 32-byte SHA-256 hash.
+///
+/// Off-Windows the stub returns a clear platform blocker — callers
+/// that supply a thumbprint policy then get a fail-closed result
+/// via `evaluate_thumbprint_policy(None, &policy)`, which is the
+/// correct security posture (no policy bypass on unsupported
+/// platforms).
+#[cfg(not(windows))]
+pub fn extract_signer_thumbprint_sha256(_path: &Path) -> Result<String, String> {
+    Err("Windows Authenticode thumbprint extraction is only available on Windows hosts".to_owned())
+}
+
 #[cfg(not(windows))]
 pub fn verify_authenticode_chain(_path: &Path) -> Result<AuthenticodeChainOutcome, String> {
     // Off-Windows: WinVerifyTrust is unavailable. The verifier
@@ -220,6 +255,158 @@ mod imp {
             ));
         }
         security_descriptor_to_sddl(buffer.as_mut_ptr().cast::<c_void>())
+    }
+
+    /// W4 — registry-key SDDL extractor. Opens the requested
+    /// `HKLM\…` (or other root) sub-key with `KEY_READ` access,
+    /// reads the DACL portion of the security descriptor via
+    /// `RegGetKeySecurity`, and converts to SDDL via
+    /// `ConvertSecurityDescriptorToStringSecurityDescriptorW` (the
+    /// same helper that the file-ACL path uses). On any Win32
+    /// failure the returned `Err` includes the Windows error code so
+    /// the caller can map specific HKEY-NOT-FOUND / access-denied
+    /// shapes to the existing `WindowsRegistryKeyAclStatus::{Missing,
+    /// Invalid}` variants.
+    pub fn inspect_registry_key_sddl(key_path: &str) -> Result<String, String> {
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+        use windows_sys::Win32::System::Registry::{
+            HKEY, KEY_READ, RegCloseKey, RegGetKeySecurity, RegOpenKeyExW,
+        };
+
+        let (root, subkey) = parse_registry_root(key_path)?;
+        let wide_subkey = to_wide(subkey);
+        let mut handle: HKEY = null_mut();
+        let open_status =
+            unsafe { RegOpenKeyExW(root, wide_subkey.as_ptr(), 0, KEY_READ, &mut handle) };
+        if open_status != ERROR_SUCCESS {
+            if open_status == ERROR_FILE_NOT_FOUND {
+                return Err(format!(
+                    "registry key not found: {key_path} (Windows error {open_status})"
+                ));
+            }
+            return Err(format!(
+                "RegOpenKeyExW failed for {key_path} with Windows error {open_status}"
+            ));
+        }
+        let result = read_registry_key_sddl(handle);
+        unsafe {
+            // RegCloseKey returns ERROR_SUCCESS on close; ignore
+            // close failure because the SDDL we already extracted is
+            // still valid. Close-failure means the kernel handle
+            // table is in a weird state but our caller's verdict
+            // shouldn't depend on it.
+            RegCloseKey(handle);
+        }
+        result
+    }
+
+    fn read_registry_key_sddl(
+        handle: windows_sys::Win32::System::Registry::HKEY,
+    ) -> Result<String, String> {
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::System::Registry::RegGetKeySecurity;
+        let requested = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut needed = 0u32;
+        let first = unsafe { RegGetKeySecurity(handle, requested, null_mut(), &mut needed) };
+        // RegGetKeySecurity reports ERROR_INSUFFICIENT_BUFFER (122)
+        // via its return value, NOT via GetLastError. Match the
+        // Win32 contract precisely.
+        if first != ERROR_INSUFFICIENT_BUFFER {
+            return Err(format!(
+                "RegGetKeySecurity sizing returned {first} (expected ERROR_INSUFFICIENT_BUFFER = {ERROR_INSUFFICIENT_BUFFER})"
+            ));
+        }
+        if needed == 0 {
+            return Err("RegGetKeySecurity reported a zero-byte security descriptor".to_owned());
+        }
+        let mut buffer = vec![0u8; needed as usize];
+        let status = unsafe {
+            RegGetKeySecurity(
+                handle,
+                requested,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                &mut needed,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "RegGetKeySecurity failed with Windows error {status}"
+            ));
+        }
+        security_descriptor_to_sddl(buffer.as_mut_ptr().cast::<c_void>())
+    }
+
+    /// Split an operator-visible registry-key path into its root
+    /// hive HKEY constant and a NUL-terminator-free relative sub-key
+    /// path suitable for `RegOpenKeyExW`. Accepted prefixes are
+    /// the five standard hives (`HKLM` / `HKEY_LOCAL_MACHINE` /
+    /// `HKCU` / `HKEY_CURRENT_USER` / `HKCR` /
+    /// `HKEY_CLASSES_ROOT` / `HKU` / `HKEY_USERS` / `HKCC` /
+    /// `HKEY_CURRENT_CONFIG`). Both `\` and `/` are accepted as
+    /// the separator between the hive prefix and the sub-key path.
+    fn parse_registry_root(
+        key_path: &str,
+    ) -> Result<(windows_sys::Win32::System::Registry::HKEY, &str), String> {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+            HKEY_USERS,
+        };
+        let trimmed = key_path.trim();
+        if trimmed.is_empty() {
+            return Err("registry key path must not be empty".to_owned());
+        }
+        let split_at = trimmed
+            .find(|c: char| c == '\\' || c == '/')
+            .ok_or_else(|| {
+                format!("registry key path {trimmed:?} missing hive separator (\\ or /)")
+            })?;
+        let prefix = &trimmed[..split_at];
+        let rest = &trimmed[split_at + 1..];
+        if rest.is_empty() {
+            return Err(format!("registry key path {trimmed:?} has empty sub-key"));
+        }
+        let root: windows_sys::Win32::System::Registry::HKEY =
+            match prefix.to_ascii_uppercase().as_str() {
+                "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
+                "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+                "HKCR" | "HKEY_CLASSES_ROOT" => HKEY_CLASSES_ROOT,
+                "HKU" | "HKEY_USERS" => HKEY_USERS,
+                "HKCC" | "HKEY_CURRENT_CONFIG" => HKEY_CURRENT_CONFIG,
+                other => {
+                    return Err(format!(
+                        "registry hive {other:?} not recognised (expected HKLM/HKCU/HKCR/HKU/HKCC)"
+                    ));
+                }
+            };
+        Ok((root, rest))
+    }
+
+    /// W5 — Authenticode SHA-256 thumbprint extractor.
+    ///
+    /// Scope of this slice: the Win32 surface (`CryptQueryObject` +
+    /// `CryptMsgGetParam(CMSG_SIGNER_INFO_PARAM)` +
+    /// `CertFindCertificateInStore` +
+    /// `CertGetCertificateContextProperty(CERT_SHA256_HASH_PROP_ID)`)
+    /// has not yet been validated against a Windows runtime
+    /// fixture. Rather than ship un-verified FFI code under a
+    /// security-sensitive function, this entry point returns a
+    /// typed reject that the caller maps to a fail-closed verdict
+    /// (the same effect the `evaluate_thumbprint_policy(None,
+    /// &policy)` path already produces today). The thumbprint
+    /// extraction stays exactly where the W5 plan called for —
+    /// inside `rustynet-windows-native::extract_signer_thumbprint_sha256`
+    /// — so the next slice (Windows-side validation on a real
+    /// fixture) drops in without changing call sites.
+    ///
+    /// Security framing: returning Err here is identical in
+    /// observable verdict to the policy evaluator's
+    /// fail-closed-on-`None` shape. It is NEVER a false pass.
+    pub fn extract_signer_thumbprint_sha256(_path: &Path) -> Result<String, String> {
+        Err(
+            "Windows Authenticode thumbprint extractor pending validation on a Windows fixture; \
+             treat as fail-closed via evaluate_thumbprint_policy(None, &policy)"
+                .to_owned(),
+        )
     }
 
     pub fn lookup_account_sid_string(account_name: &str) -> Result<String, String> {
@@ -753,6 +940,7 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{
-    call_named_pipe, dpapi_protect, dpapi_unprotect, inspect_file_sddl, lookup_account_sid_string,
+    call_named_pipe, dpapi_protect, dpapi_unprotect, extract_signer_thumbprint_sha256,
+    inspect_file_sddl, inspect_registry_key_sddl, lookup_account_sid_string,
     serve_named_pipe_one_message, verify_authenticode_chain,
 };

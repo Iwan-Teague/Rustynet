@@ -20,6 +20,7 @@ pub mod linux_key_custody;
 pub mod linux_killswitch_boot;
 pub mod linux_mesh_status;
 pub mod linux_runtime_acls;
+pub mod linux_runtime_nftables;
 pub mod linux_service_hardening;
 pub mod macos_authenticode;
 pub mod macos_dns_failclosed;

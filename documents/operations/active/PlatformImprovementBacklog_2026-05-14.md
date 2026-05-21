@@ -136,15 +136,41 @@ inline. Cross-reference with:
   directory); 0o000 mode (would break daemon startup); first-fault
   ordering (mode > uid > gid); and the AND-of-statuses
   `overall_ok` invariant. (Commit a924229.)
-* `[ ]` Remaining scope (separate slice): nftables IPv6 parity +
-  named-chain integrity in `phase10.rs` / `privileged_helper.rs`
-  bring-up. Distinct from L7 (which scopes the exit-node `ip6`
-  NAT sibling table + `ipv6_parity_supported=true` flip); this
-  entry covers the runtime-ACL families (`inet rustynet` /
-  `ip rustynet`) and their named-chain wiring against silent
-  drift. Verifier evaluator extension lives in `phase10.rs`;
-  no test floor exists yet because the surface lives outside
-  the per-platform `linux_runtime_acls` module.
+* `[~]` Verifier-evaluator scaffolding landed (commit pending).
+  New module `crates/rustynetd/src/linux_runtime_nftables.rs`
+  carries the pure evaluator + the typed snapshot/report shapes
+  for the runtime-ACL families (`inet rustynet` /
+  `ip rustynet_nat`) plus the optional `ip6 rustynet_nat`
+  sibling. The evaluator pins:
+  - both `inet rustynet` and `ip rustynet_nat` families are
+    programmed (missing either → drift);
+  - each family's chain set is exactly the reviewed list
+    (missing OR unexpected chains both surface as drift —
+    silent-extra-chain is a security-grade concern because a
+    parallel chain could widen the policy);
+  - the IPv6-parity invariant: when
+    `LinuxRuntimeNftablesPolicy::ipv6_parity_required=true` is
+    set (gated by L7's `ipv6_parity_supported=true` flip), the
+    `ip6 rustynet_nat` sibling table is required; until that
+    flip lands, the absence of `ip6` is informational only and
+    does NOT trip drift.
+  Includes `parse_nft_ruleset(body)` so the evaluator can be
+  driven directly from a captured `nft list ruleset` text.
+  15 new tests pin: clean inet+ip-NAT snapshot accepted,
+  missing inet table rejected, missing ip-NAT table rejected,
+  missing required chain rejected, unexpected chain rejected,
+  ipv6-not-required-but-absent accepted, ipv6-required-but-
+  absent rejected, ipv6-required-and-clean accepted, off-Linux
+  host short-circuits to one platform-blocker reason, report
+  overall_ok flips correctly, generation-suffix stripper
+  handles canonical + rotated forms, parser recognises both
+  families and round-trips through the evaluator, non-reviewed
+  rustynet_* tables surface as forensic-only state, and
+  schema_version is pinned at 1. Remaining scope: wire the
+  collector into the daemon's reconcile loop + add a
+  regression-coverage floor under
+  `scripts/ci/regression_coverage_gates.sh`. Runtime collector
+  wiring needs the daemon reconcile-side plumbing; queued.
 
 ### L3. `linux_service_hardening.rs` systemd sandbox-flag pinning
 
@@ -501,12 +527,32 @@ inline. Cross-reference with:
   17 new tests + a snapshot test pinning the reviewed-keys list +
   forbidden-principals list. `windows_registry_acls` gate floor
   added at :17.
-* `[ ]` Remaining scope (separate slice): Win32 collector in
-  `rustynet-windows-native` that calls `RegGetKeySecurity` +
-  `ConvertSecurityDescriptorToStringSecurityDescriptor` to populate
-  the snapshot with real SDDLs. Service-config DACL drift via the
-  Win32 API; not landable as a pure-Rust
-  audit extension.
+* `[~]` Win32 collector landed (commit pending). New
+  `rustynet_windows_native::inspect_registry_key_sddl(key_path)`
+  opens the requested HKLM/HKCU/HKCR/HKU/HKCC sub-key via
+  `RegOpenKeyExW(KEY_READ)`, reads the DACL portion of the
+  security descriptor via `RegGetKeySecurity` (matching the
+  Win32 contract: `ERROR_INSUFFICIENT_BUFFER` to size + a
+  second call to populate), and converts to SDDL via the
+  existing `security_descriptor_to_sddl` helper (the same
+  helper the file-ACL path uses). The new
+  `parse_registry_root` helper splits the operator-visible
+  `HKLM\Path\To\Key` style into the HKEY constant + relative
+  sub-key path. Off-Windows the helper returns a clear
+  "Windows-only" platform-blocker `Err`. The crate's
+  `Win32_System_Registry` feature flag was added to
+  `Cargo.toml`. The W4 consumer side in
+  `crates/rustynetd/src/windows_registry_acls.rs::collect_windows_registry_acl_report`
+  now routes each reviewed key through the native helper +
+  maps the outcome to `Ok { acl_sddl }` /
+  `Missing { reason }` / `Invalid { reason, acl_sddl: "" }` /
+  `Unobserved { reason }` per the existing typed status
+  contract. Updated test pin: every reviewed key surfaces as
+  a non-Ok status (Missing/Invalid/Unobserved depending on
+  host context) with `overall_ok=false`. Remaining scope:
+  Windows-side runtime validation on a real Win11 fixture +
+  service-config DACL drift via `QueryServiceObjectSecurity`
+  (separate, sibling API surface).
 
 ### W5. `windows_authenticode.rs` thumbprint pinning + revocation deny-list
 
@@ -545,16 +591,27 @@ inline. Cross-reference with:
   observation fail-closed / malformed allowlist drift / malformed
   denylist drift / allowlist-disabled+clean-denylist passes /
   default empty-state snapshot / policy serde round-trip).
-* `[ ]` Remaining scope (separate slice): native thumbprint EXTRACTOR
-  in `rustynet_windows_native`. The Windows extractor needs to call
-  `CryptQueryObject` on the PE → `CryptMsgGetParam` for the SignerInfo
-  → derive the signer cert from the SignedData → compute
-  `CertGetCertificateContextProperty(CERT_SHA256_HASH_PROP_ID)` and
-  surface the lowercase hex via a new
-  `extract_signer_thumbprint_sha256(path) -> Result<String, String>`
-  function. Until that lands, every observation is `None` and any
-  caller that supplies a policy gets a fail-closed result — which is
-  the correct security posture for rollout.
+* `[~]` Extractor surface scaffolded (commit pending). New
+  `rustynet_windows_native::extract_signer_thumbprint_sha256(path)`
+  is now the canonical entry point and is called from
+  `crates/rustynetd/src/windows_authenticode.rs` instead of the
+  hardcoded `None` placeholder. Today the Windows-side body
+  returns a typed "implementation pending validation on a
+  Windows fixture" `Err`, so the observable verdict on every
+  host is identical to the prior fail-closed `None` shape
+  (every caller that supplies a thumbprint policy still gets
+  the fail-closed `evaluate_thumbprint_policy(None, &policy)`
+  verdict). The scaffolding move is to put the canonical call
+  site in place so the Windows-side completion drops in
+  without touching `windows_authenticode.rs`. Remaining scope
+  (separate slice): the actual Win32 FFI body using
+  `CryptQueryObject` → `CryptMsgGetParam(CMSG_SIGNER_INFO_PARAM)`
+  → `CertFindCertificateInStore` →
+  `CertGetCertificateContextProperty(CERT_SHA256_HASH_PROP_ID)`.
+  This needs runtime validation on a real Windows fixture
+  (CERT_INFO struct shape pin + windows-sys 0.59 const
+  resolution) which is not safe to land from a non-Windows
+  dev environment.
 
 ### W6. `windows_key_custody.rs` DPAPI LocalMachine rotation tests
 
