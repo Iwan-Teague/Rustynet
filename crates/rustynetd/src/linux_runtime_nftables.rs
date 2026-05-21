@@ -366,9 +366,7 @@ fn parse_table_header(trimmed_line: &str) -> Option<ParsedTableHeader> {
     let family = parts.next()?.to_owned();
     let rest = parts.next()?;
     // Name is up to the first space or `{`.
-    let name_end = rest
-        .find([' ', '{'])
-        .unwrap_or(rest.len());
+    let name_end = rest.find([' ', '{']).unwrap_or(rest.len());
     let canonical_name = rest[..name_end].trim().to_owned();
     if family.is_empty() || canonical_name.is_empty() {
         return None;
