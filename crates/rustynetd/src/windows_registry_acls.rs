@@ -148,26 +148,74 @@ pub fn build_windows_registry_acl_report(
     }
 }
 
-/// Cross-platform stub collector. The real Win32 collector
-/// (`RegGetKeySecurity` +
-/// `ConvertSecurityDescriptorToStringSecurityDescriptor`) lives in
-/// `rustynet-windows-native` as a follow-up slice; this stub returns
-/// one `Unobserved` entry per reviewed path with a clear blocker so
-/// `overall_ok=false` and the caller sees the explicit
-/// "collector not wired yet" reason.
+/// Cross-platform collector. On Windows the W4 Win32 collector in
+/// `rustynet_windows_native::inspect_registry_key_sddl` opens each
+/// reviewed key via `RegOpenKeyExW`, reads its DACL via
+/// `RegGetKeySecurity`, and converts to SDDL via
+/// `ConvertSecurityDescriptorToStringSecurityDescriptorW` (mirroring
+/// the file-ACL path's `inspect_file_sddl`). Each per-key outcome is
+/// mapped to:
+///
+/// * `Ok { acl_sddl }` — SDDL returned cleanly.
+/// * `Missing { reason }` — Windows reported `ERROR_FILE_NOT_FOUND`
+///   (the key path doesn't exist on this host).
+/// * `Invalid { reason }` — Win32 returned a different error code,
+///   so the key path is observable but the security descriptor
+///   couldn't be read. Fail-closed: the evaluator treats this the
+///   same as a forbidden grant.
+///
+/// Off-Windows the helper returns the same `Unobserved` shape the
+/// pre-W4 stub did, so the evaluator's "collector unavailable" path
+/// stays well-defined.
 pub fn collect_windows_registry_acl_report() -> WindowsRegistryAclReport {
     let entries: Vec<WindowsRegistryKeyEntry> = REVIEWED_REGISTRY_KEY_PATHS
         .iter()
-        .map(|path| WindowsRegistryKeyEntry {
-            label: format!("registry key {path}"),
-            key_path: (*path).to_owned(),
-            requirement: REQUIREMENT_REQUIRED.to_owned(),
-            status: WindowsRegistryKeyAclStatus::Unobserved {
-                reason: "collector not yet wired (windows-native registry ACL probe is a follow-up slice)".to_owned(),
-            },
-        })
+        .map(|path| collect_one_reviewed_key(path))
         .collect();
     build_windows_registry_acl_report(entries)
+}
+
+fn collect_one_reviewed_key(key_path: &str) -> WindowsRegistryKeyEntry {
+    let status = registry_key_status_via_native(key_path);
+    WindowsRegistryKeyEntry {
+        label: format!("registry key {key_path}"),
+        key_path: key_path.to_owned(),
+        requirement: REQUIREMENT_REQUIRED.to_owned(),
+        status,
+    }
+}
+
+#[cfg(windows)]
+fn registry_key_status_via_native(key_path: &str) -> WindowsRegistryKeyAclStatus {
+    match rustynet_windows_native::inspect_registry_key_sddl(key_path) {
+        Ok(acl_sddl) => WindowsRegistryKeyAclStatus::Ok { acl_sddl },
+        Err(err) => {
+            // Operator-friendly: keep the original error in the
+            // reason so a missing-vs-locked-out case is debuggable.
+            // The evaluator only branches on the variant, never on
+            // the reason text, so log content is free-form.
+            if err.contains("not found") {
+                WindowsRegistryKeyAclStatus::Missing { reason: err }
+            } else {
+                WindowsRegistryKeyAclStatus::Invalid {
+                    reason: err,
+                    // ACL could not be read; surface an empty string
+                    // so downstream serialisers don't break on a
+                    // missing field. The evaluator branches on the
+                    // variant, not on this body.
+                    acl_sddl: String::new(),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn registry_key_status_via_native(_key_path: &str) -> WindowsRegistryKeyAclStatus {
+    WindowsRegistryKeyAclStatus::Unobserved {
+        reason: "windows-native registry ACL collector is only available on Windows hosts"
+            .to_owned(),
+    }
 }
 
 fn evaluate_registry_acl_sddl(label: &str, sddl: &str) -> Result<(), String> {
@@ -483,11 +531,22 @@ mod tests {
 
     #[test]
     fn collector_stub_returns_unobserved_required_entries() {
+        // Off-Windows the W4 collector routes through the
+        // `rustynet-windows-native` shim which returns the
+        // "Windows-only" platform-blocker error, surfaced here as
+        // `WindowsRegistryKeyAclStatus::Unobserved`. On Windows the
+        // native collector exercises real `RegGetKeySecurity` — the
+        // test still passes because the reviewed reviewed key paths
+        // (`HKLM\SYSTEM\CurrentControlSet\Services\RustyNet...`)
+        // are unlikely to exist on the dev machine running cargo
+        // test, so the collector reports `Missing` (or `Invalid`)
+        // rather than `Unobserved`. We accept any non-Ok status and
+        // require `overall_ok=false`.
         let report = collect_windows_registry_acl_report();
         assert_eq!(report.schema_version, 1);
         assert!(
             !report.overall_ok,
-            "stub collector must not claim overall_ok=true"
+            "collector must not claim overall_ok=true without observing the reviewed keys"
         );
         assert_eq!(report.entries.len(), REVIEWED_REGISTRY_KEY_PATHS.len());
         for (entry, path) in report
@@ -498,21 +557,31 @@ mod tests {
             assert_eq!(entry.key_path, *path);
             assert_eq!(entry.requirement, REQUIREMENT_REQUIRED);
             match &entry.status {
-                WindowsRegistryKeyAclStatus::Unobserved { reason } => {
+                WindowsRegistryKeyAclStatus::Ok { .. } => {
+                    panic!("collector unexpectedly observed a real ACL for {path}");
+                }
+                WindowsRegistryKeyAclStatus::Unobserved { reason }
+                | WindowsRegistryKeyAclStatus::Missing { reason }
+                | WindowsRegistryKeyAclStatus::Invalid { reason, .. } => {
                     assert!(
-                        reason.contains("collector not yet wired"),
-                        "stub reason must explain blocker: {reason}"
+                        !reason.is_empty(),
+                        "drift reason must explain why the key was not Ok: {reason:?}"
                     );
                 }
-                other => panic!("expected Unobserved, got {other:?}"),
             }
         }
+        // The evaluator surfaces every per-key non-Ok state as a
+        // drift reason. Accept any of the canonical surface
+        // tokens: "unobserved required key", "missing required",
+        // or "invalid required" — all three mean "the reviewed key
+        // is not in the Ok state".
         assert!(
-            report
-                .drift_reasons
-                .iter()
-                .any(|r| r.contains("unobserved required key")),
-            "stub must surface unobserved drift: {:?}",
+            report.drift_reasons.iter().any(|r| {
+                r.contains("unobserved required key")
+                    || r.contains("missing required")
+                    || r.contains("invalid required")
+            }),
+            "report must surface at least one per-key drift reason: {:?}",
             report.drift_reasons
         );
     }

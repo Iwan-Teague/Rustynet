@@ -346,13 +346,17 @@ pub fn inspect_authenticode_signature_with_thumbprint_policy(
 
     // W5 thumbprint extraction — wired here so the policy gate sees
     // the same observation as the report's signer_thumbprint_sha256
-    // field. The native extractor is not yet implemented on any host;
-    // for now this is always `None` and the policy evaluator
-    // fail-closes when a policy is supplied. The extractor surface
-    // lives in `rustynet_windows_native::extract_signer_thumbprint`
-    // (future slice). Off-Windows hosts will permanently observe
-    // `None`, matching the chain-status `NotEvaluated` shape.
-    let signer_thumbprint_sha256: Option<String> = None;
+    // field. The native extractor lives in
+    // `rustynet_windows_native::extract_signer_thumbprint_sha256`;
+    // today the Windows-side body still returns a typed
+    // "implementation pending validation on Windows fixture" Err and
+    // off-Windows returns the platform-blocker Err, so this code
+    // path produces `None` on every host and the policy evaluator
+    // fail-closes whenever a policy is supplied. The wiring is in
+    // place so the Windows-side completion drops in without
+    // changing the call site.
+    let signer_thumbprint_sha256: Option<String> =
+        rustynet_windows_native::extract_signer_thumbprint_sha256(path).ok();
     if let Some(policy) = policy {
         for reason in evaluate_thumbprint_policy(signer_thumbprint_sha256.as_deref(), policy) {
             drift_reasons.push(format!("thumbprint policy rejected binary: {reason}"));
