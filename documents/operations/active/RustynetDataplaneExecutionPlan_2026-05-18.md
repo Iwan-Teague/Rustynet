@@ -316,7 +316,39 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
 - **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
 - **Cross-platform note.** Linux + macOS roles all land in D12 (except macOS `blind_exit`, which stays Linux-only). Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
-- **Status (2026-05-21).** **D12.a + D12.b + D12.c (start.sh) + D12.e complete (pre-D11.a surface).**
+- **Status (2026-05-21).** **D12.a + D12.b + D12.c + D12.d (Linux) + D12.e complete (pre-D11.a surface).**
+
+  D12.d lands the Linux service deploy/undeploy infrastructure for the relay-bearing presets:
+
+  1. **`scripts/systemd/rustynet-relay.service`** (new) — the sibling unit that hosts `rustynet-relay` on Linux. Conservative defaults: loopback bind, 0640 perms, hardened sandbox flags (`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `RestrictAddressFamilies`, `CAP_NET_BIND_SERVICE` ambient only). Env-file at `/etc/default/rustynet-relay`; explicit `RUSTYNET_RELAY_BIND` / `RUSTYNET_RELAY_VERIFIER_KEY` / `RUSTYNET_RELAY_REPLAY_STORE` / `RUSTYNET_RELAY_PORT_RANGE` / session caps. `ExecStartPre` checks fail closed if the verifier key is missing.
+  2. **`crates/rustynet-cli/src/ops_install_systemd_relay.rs`** (new, ~430 lines + 7 tests) — Rust orchestrator that installs/uninstalls the unit. Reads source, atomic-renames into `/etc/systemd/system/`, runs `systemctl daemon-reload` + `systemctl enable rustynet-relay.service` + `systemctl start rustynet-relay.service` (or stop+disable+remove for uninstall). `--dry-run` mode plans without touching disk or systemctl (CI-safe). Returns a structured `InstallRelayReport` with the ordered step list + dry-run tag suitable for the role-transition audit log (D12.e).
+  3. **`OpsCommand::InstallSystemdRelay`** — new CLI verb: `rustynet ops install-systemd-relay [--uninstall] [--dry-run]`. Available today for operators who want to stand up a relay manually; once D11.a unblocks the relay/anchor planner paths in `role_cli::plan_concrete_actions`, the role-transition orchestrator calls this same helper automatically.
+
+  Service deploy is intentionally **independent** of the role planner today: pre-D11.a, the role planner refuses relay/anchor with `BlockedByCapabilitySchema`, so the deploy/undeploy code path is exercised manually via the new ops verb. When D11.a lands the capability schema and the planner emits `DeployRelayService` / `UndeployRelayService` `ConcreteAction` variants, the existing `execute_install_relay` helper is the executor — no rewrites needed.
+
+  Per-platform truth:
+  - **Linux** — landed in D12.d (this slice).
+  - **macOS** — deferred. macOS uses launchd (`launchctl bootstrap`), not systemd. A `com.rustynet.relay.plist` launchd-bootstrap helper mirrors the Linux pattern but uses different lifecycle calls; tracked separately as part of the macOS userspace shared-backend track. Manual launchd setup is documented in `documents/operations/MacosLaunchdServiceManagement.md`.
+  - **Windows** — already has working install/uninstall PowerShell helpers: `scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1` and `Uninstall-RustyNetWindowsRelayService.ps1`. The role-transition orchestrator will call these via the existing `windows_install.rs` adapter when D7/D9 unblock Windows non-client roles (D11.a is the harder prerequisite for capability-driven dispatch; the Windows PowerShell helpers are ready today).
+
+  Audit log integration: when the orchestrator invokes `execute_install_relay` (today: manually via ops verb; future: via role transition), the structured `InstallRelayReport.summary()` flows back to the operator. Future role-transition wiring will include the deploy step in the role-audit chain so each transition emits a single combined audit entry covering both the membership capability change and the service deploy.
+
+  Tests (7 new in `ops_install_systemd_relay::tests`):
+  - `dry_run_install_reports_planned_steps` — install plan in dry-run mode, no disk writes, all systemctl steps deferred to "would run".
+  - `dry_run_uninstall_reports_planned_steps` — symmetric for uninstall.
+  - `summary_includes_dry_run_tag` / `summary_omits_dry_run_tag_when_real` — operator-facing summary correctness.
+  - `default_install_targets_etc_systemd_system` / `default_uninstall_targets_etc_systemd_system` — defaults match the Linux convention.
+  - `real_install_writes_unit_file` — atomic write + 0644 perms verified.
+
+  Gates green:
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test --workspace --all-targets --all-features` (1335 lib + 30 role_cli + 14 role_audit + 7 ops_install_systemd_relay + 2 RouteRetract = no regressions)
+  - `./scripts/ci/membership_gates.sh` PASS
+
+  **D12 complete (Linux pre-D11.a surface).** macOS launchd parity + post-D11.a wiring of the role orchestrator's `DeployRelayService` / `UndeployRelayService` actions queued as the next slices.
+
+  D12.c + D12.b + D12.a + D12.e status:
 
   D12.c lands the wizard surface in `start.sh`: the initial-setup role prompt now offers all six presets (`anchor`, `admin`, `exit`, `relay`, `client`, `blind_exit`) via the new `prompt_role_preset` helper. New tracking var `SETUP_ROLE_PRESET` records the operator's preset choice; the existing `NODE_ROLE` primary axis (`admin`/`client`/`blind_exit`) is derived deterministically by the new `normalize_role_preset` helper.
 
