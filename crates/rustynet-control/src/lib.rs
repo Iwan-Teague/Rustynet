@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod enrollment;
 pub mod ga;
 pub mod membership;
 pub mod operations;

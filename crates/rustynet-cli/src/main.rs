@@ -334,6 +334,42 @@ pub enum EnrollmentCliCommand {
         pubkey_b64: String,
         push_addr: String,
     },
+    /// `rustynet enrollment admit ...` — operator one-shot that
+    /// consumes the token locally, builds a signed `AddNode`
+    /// membership update, and optionally applies it to the local
+    /// snapshot when quorum is met. Closes the trust-propagation
+    /// gap that the IPC `consume` verb alone leaves open: after
+    /// `admit` the enrollee is in the signed membership snapshot,
+    /// so every peer that consumes the snapshot (now or later)
+    /// learns the new identity through the same trust channel that
+    /// authorises every other peer.
+    Admit(Box<AdmitConfig>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmitConfig {
+    pub token: String,
+    pub pubkey_b64: String,
+    pub node_id: String,
+    pub owner: String,
+    pub roles: Vec<String>,
+    pub secret_path: PathBuf,
+    pub ledger_path: PathBuf,
+    pub snapshot_path: PathBuf,
+    pub log_path: PathBuf,
+    pub signing_key_path: PathBuf,
+    pub signing_key_passphrase_path: PathBuf,
+    pub approver_id: String,
+    pub output_path: PathBuf,
+    pub update_id: Option<String>,
+    pub reason_code: String,
+    pub ttl_secs: u64,
+    /// When true, also apply the update locally (append to log +
+    /// persist new snapshot) if the single produced signature
+    /// already meets quorum. When quorum > 1, the produced
+    /// (partially-signed) update is written to `output_path` and
+    /// the operator runs additional `membership sign-update` steps.
+    pub apply: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4156,6 +4192,85 @@ fn parse_enrollment_command(args: &[String]) -> Result<EnrollmentCliCommand, Str
                 push_addr,
             })
         }
+        "admit" => {
+            // Operator one-shot. All paths and identifiers are
+            // required except `--update-id` (auto-generated),
+            // `--reason` (defaults), `--ttl-secs` (defaults), and
+            // `--roles` (empty list).
+            let token = parser
+                .required("--token")
+                .map_err(|_| "--token <encoded> is required".to_owned())?;
+            let pubkey_b64 = parser
+                .required("--pubkey")
+                .map_err(|_| "--pubkey <b64> is required".to_owned())?;
+            let node_id = parser
+                .required("--node-id")
+                .map_err(|_| "--node-id <id> is required".to_owned())?;
+            let owner = parser
+                .required("--owner")
+                .map_err(|_| "--owner <name> is required".to_owned())?;
+            let roles = parser
+                .value("--roles")
+                .map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim().to_owned())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let secret_path = parser
+                .required_path("--secret")
+                .map_err(|_| "--secret <path> is required".to_owned())?;
+            let ledger_path = parser
+                .required_path("--ledger")
+                .map_err(|_| "--ledger <path> is required".to_owned())?;
+            let snapshot_path = parser
+                .required_path("--snapshot")
+                .map_err(|_| "--snapshot <path> is required".to_owned())?;
+            let log_path = parser
+                .required_path("--log")
+                .map_err(|_| "--log <path> is required".to_owned())?;
+            let signing_key_path = parser
+                .required_path("--signing-key")
+                .map_err(|_| "--signing-key <path> is required".to_owned())?;
+            let signing_key_passphrase_path = parser
+                .required_path("--signing-key-passphrase")
+                .map_err(|_| "--signing-key-passphrase <path> is required".to_owned())?;
+            let approver_id = parser
+                .required("--approver-id")
+                .map_err(|_| "--approver-id <id> is required".to_owned())?;
+            let output_path = parser
+                .required_path("--output")
+                .map_err(|_| "--output <path> is required".to_owned())?;
+            let update_id = parser.value("--update-id");
+            let reason_code = parser
+                .value("--reason")
+                .unwrap_or_else(|| "enrollment.token_consume.v1".to_owned());
+            let ttl_secs = parser.parse_u64_or_default(
+                "--ttl-secs",
+                rustynet_control::enrollment::DEFAULT_ADMIT_UPDATE_TTL_SECS,
+            )?;
+            let apply = parser.has_flag("--apply");
+            Ok(EnrollmentCliCommand::Admit(Box::new(AdmitConfig {
+                token,
+                pubkey_b64,
+                node_id,
+                owner,
+                roles,
+                secret_path,
+                ledger_path,
+                snapshot_path,
+                log_path,
+                signing_key_path,
+                signing_key_passphrase_path,
+                approver_id,
+                output_path,
+                update_id,
+                reason_code,
+                ttl_secs,
+                apply,
+            })))
+        }
         _ => Err(format!("unknown enrollment subcommand: {subcommand}")),
     }
 }
@@ -5153,7 +5268,120 @@ fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
                 Err(err) => Err(format!("daemon unreachable: {err}")),
             }
         }
+        EnrollmentCliCommand::Admit(config) => execute_enrollment_admit(*config),
     }
+}
+
+fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
+    use rustynet_control::enrollment::{EnrolleeAdmitContext, build_add_node_record_for_enrollee};
+    use rustynetd::enrollment_token::{
+        load_ledger, load_secret, verify_and_consume_token, write_ledger,
+    };
+    let now_unix = unix_now();
+    // Decode the enrollee pubkey early so a malformed input fails
+    // before we burn a token.
+    use base64::Engine;
+    let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(config.pubkey_b64.as_bytes())
+        .map_err(|err| format!("enrollee pubkey base64 decode failed: {err}"))?;
+    if pubkey_bytes.len() != 32 {
+        return Err(format!(
+            "enrollee pubkey must be 32 bytes after base64 decode (got {})",
+            pubkey_bytes.len()
+        ));
+    }
+    let pubkey_hex: String = pubkey_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Step 1 — verify + consume the token + persist ledger.
+    let secret = load_secret(&config.secret_path).map_err(|err| err.to_string())?;
+    let mut ledger = load_ledger(&config.ledger_path).map_err(|err| err.to_string())?;
+    verify_and_consume_token(&config.token, &secret, &mut ledger)
+        .map_err(|err| format!("enrollment token rejected: {err}"))?;
+    write_ledger(&config.ledger_path, &ledger)
+        .map_err(|err| format!("enrollment ledger persistence failed: {err}"))?;
+
+    // Step 2 — load current membership state.
+    let paths = MembershipPaths {
+        snapshot_path: config.snapshot_path.clone(),
+        log_path: config.log_path.clone(),
+    };
+    let (_, entries, state) = load_current_membership_state(&paths, now_unix)?;
+    // The reducer rejects duplicate node ids; surface a clearer
+    // diagnostic before we sign anything pointless.
+    if state.nodes.iter().any(|n| n.node_id == config.node_id) {
+        return Err(format!(
+            "membership snapshot already contains node_id {}; refusing to admit",
+            config.node_id
+        ));
+    }
+
+    // Step 3 — build the AddNode record.
+    let ctx = EnrolleeAdmitContext {
+        node_id: config.node_id.clone(),
+        node_pubkey_hex: pubkey_hex,
+        owner: config.owner,
+        roles: config.roles,
+        update_id: config.update_id.unwrap_or_else(generate_update_id),
+        reason_code: config.reason_code,
+        policy_context: None,
+        now_unix,
+        ttl_secs: config.ttl_secs,
+    };
+    let record = build_add_node_record_for_enrollee(&state, ctx)
+        .map_err(|err| format!("admit record build failed: {err}"))?;
+
+    // Step 4 — sign the record under the operator's approver key.
+    let signing_key = load_signing_key(
+        &config.signing_key_path,
+        &config.signing_key_passphrase_path,
+    )?;
+    let signature = sign_update_record(&record, config.approver_id.as_str(), &signing_key)
+        .map_err(|err| format!("sign update failed: {err}"))?;
+    let signed = SignedMembershipUpdate {
+        record,
+        approver_signatures: vec![signature],
+    };
+
+    // Step 5 — write the signed update to the operator's output
+    // path so further co-signing (when quorum > 1) can chain via
+    // `membership sign-update --merge-from`.
+    let envelope = encode_signed_update(&signed).map_err(|err| err.to_string())?;
+    write_text_file(&config.output_path, &envelope)?;
+
+    if !config.apply {
+        return Ok(format!(
+            "admit produced signed update: {} signatures={} target={} quorum_threshold={}",
+            config.output_path.display(),
+            signed.approver_signatures.len(),
+            signed.record.target,
+            state.quorum_threshold,
+        ));
+    }
+
+    // Step 6 (optional --apply) — if the single signature already
+    // meets quorum, run apply locally so the snapshot + log
+    // reflect the new node immediately.
+    if (signed.approver_signatures.len() as u8) < state.quorum_threshold {
+        return Ok(format!(
+            "admit produced partially-signed update: {} signatures={} need={} (run `rustynet membership sign-update --merge-from {}` for further co-signing)",
+            config.output_path.display(),
+            signed.approver_signatures.len(),
+            state.quorum_threshold,
+            config.output_path.display(),
+        ));
+    }
+    let mut replay_cache = replay_cache_from_entries(&entries)?;
+    let next = apply_signed_update(&state, &signed, now_unix, &mut replay_cache)
+        .map_err(|err| format!("apply_signed_update failed: {err}"))?;
+    append_membership_log_entry(&paths.log_path, &signed).map_err(|err| err.to_string())?;
+    persist_membership_snapshot(&paths.snapshot_path, &next).map_err(|err| err.to_string())?;
+    Ok(format!(
+        "admit applied: snapshot={} log={} epoch_new={} target={}",
+        paths.snapshot_path.display(),
+        paths.log_path.display(),
+        next.epoch,
+        signed.record.target,
+    ))
 }
 
 fn execute_trust(command: TrustCommand) -> Result<String, String> {
