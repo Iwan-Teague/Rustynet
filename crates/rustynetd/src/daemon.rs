@@ -4758,6 +4758,14 @@ impl DaemonRuntime {
                         handshake_freshness_secs: self.traversal_probe_handshake_freshness_secs,
                         coordination_schedule,
                         coordination_error,
+                        // D5.5 promotion: deterministic ICE role
+                        // assignment from SHA-256 of both node ids.
+                        // Both peers compute the same digests, so
+                        // the controlling/controlled split is
+                        // symmetric without an ICE-CONTROLLING
+                        // handshake.
+                        local_node_id_digest: sha256_digest(self.local_node_id.as_bytes()),
+                        remote_node_id_digest: sha256_digest(remote_node_id.as_str().as_bytes()),
                     },
                 )
                 .map_err(|err| {

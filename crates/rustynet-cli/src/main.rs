@@ -2,6 +2,7 @@
 
 mod env_file;
 mod live_lab_results;
+mod ops_cross_network_preflight;
 mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
@@ -582,6 +583,16 @@ enum OpsCommand {
     VerifyPhase6ParityEvidence,
     VerifyRequiredTestOutput {
         config: ops_phase9::VerifyRequiredTestOutputConfig,
+    },
+    /// Lever 2 — `rustynet ops cross-network-preflight`. Reads
+    /// STUN servers + an optional relay endpoint from the CLI
+    /// flags, probes them, classifies NAT behaviour, and emits an
+    /// operator-facing verdict (`direct_likely` /
+    /// `mixed_nat_could_work` / `relay_required` / `stun_broken` /
+    /// `no_stun_configured`). See `ops_cross_network_preflight`
+    /// module docs for the heuristic.
+    CrossNetworkPreflight {
+        config: ops_cross_network_preflight::CrossNetworkPreflightConfig,
     },
     GenerateCrossNetworkRemoteExitReport {
         config: ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig,
@@ -1938,6 +1949,30 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 test_filter: parser.required("--test-filter")?,
             },
         }),
+        "cross-network-preflight" => {
+            // Lever 2 — parse STUN servers + optional relay endpoint
+            // and turn them into a `CrossNetworkPreflightConfig`. The
+            // parser is intentionally permissive on the STUN list
+            // (CSV of `host:port`) so the operator can paste the
+            // same value used for `RUSTYNET_TRAVERSAL_STUN_SERVERS`.
+            let stun_servers = parser
+                .value("--stun-servers")
+                .map(split_csv)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| !s.trim().is_empty())
+                .collect::<Vec<_>>();
+            Ok(OpsCommand::CrossNetworkPreflight {
+                config: ops_cross_network_preflight::CrossNetworkPreflightConfig {
+                    stun_servers,
+                    relay_endpoint: parser.value("--relay-endpoint"),
+                    stun_timeout_ms: parser.parse_u64_or_default("--stun-timeout-ms", 2_000)?,
+                    relay_timeout_ms: parser.parse_u64_or_default("--relay-timeout-ms", 3_000)?,
+                    json: parser.has_flag("--json"),
+                    output_path: parser.optional_path("--output-path"),
+                },
+            })
+        }
         "generate-cross-network-remote-exit-report" => {
             let source_artifacts = collect_repeated_option_values(&args[1..], "--source-artifact")
                 .into_iter()
@@ -5599,6 +5634,9 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::VerifyRequiredTestOutput { config } => {
             ops_phase9::execute_ops_verify_required_test_output(config)
+        }
+        OpsCommand::CrossNetworkPreflight { config } => {
+            ops_cross_network_preflight::execute_cross_network_preflight(config)
         }
         OpsCommand::GenerateCrossNetworkRemoteExitReport { config } => {
             ops_cross_network_reports::execute_ops_generate_cross_network_remote_exit_report(config)

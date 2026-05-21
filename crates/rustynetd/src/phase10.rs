@@ -228,6 +228,17 @@ pub struct TraversalProbeEvaluation<'a> {
     pub handshake_freshness_secs: u64,
     pub coordination_schedule: Option<CoordinationSchedule>,
     pub coordination_error: Option<String>,
+    /// D5.5 promotion — SHA-256 digests of the local + remote
+    /// `NodeId` strings, used by `ice_priority::decide_role` to
+    /// deterministically split controlling/controlled across both
+    /// peers without an ICE-CONTROLLING handshake. Both peers
+    /// compute the same digests for the same node ids, so the role
+    /// assignment is symmetric and stable. The digest hides the raw
+    /// node id length from the role decision and pins the role
+    /// computation to a fixed 32-byte shape that
+    /// `ice_priority::decide_role` accepts directly.
+    pub local_node_id_digest: [u8; 32],
+    pub remote_node_id_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4361,13 +4372,25 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             };
             let mut waiter = Phase10PeerWaiter;
 
+            // D5.5 promotion (2026-05-21): production probe path now
+            // uses the parallel ICE-pair race instead of the older
+            // serial `execute_simultaneous_open`. The parallel race
+            // fires every pair of a round before polling for
+            // handshakes, which is the shape marginal-NAT pairs
+            // (one cone, one nearly-symmetric) need to succeed —
+            // the serial loop would have polled after the first
+            // probe and given up before the second pinhole opened.
+            // Cone-NAT happy paths are unaffected: the first
+            // priority-sorted pair still wins on round 0.
             engine
-                .execute_simultaneous_open(
+                .execute_ice_pair_race(
                     &mut runtime,
                     &mut waiter,
                     schedule,
                     evaluation.local_candidates,
                     evaluation.direct_candidates,
+                    &evaluation.local_node_id_digest,
+                    &evaluation.remote_node_id_digest,
                     evaluation.relay_endpoint,
                     evaluation.now_unix,
                     evaluation.handshake_freshness_secs,
@@ -8385,6 +8408,8 @@ mod tests {
                     handshake_freshness_secs: 30,
                     coordination_schedule: None,
                     coordination_error: None,
+                    local_node_id_digest: [1u8; 32],
+                    remote_node_id_digest: [2u8; 32],
                 },
             )
             .expect("existing handshake should keep direct path");
@@ -8453,6 +8478,8 @@ mod tests {
                     handshake_freshness_secs: 30,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
+                    local_node_id_digest: [1u8; 32],
+                    remote_node_id_digest: [2u8; 32],
                 },
             )
             .expect("probe should promote direct candidate");
@@ -8526,6 +8553,8 @@ mod tests {
                     handshake_freshness_secs: 30,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
+                    local_node_id_digest: [1u8; 32],
+                    remote_node_id_digest: [2u8; 32],
                 },
             )
             .expect("relay fallback should be allowed");
@@ -8598,6 +8627,8 @@ mod tests {
                     handshake_freshness_secs: 30,
                     coordination_schedule: Some(sample_coordination_schedule(210)),
                     coordination_error: None,
+                    local_node_id_digest: [1u8; 32],
+                    remote_node_id_digest: [2u8; 32],
                 },
             )
             .expect("signed direct path should stay programmed without relay fallback");
@@ -8677,6 +8708,8 @@ mod tests {
                         "validated traversal coordination for peer node-b is unavailable"
                             .to_owned(),
                     ),
+                    local_node_id_digest: [1u8; 32],
+                    remote_node_id_digest: [2u8; 32],
                 },
             )
             .expect("relay fallback should be allowed");
@@ -8747,6 +8780,8 @@ mod tests {
                         "validated traversal coordination for peer node-b is unavailable"
                             .to_owned(),
                     ),
+                    local_node_id_digest: [1u8; 32],
+                    remote_node_id_digest: [2u8; 32],
                 },
             )
             .expect_err("missing coordination must fail closed without relay");
