@@ -29,6 +29,37 @@ use rustynet_control::role_presets::{
     Capability, PrimaryRole, RolePreset, TransitionKind, composition_for, transition_plan,
 };
 
+/// Stable error-category tag for a [`RoleCliError`]. Used by the
+/// D12.e audit logger so audit consumers can match on the
+/// categorical shape without parsing the human-readable
+/// `user_message()` string.
+pub fn role_cli_error_category(err: &RoleCliError) -> &'static str {
+    match err {
+        RoleCliError::BlindExitImmutable { .. } => "blind_exit_immutable",
+        RoleCliError::BlindExitRequiresExplicitAcknowledgement { .. } => {
+            "blind_exit_requires_explicit_acknowledgement"
+        }
+        RoleCliError::BlockedByCapabilitySchema { .. } => "blocked_by_capability_schema",
+        RoleCliError::RequiresStagedTransition { .. } => "requires_staged_transition",
+        RoleCliError::StatusUnreadable { .. } => "status_unreadable",
+        RoleCliError::UnknownPreset { .. } => "unknown_preset",
+        RoleCliError::UnknownCapability { .. } => "unknown_capability",
+    }
+}
+
+/// Default audit-log path on Linux. Operator-overridable by setting
+/// `RUSTYNET_ROLE_AUDIT_LOG_PATH` in the env.
+pub const DEFAULT_ROLE_AUDIT_LOG_PATH: &str = "/var/lib/rustynet/role_transitions.audit.log";
+
+/// Resolve the role-transition audit log path. Honours
+/// `RUSTYNET_ROLE_AUDIT_LOG_PATH` first; falls back to
+/// [`DEFAULT_ROLE_AUDIT_LOG_PATH`].
+pub fn resolve_audit_log_path() -> PathBuf {
+    std::env::var_os("RUSTYNET_ROLE_AUDIT_LOG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROLE_AUDIT_LOG_PATH))
+}
+
 /// One concrete side-effect the executor must perform. Returned in
 /// the order it should be applied: e.g. retract default route
 /// (admin-gated) BEFORE writing a new NODE_ROLE=client config.

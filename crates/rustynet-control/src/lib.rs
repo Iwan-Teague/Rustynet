@@ -6,6 +6,7 @@ pub mod ga;
 pub mod membership;
 pub mod operations;
 pub mod persistence;
+pub mod role_audit;
 pub mod role_presets;
 pub mod scale;
 

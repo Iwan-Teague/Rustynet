@@ -316,7 +316,21 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
 - **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
 - **Cross-platform note.** Linux + macOS roles all land in D12 (except macOS `blind_exit`, which stays Linux-only). Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
-- **Status (2026-05-21).** **D12.a + D12.b complete (pre-D11.a surface).**
+- **Status (2026-05-21).** **D12.a + D12.b + D12.e complete (pre-D11.a surface).**
+
+  D12.e lands `crates/rustynet-control/src/role_audit.rs` (~550 lines impl + 14 tests). Every role transition (success, blocked, mid-execution failure) and every capability mutation attempt emits an append-only audit entry via the orchestrator in `main.rs::execute_role_plan` + `execute_capability`. The chain shape mirrors the existing membership audit log (`verify_membership_log_chain`): each entry binds to the previous via `previous_hash`, and `entry_hash = sha256(index | previous_hash | event_canonical_payload_hex)`. Tampering with any field invalidates the chain from that position forward — confirmed by six negative tests (entry_hash tamper, payload tamper, previous_hash tamper, reorder, insert, plus all-positive read/append/verify cycles).
+
+  Audit log path: `/var/lib/rustynet/role_transitions.audit.log` (Linux default). Operator-overridable via `RUSTYNET_ROLE_AUDIT_LOG_PATH`. File mode `0640` on first create (tightens by default; doesn't downgrade existing perms).
+
+  Event categories captured:
+  - `PresetTransition { from, to, outcome, error_category }` where outcome ∈ {Succeeded, Blocked, Failed} and error_category is the stable categorical tag from `role_cli::role_cli_error_category` (one of `blind_exit_immutable`, `blind_exit_requires_explicit_acknowledgement`, `blocked_by_capability_schema`, `requires_staged_transition`, `status_unreadable`, `side_effect_failed`).
+  - `CapabilityMutation { capability, mutation: {Add|Remove}, outcome, error_category }`.
+
+  Canonical event payload is sorted-key UTF-8 `key=value\n` lines (mirrors membership canonical payload pattern). Control characters and newlines are rejected by debug-assert; payload is hex-encoded in the log line so it stays strictly ASCII and operator-readable.
+
+  Audit log append is best-effort wrt blocking: failure surfaces as a non-fatal stderr `[warn]` and the transition still completes. The tamper-evident chain verifier (`verify_role_audit_chain`) catches post-hoc tampering whether or not every write succeeded.
+
+  D12.b commit (2026-05-21):
 
   D12.b lands in `crates/rustynet-cli/src/role_cli.rs` (640 lines impl + 30 tests) + main.rs wiring (CLI verbs `rustynet role {status, list, set, transition-check}` and `rustynet capability {list, add, remove}`) + `IpcCommand::RouteRetract(String)` (symmetric counterpart of `RouteAdvertise`, admin-gated, auto-tunnel-allowed for `0.0.0.0/0`).
 
