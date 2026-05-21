@@ -162,6 +162,72 @@ first use) handshake the Rustynet bootstrap performs with the
 out-of-band trust anchor; making it explicit closes
 SecurityHardeningAudit_2026-04-28.md §B.9.1.
 
+## 6.C) Anchor Node Capability Controls
+
+The anchor role (see
+[`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](./operations/active/AnchorNodeRoleDesign_2026-05-21.md))
+introduces a small number of LAN-exposed surfaces that must satisfy the
+following minimum-bar controls. Anchor is operational metadata, not a
+trust authority: anchor flags are never consulted before signature
+verification, and an anchor cannot self-promote — capability changes
+require an owner-signed membership bundle.
+
+Required controls when any `anchor.*` capability is advertised on a
+running daemon:
+
+1. **Signed capability advertisement.** Anchor capabilities live in the
+   canonical-payload pre-image of the signed membership bundle.
+   Tampering with the `node_capabilities` field invalidates the bundle
+   signature. The membership reducer MUST reject unsigned/invalid
+   bundles regardless of capability contents.
+
+2. **Bundle-pull endpoint default-deny.** The `anchor.bundle_pull`
+   endpoint defaults to loopback bind
+   (`127.0.0.1:51822`). LAN-IP bind requires an explicit
+   `--anchor-bundle-pull-lan-bind` flag and documented operator
+   acknowledgement. Non-loopback packets MUST be dropped when the
+   endpoint is loopback-only.
+
+3. **Token-gated bundle-pull + enrollment redemption.** Anchor
+   bundle-pull and anchor-hosted enrollment redemption MUST share a
+   single-use enrollment-token ledger so a token cannot be consumed
+   for both. Replay of a consumed token MUST be rejected fail-closed.
+
+4. **Anchor secret custody.** The anchor enrollment-endpoint HMAC
+   secret MUST be stored in OS-secure custody:
+   - Linux: systemd `LoadCredentialEncrypted` credential
+     (`anchor_enrollment_secret.cred`); plaintext custody rejected.
+   - macOS: Keychain item `rustynet.anchor_enrollment_secret`;
+     plaintext custody rejected.
+   - Windows: DPAPI-protected `anchor_enrollment_secret.dpapi` blob
+     under `C:\ProgramData\RustyNet\secrets\`; ACL must be
+     SYSTEM/Administrators-only and validated by the W4 verifier.
+
+5. **Anchor downgrade is fail-closed.** A bundle that removes anchor
+   capabilities from a previously-anchored node without a higher epoch
+   MUST be rejected by the existing membership replay-watermark path.
+
+6. **No anchor PII in logs.** Anchor bundle-pull request logs MUST
+   record only token thumbprint (not the token) plus duration. Peer
+   identifiers and candidate IPs MUST be redacted at the same level
+   as gossip surfaces, per
+   [`operations/PrivacyRetentionPolicy.md`](./operations/PrivacyRetentionPolicy.md).
+
+7. **Multi-anchor port-mapping coordination.** When multiple anchors
+   advertise `anchor.port_mapping_authoritative=true` on the same
+   LAN, only the lex-min `node_id` MUST request the router lease;
+   the others MUST stand down. Racing the router lease is rejected.
+
+8. **Mobile anchor consumption is read-only.** iOS and Android clients
+   MUST treat anchor metadata as read-only display information and
+   MUST NOT host any anchor capability locally. The mobile
+   `anchor_bundle_pull_client` FFI surface is consumption-only.
+
+Each control must have an enforcement point in code and a verification
+method (unit test, integration test, negative test, or gate). The
+anchor design document §8 maps controls to enforcement points and
+§10 maps to gates.
+
 ## 7) Phase Mapping
 - Phase 1: baseline standards and threat model defined.
 - Phase 2: auth/enrollment abuse controls + key custody baseline + atomic one-time key handling.

@@ -80,6 +80,11 @@ Should own:
 - exit-mode and routing-intent logic
 - DNS / Magic DNS state handling that is platform-agnostic
 - diagnostics generation and redaction
+- `anchor_bundle_pull_client` — single-use-token bundle-pull against
+  an anchor's LAN-loopback endpoint, sharing the verification path
+  with the desktop `rustynet anchor pull-bundle` CLI verb
+  (consumption only; mobile cannot host anchor capabilities — see
+  [`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](../operations/active/AnchorNodeRoleDesign_2026-05-21.md) §6.4–6.5)
 
 Should not own:
 
@@ -87,6 +92,9 @@ Should not own:
 - iOS `NEPacketTunnelProvider`
 - Kotlin/Swift UI
 - direct native keystore/keychain APIs
+- any anchor host capability (`anchor.gossip_seed`,
+  `anchor.bundle_pull` server side, `anchor.enrollment_endpoint`,
+  `anchor.relay_colocation`, `anchor.port_mapping_authoritative`)
 
 ### `rustynet-mobile-ffi`
 

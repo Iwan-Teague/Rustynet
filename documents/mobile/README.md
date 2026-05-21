@@ -32,3 +32,33 @@ Rules:
 - do not let mobile planning weaken current repository source-of-truth rules
 - if mobile work becomes active implementation work, add the owning plan to the
   appropriate active-ledger index
+
+## Anchor Node Role (iOS and Android are bootstrap-clients only)
+
+The anchor node role
+([`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](../operations/active/AnchorNodeRoleDesign_2026-05-21.md))
+is a host-side runtime role for always-on peers that publish a stable
+bootstrap target on the LAN. iOS and Android **cannot host** any
+anchor capability:
+
+- `NEPacketTunnelProvider` (iOS) and Android `VpnService` lifecycles
+  do not provide reliable 24/7 background residency
+- mobile addresses change too frequently to anchor (Wi-Fi/cellular
+  handoff, NAT churn)
+- mobile sandboxing prevents LAN-exposed listener bind on arbitrary
+  ports
+
+Mobile clients **consume** anchor services:
+
+- `rustynet-mobile-core` carries an `anchor_bundle_pull_client`
+  module that performs the same single-use-token bundle-pull as the
+  `rustynet anchor pull-bundle` CLI verb
+- the FFI surface stays narrow: callable from iOS Swift and Android
+  Kotlin shells; signed-bundle verification is identical to the
+  desktop path
+- mobile UI surfaces anchor metadata read-only so the operator can
+  pick a sensible first-contact target
+
+See the architecture and roadmap files in this folder for how this
+fits into the broader mobile crate split (`rustynet-mobile-core`,
+`rustynet-mobile-ffi`).
