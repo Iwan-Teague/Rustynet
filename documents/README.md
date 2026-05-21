@@ -60,7 +60,8 @@ These hold future mobile-client architecture and roadmap material.
 
 These are the first active work documents to check for current status and remaining work.
 
-- [RustynetDataplaneExecutionPlan_2026-05-18.md](./operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md) — current dataplane track (D2-D11): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, anchor-role formalisation. Read this first for "what are we building and why."
+- [RustynetDataplaneExecutionPlan_2026-05-18.md](./operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md) — current dataplane track (D2-D12): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, anchor-role formalisation, 6-role user-selectable surface. Read this first for "what are we building and why."
+- [NodeRoleTaxonomy_2026-05-21.md](./operations/active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the six user-selectable node roles (D12): `relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`. Preset compositions, transition matrix, per-platform eligibility.
 - [AnchorNodeRoleDesign_2026-05-21.md](./operations/active/AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11): role definition, per-platform host capability, refactor inventory, security controls.
 - [MasterWorkPlan_2026-03-22.md](./operations/active/MasterWorkPlan_2026-03-22.md)
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
@@ -106,6 +107,7 @@ Traversal, relay, and transport-owning backend plans:
 - [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](./operations/active/UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
 - [UdpHolePunchingImplementationBlueprint_2026-03-07.md](./operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
 - [AnchorNodeRoleDesign_2026-05-21.md](./operations/active/AnchorNodeRoleDesign_2026-05-21.md)
+- [NodeRoleTaxonomy_2026-05-21.md](./operations/active/NodeRoleTaxonomy_2026-05-21.md)
 
 Cross-platform orchestrator, Windows, and macOS plans:
 - [OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md](./operations/active/OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)
