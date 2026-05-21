@@ -5910,6 +5910,16 @@ impl DaemonRuntime {
             IpcCommand::RouteAdvertise(cidr)
                 if self.allow_auto_tunnel_exit_advertisement(cidr)
         );
+        // D12.b: `route retract 0.0.0.0/0` on an admin primary mirrors
+        // the auto-tunnel allowance the advertise side already grants —
+        // an admin must be able to back out of exit-serving without
+        // disabling auto-tunnel enforcement first. Other CIDRs remain
+        // gated by the broader auto-tunnel guard below.
+        let auto_tunnel_route_retract_allowed = matches!(
+            &command,
+            IpcCommand::RouteRetract(cidr)
+                if self.allow_auto_tunnel_exit_advertisement(cidr)
+        );
         if self.auto_tunnel_enforce
             && matches!(
                 &command,
@@ -5918,11 +5928,13 @@ impl DaemonRuntime {
                     | IpcCommand::LanAccessOn
                     | IpcCommand::LanAccessOff
                     | IpcCommand::RouteAdvertise(_)
+                    | IpcCommand::RouteRetract(_)
             )
             && !auto_tunnel_route_advertise_allowed
+            && !auto_tunnel_route_retract_allowed
         {
             return IpcResponse::err(
-                "manual route and exit mutations are disabled while auto-tunnel is enforced (except route advertise 0.0.0.0/0 for exit-serving nodes)",
+                "manual route and exit mutations are disabled while auto-tunnel is enforced (except route advertise/retract 0.0.0.0/0 for exit-serving nodes)",
             );
         }
 
@@ -6276,6 +6288,35 @@ impl DaemonRuntime {
                     self.reconcile();
                 }
                 IpcResponse::ok(format!("route advertised: {cidr}"))
+            }
+            IpcCommand::RouteRetract(cidr) => {
+                // D12.b — counterpart of RouteAdvertise. Used by the
+                // `exit → admin` and `exit → client` role transitions
+                // in the NodeRoleTaxonomy_2026-05-21 design. Tears
+                // down exit-serving forwarding + NAT when `cidr` is
+                // `0.0.0.0/0` on an admin primary.
+                if !validate_cidr(&cidr) {
+                    return IpcResponse::err("invalid cidr format");
+                }
+                if !self.advertised_routes.contains(&cidr) {
+                    return IpcResponse::err(format!(
+                        "route retract denied: {cidr} is not currently advertised"
+                    ));
+                }
+                self.advertised_routes.remove(&cidr);
+                self.local_route_reconcile_pending = true;
+                self.reconcile();
+                if let Err(err) = self.persist_state() {
+                    // Re-insert the route so the in-memory and persisted
+                    // state remain consistent on persist failure.
+                    self.advertised_routes.insert(cidr.clone());
+                    self.local_route_reconcile_pending = true;
+                    self.reconcile();
+                    return IpcResponse::err(format!(
+                        "route retract failed (persist error): {err}"
+                    ));
+                }
+                IpcResponse::ok(format!("route retracted: {cidr}"))
             }
             IpcCommand::KeyRotate => match self.rotate_local_key_material() {
                 Ok(message) => IpcResponse::ok(message),

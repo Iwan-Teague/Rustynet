@@ -48,6 +48,13 @@ pub enum IpcCommand {
     LanAccessOff,
     DnsInspect,
     RouteAdvertise(String),
+    /// D12.b — symmetric counterpart of `RouteAdvertise`. Removes
+    /// a previously-advertised route from `advertised_routes` and
+    /// triggers a dataplane reconcile. For `0.0.0.0/0` on an
+    /// admin primary this tears down exit-serving forwarding +
+    /// NAT (the `exit → admin` role transition in the
+    /// `NodeRoleTaxonomy_2026-05-21` design). Admin-gated.
+    RouteRetract(String),
     KeyRotate,
     KeyRevoke,
     /// D2.5 push-loop entry point. Carries the already-serialised
@@ -85,6 +92,7 @@ impl IpcCommand {
                 | IpcCommand::LanAccessOff
                 | IpcCommand::StateRefresh
                 | IpcCommand::RouteAdvertise(_)
+                | IpcCommand::RouteRetract(_)
                 | IpcCommand::KeyRotate
                 | IpcCommand::KeyRevoke
                 | IpcCommand::PushGossipBundle { .. }
@@ -103,6 +111,7 @@ impl IpcCommand {
             IpcCommand::LanAccessOff => "lan-access off".to_owned(),
             IpcCommand::DnsInspect => "dns inspect".to_owned(),
             IpcCommand::RouteAdvertise(cidr) => format!("route advertise {cidr}"),
+            IpcCommand::RouteRetract(cidr) => format!("route retract {cidr}"),
             IpcCommand::KeyRotate => "key rotate".to_owned(),
             IpcCommand::KeyRevoke => "key revoke".to_owned(),
             IpcCommand::PushGossipBundle { wire_bytes } => {
@@ -178,6 +187,9 @@ pub fn parse_command(raw: &str) -> IpcCommand {
         [cmd, subcmd] if cmd == "dns" && subcmd == "inspect" => IpcCommand::DnsInspect,
         [cmd, subcmd, cidr] if cmd == "route" && subcmd == "advertise" => {
             IpcCommand::RouteAdvertise(cidr.clone())
+        }
+        [cmd, subcmd, cidr] if cmd == "route" && subcmd == "retract" => {
+            IpcCommand::RouteRetract(cidr.clone())
         }
         [cmd, subcmd] if cmd == "key" && subcmd == "rotate" => IpcCommand::KeyRotate,
         [cmd, subcmd] if cmd == "key" && subcmd == "revoke" => IpcCommand::KeyRevoke,
@@ -469,6 +481,32 @@ mod tests {
             }
             other => panic!("expected EnrollmentConsume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn route_retract_round_trips_through_wire_and_parse() {
+        // D12.b: symmetric counterpart of RouteAdvertise. Pin the
+        // wire format (`route retract <cidr>`) + parse round-trip +
+        // is_mutating bit so the role-set orchestrator can call it
+        // through the existing send_command path.
+        let cmd = IpcCommand::RouteRetract("0.0.0.0/0".to_owned());
+        let wire = cmd.as_wire();
+        assert_eq!(wire, "route retract 0.0.0.0/0");
+        assert!(cmd.is_mutating(), "RouteRetract must be mutating");
+        let parsed = parse_command(&wire);
+        assert_eq!(parsed, IpcCommand::RouteRetract("0.0.0.0/0".to_owned()));
+    }
+
+    #[test]
+    fn route_retract_distinguished_from_route_advertise() {
+        let advertise = parse_command("route advertise 10.0.0.0/24");
+        let retract = parse_command("route retract 10.0.0.0/24");
+        assert_eq!(
+            advertise,
+            IpcCommand::RouteAdvertise("10.0.0.0/24".to_owned())
+        );
+        assert_eq!(retract, IpcCommand::RouteRetract("10.0.0.0/24".to_owned()));
+        assert_ne!(advertise, retract);
     }
 
     #[test]

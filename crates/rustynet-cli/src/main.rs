@@ -16,6 +16,7 @@ mod ops_phase9;
 mod ops_security_audit;
 mod ops_security_audit_workflows;
 mod ops_write_daemon_env;
+mod role_cli;
 mod security_audit_catalog;
 mod vm_lab;
 
@@ -152,6 +153,7 @@ enum CliCommand {
     TunnelInfo,
     ExitNodeList,
     Role(RoleCommand),
+    Capability(CapabilityCommand),
     ConnectivityTest,
     PeerStats,
     Bandwidth,
@@ -245,10 +247,50 @@ enum CliCommand {
     Help,
 }
 
+/// D12.b — operator-facing role surface backed by
+/// `rustynet_control::role_presets`. Replaces the earlier
+/// substring-matching `Show / Set(String)` placeholder.
+///
+/// See `crates/rustynet-cli/src/role_cli.rs` for the pure
+/// planner + status resolver; this enum is the parsed CLI shape
+/// that main.rs hands to the dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RoleCommand {
-    Show,
-    Set(String),
+    /// `rustynet role status` — read daemon IPC, resolve current
+    /// preset, print it. Available to all primary roles.
+    Status,
+    /// `rustynet role list` — print the six presets + per-preset
+    /// description. Pure local; no daemon contact.
+    List,
+    /// `rustynet role set <preset> [--accept-irreversible]` —
+    /// orchestrator. Computes plan via `role_cli::plan_concrete_actions`
+    /// and executes the side-effects.
+    Set {
+        target: rustynet_control::role_presets::RolePreset,
+        accept_irreversible: bool,
+    },
+    /// `rustynet role transition-check --to <preset>` — pure
+    /// preview; never executes side-effects.
+    TransitionCheck {
+        target: rustynet_control::role_presets::RolePreset,
+    },
+}
+
+/// D12.b — advanced capability mutation surface. The wizard never
+/// surfaces these; they exist for power users who need non-preset
+/// compositions. Today (pre-D11.a) the mutation verbs return a
+/// clean blocked-by-capability-schema error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapabilityCommand {
+    /// `rustynet capability list` — print effective capabilities
+    /// derived from current preset. Read-only; available to all
+    /// primary roles.
+    List,
+    /// `rustynet capability add <flag>` — emit signed-membership
+    /// update record adding the capability. Admin-only.
+    Add(rustynet_control::role_presets::Capability),
+    /// `rustynet capability remove <flag>` — counterpart to Add.
+    Remove(rustynet_control::role_presets::Capability),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1301,11 +1343,57 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd] if cmd == "peer-list" || cmd == "peers" => CliCommand::PeerList,
         [cmd] if cmd == "tunnel-info" || cmd == "tunnel" => CliCommand::TunnelInfo,
         [cmd] if cmd == "exit-node-list" || cmd == "exit-nodes" => CliCommand::ExitNodeList,
-        [cmd, subcmd] if cmd == "role" && subcmd == "show" => CliCommand::Role(RoleCommand::Show),
-        [cmd, subcmd, role] if cmd == "role" && subcmd == "set" => {
-            CliCommand::Role(RoleCommand::Set(role.clone()))
+        [cmd, subcmd] if cmd == "role" && (subcmd == "status" || subcmd == "show") => {
+            CliCommand::Role(RoleCommand::Status)
         }
-        [cmd] if cmd == "role" => CliCommand::Role(RoleCommand::Show),
+        [cmd, subcmd] if cmd == "role" && subcmd == "list" => CliCommand::Role(RoleCommand::List),
+        [cmd, subcmd, raw] if cmd == "role" && subcmd == "set" => {
+            // Bare `role set <preset>` (no flag). Acceptance flag
+            // requires the explicit form `role set <preset> --accept-irreversible`
+            // handled below.
+            match role_cli::parse_preset_arg(raw) {
+                Ok(target) => CliCommand::Role(RoleCommand::Set {
+                    target,
+                    accept_irreversible: false,
+                }),
+                Err(_) => CliCommand::Help,
+            }
+        }
+        [cmd, subcmd, raw, flag]
+            if cmd == "role" && subcmd == "set" && flag == "--accept-irreversible" =>
+        {
+            match role_cli::parse_preset_arg(raw) {
+                Ok(target) => CliCommand::Role(RoleCommand::Set {
+                    target,
+                    accept_irreversible: true,
+                }),
+                Err(_) => CliCommand::Help,
+            }
+        }
+        [cmd, subcmd, flag, raw]
+            if cmd == "role" && subcmd == "transition-check" && flag == "--to" =>
+        {
+            match role_cli::parse_preset_arg(raw) {
+                Ok(target) => CliCommand::Role(RoleCommand::TransitionCheck { target }),
+                Err(_) => CliCommand::Help,
+            }
+        }
+        [cmd] if cmd == "role" => CliCommand::Role(RoleCommand::Status),
+        [cmd, subcmd] if cmd == "capability" && subcmd == "list" => {
+            CliCommand::Capability(CapabilityCommand::List)
+        }
+        [cmd, subcmd, flag] if cmd == "capability" && subcmd == "add" => {
+            match role_cli::parse_capability_arg(flag) {
+                Ok(cap) => CliCommand::Capability(CapabilityCommand::Add(cap)),
+                Err(_) => CliCommand::Help,
+            }
+        }
+        [cmd, subcmd, flag] if cmd == "capability" && subcmd == "remove" => {
+            match role_cli::parse_capability_arg(flag) {
+                Ok(cap) => CliCommand::Capability(CapabilityCommand::Remove(cap)),
+                Err(_) => CliCommand::Help,
+            }
+        }
         [cmd] if cmd == "connectivity-test" || cmd == "test" => CliCommand::ConnectivityTest,
         [cmd] if cmd == "peer-stats" || cmd == "peer-health" => CliCommand::PeerStats,
         [cmd] if cmd == "bandwidth" || cmd == "speed-test" => CliCommand::Bandwidth,
@@ -4453,6 +4541,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::TunnelInfo => execute_tunnel_info(),
         CliCommand::ExitNodeList => execute_exit_node_list(),
         CliCommand::Role(cmd) => execute_role(cmd),
+        CliCommand::Capability(cmd) => execute_capability(cmd),
         CliCommand::ConnectivityTest => execute_connectivity_test(),
         CliCommand::PeerStats => execute_peer_stats(),
         CliCommand::Bandwidth => execute_bandwidth(),
@@ -13403,6 +13492,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::TunnelInfo
         | CliCommand::ExitNodeList
         | CliCommand::Role(_)
+        | CliCommand::Capability(_)
         | CliCommand::ConnectivityTest
         | CliCommand::PeerStats
         | CliCommand::Bandwidth
@@ -15566,37 +15656,258 @@ fn execute_exit_node_list() -> Result<String, String> {
 }
 
 fn execute_role(cmd: RoleCommand) -> Result<String, String> {
+    use rustynet_control::role_presets::composition_for;
+
     match cmd {
-        RoleCommand::Show => {
+        RoleCommand::List => Ok(role_cli::render_role_list()),
+
+        RoleCommand::Status => {
             let response = send_command(IpcCommand::Status)?;
             if !response.ok {
                 return Err(format!("daemon error: {}", response.message));
             }
-
-            let role = if response.message.contains("admin") {
-                "admin"
-            } else if response.message.contains("blind_exit") {
-                "blind_exit"
-            } else {
-                "client"
-            };
-
-            Ok(format!("current role: {role}"))
+            let preset = role_cli::resolve_preset_from_status(response.message.as_str())
+                .map_err(|err| err.user_message())?;
+            let comp = composition_for(preset);
+            let mut out = format!(
+                "current role: {preset} (primary={}, capabilities={})\n",
+                comp.primary,
+                if comp.capabilities.is_empty() {
+                    "none".to_owned()
+                } else {
+                    comp.capabilities
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
+            );
+            out.push_str(&format!("description: {}\n", preset.description()));
+            Ok(out)
         }
-        RoleCommand::Set(new_role) => {
-            if !["admin", "client", "blind_exit"].contains(&new_role.as_str()) {
-                return Err(format!(
-                    "invalid role '{new_role}'. must be: admin, client, or blind_exit"
-                ));
-            }
 
+        RoleCommand::TransitionCheck { target } => {
             let response = send_command(IpcCommand::Status)?;
             if !response.ok {
                 return Err(format!("daemon error: {}", response.message));
             }
+            let current = role_cli::resolve_preset_from_status(response.message.as_str())
+                .map_err(|err| err.user_message())?;
+            let plan = role_cli::plan_concrete_actions(
+                current,
+                target,
+                false,
+                PathBuf::from(role_cli::DEFAULT_DAEMON_ENV_PATH),
+            );
+            Ok(role_cli::render_transition_check(&plan))
+        }
 
+        RoleCommand::Set {
+            target,
+            accept_irreversible,
+        } => {
+            let response = send_command(IpcCommand::Status)?;
+            if !response.ok {
+                return Err(format!("daemon error: {}", response.message));
+            }
+            let current = role_cli::resolve_preset_from_status(response.message.as_str())
+                .map_err(|err| err.user_message())?;
+            let plan = role_cli::plan_concrete_actions(
+                current,
+                target,
+                accept_irreversible,
+                PathBuf::from(role_cli::DEFAULT_DAEMON_ENV_PATH),
+            );
+            execute_role_plan(plan)
+        }
+    }
+}
+
+/// Execute the side-effects produced by
+/// `role_cli::plan_concrete_actions`. The planner is pure; this
+/// function is the only place that touches the filesystem or sends
+/// IPC for role transitions.
+fn execute_role_plan(plan: role_cli::RoleSetPlan) -> Result<String, String> {
+    match plan {
+        role_cli::RoleSetPlan::Blocked { from, to, error } => Err(format!(
+            "transition {from} → {to} blocked: {}",
+            error.user_message()
+        )),
+        role_cli::RoleSetPlan::Allowed {
+            from,
+            to,
+            kind: _,
+            actions,
+            followup_instructions,
+        } => {
+            let mut summary = format!("transition planned: {from} → {to}\n");
+            for action in &actions {
+                let action_summary = execute_role_action(action)?;
+                summary.push_str(&format!("  applied: {action_summary}\n"));
+            }
+            if !followup_instructions.is_empty() {
+                summary.push_str("follow-up:\n");
+                for instruction in &followup_instructions {
+                    summary.push_str(&format!("  - {instruction}\n"));
+                }
+            }
+            Ok(summary)
+        }
+    }
+}
+
+/// Execute one [`role_cli::ConcreteAction`]. Returns a short
+/// human-readable summary string on success. Side-effects:
+///
+/// - `NoOp` — no work.
+/// - `WriteNodeRoleEnv` — read the env file, update NODE_ROLE,
+///   write back atomically. Does NOT restart the daemon; the
+///   followup-instructions list tells the operator to do that.
+/// - `AdvertiseDefaultRoute` — `IpcCommand::RouteAdvertise(0.0.0.0/0)`.
+/// - `RetractDefaultRoute` — `IpcCommand::RouteRetract(0.0.0.0/0)`.
+fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, String> {
+    match action {
+        role_cli::ConcreteAction::NoOp => Ok("no change required".to_owned()),
+        role_cli::ConcreteAction::WriteNodeRoleEnv {
+            new_primary,
+            env_path,
+            restart_required: _,
+        } => {
+            update_node_role_env_file(env_path, new_primary.as_str())?;
             Ok(format!(
-                "role change requested: {new_role} (restart daemon to apply)"
+                "wrote NODE_ROLE={} to {}",
+                new_primary,
+                env_path.display()
+            ))
+        }
+        role_cli::ConcreteAction::AdvertiseDefaultRoute => {
+            let response = send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned()))?;
+            if !response.ok {
+                return Err(format!("route advertise failed: {}", response.message));
+            }
+            Ok("advertised 0.0.0.0/0 (exit-serving activated)".to_owned())
+        }
+        role_cli::ConcreteAction::RetractDefaultRoute => {
+            let response = send_command(IpcCommand::RouteRetract("0.0.0.0/0".to_owned()))?;
+            if !response.ok {
+                return Err(format!("route retract failed: {}", response.message));
+            }
+            Ok("retracted 0.0.0.0/0 (exit-serving torn down)".to_owned())
+        }
+    }
+}
+
+/// Atomically replace the `NODE_ROLE=` line in the daemon env file.
+/// If the key is absent, append it. Other key-value lines are
+/// preserved verbatim. Write goes through a temp file + rename so
+/// concurrent reads always see a consistent snapshot.
+fn update_node_role_env_file(env_path: &Path, new_role: &str) -> Result<(), String> {
+    let existing = if env_path.exists() {
+        std::fs::read_to_string(env_path)
+            .map_err(|err| format!("read {} failed: {err}", env_path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut found = false;
+    let mut updated = String::with_capacity(existing.len() + new_role.len() + 16);
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("NODE_ROLE=") || trimmed.starts_with("RUSTYNET_NODE_ROLE=") {
+            // Preserve the key prefix the operator/installer chose.
+            // Both forms are honoured by the env reader; rewriting
+            // with the same key avoids accidentally creating a
+            // duplicate definition.
+            let key = if trimmed.starts_with("RUSTYNET_NODE_ROLE=") {
+                "RUSTYNET_NODE_ROLE"
+            } else {
+                "NODE_ROLE"
+            };
+            updated.push_str(&format!("{key}={new_role}\n"));
+            found = true;
+        } else {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+    }
+    if !found {
+        updated.push_str(&format!("NODE_ROLE={new_role}\n"));
+    }
+
+    // Atomic write via temp file + rename. Same mode/perms as the
+    // original (or 0600 if creating fresh) so secrets in the env
+    // file stay protected.
+    let parent = env_path
+        .parent()
+        .ok_or_else(|| format!("env path {} has no parent directory", env_path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.role-update.tmp",
+        env_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("rustynetd")
+    ));
+    std::fs::write(&tmp, updated.as_bytes())
+        .map_err(|err| format!("write {} failed: {err}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(env_path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        } else {
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    std::fs::rename(&tmp, env_path).map_err(|err| {
+        format!(
+            "rename {} → {} failed: {err}",
+            tmp.display(),
+            env_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn execute_capability(cmd: CapabilityCommand) -> Result<String, String> {
+    use rustynet_control::role_presets::composition_for;
+
+    match cmd {
+        CapabilityCommand::List => {
+            let response = send_command(IpcCommand::Status)?;
+            if !response.ok {
+                return Err(format!("daemon error: {}", response.message));
+            }
+            let preset = role_cli::resolve_preset_from_status(response.message.as_str())
+                .map_err(|err| err.user_message())?;
+            let comp = composition_for(preset);
+            if comp.capabilities.is_empty() {
+                Ok(format!(
+                    "current preset: {preset}\neffective capabilities: none"
+                ))
+            } else {
+                let mut out = format!("current preset: {preset}\neffective capabilities:\n");
+                for cap in comp.capabilities {
+                    out.push_str(&format!("  {}\n", cap.as_str()));
+                }
+                Ok(out)
+            }
+        }
+        CapabilityCommand::Add(cap) | CapabilityCommand::Remove(cap) => {
+            // Today (pre-D11.a), capability mutation requires the
+            // membership-bundle node_capabilities schema. Refuse
+            // cleanly with a pointer to the design doc — this is
+            // the same dependency-blocked path the planner uses
+            // for relay/anchor presets.
+            let _ = cap; // Capability type used for typed parse.
+            let placeholder_target = match cmd {
+                CapabilityCommand::Add(c) => c,
+                CapabilityCommand::Remove(c) => c,
+                CapabilityCommand::List => unreachable!(),
+            };
+            Err(format!(
+                "capability mutation for {placeholder_target} requires the D11.a capability schema (membership-bundle node_capabilities field). \
+                 That schema is queued; this verb will activate when D11.a lands. \
+                 See documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md (D11.a)."
             ))
         }
     }

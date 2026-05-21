@@ -316,7 +316,33 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
 - **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
 - **Cross-platform note.** Linux + macOS roles all land in D12 (except macOS `blind_exit`, which stays Linux-only). Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
-- **Status (2026-05-21).** **D12.a complete.** New module `crates/rustynet-control/src/role_presets.rs` carries the authoritative `ROLE_PRESET_TABLE` (six compositions: `Client`, `Admin`, `Exit`, `BlindExit`, `Relay`, `Anchor`) plus the `RolePreset` / `PrimaryRole` / `Capability` enums and the `validate_transition` + `transition_plan` validator. Two-axis model (Axis 1 primary local role; Axis 2 composable mesh capabilities) preserved. `validate_transition` covers the full §5 reversibility matrix: `Identity` (from == to), `LocalOnly` (admin ↔ client), `SignedMembership` (capability change), `Blocked` (leaving `blind_exit`), `Irreversible` (becoming `blind_exit` — destructive factory-reset path). `transition_plan` returns the full plan with capability deltas plus `requires_relay_deploy` / `requires_relay_undeploy` flags so the orchestrator (D12.b) can sequence deploy-then-advertise / undeploy-then-revoke correctly. Wire-format `as_str` / `FromStr` round-trips pinned for every enum. 44 unit tests including an exhaustive (from, to) matrix coverage pin against the taxonomy doc §5 (`transition_matrix_matches_taxonomy_doc`). `pub mod role_presets;` wired into `crates/rustynet-control/src/lib.rs` (line-shift +1 → updated `REVIEWED_SECRET_EQUALITY_EXCEPTIONS` allowlist + `secret_equality_scanner_silent_on_allowlisted_line` test). All workspace gates green (`cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace --all-targets --all-features`, `./scripts/ci/membership_gates.sh`). D12.b-e queued.
+- **Status (2026-05-21).** **D12.a + D12.b complete (pre-D11.a surface).**
+
+  D12.b lands in `crates/rustynet-cli/src/role_cli.rs` (640 lines impl + 30 tests) + main.rs wiring (CLI verbs `rustynet role {status, list, set, transition-check}` and `rustynet capability {list, add, remove}`) + `IpcCommand::RouteRetract(String)` (symmetric counterpart of `RouteAdvertise`, admin-gated, auto-tunnel-allowed for `0.0.0.0/0`).
+
+  Working today (pre-D11.a):
+  - `rustynet role list` — prints all six presets + descriptions
+  - `rustynet role status` — reads daemon IPC, resolves to `client/admin/exit/blind_exit` via primary + `serving_exit_node`
+  - `rustynet role transition-check --to <preset>` — pure preview using role_presets validator + role_cli planner
+  - `rustynet role set admin/client` — local-only, writes `NODE_ROLE` to `/etc/default/rustynetd` (atomic temp-file + rename), instructs operator to restart `rustynetd.service`
+  - `rustynet role set exit` from admin — `IpcCommand::RouteAdvertise("0.0.0.0/0")`, daemon activates exit-serving + NAT
+  - `rustynet role set admin` from exit — `IpcCommand::RouteRetract("0.0.0.0/0")`, daemon tears down exit-serving + NAT
+  - `rustynet capability list` — derives effective capabilities from current preset composition
+
+  Cleanly dependency-blocked (returns typed `RoleCliError::BlockedByCapabilitySchema` with pointer to D11.a, not a stub):
+  - `rustynet role set relay` / `role set anchor`
+  - `rustynet capability add <flag>` / `capability remove <flag>`
+  - Resolving current preset to `relay` / `anchor` (no capability schema in membership state yet)
+
+  Staged multi-step transitions (`client ↔ exit` and `* → blind_exit` with `--accept-irreversible`) refuse single-step execution and surface the explicit step sequence via `RoleCliError::RequiresStagedTransition`.
+
+  Pure planner (`role_cli::plan_concrete_actions`) is exhaustively tested against the §5 reversibility matrix (`pre_d11a_surface_matrix` test exhausts the 4×4 today-supported cells; `target_anchor_blocked_by_capability_schema` + `target_relay_blocked_by_capability_schema` exhaust the dependency-blocked rows).
+
+  All workspace gates green (`cargo fmt`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-targets --all-features` — 1335 lib tests + 30 new role_cli tests + 2 new RouteRetract round-trip tests, no regressions, `./scripts/ci/membership_gates.sh` PASS).
+
+  D12.c/d/e queued.
+
+  Original D12.a status (preset table + transition validator): New module `crates/rustynet-control/src/role_presets.rs` carries the authoritative `ROLE_PRESET_TABLE` (six compositions: `Client`, `Admin`, `Exit`, `BlindExit`, `Relay`, `Anchor`) plus the `RolePreset` / `PrimaryRole` / `Capability` enums and the `validate_transition` + `transition_plan` validator. Two-axis model (Axis 1 primary local role; Axis 2 composable mesh capabilities) preserved. `validate_transition` covers the full §5 reversibility matrix: `Identity` (from == to), `LocalOnly` (admin ↔ client), `SignedMembership` (capability change), `Blocked` (leaving `blind_exit`), `Irreversible` (becoming `blind_exit` — destructive factory-reset path). `transition_plan` returns the full plan with capability deltas plus `requires_relay_deploy` / `requires_relay_undeploy` flags so the orchestrator (D12.b) can sequence deploy-then-advertise / undeploy-then-revoke correctly. Wire-format `as_str` / `FromStr` round-trips pinned for every enum. 44 unit tests including an exhaustive (from, to) matrix coverage pin against the taxonomy doc §5 (`transition_matrix_matches_taxonomy_doc`). `pub mod role_presets;` wired into `crates/rustynet-control/src/lib.rs` (line-shift +1 → updated `REVIEWED_SECRET_EQUALITY_EXCEPTIONS` allowlist + `secret_equality_scanner_silent_on_allowlisted_line` test). All workspace gates green (`cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace --all-targets --all-features`, `./scripts/ci/membership_gates.sh`). D12.b-e queued.
 
 ### D6 — Windows readiness + node-id fix (Track Beta)
 
