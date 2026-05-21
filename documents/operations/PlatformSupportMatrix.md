@@ -89,11 +89,41 @@ Purpose: provide a single current-state view of platform capability, security po
 | Peer-distributed signed-bundle gossip primitives (Ed25519 + anti-replay) | Implemented (mint / verify / accept primitives; daemon push-loop wiring queued) | Implemented (same code path) | Domain-separated signatures + per-source monotonic sequence + freshness window | `crates/rustynetd/src/peer_gossip.rs` |
 | Enrollment-token mint / verify / consume (HMAC-SHA256) | Implemented (mint / verify / consume primitives; CLI verb wiring queued) | Implemented (same code path) | Single-use ledger + TTL cap + constant-time tag compare | `crates/rustynetd/src/enrollment_token.rs` |
 | ICE-style candidate prioritisation (RFC 8445) | Implemented (priority + pair-generation primitives; traversal-path integration queued) | Implemented (same code path) | RFC 8421 v6-preferred local preference + foundation dedupe | `crates/rustynetd/src/ice_priority.rs` |
+| Anchor node role host capability (24/7 peer, gossip seed, bundle-pull endpoint, relay co-deploy, port-mapping authoritative) | Planned (D11; design in `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md`) | Planned (D11; same code path with macOS Keychain custody for anchor secret) | Anchor metadata never gates signature verification; secret custody is OS-secure | `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md` |
+| Anchor node bundle-pull client (consumption only — bootstrap from anchor via single-use token) | Planned (D11; CLI verb `rustynet anchor pull-bundle`) | Planned (D11; same CLI verb) | Default loopback bind; LAN bind requires explicit ack flag | `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md` §5.2 |
 | IPv6 protected-mode parity | Supported | Explicitly not supported (`supports_ipv6=false`) until parity is complete | Secure short-term default | `crates/rustynet-backend-wireguard/src/lib.rs:775-781` |
 | CI dataplane evidence | Real Linux WireGuard E2E | macOS dataplane smoke + targeted security tests | Needs more work on macOS depth | `.github/workflows/cross-platform-ci.yml:55-65`, `.github/workflows/cross-platform-ci.yml:26-28`, `scripts/ci/macos_dataplane_smoke.sh:44-46` |
 | Manual peer break-glass mutation path | Removed (fail-closed) | Removed (fail-closed) | More secure than older docs/assumptions | `start.sh:3303-3356`, `start.sh:4213-4270` |
 | Exit-node selection readiness probe UX | Membership+tunnel probe in `SELECT EXIT NODE`; current selection marker + connect/disconnect quick action | Same menu behavior on macOS host profile (compat runtime) | Implemented | `start.sh:3711-3774`, `start.sh:4257-4327` |
 | Additional non-simulated backend implementation | Not present in-tree beyond WireGuard | Not present in-tree beyond WireGuard | Needs more work (policy/code discrepancy) | `crates/rustynet-backend-wireguard/src/lib.rs:54`, `crates/rustynet-backend-stub/src/lib.rs:38` |
+
+## Anchor Node Role (Cross-Platform Truth)
+
+The anchor node role (canonical design:
+`documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md`) is
+planned for D11 in the dataplane execution plan. Per-platform host
+capability truth:
+
+- Linux: anchor-eligible. Hosts every anchor capability
+  (`gossip_seed`, `bundle_pull`, `enrollment_endpoint`,
+  `relay_colocation`, `port_mapping_authoritative`). Primary host
+  platform for the role.
+- macOS: anchor-eligible. Hosts every anchor capability. Uses
+  Keychain-backed custody for the anchor enrollment secret. Tracks
+  Linux feature parity.
+- Windows: anchor-eligible **once D7/D9 land**. Today Windows is
+  `runtime-host-capable only` and not dataplane-evidenced; anchor on
+  Windows is blocked behind the same dataplane-parity work that
+  blocks Windows-as-exit and Windows-as-peer.
+- iOS: anchor-bootstrap-client only. OS lifecycle constraints
+  (`NEPacketTunnelProvider` suspension, address instability,
+  sandboxing) make anchor hosting infeasible. iOS consumes anchor
+  services via `anchor_bundle_pull_client` in `rustynet-mobile-core`.
+- Android: anchor-bootstrap-client only. Same constraint shape as
+  iOS (Doze, App Standby, lifecycle resets on network change).
+
+Anchor metadata is never consulted before signature verification on
+any platform; anchor is operational metadata, not trust authority.
 
 ## Security Notes
 - More secure than older docs/findings:

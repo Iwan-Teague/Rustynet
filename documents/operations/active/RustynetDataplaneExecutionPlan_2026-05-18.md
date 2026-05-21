@@ -155,6 +155,7 @@ The plan executes in four tracks. Alpha is sequential and is the critical path. 
 7. **D2.7** — Enrollment-token mint/verify/consume
 8. **D5** — Linux ↔ Linux cross-LAN baseline evidence
 9. **D5.5** — ICE-style candidate prioritisation
+10. **D11** — Anchor node role formalisation (canonical design: [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md))
 
 (The non-monotonic numbering — D2.3, D2.4, D2.5, D2.7 sitting between D2 and D5 — preserves cross-references to earlier brainstorm conversations. The numbers are labels, not sort keys; execute in the order above.)
 
@@ -286,6 +287,20 @@ starting script, and archive the resulting artifacts under
 - **Depends on.** D5.
 - **Status (2026-05-21).** **Complete (end-to-end).** Commits 447e40e + 9a86a05. Commit 447e40e landed the RFC 8445 §5.1.2.1 per-candidate priority + §6.1.2.3 pair-priority + §6.1.2.4 foundation dedupe + deterministic role assignment primitives. Commit 9a86a05 wires the primitives into the production connect path: a new `TraversalEngine::execute_ice_pair_race` method takes both local and remote `TraversalCandidate` slices plus both 32-byte node ids, decides the controlling/controlled role via lex-min of the ids, generates RFC-priority pairs via the existing `generate_candidate_pairs`, and runs the rounds with the parallel-race shape — every pair of a round is probed (one outbound binding-request per pair) BEFORE polling for handshakes. A new `SimultaneousOpenRuntime::handshake_endpoint` default-method extension lets endpoint-attribution-aware runtimes report the winning remote endpoint; legacy runtimes fall back to the top-priority pair the round just probed. New `TraversalDecisionReason::IcePairRaceHandshakeObserved` carries the result back through the existing `SimultaneousOpenResult::decision` shape so downstream consumers need no change. The §D5.5 pass criterion is pinned by `crates/rustynetd/tests/ice_pair_race.rs::ice_race_marginal_nat_succeeds_where_serial_attempts_would_fail`: a runtime that only completes the handshake after seeing ≥2 simultaneous outbound probes in the same round succeeds Direct — exactly the marginal-NAT case the previous serial loop denied. The cone-NAT happy path is pinned by `ice_race_picks_highest_priority_winning_endpoint`. Four additional negative pins (relay fallback, fail-closed exhaustion, role-reversal stability, runtime-without-endpoint-attribution fallback) round out the test surface.
 
+### D11 — Anchor node role formalisation (Track Alpha)
+
+- **Scope.** Formalise the always-on home-server role as a signed-membership-advertised set of capabilities (`anchor.gossip_seed`, `anchor.bundle_pull`, `anchor.enrollment_endpoint`, `anchor.relay_colocation`, `anchor.port_mapping_authoritative`). Add CLI verbs to advertise / list / pull-bundle / init the role. Add a LAN-loopback bundle-pull endpoint and a setup wizard that composes anchor + relay co-deploy.
+- **Files.** `crates/rustynet-control/src/membership.rs` (schema extension), `crates/rustynetd/src/daemon.rs` (bundle-pull listener), `crates/rustynetd/src/gossip_runtime.rs` (anchor-priority rebroadcast), `crates/rustynetd/src/port_mapper.rs` (multi-anchor coordination), `crates/rustynet-cli/src/main.rs` + new `crates/rustynet-cli/src/anchor_init.rs` (CLI surface), `scripts/systemd/rustynetd-anchor.service` (optional unit), `start.sh` (role wizard option).
+- **Sub-slices** (mapped 1:1 to [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md) §5):
+  - **D11.a** — Membership schema + `rustynet anchor advertise|list` CLI (prerequisite for the rest).
+  - **D11.b** — Bundle-pull endpoint + `rustynet anchor pull-bundle` CLI (parallel with D11.c, D11.d after D11.a).
+  - **D11.c** — Anchor-aware gossip seed selection (parallel).
+  - **D11.d** — `rustynet anchor init` setup wizard (parallel).
+- **Pass criterion.** Clean Debian 13 install runs `rustynet anchor init` and ends with a working anchor (relay co-deployed, port-mapping or keepalive fallback active, bundle-pull endpoint bound). Second machine joins via `rustynet anchor pull-bundle` + `rustynet enrollment consume` in one operator session. macOS host runs the same flow successfully. 3-peer mesh shows anchor-priority rebroadcast. Multi-anchor port-mapping coordination chooses lex-min `node_id`.
+- **Estimated cost.** 6–8 cycles total (2 + 2 + 1 + 3).
+- **Depends on.** D2.5 (gossip), D4 (relay), D2.7 (enrollment), D5.5 (ICE pair race). Anchor builds on these but does not modify them.
+- **Cross-platform note.** Linux + macOS land in D11. Windows anchor is deferred behind D7/D9 (same dataplane-parity prerequisite as Windows-as-exit). iOS + Android land the consume-only `anchor_bundle_pull_client` in `rustynet-mobile-core` as part of mobile roadmap M3 — see [`../../mobile/RustynetMobileRoadmap_2026-04-17.md`](../../mobile/RustynetMobileRoadmap_2026-04-17.md).
+
 ### D6 — Windows readiness + node-id fix (Track Beta)
 
 - **Scope.** Per `WindowsExitAndRelayDeltaPlan_2026-05-10.md` §3.3. Replace the broken `rustynet.exe status` call in the orchestrator's Windows readiness path with a real readiness check (SCM `Running` state + parse of `RUSTYNETD_DAEMON_ARGS_JSON` for `--node-id` from `C:\ProgramData\RustyNet\config\rustynetd.env`).
@@ -377,6 +392,7 @@ These are the points where the user has explicitly chosen a path but where the c
 This plan is "done" when:
 
 - D2 through D5.5 all pass their per-phase pass criteria, and D5/D5.5 artifacts exist pinned to a commit SHA in `artifacts/cross_network/<commit>/`.
+- D11 passes its pass criterion on Linux and macOS (Windows anchor deferred behind D7/D9 by design).
 - D6 passes its pass criterion against `windows-utm-1`.
 - D7 + D9 artifacts exist pinned to a commit SHA in `artifacts/windows_exit/<commit>/`.
 - D10 has updated the posture documents.

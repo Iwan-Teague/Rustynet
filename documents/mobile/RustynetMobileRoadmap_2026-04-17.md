@@ -89,6 +89,11 @@ A secure first release should optimize for:
 - split/full tunnel policy application
 - DNS behavior
 - diagnostics baseline
+- anchor-bootstrap LAN-fast-path (consumption only):
+  `anchor_bundle_pull_client` in `rustynet-mobile-core` lets a fresh
+  install on the home Wi-Fi pull the current signed bundle from a
+  visible anchor instead of waiting for gossip convergence — see
+  [`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](../operations/active/AnchorNodeRoleDesign_2026-05-21.md) §6.4–6.5
 
 ### M4: hardening
 
@@ -96,6 +101,10 @@ A secure first release should optimize for:
 - secure storage review
 - support bundle redaction
 - lifecycle and battery behavior validation
+- anchor-bootstrap reconnect after long doze (Android) / suspended
+  packet-tunnel (iOS) — validate that the
+  `anchor_bundle_pull_client` retry path stays single-use-token-safe
+  across lifecycle resets
 
 ### M5: release readiness
 

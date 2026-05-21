@@ -40,10 +40,11 @@ Primary goal:
 - CLI login flow (device code or auth URL).
 - Optional pre-auth keys for headless servers.
 - One-time throwaway account/credential generation for temporary access.
+- Anchor-mediated bootstrap: new devices may obtain the current signed membership bundle from an anchor's LAN-loopback bundle-pull endpoint, gated by a single-use enrollment token. Anchor-mediated bootstrap does not bypass signature verification — it is a faster path to the same signed state new devices would otherwise obtain via gossip convergence. See [`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](./operations/active/AnchorNodeRoleDesign_2026-05-21.md).
 - Throwaway accounts must be single-use and become invalid immediately after first successful enrollment.
 - Throwaway accounts should support short TTLs, strict scope, and manual revocation before use.
 - Node metadata:
-- Hostname, OS, tags, owner, last-seen timestamp.
+- Hostname, OS, tags, owner, last-seen timestamp, optional anchor capabilities.
 
 ### 3.1.1 Throwaway Account Lifecycle
 - `created`: single-use credential is generated with creator identity, scope, TTL, and `max_uses = 1`.
@@ -114,7 +115,9 @@ Primary goal:
 - lan-access toggle
 - dns inspect
 - route advertise
+- anchor advertise / list / pull-bundle / init / status
 - Lightweight web admin UI (phase 6) for policy and node management.
+- Anchor-aware setup wizard (`rustynet anchor init` and `start.sh` role choice) so operators can stand up an always-on home node with relay co-deployment in a single guided step. See [`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](./operations/active/AnchorNodeRoleDesign_2026-05-21.md) §5.4 for the wizard contract.
 
 ### 3.8 Observability
 - Node health status (online/offline, relay/direct, latency).
@@ -196,6 +199,12 @@ Primary goal:
 - CLI frontend to daemon + control API.
 - `rustynet-relay`:
 - Relay/DERP-like ciphertext-forwarding transport for hard NAT cases (deployment may be embedded with control in early environments, but behavior is mandatory).
+- Anchor node (operational role, not a separate binary):
+- A `rustynetd` instance whose signed membership state advertises one or more `anchor.*` capabilities (`gossip_seed`, `bundle_pull`, `enrollment_endpoint`, `relay_colocation`, `port_mapping_authoritative`).
+- Orthogonal to `NodeRole` (local CLI permissions); anchor capabilities live in signed membership state, not in local config.
+- Provides a stable bootstrap target for new devices, a LAN-loopback bundle-pull endpoint, and a deterministic relay co-deployment surface. No central trust authority — every peer still verifies signatures independently.
+- Multiple anchors are supported; anchors are not a single point of failure.
+- Canonical design: [`operations/active/AnchorNodeRoleDesign_2026-05-21.md`](./operations/active/AnchorNodeRoleDesign_2026-05-21.md).
 
 ### 6.2 Data Plane
 - WireGuard-compatible transport behavior.
