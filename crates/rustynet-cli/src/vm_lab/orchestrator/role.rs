@@ -2,6 +2,7 @@
 use std::fmt;
 
 use crate::vm_lab::VmGuestPlatform;
+use rustynet_control::roles::RoleCapability;
 
 /// OS-agnostic role definition. The 5 named roles match the bash
 /// orchestrator's existing names so membership / traffic-test / role-switch
@@ -68,6 +69,66 @@ impl NodeRole {
             NodeRole::Aux => "aux",
             NodeRole::Extra => "extra",
             NodeRole::Custom(s) => s.as_str(),
+        }
+    }
+
+    pub fn daemon_node_role_for_platform(
+        &self,
+        platform: &VmGuestPlatform,
+    ) -> Result<&'static str, String> {
+        match platform {
+            VmGuestPlatform::Linux | VmGuestPlatform::Windows => match self {
+                NodeRole::Exit => Ok("admin"),
+                NodeRole::Client | NodeRole::Entry | NodeRole::Aux | NodeRole::Extra => {
+                    Ok("client")
+                }
+                NodeRole::Custom(label) => Err(format!(
+                    "custom lab role '{label}' has no explicit daemon role mapping"
+                )),
+            },
+            VmGuestPlatform::Macos => match self {
+                NodeRole::Exit => Ok("blind_exit"),
+                NodeRole::Client | NodeRole::Entry | NodeRole::Aux | NodeRole::Extra => {
+                    Ok("client")
+                }
+                NodeRole::Custom(label) => Err(format!(
+                    "custom lab role '{label}' has no explicit daemon role mapping"
+                )),
+            },
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => {
+                Err(format!("{platform:?} has no supported daemon role mapping"))
+            }
+        }
+    }
+
+    pub fn product_capabilities_for_platform(
+        &self,
+        platform: &VmGuestPlatform,
+    ) -> Result<Vec<RoleCapability>, String> {
+        match platform {
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => Err(format!(
+                "{platform:?} has no supported product capability mapping"
+            )),
+            VmGuestPlatform::Macos if matches!(self, NodeRole::Exit) => {
+                Ok(vec![RoleCapability::BlindExit, RoleCapability::ExitServer])
+            }
+            VmGuestPlatform::Linux | VmGuestPlatform::Windows if matches!(self, NodeRole::Exit) => {
+                Ok(vec![
+                    RoleCapability::Anchor,
+                    RoleCapability::ExitServer,
+                    RoleCapability::RelayHost,
+                ])
+            }
+            _ => match self {
+                NodeRole::Client | NodeRole::Aux | NodeRole::Extra => {
+                    Ok(vec![RoleCapability::Client])
+                }
+                NodeRole::Entry => Ok(vec![RoleCapability::Client, RoleCapability::EntryRelay]),
+                NodeRole::Custom(label) => Err(format!(
+                    "custom lab role '{label}' has no explicit product capability mapping"
+                )),
+                NodeRole::Exit => unreachable!("exit role handled above"),
+            },
         }
     }
 
@@ -215,6 +276,59 @@ mod tests {
         assert!(
             !NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Macos),
             "macOS Exit remains blocked until a separate exit-node plan exists"
+        );
+    }
+
+    #[test]
+    fn daemon_role_mapping_is_explicit_per_platform() {
+        assert_eq!(
+            NodeRole::Exit
+                .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
+                .unwrap(),
+            "admin"
+        );
+        assert_eq!(
+            NodeRole::Exit
+                .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
+                .unwrap(),
+            "blind_exit"
+        );
+        assert_eq!(
+            NodeRole::Entry
+                .daemon_node_role_for_platform(&VmGuestPlatform::Windows)
+                .unwrap(),
+            "client"
+        );
+        assert!(
+            NodeRole::Custom("relay-test".to_owned())
+                .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn product_capability_mapping_is_explicit_per_platform() {
+        assert_eq!(
+            NodeRole::Exit
+                .product_capabilities_for_platform(&VmGuestPlatform::Linux)
+                .unwrap(),
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost,
+            ]
+        );
+        assert_eq!(
+            NodeRole::Exit
+                .product_capabilities_for_platform(&VmGuestPlatform::Macos)
+                .unwrap(),
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer]
+        );
+        assert_eq!(
+            NodeRole::Entry
+                .product_capabilities_for_platform(&VmGuestPlatform::Windows)
+                .unwrap(),
+            vec![RoleCapability::Client, RoleCapability::EntryRelay]
         );
     }
 }

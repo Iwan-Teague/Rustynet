@@ -75,6 +75,10 @@ impl NodeAdapter for MacosNodeAdapter {
         macos_install::restart_daemon(&self.conn)
     }
 
+    fn enforce_runtime(&self, ctx: &OrchestrationContext) -> Result<(), AdapterError> {
+        macos_install::enforce_daemon(&self.conn, &self.alias, ctx)
+    }
+
     fn uninstall_daemon(&self) -> Result<(), AdapterError> {
         macos_install::uninstall_daemon(&self.conn)
     }

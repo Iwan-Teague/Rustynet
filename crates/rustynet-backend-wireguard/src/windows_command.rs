@@ -1043,6 +1043,59 @@ mod tests {
     }
 
     #[test]
+    fn windows_backend_reports_ipv6_supported() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let backend = WindowsWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        assert!(
+            backend.capabilities().supports_ipv6,
+            "Windows WireGuard backend must report IPv6 support"
+        );
+    }
+
+    #[test]
+    fn windows_backend_accepts_ipv6_local_cidr_in_rendered_config() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+
+        let mut context = runtime_context();
+        context.local_cidr = "fd00::1/128".to_owned();
+        backend
+            .start(context)
+            .expect("IPv6 local CIDR must be accepted");
+
+        let written = fs::read_to_string(&config_path).expect("config should be written");
+        assert!(
+            written.contains("Address = fd00::1/128"),
+            "IPv6 local CIDR must appear in rendered WireGuard config; config: {written}"
+        );
+    }
+
+    #[test]
     fn windows_backend_capabilities_distinguish_exit_client_and_serving_roles() {
         let temp_dir = TempDir::new().expect("temp dir");
         let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =

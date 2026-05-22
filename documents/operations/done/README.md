@@ -15,6 +15,10 @@ Archive criteria:
 - [FallbackLogicAudit_2026-03-06.md](./FallbackLogicAudit_2026-03-06.md)
 - [RustynetAdversarialHardeningAudit_2026-03-14.md](./RustynetAdversarialHardeningAudit_2026-03-14.md)
 - [SecurityReview_2026-03-03.md](./SecurityReview_2026-03-03.md)
+- [SecurityHardeningBacklog_2026-03-09.md](./SecurityHardeningBacklog_2026-03-09.md)
+  — all 5 priority queue items complete (including HP3 relay constant-time auth
+  done 2026-03-25 with 39 tests). "Current Open Work" section states no
+  remaining items. Archived 2026-05-21.
 
 ## Archived Phase Implementation Checklists
 

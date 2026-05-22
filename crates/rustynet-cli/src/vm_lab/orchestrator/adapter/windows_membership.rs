@@ -12,6 +12,7 @@ use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
+use rustynet_control::roles::role_capability_csv;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -83,6 +84,7 @@ pub fn init_membership_snapshot(
             continue;
         }
         let pubkey_hex = hex_32_arg(&peer.public_key_hex)?;
+        let capabilities = role_capability_csv(&peer.capabilities);
         let add_script = format!(
             "$ErrorActionPreference = 'Stop'; \
              $ProgressPreference = 'SilentlyContinue'; \
@@ -90,6 +92,7 @@ pub fn init_membership_snapshot(
                  & {rustynetd_q} membership add-peer \
                      --node-id {node_id_q} \
                      --node-pubkey-hex {pubkey_q} \
+                     --capabilities {capabilities_q} \
                      --owner {owner_q} \
                      --approver-id {approver_q} \
                      --signing-key {signing_key_q} \
@@ -101,6 +104,7 @@ pub fn init_membership_snapshot(
             rustynetd_q = ps_quote(WINDOWS_RUSTYNETD_PATH)?,
             node_id_q = ps_quote(&peer.node_id)?,
             pubkey_q = ps_quote(&pubkey_hex)?,
+            capabilities_q = ps_quote(&capabilities)?,
             owner_q = ps_quote(exit_node_id)?,
             approver_q = ps_quote(&approver_id)?,
             signing_key_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_KEY_PATH)?,

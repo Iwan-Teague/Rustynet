@@ -38,6 +38,9 @@ impl TunDevice {
                 let mut buffer = vec![0u8; 65_535];
                 match device.recv(&mut buffer) {
                     Ok(len) => {
+                        if len == 0 {
+                            return Ok(None);
+                        }
                         buffer.truncate(len);
                         Ok(Some(buffer))
                     }
@@ -55,7 +58,7 @@ impl TunDevice {
                 if let Some(message) = handle.state.take_next_recv_error() {
                     return Err(BackendError::internal(message));
                 }
-                Ok(handle.dequeue_inbound_packet())
+                Ok(handle.dequeue_nonempty_inbound_packet())
             }
         }
     }
@@ -664,6 +667,16 @@ impl TunTestState {
     }
 
     #[allow(dead_code)]
+    fn dequeue_nonempty_inbound_packet(&self) -> Option<Vec<u8>> {
+        loop {
+            let packet = self.dequeue_inbound_packet()?;
+            if !packet.is_empty() {
+                return Some(packet);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     fn take_next_recv_error(&self) -> Option<String> {
         let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
         inner.next_recv_error.take()
@@ -812,6 +825,7 @@ impl TunTestState {
             last_exit_mode_target: inner.last_exit_mode_target,
             current_exit_mode: inner.current_exit_mode,
             exit_mode_mutations: inner.exit_mode_mutations.clone(),
+            queued_inbound_packets: inner.queued_inbound_packets.len(),
         }
     }
 }
@@ -882,6 +896,7 @@ pub(crate) struct TunTestSnapshot {
     pub(crate) last_exit_mode_target: Option<ExitMode>,
     pub(crate) current_exit_mode: ExitMode,
     pub(crate) exit_mode_mutations: Vec<TunExitModeMutation>,
+    pub(crate) queued_inbound_packets: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -925,6 +940,11 @@ impl TestTunDeviceHandle {
     #[allow(dead_code)]
     fn dequeue_inbound_packet(&self) -> Option<Vec<u8>> {
         self.state.dequeue_inbound_packet()
+    }
+
+    #[allow(dead_code)]
+    fn dequeue_nonempty_inbound_packet(&self) -> Option<Vec<u8>> {
+        self.state.dequeue_nonempty_inbound_packet()
     }
 
     #[allow(dead_code)]
@@ -1327,6 +1347,19 @@ mod tests {
             via_node: NodeId::new("phase1-route-node").expect("valid node id"),
             kind,
         }
+    }
+
+    #[test]
+    fn test_device_drops_empty_inbound_packets_without_worker_churn() {
+        let state = TunTestState::default();
+        state.queue_inbound_packet(Vec::new());
+        state.queue_inbound_packet(vec![4, 5, 6]);
+        let device = TunDevice::test_handle(state);
+
+        assert_eq!(
+            device.recv_packet().expect("recv should skip empty packet"),
+            Some(vec![4, 5, 6])
+        );
     }
 
     #[test]

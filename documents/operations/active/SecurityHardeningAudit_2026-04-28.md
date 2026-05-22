@@ -28,7 +28,7 @@ SHA or a "deferred — tracked under" pointer.
 - `documents/Requirements.md`
 - `documents/SecurityMinimumBar.md`
 - `documents/operations/active/OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md`
-- `documents/operations/active/SecurityHardeningBacklog_2026-03-09.md`
+- `documents/operations/done/SecurityHardeningBacklog_2026-03-09.md` (archived 2026-05-21 — all items complete)
   (older long-running backlog — this audit is *not* a replacement,
   it complements that doc with the W3/W4-window pass)
 

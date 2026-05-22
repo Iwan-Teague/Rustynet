@@ -14,9 +14,8 @@
 //!   etc.  Callers that want only the routable subset must filter
 //!   via `LocalHostCandidate::is_gossip_worthy()` or use
 //!   [`gather_gossip_worthy_host_candidates`] which does the filter
-//!   and ICE-priority sort in one call. Windows is stubbed (empty
-//!   list); a follow-up slice can wire `GetAdaptersAddresses` via a
-//!   dedicated crate.
+//!   and ICE-priority sort in one call. Windows uses
+//!   `GetAdaptersAddresses` through `rustynet-windows-native`.
 //!
 //! * [`gather_srflx_candidates`] — given a [`StunClient`], a list of
 //!   IPv4 STUN server URLs, and a list of IPv6 STUN server URLs,
@@ -176,8 +175,8 @@ pub fn classify_ip(addr: IpAddr) -> AddressScope {
 }
 
 /// Per-platform interface enumeration. On Linux/macOS uses
-/// `nix::ifaddrs::getifaddrs`. On Windows returns an empty list — the
-/// follow-up slice will wire GetAdaptersAddresses.
+/// `nix::ifaddrs::getifaddrs`. On Windows uses
+/// `GetAdaptersAddresses`.
 ///
 /// Returns the FULL list of classified addresses including
 /// non-routable scopes (loopback, link-local, multicast). Callers
@@ -189,12 +188,12 @@ pub fn enumerate_local_host_candidates() -> Vec<LocalHostCandidate> {
     {
         enumerate_via_getifaddrs()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
     {
-        // Windows / other — a follow-up slice will wire
-        // GetAdaptersAddresses via the windows crate. For now the
-        // empty list means the host has no host candidates and must
-        // rely on srflx (STUN) discovery.
+        enumerate_via_windows_get_adapters_addresses()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
         Vec::new()
     }
 }
@@ -223,6 +222,45 @@ fn enumerate_via_getifaddrs() -> Vec<LocalHostCandidate> {
             addr: ip,
             scope,
         });
+    }
+    out
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_via_windows_get_adapters_addresses() -> Vec<LocalHostCandidate> {
+    let Ok(adapters) = rustynet_windows_native::get_adapters_addresses() else {
+        return Vec::new();
+    };
+    windows_adapter_snapshots_to_host_candidates(&adapters)
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_adapter_snapshots_to_host_candidates(
+    adapters: &[rustynet_windows_native::WindowsNetworkAdapterSnapshot],
+) -> Vec<LocalHostCandidate> {
+    let mut out = Vec::new();
+    for adapter in adapters {
+        if !adapter.is_oper_up() || adapter.is_loopback() {
+            continue;
+        }
+        let interface = adapter.display_name().to_owned();
+        for addr in &adapter.unicast_addresses {
+            let scope = classify_ip(*addr);
+            if matches!(
+                scope,
+                AddressScope::Unspecified
+                    | AddressScope::Loopback
+                    | AddressScope::Multicast
+                    | AddressScope::Broadcast
+            ) {
+                continue;
+            }
+            out.push(LocalHostCandidate {
+                interface: interface.clone(),
+                addr: *addr,
+                scope,
+            });
+        }
     }
     out
 }
@@ -567,11 +605,78 @@ mod tests {
                     .all(|c| !matches!(c.scope, AddressScope::LinkLocal))
             );
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(target_os = "windows")]
         {
-            // Stub path on Windows / other — must return empty.
+            let gossip = gather_gossip_worthy_host_candidates();
+            assert!(
+                gossip
+                    .iter()
+                    .all(|c| !matches!(c.scope, AddressScope::Loopback))
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
             assert!(all.is_empty());
         }
+    }
+
+    #[test]
+    fn windows_adapter_snapshots_map_to_classified_host_candidates() {
+        let adapters = vec![
+            rustynet_windows_native::WindowsNetworkAdapterSnapshot {
+                adapter_name: "down-guid".to_owned(),
+                friendly_name: "Down".to_owned(),
+                description: String::new(),
+                if_index: 1,
+                ipv6_if_index: 1,
+                if_type: 6,
+                oper_status: 2,
+                ipv4_metric: 10,
+                ipv6_metric: 10,
+                unicast_addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))],
+                default_gateways: vec![],
+            },
+            rustynet_windows_native::WindowsNetworkAdapterSnapshot {
+                adapter_name: "ethernet-guid".to_owned(),
+                friendly_name: "Ethernet".to_owned(),
+                description: String::new(),
+                if_index: 2,
+                ipv6_if_index: 2,
+                if_type: 6,
+                oper_status: rustynet_windows_native::WINDOWS_IF_OPER_STATUS_UP,
+                ipv4_metric: 10,
+                ipv6_metric: 10,
+                unicast_addresses: vec![
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+                    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+                    IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 50)),
+                ],
+                default_gateways: vec![],
+            },
+        ];
+        let candidates = windows_adapter_snapshots_to_host_candidates(&adapters);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|c| c.interface == "Ethernet"));
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.addr == IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))
+                    && c.scope == AddressScope::Private)
+        );
+        assert!(candidates.iter().any(|c| c.addr
+            == IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 50))
+            && c.scope == AddressScope::Private));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_host_candidates_returns_non_empty_on_live_interface() {
+        let candidates = gather_gossip_worthy_host_candidates();
+        assert!(
+            !candidates.is_empty(),
+            "Windows CI host should expose at least one gossip-worthy host candidate"
+        );
     }
 
     #[test]

@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use rustynet_control::roles::role_capability_csv;
+
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{BundleKind, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -33,7 +35,9 @@ pub(crate) fn build_bundle_env(
     ctx: &OrchestrationContext,
     kind: &BundleKind,
 ) -> Result<String, String> {
-    // NODES_SPEC: node_id|endpoint|public_key_hex;...
+    // NODES_SPEC: node_id|endpoint|public_key_hex|capabilities;...
+    // Capabilities are derived from the node role + platform so the
+    // e2e-assignment-issue command can validate exit_server on the exit node.
     let mut nodes_parts = Vec::new();
     for a in &ctx.assignments {
         let node_id = ctx
@@ -49,7 +53,14 @@ pub(crate) fn build_bundle_env(
             .get(&a.alias)
             .cloned()
             .unwrap_or_else(|| "0.0.0.0:51820".to_owned());
-        nodes_parts.push(format!("{node_id}|{endpoint}|{}", pubkey.0));
+        let platform = ctx
+            .adapters
+            .get(&a.alias)
+            .map(|adapter| adapter.platform())
+            .unwrap_or(crate::vm_lab::VmGuestPlatform::Linux);
+        let capabilities = a.role.product_capabilities_for_platform(&platform)?;
+        let caps_csv = role_capability_csv(&capabilities);
+        nodes_parts.push(format!("{node_id}|{endpoint}|{}|{caps_csv}", pubkey.0));
     }
     let nodes_spec = nodes_parts.join(";");
 

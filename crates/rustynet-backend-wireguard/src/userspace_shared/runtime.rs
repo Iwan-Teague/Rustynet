@@ -20,6 +20,8 @@ use super::socket::{AUTHORITATIVE_TRANSPORT_LABEL, AuthoritativeSocket};
 use super::tun::{SharedTunLifecycle, TunDevice};
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK: usize = 64;
+const MAX_TUN_PACKETS_PER_TICK: usize = 64;
 
 type ReplySender<T> = SyncSender<Result<T, BackendError>>;
 
@@ -67,6 +69,8 @@ impl RunningUserspaceRuntime {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let test_state = RuntimeTestState::default();
         let worker_test_state = test_state.clone();
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let worker_alive_for_thread = worker_alive.clone();
         let round_trip_in_flight = Arc::new(AtomicBool::new(false));
         let thread_name = format!("rustynet-wg-userspace-{interface_name}");
 
@@ -82,6 +86,7 @@ impl RunningUserspaceRuntime {
                     command_rx,
                     ready_tx,
                     test_state: worker_test_state,
+                    worker_alive: worker_alive_for_thread,
                 });
             })
             .map_err(|err| {
@@ -108,6 +113,7 @@ impl RunningUserspaceRuntime {
             control: RuntimeControl {
                 command_tx,
                 authoritative_identity,
+                worker_alive,
                 round_trip_in_flight,
                 test_state,
             },
@@ -138,6 +144,7 @@ impl RunningUserspaceRuntime {
 pub(crate) struct RuntimeControl {
     command_tx: Sender<RuntimeRequest>,
     authoritative_identity: AuthoritativeTransportIdentity,
+    worker_alive: Arc<AtomicBool>,
     round_trip_in_flight: Arc<AtomicBool>,
     #[cfg_attr(not(test), allow(dead_code))]
     test_state: RuntimeTestState,
@@ -146,6 +153,10 @@ pub(crate) struct RuntimeControl {
 impl RuntimeControl {
     pub(crate) fn authoritative_identity(&self) -> AuthoritativeTransportIdentity {
         self.authoritative_identity.clone()
+    }
+
+    pub(crate) fn is_worker_alive(&self) -> bool {
+        self.worker_alive.load(Ordering::SeqCst)
     }
 
     pub(crate) fn configure_peer(&self, peer: PeerConfig) -> Result<(), BackendError> {
@@ -653,7 +664,10 @@ impl RuntimeState {
     }
 
     fn poll_authoritative_socket(&mut self) -> Result<(), BackendError> {
-        while let Some(datagram) = self.authoritative_socket.try_recv()? {
+        for _ in 0..MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK {
+            let Some(datagram) = self.authoritative_socket.try_recv()? else {
+                break;
+            };
             if self.try_deliver_round_trip_response(&datagram)? {
                 continue;
             }
@@ -671,7 +685,10 @@ impl RuntimeState {
     }
 
     fn poll_tun_device(&mut self) -> Result<(), BackendError> {
-        while let Some(packet) = self.tun_device.recv_packet()? {
+        for _ in 0..MAX_TUN_PACKETS_PER_TICK {
+            let Some(packet) = self.tun_device.recv_packet()? else {
+                break;
+            };
             let outcome = match self
                 .engine
                 .inject_plaintext_packet(&packet, self.authoritative_socket.transport_generation())
@@ -828,6 +845,7 @@ struct WorkerRuntimeParts {
     command_rx: Receiver<RuntimeRequest>,
     ready_tx: ReplySender<AuthoritativeTransportIdentity>,
     test_state: RuntimeTestState,
+    worker_alive: Arc<AtomicBool>,
 }
 
 fn run_worker(parts: WorkerRuntimeParts) {
@@ -840,6 +858,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
         command_rx,
         ready_tx,
         test_state,
+        worker_alive,
     } = parts;
     let mut state = RuntimeState {
         context,
@@ -859,13 +878,13 @@ fn run_worker(parts: WorkerRuntimeParts) {
     match state.authoritative_identity() {
         Ok(identity) => {
             if ready_tx.send(Ok(identity)).is_err() {
-                test_state.worker_exit_count.fetch_add(1, Ordering::SeqCst);
+                mark_worker_exit(&test_state, &worker_alive);
                 return;
             }
         }
         Err(err) => {
             let _ = ready_tx.send(Err(err));
-            test_state.worker_exit_count.fetch_add(1, Ordering::SeqCst);
+            mark_worker_exit(&test_state, &worker_alive);
             return;
         }
     }
@@ -880,7 +899,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
                     match command_rx.try_recv() {
                         Ok(request) => {
                             if !handle_request(&mut state, request) {
-                                test_state.worker_exit_count.fetch_add(1, Ordering::SeqCst);
+                                mark_worker_exit(&test_state, &worker_alive);
                                 return;
                             }
                         }
@@ -889,7 +908,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
                             state.fail_outstanding_round_trip(BackendError::internal(
                                 "linux userspace-shared runtime worker command channel disconnected during authoritative transport processing",
                             ));
-                            test_state.worker_exit_count.fetch_add(1, Ordering::SeqCst);
+                            mark_worker_exit(&test_state, &worker_alive);
                             return;
                         }
                     }
@@ -913,6 +932,11 @@ fn run_worker(parts: WorkerRuntimeParts) {
     state.fail_outstanding_round_trip(BackendError::internal(
         "linux userspace-shared runtime worker exited while an authoritative transport round trip was still in flight",
     ));
+    mark_worker_exit(&test_state, &worker_alive);
+}
+
+fn mark_worker_exit(test_state: &RuntimeTestState, worker_alive: &AtomicBool) {
+    worker_alive.store(false, Ordering::SeqCst);
     test_state.worker_exit_count.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -1031,5 +1055,126 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
             let _ = reply.send(state.recorded_tun_outbound_packets());
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::net::{SocketAddr, UdpSocket};
+
+    use base64::prelude::*;
+    use rustynet_backend_api::{NodeId, RuntimeContext};
+
+    use super::*;
+    use crate::userspace_shared::engine::UserspaceEngine;
+    use crate::userspace_shared::socket::AuthoritativeSocket;
+    use crate::userspace_shared::tun::{
+        SharedTunLifecycle, TestTunLifecycle, TunDevice, TunTestState,
+    };
+
+    #[test]
+    fn linux_runtime_authoritative_socket_poll_is_budgeted_per_tick() {
+        let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test0");
+        let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind");
+        let target = loopback_target(
+            state
+                .authoritative_socket
+                .local_addr()
+                .expect("worker addr should resolve"),
+        );
+
+        for index in 0..(MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK + 3) {
+            remote
+                .send_to(&[index as u8], target)
+                .expect("datagram should send");
+        }
+
+        state
+            .poll_authoritative_socket()
+            .expect("first socket poll should succeed");
+        assert_eq!(
+            state.recorded_peer_ciphertext_ingress().len(),
+            MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK
+        );
+
+        state
+            .poll_authoritative_socket()
+            .expect("second socket poll should drain remaining datagrams");
+        assert_eq!(
+            state.recorded_peer_ciphertext_ingress().len(),
+            MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK + 3
+        );
+    }
+
+    #[test]
+    fn linux_runtime_tun_poll_is_budgeted_per_tick() {
+        let (mut state, tun_state, _private_key) = test_runtime_state("rn-test1");
+        let packet_count = MAX_TUN_PACKETS_PER_TICK + 3;
+        for index in 0..packet_count {
+            state
+                .queue_tun_plaintext_packet_for_test(vec![index as u8])
+                .expect("test packet should queue");
+        }
+
+        state
+            .poll_tun_device()
+            .expect("first tun poll should drop invalid packets without failing");
+        assert_eq!(
+            tun_state.snapshot().queued_inbound_packets,
+            packet_count - MAX_TUN_PACKETS_PER_TICK
+        );
+
+        state
+            .poll_tun_device()
+            .expect("second tun poll should drain remaining packets");
+        assert_eq!(tun_state.snapshot().queued_inbound_packets, 0);
+    }
+
+    fn test_runtime_state(
+        interface_name: &str,
+    ) -> (RuntimeState, TunTestState, tempfile::NamedTempFile) {
+        let context = RuntimeContext {
+            local_node: NodeId::new("linux-node").expect("valid node id"),
+            interface_name: interface_name.to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.2/32".to_owned(),
+        };
+        let tun_state = TunTestState::default();
+        let tun_device = TunDevice::test_handle(tun_state.clone());
+        let tun_lifecycle = SharedTunLifecycle::new(Box::new(TestTunLifecycle::new()));
+        let authoritative_socket = AuthoritativeSocket::bind(0).expect("authoritative bind");
+        let private_key = write_private_key([7; 32]);
+        let engine = UserspaceEngine::from_private_key_file(private_key.path())
+            .expect("engine should load key");
+
+        (
+            RuntimeState {
+                context,
+                tun_device,
+                tun_lifecycle,
+                authoritative_socket,
+                engine,
+                peers: std::collections::BTreeMap::new(),
+                current_routes: Vec::new(),
+                current_exit_mode: ExitMode::Off,
+                outstanding_round_trip: None,
+                recorded_authoritative_operations: Vec::new(),
+                recorded_peer_ciphertext_egress: Vec::new(),
+                handshake_telemetry: HandshakeTelemetry::default(),
+            },
+            tun_state,
+            private_key,
+        )
+    }
+
+    fn write_private_key(bytes: [u8; 32]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp key file should be created");
+        writeln!(file, "{}", BASE64_STANDARD.encode(bytes)).expect("private key should be written");
+        file
+    }
+
+    fn loopback_target(local_addr: SocketAddr) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], local_addr.port()))
     }
 }

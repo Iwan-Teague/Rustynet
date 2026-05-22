@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,11 +13,19 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Read the `WireGuard` public key from the macOS state root.
 /// Returns the base64-encoded key decoded to hex.
+/// The keys directory is mode 700 owned by rustynetd, so the SSH user needs
+/// sudo to traverse it. Try sudo first, fall back to direct access.
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
     let pub_key_path = format!("{MACOS_KEYS_DIR}/wireguard.pub");
     let output = ssh::run_remote(
         conn,
-        &format!("cat '{pub_key_path}' 2>/dev/null || echo ''"),
+        &format!(
+            "if sudo -n true >/dev/null 2>&1; then \
+                 sudo -n cat '{pub_key_path}'; \
+             else \
+                 cat '{pub_key_path}' 2>/dev/null || echo ''; \
+             fi"
+        ),
         SHORT_TIMEOUT,
     )?;
     let trimmed = output.trim();
@@ -32,19 +41,38 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
 }
 
 /// Read the local `node_id` from the running daemon via `rustynet status`.
+/// Falls back to extracting `--node-id` from the launchd plist if the
+/// `rustynet` CLI binary is absent (e.g. a SKIP_BUILD bootstrap that only
+/// installed `rustynetd`).
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     let output = ssh::run_remote(
         conn,
-        "RUSTYNET_DAEMON_SOCKET=/var/run/rustynet/rustynetd.sock \
-         /usr/local/bin/rustynet status 2>&1",
+        "if test -x /usr/local/bin/rustynet; then \
+             sudo -n env \
+               RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
+               /usr/local/bin/rustynet status 2>&1; \
+         else \
+             sudo -n /usr/libexec/PlistBuddy \
+               -c 'Print :ProgramArguments' \
+               /Library/LaunchDaemons/com.rustynet.daemon.plist 2>/dev/null \
+               | awk '/--node-id/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/, \"\"); print}'; \
+         fi",
         SHORT_TIMEOUT,
     )?;
-    ssh::parse_status_node_id(&output).ok_or_else(|| AdapterError::Protocol {
-        message: format!(
-            "node_id field not found in rustynet status output: {}",
-            &output[..output.len().min(200)]
-        ),
-    })
+    // Try to parse as `rustynet status` output first (contains `node_id=<value>`).
+    if let Some(nid) = ssh::parse_status_node_id(&output) {
+        return Ok(nid);
+    }
+    // Plist fallback: awk emits the raw node-id value on a single line.
+    let trimmed = output.trim().to_owned();
+    if trimmed.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "could not determine node_id: rustynet CLI absent and plist fallback \
+                      returned empty (plist may not exist yet)"
+                .to_owned(),
+        });
+    }
+    Ok(trimmed)
 }
 
 /// Ping `peer_mesh_ip` 3 times. Returns `Reachable` on success.
@@ -184,7 +212,7 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     }
     let status = ssh::run_remote(
         conn,
-        "RUSTYNET_DAEMON_SOCKET=/var/run/rustynet/rustynetd.sock \
+        "RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
          /usr/local/bin/rustynet status 2>/dev/null || echo ''",
         SHORT_TIMEOUT,
     )?;
@@ -284,19 +312,25 @@ pub fn issue_bundles_to_dir(
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn validate_ip_arg(ip: &str) -> Result<(), AdapterError> {
-    if ip
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '/'))
-    {
-        Ok(())
-    } else {
-        Err(AdapterError::Protocol {
-            message: format!(
-                "IP argument '{ip}' contains characters not safe for shell embedding \
-                 (allowed: alphanumeric, '.', ':', '/')"
-            ),
-        })
+    let addr = ip.parse::<IpAddr>().map_err(|err| AdapterError::Protocol {
+        message: format!("IP argument {ip:?} is not a parseable IP address: {err}"),
+    })?;
+    if addr.is_unspecified() {
+        return Err(AdapterError::Protocol {
+            message: format!("IP argument {ip:?} must not be unspecified"),
+        });
     }
+    if addr.is_multicast() {
+        return Err(AdapterError::Protocol {
+            message: format!("IP argument {ip:?} must not be multicast"),
+        });
+    }
+    if matches!(addr, IpAddr::V4(v4) if v4 == Ipv4Addr::BROADCAST) {
+        return Err(AdapterError::Protocol {
+            message: format!("IP argument {ip:?} must not be IPv4 broadcast"),
+        });
+    }
+    Ok(())
 }
 
 fn decode_wireguard_pubkey_to_hex(value: &str) -> Result<String, String> {
@@ -367,10 +401,13 @@ fn verify_no_key_material_tarball(path: &Path) -> Result<(), AdapterError> {
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.is_empty() || (!stderr.contains("error") && !stderr.contains("Error")) {
-            return Ok(());
-        }
-        return Ok(());
+        return Err(AdapterError::Io {
+            message: format!(
+                "list tar contents failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            ),
+        });
     }
     let listing = String::from_utf8_lossy(&output.stdout);
     for entry in listing.lines() {
@@ -410,6 +447,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_ip_arg_rejects_cidr_and_dns_names() {
+        assert!(validate_ip_arg("10.0.0.1/24").is_err());
+        assert!(validate_ip_arg("peer-a.local").is_err());
+    }
+
+    #[test]
+    fn validate_ip_arg_rejects_unsafe_special_addresses() {
+        assert!(validate_ip_arg("0.0.0.0").is_err());
+        assert!(validate_ip_arg("::").is_err());
+        assert!(validate_ip_arg("224.0.0.1").is_err());
+        assert!(validate_ip_arg("ff02::1").is_err());
+        assert!(validate_ip_arg("255.255.255.255").is_err());
+    }
+
+    #[test]
     fn base64_decode_wireguard_key_roundtrip() {
         let encoded = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let hex = decode_wireguard_pubkey_to_hex(encoded).unwrap();
@@ -423,5 +475,20 @@ mod tests {
         let result = decode_wireguard_pubkey_to_hex(encoded);
         assert!(result.is_err(), "must reject non-32-byte key");
         assert!(result.unwrap_err().contains("32-byte"));
+    }
+
+    #[test]
+    fn verify_no_key_material_tarball_fails_closed_on_unreadable_archive() {
+        let path = std::env::temp_dir().join(format!(
+            "rustynet-macos-invalid-artifact-{}.tar.gz",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not a tarball").expect("write invalid tarball");
+        let result = verify_no_key_material_tarball(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "unreadable artifact tarball must fail closed"
+        );
     }
 }

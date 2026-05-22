@@ -41,6 +41,8 @@ MEMBERSHIP_SNAPSHOT_PATH="/var/lib/rustynet/membership.snapshot"
 MEMBERSHIP_LOG_PATH="/var/lib/rustynet/membership.log"
 MEMBERSHIP_WATERMARK_PATH="/var/lib/rustynet/membership.watermark"
 MEMBERSHIP_OWNER_SIGNING_KEY_PATH="/etc/rustynet/membership.owner.key"
+ANCHOR_BUNDLE_PULL_ADDR="127.0.0.1:51822"
+ANCHOR_BUNDLE_PULL_TOKEN_PATH="/var/lib/rustynet/anchor-bundle-pull.token"
 BACKEND_MODE="linux-wireguard"
 DATAPLANE_MODE="hybrid-native"
 PRIVILEGED_HELPER_SOCKET_PATH="/run/rustynet/rustynetd-privileged.sock"
@@ -60,8 +62,8 @@ NODE_ROLE=""
 # for daemon dispatch; SETUP_ROLE_PRESET records the named composition
 # the operator picked so post-setup orchestration can queue
 # preset-specific follow-up actions (e.g. advertise 0.0.0.0/0 for the
-# exit preset, surface the D11.a queued-capability notice for relay /
-# anchor).
+# exit preset, install rustynet-relay for relay / anchor, and emit
+# `rustynet anchor advertise` for anchor capability publication).
 SETUP_ROLE_PRESET=""
 MANUAL_PEER_OVERRIDE="0"
 DEFAULT_LAUNCH_PROFILE="menu"

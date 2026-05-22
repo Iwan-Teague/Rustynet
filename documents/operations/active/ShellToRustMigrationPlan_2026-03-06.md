@@ -3,6 +3,12 @@
 Date: 2026-03-06  
 Owner: Rustynet engineering
 
+> **Status (2026-05-21):** Code migration phases A–I are complete. All
+> high-risk shell-invocation paths have been replaced with Rust ops commands.
+> **One item remains open:** refresh the Rust-only remote E2E evidence so the
+> wrapper-only claim is backed by current execution proof (lab-dependent;
+> requires a live VM run). Everything else is implemented and gate-verified.
+
 ## AI Implementation Prompt
 
 ```text

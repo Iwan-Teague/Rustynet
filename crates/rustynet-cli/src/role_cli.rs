@@ -39,7 +39,6 @@ pub fn role_cli_error_category(err: &RoleCliError) -> &'static str {
         RoleCliError::BlindExitRequiresExplicitAcknowledgement { .. } => {
             "blind_exit_requires_explicit_acknowledgement"
         }
-        RoleCliError::BlockedByCapabilitySchema { .. } => "blocked_by_capability_schema",
         RoleCliError::RequiresStagedTransition { .. } => "requires_staged_transition",
         RoleCliError::StatusUnreadable { .. } => "status_unreadable",
         RoleCliError::UnknownPreset { .. } => "unknown_preset",
@@ -84,6 +83,12 @@ pub enum ConcreteAction {
     /// daemon. Tears down exit-serving forwarding + NAT.
     /// Counterpart of `AdvertiseDefaultRoute`.
     RetractDefaultRoute,
+    /// Install, enable, and start the sibling `rustynet-relay`
+    /// service via the existing hardened installer.
+    DeployRelayService,
+    /// Stop, disable, and remove the sibling `rustynet-relay`
+    /// service via the existing hardened installer.
+    UndeployRelayService,
 }
 
 /// Outcome of [`plan_concrete_actions`].
@@ -124,15 +129,6 @@ pub enum RoleCliError {
     /// Becoming `blind_exit` is destructive (wipes node identity);
     /// the caller must pass `accept_irreversible=true`.
     BlindExitRequiresExplicitAcknowledgement { reason: &'static str },
-    /// `relay` / `anchor` presets and capability mutations require
-    /// the D11.a capability schema (queued in the dataplane
-    /// execution plan). This is a clean dependency-blocked path,
-    /// not a stub: the orchestrator refuses cleanly with a
-    /// pointer to the design doc.
-    BlockedByCapabilitySchema {
-        preset: RolePreset,
-        tracking_doc: &'static str,
-    },
     /// Multi-step transition the operator must perform in stages
     /// (e.g. `client → exit`: switch to admin, restart, then
     /// switch to exit). The orchestrator refuses single-step
@@ -156,13 +152,6 @@ impl RoleCliError {
             RoleCliError::BlindExitRequiresExplicitAcknowledgement { reason } => format!(
                 "becoming blind_exit is destructive: {reason}. Pass --accept-irreversible to proceed."
             ),
-            RoleCliError::BlockedByCapabilitySchema {
-                preset,
-                tracking_doc,
-            } => format!(
-                "role '{preset}' requires the D11.a capability schema (membership-bundle node_capabilities field). \
-                 That schema is queued; this transition will land when D11.a does. See {tracking_doc}."
-            ),
             RoleCliError::RequiresStagedTransition { stages } => {
                 let mut out = String::from(
                     "this transition requires multiple operator steps. Run them in order:\n",
@@ -185,8 +174,6 @@ impl RoleCliError {
     }
 }
 
-const D11_TRACKING_DOC: &str = "documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md (D11.a — Membership schema + advertise CLI)";
-
 /// Default systemd env-file path used on Linux when an explicit
 /// path isn't supplied. Mirrors `DEFAULT_SYSTEMD_ENV_PATH` in
 /// `crates/rustynet-cli/src/main.rs`. Kept local to this module so
@@ -202,10 +189,8 @@ pub const DEFAULT_DAEMON_ENV_PATH: &str = "/etc/default/rustynetd";
 /// `serving_exit_node=<bool>` and resolve to the smallest preset
 /// the local primary + serving-state combination matches.
 ///
-/// Today (pre-D11.a), `relay` and `anchor` presets cannot be
-/// reflected in status — there is no capability field in
-/// membership state to read. Once D11.a lands, this resolver
-/// extends to inspect the signed capability set.
+/// Capability-bearing presets are resolved by the role planner
+/// once signed membership state is available to the caller.
 pub fn resolve_preset_from_status(status_line: &str) -> Result<RolePreset, RoleCliError> {
     let primary_raw =
         find_field(status_line, "node_role").ok_or_else(|| RoleCliError::StatusUnreadable {
@@ -261,31 +246,6 @@ pub fn plan_concrete_actions(
     accept_irreversible: bool,
     env_path: PathBuf,
 ) -> RoleSetPlan {
-    // Defensive: relay/anchor as the *current* state cannot occur
-    // today (no capability schema means daemon cannot report it).
-    // If a future code path somehow surfaces them, refuse cleanly
-    // until D11.a lands.
-    if matches!(current, RolePreset::Relay | RolePreset::Anchor) {
-        return RoleSetPlan::Blocked {
-            from: current,
-            to: target,
-            error: RoleCliError::BlockedByCapabilitySchema {
-                preset: current,
-                tracking_doc: D11_TRACKING_DOC,
-            },
-        };
-    }
-    if matches!(target, RolePreset::Relay | RolePreset::Anchor) {
-        return RoleSetPlan::Blocked {
-            from: current,
-            to: target,
-            error: RoleCliError::BlockedByCapabilitySchema {
-                preset: target,
-                tracking_doc: D11_TRACKING_DOC,
-            },
-        };
-    }
-
     let validator = transition_plan(current, target);
 
     match validator.kind {
@@ -350,8 +310,13 @@ pub fn plan_concrete_actions(
             }
         }
         TransitionKind::SignedMembership => {
-            // The 4-role surface (today, pre-D11.a) covers four
-            // SignedMembership cells:
+            // Signed-membership transitions mutate signed mesh
+            // capabilities. Route advertise/retract and relay
+            // service lifecycle are local effects; the signed
+            // membership proposal/sign/apply flow remains explicit.
+            //
+            // The exit cells stay staged when primary-role changes
+            // would otherwise combine with default-route mutation:
             //
             // - admin → exit     : advertise 0.0.0.0/0
             // - exit  → admin    : retract 0.0.0.0/0
@@ -403,23 +368,48 @@ pub fn plan_concrete_actions(
                     },
                 },
                 _ => {
-                    // SignedMembership cells that don't involve
-                    // exit-serving need a capability schema; the
-                    // earlier relay/anchor guard already caught
-                    // those. This arm is unreachable for the
-                    // pre-D11.a surface; assert that defensively.
-                    debug_assert!(
-                        false,
-                        "unreachable SignedMembership cell for ({current:?}, {target:?}) — \
-                         pre-D11.a surface covers only Admin↔Exit and Client→Exit / Exit→Client (staged)"
-                    );
-                    RoleSetPlan::Blocked {
+                    let mut actions = Vec::new();
+                    if let Some((_, new_primary)) = validator.primary_change {
+                        actions.push(ConcreteAction::WriteNodeRoleEnv {
+                            new_primary,
+                            env_path,
+                            restart_required: true,
+                        });
+                    }
+                    if validator.requires_relay_deploy {
+                        actions.push(ConcreteAction::DeployRelayService);
+                    }
+                    if validator.requires_relay_undeploy {
+                        actions.push(ConcreteAction::UndeployRelayService);
+                    }
+                    if actions.is_empty() {
+                        actions.push(ConcreteAction::NoOp);
+                    }
+
+                    let mut followup_instructions = vec![
+                        format!(
+                            "Emit, sign, and apply a membership capability update for this node before relying on the new {target} role."
+                        ),
+                    ];
+                    if target == RolePreset::Anchor {
+                        followup_instructions.push(
+                            "Use `rustynet anchor advertise --node-id <id> --capabilities gossip_seed,bundle_pull,enrollment_endpoint,relay_colocation,port_mapping_authoritative` to build the unsigned update record."
+                                .to_owned(),
+                        );
+                    }
+                    if validator.primary_change.is_some() {
+                        followup_instructions.push(
+                            "Restart the daemon so the new primary role takes effect: `systemctl restart rustynetd.service`."
+                                .to_owned(),
+                        );
+                    }
+
+                    RoleSetPlan::Allowed {
                         from: current,
                         to: target,
-                        error: RoleCliError::BlockedByCapabilitySchema {
-                            preset: target,
-                            tracking_doc: D11_TRACKING_DOC,
-                        },
+                        kind: TransitionKind::SignedMembership,
+                        actions,
+                        followup_instructions,
                     }
                 }
             }
@@ -508,6 +498,8 @@ fn render_action(action: &ConcreteAction) -> String {
         ),
         ConcreteAction::AdvertiseDefaultRoute => "send IPC: route advertise 0.0.0.0/0".to_owned(),
         ConcreteAction::RetractDefaultRoute => "send IPC: route retract 0.0.0.0/0".to_owned(),
+        ConcreteAction::DeployRelayService => "install+enable rustynet-relay.service".to_owned(),
+        ConcreteAction::UndeployRelayService => "disable+remove rustynet-relay.service".to_owned(),
     }
 }
 
@@ -736,16 +728,7 @@ mod tests {
             let plan = plan_concrete_actions(RolePreset::BlindExit, target, false, env_path());
             match plan {
                 RoleSetPlan::Blocked { error, .. } => {
-                    // For Relay/Anchor target we hit
-                    // BlockedByCapabilitySchema BEFORE the
-                    // BlindExit immutability check; that's
-                    // intentional ordering (capability-gated
-                    // roles fail fast regardless of source).
-                    assert!(matches!(
-                        error,
-                        RoleCliError::BlindExitImmutable { .. }
-                            | RoleCliError::BlockedByCapabilitySchema { .. }
-                    ));
+                    assert!(matches!(error, RoleCliError::BlindExitImmutable { .. }));
                 }
                 other => panic!("expected Blocked for BlindExit → {target:?}, got {other:?}"),
             }
@@ -803,58 +786,50 @@ mod tests {
         }
     }
 
-    // ----- Planner: relay/anchor blocked by D11.a -----
+    // ----- Planner: relay/anchor unlocked by D11.a -----
 
     #[test]
-    fn target_relay_blocked_by_capability_schema() {
+    fn target_relay_deploys_relay_service() {
         for &from in &[RolePreset::Client, RolePreset::Admin, RolePreset::Exit] {
             let plan = plan_concrete_actions(from, RolePreset::Relay, false, env_path());
             match plan {
-                RoleSetPlan::Blocked { error, .. } => {
-                    assert!(matches!(
-                        error,
-                        RoleCliError::BlockedByCapabilitySchema {
-                            preset: RolePreset::Relay,
-                            ..
-                        }
-                    ));
+                RoleSetPlan::Allowed { actions, .. } => {
+                    assert!(actions.contains(&ConcreteAction::DeployRelayService));
                 }
-                other => panic!("expected BlockedByCapabilitySchema, got {other:?}"),
+                other => panic!("expected relay transition allowed, got {other:?}"),
             }
         }
     }
 
     #[test]
-    fn target_anchor_blocked_by_capability_schema() {
+    fn target_anchor_deploys_relay_service() {
         let plan = plan_concrete_actions(RolePreset::Admin, RolePreset::Anchor, false, env_path());
-        assert!(matches!(
-            plan,
-            RoleSetPlan::Blocked {
-                error: RoleCliError::BlockedByCapabilitySchema {
-                    preset: RolePreset::Anchor,
-                    ..
-                },
+        match plan {
+            RoleSetPlan::Allowed {
+                actions,
+                followup_instructions,
                 ..
+            } => {
+                assert!(actions.contains(&ConcreteAction::DeployRelayService));
+                assert!(
+                    followup_instructions
+                        .iter()
+                        .any(|line| line.contains("anchor advertise"))
+                );
             }
-        ));
+            other => panic!("expected anchor transition allowed, got {other:?}"),
+        }
     }
 
     #[test]
-    fn current_relay_blocked_by_capability_schema() {
-        // Defensive — relay cannot be the current preset today
-        // (no capability schema), but if a future code path
-        // surfaces it before D11.a lands, the planner refuses.
+    fn current_relay_to_admin_undeploys_relay_service() {
         let plan = plan_concrete_actions(RolePreset::Relay, RolePreset::Admin, false, env_path());
-        assert!(matches!(
-            plan,
-            RoleSetPlan::Blocked {
-                error: RoleCliError::BlockedByCapabilitySchema {
-                    preset: RolePreset::Relay,
-                    ..
-                },
-                ..
+        match plan {
+            RoleSetPlan::Allowed { actions, .. } => {
+                assert!(actions.contains(&ConcreteAction::UndeployRelayService));
             }
-        ));
+            other => panic!("expected relay departure allowed, got {other:?}"),
+        }
     }
 
     // ----- Argument parsers -----
@@ -911,10 +886,11 @@ mod tests {
 
     #[test]
     fn render_transition_check_blocked_includes_reason() {
-        let plan = plan_concrete_actions(RolePreset::Admin, RolePreset::Anchor, false, env_path());
+        let plan =
+            plan_concrete_actions(RolePreset::Admin, RolePreset::BlindExit, false, env_path());
         let rendered = render_transition_check(&plan);
         assert!(rendered.contains("Blocked"));
-        assert!(rendered.contains("D11.a"));
+        assert!(rendered.contains("blind_exit"));
     }
 
     // ----- Exhaustive coverage of today's 4-role surface -----

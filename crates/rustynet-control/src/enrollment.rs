@@ -41,6 +41,7 @@ use crate::membership::{
     MembershipError, MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipState,
     MembershipUpdateRecord, preview_next_state,
 };
+use crate::roles::{RoleCapability, canonicalize_role_capabilities};
 
 /// Default time-to-live for a freshly-built AddNode update. Mirrors
 /// the membership Propose CLI's default TTL — long enough to walk
@@ -152,6 +153,7 @@ pub fn build_add_node_record_for_enrollee(
         node_pubkey_hex: ctx.node_pubkey_hex.clone(),
         owner: ctx.owner.clone(),
         status: MembershipNodeStatus::Active,
+        capabilities: enrollee_capabilities_from_roles(&ctx.roles),
         roles: ctx.roles,
         joined_at_unix: now_unix,
         updated_at_unix: now_unix,
@@ -178,6 +180,33 @@ pub fn build_add_node_record_for_enrollee(
         reason_code: ctx.reason_code,
         policy_context: ctx.policy_context,
     })
+}
+
+fn enrollee_capabilities_from_roles(roles: &[String]) -> Vec<RoleCapability> {
+    let mut capabilities = Vec::new();
+    for role in roles.iter().map(|role| role.trim()) {
+        match role {
+            "anchor" | "admin" | "tag:owners" | "tag:admins" | "tag:servers" => {
+                capabilities.push(RoleCapability::Anchor)
+            }
+            "client" | "tag:members" | "tag:clients" => capabilities.push(RoleCapability::Client),
+            "exit_server" | "exit-server" | "exit" => capabilities.push(RoleCapability::ExitServer),
+            "blind_exit" | "blind-exit" => {
+                capabilities.push(RoleCapability::BlindExit);
+                capabilities.push(RoleCapability::ExitServer);
+            }
+            "relay_host" | "relay-host" | "relay" => capabilities.push(RoleCapability::RelayHost),
+            "entry_relay" | "entry-relay" | "entry" => {
+                capabilities.push(RoleCapability::EntryRelay);
+                capabilities.push(RoleCapability::Client);
+            }
+            _ => {}
+        }
+    }
+    if capabilities.is_empty() {
+        capabilities.push(RoleCapability::Client);
+    }
+    canonicalize_role_capabilities(capabilities)
 }
 
 #[cfg(test)]
@@ -213,6 +242,7 @@ mod tests {
                 node_pubkey_hex: hex_lower(&founder_pubkey),
                 owner: "alice".to_owned(),
                 status: MembershipNodeStatus::Active,
+                capabilities: vec![RoleCapability::Anchor],
                 roles: vec!["admin".to_owned()],
                 joined_at_unix: 1_700_000_000,
                 updated_at_unix: 1_700_000_000,

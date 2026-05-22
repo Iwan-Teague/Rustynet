@@ -1102,16 +1102,12 @@ impl PortMapper for PcpClient {
 ///   string for the IPv4 address.
 /// * **macOS** runs `route -n get default` and scans the stdout for
 ///   the `gateway:` line.
-/// * **Windows** is not yet implemented in this slice; returns
-///   `NoGateway` with a marker string so the daemon's bring-up logic
-///   surfaces a clear "gateway autodetection unsupported on Windows
-///   — please supply --gateway-addr" message. Windows detection
-///   (GetIpForwardTable2 / `Get-NetRoute`) is a follow-up.
+/// * **Windows** calls `GetAdaptersAddresses` through the native
+///   Windows boundary crate and picks the lowest-metric usable default
+///   gateway on an operational non-loopback adapter.
 ///
-/// We do NOT trust ARP, DHCP-derived defaults, or per-interface link-local
-/// SLAAC routers as gateways — they may be present but are not the
-/// route the kernel uses for outbound traffic. The route table is the
-/// only authoritative source.
+/// We do NOT trust ARP output or shell-derived adapter text. The route table
+/// (Linux/macOS) or Windows IP Helper API data is the authoritative source.
 pub fn detect_default_gateway() -> Result<IpAddr, PortMapperError> {
     #[cfg(target_os = "linux")]
     {
@@ -1137,10 +1133,7 @@ pub fn detect_default_gateway() -> Result<IpAddr, PortMapperError> {
     }
     #[cfg(target_os = "windows")]
     {
-        Err(PortMapperError::NoGateway(
-            "Windows default-gateway autodetection is a follow-up slice; supply --gateway-addr explicitly"
-                .to_owned(),
-        ))
+        rustynet_windows_native::detect_default_gateway().map_err(PortMapperError::NoGateway)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -3427,6 +3420,13 @@ destination: default
             matches!(err, PortMapperError::NoGateway(ref msg) if msg.contains("`gateway:` line")),
             "expected NoGateway with diagnostic message, got: {err:?}"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_detect_default_gateway_returns_some() {
+        let gateway = detect_default_gateway().expect("Windows host should have a default gateway");
+        assert!(gateway.is_ipv4(), "NAT-PMP/uPnP gateway should be IPv4");
     }
 
     // ---- uPnP IGD parser / wire-format tests ----

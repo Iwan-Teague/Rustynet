@@ -59,6 +59,7 @@ pub struct MacosRuntimeAclReport {
     pub schema_version: u32,
     pub overall_ok: bool,
     pub roots: Vec<MacosRuntimeAclRootEntry>,
+    pub drift_reasons: Vec<String>,
 }
 
 /// Diagnostic walk over the canonical macOS runtime roots.
@@ -74,13 +75,50 @@ pub fn collect_macos_runtime_acl_report() -> MacosRuntimeAclReport {
             }
         })
         .collect::<Vec<_>>();
-    let overall_ok = roots
-        .iter()
-        .all(|entry| matches!(entry.status, MacosRuntimeAclRootStatus::Ok));
+    build_macos_runtime_acl_report(roots)
+}
+
+pub fn build_macos_runtime_acl_report(
+    roots: Vec<MacosRuntimeAclRootEntry>,
+) -> MacosRuntimeAclReport {
+    let drift_reasons = match evaluate_macos_runtime_acl_report(&roots) {
+        Ok(()) => Vec::new(),
+        Err(reasons) => reasons,
+    };
+    let overall_ok = drift_reasons.is_empty();
     MacosRuntimeAclReport {
         schema_version: 1,
         overall_ok,
         roots,
+        drift_reasons,
+    }
+}
+
+/// Pure report-level evaluator. Returns all root-level drift reasons in one
+/// pass and rejects empty reports fail-closed.
+pub fn evaluate_macos_runtime_acl_report(
+    roots: &[MacosRuntimeAclRootEntry],
+) -> Result<(), Vec<String>> {
+    let mut reasons = Vec::new();
+    if roots.is_empty() {
+        reasons.push("runtime ACL report contains no roots".to_owned());
+        return Err(reasons);
+    }
+    for root in roots {
+        match &root.status {
+            MacosRuntimeAclRootStatus::Ok => {}
+            MacosRuntimeAclRootStatus::Missing { reason } => {
+                reasons.push(format!("{} missing: {reason}", root.label));
+            }
+            MacosRuntimeAclRootStatus::Drifted { reason } => {
+                reasons.push(format!("{} drifted: {reason}", root.label));
+            }
+        }
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
     }
 }
 
@@ -367,6 +405,7 @@ mod tests {
             }
         }
         assert_eq!(report.roots.len(), 2);
+        assert_eq!(report.drift_reasons.len(), 2);
     }
 
     #[test]
@@ -379,6 +418,7 @@ mod tests {
                 path: "/usr/local/var/rustynet".to_owned(),
                 status: MacosRuntimeAclRootStatus::Ok,
             }],
+            drift_reasons: Vec::new(),
         };
         let json = serde_json::to_string(&report).expect("serialize");
         let parsed: MacosRuntimeAclReport = serde_json::from_str(&json).expect("deserialize");
@@ -426,11 +466,16 @@ mod tests {
 
     #[test]
     fn report_schema_version_pinned_at_one() {
-        let report = MacosRuntimeAclReport {
-            schema_version: 1,
-            overall_ok: false,
-            roots: Vec::new(),
-        };
+        let report = build_macos_runtime_acl_report(Vec::new());
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|reason| reason.contains("contains no roots")),
+            "empty report must carry explicit drift reason: {:?}",
+            report.drift_reasons
+        );
         assert_eq!(report.schema_version, 1);
         let body = serde_json::to_string(&report).expect("serialize");
         assert!(
@@ -524,20 +569,41 @@ mod tests {
     }
 
     #[test]
-    fn report_with_empty_roots_yields_vacuously_true_overall_ok() {
-        // Document the Iterator::all() vacuous-truth semantics on
-        // empty input. Production cannot hit this path (the collector
-        // iterates a 2-entry const array) but the test pins the
-        // current behavior.
-        let report = MacosRuntimeAclReport {
-            schema_version: 1,
-            overall_ok: true,
-            roots: Vec::new(),
-        };
-        let derived = report
-            .roots
-            .iter()
-            .all(|entry| matches!(entry.status, MacosRuntimeAclRootStatus::Ok));
-        assert!(derived, "empty roots is vacuously all-Ok");
+    fn report_with_empty_roots_fails_closed() {
+        let report = build_macos_runtime_acl_report(Vec::new());
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|reason| reason.contains("contains no roots")),
+            "empty roots must fail closed: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn report_evaluator_aggregates_multiple_root_drifts() {
+        let roots = vec![
+            MacosRuntimeAclRootEntry {
+                label: "state root".to_owned(),
+                path: "/usr/local/var/rustynet".to_owned(),
+                status: MacosRuntimeAclRootStatus::Missing {
+                    reason: "ENOENT".to_owned(),
+                },
+            },
+            MacosRuntimeAclRootEntry {
+                label: "config root".to_owned(),
+                path: "/usr/local/etc/rustynet".to_owned(),
+                status: MacosRuntimeAclRootStatus::Drifted {
+                    reason: "mode is 0o777".to_owned(),
+                },
+            },
+        ];
+        let reasons =
+            evaluate_macos_runtime_acl_report(&roots).expect_err("two drifts must reject");
+        assert_eq!(reasons.len(), 2, "one reason per drift: {reasons:?}");
+        assert!(reasons.iter().any(|reason| reason.contains("missing")));
+        assert!(reasons.iter().any(|reason| reason.contains("drifted")));
     }
 }

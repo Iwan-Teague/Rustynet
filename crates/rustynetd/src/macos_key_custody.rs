@@ -14,6 +14,8 @@
 //! * the keys directory is a real directory owned by `rustynetd:rustynetd`,
 //!   mode `0700`;
 //! * the plaintext private key must be absent at rest.
+//! * the plaintext passphrase file must be absent at rest; passphrase custody
+//!   must use the reviewed macOS Keychain account path.
 //!
 //! Wired through the CLI as `rustynetd macos-key-custody-check`. The
 //! orchestrator's `MacosDaemonProbe` dispatches the `KeyCustody` op here.
@@ -26,6 +28,9 @@ pub const MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str =
 pub const MACOS_WG_PUBLIC_KEY_PATH: &str = "/usr/local/var/rustynet/keys/wireguard.pub";
 /// Legacy plaintext private key — must NOT exist at rest after migration.
 pub const MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH: &str = "/usr/local/var/rustynet/keys/wireguard.key";
+/// Legacy plaintext passphrase — must NOT exist at rest after migration.
+pub const MACOS_WG_PLAINTEXT_PASSPHRASE_PATH: &str =
+    "/usr/local/var/rustynet/keys/wireguard.passphrase";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -64,21 +69,89 @@ pub struct MacosKeyCustodyReport {
     pub schema_version: u32,
     pub overall_ok: bool,
     pub entries: Vec<MacosKeyCustodyEntry>,
+    pub drift_reasons: Vec<String>,
 }
 
-pub fn collect_macos_key_custody_report() -> MacosKeyCustodyReport {
-    let entries = build_entries();
-    let overall_ok = entries.iter().all(|e| {
-        matches!(
-            e.status,
-            MacosKeyCustodyEntryStatus::Ok { .. } | MacosKeyCustodyEntryStatus::AbsentAsExpected
-        )
-    });
+const REQUIREMENT_PRESENT: &str = "present";
+const REQUIREMENT_ABSENT: &str = "absent";
+
+/// Pure evaluator: re-derives drift reasons from per-entry statuses and
+/// requirements. This deliberately aggregates every drift in one pass so a
+/// macOS operator sees the whole custody problem set instead of the first
+/// failure only.
+pub fn evaluate_macos_key_custody(entries: &[MacosKeyCustodyEntry]) -> Result<(), Vec<String>> {
+    let mut reasons = Vec::new();
+    if entries.is_empty() {
+        reasons.push("key custody report contains no entries".to_owned());
+        return Err(reasons);
+    }
+
+    for entry in entries {
+        match (entry.expected.as_str(), &entry.status) {
+            (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Ok { .. }) => {}
+            (REQUIREMENT_ABSENT, MacosKeyCustodyEntryStatus::AbsentAsExpected) => {}
+            (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Missing { reason }) => {
+                reasons.push(format!("{} missing: {reason}", entry.label));
+            }
+            (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Invalid { reason, .. }) => {
+                reasons.push(format!("{} invalid: {reason}", entry.label));
+            }
+            (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::AbsentAsExpected) => {
+                reasons.push(format!(
+                    "{} required but reported absent (collector bug or missing artifact)",
+                    entry.label
+                ));
+            }
+            (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Forbidden { reason }) => {
+                reasons.push(format!(
+                    "{} marked forbidden but requirement is present: {reason}",
+                    entry.label
+                ));
+            }
+            (REQUIREMENT_ABSENT, MacosKeyCustodyEntryStatus::Forbidden { reason }) => {
+                reasons.push(format!(
+                    "{} forbidden but present at rest: {reason}",
+                    entry.label
+                ));
+            }
+            (REQUIREMENT_ABSENT, other) => {
+                reasons.push(format!(
+                    "{} requirement is absent but status is {other:?}",
+                    entry.label
+                ));
+            }
+            (other, _) => {
+                reasons.push(format!(
+                    "{} has unknown expected requirement {other}; expected `present` or `absent`",
+                    entry.label
+                ));
+            }
+        }
+    }
+
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons)
+    }
+}
+
+pub fn build_macos_key_custody_report(entries: Vec<MacosKeyCustodyEntry>) -> MacosKeyCustodyReport {
+    let drift_reasons = match evaluate_macos_key_custody(&entries) {
+        Ok(()) => Vec::new(),
+        Err(reasons) => reasons,
+    };
+    let overall_ok = drift_reasons.is_empty();
     MacosKeyCustodyReport {
         schema_version: 1,
         overall_ok,
         entries,
+        drift_reasons,
     }
+}
+
+pub fn collect_macos_key_custody_report() -> MacosKeyCustodyReport {
+    build_macos_key_custody_report(build_entries())
 }
 
 #[cfg(target_os = "macos")]
@@ -108,6 +181,10 @@ fn build_entries() -> Vec<MacosKeyCustodyEntry> {
         probe_forbidden_file(
             MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH,
             "plaintext private key (forbidden)",
+        ),
+        probe_forbidden_file(
+            MACOS_WG_PLAINTEXT_PASSPHRASE_PATH,
+            "plaintext key passphrase (forbidden)",
         ),
     ]
 }
@@ -144,6 +221,14 @@ fn build_entries() -> Vec<MacosKeyCustodyEntry> {
         MacosKeyCustodyEntry {
             label: "plaintext private key (forbidden)".to_string(),
             path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_string(),
+            expected: "absent".to_string(),
+            status: MacosKeyCustodyEntryStatus::Missing {
+                reason: off_platform_reason.to_string(),
+            },
+        },
+        MacosKeyCustodyEntry {
+            label: "plaintext key passphrase (forbidden)".to_string(),
+            path: MACOS_WG_PLAINTEXT_PASSPHRASE_PATH.to_string(),
             expected: "absent".to_string(),
             status: MacosKeyCustodyEntryStatus::Missing {
                 reason: off_platform_reason.to_string(),
@@ -293,16 +378,16 @@ fn probe_forbidden_file(path: &'static str, label: &'static str) -> MacosKeyCust
         Err(_) => MacosKeyCustodyEntry {
             label: label.to_owned(),
             path: path.to_owned(),
-            expected: "absent".to_owned(),
+            expected: REQUIREMENT_ABSENT.to_owned(),
             status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
         },
         Ok(_) => MacosKeyCustodyEntry {
             label: label.to_owned(),
             path: path.to_owned(),
-            expected: "absent".to_owned(),
+            expected: REQUIREMENT_ABSENT.to_owned(),
             status: MacosKeyCustodyEntryStatus::Forbidden {
                 reason: format!(
-                    "plaintext private key at {path} must not exist at rest — \
+                    "plaintext key material at {path} must not exist at rest — \
                      Phase E migrated runtime key custody to encrypted-at-rest"
                 ),
             },
@@ -329,6 +414,7 @@ mod tests {
                     gid: 500,
                 },
             }],
+            drift_reasons: Vec::new(),
         };
         let json = serde_json::to_string(&report).expect("serialize");
         let parsed: MacosKeyCustodyReport = serde_json::from_str(&json).expect("deserialize");
@@ -340,7 +426,8 @@ mod tests {
     fn collect_off_macos_marks_entries_missing() {
         let report = collect_macos_key_custody_report();
         assert!(!report.overall_ok);
-        assert_eq!(report.entries.len(), 4);
+        assert_eq!(report.entries.len(), 5);
+        assert_eq!(report.drift_reasons.len(), 5);
         for entry in &report.entries {
             assert!(
                 matches!(
@@ -359,6 +446,7 @@ mod tests {
         assert!(MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.starts_with(MACOS_WG_KEYS_DIR));
         assert!(MACOS_WG_PUBLIC_KEY_PATH.starts_with(MACOS_WG_KEYS_DIR));
         assert!(MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.starts_with(MACOS_WG_KEYS_DIR));
+        assert!(MACOS_WG_PLAINTEXT_PASSPHRASE_PATH.starts_with(MACOS_WG_KEYS_DIR));
     }
 
     // ----- X4 coverage parity sweep ---------------------------------------
@@ -384,6 +472,7 @@ mod tests {
             schema_version: 1,
             overall_ok: true,
             entries: vec![keys_dir_entry()],
+            drift_reasons: Vec::new(),
         };
         assert_eq!(report.schema_version, 1);
         let body = serde_json::to_string(&report).expect("serialize");
@@ -395,7 +484,7 @@ mod tests {
 
     #[test]
     fn reviewed_entry_paths_pinned_in_canonical_order() {
-        // Snapshot the four reviewed entries that the (off-platform)
+        // Snapshot the five reviewed entries that the (off-platform)
         // collector emits today. A future refactor that drops one,
         // reorders the set, or adds a new reviewed artifact has to
         // update this snapshot in the same commit.
@@ -415,7 +504,11 @@ mod tests {
                     ("public key", MACOS_WG_PUBLIC_KEY_PATH),
                     (
                         "plaintext private key (forbidden)",
-                        MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH,
+                        MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH
+                    ),
+                    (
+                        "plaintext key passphrase (forbidden)",
+                        MACOS_WG_PLAINTEXT_PASSPHRASE_PATH,
                     ),
                 ]
             );
@@ -427,6 +520,7 @@ mod tests {
             MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
             MACOS_WG_PUBLIC_KEY_PATH,
             MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH,
+            MACOS_WG_PLAINTEXT_PASSPHRASE_PATH,
         ];
         for path in canonical_paths {
             assert!(
@@ -519,71 +613,147 @@ mod tests {
 
     #[test]
     fn report_overall_ok_is_false_when_any_entry_is_invalid() {
-        // The collector derives overall_ok via an all() walk over
-        // entry statuses, accepting Ok + AbsentAsExpected only. Pin
-        // the contract by constructing a mixed report manually and
-        // re-deriving the verdict the same way.
-        let report = MacosKeyCustodyReport {
-            schema_version: 1,
-            overall_ok: false,
-            entries: vec![
-                keys_dir_entry(),
-                MacosKeyCustodyEntry {
-                    label: "encrypted private key".to_owned(),
-                    path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
-                    expected: "present".to_owned(),
-                    status: MacosKeyCustodyEntryStatus::Invalid {
-                        reason: "mode drift".to_owned(),
-                        mode: 0o100644,
-                        uid: 500,
-                        gid: 500,
-                    },
+        let report = build_macos_key_custody_report(vec![
+            keys_dir_entry(),
+            MacosKeyCustodyEntry {
+                label: "encrypted private key".to_owned(),
+                path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+                expected: "present".to_owned(),
+                status: MacosKeyCustodyEntryStatus::Invalid {
+                    reason: "mode drift".to_owned(),
+                    mode: 0o100644,
+                    uid: 500,
+                    gid: 500,
                 },
-            ],
-        };
-        let derived = report.entries.iter().all(|e| {
-            matches!(
-                e.status,
-                MacosKeyCustodyEntryStatus::Ok { .. }
-                    | MacosKeyCustodyEntryStatus::AbsentAsExpected
-            )
-        });
+            },
+        ]);
+        assert!(!report.overall_ok);
         assert!(
-            !derived,
-            "overall_ok must be false when any entry is Invalid"
+            report
+                .drift_reasons
+                .iter()
+                .any(|reason| reason.contains("encrypted private key invalid")),
+            "invalid key drift must be reported: {:?}",
+            report.drift_reasons
         );
-        assert_eq!(report.overall_ok, derived);
     }
 
     #[test]
     fn report_overall_ok_is_true_when_only_ok_and_absent_as_expected_present() {
-        // The acceptance contract on the collector: only Ok +
-        // AbsentAsExpected count toward overall_ok=true. Pin from
-        // the positive side too.
-        let report = MacosKeyCustodyReport {
-            schema_version: 1,
-            overall_ok: true,
-            entries: vec![
-                keys_dir_entry(),
-                MacosKeyCustodyEntry {
-                    label: "plaintext private key (forbidden)".to_owned(),
-                    path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_owned(),
-                    expected: "absent".to_owned(),
-                    status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
-                },
-            ],
-        };
-        let derived = report.entries.iter().all(|e| {
-            matches!(
-                e.status,
-                MacosKeyCustodyEntryStatus::Ok { .. }
-                    | MacosKeyCustodyEntryStatus::AbsentAsExpected
-            )
-        });
+        let report = build_macos_key_custody_report(vec![
+            keys_dir_entry(),
+            MacosKeyCustodyEntry {
+                label: "plaintext private key (forbidden)".to_owned(),
+                path: MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH.to_owned(),
+                expected: "absent".to_owned(),
+                status: MacosKeyCustodyEntryStatus::AbsentAsExpected,
+            },
+        ]);
+        assert!(report.overall_ok);
+        assert!(report.drift_reasons.is_empty());
+    }
+
+    #[test]
+    fn evaluator_rejects_empty_entry_set() {
+        let reasons =
+            evaluate_macos_key_custody(&[]).expect_err("empty key custody report must reject");
         assert!(
-            derived,
-            "overall_ok must be true when entries are Ok or AbsentAsExpected"
+            reasons
+                .iter()
+                .any(|reason| reason.contains("contains no entries")),
+            "empty report rejection must be explicit: {reasons:?}"
         );
-        assert_eq!(report.overall_ok, derived);
+    }
+
+    #[test]
+    fn evaluator_rejects_plaintext_passphrase_present_at_rest() {
+        let entries = vec![
+            keys_dir_entry(),
+            MacosKeyCustodyEntry {
+                label: "plaintext key passphrase (forbidden)".to_owned(),
+                path: MACOS_WG_PLAINTEXT_PASSPHRASE_PATH.to_owned(),
+                expected: REQUIREMENT_ABSENT.to_owned(),
+                status: MacosKeyCustodyEntryStatus::Forbidden {
+                    reason: "plaintext passphrase found".to_owned(),
+                },
+            },
+        ];
+        let reasons =
+            evaluate_macos_key_custody(&entries).expect_err("plaintext passphrase must reject");
+        assert!(
+            reasons.iter().any(|reason| {
+                reason.contains("plaintext key passphrase")
+                    && reason.contains("forbidden but present at rest")
+            }),
+            "plaintext passphrase rejection must be named: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn evaluator_aggregates_multiple_drift_reasons() {
+        let entries = vec![
+            MacosKeyCustodyEntry {
+                label: "encrypted private key".to_owned(),
+                path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+                expected: REQUIREMENT_PRESENT.to_owned(),
+                status: MacosKeyCustodyEntryStatus::Invalid {
+                    reason: "mode is 0o644".to_owned(),
+                    mode: 0o100644,
+                    uid: 500,
+                    gid: 500,
+                },
+            },
+            MacosKeyCustodyEntry {
+                label: "public key".to_owned(),
+                path: MACOS_WG_PUBLIC_KEY_PATH.to_owned(),
+                expected: REQUIREMENT_PRESENT.to_owned(),
+                status: MacosKeyCustodyEntryStatus::Missing {
+                    reason: "ENOENT".to_owned(),
+                },
+            },
+            MacosKeyCustodyEntry {
+                label: "plaintext key passphrase (forbidden)".to_owned(),
+                path: MACOS_WG_PLAINTEXT_PASSPHRASE_PATH.to_owned(),
+                expected: REQUIREMENT_ABSENT.to_owned(),
+                status: MacosKeyCustodyEntryStatus::Forbidden {
+                    reason: "plaintext passphrase found".to_owned(),
+                },
+            },
+        ];
+        let reasons = evaluate_macos_key_custody(&entries).expect_err("three drifts must reject");
+        assert_eq!(
+            reasons.len(),
+            3,
+            "must report one reason per drift: {reasons:?}"
+        );
+        assert!(reasons.iter().any(|reason| reason.contains("invalid")));
+        assert!(reasons.iter().any(|reason| reason.contains("missing")));
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("forbidden but present"))
+        );
+    }
+
+    #[test]
+    fn evaluator_rejects_unknown_expected_requirement() {
+        let entries = vec![MacosKeyCustodyEntry {
+            label: "encrypted private key".to_owned(),
+            path: MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned(),
+            expected: "present-but-optional".to_owned(),
+            status: MacosKeyCustodyEntryStatus::Ok {
+                mode: 0o100600,
+                uid: 500,
+                gid: 500,
+            },
+        }];
+        let reasons =
+            evaluate_macos_key_custody(&entries).expect_err("unknown requirement must reject");
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("unknown expected requirement")),
+            "unknown requirement rejection must be explicit: {reasons:?}"
+        );
     }
 }

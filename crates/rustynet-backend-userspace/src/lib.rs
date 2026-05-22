@@ -7,9 +7,7 @@
 //!
 //! On Linux this wraps [`LinuxUserspaceSharedBackend`] from
 //! `rustynet-backend-wireguard`. On macOS this wraps
-//! [`MacosUserspaceSharedBackend`] (Phase 1 scaffolding — all operational
-//! methods return an internal error until the runtime datapath is
-//! implemented). On other platforms the type is present but all operations
+//! [`MacosUserspaceSharedBackend`]. On other platforms the type is present but all operations
 //! fail with a clear `Internal` error so callers can detect platform
 //! capability at runtime rather than compile time.
 
@@ -29,9 +27,7 @@ use rustynet_backend_wireguard::MacosUserspaceSharedBackend;
 /// A boringtun-driven userspace `WireGuard` backend.
 ///
 /// On Linux this delegates all operations to [`LinuxUserspaceSharedBackend`].
-/// On macOS this delegates to [`MacosUserspaceSharedBackend`] (Phase 1
-/// scaffolding — all operational methods return an internal error until
-/// the runtime datapath is implemented in Phase 2+).
+/// On macOS this delegates to [`MacosUserspaceSharedBackend`].
 /// On other platforms every mutating call returns a `BackendError::internal`
 /// with a platform-unavailable message.
 pub struct UserspaceBackend {

@@ -1,7 +1,7 @@
 # UTM Virtual Machine Inventory
 
 Last updated:
-`2026-04-21T16:20:45Z`
+`2026-05-21T20:33:00Z`
 
 Repository root:
 `workspace root`
@@ -58,6 +58,12 @@ Security note:
 - The Debian lab nodes are configured as `aarch64` Debian/Linux guests with
   `2048 MB` memory.
 - UTM currently reports one shared network interface per VM in the configuration record.
+- A macOS 26.4.1 (arm64) guest (`macos-utm-1`) was added 2026-05-21 using the
+  Apple Virtualization framework backend (`Backend = Apple` in UTM config). This
+  guest uses a separate bridge (`bridge101`, `192.168.65.0/24`) rather than the
+  QEMU shared network (`bridge100`, `192.168.64.0/24`) used by all other guests.
+  Remote Login (SSH) enabled; operator credentials are `mac` / `tempo` matching
+  the fleet standard. Rustynet source directory target: `/Users/mac/Rustynet`.
 - Live guest-agent verification was performed with UTM `query ip` on `2026-04-07`; live SSH reachability was rechecked in this pass over the IPv4 SSH endpoints because they were the stable SSH form on this host.
 - The per-VM IPv4s below are live-confirmed from the running guests, not inferred from hostname history.
 - One extra UTM-style historical IP, `192.168.64.18`, still exists in older host-key history but could not be tied to the current five bundles during this pass.

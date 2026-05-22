@@ -1,0 +1,66 @@
+[Unit]
+# D11.d — Anchor profile for the always-on home-server role.
+#
+# This unit composes rustynetd with the relay sibling service. The
+# daemon remains the authority for signed control state; the relay
+# forwards ciphertext only. Anchor capability advertisement still
+# flows through signed membership updates (`rustynet anchor advertise`).
+Description=Rustynet Daemon (anchor profile)
+Documentation=https://github.com/Iwan-Teague/Rustynet
+After=network-online.target rustynet-relay.service
+Wants=network-online.target rustynet-relay.service
+Requires=rustynet-relay.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/rustynetd
+EnvironmentFile=-/etc/default/rustynet-anchor
+Environment=RUSTYNET_NODE_ID=anchor-local
+Environment=RUSTYNET_NODE_ROLE=admin
+Environment=RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock
+Environment=RUSTYNET_STATE=/var/lib/rustynet/rustynetd.state
+Environment=RUSTYNET_MEMBERSHIP_SNAPSHOT=/var/lib/rustynet/membership.snapshot
+Environment=RUSTYNET_MEMBERSHIP_LOG=/var/lib/rustynet/membership.log
+Environment=RUSTYNET_MEMBERSHIP_WATERMARK=/var/lib/rustynet/membership.watermark
+Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR=127.0.0.1:51822
+Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN=/var/lib/rustynet/anchor-bundle-pull.token
+ExecStart=/usr/local/bin/rustynetd daemon \
+    --node-id ${RUSTYNET_NODE_ID} \
+    --node-role ${RUSTYNET_NODE_ROLE} \
+    --socket ${RUSTYNET_SOCKET} \
+    --state ${RUSTYNET_STATE} \
+    --membership-snapshot ${RUSTYNET_MEMBERSHIP_SNAPSHOT} \
+    --membership-log ${RUSTYNET_MEMBERSHIP_LOG} \
+    --membership-watermark ${RUSTYNET_MEMBERSHIP_WATERMARK}
+ExecStartPre=/usr/bin/test -f ${RUSTYNET_MEMBERSHIP_SNAPSHOT}
+ExecStartPre=/usr/bin/test -f ${RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN}
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=2s
+StateDirectory=rustynet
+StateDirectoryMode=0700
+RuntimeDirectory=rustynet
+RuntimeDirectoryMode=0700
+User=rustynetd
+Group=rustynetd
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/rustynet /run/rustynet
+
+[Install]
+WantedBy=multi-user.target
+

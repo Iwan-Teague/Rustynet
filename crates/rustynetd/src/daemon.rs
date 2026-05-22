@@ -114,8 +114,6 @@ use rustynet_backend_api::{
 use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 #[cfg(target_os = "linux")]
 use rustynet_backend_wireguard::LinuxWireguardBackend;
-#[cfg(target_os = "macos")]
-use rustynet_backend_wireguard::MacosWireguardBackend;
 #[cfg(test)]
 use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperation;
 use rustynet_backend_wireguard::WireguardBackend;
@@ -124,12 +122,15 @@ use rustynet_backend_wireguard::{
     DEFAULT_WINDOWS_NETSH_EXE_PATH, DEFAULT_WINDOWS_WG_EXE_PATH,
     DEFAULT_WINDOWS_WIREGUARD_EXE_PATH, WindowsWireguardBackend,
 };
+#[cfg(target_os = "macos")]
+use rustynet_backend_wireguard::{MacosUserspaceSharedBackend, MacosWireguardBackend};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
 use rustynet_control::membership::{
-    MembershipNodeStatus, MembershipState, load_membership_log, load_membership_snapshot,
-    replay_membership_snapshot_and_log,
+    MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipNodeStatus, MembershipState, load_membership_log,
+    load_membership_snapshot, replay_membership_snapshot_and_log,
 };
+use rustynet_control::roles::{RoleCapability, parse_role_capability_csv};
 use rustynet_control::{
     RelayFleetNodeDescriptor, SignedRelayFleetBundle, SignedTraversalCoordinationRecord,
     canonical_relay_id_from_label, derive_endpoint_hint_signing_key,
@@ -149,7 +150,9 @@ use rustynet_policy::{
 use rustynet_windows_native::serve_named_pipe_one_message;
 use sha2::{Digest, Sha256};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SOCKET_PATH: &str = "/private/var/run/rustynet/rustynetd.sock";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
 #[cfg(windows)]
 pub const DEFAULT_SOCKET_PATH: &str = DEFAULT_WINDOWS_DAEMON_PIPE_PATH;
@@ -177,6 +180,10 @@ pub const DEFAULT_MEMBERSHIP_SNAPSHOT_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_SN
 pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = "/var/lib/rustynet/membership.log";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_LOG_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH;
+pub const DEFAULT_ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
+pub const DEFAULT_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
+    "/var/lib/rustynet/anchor-bundle-pull.token";
+pub const MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES: usize = 256;
 #[cfg(not(windows))]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 #[cfg(windows)]
@@ -677,10 +684,13 @@ impl StateFetcher {
 
                     let dummy_bundle = AutoTunnelBundle {
                         node_id: String::new(),
+                        node_capabilities: Vec::new(),
                         mesh_cidr: String::new(),
                         assigned_cidr: String::new(),
                         peers: Vec::new(),
                         routes: Vec::new(),
+                        signed_exit_node_id: None,
+                        signed_exit_node_capabilities: Vec::new(),
                         selected_exit_node: None,
                     };
                     let context_bundle = auto_bundle.unwrap_or(&dummy_bundle);
@@ -835,21 +845,13 @@ impl DaemonBackendMode {
         }
     }
 
-    fn userspace_shared_blocker(self) -> Option<&'static str> {
-        match self {
-            DaemonBackendMode::MacosWireguardUserspaceShared => Some(
-                "macos-wireguard-userspace-shared backend is phase 1 scaffolding only: MacosUserspaceSharedBackend type exists in crates/rustynet-backend-wireguard but the macOS utun lifecycle, UDP socket, boringtun engine, and async runtime worker are not yet implemented",
-            ),
-            _ => None,
-        }
-    }
-
     fn requires_runtime_wireguard_key_material(self) -> bool {
         matches!(
             self,
             DaemonBackendMode::LinuxWireguard
                 | DaemonBackendMode::LinuxWireguardUserspaceShared
                 | DaemonBackendMode::MacosWireguard
+                | DaemonBackendMode::MacosWireguardUserspaceShared
                 | DaemonBackendMode::WindowsWireguardNt
         )
     }
@@ -868,6 +870,7 @@ impl DaemonBackendMode {
         matches!(
             self,
             DaemonBackendMode::LinuxWireguardUserspaceShared
+                | DaemonBackendMode::MacosWireguardUserspaceShared
                 | DaemonBackendMode::WindowsWireguardNt
         )
     }
@@ -918,6 +921,90 @@ fn validate_runtime_file_path(path: &Path, label: &str) -> Result<(), DaemonErro
 #[cfg(windows)]
 fn validate_runtime_file_path(path: &Path, label: &str) -> Result<(), DaemonError> {
     validate_windows_runtime_file_path(path, label).map_err(DaemonError::InvalidConfig)
+}
+
+pub fn validate_anchor_bundle_pull_addr(addr: SocketAddr) -> Result<(), DaemonError> {
+    if !addr.ip().is_loopback() {
+        return Err(DaemonError::InvalidConfig(
+            "anchor bundle-pull listener must bind loopback only".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn load_anchor_bundle_pull_token(path: &Path) -> Result<String, DaemonError> {
+    let mut token = String::new();
+    fs::File::open(path)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull token open failed: {err}")))?
+        .take(MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES as u64 + 1)
+        .read_to_string(&mut token)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull token read failed: {err}")))?;
+    if token.len() > MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES {
+        return Err(DaemonError::InvalidConfig(
+            "anchor bundle-pull token exceeds maximum size".to_owned(),
+        ));
+    }
+    let token = token.trim().to_owned();
+    if token.len() < 32 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(DaemonError::InvalidConfig(
+            "anchor bundle-pull token must be at least 32 printable ASCII bytes".to_owned(),
+        ));
+    }
+    Ok(token)
+}
+
+pub fn load_anchor_bundle_pull_bundle(path: &Path) -> Result<Vec<u8>, DaemonError> {
+    let mut bundle = Vec::new();
+    fs::File::open(path)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bundle open failed: {err}")))?
+        .take(MAX_MEMBERSHIP_SNAPSHOT_BYTES as u64 + 1)
+        .read_to_end(&mut bundle)
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bundle read failed: {err}")))?;
+    if bundle.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return Err(DaemonError::InvalidConfig(
+            "anchor bundle-pull bundle exceeds maximum membership snapshot size".to_owned(),
+        ));
+    }
+    if bundle.is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "anchor bundle-pull bundle must not be empty".to_owned(),
+        ));
+    }
+    Ok(bundle)
+}
+
+pub fn write_anchor_bundle_pull_response<W: Write>(
+    mut writer: W,
+    presented_token: &str,
+    expected_token: &str,
+    bundle: &[u8],
+) -> Result<(), DaemonError> {
+    if !constant_time_ascii_eq(presented_token.trim(), expected_token.trim()) {
+        writer
+            .write_all(b"ERR unauthorized\n")
+            .map_err(|err| DaemonError::Io(format!("anchor bundle-pull response failed: {err}")))?;
+        return Err(DaemonError::State(
+            "anchor bundle-pull token rejected".to_owned(),
+        ));
+    }
+    writer
+        .write_all(format!("OK {}\n", bundle.len()).as_bytes())
+        .and_then(|_| writer.write_all(bundle))
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull response failed: {err}")))?;
+    Ok(())
+}
+
+fn constant_time_ascii_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 #[cfg(not(windows))]
@@ -981,6 +1068,14 @@ impl NodeRole {
         matches!(self, NodeRole::Admin)
     }
 
+    fn required_membership_capabilities(self) -> &'static [RoleCapability] {
+        match self {
+            NodeRole::Admin => &[RoleCapability::Anchor],
+            NodeRole::Client => &[RoleCapability::Client],
+            NodeRole::BlindExit => &[RoleCapability::BlindExit, RoleCapability::ExitServer],
+        }
+    }
+
     fn allows_command(self, command: &IpcCommand) -> bool {
         match self {
             NodeRole::Admin => true,
@@ -1033,6 +1128,104 @@ fn sanitize_dataplane_routes_for_node_role(node_role: NodeRole, routes: Vec<Rout
             )
         })
         .collect()
+}
+
+fn validate_node_role_membership_alignment(
+    membership_state: &MembershipState,
+    local_node_id: &str,
+    node_role: NodeRole,
+) -> Result<(), String> {
+    let node = membership_state
+        .nodes
+        .iter()
+        .find(|node| node.node_id == local_node_id)
+        .ok_or_else(|| format!("local node {local_node_id} missing from signed membership"))?;
+    if node.status != MembershipNodeStatus::Active {
+        return Err(format!(
+            "local node {local_node_id} is not active in signed membership"
+        ));
+    }
+    for capability in node_role.required_membership_capabilities() {
+        if !node.capabilities.contains(capability) {
+            return Err(format!(
+                "local node_role {} requires signed membership capability {}",
+                node_role.as_str(),
+                capability.as_str()
+            ));
+        }
+    }
+    match node_role {
+        NodeRole::Admin if node.capabilities.contains(&RoleCapability::BlindExit) => {
+            Err("admin role cannot use membership carrying blind_exit capability".to_owned())
+        }
+        NodeRole::BlindExit if node.capabilities.contains(&RoleCapability::Anchor) => {
+            Err("blind_exit role cannot use membership carrying anchor capability".to_owned())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_auto_tunnel_role_membership_alignment(
+    membership_state: &MembershipState,
+    node_role: NodeRole,
+    bundle: &AutoTunnelBundle,
+) -> Result<(), String> {
+    for capability in node_role.required_membership_capabilities() {
+        if !bundle.node_capabilities.contains(capability) {
+            return Err(format!(
+                "assignment target intent lacks required local capability {}",
+                capability.as_str()
+            ));
+        }
+    }
+    if node_role.is_blind_exit() && bundle.selected_exit_node.is_some() {
+        return Err("blind_exit role cannot consume selected_exit_node assignment".to_owned());
+    }
+    for route in &bundle.routes {
+        if matches!(
+            route.kind,
+            RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan
+        ) {
+            validate_exit_provider_membership(membership_state, route.via_node.as_str())?;
+        }
+    }
+    if let Some(exit_node) = bundle.selected_exit_node.as_deref() {
+        if bundle.signed_exit_node_id.as_deref() != Some(exit_node) {
+            return Err(
+                "assignment selected_exit_node does not match signed exit intent".to_owned(),
+            );
+        }
+        if !bundle
+            .signed_exit_node_capabilities
+            .contains(&RoleCapability::ExitServer)
+        {
+            return Err("assignment signed exit intent lacks exit_server capability".to_owned());
+        }
+        validate_exit_provider_membership(membership_state, exit_node)?;
+    }
+    Ok(())
+}
+
+fn validate_exit_provider_membership(
+    membership_state: &MembershipState,
+    node_id: &str,
+) -> Result<(), String> {
+    let node = membership_state
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .ok_or_else(|| format!("assignment references unknown exit node {node_id}"))?;
+    if node.status != MembershipNodeStatus::Active {
+        return Err(format!(
+            "assignment references inactive exit node {node_id}"
+        ));
+    }
+    if !node.capabilities.contains(&RoleCapability::ExitServer) {
+        return Err(format!(
+            "assignment exit node {node_id} lacks signed membership capability exit_server"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1206,10 +1399,13 @@ impl Default for DaemonConfig {
             wg_interface: DEFAULT_WG_INTERFACE.to_owned(),
             wg_listen_port: DEFAULT_WG_LISTEN_PORT,
             wg_private_key_path: Some(PathBuf::from(DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH)),
-            wg_encrypted_private_key_path: Some(PathBuf::from(
-                DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-            )),
-            wg_key_passphrase_path: Some(PathBuf::from(DEFAULT_WG_KEY_PASSPHRASE_PATH)),
+            // Encrypted key and passphrase are opt-in: omitted from defaults so
+            // that macOS and other non-Linux targets do not inherit Linux paths
+            // that do not exist on those platforms. Service definitions (systemd
+            // ExecStart, launchd ProgramArguments) must pass these explicitly
+            // when encrypted key custody is in use.
+            wg_encrypted_private_key_path: None,
+            wg_key_passphrase_path: None,
             wg_public_key_path: Some(PathBuf::from(DEFAULT_WG_PUBLIC_KEY_PATH)),
             relay_session_signing_secret_path: std::env::var_os(ASSIGNMENT_SIGNING_SECRET_ENV)
                 .map(PathBuf::from),
@@ -1430,10 +1626,13 @@ struct AutoTunnelBundleEnvelope {
 #[derive(Debug, Clone)]
 pub struct AutoTunnelBundle {
     pub node_id: String,
+    pub node_capabilities: Vec<RoleCapability>,
     pub mesh_cidr: String,
     pub assigned_cidr: String,
     pub peers: Vec<PeerConfig>,
     pub routes: Vec<Route>,
+    pub signed_exit_node_id: Option<String>,
+    pub signed_exit_node_capabilities: Vec<RoleCapability>,
     pub selected_exit_node: Option<String>,
 }
 
@@ -1926,6 +2125,7 @@ enum MembershipBootstrapError {
     WatermarkReplay,
     LocalNodeNotActive,
     ExitNodeNotActive(String),
+    RoleMismatch(String),
     Io(String),
 }
 
@@ -1957,6 +2157,9 @@ impl fmt::Display for MembershipBootstrapError {
             MembershipBootstrapError::ExitNodeNotActive(node_id) => {
                 write!(f, "selected exit node is not active: {node_id}")
             }
+            MembershipBootstrapError::RoleMismatch(message) => {
+                write!(f, "membership role mismatch: {message}")
+            }
             MembershipBootstrapError::Io(msg) => write!(f, "membership io failure: {msg}"),
         }
     }
@@ -1979,6 +2182,9 @@ enum DaemonBackend {
     Linux(LinuxWireguardBackend<PrivilegedHelperWireguardRunner>),
     #[cfg(target_os = "macos")]
     Macos(MacosWireguardBackend<PrivilegedHelperWireguardRunner>),
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    MacosUserspaceShared(MacosUserspaceSharedBackend),
     #[cfg(windows)]
     Windows(WindowsWireguardBackend<WindowsHostWireguardRunner>),
 }
@@ -2155,7 +2361,7 @@ impl DaemonBackend {
                     )
                 })?;
                 validate_private_key_permissions(private_key)?;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "test-harness"))]
                 {
                     let backend = LinuxUserspaceSharedBackend::new_for_test(
                         config.wg_interface.clone(),
@@ -2164,6 +2370,13 @@ impl DaemonBackend {
                     )
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
                     Ok(Self::LinuxUserspaceShared(backend))
+                }
+                #[cfg(all(test, not(feature = "test-harness")))]
+                {
+                    Err(DaemonError::InvalidConfig(
+                        "linux-wireguard-userspace-shared test backend requires rustynetd test-harness feature"
+                            .to_owned(),
+                    ))
                 }
                 #[cfg(all(not(test), target_os = "linux"))]
                 {
@@ -2240,12 +2453,51 @@ impl DaemonBackend {
                     ))
                 }
             }
-            DaemonBackendMode::MacosWireguardUserspaceShared => Err(DaemonError::InvalidConfig(
-                DaemonBackendMode::MacosWireguardUserspaceShared
-                    .userspace_shared_blocker()
-                    .expect("macos shared backend blocker should exist")
-                    .to_owned(),
-            )),
+            DaemonBackendMode::MacosWireguardUserspaceShared => {
+                #[cfg(target_os = "macos")]
+                {
+                    let private_key = config.wg_private_key_path.as_ref().ok_or_else(|| {
+                        DaemonError::InvalidConfig(
+                            "wg private key path is required for macos-wireguard-userspace-shared backend".to_owned(),
+                        )
+                    })?;
+                    validate_private_key_permissions(private_key)?;
+                    #[cfg(all(test, feature = "test-harness"))]
+                    {
+                        let backend = MacosUserspaceSharedBackend::new_for_test(
+                            config.wg_interface.clone(),
+                            private_key.to_string_lossy().to_string(),
+                            config.wg_listen_port,
+                        )
+                        .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                        Ok(Self::MacosUserspaceShared(backend))
+                    }
+                    #[cfg(all(test, not(feature = "test-harness")))]
+                    {
+                        Err(DaemonError::InvalidConfig(
+                            "macos-wireguard-userspace-shared test backend requires rustynetd test-harness feature"
+                                .to_owned(),
+                        ))
+                    }
+                    #[cfg(not(test))]
+                    {
+                        let backend = MacosUserspaceSharedBackend::new(
+                            config.wg_interface.clone(),
+                            private_key.to_string_lossy().to_string(),
+                            config.wg_listen_port,
+                        )
+                        .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                        Ok(Self::MacosUserspaceShared(backend))
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Err(DaemonError::InvalidConfig(
+                        "macos-wireguard-userspace-shared backend is only supported on macos"
+                            .to_owned(),
+                    ))
+                }
+            }
             DaemonBackendMode::WindowsWireguardNt => {
                 #[cfg(windows)]
                 {
@@ -2296,6 +2548,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.name(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.name(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.name(),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.name(),
         }
@@ -2309,6 +2563,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.capabilities(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.capabilities(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.capabilities(),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.capabilities(),
         }
@@ -2322,6 +2578,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.start(context),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.start(context),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.start(context),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.start(context),
         }
@@ -2335,6 +2593,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.configure_peer(peer),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.configure_peer(peer),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.configure_peer(peer),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.configure_peer(peer),
         }
@@ -2354,6 +2614,10 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.update_peer_endpoint(node_id, endpoint),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.update_peer_endpoint(node_id, endpoint),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => {
+                backend.update_peer_endpoint(node_id, endpoint)
+            }
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.update_peer_endpoint(node_id, endpoint),
         }
@@ -2370,6 +2634,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.current_peer_endpoint(node_id),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.current_peer_endpoint(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.current_peer_endpoint(node_id),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.current_peer_endpoint(node_id),
         }
@@ -2390,6 +2656,10 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.peer_latest_handshake_unix(node_id),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.peer_latest_handshake_unix(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => {
+                backend.peer_latest_handshake_unix(node_id)
+            }
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.peer_latest_handshake_unix(node_id),
         }
@@ -2403,6 +2673,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.remove_peer(node_id),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.remove_peer(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.remove_peer(node_id),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.remove_peer(node_id),
         }
@@ -2416,6 +2688,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.apply_routes(routes),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.apply_routes(routes),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.apply_routes(routes),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.apply_routes(routes),
         }
@@ -2429,6 +2703,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.set_exit_mode(mode),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.set_exit_mode(mode),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.set_exit_mode(mode),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.set_exit_mode(mode),
         }
@@ -2442,6 +2718,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.stats(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.stats(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.stats(),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.stats(),
         }
@@ -2459,6 +2737,10 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.authoritative_transport_identity(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.authoritative_transport_identity(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => {
+                backend.authoritative_transport_identity()
+            }
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.authoritative_transport_identity(),
         }
@@ -2483,6 +2765,10 @@ impl TunnelBackend for DaemonBackend {
             }
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => {
+                backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
+            }
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => {
                 backend.authoritative_transport_round_trip(remote_addr, payload, timeout)
             }
             #[cfg(windows)]
@@ -2512,6 +2798,10 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Macos(backend) => {
                 backend.authoritative_transport_send(remote_addr, payload)
             }
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => {
+                backend.authoritative_transport_send(remote_addr, payload)
+            }
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => {
                 backend.authoritative_transport_send(remote_addr, payload)
@@ -2529,6 +2819,10 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.transport_socket_identity_blocker(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.transport_socket_identity_blocker(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => {
+                backend.transport_socket_identity_blocker()
+            }
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.transport_socket_identity_blocker(),
         }
@@ -2542,6 +2836,8 @@ impl TunnelBackend for DaemonBackend {
             DaemonBackend::Linux(backend) => backend.shutdown(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(backend) => backend.shutdown(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.shutdown(),
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.shutdown(),
         }
@@ -2572,6 +2868,10 @@ impl DaemonBackend {
             DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
                 "test handshake injection is only supported for in-memory backend",
             )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
+                "test handshake injection is only supported for in-memory backend",
+            )),
         }
     }
 
@@ -2599,6 +2899,10 @@ impl DaemonBackend {
             DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
         }
     }
 
@@ -2620,6 +2924,10 @@ impl DaemonBackend {
             )),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
         }
@@ -2646,6 +2954,10 @@ impl DaemonBackend {
             DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
         }
     }
 
@@ -2669,6 +2981,10 @@ impl DaemonBackend {
             DaemonBackend::Macos(_) => Err(BackendError::invalid_input(
                 "authoritative shared transport test harness is only supported for in-memory backend",
             )),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(_) => Err(BackendError::invalid_input(
+                "authoritative shared transport test harness is only supported for in-memory backend",
+            )),
         }
     }
 
@@ -2684,6 +3000,38 @@ impl DaemonBackend {
             DaemonBackend::Linux(_) => Vec::new(),
             #[cfg(target_os = "macos")]
             DaemonBackend::Macos(_) => Vec::new(),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(_) => Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "test-harness")]
+    fn set_linux_userspace_next_tun_recv_error_for_test(
+        &self,
+        message: impl Into<String>,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.set_next_tun_recv_error_for_test(message)
+            }
+            _ => Err(BackendError::invalid_input(
+                "linux userspace-shared TUN error injection requires linux userspace-shared backend",
+            )),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-harness"))]
+    fn set_macos_userspace_next_tun_recv_error_for_test(
+        &self,
+        message: impl Into<String>,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::MacosUserspaceShared(backend) => {
+                backend.set_next_tun_recv_error_for_test(message)
+            }
+            _ => Err(BackendError::invalid_input(
+                "macos userspace-shared TUN error injection requires macos userspace-shared backend",
+            )),
         }
     }
 }
@@ -3208,6 +3556,8 @@ impl DaemonRuntime {
         if !local_active {
             return Err(MembershipBootstrapError::LocalNodeNotActive);
         }
+        validate_node_role_membership_alignment(&replayed, &self.local_node_id, self.node_role)
+            .map_err(MembershipBootstrapError::RoleMismatch)?;
         if let Some(exit_node) = self.selected_exit_node.as_deref() {
             let exit_active = replayed.nodes.iter().any(|node| {
                 node.node_id == exit_node && node.status == MembershipNodeStatus::Active
@@ -3240,6 +3590,7 @@ impl DaemonRuntime {
 
     fn load_verified_auto_tunnel(
         &self,
+        membership_state: &MembershipState,
         membership_directory: &MembershipDirectory,
     ) -> Result<AutoTunnelBundleEnvelope, AutoTunnelBootstrapError> {
         let (bundle_path, verifier_path, watermark_path) = self.auto_tunnel_paths()?;
@@ -3254,6 +3605,12 @@ impl DaemonRuntime {
         if envelope.bundle.node_id != self.local_node_id {
             return Err(AutoTunnelBootstrapError::WrongNode);
         }
+        validate_auto_tunnel_role_membership_alignment(
+            membership_state,
+            self.node_role,
+            &envelope.bundle,
+        )
+        .map_err(AutoTunnelBootstrapError::PolicyDenied)?;
         self.policy_gate_auto_tunnel(&envelope.bundle, membership_directory)?;
         persist_auto_tunnel_watermark(watermark_path, envelope.watermark)?;
         Ok(envelope)
@@ -3704,7 +4061,7 @@ impl DaemonRuntime {
         let membership_directory = membership_directory_from_state(&membership_state);
         let auto_bundle = if self.auto_tunnel_enforce {
             Some(
-                self.load_verified_auto_tunnel(&membership_directory)
+                self.load_verified_auto_tunnel(&membership_state, &membership_directory)
                     .map_err(|err| format!("signed assignment refresh failed: {err}"))?,
             )
         } else {
@@ -5655,7 +6012,7 @@ impl DaemonRuntime {
         let membership_directory = membership_directory_from_state(&membership_state);
 
         let auto_bundle = if self.auto_tunnel_enforce {
-            match self.load_verified_auto_tunnel(&membership_directory) {
+            match self.load_verified_auto_tunnel(&membership_state, &membership_directory) {
                 Ok(bundle) => Some(bundle),
                 Err(err) => {
                     self.restrict_recoverable(err.to_string());
@@ -6391,10 +6748,9 @@ impl DaemonRuntime {
                     &[self.wg_interface.as_str(), "down"],
                 )?,
                 DaemonBackendMode::MacosWireguardUserspaceShared => {
-                    return Err(DaemonBackendMode::MacosWireguardUserspaceShared
-                        .userspace_shared_blocker()
-                        .expect("macos shared backend blocker should exist")
-                        .to_owned());
+                    return Err(
+                        "interface down is not supported for macos-wireguard-userspace-shared backend; use backend shutdown".to_owned(),
+                    );
                 }
                 DaemonBackendMode::WindowsWireguardNt => {
                     return Err(
@@ -6418,9 +6774,7 @@ impl DaemonRuntime {
                 DaemonBackendMode::LinuxWireguard => "ip link set down",
                 DaemonBackendMode::LinuxWireguardUserspaceShared => "linux userspace-shared down",
                 DaemonBackendMode::MacosWireguard => "ifconfig down",
-                DaemonBackendMode::MacosWireguardUserspaceShared => {
-                    "macos-wireguard-userspace-shared blocked"
-                }
+                DaemonBackendMode::MacosWireguardUserspaceShared => "macos userspace-shared down",
                 DaemonBackendMode::WindowsWireguardNt => "windows-wireguard-nt blocked",
                 DaemonBackendMode::WindowsUnsupported => "windows-unsupported blocked",
                 DaemonBackendMode::InMemory => "interface down",
@@ -6887,7 +7241,7 @@ impl DaemonRuntime {
         let membership_directory = membership_directory_from_state(&membership_state);
 
         let auto_bundle = if self.auto_tunnel_enforce {
-            match self.load_verified_auto_tunnel(&membership_directory) {
+            match self.load_verified_auto_tunnel(&membership_state, &membership_directory) {
                 Ok(bundle) => Some(bundle),
                 Err(err) => {
                     self.reconcile_failures = self.reconcile_failures.saturating_add(1);
@@ -8471,7 +8825,11 @@ fn prepare_runtime_wireguard_key_material(
         "wg private key path is required for linux-wireguard, macos-wireguard, or windows-wireguard-nt backend".to_owned()
     })?;
 
-    if let Some(encrypted_path) = encrypted_private_key_path {
+    // Only attempt decryption when the encrypted key file actually exists.
+    // When `encrypted_private_key_path` is the default (not user-specified) and
+    // the file is absent — as is typical on macOS where no encrypted key is
+    // provisioned — fall through to plaintext-key validation.
+    if let Some(encrypted_path) = encrypted_private_key_path.filter(|p| p.exists()) {
         let passphrase_path = passphrase_path.ok_or_else(|| {
             "wg key passphrase path is required when encrypted key path is configured".to_owned()
         })?;
@@ -8495,16 +8853,6 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "in-memory backend is disabled in production daemon paths".to_owned(),
         ));
     }
-    if matches!(
-        config.backend_mode,
-        DaemonBackendMode::MacosWireguardUserspaceShared
-    ) {
-        let blocker = config
-            .backend_mode
-            .userspace_shared_blocker()
-            .expect("macos userspace-shared blocker should exist");
-        return Err(DaemonError::InvalidConfig(blocker.to_owned()));
-    }
     #[cfg(all(not(test), not(target_os = "linux")))]
     if matches!(
         config.backend_mode,
@@ -8512,6 +8860,15 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     ) {
         return Err(DaemonError::InvalidConfig(
             "linux-wireguard-userspace-shared backend is only supported on linux".to_owned(),
+        ));
+    }
+    #[cfg(all(not(test), not(target_os = "macos")))]
+    if matches!(
+        config.backend_mode,
+        DaemonBackendMode::MacosWireguardUserspaceShared
+    ) {
+        return Err(DaemonError::InvalidConfig(
+            "macos-wireguard-userspace-shared backend is only supported on macos".to_owned(),
         ));
     }
 
@@ -8830,11 +9187,12 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         DaemonBackendMode::LinuxWireguard
             | DaemonBackendMode::LinuxWireguardUserspaceShared
             | DaemonBackendMode::MacosWireguard
+            | DaemonBackendMode::MacosWireguardUserspaceShared
             | DaemonBackendMode::WindowsWireguardNt
     ) && config.wg_private_key_path.is_none()
     {
         return Err(DaemonError::InvalidConfig(
-            "wg private key path is required for linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, or windows-wireguard-nt backend".to_owned(),
+            "wg private key path is required for linux-wireguard, linux-wireguard-userspace-shared, macos-wireguard, macos-wireguard-userspace-shared, or windows-wireguard-nt backend".to_owned(),
         ));
     }
     if config.fail_closed_ssh_allow {
@@ -8857,7 +9215,67 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
     }
 
     validate_backend_supported_on_current_host(config.backend_mode)?;
+    validate_node_role_backend_capabilities(config.node_role, config.backend_mode)?;
 
+    Ok(())
+}
+
+fn backend_mode_declared_capabilities(backend_mode: DaemonBackendMode) -> BackendCapabilities {
+    match backend_mode {
+        DaemonBackendMode::InMemory
+        | DaemonBackendMode::LinuxWireguard
+        | DaemonBackendMode::MacosWireguard
+        | DaemonBackendMode::WindowsWireguardNt => BackendCapabilities {
+            supports_roaming: true,
+            supports_exit_nodes: true,
+            supports_exit_client: true,
+            supports_exit_serving: true,
+            supports_lan_routes: true,
+            supports_ipv6: true,
+        },
+        DaemonBackendMode::LinuxWireguardUserspaceShared
+        | DaemonBackendMode::MacosWireguardUserspaceShared => BackendCapabilities {
+            supports_roaming: false,
+            supports_exit_nodes: true,
+            supports_exit_client: true,
+            supports_exit_serving: true,
+            supports_lan_routes: true,
+            supports_ipv6: false,
+        },
+        DaemonBackendMode::WindowsUnsupported => BackendCapabilities {
+            supports_roaming: false,
+            supports_exit_nodes: false,
+            supports_exit_client: false,
+            supports_exit_serving: false,
+            supports_lan_routes: false,
+            supports_ipv6: false,
+        },
+    }
+}
+
+fn validate_node_role_backend_capabilities(
+    node_role: NodeRole,
+    backend_mode: DaemonBackendMode,
+) -> Result<(), DaemonError> {
+    let capabilities = backend_mode_declared_capabilities(backend_mode);
+    let rejected = match node_role {
+        NodeRole::Admin => {
+            !(capabilities.supports_exit_nodes
+                && capabilities.supports_exit_serving
+                && capabilities.supports_lan_routes)
+        }
+        NodeRole::Client => !capabilities.supports_exit_client,
+        NodeRole::BlindExit => {
+            !(capabilities.supports_exit_nodes && capabilities.supports_exit_serving)
+        }
+    };
+    if rejected {
+        return Err(DaemonError::InvalidConfig(format!(
+            "node_role {} is not supported by backend {}",
+            node_role.as_str(),
+            backend_mode.as_str()
+        )));
+    }
     Ok(())
 }
 
@@ -9181,13 +9599,21 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         } else {
             Vec::new()
         };
-        let _ = replay_membership_snapshot_and_log(
+        let membership_state = replay_membership_snapshot_and_log(
             &membership_snapshot,
             &membership_entries,
             unix_now(),
         )
         .map_err(|err| {
             DaemonError::InvalidConfig(format!("membership replay preflight failed: {err}"))
+        })?;
+        validate_node_role_membership_alignment(
+            &membership_state,
+            &config.node_id,
+            config.node_role,
+        )
+        .map_err(|err| {
+            DaemonError::InvalidConfig(format!("membership role preflight failed: {err}"))
         })?;
     }
 
@@ -9662,8 +10088,12 @@ fn is_allowed_auto_tunnel_key(key: &str) -> bool {
         key,
         "version"
             | "node_id"
+            | "node_capabilities"
             | "mesh_cidr"
             | "assigned_cidr"
+            | "exit_node_id"
+            | "exit_node_capabilities"
+            | "traffic_route_policy"
             | "generated_at_unix"
             | "expires_at_unix"
             | "nonce"
@@ -9677,7 +10107,7 @@ fn is_allowed_auto_tunnel_key(key: &str) -> bool {
     if let Some((_index, suffix)) = parse_indexed_key(key, "peer.") {
         return matches!(
             suffix,
-            "node_id" | "endpoint" | "public_key_hex" | "allowed_ips"
+            "node_id" | "capabilities" | "endpoint" | "public_key_hex" | "allowed_ips"
         );
     }
 
@@ -9686,6 +10116,129 @@ fn is_allowed_auto_tunnel_key(key: &str) -> bool {
     }
 
     false
+}
+
+fn is_default_route_cidr(cidr: &str) -> bool {
+    matches!(cidr.trim(), "0.0.0.0/0" | "::/0")
+}
+
+fn route_peer_can_carry_signed_traffic(capabilities: &[RoleCapability]) -> bool {
+    capabilities.contains(&RoleCapability::RelayHost)
+        || capabilities.contains(&RoleCapability::ExitServer)
+}
+
+fn validate_signed_auto_tunnel_route_intent(
+    mesh_cidr: &str,
+    signed_exit_node_id: Option<&str>,
+    signed_exit_node_capabilities: &[RoleCapability],
+    selected_exit_node: Option<&str>,
+    peers: &[PeerConfig],
+    peer_capabilities: &BTreeMap<String, Vec<RoleCapability>>,
+    routes: &[Route],
+) -> Result<(), AutoTunnelBootstrapError> {
+    match (signed_exit_node_id, selected_exit_node) {
+        (Some(signed), Some(selected)) if signed == selected => {}
+        (None, None) => {
+            if !signed_exit_node_capabilities.is_empty() {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(
+                    "exit_node_capabilities present without exit_node_id".to_owned(),
+                ));
+            }
+        }
+        (Some(_), None) => {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(
+                "exit_node_id present without exit routes".to_owned(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(
+                "exit routes require signed exit_node_id".to_owned(),
+            ));
+        }
+        (Some(signed), Some(selected)) => {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "signed exit_node_id {signed} does not match selected exit node {selected}"
+            )));
+        }
+    }
+
+    if selected_exit_node.is_some()
+        && !signed_exit_node_capabilities.contains(&RoleCapability::ExitServer)
+    {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "signed exit_node_capabilities must include exit_server".to_owned(),
+        ));
+    }
+
+    for peer in peers {
+        let capabilities = peer_capabilities
+            .get(peer.node_id.as_str())
+            .ok_or_else(|| {
+                AutoTunnelBootstrapError::InvalidFormat(format!(
+                    "missing signed capabilities for peer {}",
+                    peer.node_id.as_str()
+                ))
+            })?;
+        if capabilities.is_empty() {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "peer {} has no signed capabilities",
+                peer.node_id.as_str()
+            )));
+        }
+        if !route_peer_can_carry_signed_traffic(capabilities) {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "route peer {} lacks signed relay_host or exit_server capability",
+                peer.node_id.as_str()
+            )));
+        }
+        for allowed_ip in &peer.allowed_ips {
+            let route = routes.iter().find(|route| {
+                route.destination_cidr == *allowed_ip && route.via_node == peer.node_id
+            });
+            let Some(route) = route else {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                    "allowed_ip {allowed_ip} for peer {} has no matching signed route",
+                    peer.node_id.as_str()
+                )));
+            };
+            if is_default_route_cidr(allowed_ip)
+                && selected_exit_node != Some(peer.node_id.as_str())
+            {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(
+                    "default allowed_ip must be routed through signed exit node".to_owned(),
+                ));
+            }
+            if matches!(
+                route.kind,
+                RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan
+            ) && selected_exit_node != Some(peer.node_id.as_str())
+            {
+                return Err(AutoTunnelBootstrapError::InvalidFormat(
+                    "exit route allowed_ip must be routed through signed exit node".to_owned(),
+                ));
+            }
+            match route.kind {
+                RouteKind::Mesh => {
+                    if !is_host_cidr(&route.destination_cidr)
+                        || !cidr_contains(mesh_cidr, &route.destination_cidr)
+                    {
+                        return Err(AutoTunnelBootstrapError::InvalidFormat(
+                            "mesh route allowed_ip must be a mesh host cidr".to_owned(),
+                        ));
+                    }
+                }
+                RouteKind::ExitNodeDefault | RouteKind::ExitNodeLan => {
+                    if !capabilities.contains(&RoleCapability::ExitServer) {
+                        return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                            "exit route peer {} lacks signed exit_server capability",
+                            peer.node_id.as_str()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_allowed_traversal_key(key: &str) -> bool {
@@ -10157,6 +10710,18 @@ fn load_auto_tunnel_bundle(
     NodeId::new(node_id.clone())
         .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
 
+    let node_capabilities_raw = fields.get("node_capabilities").ok_or_else(|| {
+        AutoTunnelBootstrapError::InvalidFormat("missing node_capabilities".to_owned())
+    })?;
+    let node_capabilities = parse_role_capability_csv(node_capabilities_raw).map_err(|err| {
+        AutoTunnelBootstrapError::InvalidFormat(format!("invalid node_capabilities: {err}"))
+    })?;
+    if node_capabilities.is_empty() {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "node_capabilities must not be empty".to_owned(),
+        ));
+    }
+
     let mesh_cidr = fields
         .get("mesh_cidr")
         .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing mesh_cidr".to_owned()))?
@@ -10184,6 +10749,35 @@ fn load_auto_tunnel_bundle(
     if !cidr_contains(&mesh_cidr, &assigned_cidr) {
         return Err(AutoTunnelBootstrapError::InvalidFormat(
             "assigned_cidr is outside mesh_cidr".to_owned(),
+        ));
+    }
+
+    let signed_exit_node_id = fields
+        .get("exit_node_id")
+        .ok_or_else(|| AutoTunnelBootstrapError::InvalidFormat("missing exit_node_id".to_owned()))?
+        .trim()
+        .to_owned();
+    let signed_exit_node_id = if signed_exit_node_id.is_empty() {
+        None
+    } else {
+        NodeId::new(signed_exit_node_id.clone())
+            .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
+        Some(signed_exit_node_id)
+    };
+    let signed_exit_node_capabilities_raw =
+        fields.get("exit_node_capabilities").ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat("missing exit_node_capabilities".to_owned())
+        })?;
+    let signed_exit_node_capabilities =
+        parse_role_capability_csv(signed_exit_node_capabilities_raw).map_err(|err| {
+            AutoTunnelBootstrapError::InvalidFormat(format!(
+                "invalid exit_node_capabilities: {err}"
+            ))
+        })?;
+    if fields.get("traffic_route_policy").map(String::as_str) != Some("mesh_or_relay_or_exit_node")
+    {
+        return Err(AutoTunnelBootstrapError::InvalidFormat(
+            "invalid traffic_route_policy".to_owned(),
         ));
     }
 
@@ -10269,8 +10863,10 @@ fn load_auto_tunnel_bundle(
     }
 
     let mut peers = Vec::with_capacity(peer_count);
+    let mut peer_capabilities = BTreeMap::<String, Vec<RoleCapability>>::new();
     for index in 0..peer_count {
         let node_id_key = format!("peer.{index}.node_id");
+        let capabilities_key = format!("peer.{index}.capabilities");
         let endpoint_key = format!("peer.{index}.endpoint");
         let public_key_key = format!("peer.{index}.public_key_hex");
         let allowed_ips_key = format!("peer.{index}.allowed_ips");
@@ -10280,6 +10876,21 @@ fn load_auto_tunnel_bundle(
         })?;
         let peer_node_id = NodeId::new(peer_node.clone())
             .map_err(|err| AutoTunnelBootstrapError::InvalidFormat(err.to_string()))?;
+        let peer_capabilities_raw = fields.get(&capabilities_key).ok_or_else(|| {
+            AutoTunnelBootstrapError::InvalidFormat(format!("missing {capabilities_key}"))
+        })?;
+        let parsed_peer_capabilities =
+            parse_role_capability_csv(peer_capabilities_raw).map_err(|err| {
+                AutoTunnelBootstrapError::InvalidFormat(format!(
+                    "invalid {capabilities_key}: {err}"
+                ))
+            })?;
+        if parsed_peer_capabilities.is_empty() {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(format!(
+                "{capabilities_key} must not be empty"
+            )));
+        }
+        peer_capabilities.insert(peer_node.clone(), parsed_peer_capabilities);
 
         let endpoint_raw = fields.get(&endpoint_key).ok_or_else(|| {
             AutoTunnelBootstrapError::InvalidFormat(format!("missing {endpoint_key}"))
@@ -10333,8 +10944,8 @@ fn load_auto_tunnel_bundle(
             "route_count exceeds maximum of {MAX_AUTO_TUNNEL_ROUTE_COUNT}"
         )));
     }
-    let expected_field_count = 9usize
-        .checked_add(peer_count.checked_mul(4).ok_or_else(|| {
+    let expected_field_count = 13usize
+        .checked_add(peer_count.checked_mul(5).ok_or_else(|| {
             AutoTunnelBootstrapError::InvalidFormat("peer field count overflow".to_owned())
         })?)
         .and_then(|value| value.checked_add(route_count.checked_mul(3)?))
@@ -10388,6 +10999,10 @@ fn load_auto_tunnel_bundle(
                 }
             }
             selected_exit_node = Some(via);
+        } else if is_default_route_cidr(destination_cidr) {
+            return Err(AutoTunnelBootstrapError::InvalidFormat(
+                "default routes must use exit route kind".to_owned(),
+            ));
         }
 
         routes.push(Route {
@@ -10397,13 +11012,26 @@ fn load_auto_tunnel_bundle(
         });
     }
 
+    validate_signed_auto_tunnel_route_intent(
+        &mesh_cidr,
+        signed_exit_node_id.as_deref(),
+        &signed_exit_node_capabilities,
+        selected_exit_node.as_deref(),
+        &peers,
+        &peer_capabilities,
+        &routes,
+    )?;
+
     Ok(AutoTunnelBundleEnvelope {
         bundle: AutoTunnelBundle {
             node_id,
+            node_capabilities,
             mesh_cidr,
             assigned_cidr,
             peers,
             routes,
+            signed_exit_node_id,
+            signed_exit_node_capabilities,
             selected_exit_node,
         },
         watermark,
@@ -12504,8 +13132,12 @@ fn membership_directory_from_state(state: &MembershipState) -> MembershipDirecto
 mod tests {
     use std::collections::BTreeMap;
     use std::fs::OpenOptions;
-    use std::io::{ErrorKind, Write};
-    use std::net::{IpAddr, SocketAddr, UdpSocket};
+    #[cfg(feature = "test-harness")]
+    use std::io::ErrorKind;
+    use std::io::Write;
+    #[cfg(feature = "test-harness")]
+    use std::net::UdpSocket;
+    use std::net::{IpAddr, SocketAddr};
     use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
@@ -12526,22 +13158,23 @@ mod tests {
     };
 
     use ed25519_dalek::{Signer, SigningKey};
-    use rustynet_backend_api::{
-        NodeId, Route, RouteKind, RuntimeContext, SocketEndpoint, TunnelBackend,
-    };
+    use rustynet_backend_api::{NodeId, Route, RouteKind, SocketEndpoint};
+    #[cfg(feature = "test-harness")]
+    use rustynet_backend_api::{RuntimeContext, TunnelBackend};
     use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperationKind;
     use rustynet_control::membership::{
         MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
         MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
         persist_membership_snapshot,
     };
+    use rustynet_control::roles::RoleCapability;
     use rustynet_control::{RelayFleetNodeDescriptor, SignedRelayFleetBundle};
 
     use super::{
-        AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
-        DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
-        DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonRuntime,
-        DnsZoneBootstrapError, DnsZoneLoadContext, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        AutoTunnelBundle, AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+        DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+        DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig,
+        DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
         MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
         MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
@@ -12560,7 +13193,9 @@ mod tests {
         scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
         select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
         snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
-        validate_daemon_config, validate_file_security, zeroize_optional_bytes,
+        validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
+        validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
+        write_anchor_bundle_pull_response, zeroize_optional_bytes,
     };
     use crate::phase10::{
         DataplaneState, PathMode, RuntimeSystem, TraversalProbeDecision, TraversalProbeReason,
@@ -12573,6 +13208,38 @@ mod tests {
             out.push_str(&format!("{byte:02x}"));
         }
         out
+    }
+
+    #[test]
+    fn anchor_bundle_pull_rejects_non_loopback_bind() {
+        let addr = SocketAddr::from(([192, 0, 2, 10], 51822));
+        let err = validate_anchor_bundle_pull_addr(addr).expect_err("non-loopback must reject");
+        assert!(format!("{err}").contains("loopback"));
+    }
+
+    #[test]
+    fn anchor_bundle_pull_response_is_token_gated() {
+        let bundle = b"membership-bundle";
+        let mut denied = Vec::new();
+        let err = write_anchor_bundle_pull_response(
+            &mut denied,
+            "wrong-token",
+            "0123456789abcdef0123456789abcdef",
+            bundle,
+        )
+        .expect_err("bad token must reject");
+        assert!(format!("{err}").contains("token rejected"));
+        assert_eq!(denied, b"ERR unauthorized\n");
+
+        let mut allowed = Vec::new();
+        write_anchor_bundle_pull_response(
+            &mut allowed,
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+            bundle,
+        )
+        .expect("good token must pass");
+        assert_eq!(allowed, b"OK 17\nmembership-bundle");
     }
 
     #[test]
@@ -13082,6 +13749,286 @@ mod tests {
         }
     }
 
+    #[test]
+    fn node_role_backend_capability_gate_rejects_unsupported_backend() {
+        let err = super::validate_node_role_backend_capabilities(
+            NodeRole::Admin,
+            DaemonBackendMode::WindowsUnsupported,
+        )
+        .expect_err("unsupported backend must reject privileged node role");
+        assert!(format!("{err}").contains("node_role admin is not supported"));
+
+        super::validate_node_role_backend_capabilities(
+            NodeRole::Admin,
+            DaemonBackendMode::InMemory,
+        )
+        .expect("in-memory backend advertises admin capabilities");
+        super::validate_node_role_backend_capabilities(
+            NodeRole::Client,
+            DaemonBackendMode::InMemory,
+        )
+        .expect("in-memory backend advertises client capabilities");
+        super::validate_node_role_backend_capabilities(
+            NodeRole::BlindExit,
+            DaemonBackendMode::InMemory,
+        )
+        .expect("in-memory backend advertises blind-exit capabilities");
+
+        let userspace_caps = super::backend_mode_declared_capabilities(
+            DaemonBackendMode::MacosWireguardUserspaceShared,
+        );
+        assert!(userspace_caps.supports_exit_client);
+        assert!(userspace_caps.supports_exit_serving);
+        assert!(userspace_caps.supports_lan_routes);
+        assert!(!userspace_caps.supports_roaming);
+        assert!(!userspace_caps.supports_ipv6);
+        super::validate_node_role_backend_capabilities(
+            NodeRole::Client,
+            DaemonBackendMode::MacosWireguardUserspaceShared,
+        )
+        .expect("client role must not require roaming capability");
+    }
+
+    #[test]
+    fn signed_auto_tunnel_route_intent_requires_default_via_signed_exit() {
+        let peer_node_id = NodeId::new("node-relay").expect("test node id should parse");
+        let peers = vec![rustynet_backend_api::PeerConfig {
+            node_id: peer_node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.20".parse().expect("test ip should parse"),
+                port: 51820,
+            },
+            public_key: [9u8; 32],
+            allowed_ips: vec!["0.0.0.0/0".to_owned()],
+        }];
+        let routes = vec![Route {
+            destination_cidr: "0.0.0.0/0".to_owned(),
+            via_node: peer_node_id,
+            kind: RouteKind::ExitNodeDefault,
+        }];
+
+        let err = super::validate_signed_auto_tunnel_route_intent(
+            "100.64.0.0/10",
+            Some("node-exit"),
+            &[RoleCapability::ExitServer],
+            Some("node-exit"),
+            &peers,
+            &BTreeMap::from([("node-relay".to_owned(), vec![RoleCapability::RelayHost])]),
+            &routes,
+        )
+        .expect_err("default route through non-exit peer must fail closed");
+        assert!(
+            format!("{err}").contains("default allowed_ip must be routed through signed exit node")
+        );
+    }
+
+    #[test]
+    fn signed_auto_tunnel_route_intent_rejects_mesh_subnet_route() {
+        let peer_node_id = NodeId::new("node-relay").expect("test node id should parse");
+        let peers = vec![rustynet_backend_api::PeerConfig {
+            node_id: peer_node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.21".parse().expect("test ip should parse"),
+                port: 51820,
+            },
+            public_key: [10u8; 32],
+            allowed_ips: vec!["100.64.10.0/24".to_owned()],
+        }];
+        let routes = vec![Route {
+            destination_cidr: "100.64.10.0/24".to_owned(),
+            via_node: peer_node_id,
+            kind: RouteKind::Mesh,
+        }];
+
+        let err = super::validate_signed_auto_tunnel_route_intent(
+            "100.64.0.0/10",
+            None,
+            &[],
+            None,
+            &peers,
+            &BTreeMap::from([("node-relay".to_owned(), vec![RoleCapability::RelayHost])]),
+            &routes,
+        )
+        .expect_err("mesh subnet routes must fail closed");
+        assert!(format!("{err}").contains("mesh route allowed_ip must be a mesh host cidr"));
+    }
+
+    #[test]
+    fn signed_auto_tunnel_route_intent_rejects_plain_client_route_peer() {
+        let peer_node_id = NodeId::new("node-client").expect("test node id should parse");
+        let peers = vec![rustynet_backend_api::PeerConfig {
+            node_id: peer_node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.23".parse().expect("test ip should parse"),
+                port: 51820,
+            },
+            public_key: [12u8; 32],
+            allowed_ips: vec!["100.64.0.2/32".to_owned()],
+        }];
+        let routes = vec![Route {
+            destination_cidr: "100.64.0.2/32".to_owned(),
+            via_node: peer_node_id,
+            kind: RouteKind::Mesh,
+        }];
+
+        let err = super::validate_signed_auto_tunnel_route_intent(
+            "100.64.0.0/10",
+            None,
+            &[],
+            None,
+            &peers,
+            &BTreeMap::from([("node-client".to_owned(), vec![RoleCapability::Client])]),
+            &routes,
+        )
+        .expect_err("plain client peers must not carry routed traffic");
+        assert!(format!("{err}").contains("lacks signed relay_host or exit_server"));
+    }
+
+    #[test]
+    fn signed_auto_tunnel_route_intent_requires_peer_exit_server_capability() {
+        let peer_node_id = NodeId::new("node-exit").expect("test node id should parse");
+        let peers = vec![rustynet_backend_api::PeerConfig {
+            node_id: peer_node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.22".parse().expect("test ip should parse"),
+                port: 51820,
+            },
+            public_key: [11u8; 32],
+            allowed_ips: vec!["192.168.50.0/24".to_owned()],
+        }];
+        let routes = vec![Route {
+            destination_cidr: "192.168.50.0/24".to_owned(),
+            via_node: peer_node_id,
+            kind: RouteKind::ExitNodeLan,
+        }];
+
+        let err = super::validate_signed_auto_tunnel_route_intent(
+            "100.64.0.0/10",
+            Some("node-exit"),
+            &[RoleCapability::ExitServer],
+            Some("node-exit"),
+            &peers,
+            &BTreeMap::from([("node-exit".to_owned(), vec![RoleCapability::RelayHost])]),
+            &routes,
+        )
+        .expect_err("exit routes require peer exit_server capability");
+        assert!(format!("{err}").contains("lacks signed exit_server capability"));
+    }
+
+    #[test]
+    fn signed_auto_tunnel_route_intent_allows_blind_exit_provider_for_exit_route() {
+        let peer_node_id = NodeId::new("node-blind-exit").expect("test node id should parse");
+        let peers = vec![rustynet_backend_api::PeerConfig {
+            node_id: peer_node_id.clone(),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.24".parse().expect("test ip should parse"),
+                port: 51820,
+            },
+            public_key: [13u8; 32],
+            allowed_ips: vec!["0.0.0.0/0".to_owned()],
+        }];
+        let routes = vec![Route {
+            destination_cidr: "0.0.0.0/0".to_owned(),
+            via_node: peer_node_id,
+            kind: RouteKind::ExitNodeDefault,
+        }];
+
+        super::validate_signed_auto_tunnel_route_intent(
+            "100.64.0.0/10",
+            Some("node-blind-exit"),
+            &[RoleCapability::BlindExit, RoleCapability::ExitServer],
+            Some("node-blind-exit"),
+            &peers,
+            &BTreeMap::from([(
+                "node-blind-exit".to_owned(),
+                vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+            )]),
+            &routes,
+        )
+        .expect("blind_exit with exit_server may carry exit traffic");
+    }
+
+    fn membership_state_with_capabilities(
+        local_node_id: &str,
+        local_capabilities: Vec<RoleCapability>,
+    ) -> MembershipState {
+        MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-test".to_owned(),
+            epoch: 1,
+            nodes: vec![
+                MembershipNode {
+                    node_id: local_node_id.to_owned(),
+                    node_pubkey_hex: hex_encode(&[9; 32]),
+                    owner: "owner@example.local".to_owned(),
+                    status: MembershipNodeStatus::Active,
+                    roles: vec![],
+                    capabilities: local_capabilities,
+                    joined_at_unix: 100,
+                    updated_at_unix: 100,
+                },
+                MembershipNode {
+                    node_id: "exit-node".to_owned(),
+                    node_pubkey_hex: hex_encode(&[11; 32]),
+                    owner: "owner@example.local".to_owned(),
+                    status: MembershipNodeStatus::Active,
+                    roles: vec![],
+                    capabilities: vec![RoleCapability::ExitServer],
+                    joined_at_unix: 100,
+                    updated_at_unix: 100,
+                },
+            ],
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: hex_encode(&[7; 32]),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
+    }
+
+    #[test]
+    fn node_role_membership_alignment_requires_signed_capability() {
+        let state = membership_state_with_capabilities("local", vec![RoleCapability::Client]);
+        let err = validate_node_role_membership_alignment(&state, "local", NodeRole::Admin)
+            .expect_err("admin must require anchor capability");
+        assert!(err.contains("requires signed membership capability anchor"));
+
+        let state = membership_state_with_capabilities(
+            "local",
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+        );
+        validate_node_role_membership_alignment(&state, "local", NodeRole::BlindExit)
+            .expect("blind_exit capability pair should pass");
+    }
+
+    #[test]
+    fn assignment_membership_alignment_requires_exit_server_capability() {
+        let mut state = membership_state_with_capabilities("local", vec![RoleCapability::Client]);
+        state.nodes[1].capabilities = vec![RoleCapability::Client];
+        let bundle = AutoTunnelBundle {
+            node_id: "local".to_owned(),
+            node_capabilities: vec![RoleCapability::Client],
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            assigned_cidr: "100.64.0.2/32".to_owned(),
+            peers: Vec::new(),
+            routes: vec![Route {
+                destination_cidr: "0.0.0.0/0".to_owned(),
+                via_node: NodeId::new("exit-node".to_owned()).expect("valid node id"),
+                kind: RouteKind::ExitNodeDefault,
+            }],
+            signed_exit_node_id: Some("exit-node".to_owned()),
+            signed_exit_node_capabilities: vec![RoleCapability::ExitServer],
+            selected_exit_node: Some("exit-node".to_owned()),
+        };
+        let err = validate_auto_tunnel_role_membership_alignment(&state, NodeRole::Client, &bundle)
+            .expect_err("exit assignment must require exit_server capability");
+        assert!(err.contains("lacks signed membership capability exit_server"));
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum RoleAuthMatrixMode {
         Manual,
@@ -13237,18 +14184,29 @@ mod tests {
         let traversal_watermark_path = test_dir.join("traversal.watermark");
 
         write_trust_file(&trust_path, &trust_verifier_path, 1);
-        write_membership_files(
+        // Use role-aware membership so capability checks pass for all three roles.
+        write_membership_files_for_role(
             &membership_snapshot_path,
             &membership_log_path,
             "daemon-local",
+            role,
         );
         if mode.auto_tunnel_enforced() {
-            write_auto_tunnel_file_exitless(
-                &assignment_path,
-                &assignment_verifier_path,
-                "daemon-local",
-                1,
-            );
+            if role.is_blind_exit() {
+                write_auto_tunnel_file_for_blind_exit(
+                    &assignment_path,
+                    &assignment_verifier_path,
+                    "daemon-local",
+                    1,
+                );
+            } else {
+                write_auto_tunnel_file_exitless(
+                    &assignment_path,
+                    &assignment_verifier_path,
+                    "daemon-local",
+                    1,
+                );
+            }
             write_traversal_file(
                 &traversal_path,
                 &traversal_verifier_path,
@@ -13678,7 +14636,7 @@ mod tests {
         let expires = generated.saturating_add(300);
         let peer_public = hex_encode(&[9u8; 32]);
         let payload = format!(
-            "version=1\nnode_id={node_id}\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=1\npeer.0.node_id=node-exit\npeer.0.endpoint=203.0.113.20:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=100.64.0.2/32\nroute_count=1\nroute.0.destination_cidr=0.0.0.0/0\nroute.0.via_node=node-exit\nroute.0.kind=exit_default\n"
+            "version=1\nnode_id={node_id}\nnode_capabilities=anchor,client\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\nexit_node_id=node-exit\nexit_node_capabilities=exit_server\ntraffic_route_policy=mesh_or_relay_or_exit_node\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=1\npeer.0.node_id=node-exit\npeer.0.capabilities=exit_server\npeer.0.endpoint=203.0.113.20:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=0.0.0.0/0,100.64.0.2/32\nroute_count=2\nroute.0.destination_cidr=100.64.0.2/32\nroute.0.via_node=node-exit\nroute.0.kind=mesh\nroute.1.destination_cidr=0.0.0.0/0\nroute.1.via_node=node-exit\nroute.1.kind=exit_default\n"
         );
         let signature = signing_key.sign(payload.as_bytes());
         let mut body = format!(
@@ -13687,7 +14645,7 @@ mod tests {
             hex_encode(&signature.to_bytes())
         );
         if tamper_after_sign {
-            body = body.replace("route_count=1", "route_count=2");
+            body = body.replace("route_count=2", "route_count=3");
         }
         std::fs::write(path, body).expect("auto tunnel file should be written");
         #[cfg(unix)]
@@ -13721,7 +14679,54 @@ mod tests {
         let expires = generated.saturating_add(300);
         let peer_public = hex_encode(&[9u8; 32]);
         let payload = format!(
-            "version=1\nnode_id={node_id}\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=1\npeer.0.node_id=node-exit\npeer.0.endpoint=203.0.113.21:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=100.64.0.2/32\nroute_count=0\n"
+            "version=1\nnode_id={node_id}\nnode_capabilities=anchor,client\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\nexit_node_id=\nexit_node_capabilities=\ntraffic_route_policy=mesh_or_relay_or_exit_node\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=1\npeer.0.node_id=node-exit\npeer.0.capabilities=relay_host\npeer.0.endpoint=203.0.113.21:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=100.64.0.2/32\nroute_count=1\nroute.0.destination_cidr=100.64.0.2/32\nroute.0.via_node=node-exit\nroute.0.kind=mesh\n"
+        );
+        let signature = signing_key.sign(payload.as_bytes());
+        std::fs::write(
+            path,
+            format!(
+                "{}signature={}\n",
+                payload,
+                hex_encode(&signature.to_bytes())
+            ),
+        )
+        .expect("auto tunnel file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                .expect("auto tunnel bundle permissions should be secure");
+        }
+    }
+
+    /// Assignment bundle for a `blind_exit` role node: no exit-node
+    /// consumption, node_capabilities=blind_exit,exit_server.
+    fn write_auto_tunnel_file_for_blind_exit(
+        path: &Path,
+        verifier_path: &Path,
+        node_id: &str,
+        nonce: u64,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[19u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("auto tunnel verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("auto tunnel verifier key permissions should be secure")
+        };
+
+        let generated = unix_now();
+        let expires = generated.saturating_add(300);
+        let peer_public = hex_encode(&[9u8; 32]);
+        // blind_exit nodes: no selected_exit_node, no exit_default route.
+        // Peer is node-exit (present in write_membership_files_for_role BlindExit snapshot).
+        let payload = format!(
+            "version=1\nnode_id={node_id}\nnode_capabilities=blind_exit,exit_server\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\nexit_node_id=\nexit_node_capabilities=\ntraffic_route_policy=mesh_or_relay_or_exit_node\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=1\npeer.0.node_id=node-exit\npeer.0.capabilities=exit_server\npeer.0.endpoint=203.0.113.21:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=100.64.0.2/32\nroute_count=1\nroute.0.destination_cidr=100.64.0.2/32\nroute.0.via_node=node-exit\nroute.0.kind=mesh\n"
         );
         let signature = signing_key.sign(payload.as_bytes());
         std::fs::write(
@@ -13765,7 +14770,7 @@ mod tests {
         let peer_public = hex_encode(&[9u8; 32]);
         let second_peer_public = hex_encode(&[10u8; 32]);
         let payload = format!(
-            "version=1\nnode_id={node_id}\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=2\npeer.0.node_id=node-exit\npeer.0.endpoint=203.0.113.20:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=100.64.0.2/32,0.0.0.0/0\npeer.1.node_id=node-relay\npeer.1.endpoint=203.0.113.21:51820\npeer.1.public_key_hex={second_peer_public}\npeer.1.allowed_ips=100.64.0.3/32\nroute_count=1\nroute.0.destination_cidr=0.0.0.0/0\nroute.0.via_node=node-exit\nroute.0.kind=exit_default\n"
+            "version=1\nnode_id={node_id}\nnode_capabilities=anchor,client\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\nexit_node_id=node-exit\nexit_node_capabilities=exit_server\ntraffic_route_policy=mesh_or_relay_or_exit_node\ngenerated_at_unix={generated}\nexpires_at_unix={expires}\nnonce={nonce}\npeer_count=2\npeer.0.node_id=node-exit\npeer.0.capabilities=exit_server\npeer.0.endpoint=203.0.113.20:51820\npeer.0.public_key_hex={peer_public}\npeer.0.allowed_ips=0.0.0.0/0,100.64.0.2/32\npeer.1.node_id=node-relay\npeer.1.capabilities=relay_host\npeer.1.endpoint=203.0.113.21:51820\npeer.1.public_key_hex={second_peer_public}\npeer.1.allowed_ips=100.64.0.3/32\nroute_count=3\nroute.0.destination_cidr=100.64.0.2/32\nroute.0.via_node=node-exit\nroute.0.kind=mesh\nroute.1.destination_cidr=0.0.0.0/0\nroute.1.via_node=node-exit\nroute.1.kind=exit_default\nroute.2.destination_cidr=100.64.0.3/32\nroute.2.via_node=node-relay\nroute.2.kind=mesh\n"
         );
         let signature = signing_key.sign(payload.as_bytes());
         std::fs::write(
@@ -14287,11 +15292,27 @@ mod tests {
         (runtime, test_dir)
     }
 
+    #[cfg(feature = "test-harness")]
     fn free_udp_port() -> std::io::Result<u16> {
         let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
         Ok(socket.local_addr()?.port())
     }
 
+    #[cfg(feature = "test-harness")]
+    fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
+        let start = Instant::now();
+        loop {
+            if let Some(value) = check() {
+                return value;
+            }
+            if start.elapsed() >= timeout {
+                panic!("condition was not satisfied within {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(feature = "test-harness")]
     fn write_valid_userspace_shared_private_key(path: &Path) {
         std::fs::write(path, b"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\n")
             .expect("valid userspace-shared private key should be written");
@@ -14303,6 +15324,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "test-harness")]
     fn build_runtime_with_linux_userspace_shared_backend(
         test_name: &str,
     ) -> std::io::Result<(DaemonRuntime, std::path::PathBuf)> {
@@ -14375,6 +15397,86 @@ mod tests {
             backend_mode: DaemonBackendMode::LinuxWireguardUserspaceShared,
             wg_private_key_path: Some(private_key_path),
             privileged_helper_socket_path: Some(test_dir.join("privileged-helper.sock")),
+            wg_listen_port,
+            ..DaemonConfig::default()
+        };
+        let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        Ok((runtime, test_dir))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-harness"))]
+    fn build_runtime_with_macos_userspace_shared_backend(
+        test_name: &str,
+    ) -> std::io::Result<(DaemonRuntime, std::path::PathBuf)> {
+        let relay_addr: SocketAddr = "203.0.113.34:40024".parse().expect("relay addr");
+        let wg_listen_port = free_udp_port()?;
+        let test_dir = secure_test_dir(test_name);
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+        let private_key_path = test_dir.join("wireguard.key");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 13);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            13,
+            false,
+        );
+        write_traversal_file_with_custom_relay(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            14,
+            relay_addr,
+            "relay-eu-1",
+        );
+        write_valid_userspace_shared_private_key(&private_key_path);
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path),
+            traversal_bundle_path: traversal_path,
+            traversal_verifier_key_path: traversal_verifier_path,
+            traversal_watermark_path,
+            traversal_probe_handshake_freshness_secs: NonZeroU64::new(15)
+                .expect("test traversal handshake freshness should be non-zero"),
+            traversal_probe_reprobe_interval_secs: NonZeroU64::new(60)
+                .expect("test traversal reprobe interval should be non-zero"),
+            traversal_stun_servers: vec![
+                "127.0.0.1:3478"
+                    .parse()
+                    .expect("test stun server should parse"),
+            ],
+            backend_mode: DaemonBackendMode::MacosWireguardUserspaceShared,
+            wg_interface: "utun9".to_owned(),
+            wg_private_key_path: Some(private_key_path),
             wg_listen_port,
             ..DaemonConfig::default()
         };
@@ -14571,6 +15673,78 @@ mod tests {
         );
     }
 
+    /// Role-aware variant: sets local-node capabilities to match what
+    /// `validate_node_role_membership_alignment` requires for `role`.
+    /// Use this when constructing a runtime with `node_role ≠ Admin`.
+    fn write_membership_files_for_role(
+        snapshot_path: &Path,
+        log_path: &Path,
+        local_node_id: &str,
+        role: NodeRole,
+    ) {
+        let local_caps = match role {
+            NodeRole::Admin => vec![RoleCapability::Anchor, RoleCapability::Client],
+            NodeRole::Client => vec![RoleCapability::Client],
+            // blind_exit must not carry Anchor (validator rejects that combo).
+            NodeRole::BlindExit => vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+        };
+        let owner_signing = SigningKey::from_bytes(&[7; 32]);
+        let state_nodes = vec![
+            MembershipNode {
+                node_id: local_node_id.to_owned(),
+                node_pubkey_hex: hex_encode(&[9; 32]),
+                owner: "owner@example.local".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec!["tag:servers".to_owned()],
+                capabilities: local_caps,
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            },
+            MembershipNode {
+                node_id: "node-exit".to_owned(),
+                node_pubkey_hex: hex_encode(&[11; 32]),
+                owner: "owner@example.local".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec!["tag:exit".to_owned()],
+                capabilities: vec![RoleCapability::ExitServer],
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            },
+        ];
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-test".to_owned(),
+            epoch: 1,
+            nodes: state_nodes,
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: hex_encode(owner_signing.verifying_key().as_bytes()),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        persist_membership_snapshot(snapshot_path, &state)
+            .expect("membership snapshot should be written");
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).expect("membership log parent should exist");
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600)
+        };
+        let mut file = options
+            .open(log_path)
+            .expect("membership log should be opened");
+        file.write_all(b"version=1\n")
+            .expect("membership log should be written");
+    }
+
     fn write_membership_files_with_exit_status(
         snapshot_path: &Path,
         log_path: &Path,
@@ -14616,6 +15790,7 @@ mod tests {
             owner: "owner@example.local".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:servers".to_owned()],
+            capabilities: vec![RoleCapability::Anchor, RoleCapability::Client],
             joined_at_unix: 100,
             updated_at_unix: 100,
         }];
@@ -14627,6 +15802,7 @@ mod tests {
                 owner: "owner@example.local".to_owned(),
                 status: *status,
                 roles: vec!["tag:exit".to_owned()],
+                capabilities: vec![RoleCapability::ExitServer],
                 joined_at_unix: 100,
                 updated_at_unix: 100,
             });
@@ -14899,21 +16075,34 @@ mod tests {
     }
 
     #[test]
-    fn validate_daemon_config_rejects_macos_userspace_shared_backend_with_precise_blocker() {
+    fn validate_daemon_config_accepts_macos_userspace_shared_backend() {
+        let test_dir = secure_test_dir("rustynetd-validate-macos-userspace-shared");
+        let private_key_path = test_dir.join("wireguard.key");
+        std::fs::write(&private_key_path, b"valid-wireguard-private-key\n")
+            .expect("test private key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private_key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("test private key permissions should be restrictive")
+        };
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::MacosWireguardUserspaceShared,
+            wg_private_key_path: Some(private_key_path),
+            wg_interface: "utun9".to_owned(),
             ..DaemonConfig::default()
         };
-        let err = validate_daemon_config(&config)
-            .expect_err("phase-1 macos userspace-shared backend must fail closed");
-        let message = err.to_string();
+        validate_daemon_config(&config)
+            .expect("macos userspace-shared backend config should now validate");
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_macos_userspace_shared_retains_runtime_key_at_rest() {
         assert!(
-            message.contains("macos-wireguard-userspace-shared backend is phase 1 scaffolding"),
-            "expected phase-1 blocker message, got: {message}"
-        );
-        assert!(
-            message.contains("MacosUserspaceSharedBackend"),
-            "expected type reference in blocker, got: {message}"
+            DaemonBackendMode::MacosWireguardUserspaceShared.retains_runtime_key_at_rest(),
+            "MacosWireguardUserspaceShared must retain the private key at rest so \
+             the boringtun worker can re-read it on recovery"
         );
     }
 
@@ -16500,7 +17689,7 @@ mod tests {
         let expires = now.saturating_add(300);
 
         let oversized_peer_payload = format!(
-            "version=1\nnode_id=daemon-local\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=21\npeer_count={}\nroute_count=0\n",
+            "version=1\nnode_id=daemon-local\nnode_capabilities=anchor,client\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\nexit_node_id=\nexit_node_capabilities=\ntraffic_route_policy=mesh_or_relay_or_exit_node\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=21\npeer_count={}\nroute_count=0\n",
             MAX_AUTO_TUNNEL_PEER_COUNT + 1
         );
         write_signed_kv_artifact(
@@ -16524,7 +17713,7 @@ mod tests {
         assert!(peer_err.to_string().contains("peer_count exceeds maximum"));
 
         let oversized_route_payload = format!(
-            "version=1\nnode_id=daemon-local\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=22\npeer_count=0\nroute_count={}\n",
+            "version=1\nnode_id=daemon-local\nnode_capabilities=anchor,client\nmesh_cidr=100.64.0.0/10\nassigned_cidr=100.64.0.1/32\nexit_node_id=\nexit_node_capabilities=\ntraffic_route_policy=mesh_or_relay_or_exit_node\ngenerated_at_unix={now}\nexpires_at_unix={expires}\nnonce=22\npeer_count=0\nroute_count={}\n",
             MAX_AUTO_TUNNEL_ROUTE_COUNT + 1
         );
         write_signed_kv_artifact(
@@ -17494,6 +18683,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    #[cfg(feature = "test-harness")]
     #[test]
     fn daemon_runtime_linux_userspace_shared_backend_reports_authoritative_transport_state() {
         let (mut runtime, test_dir) = match build_runtime_with_linux_userspace_shared_backend(
@@ -17535,6 +18725,287 @@ mod tests {
             netcheck
                 .message
                 .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(feature = "test-harness")]
+    #[test]
+    fn daemon_runtime_linux_userspace_shared_backend_recovers_authoritative_transport_after_worker_exit()
+     {
+        let (mut runtime, test_dir) = match build_runtime_with_linux_userspace_shared_backend(
+            "rustynetd-runtime-linux-userspace-shared-worker-exit-recovery",
+        ) {
+            Ok(value) => value,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("skipping linux userspace-shared recovery test: {err}");
+                return;
+            }
+            Err(err) => panic!("ephemeral udp port should be available: {err}"),
+        };
+
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .start(RuntimeContext {
+                local_node: NodeId::new("daemon-local").expect("test node id should parse"),
+                interface_name: runtime.wg_interface.clone(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.0.1/32".to_owned(),
+            })
+            .expect("linux userspace-shared backend should start");
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_linux_userspace_next_tun_recv_error_for_test(
+                "linux daemon simulated TUN receive failure before recovery",
+            )
+            .expect("test TUN error should inject");
+        wait_for(Duration::from_secs(1), || {
+            (runtime.transport_socket_identity_state()
+                == "authoritative_backend_shared_transport_unavailable")
+                .then_some(())
+        });
+
+        let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind should succeed");
+        remote
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("remote read timeout should set");
+        let remote_addr = remote.local_addr().expect("remote addr should resolve");
+        let responder = std::thread::spawn(move || {
+            let mut buffer = [0u8; 128];
+            let (len, source) = remote
+                .recv_from(&mut buffer)
+                .expect("recovery probe should arrive");
+            assert_eq!(&buffer[..len], b"daemon-recovery-probe");
+            remote
+                .send_to(b"daemon-recovery-ok", source)
+                .expect("recovery response should send");
+        });
+
+        let response = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_round_trip(
+                remote_addr,
+                b"daemon-recovery-probe",
+                Duration::from_secs(1),
+            )
+            .expect("daemon backend round trip should recover authoritative transport");
+        responder.join().expect("responder should finish");
+
+        assert_eq!(response.payload, b"daemon-recovery-ok");
+        assert_eq!(
+            runtime.transport_socket_identity_state(),
+            "authoritative_backend_shared_transport"
+        );
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_error=none")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-harness"))]
+    #[test]
+    fn daemon_runtime_macos_userspace_shared_backend_reports_authoritative_transport_state() {
+        let (mut runtime, test_dir) = match build_runtime_with_macos_userspace_shared_backend(
+            "rustynetd-runtime-macos-userspace-shared-authoritative-transport",
+        ) {
+            Ok(value) => value,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("skipping macos userspace-shared authoritative transport test: {err}");
+                return;
+            }
+            Err(err) => panic!("ephemeral udp port should be available: {err}"),
+        };
+
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .start(RuntimeContext {
+                local_node: NodeId::new("daemon-local").expect("test node id should parse"),
+                interface_name: runtime.wg_interface.clone(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.0.1/32".to_owned(),
+            })
+            .expect("macos userspace-shared backend should start");
+
+        assert_eq!(
+            runtime.transport_socket_identity_state(),
+            "authoritative_backend_shared_transport"
+        );
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(
+            status
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-harness"))]
+    #[test]
+    fn daemon_runtime_macos_userspace_shared_backend_reports_unavailable_after_worker_exit() {
+        let (mut runtime, test_dir) = match build_runtime_with_macos_userspace_shared_backend(
+            "rustynetd-runtime-macos-userspace-shared-worker-exit-transport",
+        ) {
+            Ok(value) => value,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("skipping macos userspace-shared worker exit test: {err}");
+                return;
+            }
+            Err(err) => panic!("ephemeral udp port should be available: {err}"),
+        };
+
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .start(RuntimeContext {
+                local_node: NodeId::new("daemon-local").expect("test node id should parse"),
+                interface_name: runtime.wg_interface.clone(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.0.1/32".to_owned(),
+            })
+            .expect("macos userspace-shared backend should start");
+        assert_eq!(
+            runtime.transport_socket_identity_state(),
+            "authoritative_backend_shared_transport"
+        );
+
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_macos_userspace_next_tun_recv_error_for_test(
+                "macos daemon simulated TUN receive failure",
+            )
+            .expect("test TUN error should inject");
+        wait_for(Duration::from_secs(1), || {
+            (runtime.transport_socket_identity_state()
+                == "authoritative_backend_shared_transport_unavailable")
+                .then_some(())
+        });
+
+        let status = runtime.handle_command(IpcCommand::Status);
+        assert!(status.ok);
+        assert!(status.message.contains(
+            "transport_socket_identity_state=authoritative_backend_shared_transport_unavailable"
+        ));
+        assert!(status.message.contains(
+            "transport_socket_identity_error=backend_authoritative_shared_transport_not_exposed"
+        ));
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(netcheck.message.contains(
+            "transport_socket_identity_state=authoritative_backend_shared_transport_unavailable"
+        ));
+        assert!(netcheck.message.contains(
+            "transport_socket_identity_error=backend_authoritative_shared_transport_not_exposed"
+        ));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "test-harness"))]
+    #[test]
+    fn daemon_runtime_macos_userspace_shared_backend_recovers_authoritative_transport_after_worker_exit()
+     {
+        let (mut runtime, test_dir) = match build_runtime_with_macos_userspace_shared_backend(
+            "rustynetd-runtime-macos-userspace-shared-worker-exit-recovery",
+        ) {
+            Ok(value) => value,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("skipping macos userspace-shared recovery test: {err}");
+                return;
+            }
+            Err(err) => panic!("ephemeral udp port should be available: {err}"),
+        };
+
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .start(RuntimeContext {
+                local_node: NodeId::new("daemon-local").expect("test node id should parse"),
+                interface_name: runtime.wg_interface.clone(),
+                mesh_cidr: "100.64.0.0/10".to_owned(),
+                local_cidr: "100.64.0.1/32".to_owned(),
+            })
+            .expect("macos userspace-shared backend should start");
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .set_macos_userspace_next_tun_recv_error_for_test(
+                "macos daemon simulated TUN receive failure before recovery",
+            )
+            .expect("test TUN error should inject");
+        wait_for(Duration::from_secs(1), || {
+            (runtime.transport_socket_identity_state()
+                == "authoritative_backend_shared_transport_unavailable")
+                .then_some(())
+        });
+
+        let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind should succeed");
+        remote
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("remote read timeout should set");
+        let remote_addr = remote.local_addr().expect("remote addr should resolve");
+        let responder = std::thread::spawn(move || {
+            let mut buffer = [0u8; 128];
+            let (len, source) = remote
+                .recv_from(&mut buffer)
+                .expect("recovery probe should arrive");
+            assert_eq!(&buffer[..len], b"daemon-recovery-probe");
+            remote
+                .send_to(b"daemon-recovery-ok", source)
+                .expect("recovery response should send");
+        });
+
+        let response = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_round_trip(
+                remote_addr,
+                b"daemon-recovery-probe",
+                Duration::from_secs(1),
+            )
+            .expect("daemon backend round trip should recover authoritative transport");
+        responder.join().expect("responder should finish");
+
+        assert_eq!(response.payload, b"daemon-recovery-ok");
+        assert_eq!(
+            runtime.transport_socket_identity_state(),
+            "authoritative_backend_shared_transport"
+        );
+        let netcheck = runtime.handle_command(IpcCommand::Netcheck);
+        assert!(netcheck.ok);
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_state=authoritative_backend_shared_transport")
+        );
+        assert!(
+            netcheck
+                .message
+                .contains("transport_socket_identity_error=none")
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
@@ -22516,10 +23987,11 @@ mod tests {
         let membership_log_path = test_dir.join("membership.log");
         let membership_watermark_path = test_dir.join("membership.watermark");
         write_trust_file(&trust_path, &trust_verifier_path, 1);
-        write_membership_files(
+        write_membership_files_for_role(
             &membership_snapshot_path,
             &membership_log_path,
             "daemon-local",
+            NodeRole::BlindExit,
         );
 
         let config = DaemonConfig {
@@ -22594,18 +24066,19 @@ mod tests {
         let traversal_watermark_path = test_dir.join("traversal.watermark");
 
         write_trust_file(&trust_path, &trust_verifier_path, 1);
-        write_membership_files(
+        // blind_exit membership must carry blind_exit,exit_server (not anchor).
+        write_membership_files_for_role(
             &membership_snapshot_path,
             &membership_log_path,
             "daemon-local",
+            NodeRole::BlindExit,
         );
-        // Includes an exit-default route that would map to selected_exit_node for clients.
-        write_auto_tunnel_file(
+        // blind_exit bundle: node_capabilities=blind_exit,exit_server, no exit route.
+        write_auto_tunnel_file_for_blind_exit(
             &assignment_path,
             &assignment_verifier_path,
             "daemon-local",
             9,
-            false,
         );
         write_traversal_file(
             &traversal_path,

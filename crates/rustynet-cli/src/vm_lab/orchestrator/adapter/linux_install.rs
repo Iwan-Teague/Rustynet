@@ -2,6 +2,7 @@
 use std::io::Write as IoWrite;
 use std::time::Duration;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -132,10 +133,9 @@ pub fn enforce_daemon(
         .get(alias)
         .cloned()
         .unwrap_or_else(|| format!("{alias}-bootstrap"));
-    let role_str = match role {
-        NodeRole::Exit => "admin",
-        _ => "client",
-    };
+    let role_str = role
+        .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
+        .map_err(|message| AdapterError::Protocol { message })?;
     // SSH_ALLOW_CIDRS may contain commas; quote the whole arg.
     // Backslash-escape any single quotes in the cidr string (none expected in practice).
     let ssh_allow_cidrs = ctx.ssh_allow_cidrs.replace('\'', "'\\''");
@@ -244,12 +244,9 @@ fn run_systemctl(conn: &NodeConnection, action: &str) -> Result<(), AdapterError
 }
 
 fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContext) -> String {
-    // `rustynet ops e2e-bootstrap-host --role` only accepts "admin" or "client".
-    // The bash orchestrator maps: exit→admin, everything else→client.
-    let role_str = match role {
-        NodeRole::Exit => "admin",
-        _ => "client",
-    };
+    let role_str = role
+        .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
+        .expect("Linux lab role must have explicit daemon role mapping");
     let ssh_allow_cidrs = &ctx.ssh_allow_cidrs;
     let network_id = &ctx.network_id;
     format!(

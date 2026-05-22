@@ -14,6 +14,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
 
+use crate::roles::{
+    RoleCapability, anchor_role_capabilities, canonicalize_role_capabilities,
+    parse_role_capability_csv, role_capability_csv,
+};
+
 pub const MEMBERSHIP_SCHEMA_VERSION: u8 = 1;
 pub const MEMBERSHIP_CLOCK_SKEW_SECS: u64 = 90;
 
@@ -124,6 +129,7 @@ pub struct MembershipNode {
     pub owner: String,
     pub status: MembershipNodeStatus,
     pub roles: Vec<String>,
+    pub capabilities: Vec<RoleCapability>,
     pub joined_at_unix: u64,
     pub updated_at_unix: u64,
 }
@@ -184,6 +190,7 @@ impl MembershipState {
                     node.node_id
                 )));
             }
+            validate_membership_node_capabilities(node)?;
         }
 
         let mut approver_ids = HashSet::new();
@@ -250,6 +257,10 @@ impl MembershipState {
             roles.sort();
             roles.dedup();
             out.push_str(&format!("node.{index}.roles={}\n", roles.join(",")));
+            out.push_str(&format!(
+                "node.{index}.capabilities={}\n",
+                role_capability_csv(&node.capabilities)
+            ));
             out.push_str(&format!(
                 "node.{index}.joined_at_unix={}\n",
                 node.joined_at_unix
@@ -322,6 +333,10 @@ impl MembershipState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MembershipOperation {
     AddNode(MembershipNode),
+    SetNodeCapabilities {
+        node_id: String,
+        capabilities: Vec<RoleCapability>,
+    },
     RemoveNode {
         node_id: String,
     },
@@ -345,6 +360,7 @@ impl MembershipOperation {
     fn operation_name(&self) -> &'static str {
         match self {
             MembershipOperation::AddNode(_) => "add_node",
+            MembershipOperation::SetNodeCapabilities { .. } => "set_node_capabilities",
             MembershipOperation::RemoveNode { .. } => "remove_node",
             MembershipOperation::RevokeNode { .. } => "revoke_node",
             MembershipOperation::RestoreNode { .. } => "restore_node",
@@ -434,8 +450,22 @@ impl MembershipUpdateRecord {
                 roles.sort();
                 roles.dedup();
                 out.push_str(&format!("op.roles={}\n", roles.join(",")));
+                out.push_str(&format!(
+                    "op.capabilities={}\n",
+                    role_capability_csv(&node.capabilities)
+                ));
                 out.push_str(&format!("op.joined_at_unix={}\n", node.joined_at_unix));
                 out.push_str(&format!("op.updated_at_unix={}\n", node.updated_at_unix));
+            }
+            MembershipOperation::SetNodeCapabilities {
+                node_id,
+                capabilities,
+            } => {
+                out.push_str(&format!("op.node_id={node_id}\n"));
+                out.push_str(&format!(
+                    "op.capabilities={}\n",
+                    role_capability_csv(capabilities)
+                ));
             }
             MembershipOperation::RemoveNode { node_id }
             | MembershipOperation::RevokeNode { node_id }
@@ -987,6 +1017,18 @@ fn reduce_membership_state(
             decode_hex_to_fixed::<32>(&node.node_pubkey_hex)?;
             next.nodes.push(node.clone());
         }
+        MembershipOperation::SetNodeCapabilities {
+            node_id,
+            capabilities,
+        } => {
+            let node = next
+                .nodes
+                .iter_mut()
+                .find(|candidate| candidate.node_id == *node_id)
+                .ok_or_else(|| MembershipError::NotFound(format!("node {node_id}")))?;
+            node.capabilities = canonicalize_role_capabilities(capabilities.iter().copied());
+            node.updated_at_unix = unix_now();
+        }
         MembershipOperation::RemoveNode { node_id } => {
             let before = next.nodes.len();
             next.nodes.retain(|candidate| candidate.node_id != *node_id);
@@ -1083,6 +1125,15 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
                 &format!("node.{index}.status"),
             )?)?,
             roles: split_csv(required_field(&fields, &format!("node.{index}.roles"))?),
+            capabilities: parse_node_capabilities(
+                fields
+                    .get(&format!("node.{index}.capabilities"))
+                    .map(String::as_str),
+                fields
+                    .get(&format!("node.{index}.roles"))
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            )?,
             joined_at_unix: parse_u64_field(&fields, &format!("node.{index}.joined_at_unix"))?,
             updated_at_unix: parse_u64_field(&fields, &format!("node.{index}.updated_at_unix"))?,
         };
@@ -1165,9 +1216,20 @@ fn parse_membership_update_payload(
             owner: required_field(&fields, "op.owner")?.to_owned(),
             status: MembershipNodeStatus::parse(required_field(&fields, "op.status")?)?,
             roles: split_csv(required_field(&fields, "op.roles")?),
+            capabilities: parse_node_capabilities(
+                fields.get("op.capabilities").map(String::as_str),
+                fields.get("op.roles").map(String::as_str).unwrap_or(""),
+            )?,
             joined_at_unix: parse_u64_field(&fields, "op.joined_at_unix")?,
             updated_at_unix: parse_u64_field(&fields, "op.updated_at_unix")?,
         }),
+        "set_node_capabilities" => MembershipOperation::SetNodeCapabilities {
+            node_id: required_field(&fields, "op.node_id")?.to_owned(),
+            capabilities: parse_node_capabilities(
+                fields.get("op.capabilities").map(String::as_str),
+                "",
+            )?,
+        },
         "remove_node" => MembershipOperation::RemoveNode {
             node_id: required_field(&fields, "op.node_id")?.to_owned(),
         },
@@ -1410,6 +1472,105 @@ fn parse_usize_field(
         .map_err(|_| MembershipError::InvalidFormat(format!("invalid usize field {key}")))
 }
 
+fn validate_membership_node_capabilities(node: &MembershipNode) -> Result<(), MembershipError> {
+    let capabilities = canonicalize_role_capabilities(node.capabilities.iter().copied());
+    if node.status == MembershipNodeStatus::Active && capabilities.is_empty() {
+        return Err(MembershipError::InvalidFormat(format!(
+            "active node {} must have at least one signed role capability",
+            node.node_id
+        )));
+    }
+    if capabilities.contains(&RoleCapability::BlindExit)
+        && !capabilities.contains(&RoleCapability::ExitServer)
+    {
+        return Err(MembershipError::InvalidFormat(format!(
+            "node {} blind_exit capability requires exit_server capability",
+            node.node_id
+        )));
+    }
+    if capabilities.contains(&RoleCapability::EntryRelay)
+        && !capabilities.contains(&RoleCapability::Client)
+    {
+        return Err(MembershipError::InvalidFormat(format!(
+            "node {} entry_relay capability requires client capability",
+            node.node_id
+        )));
+    }
+    if capabilities.contains(&RoleCapability::BlindExit)
+        && (capabilities.contains(&RoleCapability::Anchor)
+            || capabilities
+                .iter()
+                .any(|capability| capability.is_anchor_capability()))
+    {
+        return Err(MembershipError::InvalidFormat(format!(
+            "node {} cannot combine anchor and blind_exit capabilities",
+            node.node_id
+        )));
+    }
+    if capabilities.contains(&RoleCapability::AnchorRelayColocation)
+        && !capabilities.contains(&RoleCapability::RelayHost)
+    {
+        return Err(MembershipError::InvalidFormat(format!(
+            "node {} anchor.relay_colocation requires relay_host capability",
+            node.node_id
+        )));
+    }
+    Ok(())
+}
+
+fn parse_node_capabilities(
+    explicit: Option<&str>,
+    legacy_roles: &str,
+) -> Result<Vec<RoleCapability>, MembershipError> {
+    if let Some(value) = explicit {
+        return parse_role_capability_csv(value).map_err(|err| {
+            MembershipError::InvalidFormat(format!("invalid role capability: {err}"))
+        });
+    }
+
+    let mut capabilities = Vec::new();
+    for role in split_csv(legacy_roles) {
+        match role.as_str() {
+            "anchor" => capabilities.extend(anchor_role_capabilities()),
+            "admin" | "tag:owners" | "tag:admins" | "tag:servers" => {
+                capabilities.push(RoleCapability::Anchor)
+            }
+            "client" | "tag:members" | "tag:clients" => capabilities.push(RoleCapability::Client),
+            "exit_server" | "exit-server" | "exit" => capabilities.push(RoleCapability::ExitServer),
+            "blind_exit" | "blind-exit" => {
+                capabilities.push(RoleCapability::BlindExit);
+                capabilities.push(RoleCapability::ExitServer);
+            }
+            "relay_host" | "relay-host" | "relay" => capabilities.push(RoleCapability::RelayHost),
+            "entry_relay" | "entry-relay" | "entry" => {
+                capabilities.push(RoleCapability::EntryRelay);
+                capabilities.push(RoleCapability::Client);
+            }
+            "anchor.gossip_seed" | "gossip_seed" | "gossip-seed" => {
+                capabilities.push(RoleCapability::AnchorGossipSeed)
+            }
+            "anchor.bundle_pull" | "bundle_pull" | "bundle-pull" => {
+                capabilities.push(RoleCapability::AnchorBundlePull)
+            }
+            "anchor.enrollment_endpoint" | "enrollment_endpoint" | "enrollment-endpoint" => {
+                capabilities.push(RoleCapability::AnchorEnrollmentEndpoint)
+            }
+            "anchor.relay_colocation" | "relay_colocation" | "relay-colocation" => {
+                capabilities.push(RoleCapability::AnchorRelayColocation);
+                capabilities.push(RoleCapability::RelayHost);
+            }
+            "anchor.port_mapping_authoritative"
+            | "port_mapping_authoritative"
+            | "port-mapping-authoritative" => {
+                capabilities.push(RoleCapability::AnchorPortMappingAuthoritative)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(canonicalize_role_capabilities(capabilities))
+}
+
 fn split_csv(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -1490,10 +1651,12 @@ mod tests {
         MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipError,
         MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipReplayCache,
         MembershipState, MembershipUpdateRecord, SignedMembershipUpdate,
-        append_membership_log_entry, apply_signed_update, hex_encode, load_membership_log,
-        load_membership_snapshot, persist_membership_snapshot, preview_next_state,
-        replay_membership_snapshot_and_log, sign_update_record, write_membership_audit_log,
+        append_membership_log_entry, apply_signed_update, decode_update_record, hex_encode,
+        load_membership_log, load_membership_snapshot, persist_membership_snapshot,
+        preview_next_state, replay_membership_snapshot_and_log, sign_update_record,
+        write_membership_audit_log,
     };
+    use crate::roles::{RoleCapability, anchor_role_capabilities};
     use ed25519_dalek::SigningKey;
 
     fn approver(id: &str, key_byte: u8, role: MembershipApproverRole) -> MembershipApprover {
@@ -1514,6 +1677,7 @@ mod tests {
             owner: "owner@example.local".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:servers".to_owned()],
+            capabilities: vec![RoleCapability::Anchor],
             joined_at_unix: 100,
             updated_at_unix: 100,
         }
@@ -1553,6 +1717,104 @@ mod tests {
             first.state_root_hex().expect("root should build"),
             second.state_root_hex().expect("root should build")
         );
+    }
+
+    #[test]
+    fn signed_membership_payload_carries_canonical_capabilities() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![RoleCapability::Client, RoleCapability::Anchor];
+        let payload = state.canonical_payload().expect("payload should build");
+        assert!(payload.contains("node.0.capabilities=anchor,client\n"));
+
+        let update = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-add-node".to_owned(),
+            operation: MembershipOperation::AddNode(MembershipNode {
+                node_id: "node-b".to_owned(),
+                node_pubkey_hex: hex_encode(&[7; 32]),
+                owner: "owner@example.local".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec!["tag:members".to_owned()],
+                capabilities: vec![RoleCapability::Client],
+                joined_at_unix: 101,
+                updated_at_unix: 101,
+            }),
+            target: "node-b".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: state.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 101,
+            expires_at_unix: 400,
+            reason_code: "policy".to_owned(),
+            policy_context: None,
+        };
+        let update_payload = update.canonical_payload().expect("payload should build");
+        assert!(update_payload.contains("op.capabilities=client\n"));
+    }
+
+    #[test]
+    fn set_node_capabilities_update_round_trips_and_previews() {
+        let state = base_state();
+        let operation = MembershipOperation::SetNodeCapabilities {
+            node_id: "node-a".to_owned(),
+            capabilities: anchor_role_capabilities(),
+        };
+        let next = preview_next_state(&state, &operation).expect("preview should pass");
+        assert_eq!(next.epoch, state.epoch + 1);
+        assert!(
+            next.nodes[0]
+                .capabilities
+                .contains(&RoleCapability::AnchorBundlePull)
+        );
+
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-node-caps".to_owned(),
+            operation,
+            target: "node-a".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: next.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 101,
+            expires_at_unix: 400,
+            reason_code: "anchor_advertise".to_owned(),
+            policy_context: None,
+        };
+        let payload = record.canonical_payload().expect("payload should build");
+        assert!(payload.contains("operation=set_node_capabilities\n"));
+        assert!(payload.contains("op.capabilities=anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative\n"));
+        let decoded = decode_update_record(&payload).expect("decode update");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn blind_exit_rejects_anchor_capability_mix() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![
+            RoleCapability::BlindExit,
+            RoleCapability::ExitServer,
+            RoleCapability::AnchorBundlePull,
+        ];
+        let err = state.validate().expect_err("state should be rejected");
+        assert!(format!("{err}").contains("cannot combine anchor and blind_exit"));
+    }
+
+    #[test]
+    fn active_membership_nodes_require_signed_capabilities() {
+        let mut state = base_state();
+        state.nodes[0].capabilities.clear();
+        let err = state.validate().expect_err("state should be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn blind_exit_capability_requires_exit_server_capability() {
+        let mut state = base_state();
+        state.nodes[0].capabilities = vec![RoleCapability::BlindExit];
+        let err = state.validate().expect_err("state should be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use rustynet_control::roles::RoleCapability;
 
 // ── Domain value types ────────────────────────────────────────────────────────
 
@@ -33,6 +34,7 @@ pub struct MembershipSnapshot {
 pub struct NodeMembershipPeer {
     pub alias: String,
     pub role: NodeRole,
+    pub capabilities: Vec<RoleCapability>,
     pub node_id: String,
     pub public_key_hex: String,
 }
