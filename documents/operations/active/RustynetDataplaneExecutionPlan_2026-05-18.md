@@ -301,6 +301,12 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 6–8 cycles total (2 + 2 + 1 + 3).
 - **Depends on.** D2.5 (gossip), D4 (relay), D2.7 (enrollment), D5.5 (ICE pair race). Anchor builds on these but does not modify them.
 - **Cross-platform note.** Linux + macOS land in D11. Windows anchor is deferred behind D7/D9 (same dataplane-parity prerequisite as Windows-as-exit). iOS + Android land the consume-only `anchor_bundle_pull_client` in `rustynet-mobile-core` as part of mobile roadmap M3 — see [`../../mobile/RustynetMobileRoadmap_2026-04-17.md`](../../mobile/RustynetMobileRoadmap_2026-04-17.md).
+- **Status (2026-05-22).** **Complete (code).** All four sub-slices landed:
+  - D11.a: commit `e3f55b7` — 5 anchor capabilities in `membership.rs`; `rustynet anchor advertise|list|pull-bundle|init` CLI verbs wired.
+  - D11.b: daemon `TcpListener` bundle-pull endpoint + `--anchor-bundle-pull-addr` / `--anchor-bundle-pull-token-path` flags + env vars + `rustynetd-anchor.service` unit; `anchor_init.rs` wizard. Token-gated, loopback-only by default (`--anchor-bundle-pull-allow-lan` required for LAN bind).
+  - D11.c: commit `d7c2c65` — anchor-priority gossip rebroadcast in `gossip_runtime.rs`; `port_mapping_bring_up_skip_reason` None-semantics corrected (no anchor in mesh → proceed, not skip). Tests: `port_mapping_skipped_when_non_authority`, `port_mapping_proceeds_when_self_is_authority`, `port_mapping_proceeds_when_no_anchor_in_mesh`.
+  - D11.d: `anchor_init.rs` + `rustynetd-anchor.service` + `start.sh` 6-role wizard anchor preset.
+  - Live pass criterion (clean install end-to-end, second machine join, macOS flow, 3-peer rebroadcast) requires lab hardware; deferred to live-evidence cycle.
 
 ### D12 — Node role taxonomy + 6-role user-selectable surface (Track Alpha)
 
