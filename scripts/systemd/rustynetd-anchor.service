@@ -25,7 +25,10 @@ Environment=RUSTYNET_MEMBERSHIP_SNAPSHOT=/var/lib/rustynet/membership.snapshot
 Environment=RUSTYNET_MEMBERSHIP_LOG=/var/lib/rustynet/membership.log
 Environment=RUSTYNET_MEMBERSHIP_WATERMARK=/var/lib/rustynet/membership.watermark
 Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR=127.0.0.1:51822
-Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN=/var/lib/rustynet/anchor-bundle-pull.token
+Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH=/var/lib/rustynet/anchor-bundle-pull.token
+# Operator must change to true and supply a non-loopback addr to accept
+# bundle-pull connections from LAN peers. Loopback-only by default.
+Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN=false
 ExecStart=/usr/local/bin/rustynetd daemon \
     --node-id ${RUSTYNET_NODE_ID} \
     --node-role ${RUSTYNET_NODE_ROLE} \
@@ -33,9 +36,12 @@ ExecStart=/usr/local/bin/rustynetd daemon \
     --state ${RUSTYNET_STATE} \
     --membership-snapshot ${RUSTYNET_MEMBERSHIP_SNAPSHOT} \
     --membership-log ${RUSTYNET_MEMBERSHIP_LOG} \
-    --membership-watermark ${RUSTYNET_MEMBERSHIP_WATERMARK}
+    --membership-watermark ${RUSTYNET_MEMBERSHIP_WATERMARK} \
+    --anchor-bundle-pull-addr ${RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR} \
+    --anchor-bundle-pull-token-path ${RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH} \
+    --anchor-bundle-pull-allow-lan ${RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN}
 ExecStartPre=/usr/bin/test -f ${RUSTYNET_MEMBERSHIP_SNAPSHOT}
-ExecStartPre=/usr/bin/test -f ${RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN}
+ExecStartPre=/usr/bin/test -f ${RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH}
 TimeoutStopSec=15s
 Restart=on-failure
 RestartSec=2s

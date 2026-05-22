@@ -78,6 +78,9 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         traversal_url: None,
         assignment_url: None,
         dns_zone_url: None,
+        anchor_bundle_pull_addr: None,
+        anchor_bundle_pull_token_path: None,
+        anchor_bundle_pull_allow_lan: false,
     }
 }
 

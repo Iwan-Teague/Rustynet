@@ -8494,6 +8494,13 @@ fn execute_ops_disconnect_cleanup() -> Result<String, String> {
                         }
                         let family = fields[1];
                         let table_name = fields[2];
+                        // Remove only daemon-generated tables.  The boot-time
+                        // pre-protective table (`inet rustynet_boot`, installed
+                        // by `linux-killswitch-boot-check --install-boot-killswitch`
+                        // in ExecStartPre) is intentionally preserved so it
+                        // survives daemon teardown and provides an SSH recovery
+                        // path when the daemon fails to restart.  It is
+                        // reinstalled idempotently on each ExecStartPre run.
                         let managed = (family == "inet" && table_name.starts_with("rustynet_g"))
                             || (family == "ip" && table_name.starts_with("rustynet_nat_g"));
                         if !managed {

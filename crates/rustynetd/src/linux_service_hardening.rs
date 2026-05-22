@@ -684,6 +684,22 @@ mod tests {
                     line.contains("--iface"),
                     "killswitch-boot-check ExecStartPre must pass --iface for the canonical WG iface: {line}"
                 );
+                // Boot killswitch install is mandatory: omitting
+                // --install-boot-killswitch means the boot table is
+                // never created and stale-bundle reboots leave the
+                // node SSH-inaccessible.
+                assert!(
+                    line.contains("--install-boot-killswitch"),
+                    "killswitch-boot-check ExecStartPre must pass --install-boot-killswitch \
+                     to install the SSH-preserving boot table: {line}"
+                );
+                // SSH-allow flags must be forwarded from the unit
+                // environment so the boot table honours per-node
+                // SSH configuration.
+                assert!(
+                    line.contains("--fail-closed-ssh-allow"),
+                    "killswitch-boot-check ExecStartPre must pass --fail-closed-ssh-allow: {line}"
+                );
             }
         }
     }
