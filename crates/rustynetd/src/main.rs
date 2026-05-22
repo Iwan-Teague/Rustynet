@@ -2625,6 +2625,17 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
+        // Bootstrap-time single-node membership grants BOTH Anchor and
+        // Client capabilities to the local node so the daemon can start
+        // with any role mapping (Admin → Anchor, Client → Client) before
+        // the orchestrator distributes the real multi-node membership.
+        // Without Client capability here, every non-exit node fails its
+        // `validate_node_role_membership_alignment` preflight at first
+        // boot (exit 65) — the daemon never opens its socket and the
+        // orchestrator's bootstrap_hosts stage times out.  The real
+        // membership snapshot overwrites this single-node bootstrap
+        // record during DistributeMembership, so giving it broader
+        // capabilities here has no effect on production posture.
         let state = MembershipState {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
             network_id: network_id.clone(),
@@ -2635,7 +2646,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
                 owner: node_id.clone(),
                 status: MembershipNodeStatus::Active,
                 roles: vec![],
-                capabilities: vec![RoleCapability::Anchor],
+                capabilities: vec![RoleCapability::Anchor, RoleCapability::Client],
                 joined_at_unix: now,
                 updated_at_unix: now,
             }],
