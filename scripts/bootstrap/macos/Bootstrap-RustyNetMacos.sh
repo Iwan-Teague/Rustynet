@@ -516,6 +516,14 @@ install_launchd_service() {
   # without a signed assignment bundle. The orchestrator's enforce_runtime phase
   # re-invokes Install-RustyNetMacosService.sh with --auto-tunnel-enforce true
   # after all bundles are deployed (mirroring Linux e2e-enforce-host behaviour).
+  # trust_max_age_secs: macOS has no periodic trust-evidence refresh timer
+  # (the Linux unit ships a rustynetd-trust-refresh.timer; macOS does not).
+  # The bootstrap-time trust evidence may be a few minutes old by the time
+  # launchd actually invokes the daemon, and the 300 s daemon default trips
+  # "trust evidence is stale" → exit 65 → daemon never opens its socket →
+  # orchestrator's collect_pubkeys stage hangs and aborts.  Use 86400 s here
+  # to match what enforce_daemon already sets, so the very first invocation
+  # also stays within the freshness window.
   bash "${install_script}" \
     --rustynetd-bin "${RUSTYNETD_BIN}" \
     --state-root "${STATE_ROOT}" \
@@ -526,6 +534,7 @@ install_launchd_service() {
     --network-id "${NETWORK_ID}" \
     --brew-prefix "${BREW_PREFIX:-/opt/homebrew}" \
     --auto-tunnel-enforce "false" \
+    --trust-max-age-secs 86400 \
     --fail-closed-ssh-allow "${ssh_allow_flag}" \
     --fail-closed-ssh-allow-cidrs "${SSH_ALLOW_CIDRS:-}"
 }
