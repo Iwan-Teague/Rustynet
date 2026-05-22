@@ -347,12 +347,17 @@ clear_residual_state() {
 
 # ── Build from source ─────────────────────────────────────────────────────────
 build_rustynet() {
-  # Skip build when SKIP_BUILD=1 or when the binary is already installed.
-  # The orchestrator sets SKIP_BUILD=1 when the remote workdir is absent
-  # (e.g. a node that was bootstrapped manually).
-  if [[ "${SKIP_BUILD:-0}" == "1" || -x "${RUSTYNETD_BIN}" ]]; then
+  # Skip build ONLY when SKIP_BUILD=1 is explicitly set.  The previous
+  # behaviour (auto-skip when the binary already existed) silently kept
+  # stale binaries across orchestrator re-runs: the source archive on
+  # disk would be the fresh one but `/usr/local/bin/rustynetd` would
+  # still be from an earlier build, which is invisible to the operator
+  # and breaks any fix that has not yet propagated.  Always rebuilding
+  # is the correct default in an orchestrator-driven environment where
+  # this script only runs as part of a deliberate (re)deploy.
+  if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
     if [[ -x "${RUSTYNETD_BIN}" ]]; then
-      echo "[bootstrap] rustynetd already installed at ${RUSTYNETD_BIN}; skipping build"
+      echo "[bootstrap] SKIP_BUILD=1: keeping existing ${RUSTYNETD_BIN}"
     else
       echo "[bootstrap] SKIP_BUILD=1 set but ${RUSTYNETD_BIN} not found — cannot skip build" >&2
       exit 1
@@ -382,10 +387,17 @@ build_rustynet() {
 
 # ── Install binaries ──────────────────────────────────────────────────────────
 install_binaries() {
-  # Skip if build was skipped (binary already in place).
-  if [[ "${SKIP_BUILD:-0}" == "1" || ! -d "${BUILD_DIR}" ]]; then
-    echo "[bootstrap] skipping install_binaries (build was skipped)"
+  # Skip when SKIP_BUILD=1 was set (caller explicitly kept the existing
+  # binaries).  Otherwise always reinstall — the freshly built binaries
+  # at ${BUILD_DIR}/target/release must replace any stale copies in
+  # /usr/local/bin so the next launchctl restart picks up the new code.
+  if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+    echo "[bootstrap] SKIP_BUILD=1: keeping existing ${RUSTYNETD_BIN} (skipping reinstall)"
     return 0
+  fi
+  if [[ ! -d "${BUILD_DIR}" ]]; then
+    echo "[bootstrap] install_binaries: BUILD_DIR=${BUILD_DIR} is missing — build must run before install" >&2
+    exit 1
   fi
   install -m 0755 -o root -g wheel \
     "${BUILD_DIR}/target/release/rustynetd" "${RUSTYNETD_BIN}"
