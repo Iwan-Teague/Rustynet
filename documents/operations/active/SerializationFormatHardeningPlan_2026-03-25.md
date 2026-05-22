@@ -131,7 +131,7 @@ Normative precedence for this plan:
 
 This plan is intentionally linked to the larger migration and hardening work already underway:
 - [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
-- [SecurityHardeningBacklog_2026-03-09.md](./SecurityHardeningBacklog_2026-03-09.md)
+- [SecurityHardeningBacklog_2026-03-09.md](../done/SecurityHardeningBacklog_2026-03-09.md) (archived 2026-05-21 — all items complete)
 - [MeasuredEvidenceGeneration.md](../MeasuredEvidenceGeneration.md)
 - [CrossNetworkRemoteExitArtifactSchema_2026-03-16.md](../CrossNetworkRemoteExitArtifactSchema_2026-03-16.md)
 - [LiveLinuxLabOrchestrator.md](../LiveLinuxLabOrchestrator.md)

@@ -8,6 +8,7 @@ pub mod operations;
 pub mod persistence;
 pub mod role_audit;
 pub mod role_presets;
+pub mod roles;
 pub mod scale;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -34,6 +35,8 @@ use rustynet_dns_zone::{
 use rustynet_policy::{AccessRequest, Decision as PolicyEngineDecision, PolicySet, Protocol};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
+
+use crate::roles::{RoleCapability, role_capability_csv};
 
 const SIGNING_SEED_HKDF_SALT_V1: &[u8] = b"rustynet-control-signing-seed-hkdf-salt-v1";
 const ASSIGNMENT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-assignment-signing-v1";
@@ -1323,6 +1326,7 @@ pub struct NodeMetadata {
     pub hostname: String,
     pub os: String,
     pub tags: Vec<String>,
+    pub capabilities: Vec<RoleCapability>,
     pub owner: String,
     pub endpoint: String,
     pub last_seen_unix: u64,
@@ -2044,6 +2048,7 @@ pub enum AutoTunnelRouteKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoTunnelPeer {
     pub node_id: String,
+    pub capabilities: Vec<RoleCapability>,
     pub endpoint: String,
     pub public_key: [u8; 32],
     pub allowed_ips: Vec<String>,
@@ -2299,6 +2304,7 @@ impl ControlPlaneCore {
             hostname: request.hostname,
             os: request.os,
             tags: request.tags,
+            capabilities: vec![RoleCapability::Client],
             owner: request.owner.clone(),
             endpoint: request.endpoint,
             last_seen_unix: request.now_unix,
@@ -2356,6 +2362,7 @@ impl ControlPlaneCore {
             hostname: request.hostname.clone(),
             os: request.os.clone(),
             tags: request.tags.clone(),
+            capabilities: vec![RoleCapability::Client],
             owner: request.owner.clone(),
             endpoint: request.endpoint.clone(),
             last_seen_unix: request.now_unix,
@@ -2522,9 +2529,15 @@ impl ControlPlaneCore {
         let target = self.nodes.get(&request.node_id)?.ok_or_else(|| {
             ControlPlaneError::Assignment("requested node does not exist".to_owned())
         })?;
+        validate_assignment_node_capabilities(&target)?;
         if target.endpoint.parse::<SocketAddr>().is_err() {
             return Err(ControlPlaneError::Assignment(
                 "requested node endpoint is invalid".to_owned(),
+            ));
+        }
+        if !request.lan_routes.is_empty() && request.exit_node_id.is_none() {
+            return Err(ControlPlaneError::Assignment(
+                "lan routes require an explicit exit node".to_owned(),
             ));
         }
 
@@ -2550,6 +2563,7 @@ impl ControlPlaneCore {
             if !self.policy_allows_node_pair(&target, peer) {
                 continue;
             }
+            validate_assignment_node_capabilities(peer)?;
             if peer.endpoint.parse::<SocketAddr>().is_err() {
                 continue;
             }
@@ -2571,15 +2585,21 @@ impl ControlPlaneCore {
             });
         }
 
+        let mut signed_exit_node_id = None;
+        let mut signed_exit_capabilities = Vec::new();
         if let Some(exit_node_id) = request.exit_node_id.as_deref() {
             let exit_node = self.nodes.get(exit_node_id)?.ok_or_else(|| {
                 ControlPlaneError::Assignment("exit node does not exist".to_owned())
             })?;
+            validate_assignment_exit_provider(&exit_node)?;
+            validate_assignment_exit_client(&target)?;
             if !self.policy_allows_node_pair(&target, &exit_node) {
                 return Err(ControlPlaneError::Assignment(
                     "exit node denied by policy".to_owned(),
                 ));
             }
+            signed_exit_node_id = Some(exit_node.node_id.clone());
+            signed_exit_capabilities = exit_node.capabilities.clone();
             bundle_routes.push(AutoTunnelRoute {
                 destination_cidr: "0.0.0.0/0".to_owned(),
                 via_node: exit_node.node_id.clone(),
@@ -2589,6 +2609,11 @@ impl ControlPlaneCore {
                 if !is_valid_ipv4_or_ipv6_cidr(cidr) {
                     return Err(ControlPlaneError::Assignment(
                         "lan route cidr is invalid".to_owned(),
+                    ));
+                }
+                if is_default_route_cidr(cidr) {
+                    return Err(ControlPlaneError::Assignment(
+                        "lan route cidr must not be a default route".to_owned(),
                     ));
                 }
                 bundle_routes.push(AutoTunnelRoute {
@@ -2620,6 +2645,7 @@ impl ControlPlaneCore {
                 .unwrap_or_default();
             bundle_peers.push(AutoTunnelPeer {
                 node_id: peer.node_id,
+                capabilities: peer.capabilities,
                 endpoint: peer.endpoint,
                 public_key: peer.public_key,
                 allowed_ips,
@@ -2629,8 +2655,11 @@ impl ControlPlaneCore {
         let payload = serialize_auto_tunnel_payload(
             &AutoTunnelPayloadHeader {
                 node_id: &target.node_id,
+                node_capabilities: &target.capabilities,
                 mesh_cidr: &request.mesh_cidr,
                 assigned_cidr: &target_cidr,
+                exit_node_id: signed_exit_node_id.as_deref(),
+                exit_node_capabilities: &signed_exit_capabilities,
                 generated_at_unix: request.generated_at_unix,
                 expires_at_unix,
                 nonce: request.nonce,
@@ -3583,10 +3612,56 @@ fn is_valid_node_id_text(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
+fn validate_assignment_node_capabilities(node: &NodeMetadata) -> Result<(), ControlPlaneError> {
+    if node.capabilities.is_empty() {
+        return Err(ControlPlaneError::Assignment(format!(
+            "node {} has no role capabilities",
+            node.node_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_assignment_exit_client(node: &NodeMetadata) -> Result<(), ControlPlaneError> {
+    if node.capabilities.contains(&RoleCapability::BlindExit) {
+        return Err(ControlPlaneError::Assignment(format!(
+            "node {} with blind_exit capability cannot consume exit traffic",
+            node.node_id
+        )));
+    }
+    if !node.capabilities.contains(&RoleCapability::Client)
+        && !node.capabilities.contains(&RoleCapability::Anchor)
+    {
+        return Err(ControlPlaneError::Assignment(format!(
+            "node {} must carry client or anchor capability to consume exit traffic",
+            node.node_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_assignment_exit_provider(node: &NodeMetadata) -> Result<(), ControlPlaneError> {
+    validate_assignment_node_capabilities(node)?;
+    if !node.capabilities.contains(&RoleCapability::ExitServer) {
+        return Err(ControlPlaneError::Assignment(format!(
+            "exit node {} lacks exit_server capability",
+            node.node_id
+        )));
+    }
+    Ok(())
+}
+
+fn is_default_route_cidr(cidr: &str) -> bool {
+    matches!(cidr.trim(), "0.0.0.0/0" | "::/0")
+}
+
 struct AutoTunnelPayloadHeader<'a> {
     node_id: &'a str,
+    node_capabilities: &'a [RoleCapability],
     mesh_cidr: &'a str,
     assigned_cidr: &'a str,
+    exit_node_id: Option<&'a str>,
+    exit_node_capabilities: &'a [RoleCapability],
     generated_at_unix: u64,
     expires_at_unix: u64,
     nonce: u64,
@@ -3600,14 +3675,31 @@ fn serialize_auto_tunnel_payload(
     let mut payload = String::new();
     payload.push_str("version=1\n");
     payload.push_str(&format!("node_id={}\n", header.node_id));
+    payload.push_str(&format!(
+        "node_capabilities={}\n",
+        role_capability_csv(header.node_capabilities)
+    ));
     payload.push_str(&format!("mesh_cidr={}\n", header.mesh_cidr));
     payload.push_str(&format!("assigned_cidr={}\n", header.assigned_cidr));
+    payload.push_str(&format!(
+        "exit_node_id={}\n",
+        header.exit_node_id.unwrap_or("")
+    ));
+    payload.push_str(&format!(
+        "exit_node_capabilities={}\n",
+        role_capability_csv(header.exit_node_capabilities)
+    ));
+    payload.push_str("traffic_route_policy=mesh_or_relay_or_exit_node\n");
     payload.push_str(&format!("generated_at_unix={}\n", header.generated_at_unix));
     payload.push_str(&format!("expires_at_unix={}\n", header.expires_at_unix));
     payload.push_str(&format!("nonce={}\n", header.nonce));
     payload.push_str(&format!("peer_count={}\n", peers.len()));
     for (index, peer) in peers.iter().enumerate() {
         payload.push_str(&format!("peer.{index}.node_id={}\n", peer.node_id));
+        payload.push_str(&format!(
+            "peer.{index}.capabilities={}\n",
+            role_capability_csv(&peer.capabilities)
+        ));
         payload.push_str(&format!("peer.{index}.endpoint={}\n", peer.endpoint));
         payload.push_str(&format!(
             "peer.{index}.public_key_hex={}\n",
@@ -4169,13 +4261,13 @@ mod tests {
         EnrollmentRequest, LockoutConfig, MAX_RELAY_SESSION_TOKEN_TTL_SECS, PolicyCheckRequest,
         PolicyDecision, PolicyGuard, RELAY_TOKEN_SCOPE, RelayFleetBundleRequest,
         RelayFleetNodeDescriptor, RelaySessionToken, RelaySessionTokenRequest, ReplayPolicy,
-        ReusableCredentialPolicy, ReusableCredentialRequest, SignedAutoTunnelBundle,
-        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
-        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
-        TrustState, auto_tunnel_payload_field_matches, canonical_relay_id_from_label,
-        derive_endpoint_hint_signing_key, derive_signing_seed, hex_bytes, load_trust_state,
-        parse_relay_session_token_wire, parse_signed_relay_fleet_bundle_wire, persist_trust_state,
-        relay_session_token_to_wire,
+        ReusableCredentialPolicy, ReusableCredentialRequest, RoleCapability,
+        SignedAutoTunnelBundle, SignedDnsZoneBundleRequest, SignedTokenClaims,
+        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
+        TraversalCoordinationRecord, TrustState, auto_tunnel_payload_field_matches,
+        canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_signing_seed,
+        hex_bytes, load_trust_state, parse_relay_session_token_wire,
+        parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
     use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
@@ -4576,6 +4668,15 @@ mod tests {
             now_unix: 121,
         })
         .expect("enrollment should succeed");
+        let mut exit_node = core
+            .nodes
+            .get("node-b")
+            .expect("node registry access should succeed")
+            .expect("exit node should exist");
+        exit_node.capabilities = vec![RoleCapability::Anchor, RoleCapability::ExitServer];
+        core.nodes
+            .upsert(exit_node)
+            .expect("exit role capability update should succeed");
 
         let bundle = core
             .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
@@ -4595,6 +4696,22 @@ mod tests {
             Some("node-a")
         );
         assert_eq!(
+            payload_field(&bundle.payload, "node_capabilities").as_deref(),
+            Some("client")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "exit_node_id").as_deref(),
+            Some("node-b")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "exit_node_capabilities").as_deref(),
+            Some("anchor,exit_server")
+        );
+        assert_eq!(
+            payload_field(&bundle.payload, "traffic_route_policy").as_deref(),
+            Some("mesh_or_relay_or_exit_node")
+        );
+        assert_eq!(
             payload_field(&bundle.payload, "route_count").as_deref(),
             Some("3")
         );
@@ -4604,6 +4721,10 @@ mod tests {
         );
         let peer_allowed_ips = payload_field(&bundle.payload, "peer.0.allowed_ips")
             .expect("peer allowed ips should be present");
+        assert_eq!(
+            payload_field(&bundle.payload, "peer.0.capabilities").as_deref(),
+            Some("anchor,exit_server")
+        );
         assert!(peer_allowed_ips.contains("0.0.0.0/0"));
         assert!(peer_allowed_ips.contains("192.168.1.0/24"));
 
@@ -4613,6 +4734,30 @@ mod tests {
         let mut tampered = bundle.clone();
         tampered.payload.push_str("peer.99.node_id=tampered\n");
         assert!(!core.verify_signed_auto_tunnel_bundle(&tampered));
+    }
+
+    #[test]
+    fn auto_tunnel_bundle_rejects_lan_routes_without_exit_node() {
+        let core = auto_tunnel_test_core();
+        let err = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                lan_routes: vec!["192.168.1.0/24".to_owned()],
+                ..auto_tunnel_request()
+            })
+            .expect_err("lan routes must require explicit exit node");
+        assert!(format!("{err}").contains("lan routes require an explicit exit node"));
+    }
+
+    #[test]
+    fn auto_tunnel_bundle_rejects_exit_node_without_exit_server_capability() {
+        let core = auto_tunnel_test_core();
+        let err = core
+            .signed_auto_tunnel_bundle(AutoTunnelBundleRequest {
+                exit_node_id: Some("node-b".to_owned()),
+                ..auto_tunnel_request()
+            })
+            .expect_err("exit provider must carry exit_server capability");
+        assert!(format!("{err}").contains("lacks exit_server capability"));
     }
 
     #[test]

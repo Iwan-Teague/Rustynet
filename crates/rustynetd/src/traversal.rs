@@ -1788,6 +1788,7 @@ mod tests {
         parse_stun_xor_mapped_address, schedule_proactive_refresh,
     };
     use rustynet_backend_api::{NodeId, SocketEndpoint};
+    use rustynet_control::roles::RoleCapability;
     use rustynet_control::{ControlPlaneCore, NodeMetadata, TraversalCoordinationRecord};
     use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
     use std::collections::BTreeMap;
@@ -2252,6 +2253,7 @@ mod tests {
             hostname: "a".to_owned(),
             os: "linux".to_owned(),
             tags: vec![],
+            capabilities: vec![RoleCapability::Client],
             owner: "owner-a".to_owned(),
             endpoint: "127.0.0.1:51820".to_owned(),
             last_seen_unix: 1,
@@ -2262,6 +2264,7 @@ mod tests {
             hostname: "b".to_owned(),
             os: "linux".to_owned(),
             tags: vec![],
+            capabilities: vec![RoleCapability::Client],
             owner: "owner-b".to_owned(),
             endpoint: "127.0.0.1:51821".to_owned(),
             last_seen_unix: 1,
@@ -2503,6 +2506,7 @@ mod tests {
                 hostname: "host-a".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec![],
+                capabilities: vec![RoleCapability::Client],
                 owner: "user".to_owned(),
                 endpoint: "1.2.3.4:1234".to_owned(),
                 last_seen_unix: 0,
@@ -2515,6 +2519,7 @@ mod tests {
                 hostname: "host-b".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec![],
+                capabilities: vec![RoleCapability::Client],
                 owner: "user".to_owned(),
                 endpoint: "5.6.7.8:5678".to_owned(),
                 last_seen_unix: 0,
@@ -2581,6 +2586,7 @@ mod tests {
                 hostname: "host-a".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec![],
+                capabilities: vec![RoleCapability::Client],
                 owner: "user".to_owned(),
                 endpoint: "1.2.3.4:1234".to_owned(),
                 last_seen_unix: 0,
@@ -2593,6 +2599,7 @@ mod tests {
                 hostname: "host-b".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec![],
+                capabilities: vec![RoleCapability::Client],
                 owner: "user".to_owned(),
                 endpoint: "5.6.7.8:5678".to_owned(),
                 last_seen_unix: 0,
@@ -2664,6 +2671,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec![],
+                    capabilities: vec![RoleCapability::Client],
                     owner: "user".to_owned(),
                     endpoint: endpoint.to_owned(),
                     last_seen_unix: 0,
@@ -2721,6 +2729,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec![],
+                    capabilities: vec![RoleCapability::Client],
                     owner: "user".to_owned(),
                     endpoint: endpoint.to_owned(),
                     last_seen_unix: 0,
@@ -2778,6 +2787,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec![],
+                    capabilities: vec![RoleCapability::Client],
                     owner: "user".to_owned(),
                     endpoint: endpoint.to_owned(),
                     last_seen_unix: 0,

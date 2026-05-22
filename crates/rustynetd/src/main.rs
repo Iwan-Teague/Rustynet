@@ -2113,6 +2113,7 @@ fn run_membership_command(args: &[String]) -> Result<(), String> {
 ///     --signing-key      <path>
 ///     --signing-key-passphrase-file <path>
 ///     [--snapshot        <path>]
+///     [--capabilities    <csv>]
 ///     [--log             <path>]
 fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     use ed25519_dalek::SigningKey;
@@ -2122,6 +2123,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
         apply_signed_update, load_membership_log, load_membership_snapshot,
         persist_membership_snapshot, preview_next_state, sign_update_record,
     };
+    use rustynet_control::roles::{RoleCapability, parse_role_capability_csv};
     use std::time::{SystemTime, UNIX_EPOCH};
     use zeroize::Zeroize;
 
@@ -2131,6 +2133,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     let mut approver_id = String::new();
     let mut signing_key_path = String::new();
     let mut signing_key_passphrase_path = String::new();
+    let mut capabilities = vec![RoleCapability::Client];
     let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_owned();
     let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_owned();
 
@@ -2177,6 +2180,13 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
                     .get(index + 1)
                     .ok_or("--signing-key-passphrase-file requires a value")?
                     .clone();
+                index += 2;
+            }
+            Some("--capabilities") => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or("--capabilities requires a value")?;
+                capabilities = parse_role_capability_csv(raw).map_err(|err| err.to_string())?;
                 index += 2;
             }
             Some("--snapshot") => {
@@ -2270,6 +2280,7 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
         owner,
         status: MembershipNodeStatus::Active,
         roles: vec!["tag:members".to_owned()],
+        capabilities,
         joined_at_unix: now,
         updated_at_unix: now,
     });
@@ -2343,6 +2354,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
         MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
         persist_membership_snapshot,
     };
+    use rustynet_control::roles::RoleCapability;
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
@@ -2496,6 +2508,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
                 owner: node_id.clone(),
                 status: MembershipNodeStatus::Active,
                 roles: vec![],
+                capabilities: vec![RoleCapability::Anchor],
                 joined_at_unix: now,
                 updated_at_unix: now,
             }],
@@ -2651,7 +2664,7 @@ fn help_text() -> String {
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
-        "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--snapshot <path>] [--log <path>]",
+        "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd windows-registry-acls-check [--no-fail-on-drift]",
@@ -2718,8 +2731,8 @@ fn help_text() -> String {
         &format!("  wg_interface={DEFAULT_WG_INTERFACE}"),
         &format!("  wg_listen_port={DEFAULT_WG_LISTEN_PORT}"),
         &format!("  wg_private_key={DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH}"),
-        &format!("  wg_encrypted_private_key={DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH}"),
-        &format!("  wg_key_passphrase={DEFAULT_WG_KEY_PASSPHRASE_PATH}"),
+        "  wg_encrypted_private_key=<none> (opt-in; pass --wg-encrypted-private-key to enable)",
+        "  wg_key_passphrase=<none> (opt-in; pass --wg-key-passphrase to enable)",
         &format!("  wg_public_key={DEFAULT_WG_PUBLIC_KEY_PATH}"),
         &format!("  egress_interface={DEFAULT_EGRESS_INTERFACE}"),
         "  remote_ops_token_verifier_key=<disabled>",

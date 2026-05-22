@@ -14,8 +14,8 @@ use crate::linux_command::{
     validate_private_key_path,
 };
 
-mod engine;
-mod handshake;
+pub(crate) mod engine;
+pub(crate) mod handshake;
 mod runtime;
 mod socket;
 mod tun;
@@ -23,10 +23,9 @@ mod tun;
 use engine::UserspaceEngine;
 use runtime::{RunningUserspaceRuntime, RuntimeControl};
 use socket::AuthoritativeSocket;
-use tun::{
-    DirectTunLifecycle, HelperBackedTunLifecycle, SharedTunLifecycle, TestTunLifecycle,
-    TunLifecycle,
-};
+#[cfg(any(test, feature = "test-harness"))]
+use tun::TestTunLifecycle;
+use tun::{DirectTunLifecycle, HelperBackedTunLifecycle, SharedTunLifecycle, TunLifecycle};
 
 pub(crate) const LINUX_USERSPACE_SHARED_BACKEND_MODE: &str = "linux-wireguard-userspace-shared";
 
@@ -40,6 +39,8 @@ pub struct LinuxUserspaceSharedBackend {
     desired_peers: BTreeMap<NodeId, PeerConfig>,
     desired_routes: Vec<Route>,
     desired_exit_mode: ExitMode,
+    #[cfg(any(test, feature = "test-harness"))]
+    test_tun_state: Option<tun::TunTestState>,
 }
 
 impl LinuxUserspaceSharedBackend {
@@ -75,18 +76,23 @@ impl LinuxUserspaceSharedBackend {
         )
     }
 
+    #[cfg(any(test, feature = "test-harness"))]
     #[doc(hidden)]
     pub fn new_for_test(
         interface_name: impl Into<String>,
         private_key_path: impl Into<String>,
         listen_port: u16,
     ) -> Result<Self, BackendError> {
-        Self::new_with_tun_lifecycle(
+        let lifecycle = TestTunLifecycle::new();
+        let state = lifecycle.state();
+        let mut backend = Self::new_with_tun_lifecycle(
             interface_name,
             private_key_path,
             listen_port,
-            Box::new(TestTunLifecycle::new()),
-        )
+            Box::new(lifecycle),
+        )?;
+        backend.test_tun_state = Some(state);
+        Ok(backend)
     }
 
     fn new_with_tun_lifecycle(
@@ -110,6 +116,8 @@ impl LinuxUserspaceSharedBackend {
             desired_peers: BTreeMap::new(),
             desired_routes: Vec::new(),
             desired_exit_mode: ExitMode::Off,
+            #[cfg(any(test, feature = "test-harness"))]
+            test_tun_state: None,
         })
     }
 
@@ -257,6 +265,21 @@ impl LinuxUserspaceSharedBackend {
             validate_cidr(cidr)?;
         }
 
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-harness"))]
+    #[doc(hidden)]
+    pub fn set_next_tun_recv_error_for_test(
+        &self,
+        message: impl Into<String>,
+    ) -> Result<(), BackendError> {
+        let Some(state) = self.test_tun_state.as_ref() else {
+            return Err(BackendError::invalid_input(
+                "linux userspace-shared test TUN state is unavailable",
+            ));
+        };
+        state.set_next_recv_error(message);
         Ok(())
     }
 
@@ -472,6 +495,7 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
     fn authoritative_transport_identity(&self) -> Option<AuthoritativeTransportIdentity> {
         self.runtime
             .as_ref()
+            .filter(|runtime| runtime.control().is_worker_alive())
             .map(|runtime| runtime.control().authoritative_identity())
     }
 
@@ -481,8 +505,10 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
         payload: &[u8],
         timeout: Duration,
     ) -> Result<AuthoritativeTransportResponse, BackendError> {
-        self.ensure_runtime_control()?
-            .authoritative_transport_round_trip(remote_addr, payload.to_vec(), timeout)
+        let payload = payload.to_vec();
+        self.with_runtime_recovery(|control| {
+            control.authoritative_transport_round_trip(remote_addr, payload.clone(), timeout)
+        })
     }
 
     fn authoritative_transport_send(
@@ -490,8 +516,10 @@ impl TunnelBackend for LinuxUserspaceSharedBackend {
         remote_addr: SocketAddr,
         payload: &[u8],
     ) -> Result<AuthoritativeTransportIdentity, BackendError> {
-        self.ensure_runtime_control()?
-            .authoritative_transport_send(remote_addr, payload.to_vec())
+        let payload = payload.to_vec();
+        self.with_runtime_recovery(|control| {
+            control.authoritative_transport_send(remote_addr, payload.clone())
+        })
     }
 
     fn shutdown(&mut self) -> Result<(), BackendError> {
@@ -779,6 +807,7 @@ mod tests {
                 last_exit_mode_target: None,
                 current_exit_mode: ExitMode::Off,
                 exit_mode_mutations: Vec::new(),
+                queued_inbound_packets: 0,
             }
         );
 
@@ -850,6 +879,7 @@ mod tests {
                 last_exit_mode_target: None,
                 current_exit_mode: ExitMode::Off,
                 exit_mode_mutations: Vec::new(),
+                queued_inbound_packets: 0,
             }
         );
 
@@ -890,6 +920,7 @@ mod tests {
                 last_exit_mode_target: None,
                 current_exit_mode: ExitMode::Off,
                 exit_mode_mutations: Vec::new(),
+                queued_inbound_packets: 0,
             }
         );
         assert!(
@@ -936,6 +967,7 @@ mod tests {
                     TunExitModeMutation::DeleteTable,
                     TunExitModeMutation::DeletePriority,
                 ],
+                queued_inbound_packets: 0,
             }
         );
         let rebound = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], listen_port)))
@@ -1038,6 +1070,148 @@ mod tests {
             snapshot.programmed_route_cidrs,
             vec![mesh_route.destination_cidr]
         );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_recovers_dead_worker_before_authoritative_round_trip() {
+        let private_key_path = write_private_key([15; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        let peer = peer_config(
+            "peer-one",
+            backend_loopback_addr(41003),
+            peer_public_key([3; 32]),
+            vec!["100.64.13.0/24"],
+        );
+        let mesh_route = route("100.64.150.0/24", RouteKind::Mesh);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        backend
+            .configure_peer(peer.clone())
+            .expect("peer configure should succeed");
+        backend
+            .apply_routes(vec![mesh_route.clone()])
+            .expect("route apply should succeed");
+        backend
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("exit mode should set");
+        let initial_generation = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed")
+            .expect("generation should exist");
+
+        tun_state.set_next_recv_error("phase10 simulated TUN receive failure before round trip");
+        wait_for(Duration::from_secs(1), || {
+            (backend.worker_exit_count_for_test().unwrap_or_default() > 0).then_some(())
+        });
+        assert!(
+            backend.authoritative_transport_identity().is_none(),
+            "dead worker identity must not be advertised"
+        );
+
+        let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind");
+        remote
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("remote read timeout");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let responder = thread::spawn(move || {
+            let mut buffer = [0u8; 128];
+            let (len, worker_addr) = remote.recv_from(&mut buffer).expect("round trip request");
+            assert_eq!(&buffer[..len], b"stun-after-recovery");
+            remote
+                .send_to(b"stun-after-recovery-ok", worker_addr)
+                .expect("round trip response");
+        });
+
+        let response = backend
+            .authoritative_transport_round_trip(
+                remote_addr,
+                b"stun-after-recovery",
+                Duration::from_secs(1),
+            )
+            .expect("authoritative round trip should recover worker");
+
+        responder.join().expect("responder should finish");
+        assert_eq!(response.payload, b"stun-after-recovery-ok");
+        let recovered_generation = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed after recovery")
+            .expect("generation should exist after recovery");
+        let snapshot = tun_state.snapshot();
+        assert_ne!(initial_generation, recovered_generation);
+        assert_eq!(snapshot.prepare_calls, 2);
+        assert_eq!(snapshot.cleanup_calls, 1);
+        assert_eq!(snapshot.live_handles, 1);
+        assert_eq!(
+            snapshot.programmed_route_cidrs,
+            vec![mesh_route.destination_cidr]
+        );
+        assert_eq!(snapshot.current_exit_mode, ExitMode::FullTunnel);
+        assert_eq!(
+            backend
+                .current_peer_endpoint(&peer.node_id)
+                .expect("peer endpoint should survive replay"),
+            Some(peer.endpoint)
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_recovers_dead_worker_before_authoritative_send() {
+        let private_key_path = write_private_key([16; 32]);
+        let listen_port = free_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+        let initial_generation = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed")
+            .expect("generation should exist");
+
+        tun_state.set_next_recv_error("phase10 simulated TUN receive failure before send");
+        wait_for(Duration::from_secs(1), || {
+            (backend.worker_exit_count_for_test().unwrap_or_default() > 0).then_some(())
+        });
+        assert!(
+            backend.authoritative_transport_identity().is_none(),
+            "dead worker identity must not be advertised"
+        );
+
+        let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind");
+        remote
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("remote read timeout");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let identity = backend
+            .authoritative_transport_send(remote_addr, b"relay-after-recovery")
+            .expect("authoritative send should recover worker");
+
+        let mut buffer = [0u8; 128];
+        let (len, worker_addr) = remote.recv_from(&mut buffer).expect("send datagram");
+        assert_eq!(&buffer[..len], b"relay-after-recovery");
+        assert_eq!(worker_addr.port(), identity.local_addr.port());
+        let recovered_generation = backend
+            .transport_generation_for_test()
+            .expect("generation query should succeed after recovery")
+            .expect("generation should exist after recovery");
+        assert_ne!(initial_generation, recovered_generation);
+        assert_eq!(tun_state.snapshot().prepare_calls, 2);
+        assert_eq!(tun_state.snapshot().cleanup_calls, 1);
 
         backend.shutdown().expect("shutdown should succeed");
         let _ = fs::remove_file(private_key_path);

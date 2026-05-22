@@ -154,6 +154,34 @@
       "ssh_user": "debian"
     },
     {
+      "alias": "macos-utm-1",
+      "controller": {
+        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/macOS.utm",
+        "type": "local_utm",
+        "utm_name": "macOS"
+      },
+      "exit_capable": false,
+      "include_in_all": false,
+      "lab_role": "macos_client",
+      "last_known_ip": "192.168.65.2",
+      "last_known_network": "utm-apple-192.168.65.0/24",
+      "live_ips": [
+        "192.168.65.2",
+        "fd70:3706:74c9:4e2c:10cd:ba60:a1c:9c88"
+      ],
+      "mesh_ip": "100.64.0.7",
+      "network_group": "utm-apple-192.168.65.0/24",
+      "node_id": "macos-client-1",
+      "os": "macOS 26.5 (arm64)",
+      "parent_device": "iwan's MacBook Pro",
+      "platform": "macos",
+      "relay_capable": false,
+      "rustynet_src_dir": "/Users/mac/Rustynet",
+      "ssh_password": "tempo",
+      "ssh_target": "192.168.65.2",
+      "ssh_user": "mac"
+    },
+    {
       "alias": "windows-utm-1",
       "controller": {
         "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/Windows.utm",

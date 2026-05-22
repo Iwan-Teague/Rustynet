@@ -229,7 +229,10 @@ impl PrivilegedCommandClient {
 
 #[cfg(not(windows))]
 fn rustynetd_service_gid_for_socket(path: &Path) -> Option<u32> {
-    if !path.starts_with("/run/rustynet") {
+    let shared_runtime = path.starts_with("/run/rustynet")
+        || path.starts_with("/var/run/rustynet")
+        || path.starts_with("/private/var/run/rustynet");
+    if !shared_runtime {
         return None;
     }
     Group::from_name("rustynetd")

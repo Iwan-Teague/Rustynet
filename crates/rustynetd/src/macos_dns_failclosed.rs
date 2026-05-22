@@ -57,12 +57,43 @@ pub fn evaluate_macos_dns_failclosed(nameservers: &[String]) -> Vec<String> {
     reasons
 }
 
+/// Snapshot-level evaluator. This is the enforcement point used by
+/// report generation so missing/unverifiable resolver state fails
+/// closed instead of vacuously passing an empty nameserver list.
+pub fn evaluate_macos_dns_failclosed_snapshot(
+    snapshot: &MacosDnsFailclosedSnapshot,
+) -> Vec<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    if !snapshot.resolv_conf_present {
+        reasons.push(format!(
+            "{} is not present; DNS fail-closed posture cannot be verified",
+            snapshot.resolv_conf_path
+        ));
+        return reasons;
+    }
+    if snapshot.nameservers.is_empty() {
+        reasons.push(format!(
+            "{} contains no nameserver entries; cannot confirm DNS fail-closed posture",
+            snapshot.resolv_conf_path
+        ));
+        return reasons;
+    }
+    if !snapshot.loopback_resolver_advertised {
+        reasons.push(
+            "macOS loopback resolver is not advertised; DNS fail-closed posture cannot be verified"
+                .to_owned(),
+        );
+    }
+    reasons.extend(evaluate_macos_dns_failclosed(&snapshot.nameservers));
+    reasons
+}
+
 pub fn parse_resolv_conf(body: &str) -> (Vec<String>, Vec<String>) {
     let mut nameservers: Vec<String> = Vec::new();
     let mut search_domains: Vec<String> = Vec::new();
     for line in body.lines() {
         let line = line.trim();
-        if line.starts_with('#') || line.is_empty() {
+        if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
             continue;
         }
         if let Some(rest) = line.strip_prefix("nameserver") {
@@ -109,16 +140,7 @@ pub fn collect_macos_dns_failclosed_snapshot() -> MacosDnsFailclosedSnapshot {
 pub fn build_macos_dns_failclosed_report(
     snapshot: MacosDnsFailclosedSnapshot,
 ) -> MacosDnsFailclosedReport {
-    let mut drift_reasons: Vec<String> = Vec::new();
-    if !snapshot.resolv_conf_present {
-        drift_reasons.push(format!(
-            "{} is not present; DNS fail-closed posture cannot be verified",
-            snapshot.resolv_conf_path
-        ));
-    } else {
-        let ns_drift = evaluate_macos_dns_failclosed(&snapshot.nameservers);
-        drift_reasons.extend(ns_drift);
-    }
+    let drift_reasons = evaluate_macos_dns_failclosed_snapshot(&snapshot);
     let overall_ok = drift_reasons.is_empty();
     MacosDnsFailclosedReport {
         schema_version: 1,
@@ -168,7 +190,7 @@ mod tests {
 
     #[test]
     fn parser_ignores_comments_and_blank_lines() {
-        let body = "\n# ignored\nnameserver 127.0.0.1\n";
+        let body = "\n# ignored\n; classic comment\nnameserver 127.0.0.1\n";
         let (ns, _) = parse_resolv_conf(body);
         assert_eq!(ns, vec!["127.0.0.1"]);
     }
@@ -219,6 +241,48 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("cannot be verified")),
             "missing resolv.conf must surface: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn build_report_empty_nameserver_list_fails_closed() {
+        let snapshot = MacosDnsFailclosedSnapshot {
+            resolv_conf_path: "/etc/resolv.conf".to_owned(),
+            resolv_conf_present: true,
+            nameservers: vec![],
+            search_domains: vec![],
+            loopback_resolver_advertised: true,
+        };
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("no nameserver entries")),
+            "empty nameserver list must fail closed: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn build_report_rejects_missing_loopback_resolver_advertisement() {
+        let snapshot = MacosDnsFailclosedSnapshot {
+            resolv_conf_path: "/etc/resolv.conf".to_owned(),
+            resolv_conf_present: true,
+            nameservers: vec!["127.0.0.1".to_owned()],
+            search_domains: vec![],
+            loopback_resolver_advertised: false,
+        };
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("loopback resolver is not advertised")),
+            "missing loopback resolver marker must fail closed: {:?}",
             report.drift_reasons
         );
     }
@@ -325,6 +389,18 @@ mod tests {
         let body = "nameserver\nnameserver 127.0.0.1\n";
         let (ns, _) = parse_resolv_conf(body);
         assert_eq!(ns, vec!["127.0.0.1"]);
+    }
+
+    #[test]
+    fn parser_keeps_inline_comment_attached_to_nameserver() {
+        let body = "nameserver 127.0.0.1 # reviewed loopback\n";
+        let (ns, _) = parse_resolv_conf(body);
+        assert_eq!(ns, vec!["127.0.0.1 # reviewed loopback"]);
+        let reasons = evaluate_macos_dns_failclosed(&ns);
+        assert!(
+            reasons.iter().any(|r| r.contains("not a valid IP")),
+            "inline comment must not silently strip into accepted loopback: {reasons:?}"
+        );
     }
 
     #[test]

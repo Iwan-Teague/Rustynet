@@ -333,8 +333,8 @@ Phase checklists that finished and were archived to `documents/operations/done/`
 
 Active plans that are mostly closed but still useful to keep in `active/`:
 
-- `documents/operations/active/SecurityHardeningBacklog_2026-03-09.md`
-  - The current tracked backlog is marked complete.
+- `documents/operations/done/SecurityHardeningBacklog_2026-03-09.md`
+  - Archived 2026-05-21. All tracked backlog items are complete.
 - `documents/operations/active/LinuxUserspaceSharedLiveLabReadinessDelta_2026-04-02.md`
   - The earlier reduced-live-lab route-truth blockers are no longer the active issue.
 

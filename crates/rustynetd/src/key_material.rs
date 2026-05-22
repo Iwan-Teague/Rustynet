@@ -40,7 +40,7 @@ const DEFAULT_PASSPHRASE_CREDENTIAL_NAME: &str = "wg_key_passphrase";
 #[cfg(target_os = "macos")]
 const PASSPHRASE_KEYCHAIN_ACCOUNT_ENV: &str = "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT";
 #[cfg(target_os = "macos")]
-const MACOS_PASSPHRASE_KEYCHAIN_SERVICE: &str = "rustynet.wg_passphrase";
+const MACOS_PASSPHRASE_KEYCHAIN_SERVICE: &str = "net.rustynet.wg-key-passphrase";
 const MAX_PASSPHRASE_BYTES: usize = 4096;
 const WG_BINARY_PATH_ENV: &str = "RUSTYNET_WG_BINARY_PATH";
 #[cfg(not(target_os = "macos"))]
@@ -428,6 +428,11 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
             "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} must not be empty",
         ));
     }
+    if account != raw {
+        return Err(format!(
+            "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} must not contain leading or trailing whitespace",
+        ));
+    }
     if account.len() > 128 {
         return Err(format!(
             "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} exceeds max length (128)",
@@ -435,10 +440,10 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
     }
     if !account
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
     {
         return Err(format!(
-            "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} contains invalid characters; allowed: [A-Za-z0-9._-]",
+            "{PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} contains invalid characters; allowed: [A-Za-z0-9._:-]",
         ));
     }
     Ok(account.to_owned())
@@ -1189,6 +1194,8 @@ fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, Stri
 mod tests {
     #[cfg(not(target_os = "macos"))]
     use super::DEFAULT_PASSPHRASE_CREDENTIAL_NAME;
+    #[cfg(target_os = "macos")]
+    use super::{MACOS_PASSPHRASE_KEYCHAIN_SERVICE, normalize_macos_keychain_account};
     use super::{remove_file_if_present, resolve_passphrase_source_from_env, validate_binary_path};
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
@@ -1269,6 +1276,43 @@ mod tests {
             .expect_err("macOS must reject passphrase file custody");
         assert!(err.contains("disabled"));
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_keychain_service_matches_reviewed_launchd_contract() {
+        assert_eq!(
+            MACOS_PASSPHRASE_KEYCHAIN_SERVICE,
+            "net.rustynet.wg-key-passphrase"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_keychain_account_accepts_bootstrap_node_id_shape() {
+        let account = normalize_macos_keychain_account("wg-passphrase-node:exit_1.alpha")
+            .expect("bootstrap account shape should be accepted");
+        assert_eq!(account, "wg-passphrase-node:exit_1.alpha");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_keychain_account_rejects_shell_and_plist_metacharacters() {
+        for raw in [
+            "",
+            " wg-passphrase-node ",
+            "wg passphrase",
+            "wg/passphrase",
+            "wg<script>",
+            "wg&passphrase",
+            "wg\"passphrase",
+            "wg\npassphrase",
+        ] {
+            assert!(
+                normalize_macos_keychain_account(raw).is_err(),
+                "unsafe account must reject: {raw:?}"
+            );
+        }
     }
 
     #[test]

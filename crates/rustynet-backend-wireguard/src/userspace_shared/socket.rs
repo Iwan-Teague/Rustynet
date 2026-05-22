@@ -67,11 +67,17 @@ impl AuthoritativeSocket {
         remote_addr: SocketAddr,
         payload: &[u8],
     ) -> Result<(), BackendError> {
-        self.socket.send_to(payload, remote_addr).map_err(|err| {
+        let written = self.socket.send_to(payload, remote_addr).map_err(|err| {
             BackendError::internal(format!(
                 "linux userspace-shared authoritative UDP socket send_to failed for {remote_addr}: {err}"
             ))
         })?;
+        if written != payload.len() {
+            return Err(BackendError::internal(format!(
+                "linux userspace-shared authoritative UDP socket send_to truncated datagram for {remote_addr}: wrote {written} of {} bytes",
+                payload.len()
+            )));
+        }
         Ok(())
     }
 

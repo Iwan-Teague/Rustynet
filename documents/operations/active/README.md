@@ -13,6 +13,7 @@ Start with these when you need current status, remaining work, or the public imp
 - [PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
 - [OpenWorkIndex_2026-04-17.md](./OpenWorkIndex_2026-04-17.md)
 - [PlatformImprovementBacklog_2026-05-14.md](./PlatformImprovementBacklog_2026-05-14.md) — most recently updated cross-platform improvement ledger; the X1-X7 numbered tracks are the cleanest current path for code-only quality work
+- [HomelabConnectivityParityDeltaPlan_2026-05-21.md](./HomelabConnectivityParityDeltaPlan_2026-05-21.md) — active delta ledger for closing the macOS/Windows tunnel connectivity gap vs Linux baseline; covers macOS IPv6 (M3), macOS wireguard-go prereq (M2), macOS key-retention bug (M1), macOS killswitch (M4), Windows host candidate enumeration (W1), Windows gateway detection (W2), Windows E2E test coverage (W3), Windows IPv6 audit (W4), and cross-platform uPnP IGD orchestrator (C1)
 
 ## Active Phase Checklists
 
@@ -49,7 +50,6 @@ phase checklists that finished (Phase 1, 2, 3, 5) have moved to
 - [RustyfinExtensionTrustPlan_2026-05-10.md](./RustyfinExtensionTrustPlan_2026-05-10.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)
 - [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md)
-- [SecurityHardeningBacklog_2026-03-09.md](./SecurityHardeningBacklog_2026-03-09.md)
 - [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
 - [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
 - [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](./UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)

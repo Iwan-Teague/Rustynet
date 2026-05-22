@@ -1,5 +1,10 @@
 # macOS `launchd` Service Management
 
+> **Note:** This document has stale paths and labels from an earlier design.
+> For the current manual install procedure and correct plist configuration,
+> see [MacosInstallRunbook.md](./MacosInstallRunbook.md).
+> The sections below are kept for historical context.
+
 This document defines the hardened macOS service lifecycle for Rustynet runtime processes.
 
 ## Labels and Plists
@@ -18,8 +23,12 @@ This document defines the hardened macOS service lifecycle for Rustynet runtime 
   - absolute path
   - root-owned
   - executable
-- Daemon passphrase source is explicit through:
-  - `RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH=<configured macOS path>`
+- WireGuard passphrase custody is Keychain-first and uses the reviewed item:
+  - service: `net.rustynet.wg-key-passphrase`
+  - account: `RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT`
+  - placeholder path: `RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_PATH=<configured macOS path>`
+- Persistent plaintext WireGuard passphrase files are forbidden after custody
+  migration.
 - No manual `sudo -b` background process orchestration is used in the normal start/stop path.
 
 ## Lifecycle Commands

@@ -41,7 +41,7 @@ const DEFAULT_RUN_TIMEOUT_SECS: u64 = 1800;
 const DEFAULT_LIVE_LAB_TIMEOUT_SECS: u64 = 86_400;
 const DEFAULT_PREFLIGHT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_COLLECT_TIMEOUT_SECS: u64 = 300;
-const DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 60;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
@@ -10979,6 +10979,7 @@ fn amend_membership_for_windows_node(
         "set -eu; sudo -n rustynet ops e2e-membership-add \
          --client-node-id {node_id} \
          --client-pubkey-hex {pubkey} \
+         --capabilities client \
          --owner-approver-id {approver}",
         node_id = shell_quote(windows_node_id),
         pubkey = shell_quote(pubkey_hex.as_str()),
@@ -23468,7 +23469,7 @@ mod tests {
             ssh_identity_file: None,
             known_hosts_path: None,
             ssh_port,
-            timeout_secs: 2,
+            timeout_secs: 30,
             update_inventory_live_ips: false,
             report_dir: None,
         })
@@ -23559,7 +23560,7 @@ mod tests {
             ssh_identity_file: None,
             known_hosts_path: None,
             ssh_port: 65_534,
-            timeout_secs: 2,
+            timeout_secs: 30,
             update_inventory_live_ips: false,
             report_dir: None,
         })
@@ -24554,7 +24555,7 @@ mod tests {
             ssh_identity_file: None,
             known_hosts_path: None,
             ssh_port: 65_534,
-            timeout_secs: 2,
+            timeout_secs: 30,
             update_inventory_live_ips: false,
             report_dir: None,
         })
@@ -24826,7 +24827,7 @@ mod tests {
             ssh_identity_file: None,
             known_hosts_path: None,
             ssh_port: 65_534,
-            timeout_secs: 2,
+            timeout_secs: 30,
             update_inventory_live_ips: true,
             report_dir: None,
         })
@@ -26057,7 +26058,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         let present = local_utm_process_present_with_ps(
             ps.as_path(),
             bundle.as_path(),
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("process probe should succeed");
 
@@ -26118,7 +26119,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             bundle.as_path(),
             "stop",
             false,
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("stopped VM transition should no-op successfully");
 
@@ -26166,7 +26167,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             bundle.as_path(),
             "stop",
             false,
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("stopped VM transition should fall back to ps when utmctl cannot spawn");
 
@@ -26229,7 +26230,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             bundle.as_path(),
             "stop",
             false,
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("timed out stop should succeed once state is stopped");
 

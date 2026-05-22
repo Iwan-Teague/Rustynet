@@ -12,6 +12,7 @@ use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, MembershipOwnerKey, MembershipSnapshot, NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
+use rustynet_control::roles::role_capability_csv;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -65,6 +66,7 @@ pub fn init_membership_snapshot(
         }
         let node_id_arg = shell_safe_arg(&peer.node_id)?;
         let pubkey_arg = hex_32_safe_arg(&peer.public_key_hex)?;
+        let capabilities_arg = shell_safe_arg(&role_capability_csv(&peer.capabilities))?;
         ssh::run_remote(
             conn,
             &format!(
@@ -72,6 +74,7 @@ pub fn init_membership_snapshot(
                  sudo '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
                      --client-node-id '{node_id_arg}' \
                      --client-pubkey-hex '{pubkey_arg}' \
+                     --capabilities '{capabilities_arg}' \
                      --owner-approver-id \"$owner_approver_id\"",
             ),
             MEDIUM_TIMEOUT,
@@ -102,6 +105,13 @@ pub fn distribute_signed_bundle(
     bundle_path: &Path,
 ) -> Result<(), AdapterError> {
     let (remote_tmp, install_dst) = remote_bundle_paths(&kind);
+    // Staging dir must exist before SCP; /tmp is always present but the
+    // subdirectory may not have been created yet.
+    ssh::run_remote(
+        conn,
+        &format!("mkdir -p '{MACOS_STAGING_DIR}'"),
+        SHORT_TIMEOUT,
+    )?;
     ssh::scp_to(conn, bundle_path, &remote_tmp, MEDIUM_TIMEOUT)?;
     let install_dir = install_dst
         .rsplit_once('/')
@@ -131,6 +141,11 @@ pub fn distribute_verifier_key(
 ) -> Result<(), AdapterError> {
     let dst = macos_verifier_key_path(&kind);
     let remote_tmp = format!("{MACOS_STAGING_DIR}/rn-verifier-key.pub");
+    ssh::run_remote(
+        conn,
+        &format!("mkdir -p '{MACOS_STAGING_DIR}'"),
+        SHORT_TIMEOUT,
+    )?;
     ssh::scp_to(conn, pub_key_path, &remote_tmp, MEDIUM_TIMEOUT)?;
     let dst_dir = dst.rsplit_once('/').map_or(MACOS_STATE_ROOT, |(d, _)| d);
     ssh::run_remote(
@@ -184,14 +199,14 @@ fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
 fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
     if value
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ','))
     {
         Ok(value.to_owned())
     } else {
         Err(AdapterError::Protocol {
             message: format!(
                 "value '{value}' contains characters not safe for shell argument embedding \
-                 (allowed: alphanumeric, hyphen, underscore, dot)"
+                 (allowed: alphanumeric, hyphen, underscore, dot, comma)"
             ),
         })
     }
@@ -296,6 +311,11 @@ mod tests {
     fn shell_safe_arg_accepts_valid() {
         assert_eq!(shell_safe_arg("node-exit-1").unwrap(), "node-exit-1");
         assert_eq!(shell_safe_arg("abc.def_ghi").unwrap(), "abc.def_ghi");
+        // capability CSVs contain commas (e.g. "client,entry_relay")
+        assert_eq!(
+            shell_safe_arg("client,entry_relay").unwrap(),
+            "client,entry_relay"
+        );
     }
 
     #[test]

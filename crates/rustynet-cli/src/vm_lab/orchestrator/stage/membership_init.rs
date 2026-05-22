@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{NodeMembershipPeer, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -99,10 +100,20 @@ pub(crate) fn build_membership_peers(
                     assignment.alias
                 ));
             }
+            let platform = ctx
+                .adapters
+                .get(&assignment.alias)
+                .map(|adapter| adapter.platform())
+                .unwrap_or(VmGuestPlatform::Linux);
+            let capabilities = assignment
+                .role
+                .product_capabilities_for_platform(&platform)
+                .map_err(|err| format!("membership capability mapping failed: {err}"))?;
 
             Ok(NodeMembershipPeer {
                 alias: assignment.alias.clone(),
                 role: assignment.role.clone(),
+                capabilities,
                 node_id: node_id.clone(),
                 public_key_hex,
             })

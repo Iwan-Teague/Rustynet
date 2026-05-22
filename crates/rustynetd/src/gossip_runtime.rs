@@ -46,7 +46,7 @@
 //!   the source node id. The full candidate list is NEVER written to
 //!   shared logs — it is PII per the privacy retention policy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -54,6 +54,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use rustynet_control::membership::{MembershipNode, MembershipNodeStatus, MembershipState};
+use rustynet_control::roles::RoleCapability;
 
 use crate::dataplane_candidates::CandidateSet;
 use crate::gossip_transport::{GossipTransport, TransportError};
@@ -127,11 +129,26 @@ pub struct GossipPeer {
     pub push_addr: SocketAddr,
 }
 
+/// Signed membership-derived anchor view used by gossip scheduling
+/// and LAN port-mapping authority election. Kept tiny so tests and
+/// daemon integration can reason over the same deterministic rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorRuntimeView {
+    pub anchor_gossip_seed_peer_ids: Vec<[u8; 32]>,
+    pub port_mapping_authority_node_id: Option<String>,
+}
+
 /// Runtime state for one gossip participant.
 pub struct GossipNode {
     pub local_node_id: [u8; 32],
     signing_key: SigningKey,
     pub peers: HashMap<[u8; 32], GossipPeer>,
+    /// Signed membership says these peers carry
+    /// `anchor.gossip_seed`. Re-broadcast schedules send to them
+    /// first, sorted by peer id, then to all other peers sorted by
+    /// peer id. A spoofed transport sender cannot influence this:
+    /// only already-verified membership state updates the set.
+    pub anchor_gossip_seed_peer_ids: HashSet<[u8; 32]>,
     /// Last endpoints accepted from each remote source. Read by the
     /// connect path; the integration test asserts against this.
     pub applied_endpoints: HashMap<[u8; 32], Vec<SocketAddr>>,
@@ -164,6 +181,7 @@ impl GossipNode {
             local_node_id,
             signing_key,
             peers: HashMap::new(),
+            anchor_gossip_seed_peer_ids: HashSet::new(),
             applied_endpoints: HashMap::new(),
             gossip_sequence: 0,
             seen_gossip_sequences: SeenSequenceState::new(),
@@ -199,6 +217,16 @@ impl GossipNode {
                 push_addr,
             },
         );
+    }
+
+    /// Replace the anchor-seed set from verified membership state.
+    /// Unknown peer ids are harmless; the rebroadcast scheduler
+    /// intersects this set with `self.peers`.
+    pub fn set_anchor_gossip_seed_peer_ids(
+        &mut self,
+        peer_ids: impl IntoIterator<Item = [u8; 32]>,
+    ) {
+        self.anchor_gossip_seed_peer_ids = peer_ids.into_iter().collect();
     }
 
     /// Snapshot of all currently-registered peers' verifying keys
@@ -265,7 +293,10 @@ impl GossipNode {
         // rather than failing the whole mint on the first one — a
         // single peer's transport failure shouldn't suppress
         // delivery to the rest of the mesh.
-        for peer in self.peers.values() {
+        for peer_id in self.ordered_peer_ids_for_rebroadcast(None, None) {
+            let Some(peer) = self.peers.get(&peer_id) else {
+                continue;
+            };
             if let Err(err) = transport.push_bundle(peer.push_addr, &bundle) {
                 log::warn!(
                     "gossip_push_failed source={} target={:?} reason={}",
@@ -373,13 +404,11 @@ impl GossipNode {
         // immediate sender (anti-loop hint) and the originator
         // itself (it already has the bundle by definition).
         let sender_id: Option<[u8; 32]> = sender.and_then(|s| self.peer_id_for_addr(s));
-        for (peer_id, peer) in &self.peers {
-            if *peer_id == bundle.source_node_id {
+        for peer_id in self.ordered_peer_ids_for_rebroadcast(Some(bundle.source_node_id), sender_id)
+        {
+            let Some(peer) = self.peers.get(&peer_id) else {
                 continue;
-            }
-            if Some(*peer_id) == sender_id {
-                continue;
-            }
+            };
             if let Err(err) = transport.push_bundle(peer.push_addr, &bundle) {
                 log::warn!(
                     "gossip_repush_failed source={} via={} target={:?} reason={}",
@@ -406,6 +435,29 @@ impl GossipNode {
         None
     }
 
+    fn ordered_peer_ids_for_rebroadcast(
+        &self,
+        origin: Option<[u8; 32]>,
+        sender: Option<[u8; 32]>,
+    ) -> Vec<[u8; 32]> {
+        let mut anchor = Vec::new();
+        let mut ordinary = Vec::new();
+        for peer_id in self.peers.keys().copied() {
+            if Some(peer_id) == origin || Some(peer_id) == sender {
+                continue;
+            }
+            if self.anchor_gossip_seed_peer_ids.contains(&peer_id) {
+                anchor.push(peer_id);
+            } else {
+                ordinary.push(peer_id);
+            }
+        }
+        anchor.sort_unstable();
+        ordinary.sort_unstable();
+        anchor.extend(ordinary);
+        anchor
+    }
+
     fn persist_watermark(&self, watermark: &GossipWatermark) -> Result<(), GossipNodeError> {
         let Some(path) = self.watermark_path.as_deref() else {
             // No watermark configured — pure in-memory mode (only
@@ -419,6 +471,42 @@ impl GossipNode {
     fn bump_reject_counter(&mut self, kind: &'static str) {
         *self.rejected_counts.entry(kind).or_insert(0) += 1;
     }
+}
+
+pub fn anchor_runtime_view_from_membership(state: &MembershipState) -> AnchorRuntimeView {
+    AnchorRuntimeView {
+        anchor_gossip_seed_peer_ids: anchor_gossip_seed_peer_ids_from_membership(state),
+        port_mapping_authority_node_id: select_port_mapping_authority_node_id(&state.nodes),
+    }
+}
+
+pub fn anchor_gossip_seed_peer_ids_from_membership(state: &MembershipState) -> Vec<[u8; 32]> {
+    let mut ids = state
+        .nodes
+        .iter()
+        .filter(|node| node.status == MembershipNodeStatus::Active)
+        .filter(|node| {
+            node.capabilities
+                .contains(&RoleCapability::AnchorGossipSeed)
+        })
+        .filter_map(|node| decode_hex32(node.node_pubkey_hex.as_str()))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+pub fn select_port_mapping_authority_node_id(nodes: &[MembershipNode]) -> Option<String> {
+    nodes
+        .iter()
+        .filter(|node| node.status == MembershipNodeStatus::Active)
+        .filter(|node| {
+            node.capabilities
+                .contains(&RoleCapability::AnchorPortMappingAuthoritative)
+        })
+        .map(|node| node.node_id.as_str())
+        .min()
+        .map(str::to_owned)
 }
 
 /// One-shot result of an accepted inbound bundle. Returned by
@@ -468,6 +556,18 @@ fn short_id(id: &[u8; 32]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+fn decode_hex32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        out[index] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Read a gossip watermark file. Returns `Ok(default)` if the file
@@ -671,6 +771,10 @@ mod tests {
     use crate::gossip_transport::GossipTransport;
     use crate::peer_gossip::mint_bundle_with_timestamp;
     use ed25519_dalek::SigningKey;
+    use rustynet_control::membership::{
+        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+        MembershipApproverStatus,
+    };
     use std::net::{IpAddr, Ipv4Addr};
     use tempfile::TempDir;
 
@@ -682,6 +786,45 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[byte; 32]);
         let path = watermark_dir.join(format!("gossip-{byte}.watermark"));
         GossipNode::new(signing_key, Some(path)).expect("node ctor")
+    }
+
+    fn hex32(byte: u8) -> String {
+        format!("{:02x}", byte).repeat(32)
+    }
+
+    fn membership_node(
+        node_id: &str,
+        pubkey_byte: u8,
+        capabilities: Vec<RoleCapability>,
+    ) -> MembershipNode {
+        MembershipNode {
+            node_id: node_id.to_owned(),
+            node_pubkey_hex: hex32(pubkey_byte),
+            owner: "owner@example.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec!["tag:servers".to_owned()],
+            capabilities,
+            joined_at_unix: 100,
+            updated_at_unix: 100,
+        }
+    }
+
+    fn membership_state(nodes: Vec<MembershipNode>) -> MembershipState {
+        MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-1".to_owned(),
+            epoch: 1,
+            nodes,
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: hex32(0xee),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
     }
 
     #[test]
@@ -748,6 +891,67 @@ mod tests {
             .maybe_mint_and_broadcast(Instant::now(), 1_700_000_000, candidates, &transport)
             .expect("second mint ok");
         assert!(res.is_none(), "duplicate mint must be suppressed");
+    }
+
+    #[test]
+    fn rebroadcast_orders_anchor_seed_peers_first() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut node = make_node(4, dir.path());
+        let local = GossipTransport::bind(loopback_bind()).expect("transport");
+        let mut ids = Vec::new();
+        for byte in [9u8, 3, 7] {
+            let key = SigningKey::from_bytes(&[byte; 32]);
+            let peer_id = key.verifying_key().to_bytes();
+            ids.push((byte, peer_id));
+            node.register_peer(
+                peer_id,
+                key.verifying_key(),
+                local.local_addr().expect("addr"),
+            );
+        }
+        let id3 = ids.iter().find(|(byte, _)| *byte == 3).unwrap().1;
+        let id7 = ids.iter().find(|(byte, _)| *byte == 7).unwrap().1;
+        let id9 = ids.iter().find(|(byte, _)| *byte == 9).unwrap().1;
+        let mut anchor_ids = vec![id3, id7];
+        anchor_ids.sort_unstable();
+        node.set_anchor_gossip_seed_peer_ids(anchor_ids.iter().copied());
+        let mut expected = anchor_ids;
+        expected.push(id9);
+
+        let ordered = node.ordered_peer_ids_for_rebroadcast(None, None);
+        assert_eq!(ordered, expected);
+
+        let excluding_sender = node.ordered_peer_ids_for_rebroadcast(None, Some(id3));
+        assert_eq!(excluding_sender, vec![id7, id9]);
+    }
+
+    #[test]
+    fn anchor_runtime_view_uses_signed_capabilities_and_lex_min_authority() {
+        let state = membership_state(vec![
+            membership_node(
+                "node-z",
+                0x11,
+                vec![RoleCapability::AnchorPortMappingAuthoritative],
+            ),
+            membership_node(
+                "node-a",
+                0x22,
+                vec![
+                    RoleCapability::AnchorGossipSeed,
+                    RoleCapability::AnchorPortMappingAuthoritative,
+                ],
+            ),
+            membership_node("node-m", 0x33, vec![RoleCapability::AnchorGossipSeed]),
+        ]);
+        let view = anchor_runtime_view_from_membership(&state);
+        assert_eq!(
+            view.port_mapping_authority_node_id,
+            Some("node-a".to_owned())
+        );
+        assert_eq!(
+            view.anchor_gossip_seed_peer_ids,
+            vec![[0x22u8; 32], [0x33u8; 32]]
+        );
     }
 
     #[test]

@@ -2037,6 +2037,314 @@ Status: complete (for this slice)
   - `scripts/ci/fresh_install_os_matrix_release_gate.sh` fails because release gate requires `macos` in the OS matrix (pre-existing; macOS backend is Phase 1 scaffolding only).
   - Track E2 canonical cross-network reports still require distinct-underlay topology.
 
+## Role Capability Hardening — Signed Roles and Lab Mapping (2026-05-22)
+
+- **Milestone**: First role/capability hardening slice landed. Security-sensitive
+  role decisions now have a canonical Rust enum instead of relying only on
+  free-form role strings.
+- Changed files:
+  - `crates/rustynet-control/src/roles.rs` (new canonical `RoleCapability`)
+  - `crates/rustynet-control/src/membership.rs` (signed membership nodes now carry canonical capabilities; active nodes require non-empty capabilities; invalid blind-exit combinations fail closed)
+  - `crates/rustynetd/src/daemon.rs` (daemon preflight/bootstrap/reconcile validate local node role against signed membership capabilities; auto-tunnel assignments require exit providers to carry signed `exit_server`)
+  - `crates/rustynet-cli/src/main.rs` (membership `propose-add` accepts typed `--capabilities`, defaults to `client`)
+  - `crates/rustynet-cli/src/vm_lab/orchestrator/role.rs` (explicit lab role to daemon-role/product-capability mappings)
+  - `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/{linux_install.rs,windows_install.rs,macos_install.rs}` and `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` (adapters consume explicit Rust role mapping; hidden shell mapping removed on macOS)
+- Verification:
+  - `cargo fmt --all -- --check` → PASS
+  - `cargo check -p rustynet-control -p rustynet-cli -p rustynetd` → PASS
+  - `cargo clippy -p rustynet-control -p rustynet-cli -p rustynetd --all-targets -- -D warnings` → PASS
+  - `cargo test -p rustynet-control membership` → 16 tests PASS
+  - `cargo test -p rustynet-cli membership` → 37 filtered tests PASS
+  - `cargo test -p rustynet-cli vm_lab::orchestrator::role` → 24 filtered tests PASS
+  - `cargo test -p rustynet-cli vm_lab::orchestrator::adapter::macos_install` → 6 filtered tests PASS
+  - `cargo test -p rustynetd membership_alignment` → 2 tests PASS
+- Residual risk:
+  - No live daemon/macOS/Windows runs were performed by request.
+  - Assignment bundles still do not embed a separate first-class role field; daemon-side validation now binds selected exit providers/routes back to signed membership `exit_server` capability as the fail-closed enforcement point.
+
+## Role Capability Hardening — Signed Assignment Intent (2026-05-22)
+
+- **Milestone**: First three route-role enforcement items landed. Assignment bundles
+  now carry signed node capabilities, signed exit-node identity/capabilities, and
+  an explicit `traffic_route_policy=mesh_or_relay_or_exit_node` marker.
+- Changed behavior:
+  - Assignment issue rejects LAN routes unless an explicit exit node is selected.
+  - Exit traffic must be signed as an exit route and must match the signed exit
+    node id.
+  - Exit providers must carry signed `exit_server`; exit clients must carry
+    `client` or `anchor`; `blind_exit` cannot consume exit traffic.
+  - Daemon bundle parsing rejects default routes through non-exit peers and
+    rejects peer `allowed_ips` that lack matching signed routes.
+  - Daemon config validates node role against backend-declared capability gates
+    before startup.
+  - Lab membership setup now threads role capability intent into Linux, macOS,
+    and Windows peer-add paths instead of relying on default client semantics.
+- Verification:
+  - `cargo fmt --all -- --check` -> PASS
+  - `cargo check -p rustynet-control -p rustynet-cli -p rustynetd --all-targets` -> PASS
+  - `cargo clippy -p rustynet-control -p rustynet-cli -p rustynetd --all-targets -- -D warnings` -> PASS
+  - `cargo test -p rustynet-control auto_tunnel_bundle` -> 5 filtered tests PASS
+  - `cargo test -p rustynetd node_role_backend_capability_gate_rejects_unsupported_backend` -> PASS
+  - `cargo test -p rustynetd signed_auto_tunnel_route_intent_requires_default_via_signed_exit` -> PASS
+  - `cargo test -p rustynetd load_auto_tunnel_bundle` -> 9 filtered tests PASS
+  - `cargo test -p rustynet-cli membership` -> 37 filtered tests PASS
+  - `cargo test -p rustynet-cli assignment_refresh_env_quotes_structured_values` -> PASS
+  - `cargo test -p rustynet-cli vm_lab::orchestrator::role` -> 24 filtered tests PASS
+- Residual risk:
+  - No live daemon/macOS/Windows runs were performed by request.
+  - Backend-declared capability gates currently reflect existing backend
+    advertised capabilities; future backend-specific demotion should use the
+    same gate rather than adding runtime fallback branches.
+
+## Role Capability Hardening - Signed Peer Capability Intent (2026-05-22)
+
+- **Milestone**: Assignment bundles now bind every selected peer to signed
+  canonical capabilities, and the daemon rejects route intent that cannot be
+  proven against those signed peer capabilities.
+- Changed behavior:
+  - Control-plane auto-tunnel bundles emit `peer.N.capabilities` for each
+    selected peer and reject bundles when any selected peer lacks canonical
+    capabilities.
+  - Daemon bundle parsing validates `peer.N.capabilities` as an allowlisted
+    signed field, rejects missing/empty/invalid values, and includes peer
+    capability fields in fail-closed field-count validation.
+  - Daemon route-intent validation rejects default routes through non-exit
+    peers, exit routes whose peer lacks signed `exit_server`, mesh subnet
+    routes outside the local mesh CIDR, and peer allowed IPs that are not
+    backed by a signed route.
+  - Backend capability declarations now use an explicit truth matrix:
+    kernel/in-memory backends advertise the full supported matrix,
+    userspace-shared Linux/macOS demote roaming and IPv6, and unsupported
+    Windows stays all false.
+  - Client role admission no longer requires roaming support; route-serving
+    roles still require backend capabilities specific to serving, LAN serving,
+    or exit serving.
+  - Enrollment trust propagation now derives canonical capabilities from
+    enrollee roles so signed membership records do not regress to empty
+    capability sets.
+- Changed files:
+  - `crates/rustynet-control/src/lib.rs`
+  - `crates/rustynet-control/src/enrollment.rs`
+  - `crates/rustynetd/src/daemon.rs`
+  - `crates/rustynetd/tests/enrollment_trust_propagation.rs`
+- Verification:
+  - `cargo check -p rustynet-control -p rustynet-cli -p rustynetd --all-targets` -> PASS
+  - `cargo test -p rustynet-control enrollment` -> 10 filtered tests PASS
+  - `cargo test -p rustynet-control auto_tunnel_bundle` -> 5 filtered tests PASS
+  - `cargo test -p rustynetd signed_auto_tunnel_route_intent` -> 3 filtered tests PASS
+  - `cargo test -p rustynetd load_auto_tunnel_bundle` -> 9 filtered tests PASS
+  - `cargo fmt --all -- --check` -> PASS
+  - `cargo clippy -p rustynet-control -p rustynet-cli -p rustynetd --all-targets -- -D warnings` -> PASS
+  - `cargo check --workspace --all-targets --all-features` -> PASS
+- Residual risk:
+  - No live daemon/macOS/Windows runs were performed by request.
+  - macOS userspace-shared remains code-only at this stage; the same signed
+    route/capability gates will need live evidence once live testing is allowed.
+
+## macOS Userspace-Shared Runtime - Authoritative Transport Recovery (2026-05-22)
+
+- **Milestone**: macOS userspace-shared authoritative transport operations now
+  use the same runtime recovery path as peer/configuration operations instead
+  of staying fail-dead after a worker exit.
+- Changed behavior:
+  - `authoritative_transport_round_trip` recovers a dead runtime worker,
+    recreates the TUN/socket runtime, replays desired peers/routes/exit mode,
+    then runs the STUN/relay round trip on the replacement authoritative socket.
+  - `authoritative_transport_send` uses the same recovery path before emitting
+    relay/control datagrams.
+  - `authoritative_transport_identity` no longer advertises a stale socket
+    identity after the worker has exited.
+  - Runtime control now tracks worker liveness with a production atomic flag,
+    not only test counters.
+- Changed files:
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/mod.rs`
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/runtime.rs`
+- Verification:
+  - `cargo test -p rustynet-backend-wireguard macos_userspace_shared_backend_recovers_dead_worker_before_authoritative -- --nocapture` -> 2 filtered tests PASS
+  - `cargo test -p rustynet-backend-wireguard macos_runtime_reports_authoritative_identity_and_shutdowns` -> 1 filtered test PASS
+  - `cargo test -p rustynet-backend-wireguard macos_userspace_shared` -> 44 pass, 1 ignored real-utun smoke, 5 conformance tests PASS
+  - `cargo check -p rustynet-backend-wireguard --all-targets` -> PASS
+  - `cargo fmt --all -- --check` -> PASS
+  - `cargo clippy -p rustynet-backend-wireguard --all-targets -- -D warnings` -> PASS
+- Residual risk:
+  - No live daemon/macOS/network run was performed by request.
+  - Real utun/socket behavior still needs live evidence before declaring macOS
+    userspace-shared production-ready.
+
+## macOS Userspace-Shared Runtime - Flood-Starvation Guard (2026-05-22)
+
+- **Milestone**: macOS userspace-shared runtime worker now caps per-tick
+  authoritative UDP and TUN packet processing so untrusted traffic cannot starve
+  control-plane commands, shutdown, or recovery.
+- Changed behavior:
+  - Authoritative UDP socket polling processes at most 64 datagrams per worker
+    tick, then returns to command handling.
+  - TUN polling processes at most 64 packets per worker tick, then returns to
+    command handling.
+  - Test TUN snapshots now expose queued inbound packet count for budget
+    assertions.
+- Changed files:
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/runtime.rs`
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/tun.rs`
+  - `documents/operations/active/MacosUserspaceSharedBackendPlan_2026-05-08.md`
+- Verification:
+  - `cargo test -p rustynet-backend-wireguard macos_runtime_authoritative_socket_poll_is_budgeted_per_tick -- --nocapture` -> PASS
+  - `cargo test -p rustynet-backend-wireguard macos_runtime_tun_poll_is_budgeted_per_tick -- --nocapture` -> PASS
+  - `cargo test -p rustynet-backend-wireguard macos_userspace_shared` -> 44 pass, 1 ignored real-utun smoke, 5 conformance tests PASS
+  - `cargo test -p rustynet-backend-wireguard macos_runtime` -> 14 filtered tests PASS
+  - `cargo check -p rustynet-backend-wireguard --all-targets` -> PASS
+  - `cargo fmt --all -- --check` -> PASS
+  - `cargo clippy -p rustynet-backend-wireguard --all-targets -- -D warnings` -> PASS
+- Residual risk:
+  - No live daemon/macOS/network run was performed by request.
+  - Budget value is static and conservative; live soak should confirm it does
+    not underfeed high-throughput peers before release.
+
+## Shared Userspace Runtime Parity - Linux/macOS Control-Path Starvation and Recovery (2026-05-22)
+
+- **Milestone**: Linux and macOS userspace-shared backends now enforce the same
+  security contract for worker liveness, authoritative STUN/relay transport
+  recovery, and per-tick packet budgets.
+- Changed behavior:
+  - Linux userspace-shared now hides authoritative transport identity after
+    worker exit, matching macOS.
+  - Linux authoritative round-trip/send now recover a dead worker, recreate the
+    shared UDP/TUN runtime, replay desired state, then perform the STUN/relay
+    operation, matching macOS.
+  - Linux runtime polling now caps authoritative UDP and TUN packet processing
+    at 64 packets per tick, matching macOS flood-starvation guard behavior.
+  - Linux test TUN snapshots now expose queued inbound packet counts for budget
+    assertions.
+- Changed files:
+  - `crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs`
+  - `crates/rustynet-backend-wireguard/src/userspace_shared/runtime.rs`
+  - `crates/rustynet-backend-wireguard/src/userspace_shared/tun.rs`
+- Verification:
+  - `cargo test -p rustynet-backend-wireguard linux_runtime_authoritative_socket_poll_is_budgeted_per_tick -- --nocapture` -> PASS
+  - `cargo test -p rustynet-backend-wireguard linux_runtime_tun_poll_is_budgeted_per_tick -- --nocapture` -> PASS
+  - `cargo test -p rustynet-backend-wireguard linux_userspace_shared_backend_recovers_dead_worker_before_authoritative -- --nocapture` -> 2 filtered tests PASS
+  - `cargo test -p rustynet-backend-wireguard linux_runtime -- --nocapture` -> 2 filtered tests PASS
+  - `cargo test -p rustynet-backend-wireguard linux_userspace_shared` -> 42 backend tests PASS, 2 conformance tests PASS
+  - `cargo test -p rustynet-backend-wireguard macos_userspace_shared` -> 44 pass, 1 ignored real-utun smoke, 5 conformance tests PASS
+  - `cargo check -p rustynet-backend-wireguard --all-targets` -> PASS
+  - `cargo fmt --all -- --check` -> PASS
+  - `cargo clippy -p rustynet-backend-wireguard --all-targets -- -D warnings` -> PASS
+- Residual risk:
+  - No live daemon/Linux/macOS/network run was performed by request.
+  - Real throughput and latency impact of the 64-packet tick budget still needs
+    live soak evidence before release tuning.
+
+## macOS Daemon Shared-Transport + DNS/Route Join Guard (2026-05-22)
+
+- **Milestone**: daemon and Phase10 now pin two fail-closed invariants for
+  shared-transport macOS and full-tunnel route activation.
+- Changed behavior:
+  - macOS userspace-shared test backends expose a hidden fake-TUN receive-error
+    injection hook so daemon tests can prove status/netcheck stop advertising
+    authoritative transport identity after worker death.
+  - Daemon status and netcheck now have explicit regression coverage for
+    `authoritative_backend_shared_transport_unavailable` on the macOS
+    userspace-shared backend.
+  - Phase10 rejects `ExitMode::FullTunnel` with `protected_dns=false` before
+    generation, backend, route, firewall, or OS mutation.
+  - Phase10 now has an ordering test proving protected DNS is programmed before
+    the full-tunnel policy commit.
+- Changed files:
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/mod.rs`
+  - `crates/rustynetd/src/daemon.rs`
+  - `crates/rustynetd/src/phase10.rs`
+  - `documents/operations/active/MacosUserspaceSharedBackendPlan_2026-05-08.md`
+  - `documents/operations/active/MasterWorkPlan_2026-03-22.md`
+- Verification:
+  - `cargo test -p rustynetd full_tunnel_apply_rejects_unprotected_dns_before_any_mutation -- --nocapture` -> PASS
+  - `cargo test -p rustynetd full_tunnel_apply_programs_dns_before_exit_policy_commit -- --nocapture` -> PASS
+  - `cargo test -p rustynetd full_tunnel_apply -- --nocapture` -> 4 filtered tests PASS
+  - `cargo test -p rustynetd daemon_runtime_macos_userspace_shared_backend_reports_unavailable_after_worker_exit -- --nocapture` -> PASS
+  - `cargo test -p rustynetd daemon_runtime_macos_userspace_shared_backend_reports_authoritative_transport_state -- --nocapture` -> PASS
+  - `cargo test -p rustynetd daemon_runtime_macos_userspace_shared_backend_reports -- --nocapture` -> 2 filtered tests PASS
+  - `cargo test -p rustynet-backend-wireguard macos_userspace_shared_backend_reports_worker_owned_identity_after_start -- --nocapture` -> PASS
+  - `cargo test -p rustynet-backend-wireguard macos_userspace_shared -- --nocapture` -> 44 pass, 1 ignored real-utun smoke, 5 conformance tests PASS
+  - `cargo check -p rustynet-backend-wireguard -p rustynetd --all-targets` -> PASS
+  - `cargo fmt --all -- --check` -> PASS
+  - `cargo clippy -p rustynet-backend-wireguard -p rustynetd --all-targets -- -D warnings` -> PASS
+  - `git diff --check` -> PASS
+- Residual risk:
+  - No live daemon/macOS/network run was performed by request.
+  - Remaining proof still needs live macOS utun + route/DNS evidence before
+    production readiness.
+
+## macOS Parity + Route-Role Enforcement Expansion (2026-05-22)
+
+- **Milestone**: the next five macOS/security work items are now covered in
+  code-only form: daemon recovery, Linux parity, macOS route/DNS ordering,
+  PF snapshot coverage, backend conformance expansion, hidden hook gating, and
+  signed route-role enforcement.
+- Changed behavior:
+  - Daemon macOS userspace-shared tests now prove a fake worker death first
+    hides authoritative transport, then an authoritative round trip recovers
+    the backend and returns status/netcheck to
+    `authoritative_backend_shared_transport`.
+  - Phase10 now asserts protected DNS immediately after DNS apply and before
+    full-tunnel route/policy commit. Assertion failure rolls DNS back and
+    prevents `ExitMode::FullTunnel` from sticking.
+  - macOS command-system DNS assertion now verifies `dns_protected=true` and
+    that rendered PF rules contain both tunnel DNS pass rules and non-tunnel
+    DNS block rules for UDP/TCP 53.
+  - Phase10 now has full-tunnel route/DNS ordering coverage plus exact macOS PF
+    snapshots for strict fail-closed, relay-with-upstream, and full-tunnel
+    DNS-protected rules.
+  - Linux userspace-shared daemon tests now mirror macOS daemon recovery: fake
+    worker death hides shared transport, then authoritative transport recovery
+    returns netcheck to `transport_socket_identity_error=none`.
+  - macOS userspace-shared conformance now covers dead-worker identity hiding,
+    authoritative send recovery, route-apply failure retryability, and exit-mode
+    failure retryability.
+  - Test-only backend constructors and fake-TUN/failure injection hooks are now
+    compiled only under backend `test` or explicit `test-harness` features.
+    `rustynetd` exposes its shared-backend recovery tests only behind its own
+    `test-harness` feature, which forwards to the backend feature.
+  - Signed auto-tunnel route intent now rejects any route-carrying peer that
+    lacks `relay_host` or `exit_server`; exit routes still additionally require
+    `exit_server`, while `blind_exit + exit_server` remains valid for exit
+    traffic.
+- Changed files:
+  - `crates/rustynet-backend-wireguard/Cargo.toml`
+  - `crates/rustynet-backend-wireguard/src/userspace_shared/mod.rs`
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/mod.rs`
+  - `crates/rustynet-backend-wireguard/src/userspace_shared_macos/socket.rs`
+  - `crates/rustynet-backend-wireguard/tests/conformance.rs`
+  - `crates/rustynetd/Cargo.toml`
+  - `crates/rustynetd/src/daemon.rs`
+  - `crates/rustynetd/src/phase10.rs`
+  - `documents/operations/active/MacosUserspaceSharedBackendPlan_2026-05-08.md`
+  - `documents/operations/active/MasterWorkPlan_2026-03-22.md`
+- Verification:
+  - `cargo test -p rustynetd --features test-harness daemon_runtime_linux_userspace_shared_backend_ -- --nocapture` -> 2 filtered tests PASS
+  - `cargo test -p rustynetd --features test-harness daemon_runtime_macos_userspace_shared_backend_ -- --nocapture` -> 3 filtered tests PASS
+  - `cargo test -p rustynetd full_tunnel_ -- --nocapture` -> 10 filtered tests PASS
+  - `cargo test -p rustynetd signed_auto_tunnel_route_intent -- --nocapture` -> 5 filtered tests PASS
+  - `cargo test -p rustynetd load_auto_tunnel_bundle -- --nocapture` -> 9 filtered tests PASS
+  - `cargo test -p rustynetd macos_assert_dns_protection_requires_active_dns_rules -- --nocapture` -> PASS
+  - `cargo test -p rustynetd macos_render_pf_rules -- --nocapture` -> 7 filtered tests PASS
+  - `cargo test -p rustynetd full_tunnel_route_dns_apply_order_keeps_exit_commit_last -- --nocapture` -> PASS
+  - `cargo test -p rustynetd phase10::tests -- --nocapture` -> 116 tests PASS
+  - `cargo test -p rustynet-backend-wireguard --test conformance -- --nocapture` -> 0 tests PASS (feature-gated harness stays absent by default)
+  - `cargo test -p rustynet-backend-wireguard --test conformance --features test-harness -- --nocapture` -> 17 tests PASS
+  - `cargo test -p rustynet-backend-wireguard macos_userspace_shared -- --nocapture` -> 44 pass, 1 ignored real-utun smoke, default conformance gated empty PASS
+  - `cargo check -p rustynet-backend-wireguard --lib` -> PASS
+  - `cargo check -p rustynet-backend-wireguard --lib --features test-harness` -> PASS
+  - `cargo check -p rustynetd --all-targets` -> PASS
+  - `cargo check -p rustynetd --all-targets --features test-harness` -> PASS
+  - `cargo fmt --all -- --check` -> PASS
+  - `cargo clippy -p rustynet-backend-wireguard -p rustynetd --all-targets -- -D warnings` -> PASS
+  - `cargo clippy -p rustynet-backend-wireguard -p rustynetd --all-targets --features test-harness -- -D warnings` -> PASS
+  - `git diff --check` -> PASS
+- Residual risk:
+  - No live daemon/macOS/network run was performed by request.
+  - Hidden test hooks require explicit cargo feature activation outside backend
+    unit tests; live utun and PF validation still required before production
+    readiness.
+
 ## Agent Update Rules
 
 Use these rules every time you modify this document during implementation work.

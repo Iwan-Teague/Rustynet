@@ -39,10 +39,11 @@ These explain architecture, phase boundaries, and longer-running design work.
 - [Phase4.md](./Phase4.md)
 - [Phase5.md](./Phase5.md)
 - [Phase6.md](./Phase6.md)
-- [Phase7.md](./Phase7.md)
-- [Phase8.md](./Phase8.md)
-- [Phase9.md](./Phase9.md)
 - [phase10.md](./phase10.md)
+
+Phase 7, 8, and 9 documents have been archived to
+[`archive/`](./archive/README.md) as future commercial-roadmap material with
+no current active implementation work.
 - [MembershipConsensus.md](./MembershipConsensus.md)
 - [MembershipImplementationPlan.md](./MembershipImplementationPlan.md)
 - [CliCommandsDesign.md](./CliCommandsDesign.md)
@@ -80,7 +81,6 @@ Entry point:
 Cross-platform improvement and security ledgers (most recently updated):
 - [PlatformImprovementBacklog_2026-05-14.md](./operations/active/PlatformImprovementBacklog_2026-05-14.md)
 - [SecurityHardeningAudit_2026-04-28.md](./operations/active/SecurityHardeningAudit_2026-04-28.md)
-- [SecurityHardeningBacklog_2026-03-09.md](./operations/active/SecurityHardeningBacklog_2026-03-09.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./operations/active/RustynetComparativeVpnExploitCoverage_2026-03-14.md)
 - [DiagnosticFunctionsRoadmap.md](./operations/active/DiagnosticFunctionsRoadmap.md)
 
@@ -162,7 +162,7 @@ These folders are for evidence and retrospective reference, not live implementat
 
 - [archive/README.md](./archive/README.md) — top-level historical archive
   (security reviews, simulation-era gap assessments, downloads-research
-  import ledger)
+  import ledger, future commercial-roadmap Phase 7/8/9 documents)
 - [operations/done/README.md](./operations/done/README.md) — completed
   operations reviews + completed phase implementation checklists (Phase 1, 2,
   3, 5)

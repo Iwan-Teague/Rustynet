@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(windows))]
 use nix::unistd::Uid;
 use rand::{TryRngCore, rngs::OsRng};
+use rustynet_control::roles::{RoleCapability, role_capability_csv};
 use rustynet_control::{
     AutoTunnelBundleRequest, ControlPlaneCore, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
     EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType, NodeMetadata,
@@ -927,11 +928,16 @@ fn resolve_windows_install_source_root() -> Result<PathBuf, String> {
 pub fn execute_ops_e2e_membership_add(
     client_node_id: String,
     client_pubkey_hex: String,
+    capabilities: String,
     owner_approver_id: String,
 ) -> Result<String, String> {
     ensure_running_as_root()?;
     ensure_safe_token("client-node-id", client_node_id.as_str())?;
     ensure_safe_token("owner-approver-id", owner_approver_id.as_str())?;
+    let capabilities = role_capability_csv(
+        &rustynet_control::roles::parse_role_capability_csv(&capabilities)
+            .map_err(|err| err.to_string())?,
+    );
     ensure_hex_32("client-pubkey-hex", client_pubkey_hex.as_str())?;
 
     let passphrase_path = format!(
@@ -978,6 +984,8 @@ pub fn execute_ops_e2e_membership_add(
                 client_node_id.as_str(),
                 "--output",
                 record_path.to_string_lossy().as_ref(),
+                "--capabilities",
+                capabilities.as_str(),
                 "--snapshot",
                 "/var/lib/rustynet/membership.snapshot",
                 "--log",
@@ -1171,8 +1179,11 @@ pub fn execute_ops_e2e_issue_assignments(
             )?;
         }
 
+        let exit_capabilities =
+            role_capability_csv(&[RoleCapability::Anchor, RoleCapability::ExitServer]);
+        let client_capabilities = role_capability_csv(&[RoleCapability::Client]);
         let nodes_spec = format!(
-            "{exit_node_id}|{exit_endpoint}|{exit_pubkey_hex};{client_node_id}|{client_endpoint}|{client_pubkey_hex}",
+            "{exit_node_id}|{exit_endpoint}|{exit_pubkey_hex}|{exit_node_id}|{exit_node_id}|linux||{exit_capabilities};{client_node_id}|{client_endpoint}|{client_pubkey_hex}|{client_node_id}|{client_node_id}|linux||{client_capabilities}",
         );
         let allow_spec =
             format!("{client_node_id}|{exit_node_id};{exit_node_id}|{client_node_id}",);
@@ -1288,6 +1299,8 @@ struct GenericTraversalNodeSpec {
     node_id: String,
     endpoint: String,
     public_key: [u8; 32],
+    /// Optional capabilities override; defaults to `[Client]` when absent.
+    capabilities: Option<Vec<RoleCapability>>,
 }
 
 struct GenericTraversalAllowSpec {
@@ -1937,6 +1950,7 @@ fn issue_two_node_traversal_artifacts(
             hostname: exit_node_id.to_owned(),
             os: "linux".to_owned(),
             tags: Vec::new(),
+            capabilities: vec![RoleCapability::Anchor, RoleCapability::ExitServer],
             owner: exit_node_id.to_owned(),
             endpoint: exit_endpoint.to_owned(),
             last_seen_unix: now_unix,
@@ -1949,6 +1963,7 @@ fn issue_two_node_traversal_artifacts(
             hostname: client_node_id.to_owned(),
             os: "linux".to_owned(),
             tags: Vec::new(),
+            capabilities: vec![RoleCapability::Client],
             owner: client_node_id.to_owned(),
             endpoint: client_endpoint.to_owned(),
             last_seen_unix: now_unix,
@@ -2026,6 +2041,10 @@ fn control_plane_core_from_generic_specs(
                 hostname: node.node_id.clone(),
                 os: "linux".to_owned(),
                 tags: Vec::new(),
+                capabilities: node
+                    .capabilities
+                    .clone()
+                    .unwrap_or_else(|| vec![RoleCapability::Client]),
                 owner: node.node_id.clone(),
                 endpoint: node.endpoint.clone(),
                 last_seen_unix: now_unix,
@@ -2474,6 +2493,8 @@ pub fn execute_ops_run_debian_two_node_e2e(
             config.client_node_id.as_str(),
             "--client-pubkey-hex",
             client_wg_pub_hex.as_str(),
+            "--capabilities",
+            "client",
             "--owner-approver-id",
             owner_approver_id.as_str(),
         ],
@@ -2735,13 +2756,17 @@ pub fn execute_ops_run_debian_two_node_e2e(
     )?;
 
     let assignment_nodes_spec = format!(
-        "{}|{}:51820|{};{}|{}:51820|{}",
+        "{}|{}:51820|{}|{}|{}|linux||anchor,exit_server;{}|{}:51820|{}|{}|{}|linux||client",
         config.exit_node_id,
         exit_target.address,
         exit_wg_pub_hex,
+        config.exit_node_id,
+        config.exit_node_id,
         config.client_node_id,
         client_target.address,
-        client_wg_pub_hex
+        client_wg_pub_hex,
+        config.client_node_id,
+        config.client_node_id
     );
     let assignment_allow_spec = format!(
         "{}|{};{}|{}",
@@ -3533,10 +3558,23 @@ fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, S
         ensure_safe_token("node-id", node_id)?;
         ensure_safe_token("endpoint", endpoint)?;
         ensure_hex_32("node-public-key-hex", public_key_hex)?;
+        // Optional 4th field: comma-separated capabilities (e.g. "anchor,exit_server").
+        // When absent the caller defaults to [Client].
+        let capabilities = if parts.len() >= 4 && !parts[3].trim().is_empty() {
+            let csv = parts[3].trim();
+            let parsed =
+                rustynet_control::roles::parse_role_capability_csv(csv).map_err(|err| {
+                    format!("invalid capabilities in NODES_SPEC entry {trimmed:?}: {err}")
+                })?;
+            Some(parsed)
+        } else {
+            None
+        };
         nodes.push(GenericTraversalNodeSpec {
             node_id: node_id.to_owned(),
             endpoint: endpoint.to_owned(),
             public_key: decode_hex_32(public_key_hex)?,
+            capabilities,
         });
     }
     if nodes.is_empty() {
@@ -5520,8 +5558,9 @@ mod tests {
         ));
         let env = AssignmentRefreshEnv {
             target_node_id: "client-50".to_owned(),
-            nodes_spec: "client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def"
-                .to_owned(),
+            nodes_spec:
+                "client-50|192.168.18.50:51820|abc||||client;exit-49|192.168.18.49:51820|def||||anchor,exit_server"
+                    .to_owned(),
             allow_spec: "client-50|exit-49;exit-49|client-50".to_owned(),
             exit_node_id: Some("exit-49".to_owned()),
         };
@@ -5530,7 +5569,7 @@ mod tests {
         let _ = fs::remove_file(path.as_path());
         assert!(body.contains("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=\"client-50\""));
         assert!(body.contains(
-            "RUSTYNET_ASSIGNMENT_NODES=\"client-50|192.168.18.50:51820|abc;exit-49|192.168.18.49:51820|def\""
+            "RUSTYNET_ASSIGNMENT_NODES=\"client-50|192.168.18.50:51820|abc||||client;exit-49|192.168.18.49:51820|def||||anchor,exit_server\""
         ));
         assert!(body.contains("RUSTYNET_ASSIGNMENT_ALLOW=\"client-50|exit-49;exit-49|client-50\""));
         assert!(body.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-49\""));
@@ -5656,8 +5695,8 @@ client-2|192.168.64.25:51820|0123456789abcdef0123456789abcdef0123456789abcdef012
     #[test]
     fn generic_assignment_bundle_artifacts_issue_without_recursive_cli() {
         let nodes = parse_generic_nodes(
-            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
-client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|anchor,exit_server;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100|client",
         )
         .expect("nodes should parse");
         let allow_pairs =
@@ -5784,8 +5823,8 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
     #[test]
     fn generic_assignment_bundle_artifacts_reject_hostname_endpoints() {
         let nodes = parse_generic_nodes(
-            "exit-1|debian-headless-1:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
-client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+            "exit-1|debian-headless-1:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|anchor,exit_server;\
+client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100|client",
         )
         .expect("nodes should parse");
         let allow_pairs =

@@ -437,6 +437,9 @@ pub trait DataplaneSystem {
     ) -> Result<(), SystemError>;
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError>;
     fn apply_dns_protection(&mut self) -> Result<(), SystemError>;
+    fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError>;
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError>;
     fn rollback_ipv6_egress(&mut self) -> Result<(), SystemError> {
@@ -564,6 +567,10 @@ impl DataplaneSystem for DryRunSystem {
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
         self.step("apply_dns_protection")
+    }
+
+    fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
+        self.step("assert_dns_protection")
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
@@ -2297,13 +2304,18 @@ impl MacosCommandSystem {
         }
         if self.fail_closed_ssh_allow {
             for cidr in &self.fail_closed_ssh_allow_cidrs {
+                // Allow inbound SSH connections from the management CIDR.
+                // keep state creates a state entry on the SYN that also passes
+                // the sshd reply (SYN-ACK, ACK, data) through block drop out
+                // quick all without needing a separate pass out rule.
                 rules.push_str(&format!(
-                    "pass out quick {} proto tcp from any to {} port 22 keep state\n",
+                    "pass in quick {} proto tcp from {} to any port 22 keep state\n",
                     cidr.pf_family(),
                     cidr
                 ));
+                // Allow node-initiated SSH connections to management hosts.
                 rules.push_str(&format!(
-                    "pass out quick {} proto tcp from any port 22 to {} keep state\n",
+                    "pass out quick {} proto tcp from any to {} port 22 keep state\n",
                     cidr.pf_family(),
                     cidr
                 ));
@@ -2491,6 +2503,29 @@ impl DataplaneSystem for MacosCommandSystem {
         if let Err(err) = self.apply_pf_rules(false) {
             self.dns_protected = false;
             return Err(SystemError::DnsApplyFailed(err.to_string()));
+        }
+        Ok(())
+    }
+
+    fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
+        if !self.dns_protected {
+            return Err(SystemError::DnsApplyFailed(
+                "macOS DNS protection is not active".to_owned(),
+            ));
+        }
+        let rules = self.render_pf_rules(false)?;
+        for proto in ["udp", "tcp"] {
+            if !Self::ruleset_contains_dns_rule(
+                &rules,
+                "pass",
+                proto,
+                Some(self.interface_name.as_str()),
+            ) || !Self::ruleset_contains_dns_rule(&rules, "block", proto, None)
+            {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "macOS DNS protection missing {proto}/53 tunnel-pass or egress-block rule"
+                )));
+            }
         }
         Ok(())
     }
@@ -3446,6 +3481,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.assert_dns_protection(),
+            RuntimeSystem::Linux(system) => system.assert_dns_protection(),
+            RuntimeSystem::Macos(system) => system.assert_dns_protection(),
+            RuntimeSystem::Windows(system) => system.assert_dns_protection(),
+        }
+    }
+
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_dns_protection(),
@@ -3645,6 +3689,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         options: ApplyOptions,
     ) -> Result<(), Phase10Error> {
         validate_trust(&self.trust_policy, evidence)?;
+        validate_apply_options(options)?;
         let target_generation = self.generation.saturating_add(1);
         let mesh_cidr = context.mesh_cidr.clone();
         self.system.set_generation(target_generation);
@@ -3830,6 +3875,7 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         if options.protected_dns {
             self.system.apply_dns_protection()?;
             applied_stages.push(StageMarker::DnsApplied);
+            self.system.assert_dns_protection()?;
         }
 
         if !options.ipv6_parity_supported {
@@ -4650,6 +4696,15 @@ fn validate_trust(policy: &TrustPolicy, evidence: TrustEvidence) -> Result<(), P
     }
     if evidence.clock_skew_secs > policy.max_clock_skew_secs {
         return Err(Phase10Error::TrustRejected("clock_skew_exceeded"));
+    }
+    Ok(())
+}
+
+fn validate_apply_options(options: ApplyOptions) -> Result<(), Phase10Error> {
+    if options.exit_mode == ExitMode::FullTunnel && !options.protected_dns {
+        return Err(Phase10Error::System(SystemError::DnsApplyFailed(
+            "full-tunnel exit mode requires protected DNS before route activation".to_owned(),
+        )));
     }
     Ok(())
 }
@@ -6532,6 +6587,254 @@ mod tests {
                 .operations
                 .contains(&"assert_exit_policy:full_tunnel".to_owned()),
             "phase 10 must assert measured full-tunnel truth before claiming ExitActive"
+        );
+    }
+
+    #[test]
+    fn full_tunnel_apply_rejects_unprotected_dns_before_any_mutation() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let err = controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    protected_dns: false,
+                    exit_mode: ExitMode::FullTunnel,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("full-tunnel apply without protected DNS must fail closed");
+
+        assert!(matches!(
+            err,
+            Phase10Error::System(SystemError::DnsApplyFailed(_))
+        ));
+        assert_eq!(controller.state(), DataplaneState::Init);
+        assert!(!controller.backend.started);
+        assert!(
+            controller.system.operations.is_empty(),
+            "DNS guard must reject before generation, route, firewall, or backend mutation; ops={:?}",
+            controller.system.operations
+        );
+    }
+
+    #[test]
+    fn full_tunnel_apply_programs_dns_before_exit_policy_commit() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    protected_dns: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("protected full-tunnel apply should succeed");
+
+        let dns_idx = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "apply_dns_protection")
+            .expect("full-tunnel apply must program protected DNS");
+        let dns_assert_idx = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "assert_dns_protection")
+            .expect("full-tunnel apply must assert protected DNS");
+        let policy_idx = controller
+            .system
+            .operations
+            .iter()
+            .position(|op| op == "assert_exit_policy:full_tunnel")
+            .expect("full-tunnel apply must assert measured exit policy");
+        assert!(
+            dns_idx < dns_assert_idx && dns_assert_idx < policy_idx,
+            "protected DNS must be active before full-tunnel policy commit; ops={:?}",
+            controller.system.operations
+        );
+    }
+
+    #[test]
+    fn full_tunnel_route_dns_apply_order_keeps_exit_commit_last() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    protected_dns: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("protected full-tunnel apply should succeed");
+
+        let expected_order = [
+            "rollback_routes",
+            "apply_peer_endpoint_bypass_routes",
+            "apply_routes",
+            "apply_firewall_killswitch",
+            "apply_nat_forwarding",
+            "apply_dns_protection",
+            "assert_dns_protection",
+            "hard_disable_ipv6_egress",
+            "assert_exit_policy:full_tunnel",
+        ];
+        let mut last_idx = None;
+        for expected in expected_order {
+            let idx = controller
+                .system
+                .operations
+                .iter()
+                .position(|op| op == expected || op.starts_with(&format!("{expected}:")))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected operation {expected} missing from {:?}",
+                        controller.system.operations
+                    )
+                });
+            if let Some(previous) = last_idx {
+                assert!(
+                    previous < idx,
+                    "full-tunnel route/DNS ordering regressed; ops={:?}",
+                    controller.system.operations
+                );
+            }
+            last_idx = Some(idx);
+        }
+    }
+
+    #[test]
+    fn full_tunnel_dns_assert_failure_rolls_back_dns_and_blocks_exit_mode() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default().fail_on("assert_dns_protection"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        let err = controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    protected_dns: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("DNS assertion failure must fail closed before exit mode");
+
+        assert!(matches!(err, Phase10Error::System(_)));
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
+        assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"rollback_dns_protection".to_owned()),
+            "DNS assertion failure must rollback applied DNS protection; ops={:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller
+                .system
+                .operations
+                .contains(&"assert_exit_policy:full_tunnel".to_owned()),
+            "exit policy must not commit after DNS assertion failure; ops={:?}",
+            controller.system.operations
+        );
+    }
+
+    #[test]
+    fn full_tunnel_exit_policy_failure_rolls_backend_exit_mode_back_to_off() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default().fail_on("assert_exit_policy:full_tunnel"),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    protected_dns: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect_err("exit-policy assertion failure must fail closed");
+
+        assert_eq!(controller.state(), DataplaneState::FailClosed);
+        assert_eq!(controller.current_exit_mode(), ExitMode::Off);
+        assert_eq!(controller.backend.exit_mode, ExitMode::Off);
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"rollback_dns_protection".to_owned()),
+            "rollback must unwind DNS after exit-policy failure; ops={:?}",
+            controller.system.operations
         );
     }
 
@@ -9702,6 +10005,33 @@ mod tests {
     }
 
     #[test]
+    fn macos_render_pf_rules_full_tunnel_dns_snapshot() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_protected = true;
+        system.allow_egress_interface = true;
+        system.ipv6_blocked = true;
+
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+
+        assert_eq!(
+            rules,
+            "set block-policy drop\n\
+             pass out quick inet on lo0 all keep state\n\
+             pass out quick inet proto udp on utun9 to any port 53 keep state\n\
+             pass out quick inet proto tcp on utun9 to any port 53 keep state\n\
+             block drop out quick inet proto udp to any port 53\n\
+             block drop out quick inet proto tcp to any port 53\n\
+             pass out quick inet on utun9 all keep state\n\
+             pass out quick inet on en0 all keep state\n\
+             block drop out quick inet6 all\n\
+             block drop out quick all\n"
+        );
+    }
+
+    #[test]
     fn macos_render_pf_rules_omits_dns_fail_closed_rules_when_disabled() {
         let system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
             .expect("macos system should construct");
@@ -9715,7 +10045,53 @@ mod tests {
     }
 
     #[test]
-    fn macos_render_pf_rules_preserve_inbound_management_ssh_replies() {
+    fn macos_render_pf_rules_strict_fail_closed_snapshot() {
+        let system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+
+        let rules = system
+            .render_pf_rules(true)
+            .expect("rule render should succeed");
+
+        assert_eq!(rules, "set block-policy drop\nblock drop out quick all\n");
+    }
+
+    #[test]
+    fn macos_render_pf_rules_relay_with_upstream_snapshot() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.allow_egress_interface = true;
+
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+
+        assert_eq!(
+            rules,
+            "set block-policy drop\n\
+             pass out quick inet on lo0 all keep state\n\
+             pass out quick inet on utun9 all keep state\n\
+             pass out quick inet on en0 all keep state\n\
+             block drop out quick all\n"
+        );
+    }
+
+    #[test]
+    fn macos_assert_dns_protection_requires_active_dns_rules() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+
+        let err = DataplaneSystem::assert_dns_protection(&mut system)
+            .expect_err("inactive macOS DNS protection must fail closed");
+        assert!(err.to_string().contains("DNS protection is not active"));
+
+        system.dns_protected = true;
+        DataplaneSystem::assert_dns_protection(&mut system)
+            .expect("active macOS DNS protection must render tunnel-pass and egress-block rules");
+    }
+
+    #[test]
+    fn macos_render_pf_rules_allow_inbound_management_ssh() {
         let system = MacosCommandSystem::new(
             "utun9",
             "en0",
@@ -9731,11 +10107,14 @@ mod tests {
         let rules = system
             .render_pf_rules(false)
             .expect("rule render should succeed");
+        // Inbound SSH from management CIDR: keep state lets the reply
+        // (SYN-ACK) pass through block drop out quick all automatically.
+        assert!(rules.contains(
+            "pass in quick inet proto tcp from 192.168.128.0/24 to any port 22 keep state"
+        ));
+        // Node-initiated SSH to management hosts.
         assert!(rules.contains(
             "pass out quick inet proto tcp from any to 192.168.128.0/24 port 22 keep state"
-        ));
-        assert!(rules.contains(
-            "pass out quick inet proto tcp from any port 22 to 192.168.128.0/24 keep state"
         ));
     }
 

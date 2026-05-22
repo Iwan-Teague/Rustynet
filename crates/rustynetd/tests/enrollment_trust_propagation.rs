@@ -43,6 +43,7 @@ use rustynet_control::membership::{
     MembershipNode, MembershipNodeStatus, MembershipReplayCache, MembershipSignature,
     MembershipState, SignedMembershipUpdate, apply_signed_update,
 };
+use rustynet_control::roles::RoleCapability;
 
 use rustynetd::enrollment_token::{
     ConsumedTokenLedger, ENROLLMENT_SECRET_LEN, EnrollmentTokenError, mint_token_with_clock,
@@ -70,6 +71,7 @@ fn base_state() -> MembershipState {
             node_pubkey_hex: hex_lower(&founder_pubkey),
             owner: "alice".to_owned(),
             status: MembershipNodeStatus::Active,
+            capabilities: vec![RoleCapability::Anchor],
             roles: vec!["admin".to_owned()],
             joined_at_unix: 1_700_000_000,
             updated_at_unix: 1_700_000_000,

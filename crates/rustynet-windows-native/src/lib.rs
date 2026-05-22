@@ -1,7 +1,46 @@
+use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(windows))]
 use std::path::Path;
 #[cfg(not(windows))]
 use std::time::Duration;
+
+pub const WINDOWS_IF_OPER_STATUS_UP: u32 = 1;
+pub const WINDOWS_IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsNetworkAdapterSnapshot {
+    pub adapter_name: String,
+    pub friendly_name: String,
+    pub description: String,
+    pub if_index: u32,
+    pub ipv6_if_index: u32,
+    pub if_type: u32,
+    pub oper_status: u32,
+    pub ipv4_metric: u32,
+    pub ipv6_metric: u32,
+    pub unicast_addresses: Vec<IpAddr>,
+    pub default_gateways: Vec<IpAddr>,
+}
+
+impl WindowsNetworkAdapterSnapshot {
+    pub fn display_name(&self) -> &str {
+        if !self.friendly_name.is_empty() {
+            &self.friendly_name
+        } else if !self.adapter_name.is_empty() {
+            &self.adapter_name
+        } else {
+            &self.description
+        }
+    }
+
+    pub fn is_oper_up(&self) -> bool {
+        self.oper_status == WINDOWS_IF_OPER_STATUS_UP
+    }
+
+    pub fn is_loopback(&self) -> bool {
+        self.if_type == WINDOWS_IF_TYPE_SOFTWARE_LOOPBACK
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsDpapiScope {
@@ -124,17 +163,77 @@ pub fn call_named_pipe(
     Err("Windows named pipes are only available on Windows hosts".to_owned())
 }
 
+#[cfg(not(windows))]
+pub fn get_adapters_addresses() -> Result<Vec<WindowsNetworkAdapterSnapshot>, String> {
+    Err("GetAdaptersAddresses is only available on Windows hosts".to_owned())
+}
+
+pub fn detect_default_gateway() -> Result<IpAddr, String> {
+    let adapters = get_adapters_addresses()?;
+    select_default_gateway_from_adapters(&adapters)
+}
+
+pub fn select_default_gateway_from_adapters(
+    adapters: &[WindowsNetworkAdapterSnapshot],
+) -> Result<IpAddr, String> {
+    let mut best: Option<(u8, u32, usize, IpAddr)> = None;
+    for (adapter_idx, adapter) in adapters.iter().enumerate() {
+        if !adapter.is_oper_up() || adapter.is_loopback() {
+            continue;
+        }
+        for gateway in &adapter.default_gateways {
+            if !gateway_is_usable_for_port_mapping(*gateway) {
+                continue;
+            }
+            let family_rank = if gateway.is_ipv4() { 0 } else { 1 };
+            let metric = if gateway.is_ipv4() {
+                adapter.ipv4_metric
+            } else {
+                adapter.ipv6_metric
+            };
+            let candidate = (family_rank, metric, adapter_idx, *gateway);
+            if best.is_none_or(|current| candidate < current) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(_, _, _, gateway)| gateway)
+        .ok_or_else(|| "no usable Windows default gateway found".to_owned())
+}
+
+fn gateway_is_usable_for_port_mapping(gateway: IpAddr) -> bool {
+    match gateway {
+        IpAddr::V4(ip) => {
+            !ip.is_unspecified()
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+                && ip != Ipv4Addr::new(255, 255, 255, 255)
+        }
+        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast(),
+    }
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::WindowsDpapiScope;
-    use std::ffi::c_void;
+    use super::{WindowsDpapiScope, WindowsNetworkAdapterSnapshot};
+    use std::ffi::{CStr, c_void};
     use std::mem::size_of;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::Path;
     use std::ptr::{null, null_mut};
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED,
-        GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA,
+        ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, NO_ERROR,
+    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+        IP_ADAPTER_GATEWAY_ADDRESS_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET_ADDRESS,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
@@ -556,6 +655,116 @@ mod imp {
         Ok(response)
     }
 
+    pub fn get_adapters_addresses() -> Result<Vec<WindowsNetworkAdapterSnapshot>, String> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut size = 15 * 1024u32;
+        for _ in 0..MAX_ATTEMPTS {
+            let mut buffer = vec![0u8; size as usize];
+            let ret = unsafe {
+                GetAdaptersAddresses(
+                    u32::from(AF_UNSPEC),
+                    GAA_FLAG_SKIP_ANYCAST
+                        | GAA_FLAG_SKIP_MULTICAST
+                        | GAA_FLAG_SKIP_DNS_SERVER
+                        | GAA_FLAG_INCLUDE_GATEWAYS,
+                    null(),
+                    buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+                    &mut size,
+                )
+            };
+            if ret == NO_ERROR {
+                let head = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+                return adapters_from_linked_list(head);
+            }
+            if ret != ERROR_BUFFER_OVERFLOW {
+                return Err(format!(
+                    "GetAdaptersAddresses failed with Windows error {ret}"
+                ));
+            }
+        }
+        Err("GetAdaptersAddresses failed after repeated buffer growth".to_owned())
+    }
+
+    fn adapters_from_linked_list(
+        mut adapter: *const IP_ADAPTER_ADDRESSES_LH,
+    ) -> Result<Vec<WindowsNetworkAdapterSnapshot>, String> {
+        let mut out = Vec::new();
+        while !adapter.is_null() {
+            let current = unsafe { &*adapter };
+            let unicast_addresses = unicast_addresses_from_linked_list(current.FirstUnicastAddress);
+            let default_gateways = gateway_addresses_from_linked_list(current.FirstGatewayAddress);
+            let if_index = unsafe { current.Anonymous1.Anonymous.IfIndex };
+            out.push(WindowsNetworkAdapterSnapshot {
+                adapter_name: pstr_to_string(current.AdapterName),
+                friendly_name: pwstr_to_string(current.FriendlyName)?,
+                description: pwstr_to_string(current.Description)?,
+                if_index,
+                ipv6_if_index: current.Ipv6IfIndex,
+                if_type: current.IfType,
+                oper_status: current.OperStatus as u32,
+                ipv4_metric: current.Ipv4Metric,
+                ipv6_metric: current.Ipv6Metric,
+                unicast_addresses,
+                default_gateways,
+            });
+            adapter = current.Next;
+        }
+        Ok(out)
+    }
+
+    fn unicast_addresses_from_linked_list(
+        mut address: *const IP_ADAPTER_UNICAST_ADDRESS_LH,
+    ) -> Vec<IpAddr> {
+        let mut out = Vec::new();
+        while !address.is_null() {
+            let current = unsafe { &*address };
+            if let Some(ip) = socket_address_to_ipaddr(&current.Address) {
+                out.push(ip);
+            }
+            address = current.Next;
+        }
+        out
+    }
+
+    fn gateway_addresses_from_linked_list(
+        mut address: *const IP_ADAPTER_GATEWAY_ADDRESS_LH,
+    ) -> Vec<IpAddr> {
+        let mut out = Vec::new();
+        while !address.is_null() {
+            let current = unsafe { &*address };
+            if let Some(ip) = socket_address_to_ipaddr(&current.Address) {
+                out.push(ip);
+            }
+            address = current.Next;
+        }
+        out
+    }
+
+    fn socket_address_to_ipaddr(address: &SOCKET_ADDRESS) -> Option<IpAddr> {
+        let sockaddr = address.lpSockaddr;
+        if sockaddr.is_null() {
+            return None;
+        }
+        sockaddr_to_ipaddr(sockaddr)
+    }
+
+    fn sockaddr_to_ipaddr(sockaddr: *const SOCKADDR) -> Option<IpAddr> {
+        let family = unsafe { (*sockaddr).sa_family };
+        match family {
+            AF_INET => {
+                let addr = unsafe { &*(sockaddr.cast::<SOCKADDR_IN>()) };
+                let raw = unsafe { addr.sin_addr.S_un.S_addr };
+                Some(IpAddr::V4(Ipv4Addr::from(raw.to_ne_bytes())))
+            }
+            AF_INET6 => {
+                let addr = unsafe { &*(sockaddr.cast::<SOCKADDR_IN6>()) };
+                let raw = unsafe { addr.sin6_addr.u.Byte };
+                Some(IpAddr::V6(Ipv6Addr::from(raw)))
+            }
+            _ => None,
+        }
+    }
+
     fn read_pipe_message(handle: HANDLE, max_message_bytes: usize) -> Result<Vec<u8>, String> {
         let mut buffer = vec![0u8; max_message_bytes];
         let mut bytes_read = 0u32;
@@ -666,6 +875,29 @@ mod imp {
             LocalFree(ptr.cast::<c_void>());
             Ok(value)
         }
+    }
+
+    fn pwstr_to_string(ptr: *const u16) -> Result<String, String> {
+        if ptr.is_null() {
+            return Ok(String::new());
+        }
+        let mut len = 0usize;
+        unsafe {
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(ptr, len);
+            String::from_utf16(slice).map_err(|err| format!("UTF-16 decode failed: {err}"))
+        }
+    }
+
+    fn pstr_to_string(ptr: *const u8) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(ptr.cast()) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn blob_from_slice(value: &[u8]) -> Result<CRYPT_INTEGER_BLOB, String> {
@@ -941,6 +1173,91 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{
     call_named_pipe, dpapi_protect, dpapi_unprotect, extract_signer_thumbprint_sha256,
-    inspect_file_sddl, inspect_registry_key_sddl, lookup_account_sid_string,
-    serve_named_pipe_one_message, verify_authenticode_chain,
+    get_adapters_addresses, inspect_file_sddl, inspect_registry_key_sddl,
+    lookup_account_sid_string, serve_named_pipe_one_message, verify_authenticode_chain,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(
+        oper_status: u32,
+        if_type: u32,
+        ipv4_metric: u32,
+        ipv6_metric: u32,
+        default_gateways: Vec<IpAddr>,
+    ) -> WindowsNetworkAdapterSnapshot {
+        WindowsNetworkAdapterSnapshot {
+            adapter_name: "adapter-guid".to_owned(),
+            friendly_name: "Ethernet".to_owned(),
+            description: "Test adapter".to_owned(),
+            if_index: 12,
+            ipv6_if_index: 12,
+            if_type,
+            oper_status,
+            ipv4_metric,
+            ipv6_metric,
+            unicast_addresses: vec![],
+            default_gateways,
+        }
+    }
+
+    #[test]
+    fn select_default_gateway_prefers_lowest_metric_ipv4_on_up_adapter() {
+        let slow = snapshot(
+            WINDOWS_IF_OPER_STATUS_UP,
+            6,
+            500,
+            500,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))],
+        );
+        let fast = snapshot(
+            WINDOWS_IF_OPER_STATUS_UP,
+            6,
+            10,
+            10,
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))],
+        );
+        let gateway = select_default_gateway_from_adapters(&[slow, fast]).expect("gateway");
+        assert_eq!(gateway, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn select_default_gateway_skips_down_loopback_and_unusable_gateways() {
+        let down = snapshot(2, 6, 1, 1, vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))]);
+        let loopback = snapshot(
+            WINDOWS_IF_OPER_STATUS_UP,
+            WINDOWS_IF_TYPE_SOFTWARE_LOOPBACK,
+            1,
+            1,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+        );
+        let usable = snapshot(
+            WINDOWS_IF_OPER_STATUS_UP,
+            6,
+            50,
+            50,
+            vec![IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))],
+        );
+        let gateway =
+            select_default_gateway_from_adapters(&[down, loopback, usable]).expect("gateway");
+        assert_eq!(gateway, IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)));
+    }
+
+    #[test]
+    fn select_default_gateway_fails_closed_without_usable_route() {
+        let bad = snapshot(
+            WINDOWS_IF_OPER_STATUS_UP,
+            6,
+            1,
+            1,
+            vec![
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        );
+        let err = select_default_gateway_from_adapters(&[bad]).expect_err("no gateway");
+        assert!(err.contains("no usable Windows default gateway"));
+    }
+}

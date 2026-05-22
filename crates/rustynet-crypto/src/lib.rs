@@ -503,7 +503,35 @@ pub fn load_macos_generic_password(service: &str, account: &str) -> Result<Vec<u
     if service.trim().is_empty() || account.trim().is_empty() {
         return Err(CryptoError::OsStoreUnavailable);
     }
-    get_generic_password(service, account).map_err(|_| CryptoError::OsStoreUnavailable)
+    // Try the framework API first (works in GUI/user sessions with default keychain).
+    if let Ok(pw) = get_generic_password(service, account) {
+        return Ok(pw);
+    }
+    // Fallback: query the System keychain explicitly via the security CLI.
+    // Required for system launch daemons that run without a user keychain session.
+    // service/account are validated upstream (normalize_macos_keychain_account).
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-a",
+            account,
+            "-s",
+            service,
+            "-w",
+            "/Library/Keychains/System.keychain",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    if output.status.success() {
+        let mut bytes = output.stdout;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        return Ok(bytes);
+    }
+    Err(CryptoError::OsStoreUnavailable)
 }
 
 #[cfg(target_os = "linux")]

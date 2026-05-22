@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod anchor_init;
 mod env_file;
 mod live_lab_results;
 mod ops_cross_network_preflight;
@@ -25,9 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::SocketAddr;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -36,17 +37,22 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::anchor_init::{AnchorInitConfig, build_anchor_init_plan, render_anchor_init_plan};
 use crate::env_file::{format_env_assignment, parse_env_value};
 use ed25519_dalek::{Signer, SigningKey};
 use nix::unistd::{Gid, Group, Uid, User, chown};
 use rand::{TryRngCore, rngs::OsRng};
 use rustynet_control::membership::{
-    MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
-    MembershipNodeStatus, MembershipOperation, MembershipReplayCache, MembershipUpdateRecord,
-    SignedMembershipUpdate, append_membership_log_entry, apply_signed_update, decode_signed_update,
-    decode_update_record, encode_signed_update, encode_update_record, load_membership_log,
-    load_membership_snapshot, persist_membership_snapshot, replay_membership_snapshot_and_log,
-    sign_update_record, write_membership_audit_log,
+    MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipApprover, MembershipApproverRole,
+    MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipOperation,
+    MembershipReplayCache, MembershipUpdateRecord, SignedMembershipUpdate,
+    append_membership_log_entry, apply_signed_update, decode_signed_update, decode_update_record,
+    encode_signed_update, encode_update_record, load_membership_log, load_membership_snapshot,
+    persist_membership_snapshot, replay_membership_snapshot_and_log, sign_update_record,
+    write_membership_audit_log,
+};
+use rustynet_control::roles::{
+    ANCHOR_CAPABILITIES, RoleCapability, parse_role_capability_csv, role_capability_csv,
 };
 use rustynet_control::{
     AutoTunnelBundleRequest, ControlPlaneCore, EndpointHintBundleRequest, EndpointHintCandidate,
@@ -64,14 +70,15 @@ use rustynet_local_security::{
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
-    DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME,
-    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
-    DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
-    DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_TRAVERSAL_WATERMARK_PATH,
-    DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE,
-    DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
-    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, verify_signed_assignment_state_artifact,
-    verify_signed_traversal_state_artifact, verify_signed_trust_state_artifact,
+    DEFAULT_ANCHOR_BUNDLE_PULL_ADDR, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+    DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME, DEFAULT_MEMBERSHIP_LOG_PATH,
+    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH, DEFAULT_TRAVERSAL_BUNDLE_PATH,
+    DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
+    DEFAULT_TRAVERSAL_WATERMARK_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
+    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
+    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
+    verify_signed_assignment_state_artifact, verify_signed_traversal_state_artifact,
+    verify_signed_trust_state_artifact,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
@@ -126,6 +133,7 @@ enum CliCommand {
     KeyRevoke,
     Assignment(Box<AssignmentCommand>),
     Membership(Box<MembershipCommand>),
+    Anchor(Box<AnchorCommand>),
     /// D2.7 — enrollment-token operator surface: `rustynet
     /// enrollment {mint, verify, consume}`. Mint and Verify run
     /// locally against a secret file the operator owns; Consume
@@ -292,6 +300,34 @@ enum CapabilityCommand {
     Add(rustynet_control::role_presets::Capability),
     /// `rustynet capability remove <flag>` — counterpart to Add.
     Remove(rustynet_control::role_presets::Capability),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AnchorCommand {
+    Advertise(AnchorAdvertiseConfig),
+    List {
+        paths: MembershipPaths,
+    },
+    PullBundle {
+        addr: String,
+        token: String,
+        output_path: PathBuf,
+    },
+    Init {
+        config: AnchorInitConfig,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchorAdvertiseConfig {
+    paths: MembershipPaths,
+    output_path: PathBuf,
+    node_id: String,
+    requested_capabilities: Vec<RoleCapability>,
+    update_id: String,
+    reason_code: String,
+    policy_context: Option<String>,
+    expires_in_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -975,6 +1011,7 @@ enum OpsCommand {
     E2eMembershipAdd {
         client_node_id: String,
         client_pubkey_hex: String,
+        capabilities: String,
         owner_approver_id: String,
     },
     E2eIssueAssignments {
@@ -1006,6 +1043,7 @@ struct AssignmentNodeSpec {
     hostname: String,
     os: String,
     tags: Vec<String>,
+    capabilities: Vec<RoleCapability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1562,6 +1600,10 @@ fn parse_command(args: &[String]) -> CliCommand {
         },
         [cmd, rest @ ..] if cmd == "membership" => match parse_membership_command(rest) {
             Ok(command) => CliCommand::Membership(Box::new(command)),
+            Err(_) => CliCommand::Help,
+        },
+        [cmd, rest @ ..] if cmd == "anchor" => match parse_anchor_command(rest) {
+            Ok(command) => CliCommand::Anchor(Box::new(command)),
             Err(_) => CliCommand::Help,
         },
         [cmd, rest @ ..] if cmd == "enrollment" => match parse_enrollment_command(rest) {
@@ -4016,6 +4058,9 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "e2e-membership-add" => Ok(OpsCommand::E2eMembershipAdd {
             client_node_id: parser.required("--client-node-id")?,
             client_pubkey_hex: parser.required("--client-pubkey-hex")?,
+            capabilities: parser
+                .value("--capabilities")
+                .unwrap_or_else(|| "client".to_owned()),
             owner_approver_id: parser.required("--owner-approver-id")?,
         }),
         "e2e-issue-assignments" => Ok(OpsCommand::E2eIssueAssignments {
@@ -4095,12 +4140,17 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             let roles = parser
                 .value("--roles")
                 .map_or_else(|| vec!["tag:members".to_owned()], split_csv);
+            let capabilities = parser.value("--capabilities").map_or_else(
+                || Ok(vec![RoleCapability::Client]),
+                |value| parse_role_capability_csv(&value).map_err(|err| err.to_string()),
+            )?;
             let operation = MembershipOperation::AddNode(MembershipNode {
                 node_id: node_id.clone(),
                 node_pubkey_hex,
                 owner,
                 status: MembershipNodeStatus::Active,
                 roles,
+                capabilities,
                 joined_at_unix: now_unix,
                 updated_at_unix: now_unix,
             });
@@ -4219,6 +4269,83 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
         }),
         _ => Err(format!("unknown membership subcommand: {subcommand}")),
     }
+}
+
+fn parse_anchor_command(args: &[String]) -> Result<AnchorCommand, String> {
+    if args.is_empty() {
+        return Err("anchor subcommand is required".to_owned());
+    }
+    let subcommand = args[0].as_str();
+    let parser = OptionParser::parse(&args[1..])?;
+    let paths = parser.membership_paths();
+
+    match subcommand {
+        "advertise" => {
+            let node_id = parser.required("--node-id")?;
+            let requested_capabilities =
+                parse_anchor_advertise_capabilities(parser.value("--capabilities"))?;
+            Ok(AnchorCommand::Advertise(AnchorAdvertiseConfig {
+                paths,
+                output_path: parser.required_path("--output")?,
+                node_id,
+                requested_capabilities,
+                update_id: parser
+                    .value("--update-id")
+                    .unwrap_or_else(generate_update_id),
+                reason_code: parser
+                    .value("--reason")
+                    .unwrap_or_else(|| "anchor_advertise".to_owned()),
+                policy_context: parser.value("--policy-context"),
+                expires_in_secs: parser.parse_u64_or_default("--expires-in", 300)?,
+            }))
+        }
+        "list" => Ok(AnchorCommand::List { paths }),
+        "pull-bundle" => Ok(AnchorCommand::PullBundle {
+            addr: parser
+                .value("--addr")
+                .unwrap_or_else(|| DEFAULT_ANCHOR_BUNDLE_PULL_ADDR.to_owned()),
+            token: parser.required("--token")?,
+            output_path: parser.required_path("--output")?,
+        }),
+        "init" => {
+            let defaults = AnchorInitConfig::default();
+            Ok(AnchorCommand::Init {
+                config: AnchorInitConfig {
+                    node_id: parser.value("--node-id").unwrap_or(defaults.node_id),
+                    advertise_output_path: parser
+                        .optional_path("--output")
+                        .unwrap_or(defaults.advertise_output_path),
+                    relay_bind: parser.value("--relay-bind").unwrap_or(defaults.relay_bind),
+                    bundle_pull_addr: parser
+                        .value("--bundle-pull-addr")
+                        .unwrap_or(defaults.bundle_pull_addr),
+                    dry_run: parser.has_flag("--dry-run"),
+                },
+            })
+        }
+        _ => Err(format!("unknown anchor subcommand: {subcommand}")),
+    }
+}
+
+fn parse_anchor_advertise_capabilities(raw: Option<String>) -> Result<Vec<RoleCapability>, String> {
+    let parsed = match raw {
+        Some(value) => parse_role_capability_csv(&value).map_err(|err| err.to_string())?,
+        None => ANCHOR_CAPABILITIES.to_vec(),
+    };
+    let mut out = Vec::new();
+    out.push(RoleCapability::Anchor);
+    for capability in parsed {
+        if !capability.is_anchor_capability() {
+            return Err(format!(
+                "anchor advertise capability must be one of anchor.* capabilities, got {capability}"
+            ));
+        }
+        out.push(capability);
+        if capability == RoleCapability::AnchorRelayColocation {
+            out.push(RoleCapability::RelayHost);
+        }
+    }
+    Ok(rustynet_control::roles::canonicalize_role_capabilities(out))
 }
 
 fn parse_assignment_command(args: &[String]) -> Result<AssignmentCommand, String> {
@@ -4694,6 +4821,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::Traversal(command) => execute_traversal(*command),
         CliCommand::Assignment(command) => execute_assignment(*command),
         CliCommand::Membership(command) => execute_membership(*command),
+        CliCommand::Anchor(command) => execute_anchor(*command),
         CliCommand::Enrollment(command) => execute_enrollment(*command),
         CliCommand::Trust(command) => execute_trust(*command),
         CliCommand::Ops(command) => execute_ops(*command),
@@ -4782,6 +4910,7 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                         hostname: node.hostname,
                         os: node.os,
                         tags: node.tags,
+                        capabilities: node.capabilities,
                         owner: node.owner,
                         endpoint: node.endpoint,
                         last_seen_unix: generated_at_unix,
@@ -4888,6 +5017,7 @@ fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String
                 hostname: node.hostname,
                 os: node.os,
                 tags: node.tags,
+                capabilities: node.capabilities,
                 owner: node.owner,
                 endpoint: node.endpoint,
                 last_seen_unix: generated_at_unix,
@@ -4978,6 +5108,7 @@ fn execute_traversal_issue(command: TraversalIssueCommand) -> Result<String, Str
                 hostname: node.hostname,
                 os: node.os,
                 tags: node.tags,
+                capabilities: node.capabilities,
                 owner: node.owner,
                 endpoint: node.endpoint,
                 last_seen_unix: generated_at_unix,
@@ -5189,6 +5320,144 @@ fn render_operator_action(action: &str, result: Result<IpcResponse, String>) {
         Ok(response) if response.ok => println!("{action}: {}", response.message),
         Ok(response) => println!("{action}: failed: {}", response.message),
         Err(err) => println!("{action}: daemon unreachable: {err}"),
+    }
+}
+
+fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
+    match command {
+        AnchorCommand::Advertise(config) => {
+            let (_, _, state) = load_current_membership_state(&config.paths, unix_now())?;
+            let prev_root = state.state_root_hex().map_err(|err| err.to_string())?;
+            let existing = state
+                .nodes
+                .iter()
+                .find(|node| node.node_id == config.node_id)
+                .ok_or_else(|| format!("membership node {} not found", config.node_id))?;
+            let mut capabilities = existing.capabilities.clone();
+            capabilities.extend(config.requested_capabilities.iter().copied());
+            let capabilities =
+                rustynet_control::roles::canonicalize_role_capabilities(capabilities);
+            let operation = MembershipOperation::SetNodeCapabilities {
+                node_id: config.node_id.clone(),
+                capabilities,
+            };
+            let candidate = rustynet_control::membership::preview_next_state(&state, &operation)
+                .map_err(|err| err.to_string())?;
+            let new_root = candidate.state_root_hex().map_err(|err| err.to_string())?;
+            let created_at_unix = unix_now();
+            let expires_at_unix = created_at_unix.saturating_add(config.expires_in_secs);
+            if expires_at_unix <= created_at_unix {
+                return Err("invalid expiry window: --expires-in must be > 0".to_owned());
+            }
+            let record = MembershipUpdateRecord {
+                network_id: state.network_id,
+                update_id: config.update_id,
+                operation,
+                target: config.node_id,
+                prev_state_root: prev_root,
+                new_state_root: new_root,
+                epoch_prev: state.epoch,
+                epoch_new: state.epoch.saturating_add(1),
+                created_at_unix,
+                expires_at_unix,
+                reason_code: config.reason_code,
+                policy_context: config.policy_context,
+            };
+            let payload = encode_update_record(&record).map_err(|err| err.to_string())?;
+            write_text_file(&config.output_path, &payload)?;
+            Ok(format!(
+                "anchor advertise proposal written: {} target={} epoch_new={}",
+                config.output_path.display(),
+                record.target,
+                record.epoch_new
+            ))
+        }
+        AnchorCommand::List { paths } => {
+            let (_, _, state) = load_current_membership_state(&paths, unix_now())?;
+            let mut rows = state
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.status == MembershipNodeStatus::Active
+                        && node.capabilities.iter().any(|capability| {
+                            *capability == RoleCapability::Anchor
+                                || capability.is_anchor_capability()
+                        })
+                })
+                .map(|node| {
+                    format!(
+                        "{} capabilities={}",
+                        node.node_id,
+                        role_capability_csv(&node.capabilities)
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            if rows.is_empty() {
+                Ok("anchor nodes: none".to_owned())
+            } else {
+                Ok(format!("anchor nodes:\n{}", rows.join("\n")))
+            }
+        }
+        AnchorCommand::PullBundle {
+            addr,
+            token,
+            output_path,
+        } => {
+            let mut resolved = addr
+                .to_socket_addrs()
+                .map_err(|err| format!("resolve anchor bundle-pull addr failed: {err}"))?;
+            let socket_addr = resolved
+                .find(|candidate| candidate.ip().is_loopback())
+                .ok_or_else(|| "anchor bundle-pull addr must resolve to loopback".to_owned())?;
+            let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5))
+                .map_err(|err| format!("connect anchor bundle-pull failed: {err}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|err| format!("set anchor bundle-pull read timeout failed: {err}"))?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .map_err(|err| format!("set anchor bundle-pull write timeout failed: {err}"))?;
+            stream
+                .write_all(format!("{token}\n").as_bytes())
+                .map_err(|err| format!("write anchor bundle-pull token failed: {err}"))?;
+            let mut response = Vec::new();
+            stream
+                .take(MAX_MEMBERSHIP_SNAPSHOT_BYTES as u64 + 128)
+                .read_to_end(&mut response)
+                .map_err(|err| format!("read anchor bundle-pull response failed: {err}"))?;
+            let Some(header_end) = response.iter().position(|byte| *byte == b'\n') else {
+                return Err("anchor bundle-pull response missing header".to_owned());
+            };
+            let header = std::str::from_utf8(&response[..header_end])
+                .map_err(|_| "anchor bundle-pull response header is not utf8".to_owned())?;
+            let Some(size_raw) = header.strip_prefix("OK ") else {
+                return Err(format!("anchor bundle-pull failed: {header}"));
+            };
+            let expected_size = size_raw
+                .parse::<usize>()
+                .map_err(|_| "anchor bundle-pull response size is invalid".to_owned())?;
+            if expected_size > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+                return Err("anchor bundle-pull response exceeds maximum bundle size".to_owned());
+            }
+            let bundle = &response[header_end + 1..];
+            if bundle.len() != expected_size {
+                return Err(format!(
+                    "anchor bundle-pull response size mismatch: expected {expected_size}, got {}",
+                    bundle.len()
+                ));
+            }
+            write_bytes_file(&output_path, bundle)?;
+            Ok(format!(
+                "anchor bundle pulled: {} bytes written to {}",
+                bundle.len(),
+                output_path.display()
+            ))
+        }
+        AnchorCommand::Init { config } => {
+            let plan = build_anchor_init_plan(&config)?;
+            Ok(render_anchor_init_plan(&plan))
+        }
     }
 }
 
@@ -6133,10 +6402,12 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::E2eMembershipAdd {
             client_node_id,
             client_pubkey_hex,
+            capabilities,
             owner_approver_id,
         } => ops_e2e::execute_ops_e2e_membership_add(
             client_node_id,
             client_pubkey_hex,
+            capabilities,
             owner_approver_id,
         ),
         OpsCommand::E2eIssueAssignments {
@@ -7581,8 +7852,7 @@ const PHASE6_MAX_EVIDENCE_AGE_SECS: u64 = 31 * 24 * 60 * 60;
 const DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     concat!("/etc/rustynet/credentials/", "wg", "_key_passphrase.cred");
 const DEFAULT_LEGACY_LINUX_WG_PRIVATE_KEY_PATH: &str = "/etc/rustynet/wireguard.key";
-const DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE: &str =
-    concat!("rustynet.", "wg", "_passphrase");
+const DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE: &str = "net.rustynet.wg-key-passphrase";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SigningPassphraseHostProfile {
@@ -8473,13 +8743,10 @@ fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, 
     let keychain_account = required_macos_tunnel_keychain_account(
         env_string_or_default("RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT", "")?.as_str(),
     )?;
-    let keychain_service = env_required_nonempty(
+    let keychain_service = required_macos_tunnel_keychain_service(&env_required_nonempty(
         "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE",
         "macOS tunnel keychain service",
-    )?;
-    if keychain_service.trim().is_empty() {
-        return Err("macOS tunnel keychain service must not be empty".to_owned());
-    }
+    )?)?;
 
     let wg_passphrase_path = env_required_path("RUSTYNET_WG_KEY_PASSPHRASE")?;
     validate_macos_wg_passphrase_placeholder_path(wg_passphrase_path.as_path())?;
@@ -10736,32 +11003,48 @@ fn required_macos_tunnel_keychain_account(account: &str) -> Result<String, Strin
             "macOS tunnel keychain account is required (RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT)".to_owned(),
         );
     }
+    if normalized != account {
+        return Err(
+            "macOS tunnel keychain account must not contain leading or trailing whitespace"
+                .to_owned(),
+        );
+    }
     if normalized.len() > 128 {
         return Err("macOS tunnel keychain account exceeds max length (128)".to_owned());
     }
     if !normalized
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':'))
     {
         return Err(
-            "macOS tunnel keychain account contains invalid characters; allowed: [A-Za-z0-9._-]"
+            "macOS tunnel keychain account contains invalid characters; allowed: [A-Za-z0-9._:-]"
                 .to_owned(),
         );
     }
     Ok(normalized.to_owned())
 }
 
-fn macos_generic_password_exists(service: &str, account: &str) -> Result<bool, String> {
+fn required_macos_tunnel_keychain_service(service: &str) -> Result<String, String> {
     let normalized_service = service.trim();
     if normalized_service.is_empty() {
         return Err(
             "macOS tunnel keychain service is required (RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE)".to_owned(),
         );
     }
+    if normalized_service != DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE {
+        return Err(format!(
+            "macOS tunnel keychain service must be {DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE:?}, got {normalized_service:?}"
+        ));
+    }
+    Ok(normalized_service.to_owned())
+}
+
+fn macos_generic_password_exists(service: &str, account: &str) -> Result<bool, String> {
+    let normalized_service = required_macos_tunnel_keychain_service(service)?;
     let status = Command::new("security")
         .arg("find-generic-password")
         .arg("-s")
-        .arg(normalized_service)
+        .arg(normalized_service.as_str())
         .arg("-a")
         .arg(account)
         .status()
@@ -11460,10 +11743,10 @@ fn wireguard_custody_ops_config_from_env() -> Result<TunnelCustodyOpsConfig, Str
             "RUSTYNET_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB",
             DEFAULT_WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH,
         )?,
-        macos_keychain_service: env_string_or_default(
+        macos_keychain_service: required_macos_tunnel_keychain_service(&env_string_or_default(
             "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE",
             DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE,
-        )?,
+        )?)?,
         macos_keychain_account: env_string_or_default(
             "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT",
             "",
@@ -12743,6 +13026,13 @@ fn write_text_file(path: &Path, body: &str) -> Result<(), String> {
     fs::write(path, body).map_err(|err| format!("write file failed: {err}"))
 }
 
+fn write_bytes_file(path: &Path, body: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("create parent failed: {err}"))?;
+    }
+    fs::write(path, body).map_err(|err| format!("write file failed: {err}"))
+}
+
 fn encrypted_secret_permission_policy(path: &Path) -> KeyCustodyPermissionPolicy {
     let mut policy = KeyCustodyPermissionPolicy::default();
     if matches!(path.parent(), Some(parent) if parent == Path::new("/etc/rustynet")) {
@@ -12960,8 +13250,8 @@ fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, Stri
         .filter(|entry| !entry.is_empty())
     {
         let fields = raw.split('|').collect::<Vec<_>>();
-        if fields.len() < 3 || fields.len() > 7 {
-            return Err("invalid --nodes entry format; expected node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv]".to_owned());
+        if fields.len() < 3 || fields.len() > 8 {
+            return Err("invalid --nodes entry format; expected node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv|capabilities_csv]".to_owned());
         }
 
         let node_id = fields[0].trim();
@@ -12993,6 +13283,10 @@ fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, Stri
             .get(6)
             .map(|value| split_csv((*value).to_owned()))
             .unwrap_or_default();
+        let capabilities = fields.get(7).map_or_else(
+            || Ok(vec![RoleCapability::Client]),
+            |value| parse_role_capability_csv(value).map_err(|err| err.to_string()),
+        )?;
 
         nodes.push(AssignmentNodeSpec {
             node_id: node_id.to_owned(),
@@ -13002,6 +13296,7 @@ fn parse_assignment_nodes(encoded: &str) -> Result<Vec<AssignmentNodeSpec>, Stri
             hostname,
             os,
             tags,
+            capabilities,
         });
     }
     if nodes.is_empty() {
@@ -13342,13 +13637,36 @@ fn validate_assignment_issue_config(
             "target node {target_node_id} is not present in --nodes",
         ));
     }
-    match exit_node_id {
-        Some(exit_node_id) if !node_ids.contains(exit_node_id) => {
+    if let Some(exit_node_id) = exit_node_id {
+        let Some(exit_node) = nodes.iter().find(|node| node.node_id == exit_node_id) else {
             return Err(format!(
                 "exit node {exit_node_id} is not present in --nodes",
             ));
+        };
+        if !exit_node.capabilities.contains(&RoleCapability::ExitServer) {
+            return Err(format!(
+                "exit node {exit_node_id} lacks exit_server capability in --nodes",
+            ));
         }
-        _ => {}
+        let target_node = nodes
+            .iter()
+            .find(|node| node.node_id == target_node_id)
+            .expect("target already checked");
+        if target_node
+            .capabilities
+            .contains(&RoleCapability::BlindExit)
+        {
+            return Err(format!(
+                "target node {target_node_id} has blind_exit capability and cannot consume exit traffic",
+            ));
+        }
+        if !target_node.capabilities.contains(&RoleCapability::Client)
+            && !target_node.capabilities.contains(&RoleCapability::Anchor)
+        {
+            return Err(format!(
+                "target node {target_node_id} must carry client or anchor capability to consume exit traffic",
+            ));
+        }
     }
     let mut allow_pair_set = HashSet::new();
     for pair in allow_pairs {
@@ -13415,6 +13733,7 @@ impl MembershipOperationName for MembershipOperation {
     fn operation_name_for_cli(&self) -> &'static str {
         match self {
             MembershipOperation::AddNode(_) => "add_node",
+            MembershipOperation::SetNodeCapabilities { .. } => "set_node_capabilities",
             MembershipOperation::RemoveNode { .. } => "remove_node",
             MembershipOperation::RevokeNode { .. } => "revoke_node",
             MembershipOperation::RestoreNode { .. } => "restore_node",
@@ -13541,6 +13860,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::ExitNodeList
         | CliCommand::Role(_)
         | CliCommand::Capability(_)
+        | CliCommand::Anchor(_)
         | CliCommand::ConnectivityTest
         | CliCommand::PeerStats
         | CliCommand::Bandwidth
@@ -13930,7 +14250,11 @@ fn check_macos_doctor(checks: &mut Vec<String>, _all_pass: &mut bool) {
 
     // Check Keychain for passphrase
     if Command::new("security")
-        .args(["find-generic-password", "-s", "rustynet.wg_passphrase"])
+        .args([
+            "find-generic-password",
+            "-s",
+            DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE,
+        ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -15874,6 +16198,8 @@ fn emit_role_audit(event: &rustynet_control::role_audit::RoleTransitionEvent) {
 ///   followup-instructions list tells the operator to do that.
 /// - `AdvertiseDefaultRoute` — `IpcCommand::RouteAdvertise(0.0.0.0/0)`.
 /// - `RetractDefaultRoute` — `IpcCommand::RouteRetract(0.0.0.0/0)`.
+/// - `DeployRelayService` / `UndeployRelayService` — existing
+///   systemd relay installer paths.
 fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, String> {
     match action {
         role_cli::ConcreteAction::NoOp => Ok("no change required".to_owned()),
@@ -15902,6 +16228,18 @@ fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, Stri
                 return Err(format!("route retract failed: {}", response.message));
             }
             Ok("retracted 0.0.0.0/0 (exit-serving torn down)".to_owned())
+        }
+        role_cli::ConcreteAction::DeployRelayService => {
+            ops_install_systemd_relay::execute_install_relay(
+                ops_install_systemd_relay::InstallRelayConfig::default_install(),
+            )
+            .map(|report| report.summary())
+        }
+        role_cli::ConcreteAction::UndeployRelayService => {
+            ops_install_systemd_relay::execute_install_relay(
+                ops_install_systemd_relay::InstallRelayConfig::default_uninstall(),
+            )
+            .map(|report| report.summary())
         }
     }
 }
@@ -16247,10 +16585,10 @@ fn help_text() -> String {
         "  assignment issue --target-node-id <id> --nodes <node_specs> --allow <allow_specs> --signing-secret <path> --signing-secret-passphrase-file <path> --output <path> [--verifier-key-output <path>] [--mesh-cidr <cidr>] [--exit-node-id <id>] [--lan-routes <csv>] [--ttl-secs <secs>] [--generated-at <unix>] [--nonce <n>]",
         "  assignment verify --bundle <path> --verifier-key <path> --watermark <path> [--expected-node-id <id>] [--max-age-secs <secs>] [--max-clock-skew-secs <secs>]",
         "  assignment init-signing-secret --output <path> --signing-secret-passphrase-file <path> [--length-bytes <n>] [--force]",
-        "    node_specs format: node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv];... ",
+        "    node_specs format: node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv|capabilities_csv];... ",
         "    allow_specs format: source_node_id|destination_node_id;...",
         "  membership status [--snapshot <path>] [--log <path>]",
-        "  membership propose-add --node-id <id> --node-pubkey <hex> --owner <owner> --output <path> [--roles <csv>] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
+        "  membership propose-add --node-id <id> --node-pubkey <hex> --owner <owner> --output <path> [--roles <csv>] [--capabilities <csv>] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
         "  membership propose-remove --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-revoke --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-restore --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
@@ -16405,7 +16743,7 @@ fn help_text() -> String {
         "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--ssh-known-hosts-file <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
         "  ops e2e-bootstrap-host --role <role> --node-id <id> --network-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]> [--skip-apt]",
         "  ops e2e-enforce-host --role <role> --node-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]>",
-        "  ops e2e-membership-add --client-node-id <id> --client-pubkey-hex <hex> --owner-approver-id <id>",
+        "  ops e2e-membership-add --client-node-id <id> --client-pubkey-hex <hex> --owner-approver-id <id> [--capabilities <csv>]",
         "  ops e2e-issue-assignments --exit-node-id <id> --client-node-id <id> --exit-endpoint <host:port> --client-endpoint <host:port> --exit-pubkey-hex <hex> --client-pubkey-hex <hex> [--artifact-dir <absolute-path>]",
         "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
@@ -17917,8 +18255,9 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, MembershipEvidenceSummary, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform,
-        Phase6ProbeMetadataView, build_membership_audit_replay_json,
+        AnchorCommand, CliCommand, DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE,
+        MembershipEvidenceSummary, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform,
+        Phase6ProbeMetadataView, RoleCapability, build_membership_audit_replay_json,
         build_membership_evidence_diff_json, classify_cli_error, command_supports_json_render,
         contains_ip_rule_lookup_table, detect_tampered_log, execute, extract_json_flag, help_text,
         is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
@@ -17929,9 +18268,9 @@ mod tests {
         phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
         phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
         render_launchd_plist, required_macos_tunnel_keychain_account,
-        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
-        rewrite_env_key_value, to_ipc_command, unix_now, validate_control_socket_security,
-        write_json_pretty_file,
+        required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
+        validate_control_socket_security, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -18650,6 +18989,73 @@ mod tests {
             "/tmp/membership.log".to_owned(),
         ]);
         assert!(format!("{command:?}").contains("Membership"));
+    }
+
+    #[test]
+    fn parse_supports_anchor_commands() {
+        let advertise = parse_command(&[
+            "anchor".to_owned(),
+            "advertise".to_owned(),
+            "--node-id".to_owned(),
+            "node-a".to_owned(),
+            "--capabilities".to_owned(),
+            "gossip_seed,bundle_pull,enrollment_endpoint,relay_colocation,port_mapping_authoritative".to_owned(),
+            "--snapshot".to_owned(),
+            "/tmp/membership.snapshot".to_owned(),
+            "--log".to_owned(),
+            "/tmp/membership.log".to_owned(),
+            "--output".to_owned(),
+            "/tmp/anchor.update".to_owned(),
+        ]);
+        match advertise {
+            CliCommand::Anchor(command) => match *command {
+                AnchorCommand::Advertise(config) => {
+                    assert_eq!(config.node_id, "node-a");
+                    assert!(
+                        config
+                            .requested_capabilities
+                            .contains(&RoleCapability::AnchorBundlePull)
+                    );
+                    assert!(
+                        config
+                            .requested_capabilities
+                            .contains(&RoleCapability::RelayHost)
+                    );
+                }
+                other => panic!("expected anchor advertise, got {other:?}"),
+            },
+            other => panic!("expected Anchor command, got {other:?}"),
+        }
+
+        let list = parse_command(&["anchor".to_owned(), "list".to_owned()]);
+        assert!(matches!(list, CliCommand::Anchor(_)));
+
+        let pull = parse_command(&[
+            "anchor".to_owned(),
+            "pull-bundle".to_owned(),
+            "--token".to_owned(),
+            "0123456789abcdef0123456789abcdef".to_owned(),
+            "--output".to_owned(),
+            "/tmp/membership.snapshot".to_owned(),
+        ]);
+        assert!(matches!(
+            pull,
+            CliCommand::Anchor(command)
+                if matches!(*command, AnchorCommand::PullBundle { .. })
+        ));
+
+        let init = parse_command(&[
+            "anchor".to_owned(),
+            "init".to_owned(),
+            "--dry-run".to_owned(),
+            "--node-id".to_owned(),
+            "node-a".to_owned(),
+        ]);
+        assert!(matches!(
+            init,
+            CliCommand::Anchor(command)
+                if matches!(*command, AnchorCommand::Init { .. })
+        ));
     }
 
     #[test]
@@ -20901,8 +21307,24 @@ mod tests {
     #[test]
     fn macos_keychain_account_validation_rejects_invalid_values() {
         assert!(required_macos_tunnel_keychain_account("tunnel-passphrase-node").is_ok());
+        assert!(required_macos_tunnel_keychain_account("tunnel:passphrase.node_1").is_ok());
         assert!(required_macos_tunnel_keychain_account("").is_err());
+        assert!(required_macos_tunnel_keychain_account(" tunnel-passphrase-node ").is_err());
         assert!(required_macos_tunnel_keychain_account("bad account with spaces").is_err());
+        assert!(required_macos_tunnel_keychain_account("bad/account").is_err());
+    }
+
+    #[test]
+    fn macos_wg_keychain_service_matches_reviewed_contract() {
+        assert_eq!(
+            DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE,
+            "net.rustynet.wg-key-passphrase"
+        );
+        assert!(
+            required_macos_tunnel_keychain_service(DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE)
+                .is_ok()
+        );
+        assert!(required_macos_tunnel_keychain_service("rustynet.wg_passphrase").is_err());
     }
 
     #[test]

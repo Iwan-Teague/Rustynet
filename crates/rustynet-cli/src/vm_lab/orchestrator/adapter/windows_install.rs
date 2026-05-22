@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::prelude::*;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -568,15 +569,15 @@ fn run_windows_e2e_bootstrap(
 ) -> Result<(), AdapterError> {
     let node_id = windows_lab_node_id(alias, ctx);
     let network_id = &ctx.network_id;
-    let role_str = match ctx
+    let role = ctx
         .assignments
         .iter()
         .find(|a| a.alias == alias)
         .map(|a| &a.role)
-    {
-        Some(NodeRole::Exit) => "admin",
-        _ => "client",
-    };
+        .unwrap_or(&NodeRole::Client);
+    let role_str = role
+        .daemon_node_role_for_platform(&VmGuestPlatform::Windows)
+        .map_err(|message| AdapterError::Protocol { message })?;
     let _ = role_str;
 
     // ── 1. Generate trust material locally ──────────────────────────────────

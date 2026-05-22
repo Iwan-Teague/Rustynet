@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(dead_code))]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,13 +13,13 @@ use rustynet_backend_api::{
     ExitMode, NodeId, PeerConfig, Route, RuntimeContext, SocketEndpoint, TunnelStats,
 };
 
-use super::engine::{
+use super::socket::{AUTHORITATIVE_TRANSPORT_LABEL, AuthoritativeSocket};
+use super::tun::{MacosTunDevice, SharedMacosTunLifecycle};
+use crate::userspace_shared::engine::{
     ConfigurePeerDisposition, RecordedPeerCiphertextIngress, RecordedTunnelPlaintextPacket,
     UserspaceEngine,
 };
-use super::handshake::HandshakeTelemetry;
-use super::socket::{AUTHORITATIVE_TRANSPORT_LABEL, AuthoritativeSocket};
-use super::tun::{SharedTunLifecycle, TunDevice};
+use crate::userspace_shared::handshake::HandshakeTelemetry;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK: usize = 64;
@@ -60,10 +62,10 @@ impl RunningUserspaceRuntime {
     pub(crate) fn start(
         interface_name: &str,
         context: RuntimeContext,
-        tun_device: TunDevice,
+        tun_device: MacosTunDevice,
         authoritative_socket: AuthoritativeSocket,
         engine: UserspaceEngine,
-        tun_lifecycle: SharedTunLifecycle,
+        tun_lifecycle: SharedMacosTunLifecycle,
     ) -> Result<Self, BackendError> {
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -72,7 +74,7 @@ impl RunningUserspaceRuntime {
         let worker_alive = Arc::new(AtomicBool::new(true));
         let worker_alive_for_thread = worker_alive.clone();
         let round_trip_in_flight = Arc::new(AtomicBool::new(false));
-        let thread_name = format!("rustynet-wg-userspace-{interface_name}");
+        let thread_name = format!("rustynet-wg-macos-userspace-{interface_name}");
 
         let join_handle = thread::Builder::new()
             .name(thread_name)
@@ -91,7 +93,7 @@ impl RunningUserspaceRuntime {
             })
             .map_err(|err| {
                 BackendError::internal(format!(
-                    "linux userspace-shared runtime worker spawn failed: {err}"
+                    "macos userspace-shared runtime worker spawn failed: {err}"
                 ))
             })?;
 
@@ -104,7 +106,7 @@ impl RunningUserspaceRuntime {
             Err(_) => {
                 let _ = join_handle.join();
                 return Err(BackendError::internal(
-                    "linux userspace-shared runtime worker exited before reporting readiness",
+                    "macos userspace-shared runtime worker exited before reporting readiness",
                 ));
             }
         };
@@ -128,7 +130,7 @@ impl RunningUserspaceRuntime {
     pub(crate) fn shutdown(self) -> Result<(), BackendError> {
         let shutdown_result = self.control.shutdown();
         let join_result = self.join_handle.join().map_err(|_| {
-            BackendError::internal("linux userspace-shared runtime worker panicked during shutdown")
+            BackendError::internal("macos userspace-shared runtime worker panicked during shutdown")
         });
 
         match (shutdown_result, join_result) {
@@ -323,7 +325,7 @@ impl RuntimeControl {
             .map(|_| ())
             .map_err(|_| {
                 BackendError::internal(
-                    "linux userspace-shared authoritative transport round trip rejected because another round trip is already in flight",
+                    "macos userspace-shared authoritative transport round trip rejected because another round trip is already in flight",
                 )
             })
     }
@@ -334,10 +336,10 @@ impl RuntimeControl {
     ) -> Result<T, BackendError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.command_tx.send(make_request(reply_tx)).map_err(|_| {
-            BackendError::internal("linux userspace-shared runtime worker is unavailable")
+            BackendError::internal("macos userspace-shared runtime worker is unavailable")
         })?;
         reply_rx.recv().map_err(|_| {
-            BackendError::internal("linux userspace-shared runtime worker dropped a reply")
+            BackendError::internal("macos userspace-shared runtime worker dropped a reply")
         })?
     }
 }
@@ -438,8 +440,8 @@ enum RuntimeRequest {
 #[derive(Debug)]
 struct RuntimeState {
     context: RuntimeContext,
-    tun_device: TunDevice,
-    tun_lifecycle: SharedTunLifecycle,
+    tun_device: MacosTunDevice,
+    tun_lifecycle: SharedMacosTunLifecycle,
     authoritative_socket: AuthoritativeSocket,
     engine: UserspaceEngine,
     peers: BTreeMap<NodeId, PeerConfig>,
@@ -458,9 +460,29 @@ impl RuntimeState {
     }
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
+        validate_macos_userspace_endpoint(peer.endpoint)?;
+        let previous_peer = self.peers.get(&peer.node_id).cloned();
         let disposition = self.engine.configure_peer(&peer)?;
         let node_id = peer.node_id.clone();
         self.peers.insert(node_id.clone(), peer);
+        if let Err(err) = self.refresh_exit_mode_bypass_routes_if_needed() {
+            let rollback_result = match previous_peer {
+                Some(previous_peer) => {
+                    self.peers.insert(node_id.clone(), previous_peer.clone());
+                    self.engine.configure_peer(&previous_peer).map(|_| ())
+                }
+                None => {
+                    self.peers.remove(&node_id);
+                    self.engine.remove_peer(&node_id);
+                    self.handshake_telemetry.clear_peer(&node_id);
+                    Ok(())
+                }
+            };
+            return match rollback_result {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(combine_peer_mutation_error(err, rollback_err)),
+            };
+        }
         if matches!(disposition, ConfigurePeerDisposition::Replaced) {
             self.handshake_telemetry.clear_peer(&node_id);
         }
@@ -472,11 +494,23 @@ impl RuntimeState {
         node_id: &NodeId,
         endpoint: SocketEndpoint,
     ) -> Result<(), BackendError> {
+        validate_macos_userspace_endpoint(endpoint)?;
         let Some(peer) = self.peers.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
+        let previous_endpoint = peer.endpoint;
         peer.endpoint = endpoint;
         self.engine.update_peer_endpoint(node_id, endpoint)?;
+        if let Err(err) = self.refresh_exit_mode_bypass_routes_if_needed() {
+            if let Some(peer) = self.peers.get_mut(node_id) {
+                peer.endpoint = previous_endpoint;
+            }
+            let rollback_result = self.engine.update_peer_endpoint(node_id, previous_endpoint);
+            return match rollback_result {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(combine_peer_mutation_error(err, rollback_err)),
+            };
+        }
         Ok(())
     }
 
@@ -495,8 +529,16 @@ impl RuntimeState {
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
-        if self.peers.remove(node_id).is_some() {
+        if let Some(peer) = self.peers.remove(node_id) {
             self.engine.remove_peer(node_id);
+            if let Err(err) = self.refresh_exit_mode_bypass_routes_if_needed() {
+                self.peers.insert(node_id.clone(), peer.clone());
+                let rollback_result = self.engine.configure_peer(&peer).map(|_| ());
+                return match rollback_result {
+                    Ok(()) => Err(err),
+                    Err(rollback_err) => Err(combine_peer_mutation_error(err, rollback_err)),
+                };
+            }
             self.handshake_telemetry.clear_peer(node_id);
         }
         Ok(())
@@ -536,10 +578,32 @@ impl RuntimeState {
     }
 
     fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError> {
-        self.tun_lifecycle
-            .reconcile_exit_mode(self.current_exit_mode, mode)?;
+        let peers = self.configured_peers();
+        self.tun_lifecycle.reconcile_exit_mode(
+            &self.context.interface_name,
+            self.current_exit_mode,
+            mode,
+            &peers,
+        )?;
         self.current_exit_mode = mode;
         Ok(())
+    }
+
+    fn refresh_exit_mode_bypass_routes_if_needed(&mut self) -> Result<(), BackendError> {
+        if self.current_exit_mode != ExitMode::FullTunnel {
+            return Ok(());
+        }
+        let peers = self.configured_peers();
+        self.tun_lifecycle.reconcile_exit_mode(
+            &self.context.interface_name,
+            ExitMode::FullTunnel,
+            ExitMode::FullTunnel,
+            &peers,
+        )
+    }
+
+    fn configured_peers(&self) -> Vec<PeerConfig> {
+        self.peers.values().cloned().collect()
     }
 
     fn start_authoritative_round_trip(
@@ -553,10 +617,11 @@ impl RuntimeState {
         let result = (|| -> Result<OutstandingRoundTripState, BackendError> {
             if self.outstanding_round_trip.is_some() {
                 return Err(BackendError::internal(
-                    "linux userspace-shared authoritative transport round trip rejected because another round trip is already in flight",
+                    "macos userspace-shared authoritative transport round trip rejected because another round trip is already in flight",
                 ));
             }
-            self.reject_round_trip_target(remote_addr)?;
+            validate_authoritative_remote_addr(remote_addr)?;
+            self.reject_control_target(remote_addr)?;
 
             let local_addr = self.authoritative_socket.local_addr()?;
             let transport_generation = self.authoritative_socket.transport_generation();
@@ -605,6 +670,8 @@ impl RuntimeState {
         remote_addr: SocketAddr,
         payload: Vec<u8>,
     ) -> Result<AuthoritativeTransportIdentity, BackendError> {
+        validate_authoritative_remote_addr(remote_addr)?;
+        self.reject_control_target(remote_addr)?;
         let identity = self.authoritative_identity()?;
         // Unbounded-growth guard: see analogous block in
         // `start_authoritative_round_trip`. The send-side recording is only used by
@@ -711,7 +778,7 @@ impl RuntimeState {
         }
         let remote_addr = outstanding.remote_addr;
         self.fail_outstanding_round_trip(BackendError::internal(format!(
-            "linux userspace-shared authoritative transport round trip to {remote_addr} timed out"
+            "macos userspace-shared authoritative transport round trip to {remote_addr} timed out"
         )));
     }
 
@@ -721,11 +788,11 @@ impl RuntimeState {
         }
     }
 
-    fn reject_round_trip_target(&self, remote_addr: SocketAddr) -> Result<(), BackendError> {
+    fn reject_control_target(&self, remote_addr: SocketAddr) -> Result<(), BackendError> {
         let matches_peer_endpoint = self.engine.has_endpoint(remote_addr);
         if matches_peer_endpoint {
             return Err(BackendError::invalid_input(
-                "linux userspace-shared authoritative transport round trip target matches a configured peer endpoint",
+                "macos userspace-shared authoritative transport target matches a configured peer endpoint",
             ));
         }
         Ok(())
@@ -751,10 +818,9 @@ impl RuntimeState {
             remote_addr: datagram.remote_addr,
             payload: datagram.payload.clone(),
         };
-        let outstanding = self
-            .outstanding_round_trip
-            .take()
-            .expect("outstanding round trip should still exist");
+        let Some(outstanding) = self.outstanding_round_trip.take() else {
+            return Ok(false);
+        };
         let _ = outstanding.reply.send(Ok(response));
         Ok(true)
     }
@@ -779,7 +845,7 @@ impl RuntimeState {
 
     fn apply_engine_processing_outcome(
         &mut self,
-        outcome: super::engine::EngineProcessingOutcome,
+        outcome: crate::userspace_shared::engine::EngineProcessingOutcome,
     ) -> Result<(), BackendError> {
         let local_addr = self.authoritative_socket.local_addr()?;
         let transport_generation = self.authoritative_socket.transport_generation();
@@ -814,6 +880,13 @@ impl RuntimeState {
     }
 }
 
+fn combine_peer_mutation_error(primary: BackendError, rollback: BackendError) -> BackendError {
+    BackendError::internal(format!(
+        "{}; peer state rollback failed: {}",
+        primary.message, rollback.message
+    ))
+}
+
 fn should_drop_tun_plaintext_packet_error(err: &BackendError) -> bool {
     err.kind == BackendErrorKind::InvalidInput
         && matches!(
@@ -821,6 +894,67 @@ fn should_drop_tun_plaintext_packet_error(err: &BackendError) -> bool {
             "plaintext packet does not contain a valid IPv4/IPv6 destination address"
                 | "no configured peer allowed IP matches the plaintext packet destination"
         )
+}
+
+fn validate_authoritative_remote_addr(remote_addr: SocketAddr) -> Result<(), BackendError> {
+    if remote_addr.port() == 0 {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared authoritative transport target port must be non-zero",
+        ));
+    }
+    let addr = remote_addr.ip();
+    if addr.is_unspecified() {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared authoritative transport target address must not be unspecified",
+        ));
+    }
+    if addr.is_ipv6() {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared authoritative transport target currently requires IPv4 because the authoritative socket is IPv4-only",
+        ));
+    }
+    if addr.is_multicast() {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared authoritative transport target address must not be multicast",
+        ));
+    }
+    if matches!(addr, std::net::IpAddr::V4(ipv4) if ipv4.is_broadcast()) {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared authoritative transport target address must not be broadcast",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_macos_userspace_endpoint(
+    endpoint: SocketEndpoint,
+) -> Result<(), BackendError> {
+    if endpoint.port == 0 {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared peer endpoint port must be non-zero",
+        ));
+    }
+    if endpoint.addr.is_unspecified() {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared peer endpoint address must not be unspecified",
+        ));
+    }
+    if endpoint.addr.is_ipv6() {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared peer endpoint currently requires IPv4 because the authoritative socket is IPv4-only",
+        ));
+    }
+    if endpoint.addr.is_multicast() {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared peer endpoint address must not be multicast",
+        ));
+    }
+    if matches!(endpoint.addr, std::net::IpAddr::V4(ipv4) if ipv4.is_broadcast()) {
+        return Err(BackendError::invalid_input(
+            "macos userspace-shared peer endpoint address must not be broadcast",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -838,10 +972,10 @@ struct RuntimeTestState {
 
 struct WorkerRuntimeParts {
     context: RuntimeContext,
-    tun_device: TunDevice,
+    tun_device: MacosTunDevice,
     authoritative_socket: AuthoritativeSocket,
     engine: UserspaceEngine,
-    tun_lifecycle: SharedTunLifecycle,
+    tun_lifecycle: SharedMacosTunLifecycle,
     command_rx: Receiver<RuntimeRequest>,
     ready_tx: ReplySender<AuthoritativeTransportIdentity>,
     test_state: RuntimeTestState,
@@ -906,7 +1040,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => {
                             state.fail_outstanding_round_trip(BackendError::internal(
-                                "linux userspace-shared runtime worker command channel disconnected during authoritative transport processing",
+                                "macos userspace-shared runtime worker command channel disconnected during authoritative transport processing",
                             ));
                             mark_worker_exit(&test_state, &worker_alive);
                             return;
@@ -930,7 +1064,7 @@ fn run_worker(parts: WorkerRuntimeParts) {
     }
 
     state.fail_outstanding_round_trip(BackendError::internal(
-        "linux userspace-shared runtime worker exited while an authoritative transport round trip was still in flight",
+        "macos userspace-shared runtime worker exited while an authoritative transport round trip was still in flight",
     ));
     mark_worker_exit(&test_state, &worker_alive);
 }
@@ -1005,7 +1139,7 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
         }
         RuntimeRequest::Shutdown { reply } => {
             state.fail_outstanding_round_trip(BackendError::internal(
-                "linux userspace-shared authoritative transport round trip canceled during backend shutdown",
+                "macos userspace-shared authoritative transport round trip canceled during backend shutdown",
             ));
             let _ = reply.send(state.set_exit_mode(ExitMode::Off));
             false
@@ -1062,20 +1196,332 @@ fn handle_request(state: &mut RuntimeState, request: RuntimeRequest) -> bool {
 mod tests {
     use std::io::Write;
     use std::net::{SocketAddr, UdpSocket};
+    use std::thread;
+    use std::time::Duration;
 
     use base64::prelude::*;
-    use rustynet_backend_api::{NodeId, RuntimeContext};
+    use boringtun::x25519::{PublicKey, StaticSecret};
+    use rustynet_backend_api::{NodeId, RuntimeContext, SocketEndpoint};
 
     use super::*;
     use crate::userspace_shared::engine::UserspaceEngine;
-    use crate::userspace_shared::socket::AuthoritativeSocket;
-    use crate::userspace_shared::tun::{
-        SharedTunLifecycle, TestTunLifecycle, TunDevice, TunTestState,
+    use crate::userspace_shared_macos::socket::AuthoritativeSocket;
+    use crate::userspace_shared_macos::tun::{
+        MacosTunDevice, MacosTunTestState, SharedMacosTunLifecycle, TestMacosTunLifecycle,
     };
 
     #[test]
-    fn linux_runtime_authoritative_socket_poll_is_budgeted_per_tick() {
-        let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test0");
+    fn macos_runtime_reports_authoritative_identity_and_shutdowns() {
+        let runtime = start_test_runtime("utun9");
+        let identity = runtime.control().authoritative_identity();
+
+        assert_eq!(identity.label, AUTHORITATIVE_TRANSPORT_LABEL);
+        assert_ne!(identity.local_addr.port(), 0);
+
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_authoritative_round_trip_uses_worker_socket() {
+        let runtime = start_test_runtime("utun10");
+        let control = runtime.control();
+        let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind");
+        remote
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("remote read timeout");
+        let remote_addr = remote.local_addr().expect("remote addr");
+        let responder = thread::spawn(move || {
+            let mut buffer = [0u8; 128];
+            let (len, worker_addr) = remote.recv_from(&mut buffer).expect("round trip request");
+            assert_eq!(&buffer[..len], b"stun-probe");
+            remote
+                .send_to(b"stun-response", worker_addr)
+                .expect("round trip response");
+            worker_addr
+        });
+
+        let response = control
+            .authoritative_round_trip(remote_addr, b"stun-probe".to_vec(), Duration::from_secs(1))
+            .expect("round trip should complete");
+        let observed_worker_addr = responder.join().expect("responder should finish");
+
+        assert_eq!(response.remote_addr, remote_addr);
+        assert_eq!(response.payload, b"stun-response");
+        assert_eq!(response.local_addr, observed_worker_addr);
+
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_authoritative_round_trip_rejects_invalid_remote_before_send_record() {
+        let runtime = start_test_runtime("utun13");
+        let control = runtime.control();
+
+        for (remote_addr, expected) in [
+            (
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                "port must be non-zero",
+            ),
+            (
+                SocketAddr::from(([0, 0, 0, 0], 3478)),
+                "must not be unspecified",
+            ),
+            (
+                SocketAddr::new("2001:db8::1".parse().expect("valid ip"), 3478),
+                "requires IPv4",
+            ),
+            (
+                SocketAddr::from(([224, 0, 0, 1], 3478)),
+                "must not be multicast",
+            ),
+            (
+                SocketAddr::from(([255, 255, 255, 255], 3478)),
+                "must not be broadcast",
+            ),
+        ] {
+            let err = control
+                .authoritative_round_trip(
+                    remote_addr,
+                    b"stun-probe".to_vec(),
+                    Duration::from_millis(10),
+                )
+                .expect_err("invalid target should fail closed");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+            assert!(err.message.contains(expected));
+        }
+
+        assert!(
+            control
+                .recorded_authoritative_operations_for_test()
+                .expect("operation records should resolve")
+                .is_empty()
+        );
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_authoritative_send_rejects_invalid_remote_before_send_record() {
+        let runtime = start_test_runtime("utun14");
+        let control = runtime.control();
+
+        let err = control
+            .authoritative_send(
+                SocketAddr::new("2001:db8::1".parse().expect("valid ip"), 3478),
+                b"relay-keepalive".to_vec(),
+            )
+            .expect_err("ipv6 relay target should fail closed");
+
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        assert!(err.message.contains("requires IPv4"));
+        assert!(
+            control
+                .recorded_authoritative_operations_for_test()
+                .expect("operation records should resolve")
+                .is_empty()
+        );
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_authoritative_send_rejects_configured_peer_endpoint_before_send_record() {
+        let runtime = start_test_runtime("utun17");
+        let control = runtime.control();
+        let peer_endpoint = SocketAddr::from(([127, 0, 0, 1], 51820));
+        control
+            .configure_peer(sample_peer("peer-a", peer_endpoint))
+            .expect("peer should configure");
+
+        let err = control
+            .authoritative_send(peer_endpoint, b"relay-keepalive".to_vec())
+            .expect_err("send to configured peer endpoint should fail closed");
+
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        assert!(err.message.contains("configured peer endpoint"));
+        assert!(
+            control
+                .recorded_authoritative_operations_for_test()
+                .expect("operation records should resolve")
+                .is_empty()
+        );
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_peer_handshake_uses_authoritative_socket_generation() {
+        let runtime = start_test_runtime("utun11");
+        let control = runtime.control();
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").expect("peer bind");
+        peer_socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer read timeout");
+        let peer_addr = peer_socket.local_addr().expect("peer addr");
+        let peer = sample_peer("peer-a", peer_addr);
+
+        control
+            .configure_peer(peer.clone())
+            .expect("peer configure should succeed");
+        control
+            .initiate_peer_handshake(peer.node_id.clone(), true)
+            .expect("handshake initiation should succeed");
+
+        let mut buffer = [0u8; 512];
+        let (len, worker_addr) = peer_socket
+            .recv_from(&mut buffer)
+            .expect("peer should receive handshake ciphertext");
+        assert!(len > 0);
+        assert_eq!(
+            worker_addr,
+            control
+                .worker_local_addr_for_test()
+                .expect("worker addr should resolve")
+        );
+        assert_eq!(control.stats().expect("stats should resolve").peer_count, 1);
+
+        let egress = control
+            .recorded_peer_ciphertext_egress_for_test()
+            .expect("egress records should resolve");
+        assert_eq!(egress.len(), 1);
+        assert_eq!(egress[0].remote_addr, peer_addr);
+        assert_eq!(
+            egress[0].transport_generation,
+            control
+                .transport_generation_for_test()
+                .expect("generation should resolve")
+        );
+
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_configure_peer_rejects_invalid_endpoint_without_state_mutation() {
+        let runtime = start_test_runtime("utun15");
+        let control = runtime.control();
+
+        for (endpoint, expected) in [
+            (
+                SocketEndpoint {
+                    addr: "127.0.0.1".parse().expect("valid ip"),
+                    port: 0,
+                },
+                "port must be non-zero",
+            ),
+            (
+                SocketEndpoint {
+                    addr: "0.0.0.0".parse().expect("valid ip"),
+                    port: 51820,
+                },
+                "must not be unspecified",
+            ),
+            (
+                SocketEndpoint {
+                    addr: "2001:db8::1".parse().expect("valid ip"),
+                    port: 51820,
+                },
+                "requires IPv4",
+            ),
+            (
+                SocketEndpoint {
+                    addr: "224.0.0.1".parse().expect("valid ip"),
+                    port: 51820,
+                },
+                "must not be multicast",
+            ),
+            (
+                SocketEndpoint {
+                    addr: "255.255.255.255".parse().expect("valid ip"),
+                    port: 51820,
+                },
+                "must not be broadcast",
+            ),
+        ] {
+            let mut peer = sample_peer("peer-a", SocketAddr::from(([127, 0, 0, 1], 51820)));
+            peer.endpoint = endpoint;
+            let err = control
+                .configure_peer(peer)
+                .expect_err("invalid endpoint should fail closed");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+            assert!(err.message.contains(expected));
+            assert_eq!(control.stats().expect("stats should resolve").peer_count, 0);
+        }
+
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_update_peer_endpoint_rejects_invalid_endpoint_without_state_mutation() {
+        let runtime = start_test_runtime("utun16");
+        let control = runtime.control();
+        let peer = sample_peer("peer-a", SocketAddr::from(([127, 0, 0, 1], 51820)));
+        let peer_node = peer.node_id.clone();
+        let original_endpoint = peer.endpoint;
+        control
+            .configure_peer(peer)
+            .expect("initial peer configure should succeed");
+
+        let err = control
+            .update_peer_endpoint(
+                peer_node.clone(),
+                SocketEndpoint {
+                    addr: "2001:db8::1".parse().expect("valid ip"),
+                    port: 51820,
+                },
+            )
+            .expect_err("ipv6 endpoint update should fail closed");
+
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        assert!(err.message.contains("requires IPv4"));
+        assert_eq!(
+            control
+                .current_peer_endpoint(peer_node)
+                .expect("endpoint should resolve"),
+            Some(original_endpoint)
+        );
+        assert_eq!(control.stats().expect("stats should resolve").peer_count, 1);
+
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_refreshes_exit_bypass_routes_when_peer_endpoint_changes() {
+        let lifecycle = TestMacosTunLifecycle::new();
+        let state = lifecycle.state();
+        let runtime = start_test_runtime_with_lifecycle("utun12", lifecycle);
+        let control = runtime.control();
+        let initial_addr = SocketAddr::from(([203, 0, 113, 10], 51820));
+        let updated_endpoint = SocketEndpoint {
+            addr: "203.0.113.11".parse().expect("valid ip"),
+            port: 51820,
+        };
+        let peer = sample_peer("peer-a", initial_addr);
+
+        control
+            .configure_peer(peer.clone())
+            .expect("peer configure should succeed");
+        control
+            .set_exit_mode(ExitMode::FullTunnel)
+            .expect("exit mode should set");
+        assert_eq!(state.snapshot().exit_mode_reconcile_calls, 1);
+        assert_eq!(
+            state.snapshot().last_exit_mode_peer_endpoints,
+            vec![peer.endpoint]
+        );
+
+        control
+            .update_peer_endpoint(peer.node_id.clone(), updated_endpoint)
+            .expect("endpoint update should refresh bypass routes");
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.exit_mode_reconcile_calls, 2);
+        assert_eq!(
+            snapshot.last_exit_mode_peer_endpoints,
+            vec![updated_endpoint]
+        );
+
+        runtime.shutdown().expect("runtime shutdown should succeed");
+    }
+
+    #[test]
+    fn macos_runtime_authoritative_socket_poll_is_budgeted_per_tick() {
+        let (mut state, _tun_state, _private_key) = test_runtime_state("utun18");
         let remote = UdpSocket::bind("127.0.0.1:0").expect("remote bind");
         let target = loopback_target(
             state
@@ -1108,8 +1554,8 @@ mod tests {
     }
 
     #[test]
-    fn linux_runtime_tun_poll_is_budgeted_per_tick() {
-        let (mut state, tun_state, _private_key) = test_runtime_state("rn-test1");
+    fn macos_runtime_tun_poll_is_budgeted_per_tick() {
+        let (mut state, tun_state, _private_key) = test_runtime_state("utun19");
         let packet_count = MAX_TUN_PACKETS_PER_TICK + 3;
         for index in 0..packet_count {
             state
@@ -1131,19 +1577,53 @@ mod tests {
         assert_eq!(tun_state.snapshot().queued_inbound_packets, 0);
     }
 
-    fn test_runtime_state(
+    fn start_test_runtime(interface_name: &str) -> RunningUserspaceRuntime {
+        start_test_runtime_with_lifecycle(interface_name, TestMacosTunLifecycle::new())
+    }
+
+    fn start_test_runtime_with_lifecycle(
         interface_name: &str,
-    ) -> (RuntimeState, TunTestState, tempfile::NamedTempFile) {
+        lifecycle: TestMacosTunLifecycle,
+    ) -> RunningUserspaceRuntime {
         let context = RuntimeContext {
-            local_node: NodeId::new("linux-node").expect("valid node id"),
+            local_node: NodeId::new("mac-node").expect("valid node id"),
             interface_name: interface_name.to_owned(),
             mesh_cidr: "100.64.0.0/10".to_owned(),
             local_cidr: "100.64.0.2/32".to_owned(),
         };
-        let tun_state = TunTestState::default();
-        let tun_device = TunDevice::test_handle(tun_state.clone());
-        let tun_lifecycle = SharedTunLifecycle::new(Box::new(TestTunLifecycle::new()));
-        let authoritative_socket = AuthoritativeSocket::bind(0).expect("authoritative bind");
+        let tun_device = MacosTunDevice::test_handle(MacosTunTestState::default());
+        let tun_lifecycle = SharedMacosTunLifecycle::new(Box::new(lifecycle));
+        let authoritative_socket =
+            AuthoritativeSocket::bind_loopback_for_test().expect("authoritative bind");
+        let private_key = write_private_key([7; 32]);
+        let engine = UserspaceEngine::from_private_key_file(private_key.path())
+            .expect("engine should load key");
+
+        RunningUserspaceRuntime::start(
+            interface_name,
+            context,
+            tun_device,
+            authoritative_socket,
+            engine,
+            tun_lifecycle,
+        )
+        .expect("runtime should start")
+    }
+
+    fn test_runtime_state(
+        interface_name: &str,
+    ) -> (RuntimeState, MacosTunTestState, tempfile::NamedTempFile) {
+        let context = RuntimeContext {
+            local_node: NodeId::new("mac-node").expect("valid node id"),
+            interface_name: interface_name.to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.2/32".to_owned(),
+        };
+        let tun_state = MacosTunTestState::default();
+        let tun_device = MacosTunDevice::test_handle(tun_state.clone());
+        let tun_lifecycle = SharedMacosTunLifecycle::new(Box::new(TestMacosTunLifecycle::new()));
+        let authoritative_socket =
+            AuthoritativeSocket::bind_loopback_for_test().expect("authoritative bind");
         let private_key = write_private_key([7; 32]);
         let engine = UserspaceEngine::from_private_key_file(private_key.path())
             .expect("engine should load key");
@@ -1168,13 +1648,27 @@ mod tests {
         )
     }
 
+    fn loopback_target(local_addr: SocketAddr) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], local_addr.port()))
+    }
+
     fn write_private_key(bytes: [u8; 32]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().expect("temp key file should be created");
         writeln!(file, "{}", BASE64_STANDARD.encode(bytes)).expect("private key should be written");
         file
     }
 
-    fn loopback_target(local_addr: SocketAddr) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], local_addr.port()))
+    fn sample_peer(name: &str, endpoint: SocketAddr) -> PeerConfig {
+        let private_key = StaticSecret::from([8; 32]);
+        let public_key = PublicKey::from(&private_key);
+        PeerConfig {
+            node_id: NodeId::new(name).expect("valid node id"),
+            endpoint: SocketEndpoint {
+                addr: endpoint.ip(),
+                port: endpoint.port(),
+            },
+            public_key: *public_key.as_bytes(),
+            allowed_ips: vec!["100.64.1.0/24".to_owned()],
+        }
     }
 }
