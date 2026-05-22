@@ -92,14 +92,16 @@ pub fn install_daemon(
         BUILD_TIMEOUT,
     )?;
 
-    // Daemon socket is checked in enforce_baseline_runtime / validate_baseline_runtime,
-    // not at install time — install_daemon only stages binaries + bootstrap state.
-
     let verify_script = format!(
         "test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
          test -f {MACOS_KEYS_DIR}/wireguard.pub",
     );
     ssh::run_remote(conn, &verify_script, SHORT_TIMEOUT)?;
+
+    // Wait for the daemon socket so the next stage (collect_pubkeys)
+    // can talk to it; launchctl returns before the daemon finishes
+    // initialising.
+    wait_for_macos_daemon_socket(conn)?;
 
     Ok(InstallReport {
         daemon_path: MACOS_RUSTYNETD_PATH.into(),
@@ -213,13 +215,48 @@ pub fn install_daemon_from_workdir(
             .to_owned()
     };
     ssh::run_remote(conn, &build_cmd, BUILD_TIMEOUT)?;
-    // Daemon socket is checked in enforce_baseline_runtime / validate_baseline_runtime,
-    // not at install time — install_daemon only stages binaries + bootstrap state.
+
+    // The launchd plist is loaded by Bootstrap-RustyNetMacos.sh's final
+    // step, but launchctl returns before the daemon process actually
+    // opens its socket — the daemon has to verify trust evidence,
+    // initialise its state directory, and bind the socket, which can
+    // take ~10-30 s.  Without a wait here, the orchestrator's next
+    // stage (collect_pubkeys) immediately tries to read from
+    // /private/var/run/rustynet/rustynetd.sock and fails with
+    // "No such file or directory" because we got there first.  Poll
+    // for up to ~40 s (40 * 1 s) which matches the Linux
+    // install-systemd socket wait.
+    wait_for_macos_daemon_socket(conn)?;
 
     Ok(InstallReport {
         daemon_path: MACOS_RUSTYNETD_PATH.into(),
         service_name: MACOS_SERVICE_LABEL.to_owned(),
     })
+}
+
+/// Poll the remote macOS host for the rustynetd Unix socket to appear.
+/// Used by install_daemon and install_daemon_from_workdir to bridge the
+/// gap between launchctl returning and the daemon actually being ready.
+fn wait_for_macos_daemon_socket(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let socket = "/private/var/run/rustynet/rustynetd.sock";
+    // 40 iterations × 1 s = 40 s total — comfortably longer than the
+    // observed worst-case daemon startup on the lab VM and aligned with
+    // the Linux install-systemd timeout.  Probe via `test -S`
+    // (Unix-domain socket) to avoid false positives on placeholder
+    // files left by a crashed previous run.
+    let probe = format!(
+        "for i in $(seq 1 40); do \
+            if sudo test -S {socket}; then echo socket-ready; exit 0; fi; \
+            sleep 1; \
+         done; \
+         echo socket-missing; exit 1"
+    );
+    ssh::run_remote(conn, &probe, Duration::from_secs(60)).map_err(|err| AdapterError::Protocol {
+        message: format!(
+            "macOS daemon socket {socket} failed to appear within 40 s after launchd bootstrap: {err}"
+        ),
+    })?;
+    Ok(())
 }
 
 /// Start the launchd service.
