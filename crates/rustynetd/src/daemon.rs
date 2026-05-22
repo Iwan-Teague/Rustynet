@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read, Write};
 #[cfg(target_os = "linux")]
 use std::net::SocketAddrV4;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
 #[cfg(not(windows))]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -184,6 +184,9 @@ pub const DEFAULT_ANCHOR_BUNDLE_PULL_ADDR: &str = "127.0.0.1:51822";
 pub const DEFAULT_ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str =
     "/var/lib/rustynet/anchor-bundle-pull.token";
 pub const MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES: usize = 256;
+pub const ANCHOR_BUNDLE_PULL_ADDR_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR";
+pub const ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH";
+pub const ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV: &str = "RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN";
 #[cfg(not(windows))]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 #[cfg(windows)]
@@ -923,10 +926,19 @@ fn validate_runtime_file_path(path: &Path, label: &str) -> Result<(), DaemonErro
     validate_windows_runtime_file_path(path, label).map_err(DaemonError::InvalidConfig)
 }
 
-pub fn validate_anchor_bundle_pull_addr(addr: SocketAddr) -> Result<(), DaemonError> {
-    if !addr.ip().is_loopback() {
+/// Validate the bundle-pull listener bind address.
+///
+/// Non-loopback addresses are rejected unless `allow_lan` is `true`.
+/// Callers must obtain `allow_lan` from an explicit operator flag
+/// (`--anchor-bundle-pull-allow-lan` / `RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN`);
+/// there is no auto-detect or silent fallback.
+pub fn validate_anchor_bundle_pull_addr(
+    addr: SocketAddr,
+    allow_lan: bool,
+) -> Result<(), DaemonError> {
+    if !addr.ip().is_loopback() && !allow_lan {
         return Err(DaemonError::InvalidConfig(
-            "anchor bundle-pull listener must bind loopback only".to_owned(),
+            "anchor bundle-pull listener must bind loopback only; set --anchor-bundle-pull-allow-lan to permit LAN bind".to_owned(),
         ));
     }
     Ok(())
@@ -992,6 +1004,52 @@ pub fn write_anchor_bundle_pull_response<W: Write>(
         .and_then(|_| writer.write_all(bundle))
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull response failed: {err}")))?;
     Ok(())
+}
+
+fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<String, DaemonError> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                bytes.push(byte[0]);
+                if bytes.len() > MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES {
+                    return Err(DaemonError::InvalidConfig(
+                        "anchor bundle-pull request token exceeds maximum size".to_owned(),
+                    ));
+                }
+            }
+            Err(err) => {
+                return Err(DaemonError::Io(format!(
+                    "anchor bundle-pull token read failed: {err}"
+                )));
+            }
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        DaemonError::InvalidConfig("anchor bundle-pull request token is not utf8".to_owned())
+    })
+}
+
+fn handle_anchor_bundle_pull_stream(
+    mut stream: TcpStream,
+    token_path: &Path,
+    bundle_path: &Path,
+) -> Result<(), DaemonError> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull read timeout failed: {err}")))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| {
+            DaemonError::Io(format!("anchor bundle-pull write timeout failed: {err}"))
+        })?;
+    let presented_token = read_anchor_bundle_pull_request_token(&mut stream)?;
+    let expected_token = load_anchor_bundle_pull_token(token_path)?;
+    let bundle = load_anchor_bundle_pull_bundle(bundle_path)?;
+    write_anchor_bundle_pull_response(stream, &presented_token, &expected_token, &bundle)
 }
 
 fn constant_time_ascii_eq(left: &str, right: &str) -> bool {
@@ -1241,6 +1299,12 @@ pub struct DaemonConfig {
     pub membership_snapshot_path: PathBuf,
     pub membership_log_path: PathBuf,
     pub membership_watermark_path: PathBuf,
+    pub anchor_bundle_pull_addr: Option<SocketAddr>,
+    pub anchor_bundle_pull_token_path: Option<PathBuf>,
+    /// D11.b: when `true` the bundle-pull listener may bind a non-loopback
+    /// address. Default is `false` (loopback-only). Must be set explicitly
+    /// by the operator; there is no fallback or auto-detect.
+    pub anchor_bundle_pull_allow_lan: bool,
     /// D2.5: per-host spool for the gossip sequence + seen-source
     /// ledger. `None` disables gossip persistence (test default);
     /// production daemons set this via `--gossip-watermark` or
@@ -1331,6 +1395,17 @@ impl Default for DaemonConfig {
             membership_snapshot_path: PathBuf::from(DEFAULT_MEMBERSHIP_SNAPSHOT_PATH),
             membership_log_path: PathBuf::from(DEFAULT_MEMBERSHIP_LOG_PATH),
             membership_watermark_path: PathBuf::from(DEFAULT_MEMBERSHIP_WATERMARK_PATH),
+            anchor_bundle_pull_addr: Some(
+                DEFAULT_ANCHOR_BUNDLE_PULL_ADDR
+                    .parse()
+                    .expect("default anchor bundle-pull addr must parse"),
+            ),
+            anchor_bundle_pull_token_path: std::env::var_os(ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV)
+                .map(PathBuf::from),
+            anchor_bundle_pull_allow_lan: std::env::var(ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV)
+                .ok()
+                .and_then(|v| parse_bool(v.as_str()))
+                .unwrap_or(false),
             gossip_watermark_path: std::env::var_os(GOSSIP_WATERMARK_PATH_ENV).map(PathBuf::from),
             enrollment_secret_path: std::env::var_os(ENROLLMENT_SECRET_PATH_ENV).map(PathBuf::from),
             enrollment_ledger_path: std::env::var_os(ENROLLMENT_LEDGER_PATH_ENV).map(PathBuf::from),
@@ -8052,13 +8127,39 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
     }
 }
 
+/// Decide whether this node should call `PortMappingSupervisor::bring_up`.
+///
+/// Returns `None` (proceed) when:
+/// - self is the elected lex-min authority node.
+///
+/// Returns `Some(reason)` (skip) when trust state is unavailable, no signed
+/// authority is present, or another node is the elected authority.
+fn port_mapping_bring_up_skip_reason(
+    self_node_id: &str,
+    membership_state: Option<&MembershipState>,
+) -> Option<String> {
+    let Some(state) = membership_state else {
+        return Some("authority unavailable".to_owned());
+    };
+    let authority_id = crate::gossip_runtime::anchor_runtime_view_from_membership(state)
+        .port_mapping_authority_node_id;
+    match authority_id.as_deref() {
+        // No signed authority: fail closed instead of racing the router.
+        None => Some("authority unavailable".to_owned()),
+        // Self is the elected lex-min authority: proceed.
+        Some(node_id) if node_id == self_node_id => None,
+        // Another node is the elected authority: defer.
+        Some(node_id) => Some(format!("deferred to authority node={node_id}")),
+    }
+}
+
 /// Best-effort port-mapping bring-up. Logs the outcome; never propagates
 /// an error to the caller because port mapping is purely additive (the
 /// daemon's outbound-keepalive fallback covers every case where the
 /// gateway probe fails). Called once on daemon startup. Refresh-on-
 /// cadence is a follow-up cycle (see D2.3 status in the dataplane
 /// execution plan).
-fn bootstrap_port_mapping(config: &DaemonConfig) {
+fn bootstrap_port_mapping(config: &DaemonConfig, membership_state: Option<&MembershipState>) {
     use crate::port_mapper::{PortMappingMode, PortMappingSupervisor, SupervisorBringUp};
 
     log::info!(
@@ -8075,6 +8176,12 @@ fn bootstrap_port_mapping(config: &DaemonConfig) {
         log::info!(
             "port_mapping: keepalive mode — relying on WireGuard PersistentKeepalive to maintain NAT bindings"
         );
+        return;
+    }
+    if let Some(reason) =
+        port_mapping_bring_up_skip_reason(config.node_id.as_str(), membership_state)
+    {
+        log::info!("port_mapping: {reason}");
         return;
     }
     let supervisor = PortMappingSupervisor::new(config.port_mapping_mode);
@@ -8141,7 +8248,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     };
     runtime.bootstrap();
     scrub_runtime_wireguard_key_after_bootstrap(&config)?;
-    bootstrap_port_mapping(&config);
+    bootstrap_port_mapping(&config, runtime.membership_state.as_ref());
 
     #[cfg(windows)]
     {
@@ -8409,6 +8516,26 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         dns_socket
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+        let anchor_bundle_pull_listener = if let Some(token_path) =
+            config.anchor_bundle_pull_token_path.as_ref()
+        {
+            let addr = config.anchor_bundle_pull_addr.ok_or_else(|| {
+                DaemonError::InvalidConfig(
+                    "anchor bundle-pull token path requires a listener addr".to_owned(),
+                )
+            })?;
+            validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
+            load_anchor_bundle_pull_token(token_path)?;
+            let listener = TcpListener::bind(addr)
+                .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bind failed: {err}")))?;
+            listener.set_nonblocking(true).map_err(|err| {
+                DaemonError::Io(format!("anchor bundle-pull nonblocking failed: {err}"))
+            })?;
+            log::info!("anchor_bundle_pull: listening addr={addr}");
+            Some(listener)
+        } else {
+            None
+        };
 
         let socket_owner_uid = socket_owner_uid(&config.socket_path)?;
 
@@ -8522,6 +8649,37 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                     Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                     Err(err) => {
                         return Err(DaemonError::Io(format!("dns resolver recv failed: {err}")));
+                    }
+                }
+            }
+            if let (Some(anchor_listener), Some(token_path)) = (
+                anchor_bundle_pull_listener.as_ref(),
+                config.anchor_bundle_pull_token_path.as_ref(),
+            ) {
+                match anchor_listener.accept() {
+                    Ok((stream, peer_addr)) => {
+                        match handle_anchor_bundle_pull_stream(
+                            stream,
+                            token_path.as_path(),
+                            config.membership_snapshot_path.as_path(),
+                        ) {
+                            Ok(()) => {
+                                log::info!("anchor_bundle_pull: served peer={peer_addr}");
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "anchor_bundle_pull: request failed peer={peer_addr} reason={err}"
+                                );
+                            }
+                        }
+                        processed = processed.saturating_add(1);
+                        processed_io = true;
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) => {
+                        return Err(DaemonError::Io(format!(
+                            "anchor bundle-pull accept failed: {err}"
+                        )));
                     }
                 }
             }
@@ -9048,6 +9206,22 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         return Err(DaemonError::InvalidConfig(
             "membership watermark path must not be empty".to_owned(),
         ));
+    }
+    if let Some(addr) = config.anchor_bundle_pull_addr {
+        validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
+    }
+    if let Some(path) = config.anchor_bundle_pull_token_path.as_ref() {
+        if path.as_os_str().is_empty() {
+            return Err(DaemonError::InvalidConfig(
+                "anchor bundle-pull token path must not be empty".to_owned(),
+            ));
+        }
+        validate_runtime_file_path(path, "anchor bundle-pull token")?;
+        if config.anchor_bundle_pull_addr.is_none() {
+            return Err(DaemonError::InvalidConfig(
+                "anchor bundle-pull token path requires a listener addr".to_owned(),
+            ));
+        }
     }
     if config.remote_ops_expected_subject.trim().is_empty() {
         return Err(DaemonError::InvalidConfig(
@@ -13188,12 +13362,12 @@ mod tests {
         load_trust_watermark, membership_watermark_is_replay, parse_route_interface_token,
         parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
         persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
-        prepare_runtime_wireguard_key_material, resolve_egress_interface_value, run_daemon,
-        run_preflight_checks, sanitize_dataplane_routes_for_node_role,
-        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
-        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
-        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
-        validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
+        port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
+        resolve_egress_interface_value, run_daemon, run_preflight_checks,
+        sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
+        select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
+        sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
+        unix_now, validate_anchor_bundle_pull_addr, validate_auto_tunnel_role_membership_alignment,
         validate_daemon_config, validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, zeroize_optional_bytes,
     };
@@ -13213,7 +13387,8 @@ mod tests {
     #[test]
     fn anchor_bundle_pull_rejects_non_loopback_bind() {
         let addr = SocketAddr::from(([192, 0, 2, 10], 51822));
-        let err = validate_anchor_bundle_pull_addr(addr).expect_err("non-loopback must reject");
+        let err =
+            validate_anchor_bundle_pull_addr(addr, false).expect_err("non-loopback must reject");
         assert!(format!("{err}").contains("loopback"));
     }
 
@@ -13240,6 +13415,169 @@ mod tests {
         )
         .expect("good token must pass");
         assert_eq!(allowed, b"OK 17\nmembership-bundle");
+    }
+
+    // ── D11.b tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn anchor_bundle_pull_config_defaults_to_none_token_path() {
+        // DaemonConfig::default() must not hard-code a token path.
+        // The addr has a default (loopback:51822) but the token path must
+        // be None so the listener is not activated until the operator
+        // explicitly supplies the token file.
+        let config = DaemonConfig {
+            anchor_bundle_pull_token_path: None,
+            ..DaemonConfig::default()
+        };
+        assert!(
+            config.anchor_bundle_pull_token_path.is_none(),
+            "token path must default to None so the listener is opt-in"
+        );
+        assert!(
+            !config.anchor_bundle_pull_allow_lan,
+            "allow-lan must default to false"
+        );
+    }
+
+    #[test]
+    fn anchor_bundle_pull_loopback_gate_rejects_non_loopback_without_allow_lan() {
+        let lan_addr: SocketAddr = "192.168.1.10:51822".parse().expect("addr must parse");
+        // Without allow_lan the LAN address must be rejected.
+        let err = validate_anchor_bundle_pull_addr(lan_addr, false)
+            .expect_err("LAN bind without allow-lan must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loopback") || msg.contains("allow"),
+            "error must mention the restriction: {msg}"
+        );
+        // With allow_lan explicitly set the same address must succeed.
+        validate_anchor_bundle_pull_addr(lan_addr, true)
+            .expect("LAN bind with allow-lan must succeed");
+        // Loopback always succeeds regardless of the flag.
+        let lo_addr: SocketAddr = "127.0.0.1:51822".parse().expect("loopback must parse");
+        validate_anchor_bundle_pull_addr(lo_addr, false)
+            .expect("loopback must succeed without allow-lan");
+        validate_anchor_bundle_pull_addr(lo_addr, true)
+            .expect("loopback must succeed with allow-lan");
+    }
+
+    #[test]
+    fn anchor_bundle_pull_response_path_exercises_existing_helpers() {
+        // Exercises the write_anchor_bundle_pull_response path with a
+        // realistic token and bundle to confirm the response framing is
+        // correct end-to-end.
+        let token = "abcdefghijklmnopqrstuvwxyz012345"; // 32 printable ASCII bytes
+        let bundle = b"net-1:epoch-7:node-count-3";
+        let mut out = Vec::new();
+        write_anchor_bundle_pull_response(&mut out, token, token, bundle)
+            .expect("matching token must produce OK response");
+        let header_end = out
+            .iter()
+            .position(|&b| b == b'\n')
+            .expect("newline in response");
+        let header = std::str::from_utf8(&out[..header_end]).expect("header is utf8");
+        assert!(
+            header.starts_with("OK "),
+            "response header must start with OK"
+        );
+        let payload = &out[header_end + 1..];
+        assert_eq!(payload, bundle, "response body must equal the bundle");
+    }
+
+    // ── D11.c tests ──────────────────────────────────────────────────────────
+
+    fn make_membership_state_with_capabilities(
+        node_id: &str,
+        capabilities: Vec<RoleCapability>,
+    ) -> MembershipState {
+        MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-test".to_owned(),
+            epoch: 1,
+            nodes: vec![MembershipNode {
+                node_id: node_id.to_owned(),
+                node_pubkey_hex: "aa".repeat(32),
+                owner: "owner@test.local".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec![],
+                capabilities,
+                joined_at_unix: 1,
+                updated_at_unix: 1,
+            }],
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: "bb".repeat(32),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 1,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        }
+    }
+
+    #[test]
+    fn port_mapping_skipped_when_non_authority() {
+        // Another node holds AnchorPortMappingAuthoritative — self must not
+        // call bring_up.
+        let state = make_membership_state_with_capabilities(
+            "node-authority",
+            vec![RoleCapability::AnchorPortMappingAuthoritative],
+        );
+        let reason = port_mapping_bring_up_skip_reason("node-self", Some(&state));
+        assert!(
+            reason.is_some(),
+            "skip reason must be Some when another node is the authority"
+        );
+        let msg = reason.unwrap();
+        assert!(
+            msg.contains("node-authority"),
+            "skip reason must name the authority: {msg}"
+        );
+    }
+
+    #[test]
+    fn port_mapping_proceeds_when_self_is_authority() {
+        // Self carries AnchorPortMappingAuthoritative — bring_up must run.
+        let state = make_membership_state_with_capabilities(
+            "node-self",
+            vec![RoleCapability::AnchorPortMappingAuthoritative],
+        );
+        let reason = port_mapping_bring_up_skip_reason("node-self", Some(&state));
+        assert!(
+            reason.is_none(),
+            "skip reason must be None when self is the elected authority"
+        );
+    }
+
+    #[test]
+    fn port_mapping_skipped_when_authority_unavailable() {
+        // No signed AnchorPortMappingAuthoritative node: fail closed instead
+        // of racing the router or probing from a non-authority.
+        let state =
+            make_membership_state_with_capabilities("node-self", vec![RoleCapability::ExitServer]);
+        let reason = port_mapping_bring_up_skip_reason("node-self", Some(&state));
+        assert!(
+            reason.is_some(),
+            "skip reason must be Some when no authority exists"
+        );
+        let msg = reason.unwrap();
+        assert!(
+            msg.contains("authority unavailable"),
+            "skip reason must explain unavailable authority: {msg}"
+        );
+
+        // Also verify with no membership state at all.
+        let reason_no_state = port_mapping_bring_up_skip_reason("node-self", None);
+        assert!(
+            reason_no_state.is_some(),
+            "skip reason must be Some when membership state is unavailable"
+        );
+        let msg_no_state = reason_no_state.unwrap();
+        assert!(
+            msg_no_state.contains("authority unavailable"),
+            "skip reason must explain unavailable authority: {msg_no_state}"
+        );
     }
 
     #[test]

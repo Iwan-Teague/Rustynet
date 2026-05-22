@@ -2,8 +2,10 @@
 
 use rustynet_crypto::{KeyCustodyPermissionPolicy, write_encrypted_key_file};
 use rustynetd::daemon::{
-    DEFAULT_AUTO_PORT_FORWARD_EXIT, DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS, DEFAULT_EGRESS_INTERFACE,
-    DEFAULT_FAIL_CLOSED_SSH_ALLOW, DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
+    ANCHOR_BUNDLE_PULL_ADDR_ENV, ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV,
+    ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV, DEFAULT_AUTO_PORT_FORWARD_EXIT,
+    DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS, DEFAULT_EGRESS_INTERFACE, DEFAULT_FAIL_CLOSED_SSH_ALLOW,
+    DEFAULT_MAX_RECONCILE_FAILURES, DEFAULT_MEMBERSHIP_LOG_PATH,
     DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH,
     DEFAULT_MEMBERSHIP_WATERMARK_PATH, DEFAULT_NODE_ID, DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS,
     DEFAULT_RECONCILE_INTERVAL_MS, DEFAULT_RELAY_FLEET_BUNDLE_PATH,
@@ -70,7 +72,6 @@ use rustynetd::windows_service_hardening::{
 };
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64, NonZeroUsize};
-#[cfg(windows)]
 use std::path::PathBuf;
 
 const MEMBERSHIP_OWNER_SIGNING_KEY_PASSPHRASE_FILE_ENV: &str =
@@ -675,9 +676,14 @@ fn run_linux_authenticode_check_command(args: &[String]) -> Result<(), String> {
 }
 
 fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String> {
-    use rustynetd::linux_killswitch_boot::collect_linux_killswitch_boot_report;
+    use rustynetd::linux_killswitch_boot::{
+        BootSshCidr, collect_linux_killswitch_boot_report, install_linux_boot_killswitch,
+    };
     let mut fail_on_drift = true;
     let mut iface_name: String = "rustynet0".to_owned();
+    let mut install_boot = false;
+    let mut ssh_allow = false;
+    let mut ssh_cidrs: Vec<BootSshCidr> = Vec::new();
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -692,6 +698,46 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
                 iface_name = value.clone();
                 index += 2;
             }
+            Some("--install-boot-killswitch") => {
+                install_boot = true;
+                index += 1;
+            }
+            Some("--fail-closed-ssh-allow") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--fail-closed-ssh-allow requires a value (true/false)".to_owned()
+                })?;
+                ssh_allow = match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" | "" => false,
+                    _ => return Err(format!("invalid --fail-closed-ssh-allow value: {value}")),
+                };
+                index += 2;
+            }
+            Some("--fail-closed-ssh-allow-cidrs") => {
+                // The env var may expand to an empty string when unset; treat
+                // that the same as omitting the flag.
+                let raw = args.get(index + 1).map(String::as_str).unwrap_or("").trim();
+                if raw.is_empty() || raw.starts_with("--") {
+                    // When the next token is an empty string (systemd passes it
+                    // when the env var is ""), consume both the flag and the
+                    // empty token so the pointer stays aligned.  When the next
+                    // token is another flag (or absent), advance past only the
+                    // current flag.
+                    if raw.is_empty() && args.get(index + 1).is_some() {
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                } else {
+                    ssh_cidrs = raw
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(BootSshCidr::parse)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    index += 2;
+                }
+            }
             Some(flag) => {
                 return Err(format!(
                     "unknown linux-killswitch-boot-check argument: {flag}"
@@ -700,6 +746,15 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
             None => break,
         }
     }
+
+    // Install the pre-protective boot-time killswitch before running the
+    // L8 drift check.  The boot table name (rustynet_boot) is distinct from
+    // the reviewed daemon tables (rustynet / rustynet_g<N>) so the verifier
+    // below is unaffected.
+    if install_boot {
+        install_linux_boot_killswitch(iface_name.as_str(), ssh_allow, &ssh_cidrs)?;
+    }
+
     let report = collect_linux_killswitch_boot_report(iface_name.as_str());
     println!(
         "{}",
@@ -1419,6 +1474,35 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
 
 fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
     let mut config = DaemonConfig::default();
+    if let Ok(value) = std::env::var(ANCHOR_BUNDLE_PULL_ADDR_ENV) {
+        config.anchor_bundle_pull_addr = if value.trim().is_empty() {
+            None
+        } else {
+            Some(
+                value
+                    .parse::<SocketAddr>()
+                    .map_err(|err| format!("invalid {ANCHOR_BUNDLE_PULL_ADDR_ENV}: {err}"))?,
+            )
+        };
+    }
+    if let Ok(value) = std::env::var(ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV) {
+        config.anchor_bundle_pull_token_path = if value.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        };
+    }
+    if let Ok(value) = std::env::var(ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV) {
+        config.anchor_bundle_pull_allow_lan = match value.trim() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" | "" => false,
+            _ => {
+                return Err(format!(
+                    "invalid {ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV} value: expected true or false"
+                ));
+            }
+        };
+    }
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -1501,6 +1585,49 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--membership-watermark requires a value".to_owned())?;
                 config.membership_watermark_path = value.into();
+                index += 2;
+            }
+            Some("--anchor-bundle-pull-addr") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--anchor-bundle-pull-addr requires a value".to_owned())?;
+                config.anchor_bundle_pull_addr = if value.is_empty() {
+                    None
+                } else {
+                    Some(
+                        value
+                            .parse::<SocketAddr>()
+                            .map_err(|err| format!("invalid anchor bundle-pull addr: {err}"))?,
+                    )
+                };
+                index += 2;
+            }
+            Some("--anchor-bundle-pull-token-path") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--anchor-bundle-pull-token-path requires a value".to_owned())?;
+                config.anchor_bundle_pull_token_path = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.into())
+                };
+                index += 2;
+            }
+            Some("--anchor-bundle-pull-allow-lan") => {
+                // D11.b: explicit operator ack required to bind on a non-loopback
+                // address. No auto-detect or silent fallback.
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--anchor-bundle-pull-allow-lan requires a value".to_owned())?;
+                config.anchor_bundle_pull_allow_lan = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        return Err(format!(
+                            "invalid --anchor-bundle-pull-allow-lan value '{value}': expected true or false"
+                        ));
+                    }
+                };
                 index += 2;
             }
             Some("--gossip-watermark") => {
@@ -3349,6 +3476,55 @@ mod tests {
         let args = vec!["--auto-port-forward-lease-secs".to_owned(), "0".to_owned()];
         let err = parse_daemon_config(&args).expect_err("zero lease should fail parsing");
         assert!(err.contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_anchor_bundle_pull_settings() {
+        let args = vec![
+            "--anchor-bundle-pull-addr".to_owned(),
+            "127.0.0.1:51823".to_owned(),
+            "--anchor-bundle-pull-token-path".to_owned(),
+            "/var/lib/rustynet/test-anchor.token".to_owned(),
+            "--anchor-bundle-pull-allow-lan".to_owned(),
+            "true".to_owned(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(
+            config
+                .anchor_bundle_pull_addr
+                .expect("anchor addr should be set")
+                .to_string(),
+            "127.0.0.1:51823"
+        );
+        assert_eq!(
+            config.anchor_bundle_pull_token_path,
+            Some(PathBuf::from("/var/lib/rustynet/test-anchor.token"))
+        );
+        assert!(config.anchor_bundle_pull_allow_lan);
+    }
+
+    #[test]
+    fn parse_daemon_config_disables_anchor_bundle_pull_on_empty_token_path() {
+        let args = vec![
+            "--anchor-bundle-pull-token-path".to_owned(),
+            "".to_owned(),
+            "--anchor-bundle-pull-allow-lan".to_owned(),
+            "false".to_owned(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert!(config.anchor_bundle_pull_token_path.is_none());
+        assert!(!config.anchor_bundle_pull_allow_lan);
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_anchor_bundle_pull_allow_lan() {
+        let args = vec![
+            "--anchor-bundle-pull-allow-lan".to_owned(),
+            "maybe".to_owned(),
+        ];
+        let err = parse_daemon_config(&args)
+            .expect_err("invalid anchor allow-lan value should fail parsing");
+        assert!(err.contains("invalid --anchor-bundle-pull-allow-lan value"));
     }
 
     #[test]

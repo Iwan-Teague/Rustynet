@@ -1,6 +1,8 @@
 #![allow(clippy::result_large_err)]
 
-//! L8 — Linux boot-time killswitch verifier.
+//! L8 — Linux boot-time killswitch verifier **and pre-protective installer**.
+//!
+//! ## Verifier (original L8 shape)
 //!
 //! At boot the daemon programs an `inet` family table holding the
 //! `killswitch` and `forward` chains via `phase10::LiveSystem`. The
@@ -13,8 +15,37 @@
 //! to refuse to bring the `WireGuard` interface up unless the
 //! killswitch is already in place.
 //!
-//! This module owns the pure evaluator + the typed report shape. The
-//! collector parses `nft list ruleset` output and the
+//! ## Boot-time pre-protective installer
+//!
+//! When `--install-boot-killswitch` is passed to the CLI, the module
+//! also installs a minimal `inet rustynet_boot` table **before** the
+//! daemon starts.  This table survives daemon teardown because
+//! `disconnect-cleanup` only removes the daemon's generation-rotated
+//! `rustynet_g<N>` tables; `rustynet_boot` is left intact until the
+//! next ExecStartPre reinstalls it (idempotent) or a manual `nft delete
+//! table inet rustynet_boot` removes it.
+//!
+//! The purpose is to provide an SSH recovery path when the daemon fails
+//! to start or is in fail-closed mode.  If `RUSTYNET_FAIL_CLOSED_SSH_ALLOW`
+//! is true in the service environment, the boot table includes per-CIDR
+//! TCP-port-22 accept rules so an operator can always reach the node via
+//! SSH even after the daemon's killswitch is cleaned up.
+//!
+//! ### Interaction with the daemon's killswitch
+//!
+//! The boot table (`rustynet_boot`) and the daemon's table (`rustynet_g<N>`)
+//! both hook into `output` at priority 0.  In nftables, an `accept` verdict
+//! in one base chain does **not** terminate traversal of other base chains at
+//! the same hook — a `policy drop` in the daemon's chain still drops the
+//! packet.  The boot table's SSH accept rules therefore only take effect when
+//! the daemon's table has been removed (after `disconnect-cleanup` or graceful
+//! shutdown).  While the daemon is actively running in fail-closed mode with
+//! `RUSTYNET_FAIL_CLOSED_SSH_ALLOW=false`, SSH remains blocked; to unblock
+//! SSH during the daemon's lifetime set `RUSTYNET_FAIL_CLOSED_SSH_ALLOW=true`
+//! in `/etc/default/rustynetd`.
+//!
+//! This module owns the pure evaluator + typed report shape + boot installer.
+//! The collector parses `nft list ruleset` output and the
 //! `/sys/class/net/<iface>` directory presence; both surfaces are
 //! deterministic on Linux and trivially mockable in tests.
 //!
@@ -59,6 +90,199 @@ pub const REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS: &[&str] = &[
     // a black hole even for legitimate traffic.
     "ct state established,related accept",
 ];
+
+/// nftables table name for the boot-time pre-protective killswitch
+/// installed by `linux-killswitch-boot-check --install-boot-killswitch`.
+/// Distinct from the daemon's generation-rotated tables (`rustynet_g<N>`)
+/// so it survives `disconnect-cleanup` and can coexist without confusing
+/// the L8 verifier.
+pub const BOOT_KILLSWITCH_TABLE: &str = "rustynet_boot";
+
+/// A validated SSH management CIDR used when building boot-time
+/// killswitch SSH-allow rules.  Owns the IP family string ("ip" for
+/// IPv4, "ip6" for IPv6) and the CIDR string in `addr/prefix` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootSshCidr {
+    /// nftables address-family selector for this CIDR ("ip" or "ip6").
+    pub family: &'static str,
+    /// CIDR in `<addr>/<prefix>` form, e.g. "192.168.1.0/24".
+    pub cidr: String,
+}
+
+impl BootSshCidr {
+    /// Parse and validate a CIDR string.  Returns an error if the
+    /// address or prefix are syntactically invalid.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty CIDR string".to_owned());
+        }
+        let (ip_str, prefix_str) = s
+            .split_once('/')
+            .ok_or_else(|| format!("CIDR missing '/': {s}"))?;
+        let ip: std::net::IpAddr = ip_str
+            .parse()
+            .map_err(|e| format!("invalid IP address in CIDR {s}: {e}"))?;
+        let prefix: u8 = prefix_str
+            .parse()
+            .map_err(|e| format!("invalid prefix length in CIDR {s}: {e}"))?;
+        let family: &'static str = match ip {
+            std::net::IpAddr::V4(_) => {
+                if prefix > 32 {
+                    return Err(format!("IPv4 prefix length > 32 in CIDR {s}"));
+                }
+                "ip"
+            }
+            std::net::IpAddr::V6(_) => {
+                if prefix > 128 {
+                    return Err(format!("IPv6 prefix length > 128 in CIDR {s}"));
+                }
+                "ip6"
+            }
+        };
+        Ok(Self {
+            family,
+            cidr: s.to_owned(),
+        })
+    }
+}
+
+/// Install a minimal pre-protective boot-time killswitch table
+/// (`inet rustynet_boot`) before the daemon starts.  The table is
+/// always deleted and recreated so each ExecStartPre call is
+/// idempotent.
+///
+/// The table installs:
+/// - loopback accept
+/// - `ct state established,related accept` (allows SSH reply traffic
+///   during normal daemon operation)
+/// - outbound accept for the WireGuard interface (passthrough for
+///   tunnel traffic when the daemon later brings the interface up)
+/// - TCP port 22 accept for each CIDR in `ssh_cidrs` when
+///   `ssh_allow` is true
+/// - implicit `policy drop` for everything else
+///
+/// On non-Linux hosts this is a no-op (the killswitch is Linux-only).
+pub fn install_linux_boot_killswitch(
+    iface: &str,
+    ssh_allow: bool,
+    ssh_cidrs: &[BootSshCidr],
+) -> Result<(), String> {
+    install_linux_boot_killswitch_inner(iface, ssh_allow, ssh_cidrs)
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_boot_killswitch_inner(
+    iface: &str,
+    ssh_allow: bool,
+    ssh_cidrs: &[BootSshCidr],
+) -> Result<(), String> {
+    // Argv-only helper: no shell construction, args are separate tokens.
+    fn nft(args: &[&str]) -> Result<(), String> {
+        let out = std::process::Command::new("nft")
+            .args(args)
+            .output()
+            .map_err(|e| format!("nft spawn failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "nft {} failed ({}): {}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    // Always recreate: flush any stale boot table first (ignore if absent).
+    let _ = std::process::Command::new("nft")
+        .args(["delete", "table", "inet", BOOT_KILLSWITCH_TABLE])
+        .output();
+
+    nft(&["add", "table", "inet", BOOT_KILLSWITCH_TABLE])?;
+    nft(&[
+        "add",
+        "chain",
+        "inet",
+        BOOT_KILLSWITCH_TABLE,
+        "killswitch",
+        "{",
+        "type",
+        "filter",
+        "hook",
+        "output",
+        "priority",
+        "0",
+        ";",
+        "policy",
+        "drop",
+        ";",
+        "}",
+    ])?;
+    nft(&[
+        "add",
+        "rule",
+        "inet",
+        BOOT_KILLSWITCH_TABLE,
+        "killswitch",
+        "oifname",
+        "lo",
+        "accept",
+    ])?;
+    nft(&[
+        "add",
+        "rule",
+        "inet",
+        BOOT_KILLSWITCH_TABLE,
+        "killswitch",
+        "ct",
+        "state",
+        "established,related",
+        "accept",
+    ])?;
+    // Allow outbound through the WireGuard interface.  The iface may not
+    // exist yet at ExecStartPre time, but nftables accepts the rule and
+    // will match it once the interface comes up.
+    nft(&[
+        "add",
+        "rule",
+        "inet",
+        BOOT_KILLSWITCH_TABLE,
+        "killswitch",
+        "oifname",
+        iface,
+        "accept",
+    ])?;
+    if ssh_allow {
+        for cidr in ssh_cidrs {
+            nft(&[
+                "add",
+                "rule",
+                "inet",
+                BOOT_KILLSWITCH_TABLE,
+                "killswitch",
+                cidr.family,
+                "daddr",
+                cidr.cidr.as_str(),
+                "tcp",
+                "dport",
+                "22",
+                "accept",
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_linux_boot_killswitch_inner(
+    _iface: &str,
+    _ssh_allow: bool,
+    _ssh_cidrs: &[BootSshCidr],
+) -> Result<(), String> {
+    // Off-Linux: no-op. The boot-time killswitch is Linux-specific.
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinuxKillswitchBootSnapshot {
@@ -761,5 +985,105 @@ table inet rustynetfoo {
         // overall_ok must be false because the reviewed chains are
         // missing even though no leak-window reason fires.
         assert!(!report.overall_ok);
+    }
+
+    // ---- boot killswitch constants ----------------------------------------
+
+    #[test]
+    fn boot_killswitch_table_name_pinned() {
+        // The disconnect-cleanup path intentionally preserves any table
+        // whose name does not match `rustynet_g*` or `rustynet_nat_g*`,
+        // which keeps `rustynet_boot` alive across daemon teardown.
+        // Renaming the constant would silently break that invariant.
+        assert_eq!(BOOT_KILLSWITCH_TABLE, "rustynet_boot");
+    }
+
+    // ---- BootSshCidr::parse -----------------------------------------------
+
+    #[test]
+    fn boot_ssh_cidr_parse_valid_ipv4_host() {
+        let c = BootSshCidr::parse("192.168.1.5/32").unwrap();
+        assert_eq!(c.family, "ip");
+        assert_eq!(c.cidr, "192.168.1.5/32");
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_valid_ipv4_subnet() {
+        let c = BootSshCidr::parse("10.0.0.0/8").unwrap();
+        assert_eq!(c.family, "ip");
+        assert_eq!(c.cidr, "10.0.0.0/8");
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_valid_ipv6_host() {
+        let c = BootSshCidr::parse("fd00::1/128").unwrap();
+        assert_eq!(c.family, "ip6");
+        assert_eq!(c.cidr, "fd00::1/128");
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_valid_ipv6_subnet() {
+        let c = BootSshCidr::parse("fd00::/64").unwrap();
+        assert_eq!(c.family, "ip6");
+        assert_eq!(c.cidr, "fd00::/64");
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_trims_whitespace() {
+        let c = BootSshCidr::parse("  192.168.0.0/16  ").unwrap();
+        assert_eq!(c.family, "ip");
+        // The stored cidr is the trimmed input.
+        assert_eq!(c.cidr, "192.168.0.0/16");
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_rejects_empty() {
+        assert!(BootSshCidr::parse("").is_err());
+        assert!(BootSshCidr::parse("   ").is_err());
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_rejects_no_slash() {
+        assert!(BootSshCidr::parse("192.168.1.1").is_err());
+        assert!(BootSshCidr::parse("fd00::1").is_err());
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_rejects_bad_ip() {
+        assert!(BootSshCidr::parse("999.0.0.0/8").is_err());
+        assert!(BootSshCidr::parse("notanip/24").is_err());
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_rejects_bad_prefix_non_numeric() {
+        assert!(BootSshCidr::parse("192.168.0.0/abc").is_err());
+        assert!(BootSshCidr::parse("fd00::/xyz").is_err());
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_rejects_ipv4_prefix_over_32() {
+        assert!(BootSshCidr::parse("192.168.0.0/33").is_err());
+    }
+
+    #[test]
+    fn boot_ssh_cidr_parse_rejects_ipv6_prefix_over_128() {
+        assert!(BootSshCidr::parse("fd00::/129").is_err());
+    }
+
+    // ---- install_linux_boot_killswitch off-Linux no-op --------------------
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_boot_killswitch_off_linux_is_noop() {
+        // Off-Linux: must return Ok without touching any nft state.
+        let cidrs = vec![
+            BootSshCidr::parse("192.168.0.0/16").unwrap(),
+            BootSshCidr::parse("fd00::/64").unwrap(),
+        ];
+        let result = install_linux_boot_killswitch("rustynet0", true, &cidrs);
+        assert!(
+            result.is_ok(),
+            "off-Linux install must be a no-op: {result:?}"
+        );
     }
 }
