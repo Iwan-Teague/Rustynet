@@ -380,7 +380,13 @@ build_rustynet() {
 
   # macOS system SQLite is sufficient; no Homebrew sqlite needed.
   # No OpenSSL dep in rustynetd. Build is clean with just the system SDK.
-  as_user "${brew_rustup}" run stable cargo build --release --bin rustynetd --bin rustynet
+  # Build by package, not by bin name — the cli package is `rustynet-cli`
+  # (no `rustynet` bin exists at the workspace level), and `cargo build
+  # --bin rustynet` fails with "no bin target named `rustynet`" against
+  # the current workspace.  `-p rustynet-cli` builds the rustynet-cli
+  # binary at target/release/rustynet-cli, which install_binaries below
+  # renames to /usr/local/bin/rustynet on the way out.
+  as_user "${brew_rustup}" run stable cargo build --release -p rustynetd -p rustynet-cli
 
   popd >/dev/null
 }
@@ -401,8 +407,11 @@ install_binaries() {
   fi
   install -m 0755 -o root -g wheel \
     "${BUILD_DIR}/target/release/rustynetd" "${RUSTYNETD_BIN}"
+  # The CLI bin is built as `rustynet-cli` by the rustynet-cli package and
+  # installed system-wide as `rustynet` (the launchd plist and operator
+  # documentation expect the short name).
   install -m 0755 -o root -g wheel \
-    "${BUILD_DIR}/target/release/rustynet" "${RUSTYNET_BIN}"
+    "${BUILD_DIR}/target/release/rustynet-cli" "${RUSTYNET_BIN}"
   rm -rf "${BUILD_DIR}"
 }
 
