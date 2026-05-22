@@ -186,10 +186,21 @@ pub fn install_daemon(
     // Extract source archive into workdir, overwriting existing files.
     // Uses Windows built-in tar.exe (available since Windows 10 1803).
     // git archive produces files at the archive root (no leading dir component).
+    //
+    // Clean stale `.cargo/` (offline-mode config) and `vendor/` (frozen crate
+    // sources) from any prior run before extracting.  Those directories are
+    // NOT in the source archive (only git-tracked files are), so without
+    // explicit cleanup they survive across runs and pin the build to an
+    // outdated vendored snapshot.  When the workspace grows a new dep
+    // (e.g. `signal-hook` for the Unix shutdown handler), the stale vendor
+    // is missing it and `cargo build --locked` fails with
+    // "no matching package named `signal-hook` found".
     let extract_script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
          New-Item -ItemType Directory -Force -Path {workdir_q} | Out-Null; \
+         Remove-Item -LiteralPath (Join-Path {workdir_q} '.cargo') -Recurse -Force -ErrorAction SilentlyContinue; \
+         Remove-Item -LiteralPath (Join-Path {workdir_q} 'vendor') -Recurse -Force -ErrorAction SilentlyContinue; \
          & tar.exe -xzf {archive_q} -C {workdir_q}",
         workdir_q = ps_quote(workdir)?,
         archive_q = ps_quote(&remote_archive)?,
