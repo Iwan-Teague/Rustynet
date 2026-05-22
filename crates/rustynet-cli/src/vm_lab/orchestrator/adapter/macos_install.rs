@@ -107,12 +107,22 @@ pub fn install_daemon(
     })
 }
 
-/// Bootstrap via an existing remote workdir (source already on host).
-/// Used when `rustynet_src_dir` is set in inventory.
+/// Bootstrap via a remote workdir.
+///
+/// Used when `rustynet_src_dir` is set in inventory.  When `source` is
+/// `Some` and the workdir is absent on the remote host, the source
+/// archive is SCP'd over and extracted into the workdir before the
+/// build step runs.  This guarantees the bootstrap always builds the
+/// freshest code rather than silently falling back to the binary
+/// already installed at `/usr/local/bin/rustynetd` (which may be from
+/// an earlier deploy).  Pass `None` only for legacy callers that
+/// genuinely need the "use existing workdir if present, else
+/// SKIP_BUILD" behaviour.
 pub fn install_daemon_from_workdir(
     conn: &NodeConnection,
     alias: &str,
     workdir: &str,
+    source: Option<&SourceArchive>,
     ctx: &OrchestrationContext,
 ) -> Result<InstallReport, AdapterError> {
     if workdir.is_empty() {
@@ -165,25 +175,37 @@ pub fn install_daemon_from_workdir(
     let _ = std::fs::remove_file(&script_tmp);
     let _ = std::fs::remove_file(&install_tmp);
 
-    // If the workdir exists on the remote host, create a source archive from it
-    // and run the full bootstrap.  If it does not exist but the binary is already
-    // installed (e.g. a node that was set up manually), skip the build step and
-    // run only the service-install phase so the plist is kept current.
     // Probe: exit 0 if workdir exists, non-zero otherwise.
     let workdir_present =
         ssh::run_remote(conn, &format!("test -d '{workdir}'"), SHORT_TIMEOUT).is_ok();
 
     let build_cmd = if workdir_present {
+        // Workdir already has the fresh source (a prior caller — e.g.
+        // an earlier orchestrator stage or a manual sync — populated
+        // it).  Pack it into the bootstrap archive path and proceed.
         format!(
             "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
              cd '{workdir}' && tar -czf /tmp/rn_source.tar.gz . && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
              sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
         )
+    } else if let Some(source) = source {
+        // Workdir absent but the orchestrator carried a fresh source
+        // archive.  Ship it directly, then run the bootstrap with
+        // SOURCE_ARCHIVE pointing at the SCP'd tarball.  Skipping
+        // build here (the old behaviour) silently kept stale
+        // binaries across deploys and was the actual root cause of
+        // "membership role preflight failed" reappearing after the
+        // capability fix was merged.
+        ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+             echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
+             sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
+            .to_owned()
     } else {
-        // Workdir absent — rely on SKIP_BUILD guard in bootstrap script.
-        // The bootstrap will skip compilation and only (re-)install the service
-        // if the binary is already present at RUSTYNETD_BIN.
+        // No workdir AND no source — last-resort legacy path: rely on
+        // SKIP_BUILD=1 so the bootstrap re-runs the service-install
+        // phase against whatever binary is already on disk.
         "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
              echo 'SKIP_BUILD=1' >> /tmp/rn_macos_bootstrap.env && \
              echo 'SOURCE_ARCHIVE=/dev/null' >> /tmp/rn_macos_bootstrap.env && \

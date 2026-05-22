@@ -191,10 +191,7 @@ pub fn install_daemon(
     // sources) from any prior run before extracting.  Those directories are
     // NOT in the source archive (only git-tracked files are), so without
     // explicit cleanup they survive across runs and pin the build to an
-    // outdated vendored snapshot.  When the workspace grows a new dep
-    // (e.g. `signal-hook` for the Unix shutdown handler), the stale vendor
-    // is missing it and `cargo build --locked` fails with
-    // "no matching package named `signal-hook` found".
+    // outdated vendored snapshot.
     let extract_script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
@@ -206,6 +203,40 @@ pub fn install_daemon(
         archive_q = ps_quote(&remote_archive)?,
     );
     run_remote_ps(conn, &extract_script, Duration::from_secs(120))?;
+
+    // If the operator has pre-vendored crates on the host at
+    // /tmp/rustynet-vendor-flat.tar.gz (created with `cargo vendor` and
+    // tarred with contents at the archive root), ship them across and
+    // wire up an offline `.cargo/config.toml`.  This is required for
+    // Windows lab VMs whose virtio NIC has working LAN connectivity
+    // but no external internet egress (so `cargo build` cannot reach
+    // crates.io).  When the tarball is absent the build falls back to
+    // online crates.io, which is fine for VMs with full internet.
+    let local_vendor = std::path::PathBuf::from("/tmp/rustynet-vendor-flat.tar.gz");
+    if local_vendor.is_file() {
+        let remote_vendor = format!(r"{staging_dir}\rn_vendor.tar.gz");
+        ssh::scp_to(
+            conn,
+            local_vendor.as_path(),
+            &remote_vendor.replace('\\', "/"),
+            Duration::from_secs(600),
+        )?;
+        let vendor_extract_script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $ProgressPreference = 'SilentlyContinue'; \
+             $vendorDir = Join-Path {workdir_q} 'vendor'; \
+             $cargoDir = Join-Path {workdir_q} '.cargo'; \
+             New-Item -ItemType Directory -Force -Path $vendorDir | Out-Null; \
+             New-Item -ItemType Directory -Force -Path $cargoDir | Out-Null; \
+             & tar.exe -xzf {vendor_archive_q} -C $vendorDir; \
+             $cargoConfig = Join-Path $cargoDir 'config.toml'; \
+             $configBytes = [Text.Encoding]::ASCII.GetBytes(\"[source.crates-io]`nreplace-with = `\"vendored-sources`\"`n`n[source.vendored-sources]`ndirectory = `\"vendor`\"`n\"); \
+             [IO.File]::WriteAllBytes($cargoConfig, $configBytes)",
+            workdir_q = ps_quote(workdir)?,
+            vendor_archive_q = ps_quote(&remote_vendor)?,
+        );
+        run_remote_ps(conn, &vendor_extract_script, Duration::from_secs(300))?;
+    }
 
     // Build release from synced workdir.
     let build_script = build_windows_release_script(workdir, &remote_bootstrap)?;

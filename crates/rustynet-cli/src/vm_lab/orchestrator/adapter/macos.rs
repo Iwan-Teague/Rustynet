@@ -57,7 +57,18 @@ impl NodeAdapter for MacosNodeAdapter {
         ctx: &OrchestrationContext,
     ) -> Result<InstallReport, AdapterError> {
         if let Some(workdir) = &self.workdir {
-            macos_install::install_daemon_from_workdir(&self.conn, &self.alias, workdir, ctx)
+            // Pass the fresh source archive even when a workdir is
+            // configured: install_daemon_from_workdir will extract it
+            // when the workdir is absent on the remote host (cold
+            // bootstrap) so the build step always picks up the
+            // newest code.
+            macos_install::install_daemon_from_workdir(
+                &self.conn,
+                &self.alias,
+                workdir,
+                Some(source),
+                ctx,
+            )
         } else {
             macos_install::install_daemon(&self.conn, &self.alias, source, ctx)
         }
