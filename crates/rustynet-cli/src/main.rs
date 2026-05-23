@@ -7,6 +7,7 @@ mod ops_cross_network_preflight;
 mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
+mod ops_install_macos_relay;
 mod ops_install_systemd;
 mod ops_install_systemd_relay;
 mod ops_live_lab_failure_digest;
@@ -908,6 +909,9 @@ enum OpsCommand {
     /// available as a standalone operator verb today.
     InstallSystemdRelay {
         config: ops_install_systemd_relay::InstallRelayConfig,
+    },
+    InstallMacosRelay {
+        config: ops_install_macos_relay::InstallMacosRelayConfig,
     },
     InstallWindowsService,
     InstallWindowsRelayService,
@@ -3075,6 +3079,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 extra_vm: parser.value("--extra-vm"),
                 fifth_client_vm: parser.value("--fifth-client-vm"),
                 windows_vm: parser.value("--windows-vm"),
+                macos_vm: parser.value("--macos-vm"),
                 ssh_identity_file: parser.required_path("--ssh-identity-file")?,
                 known_hosts_path: parser.optional_path("--known-hosts-file"),
                 require_same_network: parser.has_flag("--require-same-network"),
@@ -3769,6 +3774,38 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 }
             };
             Ok(OpsCommand::InstallSystemdRelay { config })
+        }
+        "install-macos-relay" => {
+            let mut mode = ops_install_macos_relay::LaunchdRelayMode::InstallAndBootstrap;
+            let mut dry_run = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--uninstall" => {
+                        mode = ops_install_macos_relay::LaunchdRelayMode::DisableAndRemove;
+                    }
+                    "--dry-run" => dry_run = true,
+                    other => {
+                        return Err(format!(
+                            "ops install-macos-relay: unknown flag {other:?} (expected --uninstall or --dry-run)"
+                        ));
+                    }
+                }
+            }
+            let config = match mode {
+                ops_install_macos_relay::LaunchdRelayMode::InstallAndBootstrap => {
+                    ops_install_macos_relay::InstallMacosRelayConfig {
+                        dry_run,
+                        ..ops_install_macos_relay::InstallMacosRelayConfig::default_install()
+                    }
+                }
+                ops_install_macos_relay::LaunchdRelayMode::DisableAndRemove => {
+                    ops_install_macos_relay::InstallMacosRelayConfig {
+                        dry_run,
+                        ..ops_install_macos_relay::InstallMacosRelayConfig::default_uninstall()
+                    }
+                }
+            };
+            Ok(OpsCommand::InstallMacosRelay { config })
         }
         "install-windows-service" => {
             if args.len() != 1 {
@@ -6269,6 +6306,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::InstallSystemd => ops_install_systemd::execute_ops_install_systemd(),
         OpsCommand::InstallSystemdRelay { config } => {
             ops_install_systemd_relay::execute_install_relay(config)
+                .map(|report| report.summary())
+        }
+        OpsCommand::InstallMacosRelay { config } => {
+            ops_install_macos_relay::execute_install_macos_relay(config)
                 .map(|report| report.summary())
         }
         OpsCommand::InstallWindowsService => ops_e2e::execute_ops_install_windows_service(),
@@ -16205,8 +16246,8 @@ fn emit_role_audit(event: &rustynet_control::role_audit::RoleTransitionEvent) {
 ///   followup-instructions list tells the operator to do that.
 /// - `AdvertiseDefaultRoute` — `IpcCommand::RouteAdvertise(0.0.0.0/0)`.
 /// - `RetractDefaultRoute` — `IpcCommand::RouteRetract(0.0.0.0/0)`.
-/// - `DeployRelayService` / `UndeployRelayService` — existing
-///   systemd relay installer paths.
+/// - `DeployRelayService` / `UndeployRelayService` — platform relay
+///   service installer paths (systemd on Linux, launchd on macOS).
 fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, String> {
     match action {
         role_cli::ConcreteAction::NoOp => Ok("no change required".to_owned()),
@@ -16236,19 +16277,36 @@ fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, Stri
             }
             Ok("retracted 0.0.0.0/0 (exit-serving torn down)".to_owned())
         }
-        role_cli::ConcreteAction::DeployRelayService => {
-            ops_install_systemd_relay::execute_install_relay(
-                ops_install_systemd_relay::InstallRelayConfig::default_install(),
-            )
-            .map(|report| report.summary())
-        }
+        role_cli::ConcreteAction::DeployRelayService => execute_platform_relay_service_action(true),
         role_cli::ConcreteAction::UndeployRelayService => {
-            ops_install_systemd_relay::execute_install_relay(
-                ops_install_systemd_relay::InstallRelayConfig::default_uninstall(),
-            )
-            .map(|report| report.summary())
+            execute_platform_relay_service_action(false)
         }
     }
+}
+
+fn execute_platform_relay_service_action(install: bool) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        let config = if install {
+            ops_install_systemd_relay::InstallRelayConfig::default_install()
+        } else {
+            ops_install_systemd_relay::InstallRelayConfig::default_uninstall()
+        };
+        return ops_install_systemd_relay::execute_install_relay(config)
+            .map(|report| report.summary());
+    }
+    if cfg!(target_os = "macos") {
+        let config = if install {
+            ops_install_macos_relay::InstallMacosRelayConfig::default_install()
+        } else {
+            ops_install_macos_relay::InstallMacosRelayConfig::default_uninstall()
+        };
+        return ops_install_macos_relay::execute_install_macos_relay(config)
+            .map(|report| report.summary());
+    }
+    Err(format!(
+        "relay service role transition is not supported on {}",
+        std::env::consts::OS
+    ))
 }
 
 /// Atomically replace the `NODE_ROLE=` line in the daemon env file.
@@ -16686,7 +16744,7 @@ fn help_text() -> String {
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--legacy-bash-orchestrator] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--script <path>] [--source-mode <mode>] [--repo-ref <ref>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--no-fail-on-authenticode] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",
         "  ops vm-lab-distribute-windows-state [--inventory <path>] --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--membership-bundle <path>] [--assignment-bundle <path>] [--traversal-bundle <path>] [--dns-zone-bundle <path>]",
@@ -20237,6 +20295,14 @@ mod tests {
 
         let installer = parse_command(&["ops".to_owned(), "install-systemd".to_owned()]);
         assert!(format!("{installer:?}").contains("InstallSystemd"));
+
+        let systemd_relay_installer =
+            parse_command(&["ops".to_owned(), "install-systemd-relay".to_owned()]);
+        assert!(format!("{systemd_relay_installer:?}").contains("InstallSystemdRelay"));
+
+        let macos_relay_installer =
+            parse_command(&["ops".to_owned(), "install-macos-relay".to_owned()]);
+        assert!(format!("{macos_relay_installer:?}").contains("InstallMacosRelay"));
 
         let windows_installer =
             parse_command(&["ops".to_owned(), "install-windows-service".to_owned()]);

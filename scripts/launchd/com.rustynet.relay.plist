@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.rustynet.relay.plist - reviewed launchd unit for rustynet-relay.
+
+  Install to: /Library/LaunchDaemons/com.rustynet.relay.plist
+  Owner/mode: root:wheel 0644
+  Load via:   launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.relay.plist
+  Unload via: launchctl bootout system/com.rustynet.relay
+
+  Defaults are loopback-only. Operators must deliberately widen --bind after
+  installing trust material and deciding this host should accept relay traffic
+  from other peers.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.relay</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynet-relay</string>
+        <string>--relay-id</string>
+        <string>relay-local</string>
+        <string>--bind</string>
+        <string>127.0.0.1:4500</string>
+        <string>--verifier-key</string>
+        <string>/usr/local/var/rustynet/relay-verifier.pub</string>
+        <string>--replay-store</string>
+        <string>/usr/local/var/rustynet/relay.replay</string>
+        <string>--port-range</string>
+        <string>40000-49999</string>
+        <string>--max-sessions-per-node</string>
+        <string>8</string>
+        <string>--max-total-sessions</string>
+        <string>4096</string>
+        <string>--health-bind</string>
+        <string>127.0.0.1:4501</string>
+    </array>
+
+    <key>UserName</key>
+    <string>rustynetd</string>
+
+    <key>GroupName</key>
+    <string>rustynetd</string>
+
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/rustynet</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>AbandonProcessGroup</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/rustynet/rustynet-relay.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/rustynet/rustynet-relay-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

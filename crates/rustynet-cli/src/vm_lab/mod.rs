@@ -820,6 +820,10 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// When set, the orchestrator includes this VM in UTM discovery/restart, then runs
     /// Windows-specific bootstrap and validation stages after all Linux stages pass.
     pub windows_vm: Option<String>,
+    /// Alias of an optional macOS UTM VM to bootstrap and validate as a client node.
+    /// When set, the orchestrator includes this VM in UTM discovery/restart, then runs
+    /// macOS-specific bootstrap and validation stages after all Linux stages pass.
+    pub macos_vm: Option<String>,
     /// Skip all Linux stages and run only the Windows bootstrap and validation stages.
     /// Requires `--windows-vm`. Use when the Linux lab is already known-good and only
     /// the Windows client path needs to be exercised.
@@ -6604,13 +6608,18 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         config.extra_vm.as_deref(),
         config.fifth_client_vm.as_deref(),
     )?;
-    // Build discovery alias list: Linux nodes + optional Windows node.
+    // Build discovery alias list: Linux nodes + optional Windows/macOS nodes.
     // selected_aliases (Linux only) continues to be used for profile/setup.
     let mut discovery_aliases = selected_aliases.clone();
     if let Some(ref windows_alias) = config.windows_vm
         && !discovery_aliases.contains(windows_alias)
     {
         discovery_aliases.push(windows_alias.clone());
+    }
+    if let Some(ref macos_alias) = config.macos_vm
+        && !discovery_aliases.contains(macos_alias)
+    {
+        discovery_aliases.push(macos_alias.clone());
     }
     let effective_profile_path = match config.profile_path.clone() {
         Some(path) => resolve_absolute_path(path.as_path())?,
@@ -7018,6 +7027,21 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 }
                 outcomes.extend(windows_outcomes);
             }
+            if let Some(ref macos_alias) = config.macos_vm {
+                let macos_outcomes = run_macos_orchestration_stages(
+                    macos_alias.as_str(),
+                    inventory_path.as_path(),
+                    config.ssh_identity_file.as_path(),
+                    config.known_hosts_path.as_deref(),
+                    config.dry_run,
+                    report_dir.as_path(),
+                    &outcomes,
+                );
+                for outcome in &macos_outcomes {
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+                }
+                outcomes.extend(macos_outcomes);
+            }
             if !config.skip_diagnose_on_failure
                 && effective_profile_path.is_file()
                 && report_dir.join("state/stages.tsv").exists()
@@ -7121,6 +7145,21 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                 }
                 outcomes.extend(windows_outcomes);
             }
+            if let Some(ref macos_alias) = config.macos_vm {
+                let macos_outcomes = run_macos_orchestration_stages(
+                    macos_alias.as_str(),
+                    inventory_path.as_path(),
+                    config.ssh_identity_file.as_path(),
+                    config.known_hosts_path.as_deref(),
+                    config.dry_run,
+                    report_dir.as_path(),
+                    &outcomes,
+                );
+                for outcome in &macos_outcomes {
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+                }
+                outcomes.extend(macos_outcomes);
+            }
             if config.validate_linux_daemon_state && !selected_aliases.is_empty() {
                 let linux_outcomes = run_linux_daemon_validators_for_aliases(
                     selected_aliases.as_slice(),
@@ -7189,6 +7228,21 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
                     emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
                 }
                 outcomes.extend(windows_outcomes);
+            }
+            if let Some(ref macos_alias) = config.macos_vm {
+                let macos_outcomes = run_macos_orchestration_stages(
+                    macos_alias.as_str(),
+                    inventory_path.as_path(),
+                    config.ssh_identity_file.as_path(),
+                    config.known_hosts_path.as_deref(),
+                    config.dry_run,
+                    report_dir.as_path(),
+                    &outcomes,
+                );
+                for outcome in &macos_outcomes {
+                    emit_vm_lab_progress_outcome("vm-lab-orchestrate-live-lab", outcome);
+                }
+                outcomes.extend(macos_outcomes);
             }
             if !config.skip_diagnose_on_failure && report_dir.join("state/stages.tsv").exists() {
                 let diagnose_result = execute_ops_vm_lab_diagnose_live_lab_failure(
@@ -7384,6 +7438,631 @@ fn run_windows_orchestration_with_pulled_bundles(
         report_dir,
         options,
     ));
+    outcomes
+}
+
+// =====================================================================
+// macOS orchestration stages (--macos-vm)
+//
+// Five sequential stages mirror the structure used for the Windows peer:
+//   1. bootstrap_macos_host      — upload source archive + bootstrap script,
+//                                  write a minimal env file, run the script.
+//   2. collect_macos_pubkey      — SSH cat the WireGuard public key file
+//                                  written by Bootstrap-RustyNetMacos.sh.
+//   3. amend_membership_for_macos — add the macOS node to the Linux mesh
+//                                  membership on the exit node (same logic
+//                                  as amend_membership_for_windows_node).
+//   4. distribute_macos_bundles  — SCP signed bundles to the macOS VM.
+//   5. validate_macos_mesh_join  — verify the daemon reports at least one
+//                                  active peer.
+//
+// macOS paths: `/usr/local/var/rustynet/` (STATE_ROOT in the bootstrap
+// script) vs `/var/lib/rustynet/` on Linux.
+// =====================================================================
+
+/// macOS state root path written by `Bootstrap-RustyNetMacos.sh`.
+const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
+
+/// Remote path of the bootstrap script on the macOS VM (uploaded by stage 1).
+const MACOS_BOOTSTRAP_SCRIPT_REMOTE: &str = "/tmp/Bootstrap-RustyNetMacos.sh";
+
+/// Remote path of the macOS env file (uploaded by stage 1).
+const MACOS_ENV_FILE_REMOTE: &str = "/tmp/rustynet-macos-bootstrap.env";
+
+/// Run all macOS orchestration stages for the alias given by `--macos-vm`.
+///
+/// `linux_outcomes` is the current accumulated outcome list — the membership
+/// amendment stage gates on whether the Linux distribute_* stages passed so
+/// that the macOS node is only added to a mesh that already has a complete
+/// signed bundle set.
+#[allow(clippy::too_many_arguments)]
+fn run_macos_orchestration_stages(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    dry_run: bool,
+    report_dir: &Path,
+    linux_outcomes: &[VmLabStageOutcome],
+) -> Vec<VmLabStageOutcome> {
+    let logs_dir = report_dir.join("logs");
+    let _ = std::fs::create_dir_all(&logs_dir);
+
+    // ── Stage 1: bootstrap_macos_host ────────────────────────────────────
+    let bootstrap_log_path = logs_dir.join("bootstrap_macos_host.log");
+    let bootstrap_outcome = if dry_run {
+        stage_outcome(
+            "bootstrap_macos_host",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would bootstrap macOS host {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let result = (|| -> Result<String, String> {
+            let inventory = load_inventory(inventory_path)?;
+            let macos_entry = inventory
+                .iter()
+                .find(|e| e.alias == macos_alias)
+                .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
+                .clone();
+            if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+                return Err(format!(
+                    "alias {macos_alias} resolved to non-macOS platform: {}",
+                    macos_entry.platform_profile().platform.as_str()
+                ));
+            }
+            let node_id = macos_entry
+                .node_id
+                .as_deref()
+                .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?;
+            validate_mesh_node_id(node_id)?;
+            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+
+            // Locate and upload the source archive prepared for Linux.
+            let source_archive = report_dir.join("state").join("rustynet-source.tar.gz");
+            if !source_archive.is_file() {
+                return Err(format!(
+                    "source archive not found at {}; Linux setup stages must produce it first",
+                    source_archive.display()
+                ));
+            }
+            let remote_archive = format!("/tmp/rustynet-src-{}.tar.gz", unique_suffix());
+            ensure_success_status(
+                scp_to_remote_for_target(
+                    &target,
+                    None,
+                    Some(ssh_identity_file),
+                    known_hosts_path,
+                    source_archive.as_path(),
+                    remote_archive.as_str(),
+                    timeout,
+                )
+                .map_err(|e| format!("SCP source archive to {macos_alias} failed: {e}"))?,
+                "SCP source archive to macOS host",
+            )?;
+
+            // Upload the bootstrap script.
+            let bootstrap_script =
+                workspace_root_path().join("scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh");
+            if !bootstrap_script.is_file() {
+                return Err(format!(
+                    "Bootstrap-RustyNetMacos.sh not found at {}",
+                    bootstrap_script.display()
+                ));
+            }
+            ensure_success_status(
+                scp_to_remote_for_target(
+                    &target,
+                    None,
+                    Some(ssh_identity_file),
+                    known_hosts_path,
+                    bootstrap_script.as_path(),
+                    MACOS_BOOTSTRAP_SCRIPT_REMOTE,
+                    timeout,
+                )
+                .map_err(|e| format!("SCP bootstrap script to {macos_alias} failed: {e}"))?,
+                "SCP bootstrap script to macOS host",
+            )?;
+
+            // Write a minimal env file and upload it.
+            // Derive SSH_ALLOW_CIDRS from the macOS host's last_known_ip subnet.
+            let ssh_allow_cidrs = macos_entry
+                .last_known_ip
+                .as_deref()
+                .and_then(|ip| {
+                    // Turn e.g. "192.168.64.18" into "192.168.64.0/24"
+                    let parts: Vec<&str> = ip.split('.').collect();
+                    if parts.len() == 4 {
+                        Some(format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "192.168.64.0/24".to_owned());
+
+            // DAEMON_NODE_ROLE is the role arg consumed by install_launchd_service
+            // inside the bootstrap script (must be admin|client|blind_exit).
+            let env_body = format!(
+                "ROLE=client\nNODE_ID={node_id}\nNETWORK_ID=rustynet\nSSH_ALLOW_CIDRS={ssh_allow}\nSOURCE_ARCHIVE={archive}\nDAEMON_NODE_ROLE=client\n",
+                node_id = node_id,
+                ssh_allow = ssh_allow_cidrs,
+                archive = remote_archive,
+            );
+            let local_env_path = report_dir.join("state").join("macos-bootstrap.env");
+            let _ = std::fs::create_dir_all(report_dir.join("state"));
+            std::fs::write(&local_env_path, env_body.as_str())
+                .map_err(|e| format!("write macOS bootstrap env failed: {e}"))?;
+            ensure_success_status(
+                scp_to_remote_for_target(
+                    &target,
+                    None,
+                    Some(ssh_identity_file),
+                    known_hosts_path,
+                    local_env_path.as_path(),
+                    MACOS_ENV_FILE_REMOTE,
+                    timeout,
+                )
+                .map_err(|e| format!("SCP bootstrap env to {macos_alias} failed: {e}"))?,
+                "SCP bootstrap env to macOS host",
+            )?;
+
+            // Run the bootstrap script via sudo.
+            let run_script = format!(
+                "sudo bash {script} {env_file}",
+                script = shell_quote(MACOS_BOOTSTRAP_SCRIPT_REMOTE),
+                env_file = shell_quote(MACOS_ENV_FILE_REMOTE),
+            );
+            capture_remote_shell_command_for_target(
+                &target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                run_script.as_str(),
+                // Bootstrap can take several minutes (build from source).
+                Duration::from_secs(900),
+            )
+            .map_err(|e| format!("bootstrap script on {macos_alias} failed: {e}"))?;
+
+            Ok(format!(
+                "macOS host {macos_alias} bootstrapped; node_id={node_id}"
+            ))
+        })();
+        match result {
+            Ok(summary) => {
+                let _ = std::fs::write(&bootstrap_log_path, summary.as_str());
+                stage_outcome(
+                    "bootstrap_macos_host",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![bootstrap_log_path.clone()],
+                )
+            }
+            Err(err) => {
+                let _ = std::fs::write(&bootstrap_log_path, err.as_str());
+                stage_outcome(
+                    "bootstrap_macos_host",
+                    VmLabStageStatus::Fail,
+                    format!("macOS host bootstrap failed for {macos_alias}: {err}"),
+                    vec![bootstrap_log_path.clone()],
+                )
+            }
+        }
+    };
+    let bootstrap_passed = bootstrap_outcome.status == VmLabStageStatus::Pass;
+    let mut outcomes = vec![bootstrap_outcome];
+
+    // ── Stage 2: collect_macos_pubkey ────────────────────────────────────
+    let collect_pubkey_log_path = logs_dir.join("collect_macos_pubkey.log");
+    let mut macos_wg_pubkey_hex: Option<String> = None;
+    let collect_pubkey_outcome = if dry_run {
+        stage_outcome(
+            "collect_macos_pubkey",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would collect WireGuard pubkey from {macos_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "collect_macos_pubkey",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_macos_host did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let result = (|| -> Result<String, String> {
+            let inventory = load_inventory(inventory_path)?;
+            let macos_entry = inventory
+                .iter()
+                .find(|e| e.alias == macos_alias)
+                .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
+                .clone();
+            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            // The bootstrap script writes wireguard.pub as raw base64 WireGuard key.
+            // To get hex: read pub file and convert via Python (python3 is present on
+            // macOS). `wg pubkey` output is base64; we decode and hexlify.
+            let collect_script = format!(
+                "sudo cat {pub_path} | python3 -c \
+                 'import sys,base64,binascii; \
+                  raw=sys.stdin.read().strip(); \
+                  print(binascii.hexlify(base64.b64decode(raw)).decode())'",
+                pub_path = shell_quote(&format!("{MACOS_STATE_ROOT}/keys/wireguard.pub")),
+            );
+            let raw = capture_remote_shell_command_for_target(
+                &target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                collect_script.as_str(),
+                Duration::from_secs(30),
+            )
+            .map_err(|e| {
+                format!("collect macOS WireGuard pubkey from {macos_alias} failed: {e}")
+            })?;
+            let pubkey_hex = raw.trim().to_owned();
+            if pubkey_hex.len() != 64 || !pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "macOS WireGuard pubkey from {macos_alias} is not a 64-char lowercase hex \
+                     string: {pubkey_hex:?}"
+                ));
+            }
+            Ok(pubkey_hex)
+        })();
+        match result {
+            Ok(pubkey_hex) => {
+                let summary =
+                    format!("collected WireGuard pubkey from {macos_alias}: {pubkey_hex}");
+                let _ = std::fs::write(&collect_pubkey_log_path, summary.as_str());
+                macos_wg_pubkey_hex = Some(pubkey_hex);
+                stage_outcome(
+                    "collect_macos_pubkey",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![collect_pubkey_log_path.clone()],
+                )
+            }
+            Err(err) => {
+                let _ = std::fs::write(&collect_pubkey_log_path, err.as_str());
+                stage_outcome(
+                    "collect_macos_pubkey",
+                    VmLabStageStatus::Fail,
+                    format!("collect macOS pubkey failed for {macos_alias}: {err}"),
+                    vec![collect_pubkey_log_path.clone()],
+                )
+            }
+        }
+    };
+    let collect_pubkey_passed = collect_pubkey_outcome.status == VmLabStageStatus::Pass;
+    outcomes.push(collect_pubkey_outcome);
+
+    // ── Stage 3: amend_membership_for_macos ──────────────────────────────
+    //
+    // Requires: the Linux distribute_* stages passed (so the exit node has
+    // a complete signed bundle set) and the pubkey collection succeeded.
+    let amend_membership_log_path = logs_dir.join("amend_membership_for_macos.log");
+    let mut amended_membership_path: Option<PathBuf> = None;
+    let linux_distribute_ok = linux_distribute_stages_passed(linux_outcomes);
+    let amend_membership_outcome = if dry_run {
+        stage_outcome(
+            "amend_membership_for_macos",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would amend Linux membership to include {macos_alias}"),
+            vec![],
+        )
+    } else if !collect_pubkey_passed {
+        stage_outcome(
+            "amend_membership_for_macos",
+            VmLabStageStatus::Skipped,
+            format!("skipped: collect_macos_pubkey did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else if !linux_distribute_ok {
+        stage_outcome(
+            "amend_membership_for_macos",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: Linux bundle-distribution stages did not all pass ({})",
+                LINUX_DISTRIBUTE_STAGES_FOR_WINDOWS_BUNDLES.join(", ")
+            ),
+            vec![],
+        )
+    } else {
+        let result = (|| -> Result<String, String> {
+            let inventory = load_inventory(inventory_path)?;
+            let macos_entry = inventory
+                .iter()
+                .find(|e| e.alias == macos_alias)
+                .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
+                .clone();
+            let macos_node_id = macos_entry
+                .node_id
+                .as_deref()
+                .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?;
+            validate_mesh_node_id(macos_node_id)?;
+
+            // Resolve the Linux exit alias.
+            let exit_alias = default_inventory_alias_for_lab_roles(inventory_path, &["exit"])
+                .map_err(|e| format!("could not resolve Linux exit alias: {e}"))?
+                .ok_or_else(|| {
+                    "no Linux exit alias resolvable from inventory lab_role=exit".to_owned()
+                })?;
+            let exit_entry = inventory
+                .iter()
+                .find(|e| e.alias == exit_alias)
+                .ok_or_else(|| format!("exit alias {exit_alias:?} not found in inventory"))?
+                .clone();
+            let exit_node_id = exit_entry
+                .node_id
+                .as_deref()
+                .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
+            let exit_target = remote_target_from_inventory_entry(&exit_entry, None);
+
+            let pubkey_hex = macos_wg_pubkey_hex.as_deref().unwrap();
+            let owner_approver_id = format!("{exit_node_id}-owner");
+            let add_script = format!(
+                "set -eu; sudo -n rustynet ops e2e-membership-add \
+                 --client-node-id {node_id} \
+                 --client-pubkey-hex {pubkey} \
+                 --capabilities client \
+                 --owner-approver-id {approver}",
+                node_id = shell_quote(macos_node_id),
+                pubkey = shell_quote(pubkey_hex),
+                approver = shell_quote(owner_approver_id.as_str()),
+            );
+            let add_out = capture_remote_shell_command_for_target(
+                &exit_target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                add_script.as_str(),
+                Duration::from_secs(60),
+            )
+            .map_err(|e| format!("e2e-membership-add on {exit_alias} failed: {e}"))?;
+
+            // Fetch the updated membership snapshot.
+            let snapshot_path = report_dir.join("state").join("macos-membership.snapshot");
+            capture_remote_file_to_local(
+                &exit_target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                "/var/lib/rustynet/membership.snapshot",
+                snapshot_path.as_path(),
+                Duration::from_secs(30),
+            )
+            .map_err(|e| format!("fetch membership.snapshot from {exit_alias} failed: {e}"))?;
+            amended_membership_path = Some(snapshot_path.clone());
+
+            Ok(format!(
+                "amended Linux membership to include {macos_alias} ({macos_node_id}) on \
+                 {exit_alias}: pubkey={pubkey_hex} add_output={} snapshot={}",
+                add_out.trim(),
+                snapshot_path.display(),
+            ))
+        })();
+        match result {
+            Ok(summary) => {
+                let _ = std::fs::write(&amend_membership_log_path, summary.as_str());
+                stage_outcome(
+                    "amend_membership_for_macos",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![amend_membership_log_path.clone()],
+                )
+            }
+            Err(err) => {
+                let _ = std::fs::write(&amend_membership_log_path, err.as_str());
+                stage_outcome(
+                    "amend_membership_for_macos",
+                    VmLabStageStatus::Fail,
+                    format!("macOS membership amendment failed for {macos_alias}: {err}"),
+                    vec![amend_membership_log_path.clone()],
+                )
+            }
+        }
+    };
+    let amend_membership_passed = amend_membership_outcome.status == VmLabStageStatus::Pass;
+    outcomes.push(amend_membership_outcome);
+
+    // ── Stage 4: distribute_macos_bundles ─────────────────────────────────
+    //
+    // SCP the signed membership snapshot, membership log, and assignment
+    // bundle to the macOS VM's STATE_ROOT. We use the snapshot produced by
+    // the amend stage (or the one from the report state dir as fallback).
+    let distribute_log_path = logs_dir.join("distribute_macos_bundles.log");
+    let distribute_outcome = if dry_run {
+        stage_outcome(
+            "distribute_macos_bundles",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would distribute bundles to {macos_alias}"),
+            vec![],
+        )
+    } else if !amend_membership_passed {
+        stage_outcome(
+            "distribute_macos_bundles",
+            VmLabStageStatus::Skipped,
+            format!("skipped: amend_membership_for_macos did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let result = (|| -> Result<String, String> {
+            let inventory = load_inventory(inventory_path)?;
+            let macos_entry = inventory
+                .iter()
+                .find(|e| e.alias == macos_alias)
+                .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
+                .clone();
+            let macos_node_id = macos_entry
+                .node_id
+                .as_deref()
+                .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?
+                .to_owned();
+            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+
+            // Membership snapshot (from amend stage or report state).
+            let membership_snapshot = amended_membership_path
+                .clone()
+                .or_else(|| {
+                    let p = report_dir.join("state").join("membership.snapshot");
+                    p.is_file().then_some(p)
+                })
+                .ok_or_else(|| {
+                    "no membership.snapshot available for distribution to macOS host".to_owned()
+                })?;
+            let remote_snapshot = format!("{MACOS_STATE_ROOT}/membership.snapshot");
+            ensure_success_status(
+                scp_to_remote_for_target(
+                    &target,
+                    None,
+                    Some(ssh_identity_file),
+                    known_hosts_path,
+                    membership_snapshot.as_path(),
+                    remote_snapshot.as_str(),
+                    timeout,
+                )
+                .map_err(|e| format!("SCP membership.snapshot to {macos_alias} failed: {e}"))?,
+                "SCP membership.snapshot to macOS host",
+            )?;
+
+            // Membership log (optional — skip if not present rather than fail).
+            let membership_log = report_dir.join("state").join("membership.log");
+            if membership_log.is_file() {
+                let _ = ensure_success_status(
+                    scp_to_remote_for_target(
+                        &target,
+                        None,
+                        Some(ssh_identity_file),
+                        known_hosts_path,
+                        membership_log.as_path(),
+                        &format!("{MACOS_STATE_ROOT}/membership.log"),
+                        timeout,
+                    )
+                    .map_err(|e| format!("SCP membership.log to {macos_alias} failed: {e}"))?,
+                    "SCP membership.log to macOS host",
+                );
+            }
+
+            // Assignment bundle.
+            let assignment_bundle = report_dir
+                .join("state")
+                .join(format!("assignment-{macos_node_id}.bundle"));
+            if assignment_bundle.is_file() {
+                ensure_success_status(
+                    scp_to_remote_for_target(
+                        &target,
+                        None,
+                        Some(ssh_identity_file),
+                        known_hosts_path,
+                        assignment_bundle.as_path(),
+                        &format!("{MACOS_STATE_ROOT}/assignment.bundle"),
+                        timeout,
+                    )
+                    .map_err(|e| format!("SCP assignment bundle to {macos_alias} failed: {e}"))?,
+                    "SCP assignment bundle to macOS host",
+                )?;
+            }
+
+            Ok(format!(
+                "distributed membership snapshot (and assignment bundle if present) to \
+                 {macos_alias}; snapshot={}",
+                membership_snapshot.display(),
+            ))
+        })();
+        match result {
+            Ok(summary) => {
+                let _ = std::fs::write(&distribute_log_path, summary.as_str());
+                stage_outcome(
+                    "distribute_macos_bundles",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![distribute_log_path.clone()],
+                )
+            }
+            Err(err) => {
+                let _ = std::fs::write(&distribute_log_path, err.as_str());
+                stage_outcome(
+                    "distribute_macos_bundles",
+                    VmLabStageStatus::Fail,
+                    format!("macOS bundle distribution failed for {macos_alias}: {err}"),
+                    vec![distribute_log_path.clone()],
+                )
+            }
+        }
+    };
+    let distribute_passed = distribute_outcome.status == VmLabStageStatus::Pass;
+    outcomes.push(distribute_outcome);
+
+    // ── Stage 5: validate_macos_mesh_join ─────────────────────────────────
+    //
+    // Verify the daemon reports at least one active peer by running
+    // `rustynet peer-list` on the macOS VM and checking for non-empty output.
+    let validate_log_path = logs_dir.join("validate_macos_mesh_join.log");
+    let validate_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate mesh join for {macos_alias}"),
+            vec![],
+        )
+    } else if !distribute_passed {
+        stage_outcome(
+            "validate_macos_mesh_join",
+            VmLabStageStatus::Skipped,
+            format!("skipped: distribute_macos_bundles did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let result = (|| -> Result<String, String> {
+            let inventory = load_inventory(inventory_path)?;
+            let macos_entry = inventory
+                .iter()
+                .find(|e| e.alias == macos_alias)
+                .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
+                .clone();
+            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            let check_script = "sudo /usr/local/bin/rustynet peer-list 2>/dev/null || true";
+            let output = capture_remote_shell_command_for_target(
+                &target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                check_script,
+                Duration::from_secs(30),
+            )
+            .map_err(|e| format!("rustynet peer-list on {macos_alias} failed: {e}"))?;
+            let trimmed = output.trim().to_owned();
+            if trimmed.is_empty() {
+                Err(format!(
+                    "rustynet peer-list returned no output on {macos_alias}; \
+                     daemon may not have joined mesh yet"
+                ))
+            } else {
+                Ok(format!("macOS node {macos_alias} peer-list: {trimmed}"))
+            }
+        })();
+        match result {
+            Ok(summary) => {
+                let _ = std::fs::write(&validate_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_macos_mesh_join",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![validate_log_path.clone()],
+                )
+            }
+            Err(err) => {
+                let _ = std::fs::write(&validate_log_path, err.as_str());
+                stage_outcome(
+                    "validate_macos_mesh_join",
+                    VmLabStageStatus::Fail,
+                    format!("macOS mesh join validation failed for {macos_alias}: {err}"),
+                    vec![validate_log_path.clone()],
+                )
+            }
+        }
+    };
+    outcomes.push(validate_outcome);
     outcomes
 }
 
@@ -30618,6 +31297,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             stop_after_ready: false,
             dry_run: false,
             windows_vm: None,
+            macos_vm: None,
             windows_only: false,
             validate_linux_daemon_state: false,
             node_assignments: Vec::new(),
