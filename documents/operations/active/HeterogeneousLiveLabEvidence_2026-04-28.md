@@ -260,3 +260,47 @@ nor any `--*-platform` selector is set and the operator passes only
 and reports zero overrides. Default Linux-exit live-lab runs continue
 to produce the same `setup_live_lab_profile.env` as before this
 change.
+
+## 8) Track C (Chaos Live-Lab Scaffold) — 2026-05-23 evidence
+
+This section records the first implementation slice for Track C of
+[`AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md`](./AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md).
+It is hermetic scaffold evidence only: no daemon was killed, no host
+clock was changed, no filesystem was filled, and no network impairment
+was applied to a live VM.
+
+### 8.1) Code surfaces shipped
+
+| Area | Deliverable | Files |
+|---|---|---|
+| Chaos category harnesses | Eight bins emit structured per-category dry-run reports with stage names, fault descriptions, recovery deadlines, and leak-proof placeholders. | `crates/rustynet-cli/src/bin/live_chaos_*_test.rs`, `crates/rustynet-cli/src/bin/live_chaos_support/mod.rs` |
+| Signed-state adversarial input generator | `live_signed_bundle_forger` creates offline reject-only fixtures for truncation, future-dating, forged signature, replay watermark, and quorum-starvation scenarios. It is gated behind Cargo feature `chaos-forger`. | `crates/rustynet-cli/src/bin/live_signed_bundle_forger.rs`, `crates/rustynet-cli/Cargo.toml` |
+| Impairment harness | Plan/apply/clear wrapper validates platform, interface, direction, and profile; `plan` is hermetic, `apply/clear` are Linux-only and require an explicit interface allow-list. | `scripts/e2e/chaos_impair_link.sh` |
+| Chaos coordinator scaffold | Shared helpers record fault windows and teardown callbacks; cleanup invokes registered callbacks before removing the live-lab workspace. | `scripts/e2e/live_lab_common.sh` |
+| Orchestrator opt-in | `--enable-chaos-suite` adds eight `chaos_*` stages after managed DNS. Default runs record explicit skips, preserving current live-lab duration and behaviour. | `scripts/e2e/live_linux_lab_orchestrator.sh`, `scripts/e2e/live_chaos_*_test.sh` |
+| Hermetic CI gate | `scripts/ci/chaos_gates.sh` validates impairment parser rejection, forger output, and all eight dry-run category reports. | `scripts/ci/chaos_gates.sh` |
+
+### 8.2) Verification performed
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo check -p rustynet-cli --all-targets --all-features` | pass |
+| `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings` | pass |
+| `cargo test -p rustynet-cli --all-features --bins` | pass |
+| `scripts/ci/chaos_gates.sh` | pass |
+| `git diff --check` | pass |
+
+### 8.3) Remaining Track C live evidence
+
+The following remain open before Track C can satisfy its full definition of
+done:
+
+- Replace dry-run reports with live category implementations that register
+  teardown before mutation.
+- Capture tcpdump windows proving zero plaintext leakage from mesh IPs to
+  non-mesh CIDRs during every fault.
+- Measure recovery time per chaos sub-stage and compare it with the encoded
+  recovery deadline.
+- Add post-run invariants proving clocks, qdisc/pf/netsh rules, filesystem
+  state, daemon service state, and signed-state files returned to baseline.

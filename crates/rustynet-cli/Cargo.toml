@@ -6,6 +6,14 @@ license.workspace = true
 authors.workspace = true
 default-run = "rustynet-cli"
 
+[features]
+chaos-forger = []
+
+[[bin]]
+name = "live_signed_bundle_forger"
+path = "src/bin/live_signed_bundle_forger.rs"
+required-features = ["chaos-forger"]
+
 [dependencies]
 base64 = "0.22"
 rustynet-control = { path = "../rustynet-control" }

@@ -544,3 +544,13 @@ across stages.
   platform explicitly, runs the live traffic validator only for Linux anchors,
   and records an honest skip for macOS/Windows anchors until their live-safe
   runners graduate beyond non-mutating plan gates.
+- 2026-05-23 — Track C C2 scaffold landed. Added the shared chaos tooling
+  surfaces without enabling destructive live faults by default:
+  `scripts/e2e/chaos_impair_link.sh` for allow-listed impairment planning,
+  `live_signed_bundle_forger` gated behind the `chaos-forger` Cargo feature,
+  chaos coordinator bookkeeping helpers in `live_lab_common.sh`, eight
+  category harness bins plus wrappers, `--enable-chaos-suite` opt-in wiring
+  in `live_linux_lab_orchestrator.sh`, and `scripts/ci/chaos_gates.sh`.
+  The category harnesses emit structured dry-run reports today; live host
+  mutation, tcpdump leak proofs, and measured recovery deadlines remain the
+  next Track C slices.

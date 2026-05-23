@@ -33,6 +33,7 @@ ONEHOP_STATE_ENV="${STATE_DIR}/onehop_state.env"
 SOAK_HARD_FAIL=0
 RUN_LOCAL_GATES=1
 RUN_SOAK=1
+ENABLE_CHAOS_SUITE=0
 DRY_RUN=0
 SETUP_ONLY=0
 SKIP_SETUP=0
@@ -151,6 +152,7 @@ options:
   --traversal-ttl-secs <secs>    Signed traversal bundle TTL for issued lab bundles (1-120, default: ${TRAVERSAL_TTL_SECS})
   --skip-gates                   Skip local full gate suite
   --skip-soak                    Skip extended soak/reboot stages
+  --enable-chaos-suite           Run opt-in chaos/fault-injection scaffold stages after managed DNS
   --skip-cross-network           Skip cross-network validator stages
   --force-cross-network          Force cross-network validator stages even on same-prefix underlay targets
   --cross-network-nat-profiles <csv>
@@ -5304,6 +5306,72 @@ stage_run_cross_network_traversal_adversarial() {
   run_cross_network_stage_with_impairment adversarial "${cmd[@]}"
 }
 
+stage_run_chaos_category() {
+  local category="$1"
+  local script="$2"
+  local report_path="$REPORT_DIR/${category}_report.json"
+  local log_path="$REPORT_DIR/${category}.log"
+  bash "$ROOT_DIR/scripts/e2e/${script}" \
+    --dry-run \
+    --git-commit "$(current_run_git_commit)" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
+stage_run_chaos_daemon_fault() {
+  stage_run_chaos_category chaos_daemon_fault live_chaos_daemon_fault_test.sh
+}
+
+stage_run_chaos_clock_attack() {
+  stage_run_chaos_category chaos_clock_attack live_chaos_clock_attack_test.sh
+}
+
+stage_run_chaos_signed_state_adversarial() {
+  stage_run_chaos_category chaos_signed_state_adversarial live_chaos_signed_state_adversarial_test.sh
+}
+
+stage_run_chaos_crash_recovery() {
+  stage_run_chaos_category chaos_crash_recovery live_chaos_crash_recovery_test.sh
+}
+
+stage_run_chaos_resource_exhaustion() {
+  stage_run_chaos_category chaos_resource_exhaustion live_chaos_resource_exhaustion_test.sh
+}
+
+stage_run_chaos_network_impairment() {
+  stage_run_chaos_category chaos_network_impairment live_chaos_network_impairment_test.sh
+}
+
+stage_run_chaos_membership_adversarial() {
+  stage_run_chaos_category chaos_membership_adversarial live_chaos_membership_adversarial_test.sh
+}
+
+stage_run_chaos_privileged_boundary() {
+  stage_run_chaos_category chaos_privileged_boundary live_chaos_privileged_boundary_test.sh
+}
+
+run_or_skip_chaos_suite() {
+  if [[ "$ENABLE_CHAOS_SUITE" -ne 1 ]]; then
+    record_stage_skip chaos_daemon_fault hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_clock_attack hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_signed_state_adversarial hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_crash_recovery hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_resource_exhaustion hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_network_impairment hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_membership_adversarial hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_privileged_boundary hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    return 0
+  fi
+  run_stage hard chaos_daemon_fault 'run daemon process fault-injection scaffold' stage_run_chaos_daemon_fault
+  run_stage hard chaos_clock_attack 'run clock attack scaffold' stage_run_chaos_clock_attack
+  run_stage hard chaos_signed_state_adversarial 'run signed-state adversarial scaffold' stage_run_chaos_signed_state_adversarial
+  run_stage hard chaos_crash_recovery 'run crash recovery scaffold' stage_run_chaos_crash_recovery
+  run_stage hard chaos_resource_exhaustion 'run resource-exhaustion scaffold' stage_run_chaos_resource_exhaustion
+  run_stage hard chaos_network_impairment 'run network impairment scaffold' stage_run_chaos_network_impairment
+  run_stage hard chaos_membership_adversarial 'run membership adversarial scaffold' stage_run_chaos_membership_adversarial
+  run_stage hard chaos_privileged_boundary 'run privileged-boundary scaffold' stage_run_chaos_privileged_boundary
+}
+
 stage_run_cross_network_remote_exit_dns() {
   local nat_profile="${1:-baseline_lan}"
   local report_path="${2:-$REPORT_DIR/cross_network_remote_exit_dns_report.json}"
@@ -6235,6 +6303,7 @@ parse_args() {
       --max-parallel-node-workers) MAX_PARALLEL_NODE_WORKERS="$2"; shift 2 ;;
       --skip-gates) RUN_LOCAL_GATES=0; shift ;;
       --skip-soak) RUN_SOAK=0; shift ;;
+      --enable-chaos-suite) ENABLE_CHAOS_SUITE=1; shift ;;
       --skip-cross-network) CROSS_NETWORK_MODE="skip"; shift ;;
       --force-cross-network) CROSS_NETWORK_MODE="force"; shift ;;
       --cross-network-nat-profiles) CROSS_NETWORK_NAT_PROFILES="$2"; shift 2 ;;
@@ -6516,6 +6585,25 @@ main() {
       record_stage_skip "live_lan_toggle" "hard" "dry-run: not executed"
     fi
     record_stage_skip "live_managed_dns" "hard" "dry-run: not executed"
+    if [[ "$ENABLE_CHAOS_SUITE" -eq 1 ]]; then
+      record_stage_skip "chaos_daemon_fault" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_clock_attack" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_signed_state_adversarial" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_crash_recovery" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_resource_exhaustion" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_network_impairment" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_membership_adversarial" "hard" "dry-run: chaos scaffold not executed"
+      record_stage_skip "chaos_privileged_boundary" "hard" "dry-run: chaos scaffold not executed"
+    else
+      record_stage_skip "chaos_daemon_fault" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_clock_attack" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_signed_state_adversarial" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_crash_recovery" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_resource_exhaustion" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_network_impairment" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_membership_adversarial" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+      record_stage_skip "chaos_privileged_boundary" "hard" "dry-run: skipped by default; pass --enable-chaos-suite"
+    fi
     if has_five_node_release_gate_topology; then
       record_stage_skip "fresh_install_os_matrix_report" "hard" "dry-run: not executed"
     else
@@ -6625,6 +6713,7 @@ main() {
     record_stage_skip live_lan_toggle hard 'requires aux target'
   fi
   run_stage hard live_managed_dns 'run live managed DNS validation' stage_run_live_managed_dns
+  run_or_skip_chaos_suite
 
   if has_five_node_release_gate_topology; then
     run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
