@@ -1006,6 +1006,39 @@ pub fn write_anchor_bundle_pull_response<W: Write>(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchorBundlePullOutcome {
+    token_thumbprint: String,
+}
+
+#[derive(Debug)]
+struct AnchorBundlePullStreamError {
+    source: DaemonError,
+    token_thumbprint: Option<String>,
+}
+
+impl AnchorBundlePullStreamError {
+    fn without_token(source: DaemonError) -> Self {
+        Self {
+            source,
+            token_thumbprint: None,
+        }
+    }
+
+    fn with_token(source: DaemonError, token_thumbprint: String) -> Self {
+        Self {
+            source,
+            token_thumbprint: Some(token_thumbprint),
+        }
+    }
+}
+
+impl fmt::Display for AnchorBundlePullStreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, f)
+    }
+}
+
 fn read_anchor_bundle_pull_request_token(stream: &mut TcpStream) -> Result<String, DaemonError> {
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
@@ -1037,19 +1070,39 @@ fn handle_anchor_bundle_pull_stream(
     mut stream: TcpStream,
     token_path: &Path,
     bundle_path: &Path,
-) -> Result<(), DaemonError> {
+) -> Result<AnchorBundlePullOutcome, AnchorBundlePullStreamError> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|err| DaemonError::Io(format!("anchor bundle-pull read timeout failed: {err}")))?;
+        .map_err(|err| {
+            AnchorBundlePullStreamError::without_token(DaemonError::Io(format!(
+                "anchor bundle-pull read timeout failed: {err}"
+            )))
+        })?;
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|err| {
-            DaemonError::Io(format!("anchor bundle-pull write timeout failed: {err}"))
+            AnchorBundlePullStreamError::without_token(DaemonError::Io(format!(
+                "anchor bundle-pull write timeout failed: {err}"
+            )))
         })?;
-    let presented_token = read_anchor_bundle_pull_request_token(&mut stream)?;
-    let expected_token = load_anchor_bundle_pull_token(token_path)?;
-    let bundle = load_anchor_bundle_pull_bundle(bundle_path)?;
-    write_anchor_bundle_pull_response(stream, &presented_token, &expected_token, &bundle)
+    let presented_token = read_anchor_bundle_pull_request_token(&mut stream)
+        .map_err(AnchorBundlePullStreamError::without_token)?;
+    let token_thumbprint = anchor_bundle_pull_token_thumbprint(&presented_token);
+    let expected_token = load_anchor_bundle_pull_token(token_path).map_err(|source| {
+        AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
+    })?;
+    let bundle = load_anchor_bundle_pull_bundle(bundle_path).map_err(|source| {
+        AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
+    })?;
+    write_anchor_bundle_pull_response(stream, &presented_token, &expected_token, &bundle).map_err(
+        |source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()),
+    )?;
+    Ok(AnchorBundlePullOutcome { token_thumbprint })
+}
+
+fn anchor_bundle_pull_token_thumbprint(token: &str) -> String {
+    let digest = sha256_digest(token.trim().as_bytes());
+    encode_hex(&digest[..8])
 }
 
 fn constant_time_ascii_eq(left: &str, right: &str) -> bool {
@@ -8662,13 +8715,22 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                             token_path.as_path(),
                             config.membership_snapshot_path.as_path(),
                         ) {
-                            Ok(()) => {
-                                log::info!("anchor_bundle_pull: served peer={peer_addr}");
+                            Ok(outcome) => {
+                                log::info!(
+                                    "anchor_bundle_pull: served peer={peer_addr} token_thumbprint={}",
+                                    outcome.token_thumbprint
+                                );
                             }
                             Err(err) => {
-                                log::warn!(
-                                    "anchor_bundle_pull: request failed peer={peer_addr} reason={err}"
-                                );
+                                if let Some(token_thumbprint) = err.token_thumbprint.as_deref() {
+                                    log::warn!(
+                                        "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint={token_thumbprint} reason={err}"
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint=unavailable reason={err}"
+                                    );
+                                }
                             }
                         }
                         processed = processed.saturating_add(1);
@@ -13353,8 +13415,8 @@ mod tests {
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole, StateFetcher,
         TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS, TraversalCandidate, TraversalCandidateType,
-        TrustEvidenceRecord, TrustPolicy, TrustWatermark, build_dns_response,
-        collect_traversal_host_candidate_snapshot_with_retry,
+        TrustEvidenceRecord, TrustPolicy, TrustWatermark, anchor_bundle_pull_token_thumbprint,
+        build_dns_response, collect_traversal_host_candidate_snapshot_with_retry,
         is_root_managed_shared_runtime_parent, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
         load_dns_zone_bundle, load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
         load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
@@ -13414,6 +13476,20 @@ mod tests {
         )
         .expect("good token must pass");
         assert_eq!(allowed, b"OK 17\nmembership-bundle");
+    }
+
+    #[test]
+    fn anchor_bundle_pull_token_thumbprint_is_trimmed_digest_prefix() {
+        let token = "abcdefghijklmnopqrstuvwxyz012345";
+        let with_newline = format!("{token}\n");
+        let thumbprint = anchor_bundle_pull_token_thumbprint(token);
+        assert_eq!(
+            thumbprint,
+            anchor_bundle_pull_token_thumbprint(&with_newline)
+        );
+        assert_eq!(thumbprint.len(), 16);
+        assert_ne!(thumbprint, token);
+        assert!(thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     // ── D11.b tests ──────────────────────────────────────────────────────────
