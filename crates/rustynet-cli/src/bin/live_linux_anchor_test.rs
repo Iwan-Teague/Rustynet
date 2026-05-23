@@ -163,10 +163,14 @@ fn run() -> Result<(), String> {
     ));
 
     let pull_summary = validate_bundle_pull_loopback(identity, &work_known_hosts, &config)?;
+    let invalid_token_summary =
+        validate_invalid_token_rejected(identity, &work_known_hosts, &config)?;
+    let redaction_summary =
+        validate_bundle_pull_log_redaction(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
         "validate_anchor_bundle_pull",
-        "loopback bundle-pull listener returned membership snapshot byte-for-byte and rejected invalid token",
-        json!({ "pull": pull_summary, "invalid_token": validate_invalid_token_rejected(identity, &work_known_hosts, &config)? }),
+        "loopback bundle-pull listener returned membership snapshot byte-for-byte, rejected invalid token, and logged only token thumbprints",
+        json!({ "pull": pull_summary, "invalid_token": invalid_token_summary, "log_redaction": redaction_summary }),
     ));
 
     let gossip_priority = validate_anchor_gossip_priority(identity, &work_known_hosts, &config)?;
@@ -665,6 +669,50 @@ printf 'invalid_token_rejected=true\n'
     capture_root(identity, known_hosts, &config.anchor_host, &script)
         .map(|out| out.trim().to_owned())
         .map_err(|err| format!("invalid token rejection check failed: {err}"))
+}
+
+fn validate_bundle_pull_log_redaction(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+) -> Result<String, String> {
+    if config.platform != AnchorPlatform::Linux {
+        return Ok(format!(
+            "log_redaction_check=skipped platform={} reason=journalctl-linux-only",
+            config.platform.as_str()
+        ));
+    }
+    let script = format!(
+        r#"set -eu
+command -v journalctl >/dev/null
+command -v sha256sum >/dev/null
+test -r {token_path}
+token="$(cat {token_path})"
+case "$token" in
+  *[! -~]*|'') printf 'invalid token material shape\n' >&2; exit 1;;
+esac
+thumbprint="$(printf '%s' "$token" | sha256sum | awk '{{print substr($1,1,16)}}')"
+logs="$(journalctl -u rustynetd --since '10 minutes ago' --no-pager 2>/dev/null | grep -F 'anchor_bundle_pull:' || true)"
+case "$logs" in
+  *"$token"*)
+    printf 'anchor bundle-pull journal leaked raw token material\n' >&2
+    exit 1
+    ;;
+esac
+case "$logs" in
+  *"token_thumbprint=$thumbprint"*) ;;
+  *)
+    printf 'anchor bundle-pull journal missing token thumbprint %s\n' "$thumbprint" >&2
+    exit 1
+    ;;
+esac
+printf 'token_thumbprint=%s raw_token_leaked=false\n' "$thumbprint"
+"#,
+        token_path = shell_quote(config.anchor_token_path.as_str()),
+    );
+    capture_root(identity, known_hosts, &config.anchor_host, &script)
+        .map(|out| out.trim().to_owned())
+        .map_err(|err| format!("bundle-pull log redaction check failed: {err}"))
 }
 
 fn capture_daemon_status(
