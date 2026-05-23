@@ -176,6 +176,14 @@ fn run() -> Result<(), String> {
         json!({ "summary": gossip_priority }),
     ));
 
+    let enrollment_endpoint =
+        validate_anchor_enrollment_endpoint(identity, &work_known_hosts, &config)?;
+    subchecks.push(Subcheck::pass(
+        "validate_anchor_enrollment_endpoint",
+        "anchor minted enrollment token, rejected negative token paths, admitted enrollee through signed membership, and verified membership visibility",
+        json!({ "summary": enrollment_endpoint }),
+    ));
+
     let downgrade_revocation =
         validate_anchor_downgrade_revocation(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
@@ -350,6 +358,117 @@ fn validate_lex_min_anchor_authority(
         ));
     }
     Ok(())
+}
+
+fn validate_anchor_enrollment_endpoint(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+) -> Result<String, String> {
+    let enrollee_host = config.enrollee_host.as_deref().ok_or_else(|| {
+        "--enrollee-host is required for validate_anchor_enrollment_endpoint".to_owned()
+    })?;
+    let enrollee_node_id = config.enrollee_node_id.as_deref().ok_or_else(|| {
+        "--enrollee-node-id is required for validate_anchor_enrollment_endpoint".to_owned()
+    })?;
+    let owner_approver_id = config.owner_approver_id.as_deref().ok_or_else(|| {
+        "--owner-approver-id is required for validate_anchor_enrollment_endpoint".to_owned()
+    })?;
+
+    let script = format!(
+        r#"set -eu
+command -v rustynet >/dev/null
+command -v systemd-creds >/dev/null
+command -v base64 >/dev/null
+command -v dd >/dev/null
+command -v tr >/dev/null
+test -r {enrollment_secret}
+test -r {membership_snapshot}
+test -r {membership_log}
+test -r {owner_signing_key}
+test -r {signing_credential}
+work="$(mktemp -d)"
+chmod 700 "$work"
+passphrase="$work/signing.passphrase"
+wrong_secret="$work/wrong.secret"
+signed_update="$work/enrollee.signed"
+trap 'rm -rf "$work"' EXIT
+systemd-creds decrypt --name=signing_key_passphrase {signing_credential} "$passphrase"
+chmod 600 "$passphrase"
+dd if=/dev/zero bs=32 count=1 of="$wrong_secret" 2>/dev/null
+chmod 600 "$wrong_secret"
+enrollee_status="$(rustynet membership status --snapshot {membership_snapshot} --log {membership_log})"
+case "$enrollee_status" in
+  *"active_nodes="*"{enrollee_node_id}"*)
+    printf 'enrollee node %s already exists in membership; cleanup required before live enrollment\n' {enrollee_node_id} >&2
+    exit 1
+    ;;
+esac
+pubkey_b64="$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr '+/' '-_' | tr -d '= \n')"
+token="$(rustynet enrollment mint --secret {enrollment_secret} --ttl 300)"
+if rustynet enrollment verify --secret "$wrong_secret" --token "$token" >/dev/null 2>&1; then
+  printf 'wrong-secret enrollment token verification unexpectedly succeeded\n' >&2
+  exit 1
+fi
+if rustynet enrollment verify --secret {enrollment_secret} --ledger {enrollment_ledger} --token "not-a-token" >/dev/null 2>&1; then
+  printf 'bogus enrollment token unexpectedly verified\n' >&2
+  exit 1
+fi
+if rustynet enrollment admit \
+  --pubkey "$pubkey_b64" \
+  --node-id {enrollee_node_id} \
+  --owner {enrollee_node_id} \
+  --roles client \
+  --secret {enrollment_secret} \
+  --ledger {enrollment_ledger} \
+  --snapshot {membership_snapshot} \
+  --log {membership_log} \
+  --signing-key {owner_signing_key} \
+  --signing-key-passphrase "$passphrase" \
+  --approver-id {owner_approver_id} \
+  --output "$signed_update" \
+  --apply >/dev/null 2>&1; then
+  printf 'missing-token enrollment admit unexpectedly succeeded\n' >&2
+  exit 1
+fi
+rustynet enrollment admit \
+  --token "$token" \
+  --pubkey "$pubkey_b64" \
+  --node-id {enrollee_node_id} \
+  --owner {enrollee_node_id} \
+  --roles client \
+  --secret {enrollment_secret} \
+  --ledger {enrollment_ledger} \
+  --snapshot {membership_snapshot} \
+  --log {membership_log} \
+  --signing-key {owner_signing_key} \
+  --signing-key-passphrase "$passphrase" \
+  --approver-id {owner_approver_id} \
+  --output "$signed_update" \
+  --apply >/dev/null
+post_status="$(rustynet membership status --snapshot {membership_snapshot} --log {membership_log})"
+case "$post_status" in
+  *"active_nodes="*"{enrollee_node_id}"*) ;;
+  *)
+    printf 'enrollee missing from membership status after admit\n' >&2
+    exit 1
+    ;;
+esac
+printf 'enrollee=%s host=%s admitted=true wrong_secret_rejected=true bogus_token_rejected=true missing_token_rejected=true\n' {enrollee_node_id} {enrollee_host}
+"#,
+        enrollment_secret = shell_quote(config.enrollment_secret_path.as_str()),
+        enrollment_ledger = shell_quote(config.enrollment_ledger_path.as_str()),
+        membership_snapshot = shell_quote(config.membership_snapshot_path.as_str()),
+        membership_log = shell_quote(config.membership_log_path.as_str()),
+        owner_signing_key = shell_quote(config.owner_signing_key_path.as_str()),
+        signing_credential = shell_quote(config.signing_key_passphrase_cred_path.as_str()),
+        enrollee_node_id = shell_quote(enrollee_node_id),
+        enrollee_host = shell_quote(enrollee_host),
+        owner_approver_id = shell_quote(owner_approver_id),
+    );
+    capture_root(identity, known_hosts, &config.anchor_host, &script)
+        .map(|out| out.trim().to_owned())
+        .map_err(|err| format!("anchor enrollment endpoint validation failed: {err}"))
 }
 
 fn validate_anchor_downgrade_revocation(
@@ -610,6 +729,11 @@ fn render_report(
         "owner_approver_id": config.owner_approver_id,
         "anchor_bundle_pull_addr": config.anchor_bundle_pull_addr,
         "membership_snapshot_path": config.membership_snapshot_path,
+        "membership_log_path": config.membership_log_path,
+        "enrollment_secret_path": config.enrollment_secret_path,
+        "enrollment_ledger_path": config.enrollment_ledger_path,
+        "owner_signing_key_path": config.owner_signing_key_path,
+        "signing_key_passphrase_cred_path": config.signing_key_passphrase_cred_path,
         "subchecks": checks,
         "anchor_list": anchor_list,
     }))
@@ -678,6 +802,11 @@ struct Config {
     anchor_bundle_pull_addr: String,
     anchor_token_path: String,
     membership_snapshot_path: String,
+    membership_log_path: String,
+    enrollment_secret_path: String,
+    enrollment_ledger_path: String,
+    owner_signing_key_path: String,
+    signing_key_passphrase_cred_path: String,
     ssh_identity_file: Option<PathBuf>,
     pinned_known_hosts_file: Option<PathBuf>,
     report_path: PathBuf,
@@ -702,6 +831,12 @@ impl Config {
             anchor_bundle_pull_addr: "127.0.0.1:51822".to_owned(),
             anchor_token_path: "/var/lib/rustynet/anchor-bundle-pull.token".to_owned(),
             membership_snapshot_path: "/var/lib/rustynet/membership.snapshot".to_owned(),
+            membership_log_path: "/var/lib/rustynet/membership.log".to_owned(),
+            enrollment_secret_path: "/var/lib/rustynet/keys/enrollment.secret".to_owned(),
+            enrollment_ledger_path: "/var/lib/rustynet/rustynetd.enrollment.ledger".to_owned(),
+            owner_signing_key_path: "/etc/rustynet/membership.owner.key".to_owned(),
+            signing_key_passphrase_cred_path:
+                "/etc/rustynet/credentials/signing_key_passphrase.cred".to_owned(),
             ssh_identity_file: None,
             pinned_known_hosts_file: None,
             report_path: PathBuf::from("artifacts/phase10/live_linux_anchor_report.json"),
@@ -743,6 +878,21 @@ impl Config {
                 "--anchor-token-path" => config.anchor_token_path = next_value(&mut iter, &arg)?,
                 "--membership-snapshot-path" => {
                     config.membership_snapshot_path = next_value(&mut iter, &arg)?
+                }
+                "--membership-log-path" => {
+                    config.membership_log_path = next_value(&mut iter, &arg)?
+                }
+                "--enrollment-secret-path" => {
+                    config.enrollment_secret_path = next_value(&mut iter, &arg)?
+                }
+                "--enrollment-ledger-path" => {
+                    config.enrollment_ledger_path = next_value(&mut iter, &arg)?
+                }
+                "--owner-signing-key-path" => {
+                    config.owner_signing_key_path = next_value(&mut iter, &arg)?
+                }
+                "--signing-key-passphrase-cred-path" => {
+                    config.signing_key_passphrase_cred_path = next_value(&mut iter, &arg)?
                 }
                 "--ssh-identity-file" => {
                     config.ssh_identity_file = Some(PathBuf::from(next_value(&mut iter, &arg)?))
@@ -803,28 +953,40 @@ impl Config {
         )?;
         ensure_safe_token("anchor bundle-pull addr", &self.anchor_bundle_pull_addr)?;
         parse_nc_addr(&self.anchor_bundle_pull_addr)?;
-        if self.anchor_token_path.contains('\0')
-            || self.anchor_token_path.contains('\n')
-            || !self.platform.path_is_absolute(&self.anchor_token_path)
-        {
-            return Err(format!(
-                "--anchor-token-path must be an absolute {} path",
-                self.platform.as_str()
-            ));
-        }
-        if self.membership_snapshot_path.contains('\0')
-            || self.membership_snapshot_path.contains('\n')
-            || !self
-                .platform
-                .path_is_absolute(&self.membership_snapshot_path)
-        {
-            return Err(format!(
-                "--membership-snapshot-path must be an absolute {} path",
-                self.platform.as_str()
-            ));
-        }
+        self.ensure_absolute_platform_path("--anchor-token-path", &self.anchor_token_path)?;
+        self.ensure_absolute_platform_path(
+            "--membership-snapshot-path",
+            &self.membership_snapshot_path,
+        )?;
+        self.ensure_absolute_platform_path("--membership-log-path", &self.membership_log_path)?;
+        self.ensure_absolute_platform_path(
+            "--enrollment-secret-path",
+            &self.enrollment_secret_path,
+        )?;
+        self.ensure_absolute_platform_path(
+            "--enrollment-ledger-path",
+            &self.enrollment_ledger_path,
+        )?;
+        self.ensure_absolute_platform_path(
+            "--owner-signing-key-path",
+            &self.owner_signing_key_path,
+        )?;
+        self.ensure_absolute_platform_path(
+            "--signing-key-passphrase-cred-path",
+            &self.signing_key_passphrase_cred_path,
+        )?;
         if !self.dry_run && self.ssh_identity_file.is_none() {
             return Err("--ssh-identity-file is required unless --dry-run is set".to_owned());
+        }
+        Ok(())
+    }
+
+    fn ensure_absolute_platform_path(&self, flag: &str, path: &str) -> Result<(), String> {
+        if path.contains('\0') || path.contains('\n') || !self.platform.path_is_absolute(path) {
+            return Err(format!(
+                "{flag} must be an absolute {} path",
+                self.platform.as_str()
+            ));
         }
         Ok(())
     }
@@ -936,7 +1098,7 @@ fn require_pair<T>(
 }
 
 fn usage() -> String {
-    "usage: live_linux_anchor_test --ssh-identity-file <path> [options]\n\noptions:\n  --platform <linux|macos|windows>\n  --anchor-host <user@host>\n  --anchor-node-id <id>\n  --second-anchor-host <user@host>\n  --second-anchor-node-id <id>\n  --leaf-client-host <user@host>\n  --leaf-client-node-id <id>\n  --enrollee-host <user@host>\n  --enrollee-node-id <id>\n  --owner-approver-id <id>\n  --anchor-bundle-pull-addr <host:port>\n  --anchor-token-path <path>\n  --membership-snapshot-path <path>\n  --known-hosts <path>\n  --report-path <path>\n  --log-path <path>\n  --git-commit <sha>\n  --dry-run".to_owned()
+    "usage: live_linux_anchor_test --ssh-identity-file <path> [options]\n\noptions:\n  --platform <linux|macos|windows>\n  --anchor-host <user@host>\n  --anchor-node-id <id>\n  --second-anchor-host <user@host>\n  --second-anchor-node-id <id>\n  --leaf-client-host <user@host>\n  --leaf-client-node-id <id>\n  --enrollee-host <user@host>\n  --enrollee-node-id <id>\n  --owner-approver-id <id>\n  --anchor-bundle-pull-addr <host:port>\n  --anchor-token-path <path>\n  --membership-snapshot-path <path>\n  --membership-log-path <path>\n  --enrollment-secret-path <path>\n  --enrollment-ledger-path <path>\n  --owner-signing-key-path <path>\n  --signing-key-passphrase-cred-path <path>\n  --known-hosts <path>\n  --report-path <path>\n  --log-path <path>\n  --git-commit <sha>\n  --dry-run".to_owned()
 }
 
 #[cfg(test)]
@@ -977,6 +1139,16 @@ mod tests {
             r"C:\ProgramData\RustyNet\anchor\bundle-pull.token".to_owned(),
             "--membership-snapshot-path".to_owned(),
             r"C:\ProgramData\RustyNet\state\membership.snapshot".to_owned(),
+            "--membership-log-path".to_owned(),
+            r"C:\ProgramData\RustyNet\state\membership.log".to_owned(),
+            "--enrollment-secret-path".to_owned(),
+            r"C:\ProgramData\RustyNet\keys\enrollment.secret".to_owned(),
+            "--enrollment-ledger-path".to_owned(),
+            r"C:\ProgramData\RustyNet\state\enrollment.ledger".to_owned(),
+            "--owner-signing-key-path".to_owned(),
+            r"C:\ProgramData\RustyNet\keys\membership.owner.key".to_owned(),
+            "--signing-key-passphrase-cred-path".to_owned(),
+            r"C:\ProgramData\RustyNet\keys\signing_key_passphrase.cred".to_owned(),
         ])
         .expect("windows dry-run parses");
         assert_eq!(cfg.platform, AnchorPlatform::Windows);
@@ -1014,6 +1186,27 @@ mod tests {
         ])
         .expect_err("unpaired second anchor rejected");
         assert!(err.contains("--second-anchor-host"));
+    }
+
+    #[test]
+    fn parse_accepts_enrollment_path_overrides() {
+        let cfg = Config::parse(vec![
+            "--dry-run".to_owned(),
+            "--membership-log-path".to_owned(),
+            "/state/membership.log".to_owned(),
+            "--enrollment-secret-path".to_owned(),
+            "/keys/enrollment.secret".to_owned(),
+            "--enrollment-ledger-path".to_owned(),
+            "/state/enrollment.ledger".to_owned(),
+            "--owner-signing-key-path".to_owned(),
+            "/keys/membership.owner.key".to_owned(),
+            "--signing-key-passphrase-cred-path".to_owned(),
+            "/creds/signing_key_passphrase.cred".to_owned(),
+        ])
+        .expect("enrollment path overrides parse");
+        assert_eq!(cfg.membership_log_path, "/state/membership.log");
+        assert_eq!(cfg.enrollment_secret_path, "/keys/enrollment.secret");
+        assert_eq!(cfg.enrollment_ledger_path, "/state/enrollment.ledger");
     }
 
     #[test]
