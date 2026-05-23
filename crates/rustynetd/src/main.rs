@@ -2646,7 +2646,12 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
                 owner: node_id.clone(),
                 status: MembershipNodeStatus::Active,
                 roles: vec![],
-                capabilities: vec![RoleCapability::Anchor, RoleCapability::Client],
+                capabilities: vec![
+                    RoleCapability::Anchor,
+                    RoleCapability::Client,
+                    RoleCapability::ExitServer,
+                    RoleCapability::RelayHost,
+                ],
                 joined_at_unix: now,
                 updated_at_unix: now,
             }],
