@@ -255,8 +255,10 @@ fn run() -> Result<(), String> {
     let client_addr = LiveLabContext::resolved_target_address(&client_host)?;
     let blind_exit_addr = LiveLabContext::resolved_target_address(&blind_exit_host)?;
 
+    // blind_exit MUST NOT carry anchor capability (daemon rejects). Required
+    // caps per NodeRole::BlindExit: blind_exit + exit_server.
     let nodes_spec = format!(
-        "{exit_node_id}|{exit_addr}:51820|{exit_pub_hex};{client_node_id}|{client_addr}:51820|{client_pub_hex};{blind_exit_node_id}|{blind_exit_addr}:51820|{blind_exit_pub_hex}"
+        "{exit_node_id}|{exit_addr}:51820|{exit_pub_hex}|anchor,exit_server;{client_node_id}|{client_addr}:51820|{client_pub_hex}|client,relay_host;{blind_exit_node_id}|{blind_exit_addr}:51820|{blind_exit_pub_hex}|blind_exit,exit_server"
     );
     let allow_spec = format!(
         "{client_node_id}|{exit_node_id};{exit_node_id}|{client_node_id};{blind_exit_node_id}|{exit_node_id};{exit_node_id}|{blind_exit_node_id}"

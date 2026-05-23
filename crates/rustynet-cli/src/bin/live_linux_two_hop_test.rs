@@ -141,7 +141,7 @@ fn run() -> Result<(), String> {
     let second_client_addr = resolved_target_address(&config.second_client_host)?;
 
     let nodes_spec = format!(
-        "{}|{}:51820|{};{}|{}:51820|{};{}|{}:51820|{};{}|{}:51820|{}",
+        "{}|{}:51820|{}|anchor,exit_server;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host",
         config.final_exit_node_id,
         final_exit_addr,
         final_exit_pub_hex,

@@ -164,7 +164,7 @@ fn run() -> Result<(), String> {
     let client_addr = resolved_target_address(&config.client_host)?;
 
     let nodes_spec = format!(
-        "{}|{}:51820|{};{}|{}:51820|{};{}|{}:51820|{}",
+        "{}|{}:51820|{}|anchor,exit_server;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host",
         config.exit_a_node_id,
         exit_a_addr,
         exit_a_pub_hex,
@@ -209,6 +209,9 @@ fn run() -> Result<(), String> {
             config.exit_a_node_id
         ),
     )?;
+    // BUNDLE_TTL_SECS: extend so handoff bundles survive the long enforce
+    // pipeline that follows (default 300s expires before validation runs).
+    append_env_assignment(&issue_env, "BUNDLE_TTL_SECS", "3600")?;
 
     logger.line(
         format!(
