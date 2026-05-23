@@ -12628,6 +12628,83 @@ fn macos_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Resul
     }
 }
 
+/// Linux exit-mode DNS fail-closed artefact-directory validator.
+/// Mirrors the macOS/Windows exit DNS contracts, but reads the Linux
+/// nftables producer's `firewall_block_rules.json` and existing
+/// `linux_dns_failclosed_check.json` report.
+fn evaluate_linux_exit_dns_failclosed_artifact_dir(
+    linux_alias: &str,
+    artifact_dir: &Path,
+) -> Result<String, String> {
+    linux_exit_dns_failclosed_artifact_set_complete(artifact_dir)?;
+    let firewall_rules = fs::read_to_string(artifact_dir.join("firewall_block_rules.json"))
+        .map_err(|err| format!("read firewall_block_rules.json failed: {err}"))?;
+    let firewall_report: Value = serde_json::from_str(&firewall_rules)
+        .map_err(|err| format!("parse firewall_block_rules.json failed: {err}"))?;
+    require_json_u64(&firewall_report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            "firewall_block_rules.json returned unsupported schema_version".to_owned()
+        })?;
+    if !require_json_bool(&firewall_report, "overall_ok")? {
+        return Err("firewall_block_rules.json did not report overall_ok=true".to_owned());
+    }
+    let rules = require_json_array(&firewall_report, "rules")?;
+    require_linux_dns_block_rule(rules, "rustynet-dns-block-lan-udp")?;
+    require_linux_dns_block_rule(rules, "rustynet-dns-block-lan-tcp")?;
+
+    let udp_pcap = fs::read_to_string(artifact_dir.join("udp_block_pcap.txt"))
+        .map_err(|err| format!("read udp_block_pcap.txt failed: {err}"))?;
+    require_empty_dns_pcap("udp_block_pcap.txt", udp_pcap.as_str())?;
+    let tcp_pcap = fs::read_to_string(artifact_dir.join("tcp_block_pcap.txt"))
+        .map_err(|err| format!("read tcp_block_pcap.txt failed: {err}"))?;
+    require_empty_dns_pcap("tcp_block_pcap.txt", tcp_pcap.as_str())?;
+
+    let positive_control = fs::read_to_string(artifact_dir.join("tunnel_path_resolves.json"))
+        .map_err(|err| format!("read tunnel_path_resolves.json failed: {err}"))?;
+    let positive_report: Value = serde_json::from_str(&positive_control)
+        .map_err(|err| format!("parse tunnel_path_resolves.json failed: {err}"))?;
+    if !require_json_bool(&positive_report, "overall_ok")?
+        || !require_json_bool(&positive_report, "resolved")?
+    {
+        return Err(
+            "tunnel_path_resolves.json did not prove tunnel DNS positive control".to_owned(),
+        );
+    }
+
+    let dns_check = fs::read_to_string(artifact_dir.join("linux_dns_failclosed_check.json"))
+        .map_err(|err| format!("read linux_dns_failclosed_check.json failed: {err}"))?;
+    evaluate_linux_dns_failclosed_report(linux_alias, dns_check.as_str())?;
+
+    Ok(format!(
+        "Linux exit DNS leak proof verified on {linux_alias}: UDP/TCP egress pcaps empty and tunnel positive control passed"
+    ))
+}
+
+fn linux_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Result<(), String> {
+    let required = [
+        "firewall_block_rules.json",
+        "udp_block_pcap.txt",
+        "tcp_block_pcap.txt",
+        "tunnel_path_resolves.json",
+        "linux_dns_failclosed_check.json",
+    ];
+    let missing = required
+        .iter()
+        .filter(|relative| !artifact_dir.join(relative).is_file())
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing required artifact(s): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
 /// macOS exit killswitch precedence artefact validator. Same contract
 /// as the Windows variant: baseline assertion must pass, tampered
 /// assertion must fail with a non-zero exit code and a non-empty
@@ -12740,6 +12817,30 @@ fn require_pf_block_rule(rules: &[Value], expected_name: &str) -> Result<(), Str
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(format!(
                 "pf rule {expected_name} field {field} was {actual:?}, expected {expected}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_linux_dns_block_rule(rules: &[Value], expected_name: &str) -> Result<(), String> {
+    let rule = rules
+        .iter()
+        .find(|rule| {
+            rule.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == expected_name)
+        })
+        .ok_or_else(|| format!("firewall_block_rules.json missing {expected_name}"))?;
+    for (field, expected) in [
+        ("action", "drop"),
+        ("direction", "out"),
+        ("enabled", "true"),
+    ] {
+        let actual = require_json_str(rule, field)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "Linux DNS block rule {expected_name} field {field} was {actual:?}, expected {expected}"
             ));
         }
     }
@@ -14275,6 +14376,7 @@ fn run_linux_orchestration_stages_with_options(
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
+    let exit_dns_failclosed_log_path = logs_dir.join("validate_linux_exit_dns_failclosed.log");
     let relay_lifecycle_log_path = logs_dir.join("validate_linux_relay_service_lifecycle.log");
     let anchor_bundle_pull_log_path = logs_dir.join("validate_linux_anchor_bundle_pull.log");
     let membership_genesis_log_path = logs_dir.join("validate_linux_membership_genesis.log");
@@ -14464,6 +14566,83 @@ fn run_linux_orchestration_stages_with_options(
                             "Linux Exit NAT lifecycle artifact validation failed for {linux_alias}: {reason}"
                         ),
                         vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
+    let exit_dns_failclosed_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_exit_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Linux Exit DNS leak artifacts for {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_exit_dns_failclosed",
+            "validate_linux_runtime_acls",
+        )
+    } else if !key_custody_passed {
+        make_skipped(
+            "validate_linux_exit_dns_failclosed",
+            "validate_linux_key_custody",
+        )
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_exit_dns_failclosed",
+            "validate_linux_service_hardening",
+        )
+    } else if !dns_failclosed_passed {
+        make_skipped(
+            "validate_linux_exit_dns_failclosed",
+            "validate_linux_dns_failclosed",
+        )
+    } else {
+        let artifact_dir = report_dir
+            .join("linux_exit_evidence")
+            .join("dns_leak_proof");
+        if !artifact_dir.exists() {
+            stage_outcome(
+                "validate_linux_exit_dns_failclosed",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Linux Exit DNS leak artifact directory not present at {}",
+                    artifact_dir.display()
+                ),
+                vec![],
+            )
+        } else if let Err(reason) = linux_exit_dns_failclosed_artifact_set_complete(&artifact_dir) {
+            stage_outcome(
+                "validate_linux_exit_dns_failclosed",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Linux Exit DNS leak artifact set incomplete at {}: {reason}",
+                    artifact_dir.display()
+                ),
+                vec![],
+            )
+        } else {
+            match evaluate_linux_exit_dns_failclosed_artifact_dir(linux_alias, &artifact_dir) {
+                Ok(summary) => {
+                    let _ = fs::write(&exit_dns_failclosed_log_path, summary.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_dns_failclosed",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_dns_failclosed_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_dns_failclosed_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_dns_failclosed",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Linux Exit DNS leak artifact validation failed for {linux_alias}: {reason}"
+                        ),
+                        vec![exit_dns_failclosed_log_path.clone()],
                     )
                 }
             }
@@ -14683,6 +14862,7 @@ fn run_linux_orchestration_stages_with_options(
         authenticode_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
+        exit_dns_failclosed_outcome,
         relay_lifecycle_outcome,
         anchor_bundle_pull_outcome,
         membership_genesis_outcome,
@@ -33683,6 +33863,89 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         assert!(err.contains("8.8.8.8"));
     }
 
+    fn write_reviewed_linux_exit_dns_artifacts(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(
+            dir.join("firewall_block_rules.json"),
+            r#"{
+                "schema_version": 1,
+                "overall_ok": true,
+                "rules": [
+                    {"name": "rustynet-dns-block-lan-udp", "action": "drop", "direction": "out", "enabled": "true"},
+                    {"name": "rustynet-dns-block-lan-tcp", "action": "drop", "direction": "out", "enabled": "true"}
+                ]
+            }"#,
+        )
+        .expect("write firewall_block_rules");
+        std::fs::write(dir.join("udp_block_pcap.txt"), "0 packets captured\n")
+            .expect("write udp pcap");
+        std::fs::write(dir.join("tcp_block_pcap.txt"), "").expect("write tcp pcap");
+        std::fs::write(
+            dir.join("tunnel_path_resolves.json"),
+            r#"{
+                "schema_version": 1,
+                "overall_ok": true,
+                "resolved": true,
+                "hostname": "exit-1.rustynet",
+                "addresses": ["100.64.0.1"],
+                "reason": "resolved through platform resolver"
+            }"#,
+        )
+        .expect("write tunnel_path_resolves");
+        std::fs::write(
+            dir.join("linux_dns_failclosed_check.json"),
+            r#"{
+                "schema_version": 1,
+                "overall_ok": true,
+                "snapshot": {
+                    "resolv_conf_path": "/etc/resolv.conf",
+                    "resolv_conf_present": true,
+                    "nameservers": ["127.0.0.53"],
+                    "search_domains": [],
+                    "loopback_resolver_advertised": true
+                },
+                "drift_reasons": []
+            }"#,
+        )
+        .expect("write dns check");
+    }
+
+    #[test]
+    fn evaluate_linux_exit_dns_failclosed_artifact_dir_accepts_reviewed_payloads() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        write_reviewed_linux_exit_dns_artifacts(temp.path());
+        let summary =
+            super::evaluate_linux_exit_dns_failclosed_artifact_dir("debian-utm-1", temp.path())
+                .expect("reviewed Linux exit DNS artifacts must pass");
+        assert!(summary.contains("debian-utm-1"));
+        assert!(summary.contains("UDP/TCP egress pcaps empty"));
+    }
+
+    #[test]
+    fn evaluate_linux_exit_dns_failclosed_artifact_dir_rejects_nonempty_block_pcap() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        write_reviewed_linux_exit_dns_artifacts(temp.path());
+        std::fs::write(
+            temp.path().join("udp_block_pcap.txt"),
+            "12:00:00 IP 192.168.1.10.53000 > 192.168.1.1.53: query\n",
+        )
+        .expect("write pcap drift");
+        let err =
+            super::evaluate_linux_exit_dns_failclosed_artifact_dir("debian-utm-1", temp.path())
+                .expect_err("DNS pcap leak must reject");
+        assert!(err.contains("udp_block_pcap.txt"));
+    }
+
+    #[test]
+    fn linux_exit_dns_failclosed_artifact_set_complete_rejects_partial_capture() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("firewall_block_rules.json"), "{}").expect("write partial");
+        let err = super::linux_exit_dns_failclosed_artifact_set_complete(temp.path())
+            .expect_err("partial set must reject");
+        assert!(err.contains("udp_block_pcap.txt"));
+        assert!(err.contains("linux_dns_failclosed_check.json"));
+    }
+
     #[test]
     fn run_linux_daemon_validators_for_aliases_dry_run_prefixes_stage_names_per_alias() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -33823,6 +34086,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 "validate_linux_authenticode",
                 "validate_linux_dns_failclosed",
                 "validate_linux_exit_nat_lifecycle",
+                "validate_linux_exit_dns_failclosed",
                 "validate_linux_relay_service_lifecycle",
                 "validate_linux_anchor_bundle_pull",
                 "validate_linux_membership_genesis",

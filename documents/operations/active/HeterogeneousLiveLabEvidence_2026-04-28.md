@@ -324,13 +324,13 @@ Windows. This is code-only evidence until the operator runs the clean Debian
 |---|---|---|
 | L1 | Linux exit NAT lifecycle producer + validator. `rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]` emits a single-phase nftables NAT + `/proc/sys` forwarding snapshot. `capture_linux_exit_nat_lifecycle.sh` performs the destructive two-phase stop/start capture and writes the merged artefact consumed by `validate_linux_exit_nat_lifecycle`. | `crates/rustynetd/src/linux_exit_nat_lifecycle.rs`, `crates/rustynetd/src/main.rs`, `scripts/e2e/capture_linux_exit_nat_lifecycle.sh`, `crates/rustynet-cli/src/vm_lab/mod.rs` |
 | L2 | Linux relay lifecycle, anchor bundle-pull, and membership genesis validator stages. `validate_linux_relay_service_lifecycle` exercises `rustynet ops install-systemd-relay --dry-run` plus `--uninstall --dry-run` over SSH and verifies the systemd lifecycle plan. `validate_linux_anchor_bundle_pull` exercises the anchor init dry-run plan and verifies all anchor sub-capabilities plus the loopback bundle-pull listener plan. `validate_linux_membership_genesis` verifies canonical membership files are `0600`, owned by `rustynetd:rustynetd`, and readable through `rustynet membership status`. | `crates/rustynet-cli/src/vm_lab/mod.rs` |
+| L3 | Linux exit DNS fail-closed producer + validator. `rustynetd linux-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>] [--killswitch-table <name>]` emits nftables DNS block-rule evidence, UDP/TCP 53 pcap leak windows, tunnel positive-control resolution, and the existing Linux DNS fail-closed report. `validate_linux_exit_dns_failclosed` consumes the artefact directory under `linux_exit_evidence/dns_leak_proof` and skips cleanly when absent. | `crates/rustynetd/src/linux_exit_dns_failclosed.rs`, `crates/rustynetd/src/main.rs`, `crates/rustynet-cli/src/vm_lab/mod.rs` |
 | L1 CI | Hermetic Linux exit-role gate plus cross-platform gate references. | `scripts/ci/linux_exit_role_gates.sh`, `scripts/ci/cross_platform_role_gates.sh` |
 
 ### 9.2) Remaining Linux Parity Work
 
-- Add Linux exit DNS fail-closed producer and `validate_linux_exit_dns_failclosed`.
 - Add Linux killswitch precedence producer and `validate_linux_exit_killswitch_precedence`.
 - Capture live Debian 13 evidence for the landed Linux relay lifecycle, anchor
-  bundle-pull, and membership genesis validator stages.
+  bundle-pull, membership genesis, and exit DNS fail-closed validator stages.
 - Flip Linux/macOS NAT lifecycle schemas to v2 for IPv6 parity once dual-stack
   membership detection is wired.

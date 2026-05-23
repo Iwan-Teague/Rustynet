@@ -206,6 +206,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "linux-dns-failclosed-check" => {
                 run_linux_dns_failclosed_check_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "linux-exit-dns-failclosed-capture" => {
+                run_linux_exit_dns_failclosed_capture_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "linux-exit-nat-lifecycle-snapshot" => {
                 run_linux_exit_nat_lifecycle_snapshot_command(rest)
             }
@@ -1204,6 +1207,73 @@ fn run_linux_exit_nat_lifecycle_snapshot_command(args: &[String]) -> Result<(), 
         serde_json::to_string_pretty(&snapshot).map_err(|err| {
             format!("serialize linux-exit-nat-lifecycle snapshot failed: {err}")
         })?
+    );
+    Ok(())
+}
+
+fn run_linux_exit_dns_failclosed_capture_command(args: &[String]) -> Result<(), String> {
+    let mut output: Option<PathBuf> = None;
+    let mut lan_iface: Option<String> = None;
+    let mut tunnel_dns_hostname =
+        rustynetd::linux_exit_dns_failclosed::DEFAULT_TUNNEL_DNS_HOSTNAME.to_owned();
+    let mut killswitch_table =
+        rustynetd::linux_exit_dns_failclosed::DEFAULT_LINUX_KILLSWITCH_TABLE.to_owned();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--output") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-exit-dns-failclosed-capture: --output requires a value".to_owned()
+                })?;
+                output = Some(PathBuf::from(value));
+                index += 2;
+            }
+            Some("--lan-iface") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-exit-dns-failclosed-capture: --lan-iface requires a value".to_owned()
+                })?;
+                lan_iface = Some(value.clone());
+                index += 2;
+            }
+            Some("--mesh-hostname") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-exit-dns-failclosed-capture: --mesh-hostname requires a value".to_owned()
+                })?;
+                tunnel_dns_hostname = value.clone();
+                index += 2;
+            }
+            Some("--killswitch-table") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-exit-dns-failclosed-capture: --killswitch-table requires a value"
+                        .to_owned()
+                })?;
+                killswitch_table = value.clone();
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown linux-exit-dns-failclosed-capture argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let output = output
+        .ok_or_else(|| "linux-exit-dns-failclosed-capture: --output is required".to_owned())?;
+    let lan_iface = lan_iface
+        .ok_or_else(|| "linux-exit-dns-failclosed-capture: --lan-iface is required".to_owned())?;
+    let options = rustynetd::linux_exit_dns_failclosed::LinuxExitDnsFailclosedOptions::new(
+        lan_iface,
+        tunnel_dns_hostname,
+        killswitch_table,
+    );
+    rustynetd::linux_exit_dns_failclosed::write_linux_exit_dns_failclosed_artifacts(
+        output.as_path(),
+        &options,
+    )?;
+    println!(
+        "linux exit DNS fail-closed artifacts written to {}",
+        output.display()
     );
     Ok(())
 }
@@ -3102,6 +3172,7 @@ fn help_text() -> String {
         "  rustynetd linux-authenticode-check [--no-fail-on-drift]",
         "  rustynetd linux-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
+        "  rustynetd linux-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>] [--killswitch-table <name>]",
         "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
         "  rustynetd macos-exit-killswitch-precedence-check --output <path> [--pf-anchor <name>]",
@@ -3193,6 +3264,7 @@ fn help_text() -> String {
 mod tests {
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
+        run_linux_exit_dns_failclosed_capture_command,
         run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
@@ -3525,6 +3597,42 @@ mod tests {
         let err = run_macos_exit_dns_failclosed_capture_command(&[
             "--lan-iface".to_owned(),
             "en0".to_owned(),
+        ])
+        .expect_err("missing output must reject");
+        assert!(
+            err.contains("--output is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_linux_exit_dns_failclosed_capture_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("linux-exit-dns-failclosed-capture"),
+            "help text must advertise linux-exit-dns-failclosed-capture subcommand"
+        );
+        assert!(
+            help.contains("--killswitch-table"),
+            "help text must advertise --killswitch-table"
+        );
+    }
+
+    #[test]
+    fn run_linux_exit_dns_failclosed_capture_command_rejects_unknown_flags() {
+        let err = run_linux_exit_dns_failclosed_capture_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown linux-exit-dns-failclosed-capture argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_linux_exit_dns_failclosed_capture_command_requires_output() {
+        let err = run_linux_exit_dns_failclosed_capture_command(&[
+            "--lan-iface".to_owned(),
+            "enp0s1".to_owned(),
         ])
         .expect_err("missing output must reject");
         assert!(
