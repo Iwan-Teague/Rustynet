@@ -8892,6 +8892,94 @@ fn exercise_macos_relay_lifecycle_dry_run(
     ))
 }
 
+fn exercise_linux_relay_lifecycle_dry_run(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {linux_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "alias {linux_alias} resolved to non-Linux platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let install_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        build_linux_relay_install_command(false).as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("install-systemd-relay --dry-run on {linux_alias} failed: {err}"))?;
+    validate_linux_relay_install_output(install_output.as_str())?;
+
+    let uninstall_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        build_linux_relay_install_command(true).as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        format!("install-systemd-relay --uninstall --dry-run on {linux_alias} failed: {err}")
+    })?;
+    validate_linux_relay_uninstall_output(uninstall_output.as_str())?;
+    Ok(format!(
+        "Linux relay systemd lifecycle dry-run verified on {linux_alias}: install+enable -> disable+remove"
+    ))
+}
+
+fn build_linux_relay_install_command(uninstall: bool) -> String {
+    if uninstall {
+        "/usr/local/bin/rustynet ops install-systemd-relay --uninstall --dry-run 2>&1".to_owned()
+    } else {
+        "/usr/local/bin/rustynet ops install-systemd-relay --dry-run 2>&1".to_owned()
+    }
+}
+
+fn validate_linux_relay_install_output(output: &str) -> Result<(), String> {
+    for required in [
+        "install+enable",
+        "dry-run",
+        "would run: systemctl daemon-reload",
+        "would run: systemctl enable rustynet-relay.service",
+        "would run: systemctl start rustynet-relay.service",
+    ] {
+        if !output.contains(required) {
+            return Err(format!(
+                "install-systemd-relay --dry-run output missing required fragment {required:?}: {output}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_linux_relay_uninstall_output(output: &str) -> Result<(), String> {
+    for required in [
+        "disable+remove",
+        "dry-run",
+        "would run: systemctl stop rustynet-relay.service",
+        "would run: systemctl disable rustynet-relay.service",
+        "would run: systemctl daemon-reload",
+    ] {
+        if !output.contains(required) {
+            return Err(format!(
+                "install-systemd-relay --uninstall --dry-run output missing required fragment {required:?}: {output}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn exercise_macos_anchor_bundle_pull_plan_dry_run(
     macos_alias: &str,
     inventory_path: &Path,
@@ -8935,6 +9023,49 @@ fn exercise_macos_anchor_bundle_pull_plan_dry_run(
     ))
 }
 
+fn exercise_linux_anchor_bundle_pull_plan_dry_run(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {linux_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "alias {linux_alias} resolved to non-Linux platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let inventory = load_inventory(inventory_path)?;
+    let node_id = inventory
+        .iter()
+        .find(|entry| entry.alias == linux_alias)
+        .and_then(|entry| entry.node_id.as_deref())
+        .ok_or_else(|| format!("inventory entry for {linux_alias:?} has no node_id"))?;
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = format!(
+        "/usr/local/bin/rustynet anchor init --dry-run --node-id {} --bundle-pull-addr 127.0.0.1:51822 2>&1",
+        shell_quote(node_id)
+    );
+    let output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        script.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("anchor init --dry-run on {linux_alias} failed: {err}"))?;
+    validate_anchor_init_bundle_pull_plan(output.as_str())?;
+    Ok(format!(
+        "Linux anchor bundle-pull dry-run plan verified on {linux_alias}: anchor capabilities + loopback listener plan present"
+    ))
+}
+
 fn validate_anchor_init_bundle_pull_plan(output: &str) -> Result<(), String> {
     for required in [
         "anchor init plan:",
@@ -8951,6 +9082,76 @@ fn validate_anchor_init_bundle_pull_plan(output: &str) -> Result<(), String> {
                 "anchor init dry-run output missing required fragment {required:?}: {output}"
             ));
         }
+    }
+    Ok(())
+}
+
+fn exercise_linux_membership_genesis_validation(
+    linux_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[linux_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {linux_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Linux {
+        return Err(format!(
+            "alias {linux_alias} resolved to non-Linux platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        build_linux_membership_genesis_check_script().as_str(),
+        timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS),
+    )
+    .map_err(|err| format!("membership genesis validation on {linux_alias} failed: {err}"))?;
+    validate_linux_membership_genesis_output(output.as_str())?;
+    Ok(format!(
+        "Linux membership genesis verified on {linux_alias}: canonical files mode/owner valid and signed snapshot readable"
+    ))
+}
+
+fn build_linux_membership_genesis_check_script() -> String {
+    r#"set -eu
+for path in /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark; do
+  test -f "$path"
+  stat -c '%a %U:%G %n' "$path"
+done
+/usr/local/bin/rustynet membership status \
+  --snapshot /var/lib/rustynet/membership.snapshot \
+  --log /var/lib/rustynet/membership.log
+"#
+    .to_owned()
+}
+
+fn validate_linux_membership_genesis_output(output: &str) -> Result<(), String> {
+    for path in [
+        "/var/lib/rustynet/membership.snapshot",
+        "/var/lib/rustynet/membership.log",
+        "/var/lib/rustynet/membership.watermark",
+    ] {
+        let expected = format!("600 rustynetd:rustynetd {path}");
+        if !output.contains(expected.as_str()) {
+            return Err(format!(
+                "membership genesis output missing canonical mode/owner line {expected:?}: {output}"
+            ));
+        }
+    }
+    if !output.contains("membership status:")
+        || !output.contains("network_id=")
+        || !output.contains("epoch=")
+        || !output.contains("active_nodes=")
+    {
+        return Err(format!(
+            "membership status output did not prove readable signed snapshot: {output}"
+        ));
     }
     Ok(())
 }
@@ -14074,6 +14275,9 @@ fn run_linux_orchestration_stages_with_options(
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
+    let relay_lifecycle_log_path = logs_dir.join("validate_linux_relay_service_lifecycle.log");
+    let anchor_bundle_pull_log_path = logs_dir.join("validate_linux_anchor_bundle_pull.log");
+    let membership_genesis_log_path = logs_dir.join("validate_linux_membership_genesis.log");
 
     type LinuxStageFn =
         fn(&str, &Path, &Path, Option<&Path>) -> Result<(String, String), (String, String)>;
@@ -14266,6 +14470,148 @@ fn run_linux_orchestration_stages_with_options(
         }
     };
 
+    let relay_lifecycle_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would exercise rustynet-relay systemd lifecycle on {linux_alias} (ops install-systemd-relay --dry-run + --uninstall --dry-run)"
+            ),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_relay_service_lifecycle",
+            "validate_linux_runtime_acls",
+        )
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_relay_service_lifecycle",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        match exercise_linux_relay_lifecycle_dry_run(
+            linux_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&relay_lifecycle_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_linux_relay_service_lifecycle",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![relay_lifecycle_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&relay_lifecycle_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_linux_relay_service_lifecycle",
+                    VmLabStageStatus::Fail,
+                    format!("Linux relay lifecycle validation failed for {linux_alias}: {reason}"),
+                    vec![relay_lifecycle_log_path.clone()],
+                )
+            }
+        }
+    };
+    let relay_lifecycle_passed = relay_lifecycle_outcome.status == VmLabStageStatus::Pass;
+
+    let anchor_bundle_pull_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would exercise anchor init bundle-pull plan on {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_anchor_bundle_pull",
+            "validate_linux_runtime_acls",
+        )
+    } else if !relay_lifecycle_passed {
+        make_skipped(
+            "validate_linux_anchor_bundle_pull",
+            "validate_linux_relay_service_lifecycle",
+        )
+    } else {
+        match exercise_linux_anchor_bundle_pull_plan_dry_run(
+            linux_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&anchor_bundle_pull_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_linux_anchor_bundle_pull",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![anchor_bundle_pull_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&anchor_bundle_pull_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_linux_anchor_bundle_pull",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "Linux anchor bundle-pull plan validation failed for {linux_alias}: {reason}"
+                    ),
+                    vec![anchor_bundle_pull_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    let membership_genesis_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_membership_genesis",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Linux membership genesis files on {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_membership_genesis",
+            "validate_linux_runtime_acls",
+        )
+    } else if !key_custody_passed {
+        make_skipped(
+            "validate_linux_membership_genesis",
+            "validate_linux_key_custody",
+        )
+    } else {
+        match exercise_linux_membership_genesis_validation(
+            linux_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&membership_genesis_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_linux_membership_genesis",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![membership_genesis_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&membership_genesis_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_linux_membership_genesis",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "Linux membership genesis validation failed for {linux_alias}: {reason}"
+                    ),
+                    vec![membership_genesis_log_path.clone()],
+                )
+            }
+        }
+    };
+
     let mesh_status_outcome = if !runtime_acls_passed && !options.dry_run {
         make_skipped("validate_linux_mesh_status", "validate_linux_runtime_acls")
     } else if !key_custody_passed && !options.dry_run {
@@ -14337,6 +14683,9 @@ fn run_linux_orchestration_stages_with_options(
         authenticode_outcome,
         dns_failclosed_outcome,
         exit_nat_lifecycle_outcome,
+        relay_lifecycle_outcome,
+        anchor_bundle_pull_outcome,
+        membership_genesis_outcome,
         mesh_status_outcome,
     ]
 }
@@ -30803,6 +31152,51 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         );
     }
 
+    #[test]
+    fn linux_relay_lifecycle_output_validators_accept_reviewed_dry_run_text() {
+        let install = "rustynet-relay systemd unit: install+enable (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl daemon-reload\n  - would run: systemctl enable rustynet-relay.service\n  - would run: systemctl start rustynet-relay.service\n";
+        super::validate_linux_relay_install_output(install).expect("install output validates");
+        let uninstall = "rustynet-relay systemd unit: disable+remove (dry-run) at /etc/systemd/system/rustynet-relay.service\n  - would run: systemctl stop rustynet-relay.service\n  - would run: systemctl disable rustynet-relay.service\n  - would run: systemctl daemon-reload\n";
+        super::validate_linux_relay_uninstall_output(uninstall)
+            .expect("uninstall output validates");
+    }
+
+    #[test]
+    fn linux_relay_lifecycle_output_validator_rejects_missing_systemctl_step() {
+        let err = super::validate_linux_relay_install_output(
+            "rustynet-relay systemd unit: install+enable (dry-run)\n",
+        )
+        .expect_err("missing systemctl start must reject");
+        assert!(err.contains("systemctl daemon-reload") || err.contains("systemctl start"));
+    }
+
+    #[test]
+    fn linux_relay_install_command_is_canonical_and_dry_run() {
+        assert_eq!(
+            super::build_linux_relay_install_command(false),
+            "/usr/local/bin/rustynet ops install-systemd-relay --dry-run 2>&1"
+        );
+        assert_eq!(
+            super::build_linux_relay_install_command(true),
+            "/usr/local/bin/rustynet ops install-systemd-relay --uninstall --dry-run 2>&1"
+        );
+    }
+
+    #[test]
+    fn linux_membership_genesis_validator_accepts_reviewed_output() {
+        let output = "600 rustynetd:rustynetd /var/lib/rustynet/membership.snapshot\n600 rustynetd:rustynetd /var/lib/rustynet/membership.log\n600 rustynetd:rustynetd /var/lib/rustynet/membership.watermark\nmembership status: network_id=test epoch=1 quorum_threshold=1 active_nodes=3 state_root=abc\n";
+        super::validate_linux_membership_genesis_output(output)
+            .expect("membership genesis output validates");
+    }
+
+    #[test]
+    fn linux_membership_genesis_validator_rejects_weak_mode() {
+        let output = "644 rustynetd:rustynetd /var/lib/rustynet/membership.snapshot\n600 rustynetd:rustynetd /var/lib/rustynet/membership.log\n600 rustynetd:rustynetd /var/lib/rustynet/membership.watermark\nmembership status: network_id=test epoch=1 quorum_threshold=1 active_nodes=3 state_root=abc\n";
+        let err = super::validate_linux_membership_genesis_output(output)
+            .expect_err("weak mode must reject");
+        assert!(err.contains("membership.snapshot"));
+    }
+
     fn reviewed_macos_exit_killswitch_precedence_artifact() -> serde_json::Value {
         serde_json::json!({
             "schema_version": 1,
@@ -33428,6 +33822,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 "validate_linux_service_hardening",
                 "validate_linux_authenticode",
                 "validate_linux_dns_failclosed",
+                "validate_linux_exit_nat_lifecycle",
+                "validate_linux_relay_service_lifecycle",
+                "validate_linux_anchor_bundle_pull",
+                "validate_linux_membership_genesis",
                 "validate_linux_mesh_status",
             ]
         );

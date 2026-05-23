@@ -585,3 +585,14 @@ across stages.
   `scripts/ci/cross_platform_role_gates.sh` to include the Linux producer. DNS
   fail-closed, killswitch precedence, relay, anchor, genesis, and IPv6 schema-v2
   parity remain follow-up Linux slices.
+- 2026-05-23 — Linux orchestration parity L2 landed. Added
+  `validate_linux_relay_service_lifecycle`,
+  `validate_linux_anchor_bundle_pull`, and
+  `validate_linux_membership_genesis` to the Linux validator chain. The relay
+  stage verifies the systemd install/uninstall dry-run lifecycle, the anchor
+  stage verifies the anchor init bundle-pull plan plus all five anchor
+  sub-capabilities, and the genesis stage verifies canonical membership file
+  mode/owner plus `rustynet membership status` readability. Added hermetic
+  validator tests and extended `scripts/ci/linux_exit_role_gates.sh`. DNS
+  fail-closed, killswitch precedence, live Debian 13 evidence, and IPv6
+  schema-v2 parity remain follow-up Linux slices.
