@@ -8155,7 +8155,204 @@ fn run_macos_orchestration_stages(
             }
         }
     };
+    let mesh_join_passed = validate_outcome.status == VmLabStageStatus::Pass;
     outcomes.push(validate_outcome);
+
+    // ── Stage 6: validate_macos_exit_nat_lifecycle ────────────────────────
+    //
+    // Mirrors the Windows `validate_windows_exit_nat_lifecycle` stage but
+    // looks for a pf-anchor / `net.inet.ip.forwarding` lifecycle artefact
+    // under `<report_dir>/macos_exit_evidence/`. The artefact is produced
+    // by a macOS-on-host exit-mode test bin; if it isn't present we skip
+    // cleanly so default runs (macOS-as-client) don't fail.
+    let macos_exit_artifact_root = report_dir.join("macos_exit_evidence");
+    let exit_nat_lifecycle_log_path = logs_dir.join("validate_macos_exit_nat_lifecycle.log");
+    let exit_nat_lifecycle_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_exit_nat_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate macOS Exit NAT lifecycle artifact for {macos_alias}"),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_exit_nat_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_path = macos_exit_artifact_root.join("macos_exit_nat_lifecycle.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_macos_exit_nat_lifecycle",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: macOS Exit NAT lifecycle artifact not present at {}; \
+                     macOS is not the active exit",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_macos_exit_nat_lifecycle_artifact(macos_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_nat_lifecycle_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_macos_exit_nat_lifecycle",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_nat_lifecycle_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_macos_exit_nat_lifecycle",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "macOS Exit NAT lifecycle artifact validation failed for {macos_alias}: {reason}"
+                        ),
+                        vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+    outcomes.push(exit_nat_lifecycle_outcome);
+
+    // ── Stage 7: validate_macos_exit_dns_failclosed ───────────────────────
+    let exit_dns_leak_log_path = logs_dir.join("validate_macos_exit_dns_failclosed.log");
+    let exit_dns_leak_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_exit_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate macOS Exit DNS leak artifacts for {macos_alias}"),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_exit_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_dir = macos_exit_artifact_root.join("dns_leak_proof");
+        if !artifact_dir.exists() {
+            stage_outcome(
+                "validate_macos_exit_dns_failclosed",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: macOS Exit DNS leak artifact directory not present at {}",
+                    artifact_dir.display()
+                ),
+                vec![],
+            )
+        } else if let Err(reason) = macos_exit_dns_failclosed_artifact_set_complete(&artifact_dir) {
+            stage_outcome(
+                "validate_macos_exit_dns_failclosed",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: macOS Exit DNS leak artifact set incomplete at {}: {reason}",
+                    artifact_dir.display()
+                ),
+                vec![],
+            )
+        } else {
+            match evaluate_macos_exit_dns_failclosed_artifact_dir(macos_alias, &artifact_dir) {
+                Ok(summary) => {
+                    let _ = fs::write(&exit_dns_leak_log_path, summary.as_str());
+                    stage_outcome(
+                        "validate_macos_exit_dns_failclosed",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_dns_leak_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_dns_leak_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_macos_exit_dns_failclosed",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "macOS Exit DNS leak artifact validation failed for {macos_alias}: {reason}"
+                        ),
+                        vec![exit_dns_leak_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+    outcomes.push(exit_dns_leak_outcome);
+
+    // ── Stage 8: validate_macos_exit_killswitch_precedence ────────────────
+    let exit_killswitch_log_path = logs_dir.join("validate_macos_exit_killswitch_precedence.log");
+    let exit_killswitch_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_exit_killswitch_precedence",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would validate macOS Exit killswitch precedence artifact for {macos_alias}"
+            ),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_exit_killswitch_precedence",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        let artifact_path = macos_exit_artifact_root.join("macos_exit_killswitch_precedence.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_macos_exit_killswitch_precedence",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: macOS Exit killswitch precedence artifact not present at {}",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_macos_exit_killswitch_precedence_artifact(macos_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_killswitch_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_macos_exit_killswitch_precedence",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_killswitch_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_killswitch_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_macos_exit_killswitch_precedence",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "macOS Exit killswitch precedence artifact validation failed for {macos_alias}: {reason}"
+                        ),
+                        vec![exit_killswitch_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+    outcomes.push(exit_killswitch_outcome);
+
     outcomes
 }
 
@@ -10925,6 +11122,280 @@ fn evaluate_windows_exit_killswitch_precedence_artifact(
     Ok(format!(
         "Windows exit killswitch precedence verified on {windows_alias}: tamper rejected with exit_code={exit_code}"
     ))
+}
+
+// ─── Track B Step 2 (M1): macOS exit-mode validators ─────────────────────
+//
+// The three evaluators below mirror the Windows exit-mode artefact
+// validation: they parse a JSON report produced by an on-host test bin
+// running in macOS exit mode, and pass/fail/reject based on whether the
+// reported pf + scutil state matches the reviewed contract.
+//
+// Schema is intentionally pinned via `schema_version=1` so the daemon
+// side and orchestrator can evolve independently; bumping the version
+// requires an orchestrator update to read the new fields.
+
+/// macOS NAT lifecycle artefact validator. Mirrors the Windows
+/// `evaluate_windows_exit_nat_lifecycle_artifact` shape, but instead of
+/// asserting a Windows `NetNat` object the macOS variant asserts a pf
+/// anchor with the matching internal prefix and `sysctl
+/// net.inet.ip.forwarding=1` while the daemon is running. Both the pf
+/// anchor and the forwarding sysctl MUST revert when the daemon stops;
+/// any leftover anchor or `ip.forwarding=1` after stop fails closed.
+fn evaluate_macos_exit_nat_lifecycle_artifact(
+    macos_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse macos exit NAT lifecycle artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "macos exit NAT lifecycle artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let mesh_cidr = require_json_str(&report, "mesh_cidr")?;
+    validate_cidr_like("mesh_cidr", mesh_cidr)?;
+    let pf_anchor = require_json_str(&report, "pf_anchor")?;
+    if pf_anchor.trim().is_empty() {
+        return Err("macos exit NAT lifecycle artifact has empty pf_anchor".to_owned());
+    }
+    let during = require_json_value(&report, "during_run")?;
+    if !require_json_bool(during, "pf_anchor_present")? {
+        return Err(
+            "macos exit NAT lifecycle artifact did not prove pf anchor present during run"
+                .to_owned(),
+        );
+    }
+    let internal_prefix = require_json_str(during, "internal_prefix")?;
+    if internal_prefix != mesh_cidr {
+        return Err(format!(
+            "macos exit NAT lifecycle artifact internal_prefix {internal_prefix:?} did not match mesh_cidr {mesh_cidr:?}"
+        ));
+    }
+    require_forwarding_enabled_macos(during, "tunnel_forwarding")?;
+    require_forwarding_enabled_macos(during, "egress_forwarding")?;
+
+    let after = require_json_value(&report, "after_stop")?;
+    if require_json_bool(after, "pf_anchor_present")? {
+        return Err(
+            "macos exit NAT lifecycle artifact left pf anchor present after daemon stop".to_owned(),
+        );
+    }
+    if !require_json_bool(after, "forwarding_restored")? {
+        return Err(
+            "macos exit NAT lifecycle artifact did not prove ip.forwarding sysctl was restored after stop"
+                .to_owned(),
+        );
+    }
+    Ok(format!(
+        "macOS exit NAT lifecycle verified on {macos_alias} (pf_anchor={pf_anchor}, mesh_cidr={mesh_cidr})"
+    ))
+}
+
+/// macOS DNS fail-closed artefact-directory validator. Parallel to the
+/// Windows variant. Required files in the artefact directory:
+///
+/// - `pf_block_rules.json` — pf NAT/quick-block rules covering UDP 53
+///   and TCP 53 toward the LAN; overall_ok=true
+/// - `udp_block_pcap.txt` / `tcp_block_pcap.txt` — empty (no DNS
+///   egress observed on the LAN side while the daemon enforces the
+///   killswitch)
+/// - `tunnel_path_resolves.json` — positive control: a query routed
+///   through the tunnel returned an answer
+/// - `macos_dns_failclosed_check.json` — `{ schema_version: 1,
+///   overall_ok: bool, drift_reasons: [String] }`, mirrors the
+///   Windows-side `windows_dns_failclosed_check.json` contract.
+fn evaluate_macos_exit_dns_failclosed_artifact_dir(
+    macos_alias: &str,
+    artifact_dir: &Path,
+) -> Result<String, String> {
+    macos_exit_dns_failclosed_artifact_set_complete(artifact_dir)?;
+    let pf_rules = fs::read_to_string(artifact_dir.join("pf_block_rules.json"))
+        .map_err(|err| format!("read pf_block_rules.json failed: {err}"))?;
+    let pf_report: Value = serde_json::from_str(&pf_rules)
+        .map_err(|err| format!("parse pf_block_rules.json failed: {err}"))?;
+    require_json_u64(&pf_report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| "pf_block_rules.json returned unsupported schema_version".to_owned())?;
+    if !require_json_bool(&pf_report, "overall_ok")? {
+        return Err("pf_block_rules.json did not report overall_ok=true".to_owned());
+    }
+    let rules = require_json_array(&pf_report, "rules")?;
+    require_pf_block_rule(rules, "rustynet-dns-block-lan-udp")?;
+    require_pf_block_rule(rules, "rustynet-dns-block-lan-tcp")?;
+
+    let udp_pcap = fs::read_to_string(artifact_dir.join("udp_block_pcap.txt"))
+        .map_err(|err| format!("read udp_block_pcap.txt failed: {err}"))?;
+    require_empty_dns_pcap("udp_block_pcap.txt", udp_pcap.as_str())?;
+    let tcp_pcap = fs::read_to_string(artifact_dir.join("tcp_block_pcap.txt"))
+        .map_err(|err| format!("read tcp_block_pcap.txt failed: {err}"))?;
+    require_empty_dns_pcap("tcp_block_pcap.txt", tcp_pcap.as_str())?;
+
+    let positive_control = fs::read_to_string(artifact_dir.join("tunnel_path_resolves.json"))
+        .map_err(|err| format!("read tunnel_path_resolves.json failed: {err}"))?;
+    let positive_report: Value = serde_json::from_str(&positive_control)
+        .map_err(|err| format!("parse tunnel_path_resolves.json failed: {err}"))?;
+    if !require_json_bool(&positive_report, "overall_ok")?
+        || !require_json_bool(&positive_report, "resolved")?
+    {
+        return Err(
+            "tunnel_path_resolves.json did not prove tunnel DNS positive control".to_owned(),
+        );
+    }
+
+    let dns_check = fs::read_to_string(artifact_dir.join("macos_dns_failclosed_check.json"))
+        .map_err(|err| format!("read macos_dns_failclosed_check.json failed: {err}"))?;
+    evaluate_macos_dns_failclosed_report(macos_alias, dns_check.as_str())?;
+
+    Ok(format!(
+        "macOS exit DNS leak proof verified on {macos_alias}: UDP/TCP egress pcaps empty and tunnel positive control passed"
+    ))
+}
+
+fn macos_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Result<(), String> {
+    let required = [
+        "pf_block_rules.json",
+        "udp_block_pcap.txt",
+        "tcp_block_pcap.txt",
+        "tunnel_path_resolves.json",
+        "macos_dns_failclosed_check.json",
+    ];
+    let missing = required
+        .iter()
+        .filter(|relative| !artifact_dir.join(relative).is_file())
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing required artifact(s): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// macOS exit killswitch precedence artefact validator. Same contract
+/// as the Windows variant: baseline assertion must pass, tampered
+/// assertion must fail with a non-zero exit code and a non-empty
+/// reason string. The tamper itself (e.g. flushing pf or unloading the
+/// `com.rustynet.daemon` plist mid-run) is producer-side; the
+/// validator only enforces the audit-shape contract.
+fn evaluate_macos_exit_killswitch_precedence_artifact(
+    macos_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse macos exit killswitch precedence artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            "macos exit killswitch precedence artifact returned unsupported schema_version"
+                .to_owned()
+        })?;
+    let baseline = require_json_value(&report, "baseline_assert")?;
+    if !require_json_bool(baseline, "overall_ok")? {
+        return Err("baseline killswitch assertion did not pass before tamper".to_owned());
+    }
+    let tampered = require_json_value(&report, "tampered_assert")?;
+    if require_json_bool(tampered, "overall_ok")? {
+        return Err("tampered killswitch assertion reported overall_ok=true".to_owned());
+    }
+    let exit_code = require_json_i64(tampered, "exit_code")?;
+    if exit_code == 0 {
+        return Err("tampered killswitch assertion exited zero".to_owned());
+    }
+    let reason = require_json_str(tampered, "reason")?;
+    if reason.trim().is_empty() {
+        return Err("tampered killswitch assertion did not record a reason".to_owned());
+    }
+    Ok(format!(
+        "macOS exit killswitch precedence verified on {macos_alias}: tamper rejected with exit_code={exit_code}"
+    ))
+}
+
+fn evaluate_macos_dns_failclosed_report(
+    macos_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse macos-dns-failclosed-check JSON output failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "macos-dns-failclosed-check returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let overall_ok = require_json_bool(&report, "overall_ok")?;
+    let drift_reasons = require_json_array(&report, "drift_reasons")?;
+    if !overall_ok {
+        let reasons = if drift_reasons.is_empty() {
+            "report set overall_ok=false but no drift_reasons recorded; output is inconsistent"
+                .to_owned()
+        } else {
+            drift_reasons
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(format!("macOS DNS fail-closed drift detected: {reasons}"));
+    }
+    if !drift_reasons.is_empty() {
+        let joined = drift_reasons
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "report set overall_ok=true but drift_reasons is non-empty: {joined}"
+        ));
+    }
+    Ok(format!("macOS DNS fail-closed verified on {macos_alias}"))
+}
+
+fn require_forwarding_enabled_macos(value: &Value, field: &str) -> Result<(), String> {
+    let status = require_json_str(value, field)?;
+    if status.eq_ignore_ascii_case("enabled") {
+        Ok(())
+    } else {
+        Err(format!(
+            "macOS exit forwarding field {field} was {status:?}, expected Enabled"
+        ))
+    }
+}
+
+fn require_pf_block_rule(rules: &[Value], expected_name: &str) -> Result<(), String> {
+    let rule = rules
+        .iter()
+        .find(|rule| {
+            rule.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == expected_name)
+        })
+        .ok_or_else(|| format!("pf_block_rules.json missing {expected_name}"))?;
+    for (field, expected) in [
+        ("action", "block"),
+        ("direction", "out"),
+        ("enabled", "true"),
+    ] {
+        let actual = require_json_str(rule, field)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "pf rule {expected_name} field {field} was {actual:?}, expected {expected}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_json_value<'a>(value: &'a Value, field: &str) -> Result<&'a Value, String> {
@@ -28827,6 +29298,293 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             err.contains("reported overall_ok=true"),
             "unexpected error: {err}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Track B Step 2 (M1): macOS exit-mode evaluator tests
+    // ---------------------------------------------------------------
+
+    fn reviewed_macos_exit_nat_lifecycle_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "mesh_cidr": "100.64.0.0/16",
+            "pf_anchor": "com.rustynet/nat",
+            "during_run": {
+                "pf_anchor_present": true,
+                "internal_prefix": "100.64.0.0/16",
+                "tunnel_forwarding": "Enabled",
+                "egress_forwarding": "Enabled"
+            },
+            "after_stop": {
+                "pf_anchor_present": false,
+                "forwarding_restored": true
+            }
+        })
+    }
+
+    #[test]
+    fn evaluate_macos_exit_nat_lifecycle_artifact_accepts_reviewed_payload() {
+        let summary = super::evaluate_macos_exit_nat_lifecycle_artifact(
+            "macos-utm-1",
+            reviewed_macos_exit_nat_lifecycle_artifact()
+                .to_string()
+                .as_str(),
+        )
+        .expect("reviewed macOS NAT lifecycle artifact must validate");
+        assert!(
+            summary.contains("macos-utm-1")
+                && summary.contains("com.rustynet/nat")
+                && summary.contains("mesh_cidr=100.64.0.0/16"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_exit_nat_lifecycle_artifact_rejects_leftover_anchor_after_stop() {
+        let mut payload = reviewed_macos_exit_nat_lifecycle_artifact();
+        payload["after_stop"]["pf_anchor_present"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_macos_exit_nat_lifecycle_artifact(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("leftover pf anchor after stop must fail");
+        assert!(
+            err.contains("left pf anchor present after daemon stop"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_exit_nat_lifecycle_artifact_rejects_internal_prefix_drift() {
+        let mut payload = reviewed_macos_exit_nat_lifecycle_artifact();
+        payload["during_run"]["internal_prefix"] = serde_json::Value::String("10.0.0.0/8".into());
+        let err = super::evaluate_macos_exit_nat_lifecycle_artifact(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("internal_prefix drift must fail");
+        assert!(
+            err.contains("did not match mesh_cidr"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_exit_nat_lifecycle_artifact_rejects_unknown_schema_version() {
+        let mut payload = reviewed_macos_exit_nat_lifecycle_artifact();
+        payload["schema_version"] = serde_json::Value::from(99);
+        let err = super::evaluate_macos_exit_nat_lifecycle_artifact(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("unknown schema_version must fail");
+        assert!(err.contains("schema_version=99"), "unexpected error: {err}");
+    }
+
+    fn reviewed_macos_exit_killswitch_precedence_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "baseline_assert": { "overall_ok": true },
+            "tampered_assert": {
+                "overall_ok": false,
+                "exit_code": 2,
+                "reason": "macOS pf killswitch verification failed: default outbound rule was pass"
+            }
+        })
+    }
+
+    #[test]
+    fn evaluate_macos_exit_killswitch_precedence_artifact_accepts_reviewed_payload() {
+        let summary = super::evaluate_macos_exit_killswitch_precedence_artifact(
+            "macos-utm-1",
+            reviewed_macos_exit_killswitch_precedence_artifact()
+                .to_string()
+                .as_str(),
+        )
+        .expect("reviewed macOS killswitch precedence artifact must validate");
+        assert!(
+            summary.contains("macos-utm-1") && summary.contains("tamper rejected"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_exit_killswitch_precedence_artifact_rejects_tampered_success() {
+        let mut payload = reviewed_macos_exit_killswitch_precedence_artifact();
+        payload["tampered_assert"]["overall_ok"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_macos_exit_killswitch_precedence_artifact(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("tampered killswitch success must fail closed");
+        assert!(
+            err.contains("reported overall_ok=true"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_exit_killswitch_precedence_artifact_rejects_zero_exit_code() {
+        let mut payload = reviewed_macos_exit_killswitch_precedence_artifact();
+        payload["tampered_assert"]["exit_code"] = serde_json::Value::from(0);
+        let err = super::evaluate_macos_exit_killswitch_precedence_artifact(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("tampered killswitch zero exit must fail");
+        assert!(err.contains("exited zero"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn evaluate_macos_dns_failclosed_report_accepts_reviewed_payload() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "drift_reasons": []
+        });
+        let summary = super::evaluate_macos_dns_failclosed_report(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect("reviewed macOS DNS failclosed payload must validate");
+        assert!(
+            summary.contains("macos-utm-1"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_dns_failclosed_report_rejects_inconsistent_overall_ok() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": false,
+            "drift_reasons": []
+        });
+        let err = super::evaluate_macos_dns_failclosed_report(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("inconsistent overall_ok=false with empty drift_reasons must fail");
+        assert!(
+            err.contains("output is inconsistent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_macos_dns_failclosed_report_rejects_overall_ok_true_with_drift() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "drift_reasons": ["bogus drift"]
+        });
+        let err = super::evaluate_macos_dns_failclosed_report(
+            "macos-utm-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("overall_ok=true with drift_reasons must fail");
+        assert!(err.contains("bogus drift"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn macos_exit_dns_failclosed_artifact_set_complete_detects_missing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-macos-dns-failclosed-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only write 2 of the 5 required files.
+        std::fs::write(dir.join("pf_block_rules.json"), "{}").unwrap();
+        std::fs::write(dir.join("tunnel_path_resolves.json"), "{}").unwrap();
+        let err = super::macos_exit_dns_failclosed_artifact_set_complete(&dir)
+            .expect_err("partial set must fail");
+        assert!(
+            err.contains("udp_block_pcap.txt")
+                && err.contains("tcp_block_pcap.txt")
+                && err.contains("macos_dns_failclosed_check.json"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_macos_exit_dns_failclosed_artifact_dir_accepts_reviewed_payloads() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-macos-dns-failclosed-accept-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pf_rules = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "rules": [
+                { "name": "rustynet-dns-block-lan-udp", "action": "block", "direction": "out", "enabled": "true" },
+                { "name": "rustynet-dns-block-lan-tcp", "action": "block", "direction": "out", "enabled": "true" }
+            ]
+        });
+        std::fs::write(dir.join("pf_block_rules.json"), pf_rules.to_string()).unwrap();
+        std::fs::write(dir.join("udp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(dir.join("tcp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(
+            dir.join("tunnel_path_resolves.json"),
+            serde_json::json!({ "overall_ok": true, "resolved": true }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("macos_dns_failclosed_check.json"),
+            serde_json::json!({ "schema_version": 1, "overall_ok": true, "drift_reasons": [] })
+                .to_string(),
+        )
+        .unwrap();
+        let summary = super::evaluate_macos_exit_dns_failclosed_artifact_dir("macos-utm-1", &dir)
+            .expect("reviewed payloads must validate");
+        assert!(
+            summary.contains("macos-utm-1") && summary.contains("UDP/TCP egress pcaps empty"),
+            "unexpected summary: {summary}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_macos_exit_dns_failclosed_artifact_dir_rejects_nonempty_block_pcap() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-macos-dns-failclosed-reject-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pf_rules = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "rules": [
+                { "name": "rustynet-dns-block-lan-udp", "action": "block", "direction": "out", "enabled": "true" },
+                { "name": "rustynet-dns-block-lan-tcp", "action": "block", "direction": "out", "enabled": "true" }
+            ]
+        });
+        std::fs::write(dir.join("pf_block_rules.json"), pf_rules.to_string()).unwrap();
+        std::fs::write(
+            dir.join("udp_block_pcap.txt"),
+            "2 packets captured\n... DNS leak observed",
+        )
+        .unwrap();
+        std::fs::write(dir.join("tcp_block_pcap.txt"), "0 packets captured").unwrap();
+        std::fs::write(
+            dir.join("tunnel_path_resolves.json"),
+            serde_json::json!({ "overall_ok": true, "resolved": true }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("macos_dns_failclosed_check.json"),
+            serde_json::json!({ "schema_version": 1, "overall_ok": true, "drift_reasons": [] })
+                .to_string(),
+        )
+        .unwrap();
+        let err = super::evaluate_macos_exit_dns_failclosed_artifact_dir("macos-utm-1", &dir)
+            .expect_err("non-empty udp pcap must fail");
+        assert!(
+            err.contains("DNS egress evidence"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------------------------------------------------------------
