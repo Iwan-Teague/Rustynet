@@ -34,6 +34,11 @@ cargo run --quiet -p rustynet-cli --bin live_linux_anchor_test -- \
   --dry-run \
   --anchor-token-path 'C:\ProgramData\RustyNet\anchor\bundle-pull.token' \
   --membership-snapshot-path 'C:\ProgramData\RustyNet\state\membership.snapshot' \
+  --membership-log-path 'C:\ProgramData\RustyNet\state\membership.log' \
+  --enrollment-secret-path 'C:\ProgramData\RustyNet\keys\enrollment.secret' \
+  --enrollment-ledger-path 'C:\ProgramData\RustyNet\state\enrollment.ledger' \
+  --owner-signing-key-path 'C:\ProgramData\RustyNet\keys\membership.owner.key' \
+  --signing-key-passphrase-cred-path 'C:\ProgramData\RustyNet\keys\signing_key_passphrase.cred' \
   --report-path "$tmp_dir/live_windows_anchor_report.json" \
   --log-path "$tmp_dir/live_windows_anchor.log"
 
