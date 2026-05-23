@@ -7419,8 +7419,21 @@ fn run_windows_orchestration_with_pulled_bundles(
     linux_outcomes: &[VmLabStageOutcome],
 ) -> Vec<VmLabStageOutcome> {
     let mut prelude_outcomes: Vec<VmLabStageOutcome> = Vec::new();
+    // Track B Step 4 (W1) — promote the Windows host to the active
+    // mesh exit when the resolved topology elects it. The topology
+    // override step (`topology::apply_topology_overrides_to_orchestrate_config`)
+    // rewrites `config.exit_vm` to the resolved alias before
+    // orchestration starts, so a Windows-vs-exit alias match is the
+    // canonical signal that the operator asked Windows to be the
+    // active exit.
+    let promote_windows_to_active_exit = config
+        .windows_vm
+        .as_deref()
+        .zip(config.exit_vm.as_deref())
+        .is_some_and(|(win, exit)| win == exit);
     let mut options = WindowsOrchestrationOptions {
         no_fail_on_authenticode: config.no_fail_on_authenticode,
+        promote_to_active_exit: promote_windows_to_active_exit,
         ..WindowsOrchestrationOptions::default()
     };
 
@@ -8556,6 +8569,17 @@ pub struct WindowsOrchestrationOptions {
     /// that does not include the Windows node and the daemon stays in
     /// `LocalNodeNotActive` fail-closed.
     pub linux_exit_alias: Option<String>,
+    /// Track B Step 4 (W1) — promote the Windows host to the active
+    /// mesh exit. When true the orchestrator inserts a
+    /// `promote_windows_exit_active` stage that runs the reviewed
+    /// `ops install-windows-exit-service` preflight on the Windows
+    /// host, then polls the daemon IPC status until it reports
+    /// `node_role=admin serving_exit_node=true`. Default (false)
+    /// leaves the Windows host as a client peer — the existing
+    /// `validate_windows_exit_*` stages still attest the host is
+    /// *capable* of exit-serving, but the active mesh exit stays on
+    /// the Linux alias.
+    pub promote_to_active_exit: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9200,6 +9224,70 @@ fn run_windows_orchestration_stages_with_options(
     };
 
     let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
+
+    // ── Track B Step 4 (W1): promote Windows to active mesh exit ─────────
+    //
+    // Gated by `options.promote_to_active_exit`, which is set by
+    // `run_windows_orchestration_with_pulled_bundles` when the topology
+    // resolution elected the Windows host as the exit alias. Default
+    // runs (windows_vm != exit_vm) leave this stage skipped, preserving
+    // the historical readiness-only validate_windows_exit_* posture
+    // byte-for-byte.
+    let promote_exit_log_path = logs_dir.join("promote_windows_exit_active.log");
+    let promote_exit_outcome = if !options.promote_to_active_exit {
+        stage_outcome(
+            "promote_windows_exit_active",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: promote_to_active_exit is false for {windows_alias}; \
+                 topology did not elect Windows as the active exit"
+            ),
+            vec![],
+        )
+    } else if dry_run {
+        stage_outcome(
+            "promote_windows_exit_active",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would promote {windows_alias} to active mesh exit \
+                 (install-windows-exit-service + IPC wait)"
+            ),
+            vec![],
+        )
+    } else if !dns_failclosed_passed {
+        stage_outcome(
+            "promote_windows_exit_active",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        match promote_windows_to_active_exit(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = fs::write(&promote_exit_log_path, summary.as_str());
+                stage_outcome(
+                    "promote_windows_exit_active",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![promote_exit_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = fs::write(&promote_exit_log_path, reason.as_str());
+                stage_outcome(
+                    "promote_windows_exit_active",
+                    VmLabStageStatus::Fail,
+                    format!("Windows active-exit promotion failed for {windows_alias}: {reason}"),
+                    vec![promote_exit_log_path.clone()],
+                )
+            }
+        }
+    };
 
     // Optional pre-live Windows-as-exit evidence pull + validators. Evidence
     // is copied from a reviewed guest root through an allowlist, not recursive
@@ -9926,6 +10014,7 @@ fn run_windows_orchestration_stages_with_options(
         custody_outcome,
         authenticode_outcome,
         dns_failclosed_outcome,
+        promote_exit_outcome,
         capture_exit_evidence_outcome,
         pull_exit_evidence_outcome,
         exit_nat_lifecycle_outcome,
@@ -10317,6 +10406,121 @@ fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize,
         .map_or(0, std::vec::Vec::len);
     Ok((written.len(), format!("{skipped_count} skipped reason(s)")))
 }
+
+/// Track B Step 4 (W1) — promote a Windows host to the active mesh
+/// exit by:
+///
+/// 1. Running the reviewed `Install-RustyNetWindowsExitService.ps1`
+///    preflight on the Windows host (enables IPv4 forwarding on every
+///    interface and writes a reviewed install-evidence JSON).
+/// 2. Polling the daemon's IPC status via `rustynet status` until it
+///    reports `serving_exit_node=true`, capped at
+///    [`WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS`] so a wedged daemon
+///    surfaces as a clear failure rather than an open-ended wait.
+///
+/// The host-interface egress evidence is captured by the existing
+/// `validate_windows_exit_nat_lifecycle` stage, which inspects the
+/// `internal_prefix` and `tunnel_forwarding`/`egress_forwarding`
+/// fields of the NAT lifecycle artefact — the spec's "source IP
+/// field" evidence.
+fn promote_windows_to_active_exit(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {windows_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+
+    // Step 1: run the reviewed exit preflight installer via PowerShell.
+    // The script writes a structured install-evidence JSON and exits
+    // non-zero on per-interface failures, so success implies forwarding
+    // was enabled on every IPv4 interface.
+    let install_script = format!(
+        "& {exe} ops install-windows-exit-service",
+        exe = powershell_quote(WINDOWS_RUSTYNETD_CLI_PATH)?,
+    );
+    let install_invocation = build_ssh_powershell_encoded_invocation(install_script.as_str())?;
+    let install_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        install_invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("install-windows-exit-service on {windows_alias} failed: {err}"))?;
+    let install_trimmed = install_output.trim().to_owned();
+
+    // Step 2: poll daemon IPC status until serving_exit_node=true or
+    // we hit the timeout. The poll runs a short PowerShell loop on the
+    // Windows host that captures `rustynet status` and parses it for
+    // the `serving_exit_node=true` field — same field shape as
+    // `resolve_preset_from_status` consumes.
+    let poll_script = format!(
+        "$deadline = (Get-Date).AddSeconds({timeout}); \
+         while ((Get-Date) -lt $deadline) {{ \
+           $out = & {exe} status 2>$null; \
+           if ($LASTEXITCODE -eq 0 -and $out -match 'serving_exit_node=true' \
+               -and $out -match 'node_role=admin') {{ \
+             Write-Output \"PROMOTED $out\"; \
+             exit 0; \
+           }}; \
+           Start-Sleep -Seconds 2; \
+         }}; \
+         Write-Error \"timed out waiting for serving_exit_node=true on {windows_alias}\"; \
+         exit 1",
+        timeout = WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS,
+        exe = powershell_quote(WINDOWS_RUSTYNETD_CLI_PATH)?,
+        windows_alias = windows_alias,
+    );
+    let poll_invocation = build_ssh_powershell_encoded_invocation(poll_script.as_str())?;
+    let poll_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        poll_invocation.as_str(),
+        timeout_or_default(
+            WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS + 30,
+            DEFAULT_RUN_TIMEOUT_SECS,
+        ),
+    )
+    .map_err(|err| {
+        format!(
+            "polling Windows daemon IPC for serving_exit_node=true on {windows_alias} failed: {err}"
+        )
+    })?;
+    let poll_trimmed = poll_output.trim().to_owned();
+    if !poll_trimmed.contains("PROMOTED") {
+        return Err(format!(
+            "Windows daemon on {windows_alias} did not report serving_exit_node=true within {WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS}s: {poll_trimmed}"
+        ));
+    }
+    Ok(format!(
+        "Windows host {windows_alias} promoted to active mesh exit; preflight: {install_trimmed}; daemon IPC: {poll_trimmed}"
+    ))
+}
+
+/// Cap on the Windows active-exit promotion IPC poll. Long enough to
+/// absorb a daemon restart on the Windows host (Set-NetIPInterface +
+/// SCM service reload typically settles in <30s), short enough that a
+/// wedged daemon fails the stage instead of stalling the live lab.
+const WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS: u64 = 60;
+
+/// Path of the installed `rustynet.exe` (CLI) on Windows guests,
+/// mirroring `rustynetd.exe`'s sibling install path.
+const WINDOWS_RUSTYNETD_CLI_PATH: &str = r"C:\Program Files\RustyNet\rustynet.exe";
 
 fn capture_windows_exit_evidence_artifacts(
     windows_alias: &str,
