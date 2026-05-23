@@ -56,5 +56,9 @@ do
   grep -q '"suite": "rustynet-live-lab-chaos"' "$WORK_DIR/${bin}.json"
   grep -q '"requires_explicit_enable_chaos_suite": true' "$WORK_DIR/${bin}.json"
 done
+grep -q '"category": "chaos_signed_state_adversarial"' "$WORK_DIR/live_chaos_signed_state_adversarial_test.json"
+grep -q '"overall_status": "pass"' "$WORK_DIR/live_chaos_signed_state_adversarial_test.json"
+grep -q '"expected_result": "reject_fail_closed"' "$WORK_DIR/live_chaos_signed_state_adversarial_test.json"
+grep -q '"production_accepted": false' "$WORK_DIR/live_chaos_signed_state_adversarial_test.json"
 
 echo "[chaos-gates] pass"
