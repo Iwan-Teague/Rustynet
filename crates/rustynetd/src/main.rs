@@ -176,6 +176,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "windows-dns-failclosed-check" => {
                 run_windows_dns_failclosed_check_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "windows-exit-nat-lifecycle-snapshot" => {
+                run_windows_exit_nat_lifecycle_snapshot_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "windows-killswitch-assert" => {
                 run_windows_killswitch_assert_command(rest)
             }
@@ -1414,6 +1417,65 @@ fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), Strin
             "windows-dns-failclosed-check reported drift in the live RustyNet DNS fail-closed state".to_owned(),
         );
     }
+    Ok(())
+}
+
+fn run_windows_exit_nat_lifecycle_snapshot_command(args: &[String]) -> Result<(), String> {
+    let mut mesh_cidr: Option<String> = None;
+    let mut nat_name =
+        rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_EXIT_NAT_NAME.to_owned();
+    let mut tunnel_alias =
+        rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_TUNNEL_ALIAS.to_owned();
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--mesh-cidr") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "windows-exit-nat-lifecycle-snapshot: --mesh-cidr requires a value".to_owned()
+                })?;
+                mesh_cidr = Some(value.clone());
+                index += 2;
+            }
+            Some("--nat-name") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "windows-exit-nat-lifecycle-snapshot: --nat-name requires a value".to_owned()
+                })?;
+                nat_name = value.clone();
+                index += 2;
+            }
+            Some("--tunnel-alias") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "windows-exit-nat-lifecycle-snapshot: --tunnel-alias requires a value"
+                        .to_owned()
+                })?;
+                tunnel_alias = value.clone();
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-exit-nat-lifecycle-snapshot argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let mesh_cidr = mesh_cidr
+        .ok_or_else(|| "windows-exit-nat-lifecycle-snapshot: --mesh-cidr is required".to_owned())?;
+    let options = rustynetd::windows_exit_nat_lifecycle::WindowsExitNatLifecycleOptions {
+        mesh_cidr,
+        nat_name,
+        tunnel_alias,
+    };
+    let snapshot =
+        rustynetd::windows_exit_nat_lifecycle::collect_windows_exit_nat_lifecycle_snapshot(
+            &options,
+        )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot).map_err(|err| {
+            format!("serialize windows-exit-nat-lifecycle snapshot failed: {err}")
+        })?
+    );
     Ok(())
 }
 
@@ -3048,6 +3110,7 @@ fn help_text() -> String {
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
         "  rustynetd windows-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
         "  rustynetd windows-dns-failclosed-check [--no-fail-on-drift] [--enforce-ipv6-sibling-rules] [--enforce-ra-suppression]",
+        "  rustynetd windows-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-name <name>] [--tunnel-alias <name>]",
         "  rustynetd windows-killswitch-assert [daemon options] [--no-fail-on-drift]",
         "  rustynetd windows-backend-readiness-check [--no-fail-on-drift]",
         "  rustynetd --emit-phase1-baseline <path>",
@@ -3133,9 +3196,10 @@ mod tests {
         run_macos_exit_dns_failclosed_capture_command,
         run_macos_exit_killswitch_precedence_check_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
-        run_windows_key_custody_check_command, run_windows_killswitch_assert_command,
-        run_windows_mesh_status_check_command, run_windows_registry_acls_check_command,
-        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
+        run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
+        run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
+        run_windows_registry_acls_check_command, run_windows_runtime_acls_check_command,
+        run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -3573,6 +3637,42 @@ mod tests {
         assert!(
             !err.contains("unknown windows-dns-failclosed-check argument"),
             "all three flags must be recognized: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_windows_exit_nat_lifecycle_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("windows-exit-nat-lifecycle-snapshot"),
+            "help text must advertise windows-exit-nat-lifecycle-snapshot subcommand"
+        );
+        assert!(
+            help.contains("--mesh-cidr"),
+            "help text must advertise --mesh-cidr"
+        );
+    }
+
+    #[test]
+    fn run_windows_exit_nat_lifecycle_snapshot_command_rejects_unknown_flags() {
+        let err = run_windows_exit_nat_lifecycle_snapshot_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must reject");
+        assert!(
+            err.contains("unknown windows-exit-nat-lifecycle-snapshot argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_windows_exit_nat_lifecycle_snapshot_command_requires_mesh_cidr() {
+        let err = run_windows_exit_nat_lifecycle_snapshot_command(&[
+            "--nat-name".to_owned(),
+            "RustyNetExit-rustynet0".to_owned(),
+        ])
+        .expect_err("missing mesh cidr must reject");
+        assert!(
+            err.contains("--mesh-cidr is required"),
+            "unexpected error: {err}"
         );
     }
 
