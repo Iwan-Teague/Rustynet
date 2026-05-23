@@ -228,8 +228,15 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         "/var/lib/rustynet/rustynetd.assignment.watermark",
         &existing_env,
     )?;
-    let auto_tunnel_max_age_secs =
-        env_string_or_existing_default("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS", "300", &existing_env)?;
+    let auto_tunnel_max_age_secs = env_string_or_existing_default(
+        "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS",
+        // Default 3600s to align with the orchestrator's BUNDLE_TTL_SECS
+        // and RUSTYNET_ASSIGNMENT_TTL_SECS. Anything shorter causes the
+        // daemon to reject the freshly-issued lab bundle as stale before
+        // validate_baseline_runtime even completes a single refresh cycle.
+        "3600",
+        &existing_env,
+    )?;
     let traversal_bundle_path = env_path_or_existing_default(
         "RUSTYNET_TRAVERSAL_BUNDLE",
         "/var/lib/rustynet/rustynetd.traversal",
