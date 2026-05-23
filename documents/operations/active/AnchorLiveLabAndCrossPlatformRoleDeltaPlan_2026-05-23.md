@@ -500,3 +500,15 @@ across stages.
   sub-capabilities, relay co-deploy, and loopback bundle-pull listener
   enablement at `127.0.0.1:51822`. It does not bind a socket, consume a token,
   or mutate the Windows guest; live token/listener proof remains Track A / C.
+- 2026-05-23 — Anchor live harness dry-run coverage extended to Windows.
+  `live_linux_anchor_test --platform windows --dry-run` now accepts reviewed
+  Windows absolute paths and emits a Windows-labelled `live_anchor` report.
+  `scripts/e2e/live_windows_anchor_test.sh` was added as the Windows wrapper,
+  and `scripts/ci/anchor_live_lab_gates.sh` now generates Linux, macOS, and
+  Windows dry-run anchor reports. Live Windows execution still fails closed
+  until a reviewed PowerShell/SCM-safe runner is added.
+- 2026-05-23 — Bash live-lab orchestrator made anchor-platform aware. The
+  `live_anchor` stage now records dry-run coverage, resolves the exit node's
+  platform explicitly, runs the live traffic validator only for Linux anchors,
+  and records an honest skip for macOS/Windows anchors until their live-safe
+  runners graduate beyond non-mutating plan gates.

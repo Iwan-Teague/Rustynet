@@ -8638,6 +8638,39 @@ fn validate_anchor_init_bundle_pull_plan(output: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_windows_anchor_bundle_pull_plan_contract(
+    windows_alias: &str,
+    inventory_path: &Path,
+) -> Result<String, String> {
+    let inventory = load_inventory(inventory_path)?;
+    let entry = inventory
+        .iter()
+        .find(|entry| entry.alias == windows_alias)
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} not found"))?;
+    if entry.platform_profile().platform != VmGuestPlatform::Windows {
+        return Err(format!(
+            "alias {windows_alias} resolved to non-Windows platform: {}",
+            entry.platform_profile().platform.as_str()
+        ));
+    }
+    let node_id = entry
+        .node_id
+        .as_deref()
+        .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?;
+    let config = crate::anchor_init::AnchorInitConfig {
+        node_id: node_id.to_owned(),
+        bundle_pull_addr: "127.0.0.1:51822".to_owned(),
+        dry_run: true,
+        ..crate::anchor_init::AnchorInitConfig::default()
+    };
+    let plan = crate::anchor_init::build_anchor_init_plan(&config)?;
+    let output = crate::anchor_init::render_anchor_init_plan(&plan);
+    validate_anchor_init_bundle_pull_plan(output.as_str())?;
+    Ok(format!(
+        "Windows anchor bundle-pull dry-run plan contract verified without guest mutation for {windows_alias}: node_id={node_id} bind=127.0.0.1:51822"
+    ))
+}
+
 fn validate_windows_relay_service_lifecycle_contract_from_repo() -> Result<String, String> {
     let install_path = windows_relay_service_install_helper_script_local_path();
     let uninstall_path = windows_relay_service_uninstall_helper_script_local_path();
@@ -8707,8 +8740,11 @@ fn validate_windows_relay_service_lifecycle_contract(
         "relay.env",
         "ConvertTo-Json -Depth 8",
     ];
-    let install_count =
-        validate_required_fragments("Windows relay install helper", install_script, &install_required)?;
+    let install_count = validate_required_fragments(
+        "Windows relay install helper",
+        install_script,
+        &install_required,
+    )?;
     let uninstall_count = validate_required_fragments(
         "Windows relay uninstall helper",
         uninstall_script,
@@ -10433,14 +10469,74 @@ fn run_windows_orchestration_stages_with_options(
             }
         }
     };
-    let windows_anchor_bundle_pull_outcome = stage_outcome(
-        "validate_windows_anchor_bundle_pull",
-        VmLabStageStatus::Skipped,
-        format!(
-            "skipped: anchor bundle-pull live test bin is Track A scope; Windows reserved slot for {windows_alias}"
-        ),
-        vec![],
-    );
+    let windows_anchor_bundle_pull_log_path =
+        logs_dir.join("validate_windows_anchor_bundle_pull.log");
+    let windows_anchor_bundle_pull_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would validate Windows anchor bundle-pull dry-run plan for {windows_alias} without guest mutation"
+            ),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !hardening_passed {
+        stage_outcome(
+            "validate_windows_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_service_hardening did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !custody_passed {
+        stage_outcome(
+            "validate_windows_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_key_custody did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        match validate_windows_anchor_bundle_pull_plan_contract(windows_alias, inventory_path) {
+            Ok(summary) => {
+                let _ = std::fs::write(&windows_anchor_bundle_pull_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_windows_anchor_bundle_pull",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![windows_anchor_bundle_pull_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&windows_anchor_bundle_pull_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_windows_anchor_bundle_pull",
+                    VmLabStageStatus::Fail,
+                    format!("Windows anchor bundle-pull plan validation failed: {reason}"),
+                    vec![windows_anchor_bundle_pull_log_path.clone()],
+                )
+            }
+        }
+    };
 
     vec![
         bootstrap_outcome,
@@ -30128,6 +30224,89 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
+    fn validate_windows_anchor_bundle_pull_plan_contract_accepts_windows_node() {
+        let inventory = write_temp_inventory(
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "windows-utm-1",
+                  "ssh_target": "windows@192.168.64.20",
+                  "platform": "windows",
+                  "remote_shell": "powershell",
+                  "guest_exec_mode": "windows_powershell",
+                  "service_manager": "windows_service",
+                  "node_id": "windows-anchor-1"
+                }
+              ]
+            }"#,
+        );
+        let summary = super::validate_windows_anchor_bundle_pull_plan_contract(
+            "windows-utm-1",
+            inventory.as_path(),
+        )
+        .expect("Windows anchor plan contract should validate");
+        assert!(
+            summary.contains("windows-anchor-1") && summary.contains("127.0.0.1:51822"),
+            "unexpected summary: {summary}"
+        );
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn validate_windows_anchor_bundle_pull_plan_contract_rejects_missing_node_id() {
+        let inventory = write_temp_inventory(
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "windows-utm-1",
+                  "ssh_target": "windows@192.168.64.20",
+                  "platform": "windows",
+                  "remote_shell": "powershell",
+                  "guest_exec_mode": "windows_powershell",
+                  "service_manager": "windows_service"
+                }
+              ]
+            }"#,
+        );
+        let err = super::validate_windows_anchor_bundle_pull_plan_contract(
+            "windows-utm-1",
+            inventory.as_path(),
+        )
+        .expect_err("missing node_id must fail closed");
+        assert!(err.contains("no node_id"), "unexpected error: {err}");
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
+    fn validate_windows_anchor_bundle_pull_plan_contract_rejects_non_windows_alias() {
+        let inventory = write_temp_inventory(
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "macos-utm-1",
+                  "ssh_target": "macos@192.168.64.30",
+                  "platform": "macos",
+                  "remote_shell": "posix",
+                  "guest_exec_mode": "macos_posix",
+                  "service_manager": "launchd",
+                  "node_id": "macos-anchor-1"
+                }
+              ]
+            }"#,
+        );
+        let err = super::validate_windows_anchor_bundle_pull_plan_contract(
+            "macos-utm-1",
+            inventory.as_path(),
+        )
+        .expect_err("non-Windows alias must fail closed");
+        assert!(err.contains("non-Windows"), "unexpected error: {err}");
+        cleanup_temp_inventory(inventory.as_path());
+    }
+
+    #[test]
     fn validate_windows_relay_service_lifecycle_contract_accepts_reviewed_helpers() {
         let install = fs::read_to_string(windows_relay_service_install_helper_script_local_path())
             .expect("read relay install helper");
@@ -30157,10 +30336,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             uninstall.as_str(),
         )
         .expect_err("missing health-bind loopback gate must fail closed");
-        assert!(
-            err.contains("-RequireLoopback"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("-RequireLoopback"), "unexpected error: {err}");
     }
 
     #[test]

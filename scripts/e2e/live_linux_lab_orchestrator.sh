@@ -821,6 +821,19 @@ node_role_for_label() {
   awk -F '\t' -v label="$label" '$1 == label { print $4; exit }' "$NODES_TSV"
 }
 
+node_platform_for_label() {
+  local label="$1"
+  case "$label" in
+    exit) printf '%s\n' "$EXIT_PLATFORM" ;;
+    client) printf '%s\n' "$CLIENT_PLATFORM" ;;
+    entry) printf '%s\n' "$ENTRY_PLATFORM" ;;
+    aux) printf '%s\n' "$AUX_PLATFORM" ;;
+    extra) printf '%s\n' "$EXTRA_PLATFORM" ;;
+    fifth_client) printf '%s\n' "$FIFTH_CLIENT_PLATFORM" ;;
+    *) printf 'unknown node label for platform lookup: %s\n' "$label" >&2; return 1 ;;
+  esac
+}
+
 has_label() {
   local label="$1"
   awk -F '\t' -v label="$label" '$1 == label { found=1; exit } END { exit(found ? 0 : 1) }' "$NODES_TSV"
@@ -3915,6 +3928,41 @@ refresh_phase6_linux_parity_probe_from_lab() {
     --label 'phase6 linux parity inbox probe' >/dev/null
 }
 
+stage_run_live_anchor() {
+  local anchor_platform wrapper report_path log_path
+  anchor_platform="$(node_platform_for_label exit)"
+  case "$anchor_platform" in
+    linux)
+      wrapper="$ROOT_DIR/scripts/e2e/live_linux_anchor_test.sh"
+      report_path="$REPORT_DIR/live_linux_anchor_report.json"
+      log_path="$REPORT_DIR/live_linux_anchor.log"
+      ;;
+    macos)
+      wrapper="$ROOT_DIR/scripts/e2e/live_macos_anchor_test.sh"
+      report_path="$REPORT_DIR/live_macos_anchor_report.json"
+      log_path="$REPORT_DIR/live_macos_anchor.log"
+      ;;
+    windows)
+      wrapper="$ROOT_DIR/scripts/e2e/live_windows_anchor_test.sh"
+      report_path="$REPORT_DIR/live_windows_anchor_report.json"
+      log_path="$REPORT_DIR/live_windows_anchor.log"
+      ;;
+    *)
+      printf 'unsupported anchor platform for live_anchor: %s\n' "$anchor_platform" >&2
+      return 1
+      ;;
+  esac
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
+    --anchor-host "$(node_target_for_label exit)" \
+    --anchor-node-id "$(node_id_for_label exit)" \
+    --anchor-bundle-pull-addr "127.0.0.1:51822" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
 stage_run_live_exit_handoff() {
   local alternate_label alternate_target alternate_node_id
   if has_label entry; then
@@ -6447,8 +6495,10 @@ main() {
     record_stage_skip "enforce_baseline_runtime" "hard" "dry-run: not executed"
     record_stage_skip "validate_baseline_runtime" "hard" "dry-run: not executed"
     if has_five_node_release_gate_topology; then
+      record_stage_skip "live_anchor" "hard" "dry-run: not executed"
       record_stage_skip "live_role_switch_matrix" "hard" "dry-run: not executed"
     else
+      record_stage_skip "live_anchor" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
       record_stage_skip "live_role_switch_matrix" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
     fi
     if has_label entry; then
@@ -6542,8 +6592,15 @@ main() {
   fi
 
   if has_five_node_release_gate_topology; then
+    anchor_platform="$(node_platform_for_label exit)"
+    if [[ "$anchor_platform" == "linux" ]]; then
+      run_stage hard live_anchor 'run live anchor role validation' stage_run_live_anchor
+    else
+      record_stage_skip live_anchor hard "live anchor traffic validation currently supports linux anchors; ${anchor_platform} anchors are covered by non-mutating plan gates"
+    fi
     run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix
   else
+    record_stage_skip live_anchor hard 'requires the full five-node topology (entry, aux, and extra targets)'
     record_stage_skip live_role_switch_matrix hard 'requires the full five-node topology (entry, aux, and extra targets)'
   fi
 
