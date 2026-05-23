@@ -169,6 +169,13 @@ fn run() -> Result<(), String> {
         json!({ "pull": pull_summary, "invalid_token": validate_invalid_token_rejected(identity, &work_known_hosts, &config)? }),
     ));
 
+    let gossip_priority = validate_anchor_gossip_priority(identity, &work_known_hosts, &config)?;
+    subchecks.push(Subcheck::pass(
+        "validate_anchor_gossip_priority",
+        "second anchor is signed into membership, leaf sees both anchors, and lex-min authority remains primary",
+        json!({ "summary": gossip_priority }),
+    ));
+
     let daemon_status = capture_daemon_status(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
         "validate_anchor_daemon_status_available",
@@ -193,9 +200,17 @@ fn capture_anchor_list(
     known_hosts: &Path,
     config: &Config,
 ) -> Result<String, String> {
+    capture_anchor_list_from_host(identity, known_hosts, &config.anchor_host)
+}
+
+fn capture_anchor_list_from_host(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+) -> Result<String, String> {
     let command = "command -v rustynet >/dev/null; rustynet anchor list";
-    capture_root(identity, known_hosts, &config.anchor_host, command)
-        .map_err(|err| format!("anchor list failed on {}: {err}", config.anchor_host))
+    capture_root(identity, known_hosts, host, command)
+        .map_err(|err| format!("anchor list failed on {host}: {err}"))
 }
 
 fn validate_anchor_capabilities(anchor_list: &str, anchor_node_id: &str) -> Result<(), String> {
@@ -209,6 +224,122 @@ fn validate_anchor_capabilities(anchor_list: &str, anchor_node_id: &str) -> Resu
                 "anchor capability {capability} missing for {anchor_node_id}: {row}"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_anchor_gossip_priority(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+) -> Result<String, String> {
+    let second_anchor_host = config.second_anchor_host.as_deref().ok_or_else(|| {
+        "--second-anchor-host is required for validate_anchor_gossip_priority".to_owned()
+    })?;
+    let second_anchor_node_id = config.second_anchor_node_id.as_deref().ok_or_else(|| {
+        "--second-anchor-node-id is required for validate_anchor_gossip_priority".to_owned()
+    })?;
+    let leaf_client_host = config.leaf_client_host.as_deref().ok_or_else(|| {
+        "--leaf-client-host is required for validate_anchor_gossip_priority".to_owned()
+    })?;
+    let owner_approver_id = config.owner_approver_id.as_deref().ok_or_else(|| {
+        "--owner-approver-id is required for validate_anchor_gossip_priority".to_owned()
+    })?;
+
+    set_membership_capabilities(
+        identity,
+        known_hosts,
+        &config.anchor_host,
+        second_anchor_node_id,
+        "anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
+        owner_approver_id,
+    )
+    .map_err(|err| format!("promote second anchor {second_anchor_node_id} failed: {err}"))?;
+
+    let validation = (|| -> Result<String, String> {
+        let anchor_list = capture_anchor_list_from_host(identity, known_hosts, leaf_client_host)?;
+        validate_anchor_capabilities(&anchor_list, config.anchor_node_id.as_str())?;
+        validate_anchor_capabilities(&anchor_list, second_anchor_node_id)?;
+        validate_lex_min_anchor_authority(
+            &anchor_list,
+            config.anchor_node_id.as_str(),
+            second_anchor_node_id,
+        )?;
+        Ok(format!(
+            "primary={} secondary={} leaf={} secondary_host={}",
+            config.anchor_node_id, second_anchor_node_id, leaf_client_host, second_anchor_host
+        ))
+    })();
+
+    let restore = set_membership_capabilities(
+        identity,
+        known_hosts,
+        &config.anchor_host,
+        second_anchor_node_id,
+        "client,relay_host",
+        owner_approver_id,
+    );
+
+    match (validation, restore) {
+        (Ok(summary), Ok(_)) => Ok(format!("{summary} restore=ok")),
+        (Err(err), Ok(_)) => Err(err),
+        (Ok(_), Err(restore_err)) => Err(format!(
+            "second anchor validation passed but restore failed for {second_anchor_node_id}: {restore_err}"
+        )),
+        (Err(err), Err(restore_err)) => Err(format!(
+            "{err}; restore failed for {second_anchor_node_id}: {restore_err}"
+        )),
+    }
+}
+
+fn set_membership_capabilities(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    node_id: &str,
+    capabilities: &str,
+    owner_approver_id: &str,
+) -> Result<String, String> {
+    let command = format!(
+        "command -v rustynet >/dev/null; rustynet ops e2e-membership-set-capabilities --node-id {node_id} --capabilities {capabilities} --owner-approver-id {owner}",
+        node_id = shell_quote(node_id),
+        capabilities = shell_quote(capabilities),
+        owner = shell_quote(owner_approver_id),
+    );
+    capture_root(identity, known_hosts, host, &command)
+        .map(|out| out.trim().to_owned())
+        .map_err(|err| format!("membership capability mutation failed on {host}: {err}"))
+}
+
+fn validate_lex_min_anchor_authority(
+    anchor_list: &str,
+    expected_authority_node_id: &str,
+    second_anchor_node_id: &str,
+) -> Result<(), String> {
+    let mut anchors = anchor_list
+        .lines()
+        .filter_map(|line| {
+            line.split_once(" capabilities=")
+                .map(|(node_id, _)| node_id)
+        })
+        .filter(|node_id| *node_id != "anchor nodes:")
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    anchors.sort();
+    let actual = anchors
+        .first()
+        .ok_or_else(|| "anchor list has no authority candidates".to_owned())?;
+    if actual != expected_authority_node_id {
+        return Err(format!(
+            "port-mapping authority mismatch: expected lex-min {expected_authority_node_id}, got {actual}; anchors={}",
+            anchors.join(",")
+        ));
+    }
+    if !anchors.iter().any(|node| node == second_anchor_node_id) {
+        return Err(format!(
+            "second anchor {second_anchor_node_id} missing from authority candidate set: {}",
+            anchors.join(",")
+        ));
     }
     Ok(())
 }
@@ -781,6 +912,15 @@ mod tests {
         validate_anchor_capabilities(output, "exit-1").expect("all caps present");
         let err = validate_anchor_capabilities(output, "missing").expect_err("missing node");
         assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn validate_lex_min_authority_rejects_wrong_primary() {
+        let output = "anchor nodes:\nexit-1 capabilities=anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative\nrelay-1 capabilities=anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative\n";
+        validate_lex_min_anchor_authority(output, "exit-1", "relay-1").expect("exit-1 is lex-min");
+        let err = validate_lex_min_anchor_authority(output, "relay-1", "relay-1")
+            .expect_err("non lex-min primary rejected");
+        assert!(err.contains("authority mismatch"));
     }
 
     #[test]
