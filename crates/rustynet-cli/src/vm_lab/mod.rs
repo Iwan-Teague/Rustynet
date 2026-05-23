@@ -8003,36 +8003,75 @@ fn run_macos_orchestration_stages(
                 .ok_or_else(|| {
                     "no membership.snapshot available for distribution to macOS host".to_owned()
                 })?;
-            let remote_snapshot = format!("{MACOS_STATE_ROOT}/membership.snapshot");
-            ensure_success_status(
-                scp_to_remote_for_target(
-                    &target,
-                    None,
-                    Some(ssh_identity_file),
-                    known_hosts_path,
-                    membership_snapshot.as_path(),
-                    remote_snapshot.as_str(),
-                    timeout,
-                )
-                .map_err(|e| format!("SCP membership.snapshot to {macos_alias} failed: {e}"))?,
-                "SCP membership.snapshot to macOS host",
-            )?;
-
-            // Membership log (optional — skip if not present rather than fail).
-            let membership_log = report_dir.join("state").join("membership.log");
-            if membership_log.is_file() {
-                let _ = ensure_success_status(
+            // MACOS_STATE_ROOT is 0700 rustynetd:rustynetd and the daemon's
+            // launchd plist reads membership state from STATE_ROOT/membership/.
+            // Direct SCP cannot write to those paths (permission denied), so
+            // each file is staged under /tmp first then sudo-installed with
+            // the correct owner / group / mode the daemon expects.
+            let stage_and_install = |label: &str,
+                                     local: &Path,
+                                     remote_final: &str,
+                                     mode: &str|
+             -> Result<(), String> {
+                let file_name = remote_final.rsplit('/').next().unwrap_or("file");
+                let staged = format!("/tmp/rn-macos-{file_name}");
+                let parent_dir = remote_final
+                    .rsplit_once('/')
+                    .map(|(p, _)| p)
+                    .unwrap_or(MACOS_STATE_ROOT);
+                ensure_success_status(
                     scp_to_remote_for_target(
                         &target,
                         None,
                         Some(ssh_identity_file),
                         known_hosts_path,
-                        membership_log.as_path(),
-                        &format!("{MACOS_STATE_ROOT}/membership.log"),
+                        local,
+                        staged.as_str(),
                         timeout,
                     )
-                    .map_err(|e| format!("SCP membership.log to {macos_alias} failed: {e}"))?,
-                    "SCP membership.log to macOS host",
+                    .map_err(|e| format!("SCP {label} to {macos_alias} failed: {e}"))?,
+                    &format!("SCP {label} to macOS host"),
+                )?;
+                let install_script = format!(
+                    "sudo /usr/bin/install -d -m 0700 -o rustynetd -g rustynetd {parent} && \
+                     sudo /usr/bin/install -m {mode} -o rustynetd -g rustynetd {staged} {final_path} && \
+                     sudo /bin/rm -f {staged}",
+                    parent = shell_quote(parent_dir),
+                    mode = mode,
+                    staged = shell_quote(&staged),
+                    final_path = shell_quote(remote_final),
+                );
+                ensure_success_status(
+                    run_remote_shell_command_for_target(
+                        &target,
+                        None,
+                        Some(ssh_identity_file),
+                        known_hosts_path,
+                        install_script.as_str(),
+                        timeout,
+                    )
+                    .map_err(|e| format!("install {label} on {macos_alias} failed: {e}"))?,
+                    &format!("install {label} on macOS host"),
+                )?;
+                Ok(())
+            };
+
+            let remote_snapshot = format!("{MACOS_STATE_ROOT}/membership/membership.snapshot");
+            stage_and_install(
+                "membership.snapshot",
+                membership_snapshot.as_path(),
+                remote_snapshot.as_str(),
+                "0600",
+            )?;
+
+            // Membership log (optional — skip if not present rather than fail).
+            let membership_log = report_dir.join("state").join("membership.log");
+            if membership_log.is_file() {
+                let _ = stage_and_install(
+                    "membership.log",
+                    membership_log.as_path(),
+                    &format!("{MACOS_STATE_ROOT}/membership/membership.log"),
+                    "0600",
                 );
             }
 
@@ -8041,18 +8080,11 @@ fn run_macos_orchestration_stages(
                 .join("state")
                 .join(format!("assignment-{macos_node_id}.bundle"));
             if assignment_bundle.is_file() {
-                ensure_success_status(
-                    scp_to_remote_for_target(
-                        &target,
-                        None,
-                        Some(ssh_identity_file),
-                        known_hosts_path,
-                        assignment_bundle.as_path(),
-                        &format!("{MACOS_STATE_ROOT}/assignment.bundle"),
-                        timeout,
-                    )
-                    .map_err(|e| format!("SCP assignment bundle to {macos_alias} failed: {e}"))?,
-                    "SCP assignment bundle to macOS host",
+                stage_and_install(
+                    "assignment bundle",
+                    assignment_bundle.as_path(),
+                    &format!("{MACOS_STATE_ROOT}/rustynetd.assignment"),
+                    "0640",
                 )?;
             }
 
