@@ -304,7 +304,7 @@ starting script, and archive the resulting artifacts under
 - **Status (2026-05-22).** **Complete (code).** All four sub-slices landed:
   - D11.a: commit `e3f55b7` — 5 anchor capabilities in `membership.rs`; `rustynet anchor advertise|list|pull-bundle|init` CLI verbs wired.
   - D11.b: daemon `TcpListener` bundle-pull endpoint + `--anchor-bundle-pull-addr` / `--anchor-bundle-pull-token-path` flags + env vars + `rustynetd-anchor.service` unit; `anchor_init.rs` wizard. Token-gated, loopback-only by default (`--anchor-bundle-pull-allow-lan` required for LAN bind).
-  - D11.c: commit `d7c2c65` — anchor-priority gossip rebroadcast in `gossip_runtime.rs`; `port_mapping_bring_up_skip_reason` None-semantics corrected (no anchor in mesh → proceed, not skip). Tests: `port_mapping_skipped_when_non_authority`, `port_mapping_proceeds_when_self_is_authority`, `port_mapping_proceeds_when_no_anchor_in_mesh`.
+  - D11.c: commit `d7c2c65` plus follow-up — anchor-priority gossip rebroadcast in `gossip_runtime.rs`; `port_mapping_bring_up_skip_reason` is fail-closed unless signed membership elects this node as `anchor.port_mapping_authoritative`. Tests: `port_mapping_skipped_when_non_authority`, `port_mapping_proceeds_when_self_is_authority`, `port_mapping_skipped_when_authority_unavailable`.
   - D11.d: `anchor_init.rs` + `rustynetd-anchor.service` + `start.sh` 6-role wizard anchor preset.
   - Live pass criterion (clean install end-to-end, second machine join, macOS flow, 3-peer rebroadcast) requires lab hardware; deferred to live-evidence cycle.
 
@@ -322,7 +322,7 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
 - **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
 - **Cross-platform note.** Linux + macOS roles all land in D12 (except macOS `blind_exit`, which stays Linux-only). Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
-- **Status (2026-05-21).** **D12.a + D12.b + D12.c + D12.d (Linux) + D12.e complete (pre-D11.a surface).**
+- **Status (2026-05-22).** **D12.a + D12.b + D12.c + D12.d (Linux + macOS relay service path) + D12.e complete.**
 
   D12.d lands the Linux service deploy/undeploy infrastructure for the relay-bearing presets:
 
@@ -333,8 +333,8 @@ starting script, and archive the resulting artifacts under
   Service deploy is intentionally **independent** of the role planner today: pre-D11.a, the role planner refuses relay/anchor with `BlockedByCapabilitySchema`, so the deploy/undeploy code path is exercised manually via the new ops verb. When D11.a lands the capability schema and the planner emits `DeployRelayService` / `UndeployRelayService` `ConcreteAction` variants, the existing `execute_install_relay` helper is the executor — no rewrites needed.
 
   Per-platform truth:
-  - **Linux** — landed in D12.d (this slice).
-  - **macOS** — deferred. macOS uses launchd (`launchctl bootstrap`), not systemd. A `com.rustynet.relay.plist` launchd-bootstrap helper mirrors the Linux pattern but uses different lifecycle calls; tracked separately as part of the macOS userspace shared-backend track. Manual launchd setup is documented in `documents/operations/MacosLaunchdServiceManagement.md`.
+  - **Linux** — landed in D12.d.
+  - **macOS** — relay service parity landed as a code-only path: `scripts/launchd/com.rustynet.relay.plist`, `crates/rustynet-cli/src/ops_install_macos_relay.rs`, `rustynet ops install-macos-relay [--uninstall] [--dry-run]`, and role-transition dispatch through launchd on macOS. Live launchd bootstrap remains deferred to a reviewed macOS test pass.
   - **Windows** — already has working install/uninstall PowerShell helpers: `scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1` and `Uninstall-RustyNetWindowsRelayService.ps1`. The role-transition orchestrator will call these via the existing `windows_install.rs` adapter when D7/D9 unblock Windows non-client roles (D11.a is the harder prerequisite for capability-driven dispatch; the Windows PowerShell helpers are ready today).
 
   Audit log integration: when the orchestrator invokes `execute_install_relay` (today: manually via ops verb; future: via role transition), the structured `InstallRelayReport.summary()` flows back to the operator. Future role-transition wiring will include the deploy step in the role-audit chain so each transition emits a single combined audit entry covering both the membership capability change and the service deploy.
