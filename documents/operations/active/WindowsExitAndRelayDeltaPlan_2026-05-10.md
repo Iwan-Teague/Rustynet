@@ -174,14 +174,13 @@ cargo test -p rustynet-backend-wireguard --all-features 2>&1 | grep '^test resul
   topology iterations and remote evidence scripts. The old evidence-capture
   failure was a double-encoded SSH PowerShell payload that exceeded the
   Windows `CreateProcess` command-line limit; fixed in `0574a4d`.
-- **Current hard blocker: Windows service readiness / node-id collection.**
-  The Windows topology path still calls
-  `C:\Program Files\RustyNet\rustynet.exe status` in readiness and node-id
-  collection. On Windows that binary is the trust CLI, so it prints
-  `usage: rustynet trust <keygen|export-verifier-key|issue> [options]`.
-  Replace this with parsing `--node-id` from
-  `C:\ProgramData\RustyNet\config\rustynetd.env` and proving readiness via
-  SCM service state plus reviewed config/runtime evidence.
+- **Windows service readiness / node-id collection no longer uses trust CLI
+  status.** The orchestrator adapter path reads `--node-id` from
+  `C:\ProgramData\RustyNet\config\rustynetd.env`; the monolithic Windows
+  active-exit promotion path now gates readiness on SCM `Running`, reviewed
+  env/config evidence, and `rustynetd.exe windows-mesh-status-check`. It no
+  longer invokes `C:\Program Files\RustyNet\rustynet.exe status`, which can be
+  the trust CLI on Windows.
 - **Possible second blocker after readiness is fixed:** the latest Windows
   service failure showed SCM exit code `1`, and the WireGuard tunnel service
   logged that it could not find
@@ -225,7 +224,7 @@ Memorise these — most of the work happens here.
 
 ---
 
-## 3) The current blocker: Windows service readiness and node-id proof
+## 3) Windows service readiness and node-id proof
 
 The original lab-access blocker is partially resolved. Do not treat this as
 release evidence: it only means the orchestrator can now run meaningful
@@ -249,26 +248,26 @@ Owning historical recovery ledger:
 
 ### 3.2 What is broken
 
-- Windows readiness and node-id collection still use
-  `rustynet.exe status`, but the Windows `rustynet.exe` installed in
-  `C:\Program Files\RustyNet\` is the trust CLI, not the full daemon-control
-  CLI. This causes collect/readiness failures before exit proof can run.
+- The invalid `rustynet.exe status` readiness path has been removed from the
+  Windows active-exit promotion path. Windows readiness now fails closed unless
+  SCM reports `RustyNet=Running`, the reviewed env-file has a non-empty
+  `--node-id` and `--node-role admin`, `wireguard.pub` exists, and
+  `rustynetd.exe windows-mesh-status-check --max-age-seconds 120` reports
+  `overall_ok=true`.
 - Latest topology evidence also showed the RustyNet service stopping with
-  SCM exit code `1`. The next debug step is to remove the invalid status-CLI
-  check, then re-run. If service still stops, investigate the missing
-  `rustynet0.conf.dpapi` tunnel config noted in §2.2.
+  SCM exit code `1`. If service still stops after this readiness fix,
+  investigate the missing `rustynet0.conf.dpapi` tunnel config noted in §2.2.
 - The host has not yet been proven in active exit-serving mode, so NetNat,
   DNS block, and killswitch artifacts remain unproven.
 
 ### 3.3 Order of operations
 
-1. Patch `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_traffic.rs`
-   so `collect_node_id` reads `--node-id` from
+1. Keep Windows node-id collection pinned to
    `C:\ProgramData\RustyNet\config\rustynetd.env`
-   (`RUSTYNETD_DAEMON_ARGS_JSON`) instead of invoking `rustynet.exe status`.
-2. Patch `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs`
-   so daemon readiness uses SCM `Running` state plus reviewed env/config
-   evidence. It must not invoke the Windows trust CLI as a status CLI.
+   (`RUSTYNETD_DAEMON_ARGS_JSON`); do not reintroduce `rustynet.exe status`.
+2. Keep Windows readiness pinned to SCM `Running`, reviewed env/config
+   evidence, and the daemon-owned `rustynetd.exe windows-mesh-status-check`
+   probe.
 3. Re-run the 2-node topology
    (`windows-utm-1:exit`, `debian-headless-2:client`) and require
    `bootstrap_hosts` + `collect_pubkeys` to pass before §A.1 proof.
