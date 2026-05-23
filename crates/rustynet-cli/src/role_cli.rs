@@ -89,6 +89,18 @@ pub enum ConcreteAction {
     /// Stop, disable, and remove the sibling `rustynet-relay`
     /// service via the existing hardened installer.
     UndeployRelayService,
+    /// Track B Step 3 (B1.4) — install / enable / start the
+    /// rustynet-exit preflight (sibling systemd unit on Linux,
+    /// launchd plist on macOS, IPv4 forwarding script on Windows)
+    /// via the platform-specific hardened installer. Used by the
+    /// role-transition orchestrator when entering an exit-bearing
+    /// preset. Dispatch lives in `execute_platform_exit_service_action`
+    /// in `main.rs`.
+    DeployExitService,
+    /// Counterpart of [`Self::DeployExitService`]. Stop and remove the
+    /// exit preflight via the platform-specific installer when
+    /// leaving an exit-bearing preset.
+    UndeployExitService,
 }
 
 /// Outcome of [`plan_concrete_actions`].
@@ -327,7 +339,19 @@ pub fn plan_concrete_actions(
                     from: current,
                     to: target,
                     kind: TransitionKind::SignedMembership,
-                    actions: vec![ConcreteAction::AdvertiseDefaultRoute],
+                    // Track B Step 3 (B1.4): advertise the default
+                    // route first so the daemon takes ownership of
+                    // exit-serving NAT/forwarding before the platform
+                    // preflight runs. This matches the ordering rule
+                    // baked into NodeRoleTaxonomy_2026-05-21.md §10:
+                    // "Service deploy precedes capability advertisement"
+                    // — the membership-signed advertisement is the
+                    // earlier signal, the platform preflight is the
+                    // follow-up that prepares the host kernel.
+                    actions: vec![
+                        ConcreteAction::AdvertiseDefaultRoute,
+                        ConcreteAction::DeployExitService,
+                    ],
                     followup_instructions: vec![
                         "Issue per-client signed assignment bundles naming this node as `--exit-node-id` so peers can select it (`rustynet assignment issue`)."
                             .to_owned(),
@@ -337,7 +361,17 @@ pub fn plan_concrete_actions(
                     from: current,
                     to: target,
                     kind: TransitionKind::SignedMembership,
-                    actions: vec![ConcreteAction::RetractDefaultRoute],
+                    // Reverse ordering: tear down the platform preflight
+                    // (sysctl forwarding off, pf anchor flushed, Windows
+                    // NetIPInterface disabled) BEFORE retracting the
+                    // signed default route. Leaves a tight window where
+                    // forwarding is off but advertisement is still
+                    // present — peers fail closed via the existing
+                    // route retract on the next reconcile.
+                    actions: vec![
+                        ConcreteAction::UndeployExitService,
+                        ConcreteAction::RetractDefaultRoute,
+                    ],
                     followup_instructions: vec![
                         "Re-issue any per-client assignment bundles that previously named this node as their exit so peers don't fail closed on a stale exit reference."
                             .to_owned(),
@@ -500,6 +534,12 @@ fn render_action(action: &ConcreteAction) -> String {
         ConcreteAction::RetractDefaultRoute => "send IPC: route retract 0.0.0.0/0".to_owned(),
         ConcreteAction::DeployRelayService => "install+enable rustynet-relay.service".to_owned(),
         ConcreteAction::UndeployRelayService => "disable+remove rustynet-relay.service".to_owned(),
+        ConcreteAction::DeployExitService => {
+            "install+enable rustynet-exit preflight (platform-specific)".to_owned()
+        }
+        ConcreteAction::UndeployExitService => {
+            "disable+remove rustynet-exit preflight (platform-specific)".to_owned()
+        }
     }
 }
 
@@ -663,24 +703,44 @@ mod tests {
     // ----- Planner: admin ↔ exit (signed-membership, today's surface) -----
 
     #[test]
-    fn admin_to_exit_advertises_default_route() {
+    fn admin_to_exit_advertises_default_route_then_deploys_exit_preflight() {
         let plan = plan_concrete_actions(RolePreset::Admin, RolePreset::Exit, false, env_path());
         match plan {
             RoleSetPlan::Allowed { kind, actions, .. } => {
                 assert_eq!(kind, TransitionKind::SignedMembership);
-                assert_eq!(actions, vec![ConcreteAction::AdvertiseDefaultRoute]);
+                // Track B Step 3 (B1.4): admin → exit now emits the
+                // advertise IPC first, followed by the platform-specific
+                // exit preflight install. Ordering matters: the
+                // signed-membership advertisement is the earlier signal;
+                // the preflight just prepares the host kernel.
+                assert_eq!(
+                    actions,
+                    vec![
+                        ConcreteAction::AdvertiseDefaultRoute,
+                        ConcreteAction::DeployExitService,
+                    ]
+                );
             }
             other => panic!("expected Allowed SignedMembership, got {other:?}"),
         }
     }
 
     #[test]
-    fn exit_to_admin_retracts_default_route() {
+    fn exit_to_admin_undeploys_exit_preflight_then_retracts_default_route() {
         let plan = plan_concrete_actions(RolePreset::Exit, RolePreset::Admin, false, env_path());
         match plan {
             RoleSetPlan::Allowed { kind, actions, .. } => {
                 assert_eq!(kind, TransitionKind::SignedMembership);
-                assert_eq!(actions, vec![ConcreteAction::RetractDefaultRoute]);
+                // Reverse ordering: tear down the preflight BEFORE
+                // retracting the default route so forwarding is off
+                // first.
+                assert_eq!(
+                    actions,
+                    vec![
+                        ConcreteAction::UndeployExitService,
+                        ConcreteAction::RetractDefaultRoute,
+                    ]
+                );
             }
             other => panic!("expected Allowed SignedMembership, got {other:?}"),
         }
@@ -967,7 +1027,13 @@ mod tests {
                         actions,
                         ..
                     },
-                ) => actions.as_slice() == [ConcreteAction::AdvertiseDefaultRoute],
+                ) => {
+                    actions.as_slice()
+                        == [
+                            ConcreteAction::AdvertiseDefaultRoute,
+                            ConcreteAction::DeployExitService,
+                        ]
+                }
                 (
                     ExpectedPlanShape::Retract,
                     RoleSetPlan::Allowed {
@@ -975,7 +1041,13 @@ mod tests {
                         actions,
                         ..
                     },
-                ) => actions.as_slice() == [ConcreteAction::RetractDefaultRoute],
+                ) => {
+                    actions.as_slice()
+                        == [
+                            ConcreteAction::UndeployExitService,
+                            ConcreteAction::RetractDefaultRoute,
+                        ]
+                }
                 (
                     ExpectedPlanShape::Staged,
                     RoleSetPlan::Blocked {

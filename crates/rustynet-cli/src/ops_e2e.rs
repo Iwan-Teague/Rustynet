@@ -772,6 +772,34 @@ pub fn execute_ops_uninstall_windows_relay_service() -> Result<String, String> {
     Err("ops uninstall-windows-relay-service is only supported on Windows hosts".to_owned())
 }
 
+/// Track B Step 3 (B1.4) — install the Windows exit-mode preflight.
+///
+/// Runs `Install-RustyNetWindowsExitService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges. Enables IPv4 forwarding via
+/// `Set-NetIPInterface -Forwarding Enabled` and writes a reviewed install
+/// evidence report to
+/// `C:\ProgramData\RustyNet\install-evidence\rustynet-exit-install.json`.
+///
+/// On non-Windows hosts this always returns an error.
+#[cfg(not(windows))]
+pub fn execute_ops_install_windows_exit_service() -> Result<String, String> {
+    Err("ops install-windows-exit-service is only supported on Windows hosts".to_owned())
+}
+
+/// Track B Step 3 (B1.4) — uninstall the Windows exit-mode preflight.
+///
+/// Runs `Uninstall-RustyNetWindowsExitService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges. Disables IPv4 forwarding via
+/// `Set-NetIPInterface -Forwarding Disabled`.
+///
+/// On non-Windows hosts this always returns an error.
+#[cfg(not(windows))]
+pub fn execute_ops_uninstall_windows_exit_service() -> Result<String, String> {
+    Err("ops uninstall-windows-exit-service is only supported on Windows hosts".to_owned())
+}
+
 /// Install the `rustynetd` Windows service.
 ///
 /// Runs `Install-RustyNetWindowsService.ps1` from the source root resolved via
@@ -908,6 +936,88 @@ pub fn execute_ops_uninstall_windows_relay_service() -> Result<String, String> {
         "RustyNet Windows relay service uninstalled; verifier key and replay store preserved"
             .to_string(),
     )
+}
+
+/// Track B Step 3 (B1.4) — install the Windows exit-mode preflight.
+///
+/// Runs `Install-RustyNetWindowsExitService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+#[cfg(windows)]
+pub fn execute_ops_install_windows_exit_service() -> Result<String, String> {
+    ensure_running_as_root()?;
+    let source_root = resolve_windows_install_source_root()?;
+    let script_path = source_root
+        .join("scripts")
+        .join("bootstrap")
+        .join("windows")
+        .join("Install-RustyNetWindowsExitService.ps1");
+    if !script_path.is_file() {
+        return Err(format!(
+            "Windows exit preflight install script not found at {}; \
+             ensure RUSTYNET_INSTALL_SOURCE_ROOT points to the repo root",
+            script_path.display()
+        ));
+    }
+    let script_str = script_path.to_string_lossy().to_string();
+    run_status(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_str.as_str(),
+            "-InstallRoot",
+            r"C:\Program Files\RustyNet",
+            "-StateRoot",
+            r"C:\ProgramData\RustyNet",
+        ],
+        &[],
+        "Windows exit preflight install script failed",
+    )?;
+    Ok("RustyNet Windows exit preflight installed; IPv4 forwarding enabled".to_string())
+}
+
+/// Track B Step 3 (B1.4) — uninstall the Windows exit-mode preflight.
+///
+/// Runs `Uninstall-RustyNetWindowsExitService.ps1` from the source root resolved
+/// via `RUSTYNET_INSTALL_SOURCE_ROOT` or the current working directory.
+/// Requires Administrator privileges.
+#[cfg(windows)]
+pub fn execute_ops_uninstall_windows_exit_service() -> Result<String, String> {
+    ensure_running_as_root()?;
+    let source_root = resolve_windows_install_source_root()?;
+    let script_path = source_root
+        .join("scripts")
+        .join("bootstrap")
+        .join("windows")
+        .join("Uninstall-RustyNetWindowsExitService.ps1");
+    if !script_path.is_file() {
+        return Err(format!(
+            "Windows exit preflight uninstall script not found at {}; \
+             ensure RUSTYNET_INSTALL_SOURCE_ROOT points to the repo root",
+            script_path.display()
+        ));
+    }
+    let script_str = script_path.to_string_lossy().to_string();
+    run_status(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_str.as_str(),
+            "-InstallRoot",
+            r"C:\Program Files\RustyNet",
+            "-StateRoot",
+            r"C:\ProgramData\RustyNet",
+        ],
+        &[],
+        "Windows exit preflight uninstall script failed",
+    )?;
+    Ok("RustyNet Windows exit preflight uninstalled; IPv4 forwarding disabled".to_string())
 }
 
 #[cfg(windows)]
