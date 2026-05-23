@@ -494,7 +494,24 @@ across stages.
   - Track B all seven steps now landed; full commit chain: `4e5a37f`
     (Step 1) → `c664a4f` (Step 2) → `5739385` (Step 3+5) → `3bdc92e`
     (Step 4) → `c2fceeb` (Step 6) → `acf9934` (gates+evidence+ledger)
-    → `6ccf153` (Step 7).
+    → `6ccf153` (Step 7) → `7938750` (Step 2 follow-up: macOS NAT
+    lifecycle producer).
+- 2026-05-23 — Step 2 (M1) producer-side wiring landed in commit
+  `7938750`: the `validate_macos_exit_nat_lifecycle` orchestrator
+  stage now has a working artefact source. New
+  `crates/rustynetd/src/macos_exit_nat_lifecycle.rs` module +
+  `rustynetd macos-exit-nat-lifecycle-snapshot` subcommand emit a
+  single-phase pf-anchor + sysctl forwarding snapshot. New
+  `scripts/e2e/capture_macos_exit_nat_lifecycle.sh` drives the
+  destructive two-phase capture sequence (snapshot during exit
+  mode → stop daemon → snapshot → restart → merge) and writes the
+  validator's two-phase JSON artefact. 11 producer unit tests + 2
+  orchestrator-side round-trip tests (`vm_lab::tests::
+  macos_exit_nat_lifecycle_producer_*`) pin the contract. CI gate
+  extended to verify the module + subcommand wiring + round-trip
+  tests. Track B DOD now achievable on a live macOS-as-exit run
+  for the NAT lifecycle artefact; DNS-failclosed + killswitch
+  producers remain follow-up work.
 - 2026-05-23 — Windows relay lifecycle slot upgraded from a pure reserved
   placeholder to a non-mutating SCM helper contract gate. The
   `validate_windows_relay_service_lifecycle` stage now verifies the reviewed

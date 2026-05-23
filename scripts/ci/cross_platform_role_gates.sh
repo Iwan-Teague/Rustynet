@@ -14,6 +14,7 @@ required_files=(
   crates/rustynet-cli/src/ops_install_systemd_exit.rs
   crates/rustynet-cli/src/ops_install_macos_exit.rs
   crates/rustynetd/src/macos_exit_nat_lifecycle.rs
+  scripts/e2e/capture_macos_exit_nat_lifecycle.sh
   scripts/systemd/rustynet-exit.service
   scripts/launchd/com.rustynet.exit.plist
   scripts/bootstrap/windows/Install-RustyNetWindowsExitService.ps1
