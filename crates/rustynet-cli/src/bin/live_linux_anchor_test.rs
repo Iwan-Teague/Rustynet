@@ -184,7 +184,7 @@ fn run() -> Result<(), String> {
         validate_anchor_enrollment_endpoint(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
         "validate_anchor_enrollment_endpoint",
-        "anchor minted enrollment token, rejected negative token paths, admitted enrollee through signed membership, and verified membership visibility",
+        "anchor minted enrollment token, rejected negative token and approver paths, admitted enrollee through signed membership, and verified membership visibility",
         json!({ "summary": enrollment_endpoint }),
     ));
 
@@ -396,6 +396,7 @@ chmod 700 "$work"
 passphrase="$work/signing.passphrase"
 wrong_secret="$work/wrong.secret"
 signed_update="$work/enrollee.signed"
+bad_approver_update="$work/bad-approver.signed"
 trap 'rm -rf "$work"' EXIT
 systemd-creds decrypt --name=signing_key_passphrase {signing_credential} "$passphrase"
 chmod 600 "$passphrase"
@@ -435,6 +436,25 @@ if rustynet enrollment admit \
   printf 'missing-token enrollment admit unexpectedly succeeded\n' >&2
   exit 1
 fi
+bad_approver_token="$(rustynet enrollment mint --secret {enrollment_secret} --ttl 300)"
+if rustynet enrollment admit \
+  --token "$bad_approver_token" \
+  --pubkey "$pubkey_b64" \
+  --node-id {enrollee_node_id} \
+  --owner {enrollee_node_id} \
+  --roles client \
+  --secret {enrollment_secret} \
+  --ledger {enrollment_ledger} \
+  --snapshot {membership_snapshot} \
+  --log {membership_log} \
+  --signing-key {owner_signing_key} \
+  --signing-key-passphrase "$passphrase" \
+  --approver-id rustynet-live-negative-approver \
+  --output "$bad_approver_update" \
+  --apply >/dev/null 2>&1; then
+  printf 'non-anchor approver enrollment admit unexpectedly succeeded\n' >&2
+  exit 1
+fi
 rustynet enrollment admit \
   --token "$token" \
   --pubkey "$pubkey_b64" \
@@ -458,7 +478,7 @@ case "$post_status" in
     exit 1
     ;;
 esac
-printf 'enrollee=%s host=%s admitted=true wrong_secret_rejected=true bogus_token_rejected=true missing_token_rejected=true\n' {enrollee_node_id} {enrollee_host}
+printf 'enrollee=%s host=%s admitted=true wrong_secret_rejected=true bogus_token_rejected=true missing_token_rejected=true non_anchor_approver_rejected=true\n' {enrollee_node_id} {enrollee_host}
 "#,
         enrollment_secret = shell_quote(config.enrollment_secret_path.as_str()),
         enrollment_ledger = shell_quote(config.enrollment_ledger_path.as_str()),
