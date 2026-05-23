@@ -221,6 +221,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "macos-dns-failclosed-check" => {
                 run_macos_dns_failclosed_check_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "macos-exit-nat-lifecycle-snapshot" => {
+                run_macos_exit_nat_lifecycle_snapshot_command(rest)
+            }
             _ => Err(help_text()),
         },
     }
@@ -1082,6 +1085,60 @@ fn run_macos_mesh_status_check_command(args: &[String]) -> Result<(), String> {
             }
         ));
     }
+    Ok(())
+}
+
+/// Track B Step 2 follow-up — macOS exit-mode NAT lifecycle producer.
+///
+/// Captures the current pf anchor + sysctl IPv4 forwarding state and
+/// emits a single-phase snapshot to stdout. The orchestrator runs
+/// this twice (during exit mode + after daemon stop) and merges into
+/// the two-phase artefact the
+/// `evaluate_macos_exit_nat_lifecycle_artifact` validator reads.
+fn run_macos_exit_nat_lifecycle_snapshot_command(args: &[String]) -> Result<(), String> {
+    let mut mesh_cidr: Option<String> = None;
+    let mut pf_anchor: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--mesh-cidr") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-exit-nat-lifecycle-snapshot: --mesh-cidr requires a value".to_owned()
+                })?;
+                mesh_cidr = Some(value.clone());
+                index += 2;
+            }
+            Some("--pf-anchor") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-exit-nat-lifecycle-snapshot: --pf-anchor requires a value".to_owned()
+                })?;
+                pf_anchor = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown macos-exit-nat-lifecycle-snapshot argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let mesh_cidr = mesh_cidr
+        .ok_or_else(|| "macos-exit-nat-lifecycle-snapshot: --mesh-cidr is required".to_owned())?;
+    let options = rustynetd::macos_exit_nat_lifecycle::MacosExitNatLifecycleOptions {
+        mesh_cidr,
+        pf_anchor: pf_anchor.unwrap_or_else(|| {
+            rustynetd::macos_exit_nat_lifecycle::DEFAULT_MACOS_EXIT_PF_ANCHOR.to_owned()
+        }),
+    };
+    let snapshot =
+        rustynetd::macos_exit_nat_lifecycle::collect_macos_exit_nat_lifecycle_snapshot(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot).map_err(|err| {
+            format!("serialize macos-exit-nat-lifecycle snapshot failed: {err}")
+        })?
+    );
     Ok(())
 }
 

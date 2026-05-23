@@ -30109,6 +30109,78 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         );
     }
 
+    /// Track B Step 2 follow-up — producer-side
+    /// `rustynetd::macos_exit_nat_lifecycle` builds snapshots that
+    /// pass the orchestrator-side validator end-to-end. This test
+    /// pins the producer→validator round trip on synthetic pfctl +
+    /// sysctl output so a future schema bump breaks one place.
+    #[test]
+    fn macos_exit_nat_lifecycle_producer_to_validator_round_trip() {
+        let during = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            1,
+            "100.64.0.0/16",
+            "com.rustynet/nat",
+            "nat on en0 inet from 100.64.0.0/16 to any -> (en0)\n",
+            "1\n",
+        );
+        let after = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            2,
+            "100.64.0.0/16",
+            "com.rustynet/nat",
+            "",
+            "0\n",
+        );
+        let merged = rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact(
+            &during, &after,
+        );
+        let summary = super::evaluate_macos_exit_nat_lifecycle_artifact(
+            "macos-utm-1",
+            merged.to_string().as_str(),
+        )
+        .expect("producer-built artifact must validate");
+        assert!(
+            summary.contains("macos-utm-1")
+                && summary.contains("com.rustynet/nat")
+                && summary.contains("mesh_cidr=100.64.0.0/16"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    /// Producer's after_stop snapshot — if forwarding wasn't actually
+    /// reverted, the merge step records `forwarding_restored=false`
+    /// and the validator rejects. Pins the negative-path coverage of
+    /// the producer/validator contract.
+    #[test]
+    fn macos_exit_nat_lifecycle_producer_round_trip_rejects_forwarding_not_restored() {
+        let during = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            1,
+            "100.64.0.0/16",
+            "com.rustynet/nat",
+            "nat on en0 inet from 100.64.0.0/16 to any -> (en0)\n",
+            "1\n",
+        );
+        // After-stop snapshot where the operator left forwarding on.
+        let after = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            2,
+            "100.64.0.0/16",
+            "com.rustynet/nat",
+            "",
+            "1\n",
+        );
+        let merged = rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact(
+            &during, &after,
+        );
+        let err = super::evaluate_macos_exit_nat_lifecycle_artifact(
+            "macos-utm-1",
+            merged.to_string().as_str(),
+        )
+        .expect_err("not-restored forwarding must fail");
+        assert!(
+            err.contains("forwarding") || err.contains("restored"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn evaluate_macos_exit_nat_lifecycle_artifact_rejects_leftover_anchor_after_stop() {
         let mut payload = reviewed_macos_exit_nat_lifecycle_artifact();
