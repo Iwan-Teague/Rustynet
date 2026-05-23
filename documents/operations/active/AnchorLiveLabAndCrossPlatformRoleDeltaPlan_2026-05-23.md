@@ -596,3 +596,13 @@ across stages.
   validator tests and extended `scripts/ci/linux_exit_role_gates.sh`. DNS
   fail-closed, killswitch precedence, live Debian 13 evidence, and IPv6
   schema-v2 parity remain follow-up Linux slices.
+- 2026-05-23 — Linux orchestration parity L3 landed. Added
+  `rustynetd linux-exit-dns-failclosed-capture`, the
+  `linux_exit_dns_failclosed` producer module, and
+  `validate_linux_exit_dns_failclosed`. The producer captures nftables DNS
+  drop-rule evidence, UDP/TCP 53 pcap leak windows, a tunnel DNS positive
+  control, and the existing Linux DNS fail-closed report; the validator consumes
+  `linux_exit_evidence/dns_leak_proof` with skip-when-absent behavior. Added
+  hermetic producer/evaluator tests and extended both Linux exit-role and
+  cross-platform role gates. Killswitch precedence, live Debian 13 evidence,
+  and IPv6 schema-v2 parity remain follow-up Linux slices.

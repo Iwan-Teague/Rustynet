@@ -7,6 +7,7 @@ echo "Running Linux exit-role CI gates..."
 
 required_files=(
   crates/rustynetd/src/linux_exit_nat_lifecycle.rs
+  crates/rustynetd/src/linux_exit_dns_failclosed.rs
   scripts/e2e/capture_linux_exit_nat_lifecycle.sh
 )
 
@@ -15,8 +16,11 @@ for path in "${required_files[@]}"; do
 done
 
 rg -q 'linux-exit-nat-lifecycle-snapshot' crates/rustynetd/src/main.rs
+rg -q 'linux-exit-dns-failclosed-capture' crates/rustynetd/src/main.rs
 rg -q 'pub mod linux_exit_nat_lifecycle' crates/rustynetd/src/lib.rs
+rg -q 'pub mod linux_exit_dns_failclosed' crates/rustynetd/src/lib.rs
 rg -q 'validate_linux_exit_nat_lifecycle' crates/rustynet-cli/src/vm_lab/mod.rs
+rg -q 'validate_linux_exit_dns_failclosed' crates/rustynet-cli/src/vm_lab/mod.rs
 rg -q 'validate_linux_relay_service_lifecycle' crates/rustynet-cli/src/vm_lab/mod.rs
 rg -q 'validate_linux_anchor_bundle_pull' crates/rustynet-cli/src/vm_lab/mod.rs
 rg -q 'validate_linux_membership_genesis' crates/rustynet-cli/src/vm_lab/mod.rs
@@ -24,8 +28,11 @@ rg -q 'evaluate_linux_exit_nat_lifecycle_artifact' crates/rustynet-cli/src/vm_la
 rg -q 'merge_linux_exit_nat_lifecycle_artifact' crates/rustynetd/src/linux_exit_nat_lifecycle.rs
 
 cargo test -p rustynetd --lib linux_exit_nat_lifecycle:: -- --nocapture
+cargo test -p rustynetd --lib linux_exit_dns_failclosed:: -- --nocapture
 cargo test -p rustynet-cli --bin rustynet-cli \
   vm_lab::tests::evaluate_linux_exit_nat_lifecycle_artifact_accepts_reviewed_payload -- --nocapture
+cargo test -p rustynet-cli --bin rustynet-cli \
+  vm_lab::tests::evaluate_linux_exit_dns_failclosed_artifact_dir_accepts_reviewed_payloads -- --nocapture
 cargo test -p rustynet-cli --bin rustynet-cli \
   vm_lab::tests::linux_exit_nat_lifecycle_producer_to_validator_round_trip -- --nocapture
 cargo test -p rustynet-cli --bin rustynet-cli \
