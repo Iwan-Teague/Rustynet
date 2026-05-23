@@ -565,3 +565,13 @@ across stages.
   KILL proof; default runs still skip chaos. The OOM, SIGSTOP/SIGCONT, and
   helper-socket daemon-fault sub-stages remain skipped until their live-safe
   implementations land.
+- 2026-05-23 — Track C C1.3 signed-state adversarial offline slice landed. The
+  `live_signed_bundle_forger` scenario contract moved into shared Rust helper
+  code (`live_signed_state_chaos`) and `live_chaos_signed_state_adversarial_test`
+  now generates and validates reject-only fixtures for replayed membership,
+  future-dated assignment, truncated bundles, forged signature, and
+  quorum-starved proposal stages. The report fails if any signed-state stage
+  lacks fixture coverage or if the manifest ever claims `production_accepted`.
+  `scripts/ci/chaos_gates.sh` now asserts the signed-state report is `pass`,
+  `reject_fail_closed`, and `production_accepted=false`. This is hermetic only;
+  live daemon ingestion/rejection proof remains a later opt-in live-lab slice.
