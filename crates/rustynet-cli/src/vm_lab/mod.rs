@@ -7466,6 +7466,10 @@ const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 /// Remote path of the bootstrap script on the macOS VM (uploaded by stage 1).
 const MACOS_BOOTSTRAP_SCRIPT_REMOTE: &str = "/tmp/Bootstrap-RustyNetMacos.sh";
 
+/// Remote path of the launchd service installer the bootstrap script calls
+/// out to (uploaded by stage 1 next to Bootstrap-RustyNetMacos.sh).
+const MACOS_INSTALL_SERVICE_SCRIPT_REMOTE: &str = "/tmp/Install-RustyNetMacosService.sh";
+
 /// Remote path of the macOS env file (uploaded by stage 1).
 const MACOS_ENV_FILE_REMOTE: &str = "/tmp/rustynet-macos-bootstrap.env";
 
@@ -7563,6 +7567,33 @@ fn run_macos_orchestration_stages(
                 )
                 .map_err(|e| format!("SCP bootstrap script to {macos_alias} failed: {e}"))?,
                 "SCP bootstrap script to macOS host",
+            )?;
+
+            // Upload the launchd service installer the bootstrap script
+            // sources after build. Without this, Bootstrap-RustyNetMacos.sh
+            // fails with "Install-RustyNetMacosService.sh not found".
+            let install_service_script = workspace_root_path()
+                .join("scripts/bootstrap/macos/Install-RustyNetMacosService.sh");
+            if !install_service_script.is_file() {
+                return Err(format!(
+                    "Install-RustyNetMacosService.sh not found at {}",
+                    install_service_script.display()
+                ));
+            }
+            ensure_success_status(
+                scp_to_remote_for_target(
+                    &target,
+                    None,
+                    Some(ssh_identity_file),
+                    known_hosts_path,
+                    install_service_script.as_path(),
+                    MACOS_INSTALL_SERVICE_SCRIPT_REMOTE,
+                    timeout,
+                )
+                .map_err(|e| {
+                    format!("SCP Install-RustyNetMacosService.sh to {macos_alias} failed: {e}")
+                })?,
+                "SCP Install-RustyNetMacosService.sh to macOS host",
             )?;
 
             // Write a minimal env file and upload it.
