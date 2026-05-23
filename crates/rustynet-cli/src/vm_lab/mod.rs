@@ -44,7 +44,7 @@ const DEFAULT_PREFLIGHT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_COLLECT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
-const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 60;
+const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
 const DEFAULT_LIVE_LAB_PROFILE_ROOT: &str = "profiles/live_lab";
 const DEFAULT_LIVE_LAB_REPORT_ROOT: &str = "artifacts/live_lab";
@@ -73,6 +73,7 @@ const DEFAULT_PRECHECK_COMMANDS: &[&str] = &["git", "cargo", "systemctl"];
 const POLL_INTERVAL_MILLIS: u64 = 100;
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const FULL_RELEASE_GATE_REQUIRED_STAGES: &[&str] = &[
+    "live_anchor",
     "live_role_switch_matrix",
     "live_exit_handoff",
     "live_two_hop",
@@ -8455,14 +8456,53 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(macos_relay_lifecycle_outcome);
 
-    outcomes.push(stage_outcome(
-        "validate_macos_anchor_bundle_pull",
-        VmLabStageStatus::Skipped,
-        format!(
-            "skipped: anchor bundle-pull live test bin is Track A scope; macOS reserved slot for {macos_alias}"
-        ),
-        vec![],
-    ));
+    let macos_anchor_bundle_pull_log_path = logs_dir.join("validate_macos_anchor_bundle_pull.log");
+    let macos_anchor_bundle_pull_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would exercise rustynet anchor init --dry-run bundle-pull plan on {macos_alias}"
+            ),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_anchor_bundle_pull",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_macos_anchor_bundle_pull_plan_dry_run(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_macos_anchor_bundle_pull",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![macos_anchor_bundle_pull_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&macos_anchor_bundle_pull_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_macos_anchor_bundle_pull",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "macOS anchor bundle-pull plan validation failed for {macos_alias}: {reason}"
+                    ),
+                    vec![macos_anchor_bundle_pull_log_path.clone()],
+                )
+            }
+        }
+    };
+    outcomes.push(macos_anchor_bundle_pull_outcome);
 
     outcomes
 }
@@ -8533,6 +8573,184 @@ fn exercise_macos_relay_lifecycle_dry_run(
     Ok(format!(
         "macOS relay launchd lifecycle dry-run verified on {macos_alias}: install+bootstrap → bootout+remove"
     ))
+}
+
+fn exercise_macos_anchor_bundle_pull_plan_dry_run(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {macos_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let inventory = load_inventory(inventory_path)?;
+    let node_id = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .and_then(|entry| entry.node_id.as_deref())
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?;
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = format!(
+        "/usr/local/bin/rustynet anchor init --dry-run --node-id {} --bundle-pull-addr 127.0.0.1:51822 2>&1",
+        shell_quote(node_id)
+    );
+    let output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        script.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("anchor init --dry-run on {macos_alias} failed: {err}"))?;
+    validate_anchor_init_bundle_pull_plan(output.as_str())?;
+    Ok(format!(
+        "macOS anchor bundle-pull dry-run plan verified on {macos_alias}: anchor capabilities + loopback listener plan present"
+    ))
+}
+
+fn validate_anchor_init_bundle_pull_plan(output: &str) -> Result<(), String> {
+    for required in [
+        "anchor init plan:",
+        "rustynet anchor advertise",
+        "anchor.bundle_pull",
+        "anchor.gossip_seed",
+        "anchor.enrollment_endpoint",
+        "anchor.relay_colocation",
+        "anchor.port_mapping_authoritative",
+        "enable loopback bundle-pull listener at 127.0.0.1:51822",
+    ] {
+        if !output.contains(required) {
+            return Err(format!(
+                "anchor init dry-run output missing required fragment {required:?}: {output}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_windows_relay_service_lifecycle_contract_from_repo() -> Result<String, String> {
+    let install_path = windows_relay_service_install_helper_script_local_path();
+    let uninstall_path = windows_relay_service_uninstall_helper_script_local_path();
+    let install = fs::read_to_string(install_path.as_path())
+        .map_err(|err| format!("read {} failed: {err}", install_path.display()))?;
+    let uninstall = fs::read_to_string(uninstall_path.as_path())
+        .map_err(|err| format!("read {} failed: {err}", uninstall_path.display()))?;
+    let (install_count, uninstall_count) =
+        validate_windows_relay_service_lifecycle_contract(install.as_str(), uninstall.as_str())?;
+    Ok(format!(
+        "Windows relay SCM helper contract verified without guest mutation: install_fragments={install_count} uninstall_fragments={uninstall_count} install_helper={} uninstall_helper={}",
+        install_path.display(),
+        uninstall_path.display()
+    ))
+}
+
+fn validate_windows_relay_service_lifecycle_contract(
+    install_script: &str,
+    uninstall_script: &str,
+) -> Result<(usize, usize), String> {
+    let install_required = [
+        "Set-StrictMode -Version Latest",
+        "$ErrorActionPreference = 'Stop'",
+        "Test-ReviewedRelayServiceName",
+        "Test-ReviewedInstallRoot",
+        "Test-ReviewedRelayRoot",
+        "Test-ReviewedRelayRuntimePath",
+        "Test-RelayId",
+        "Test-Endpoint",
+        "Test-PortRange",
+        "C:\\Program Files\\RustyNet",
+        "C:\\ProgramData\\RustyNet\\relay",
+        "Find-Signtool",
+        "Sign-RelayBinaryForAuthenticode",
+        "New-SelfSignedCertificate",
+        "Repair-RelayRuntimeAcl",
+        "Repair-RelayBinaryAcl",
+        "Ensure-ServiceSidTypeUnrestricted",
+        "Set-RelayServiceFailureActions",
+        "windows-service-hardening-check",
+        "RUSTYNET_RELAY_ARGS_JSON",
+        "--windows-service",
+        "--env-file",
+        "-RequireLoopback",
+        "relay health bind port must not equal",
+        "New-FailClosedRelayInstallReport",
+        "Write-RelayInstallReportIfRequested",
+        "ConvertTo-Json -Depth 8",
+    ];
+    let uninstall_required = [
+        "$ErrorActionPreference = 'Stop'",
+        "Test-ReviewedRelayServiceName",
+        "Test-ReviewedInstallRoot",
+        "Test-ReviewedRelayRoot",
+        "C:\\Program Files\\RustyNet",
+        "C:\\ProgramData\\RustyNet\\relay",
+        "Stop-Service",
+        "sc.exe",
+        "delete",
+        "Remove-ReviewedFileIfPresent",
+        "New-RelayUninstallReport",
+        "Write-RelayUninstallReportIfRequested",
+        "preserved_artifacts",
+        "relay-verifier.key",
+        "relay-replay.nonces",
+        "rustynet-relay.exe",
+        "relay.env",
+        "ConvertTo-Json -Depth 8",
+    ];
+    let install_count =
+        validate_required_fragments("Windows relay install helper", install_script, &install_required)?;
+    let uninstall_count = validate_required_fragments(
+        "Windows relay uninstall helper",
+        uninstall_script,
+        &uninstall_required,
+    )?;
+    for (label, body, forbidden) in [
+        (
+            "Windows relay install helper",
+            install_script,
+            ["Invoke-Expression", "cmd.exe /c", "powershell -Command"],
+        ),
+        (
+            "Windows relay uninstall helper",
+            uninstall_script,
+            ["Invoke-Expression", "cmd.exe /c", "powershell -Command"],
+        ),
+    ] {
+        for fragment in forbidden {
+            if body.contains(fragment) {
+                return Err(format!("{label} contains forbidden fragment {fragment:?}"));
+            }
+        }
+    }
+    if uninstall_script.contains("Remove-Item -Recurse") {
+        return Err(
+            "Windows relay uninstall helper must not recursively delete relay state".to_owned(),
+        );
+    }
+    Ok((install_count, uninstall_count))
+}
+
+fn validate_required_fragments(
+    label: &str,
+    body: &str,
+    required: &[&str],
+) -> Result<usize, String> {
+    for fragment in required {
+        if !body.contains(fragment) {
+            return Err(format!("{label} missing required fragment {fragment:?}"));
+        }
+    }
+    Ok(required.len())
 }
 
 struct WindowsBundleLocalPaths {
@@ -10142,21 +10360,79 @@ fn run_windows_orchestration_stages_with_options(
 
     // ── Track B Step 6 (W2 + W3): Windows relay + anchor live stages ─────
     //
-    // Skip-with-reason placeholders that reserve the stage slots so
-    // future work wiring real SCM install + verify + uninstall does
-    // not need to edit the orchestration shape, only the live
-    // invocation. Live SCM lifecycle on Windows requires admin
-    // privileges + a persistent service install on the guest; the
-    // chaos-grade end-to-end variant lives in Track C, and the anchor
-    // bundle-pull test bin lives in Track A.
-    let windows_relay_lifecycle_outcome = stage_outcome(
-        "validate_windows_relay_service_lifecycle",
-        VmLabStageStatus::Skipped,
-        format!(
-            "skipped: Windows SCM relay-service lifecycle live test pending (W2 follow-up); reserved slot for {windows_alias}"
-        ),
-        vec![],
-    );
+    // Windows relay has no reviewed no-op SCM dry-run yet. This stage
+    // therefore validates the shipped install/uninstall helper contract
+    // locally after the base Windows host gates pass, without touching
+    // the guest SCM. Real install + traffic + uninstall remains a live
+    // Track-C exercise once the operator opts into guest mutation.
+    let windows_relay_lifecycle_log_path =
+        logs_dir.join("validate_windows_relay_service_lifecycle.log");
+    let windows_relay_lifecycle_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would validate Windows relay SCM helper contract for {windows_alias} without guest mutation"
+            ),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !hardening_passed {
+        stage_outcome(
+            "validate_windows_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_service_hardening did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !authenticode_passed {
+        stage_outcome(
+            "validate_windows_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_authenticode did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        match validate_windows_relay_service_lifecycle_contract_from_repo() {
+            Ok(summary) => {
+                let _ = std::fs::write(&windows_relay_lifecycle_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_windows_relay_service_lifecycle",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![windows_relay_lifecycle_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&windows_relay_lifecycle_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_windows_relay_service_lifecycle",
+                    VmLabStageStatus::Fail,
+                    format!("Windows relay SCM helper contract validation failed: {reason}"),
+                    vec![windows_relay_lifecycle_log_path.clone()],
+                )
+            }
+        }
+    };
     let windows_anchor_bundle_pull_outcome = stage_outcome(
         "validate_windows_anchor_bundle_pull",
         VmLabStageStatus::Skipped,
@@ -15988,7 +16264,7 @@ fn pull_windows_local_utm_guest_file_with_retry(
         if remaining.is_zero() {
             break;
         }
-        thread::sleep(Duration::from_secs(1).min(remaining));
+        thread::sleep(Duration::from_secs(5).min(remaining));
     }
     Err(last_error
         .unwrap_or_else(|| format!("{label} file pull failed for {utm_name}:{remote_path}")))
@@ -29831,6 +30107,79 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         )
         .expect_err("tampered killswitch zero exit must fail");
         assert!(err.contains("exited zero"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_anchor_init_bundle_pull_plan_accepts_reviewed_output() {
+        let output = "anchor init plan:\n  1. run `rustynet role set admin`\n  2. install relay sibling service with RUSTYNET_RELAY_BIND=127.0.0.1:4500\n  3. run `rustynet anchor advertise --node-id macos-1 --capabilities anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative --output artifacts/membership/anchor-advertise.update`\n  4. enable loopback bundle-pull listener at 127.0.0.1:51822\n  5. restart rustynetd after signed update applies\n";
+        super::validate_anchor_init_bundle_pull_plan(output)
+            .expect("reviewed anchor init plan should validate");
+    }
+
+    #[test]
+    fn validate_anchor_init_bundle_pull_plan_rejects_missing_bundle_pull() {
+        let output = "anchor init plan:\nrun `rustynet anchor advertise --node-id macos-1 --capabilities anchor,relay_host,anchor.gossip_seed --output out`\n";
+        let err = super::validate_anchor_init_bundle_pull_plan(output)
+            .expect_err("missing bundle-pull capability must fail closed");
+        assert!(
+            err.contains("anchor.bundle_pull"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_windows_relay_service_lifecycle_contract_accepts_reviewed_helpers() {
+        let install = fs::read_to_string(windows_relay_service_install_helper_script_local_path())
+            .expect("read relay install helper");
+        let uninstall =
+            fs::read_to_string(windows_relay_service_uninstall_helper_script_local_path())
+                .expect("read relay uninstall helper");
+        let (install_count, uninstall_count) =
+            super::validate_windows_relay_service_lifecycle_contract(
+                install.as_str(),
+                uninstall.as_str(),
+            )
+            .expect("reviewed Windows relay helper contract should validate");
+        assert!(install_count >= 20);
+        assert!(uninstall_count >= 15);
+    }
+
+    #[test]
+    fn validate_windows_relay_service_lifecycle_contract_rejects_missing_loopback_gate() {
+        let install = fs::read_to_string(windows_relay_service_install_helper_script_local_path())
+            .expect("read relay install helper")
+            .replace("-RequireLoopback", "-AllowAnyHealthBind");
+        let uninstall =
+            fs::read_to_string(windows_relay_service_uninstall_helper_script_local_path())
+                .expect("read relay uninstall helper");
+        let err = super::validate_windows_relay_service_lifecycle_contract(
+            install.as_str(),
+            uninstall.as_str(),
+        )
+        .expect_err("missing health-bind loopback gate must fail closed");
+        assert!(
+            err.contains("-RequireLoopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_windows_relay_service_lifecycle_contract_rejects_recursive_uninstall() {
+        let install = fs::read_to_string(windows_relay_service_install_helper_script_local_path())
+            .expect("read relay install helper");
+        let mut uninstall =
+            fs::read_to_string(windows_relay_service_uninstall_helper_script_local_path())
+                .expect("read relay uninstall helper");
+        uninstall.push_str("\nRemove-Item -Recurse -LiteralPath $RelayRoot\n");
+        let err = super::validate_windows_relay_service_lifecycle_contract(
+            install.as_str(),
+            uninstall.as_str(),
+        )
+        .expect_err("recursive relay-state delete must fail closed");
+        assert!(
+            err.contains("must not recursively delete relay state"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
