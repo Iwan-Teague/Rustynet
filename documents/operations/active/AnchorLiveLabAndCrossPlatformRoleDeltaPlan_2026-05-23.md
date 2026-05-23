@@ -471,15 +471,30 @@ across stages.
     `validate_windows_relay_service_lifecycle` is now a non-mutating SCM helper
     contract gate; real Windows SCM install/start/traffic/uninstall remains
     Track C.
-  - **Step 7 (B1.2)** non-Linux genesis: explicitly deferred per spec
-    ("optional, last"). The current genesis path still runs on Linux.
+  - **Step 7 (B1.2)** non-Linux genesis (was deferred, now landed via
+    commit `6ccf153`): new `ops e2e-bootstrap-macos` and
+    `ops e2e-bootstrap-windows` CLI verbs in
+    `crates/rustynet-cli/src/ops_e2e.rs` mirror the Linux
+    `ops e2e-bootstrap-host` membership-init step against the
+    platform-canonical state paths. macOS uses
+    `/usr/local/var/rustynet/membership/`; Windows uses
+    `rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_*` so a
+    future path move stays consistent with the daemon. Each verb is
+    cfg-gated to its host OS and returns a clear error on
+    non-target platforms.
   - New CI gate `scripts/ci/cross_platform_role_gates.sh` covers all
-    of the above hermetically (no VM required).
+    of the above hermetically (no VM required), including the new
+    genesis verbs (`E2eBootstrapMacos` + `E2eBootstrapWindows`
+    OpsCommand variants and the per-OS executor functions).
   - Evidence appended to
     [`HeterogeneousLiveLabEvidence_2026-04-28.md`](./HeterogeneousLiveLabEvidence_2026-04-28.md)
     §7.
   - Track-A enrollment / downgrade destructive sub-stages and Track-C
     chaos work remain out of scope for this Track-B run.
+  - Track B all seven steps now landed; full commit chain: `4e5a37f`
+    (Step 1) → `c664a4f` (Step 2) → `5739385` (Step 3+5) → `3bdc92e`
+    (Step 4) → `c2fceeb` (Step 6) → `acf9934` (gates+evidence+ledger)
+    → `6ccf153` (Step 7).
 - 2026-05-23 — Windows relay lifecycle slot upgraded from a pure reserved
   placeholder to a non-mutating SCM helper contract gate. The
   `validate_windows_relay_service_lifecycle` stage now verifies the reviewed

@@ -198,10 +198,20 @@ relay / anchor instead of locking the mesh exit to Linux exit-1.
 | M5 + W4 (combined with B1.4) | New per-OS exit installers (systemd, launchd, Windows PS). | `ops_install_systemd_exit.rs`, `ops_install_macos_exit.rs`, `ops_e2e.rs::execute_ops_install_windows_exit_service`, `scripts/systemd/rustynet-exit.service`, `scripts/launchd/com.rustynet.exit.plist`, `scripts/bootstrap/windows/{Install,Uninstall}-RustyNetWindowsExitService.ps1` |
 | W1 | Windows active-exit promotion stage. Gated on `windows_vm == exit_vm`. | `promote_windows_exit_active` stage + `promote_windows_to_active_exit` helper in `vm_lab/mod.rs` |
 | W2 / W3 / M2 / M3 | Relay + anchor live-lab stage slots. macOS relay lifecycle substantive (dry-run via SSH); the other three are skip-with-reason placeholders referencing Track A / W2 / chaos Track C. | `validate_macos_relay_service_lifecycle` (substantive), `validate_macos_anchor_bundle_pull`, `validate_windows_relay_service_lifecycle`, `validate_windows_anchor_bundle_pull` in `vm_lab/mod.rs` |
+| B1.2 | Non-Linux genesis verbs. macOS + Windows variants of the membership-init step that mirror Linux `ops e2e-bootstrap-host`. cfg-gated to host OS. | `OpsCommand::E2eBootstrapMacos`/`E2eBootstrapWindows` + `execute_ops_e2e_bootstrap_macos`/`execute_ops_e2e_bootstrap_windows` in `ops_e2e.rs`; CLI verbs `ops e2e-bootstrap-macos` and `ops e2e-bootstrap-windows`; help text in `main.rs` |
 
-Step B1.2 (non-Linux genesis) is deferred — Track B step 7 in the
-delta plan is explicitly marked optional. The current genesis path
-still requires a Linux host running `rustynet ops e2e-bootstrap`.
+Step B1.2 (non-Linux genesis) — landed: new `ops e2e-bootstrap-macos`
+and `ops e2e-bootstrap-windows` CLI verbs in
+`crates/rustynet-cli/src/ops_e2e.rs` mirror the Linux
+`ops e2e-bootstrap-host` membership-init step against the
+platform-canonical state paths (macOS: `/usr/local/var/rustynet/`;
+Windows: `C:\ProgramData\RustyNet\membership\` via the daemon's
+`windows_paths` constants). Each verb is cfg-gated to its host OS;
+non-target hosts return a clear "only supported on" error. The
+verbs accept `--node-id`, `--network-id`, and `--passphrase-file`,
+matching the existing Linux variant's argument shape. Parser test
+in `tests::parse_supports_ops_commands` pins both verb routings;
+execution is exercised on the matching host platform.
 
 ### 7.2) CI gate added
 
