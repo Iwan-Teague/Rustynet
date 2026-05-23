@@ -1443,8 +1443,8 @@ live_lab_write_assignment_refresh_env() {
   live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_ALLOW" "$allow_spec"
   live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_SIGNING_SECRET" "/etc/rustynet/assignment.signing.secret"
   live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE" "/run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase"
-  live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_TTL_SECS" "300"
-  live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS" "180"
+  live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_TTL_SECS" "3600"
+  live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS" "300"
   if [[ -n "$exit_node_id" ]]; then
     live_lab_append_env_assignment "$env_path" "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID" "$exit_node_id"
   fi

@@ -2730,11 +2730,18 @@ build_onehop_specs() {
   exit_target="$(node_target_for_label exit)"
   exit_node_id="$(node_id_for_label exit)"
   while IFS=$'\t' read -r _label target node_id pub_hex; do
+    local node_capabilities
+    if [[ "$node_id" == "$exit_node_id" ]]; then
+      node_capabilities="anchor,exit_server"
+    else
+      node_capabilities="client,relay_host"
+    fi
+    local node_entry="${node_id}|$(live_lab_resolved_target_address "$target"):51820|${pub_hex}|${node_capabilities}||||${node_capabilities}"
     if [[ "$first" == "1" ]]; then
-      nodes_spec="${node_id}|$(live_lab_resolved_target_address "$target"):51820|${pub_hex}"
+      nodes_spec="${node_entry}"
       first="0"
     else
-      nodes_spec="${nodes_spec};${node_id}|$(live_lab_resolved_target_address "$target"):51820|${pub_hex}"
+      nodes_spec="${nodes_spec};${node_entry}"
     fi
     if [[ "$node_id" == "$exit_node_id" ]]; then
       assignments_spec="${assignments_spec:+${assignments_spec};}${node_id}|-"
@@ -2770,7 +2777,17 @@ stage_membership_setup() {
   live_lab_run_root "$exit_target" "root test -f /var/lib/rustynet/membership.snapshot && root test -f /var/lib/rustynet/membership.log && root test -f /var/lib/rustynet/membership.watermark && root chown rustynetd:rustynetd /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark && root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark" || return 1
   while IFS=$'\t' read -r _label target node_id pub_hex; do
     [[ "$node_id" == "$exit_node_id" ]] && continue
-    live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}'" || return 1
+    # Caps assigned to every non-exit node so the orchestrator can flip
+    # them between Client / Relay / Exit / BlindExit roles at runtime
+    # without re-issuing membership:
+    #   - client       : default daemon NodeRole::Client requirement
+    #   - relay_host   : lets peer carry signed traffic for others
+    #   - exit_server  : lets the node be promoted to exit during handoff
+    #   - blind_exit   : satisfies NodeRole::BlindExit (used by lan_toggle)
+    # Anchor is intentionally OMITTED — NodeRole::BlindExit rejects any
+    # membership entry carrying Anchor. Only the exit-1 genesis node owns
+    # the anchor role in this lab.
+    live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}' --capabilities 'client,relay_host,exit_server,blind_exit'" || return 1
   done < "$PUBKEYS_TSV"
 }
 
@@ -2804,6 +2821,7 @@ stage_issue_and_distribute_assignments() {
   append_env_assignment "$env_path" "NODES_SPEC" "$NODES_SPEC"
   append_env_assignment "$env_path" "ALLOW_SPEC" "$ALLOW_SPEC"
   append_env_assignment "$env_path" "ASSIGNMENTS_SPEC" "$ASSIGNMENTS_SPEC"
+  append_env_assignment "$env_path" "BUNDLE_TTL_SECS" "3600"
   live_lab_issue_assignment_bundles_from_env "$exit_target" "$env_path" "/tmp/rn_issue_assignments.env" || return 1
 
   verifier_local="$STATE_DIR/assignment.pub"
