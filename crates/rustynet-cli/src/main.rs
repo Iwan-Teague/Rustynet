@@ -7,8 +7,10 @@ mod ops_cross_network_preflight;
 mod ops_cross_network_reports;
 mod ops_e2e;
 mod ops_fresh_install_os_matrix;
+mod ops_install_macos_exit;
 mod ops_install_macos_relay;
 mod ops_install_systemd;
+mod ops_install_systemd_exit;
 mod ops_install_systemd_relay;
 mod ops_live_lab_failure_digest;
 mod ops_live_lab_orchestrator;
@@ -913,9 +915,28 @@ enum OpsCommand {
     InstallMacosRelay {
         config: ops_install_macos_relay::InstallMacosRelayConfig,
     },
+    /// Track B Step 3 (B1.4) — install / uninstall the
+    /// rustynet-exit.service sibling systemd unit. Used by the
+    /// role-transition orchestrator when entering / leaving the
+    /// `exit` (or `blind_exit`) preset on Linux.
+    InstallSystemdExit {
+        config: ops_install_systemd_exit::InstallExitConfig,
+    },
+    /// Track B Step 3 (B1.4) — install / uninstall the
+    /// com.rustynet.exit launchd service. Used by the role-transition
+    /// orchestrator when entering / leaving the `exit` preset on macOS.
+    InstallMacosExit {
+        config: ops_install_macos_exit::InstallMacosExitConfig,
+    },
     InstallWindowsService,
     InstallWindowsRelayService,
     UninstallWindowsRelayService,
+    /// Track B Step 3 (B1.4) — install / uninstall the
+    /// Windows exit-mode preflight (IPv4 forwarding enable/disable).
+    /// Used by the role-transition orchestrator when entering / leaving
+    /// the `exit` preset on Windows.
+    InstallWindowsExitService,
+    UninstallWindowsExitService,
     PrepareSystemDirs,
     RestartRuntimeService,
     StopRuntimeService,
@@ -3811,6 +3832,75 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             };
             Ok(OpsCommand::InstallMacosRelay { config })
         }
+        "install-systemd-exit" => {
+            // Track B Step 3 (B1.4) — install/uninstall the
+            // rustynet-exit.service sibling unit on Linux. Default mode
+            // is install+enable. `--uninstall` flips to disable+remove.
+            // `--dry-run` plans the work without touching disk or
+            // invoking systemctl.
+            let mut mode = ops_install_systemd_exit::ExitUnitMode::InstallAndEnable;
+            let mut dry_run = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--uninstall" => {
+                        mode = ops_install_systemd_exit::ExitUnitMode::DisableAndRemove;
+                    }
+                    "--dry-run" => dry_run = true,
+                    other => {
+                        return Err(format!(
+                            "ops install-systemd-exit: unknown flag {other:?} (expected --uninstall or --dry-run)"
+                        ));
+                    }
+                }
+            }
+            let config = match mode {
+                ops_install_systemd_exit::ExitUnitMode::InstallAndEnable => {
+                    ops_install_systemd_exit::InstallExitConfig {
+                        dry_run,
+                        ..ops_install_systemd_exit::InstallExitConfig::default_install()
+                    }
+                }
+                ops_install_systemd_exit::ExitUnitMode::DisableAndRemove => {
+                    ops_install_systemd_exit::InstallExitConfig {
+                        dry_run,
+                        ..ops_install_systemd_exit::InstallExitConfig::default_uninstall()
+                    }
+                }
+            };
+            Ok(OpsCommand::InstallSystemdExit { config })
+        }
+        "install-macos-exit" => {
+            let mut mode = ops_install_macos_exit::LaunchdExitMode::InstallAndBootstrap;
+            let mut dry_run = false;
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--uninstall" => {
+                        mode = ops_install_macos_exit::LaunchdExitMode::DisableAndRemove;
+                    }
+                    "--dry-run" => dry_run = true,
+                    other => {
+                        return Err(format!(
+                            "ops install-macos-exit: unknown flag {other:?} (expected --uninstall or --dry-run)"
+                        ));
+                    }
+                }
+            }
+            let config = match mode {
+                ops_install_macos_exit::LaunchdExitMode::InstallAndBootstrap => {
+                    ops_install_macos_exit::InstallMacosExitConfig {
+                        dry_run,
+                        ..ops_install_macos_exit::InstallMacosExitConfig::default_install()
+                    }
+                }
+                ops_install_macos_exit::LaunchdExitMode::DisableAndRemove => {
+                    ops_install_macos_exit::InstallMacosExitConfig {
+                        dry_run,
+                        ..ops_install_macos_exit::InstallMacosExitConfig::default_uninstall()
+                    }
+                }
+            };
+            Ok(OpsCommand::InstallMacosExit { config })
+        }
         "install-windows-service" => {
             if args.len() != 1 {
                 return Err("ops install-windows-service does not accept options".to_owned());
@@ -3830,6 +3920,18 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 );
             }
             Ok(OpsCommand::UninstallWindowsRelayService)
+        }
+        "install-windows-exit-service" => {
+            if args.len() != 1 {
+                return Err("ops install-windows-exit-service does not accept options".to_owned());
+            }
+            Ok(OpsCommand::InstallWindowsExitService)
+        }
+        "uninstall-windows-exit-service" => {
+            if args.len() != 1 {
+                return Err("ops uninstall-windows-exit-service does not accept options".to_owned());
+            }
+            Ok(OpsCommand::UninstallWindowsExitService)
         }
         "prepare-system-dirs" => {
             if args.len() != 1 {
@@ -6316,12 +6418,24 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_install_macos_relay::execute_install_macos_relay(config)
                 .map(|report| report.summary())
         }
+        OpsCommand::InstallSystemdExit { config } => {
+            ops_install_systemd_exit::execute_install_exit(config).map(|report| report.summary())
+        }
+        OpsCommand::InstallMacosExit { config } => {
+            ops_install_macos_exit::execute_install_macos_exit(config).map(|report| report.summary())
+        }
         OpsCommand::InstallWindowsService => ops_e2e::execute_ops_install_windows_service(),
         OpsCommand::InstallWindowsRelayService => {
             ops_e2e::execute_ops_install_windows_relay_service()
         }
         OpsCommand::UninstallWindowsRelayService => {
             ops_e2e::execute_ops_uninstall_windows_relay_service()
+        }
+        OpsCommand::InstallWindowsExitService => {
+            ops_e2e::execute_ops_install_windows_exit_service()
+        }
+        OpsCommand::UninstallWindowsExitService => {
+            ops_e2e::execute_ops_uninstall_windows_exit_service()
         }
         OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
         OpsCommand::RestartRuntimeService => execute_ops_restart_runtime_service(),
@@ -16285,6 +16399,10 @@ fn execute_role_action(action: &role_cli::ConcreteAction) -> Result<String, Stri
         role_cli::ConcreteAction::UndeployRelayService => {
             execute_platform_relay_service_action(false)
         }
+        role_cli::ConcreteAction::DeployExitService => execute_platform_exit_service_action(true),
+        role_cli::ConcreteAction::UndeployExitService => {
+            execute_platform_exit_service_action(false)
+        }
     }
 }
 
@@ -16307,8 +16425,50 @@ fn execute_platform_relay_service_action(install: bool) -> Result<String, String
         return ops_install_macos_relay::execute_install_macos_relay(config)
             .map(|report| report.summary());
     }
+    if cfg!(target_os = "windows") {
+        // Track B Step 3 (B1.4) — Windows relay role-transition now
+        // dispatches to the reviewed SCM install scripts so the
+        // role-transition planner has one hardened execution path per
+        // platform. The Rust caller drives PowerShell with argv-only
+        // args; the script enforces fail-closed on missing dependencies.
+        if install {
+            return ops_e2e::execute_ops_install_windows_relay_service();
+        }
+        return ops_e2e::execute_ops_uninstall_windows_relay_service();
+    }
     Err(format!(
         "relay service role transition is not supported on {}",
+        std::env::consts::OS
+    ))
+}
+
+fn execute_platform_exit_service_action(install: bool) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        let config = if install {
+            ops_install_systemd_exit::InstallExitConfig::default_install()
+        } else {
+            ops_install_systemd_exit::InstallExitConfig::default_uninstall()
+        };
+        return ops_install_systemd_exit::execute_install_exit(config)
+            .map(|report| report.summary());
+    }
+    if cfg!(target_os = "macos") {
+        let config = if install {
+            ops_install_macos_exit::InstallMacosExitConfig::default_install()
+        } else {
+            ops_install_macos_exit::InstallMacosExitConfig::default_uninstall()
+        };
+        return ops_install_macos_exit::execute_install_macos_exit(config)
+            .map(|report| report.summary());
+    }
+    if cfg!(target_os = "windows") {
+        if install {
+            return ops_e2e::execute_ops_install_windows_exit_service();
+        }
+        return ops_e2e::execute_ops_uninstall_windows_exit_service();
+    }
+    Err(format!(
+        "exit service role transition is not supported on {}",
         std::env::consts::OS
     ))
 }
@@ -20321,6 +20481,40 @@ mod tests {
             "uninstall-windows-relay-service".to_owned(),
         ]);
         assert!(format!("{windows_relay_uninstaller:?}").contains("UninstallWindowsRelayService"));
+
+        // Track B Step 3 (B1.4) — exit-service install/uninstall verbs
+        // for Linux (systemd), macOS (launchd), and Windows (PS1
+        // preflight). All three dispatch from the planner's
+        // `ConcreteAction::{Deploy,Undeploy}ExitService` actions when
+        // entering/leaving an exit-bearing preset on the target host.
+        let systemd_exit_installer =
+            parse_command(&["ops".to_owned(), "install-systemd-exit".to_owned()]);
+        assert!(format!("{systemd_exit_installer:?}").contains("InstallSystemdExit"));
+        let systemd_exit_uninstaller = parse_command(&[
+            "ops".to_owned(),
+            "install-systemd-exit".to_owned(),
+            "--uninstall".to_owned(),
+        ]);
+        assert!(format!("{systemd_exit_uninstaller:?}").contains("DisableAndRemove"));
+
+        let macos_exit_installer =
+            parse_command(&["ops".to_owned(), "install-macos-exit".to_owned()]);
+        assert!(format!("{macos_exit_installer:?}").contains("InstallMacosExit"));
+        let macos_exit_uninstaller = parse_command(&[
+            "ops".to_owned(),
+            "install-macos-exit".to_owned(),
+            "--uninstall".to_owned(),
+        ]);
+        assert!(format!("{macos_exit_uninstaller:?}").contains("DisableAndRemove"));
+
+        let windows_exit_installer =
+            parse_command(&["ops".to_owned(), "install-windows-exit-service".to_owned()]);
+        assert!(format!("{windows_exit_installer:?}").contains("InstallWindowsExitService"));
+        let windows_exit_uninstaller = parse_command(&[
+            "ops".to_owned(),
+            "uninstall-windows-exit-service".to_owned(),
+        ]);
+        assert!(format!("{windows_exit_uninstaller:?}").contains("UninstallWindowsExitService"));
 
         let prepare_dirs = parse_command(&["ops".to_owned(), "prepare-system-dirs".to_owned()]);
         assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));

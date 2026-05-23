@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.rustynet.exit.plist - reviewed launchd unit for the macOS
+  exit-mode preflight one-shot. Track B Step 3 (B1.4).
+
+  Install to: /Library/LaunchDaemons/com.rustynet.exit.plist
+  Owner/mode: root:wheel 0644
+  Load via:   launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.exit.plist
+  Unload via: launchctl bootout system/com.rustynet.exit
+
+  Pre-arms the host for exit-server role transitions by enabling
+  the `net.inet.ip.forwarding` sysctl. NAT activation, default-route
+  advertisement, and DNS killswitch enforcement remain owned by
+  rustynetd; this unit is install-time evidence the host is prepared,
+  not a parallel exit dataplane.
+
+  RunAtLoad fires the preflight once on bootstrap. KeepAlive=false
+  so the unit doesn't churn — operators reload it explicitly when
+  the role transition flips again.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.exit</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/sbin/sysctl</string>
+        <string>-w</string>
+        <string>net.inet.ip.forwarding=1</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/rustynet/rustynet-exit.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/rustynet/rustynet-exit-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/sbin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/sbin</string>
+    </dict>
+</dict>
+</plist>
