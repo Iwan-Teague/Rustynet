@@ -9479,8 +9479,10 @@ pub struct WindowsOrchestrationOptions {
     /// mesh exit. When true the orchestrator inserts a
     /// `promote_windows_exit_active` stage that runs the reviewed
     /// `ops install-windows-exit-service` preflight on the Windows
-    /// host, then polls the daemon IPC status until it reports
-    /// `node_role=admin serving_exit_node=true`. Default (false)
+    /// host, then polls Windows SCM + the daemon-owned
+    /// `rustynetd.exe windows-mesh-status-check` probe until the
+    /// daemon is running with the reviewed admin env-file posture.
+    /// Default (false)
     /// leaves the Windows host as a client peer — the existing
     /// `validate_windows_exit_*` stages still attest the host is
     /// *capable* of exit-serving, but the active mesh exit stays on
@@ -11465,10 +11467,12 @@ fn parse_windows_exit_evidence_capture_summary(raw_json: &str) -> Result<(usize,
 /// 1. Running the reviewed `Install-RustyNetWindowsExitService.ps1`
 ///    preflight on the Windows host (enables IPv4 forwarding on every
 ///    interface and writes a reviewed install-evidence JSON).
-/// 2. Polling the daemon's IPC status via `rustynet status` until it
-///    reports `serving_exit_node=true`, capped at
-///    [`WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS`] so a wedged daemon
-///    surfaces as a clear failure rather than an open-ended wait.
+/// 2. Polling Windows SCM + the daemon-owned
+///    `rustynetd.exe windows-mesh-status-check` probe until the
+///    daemon is Running, has the reviewed admin env-file posture, and
+///    publishes a fresh runtime mesh snapshot. This avoids
+///    `rustynet.exe status` on Windows because that binary can be the
+///    trust CLI and is not a daemon-control surface.
 ///
 /// The host-interface egress evidence is captured by the existing
 /// `validate_windows_exit_nat_lifecycle` stage, which inspects the
@@ -11514,28 +11518,14 @@ fn promote_windows_to_active_exit(
     .map_err(|err| format!("install-windows-exit-service on {windows_alias} failed: {err}"))?;
     let install_trimmed = install_output.trim().to_owned();
 
-    // Step 2: poll daemon IPC status until serving_exit_node=true or
-    // we hit the timeout. The poll runs a short PowerShell loop on the
-    // Windows host that captures `rustynet status` and parses it for
-    // the `serving_exit_node=true` field — same field shape as
-    // `resolve_preset_from_status` consumes.
-    let poll_script = format!(
-        "$deadline = (Get-Date).AddSeconds({timeout}); \
-         while ((Get-Date) -lt $deadline) {{ \
-           $out = & {exe} status 2>$null; \
-           if ($LASTEXITCODE -eq 0 -and $out -match 'serving_exit_node=true' \
-               -and $out -match 'node_role=admin') {{ \
-             Write-Output \"PROMOTED $out\"; \
-             exit 0; \
-           }}; \
-           Start-Sleep -Seconds 2; \
-         }}; \
-         Write-Error \"timed out waiting for serving_exit_node=true on {windows_alias}\"; \
-         exit 1",
-        timeout = WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS,
-        exe = powershell_quote(WINDOWS_RUSTYNETD_CLI_PATH)?,
-        windows_alias = windows_alias,
-    );
+    // Step 2: poll daemon-owned readiness. Never call
+    // `rustynet.exe status`: on Windows that binary may be the trust
+    // CLI, not a daemon-control CLI. Active-exit NAT/DNS/killswitch
+    // stages provide the exit-serving proof after this gate.
+    let poll_script = build_windows_active_exit_readiness_script(
+        windows_alias,
+        WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS,
+    )?;
     let poll_invocation = build_ssh_powershell_encoded_invocation(poll_script.as_str())?;
     let poll_output = capture_remote_shell_command_for_target(
         &target,
@@ -11549,18 +11539,16 @@ fn promote_windows_to_active_exit(
         ),
     )
     .map_err(|err| {
-        format!(
-            "polling Windows daemon IPC for serving_exit_node=true on {windows_alias} failed: {err}"
-        )
+        if windows_trust_cli_status_output(err.as_str()) {
+            return classify_windows_active_exit_readiness_output(windows_alias, err.as_str())
+                .expect_err("trust CLI status output must classify as readiness error");
+        }
+        format!("polling Windows daemon readiness for {windows_alias} failed: {err}")
     })?;
     let poll_trimmed = poll_output.trim().to_owned();
-    if !poll_trimmed.contains("PROMOTED") {
-        return Err(format!(
-            "Windows daemon on {windows_alias} did not report serving_exit_node=true within {WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS}s: {poll_trimmed}"
-        ));
-    }
+    classify_windows_active_exit_readiness_output(windows_alias, poll_trimmed.as_str())?;
     Ok(format!(
-        "Windows host {windows_alias} promoted to active mesh exit; preflight: {install_trimmed}; daemon IPC: {poll_trimmed}"
+        "Windows host {windows_alias} promoted to active mesh exit; preflight: {install_trimmed}; daemon readiness: {poll_trimmed}"
     ))
 }
 
@@ -11570,9 +11558,89 @@ fn promote_windows_to_active_exit(
 /// wedged daemon fails the stage instead of stalling the live lab.
 const WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS: u64 = 60;
 
-/// Path of the installed `rustynet.exe` (CLI) on Windows guests,
-/// mirroring `rustynetd.exe`'s sibling install path.
+/// Path of the installed `rustynet.exe` (CLI) on Windows guests. This is
+/// only valid for reviewed `rustynet ops ...` invocations; it must not be
+/// used as a daemon status/readiness CLI on Windows.
 const WINDOWS_RUSTYNETD_CLI_PATH: &str = r"C:\Program Files\RustyNet\rustynet.exe";
+
+const WINDOWS_RUSTYNETD_ENV_PATH: &str = r"C:\ProgramData\RustyNet\config\rustynetd.env";
+const WINDOWS_WIREGUARD_PUBLIC_KEY_PATH: &str = r"C:\ProgramData\RustyNet\keys\wireguard.pub";
+
+fn build_windows_active_exit_readiness_script(
+    windows_alias: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    ensure_no_control_chars("Windows alias", windows_alias)?;
+    let alias_q = powershell_quote(windows_alias)?;
+    let daemon_q = powershell_quote(WINDOWS_RUSTYNETD_EXE_PATH)?;
+    let env_q = powershell_quote(WINDOWS_RUSTYNETD_ENV_PATH)?;
+    let key_q = powershell_quote(WINDOWS_WIREGUARD_PUBLIC_KEY_PATH)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; \
+         $ErrorActionPreference = 'Stop'; \
+         $TargetAlias = {alias_q}; \
+         $DaemonPath = {daemon_q}; \
+         $EnvPath = {env_q}; \
+         $KeyPath = {key_q}; \
+         $deadline = (Get-Date).AddSeconds({timeout_secs}); \
+         $last = 'not-started'; \
+         while ((Get-Date) -lt $deadline) {{ \
+           $svc = Get-Service -Name RustyNet -ErrorAction SilentlyContinue; \
+           $svcStatus = if ($null -eq $svc) {{ 'missing' }} else {{ [string]$svc.Status }}; \
+           $envContent = ''; \
+           if (Test-Path -LiteralPath $EnvPath -PathType Leaf) {{ \
+             $envContent = Get-Content -LiteralPath $EnvPath -Raw -ErrorAction Stop \
+           }}; \
+           $nodeMatch = [regex]::Match($envContent, '\"--node-id\",\"([^\"]+)\"'); \
+           $roleMatch = [regex]::Match($envContent, '\"--node-role\",\"([^\"]+)\"'); \
+           $nodeId = if ($nodeMatch.Success) {{ $nodeMatch.Groups[1].Value.Trim() }} else {{ '' }}; \
+           $role = if ($roleMatch.Success) {{ $roleMatch.Groups[1].Value.Trim() }} else {{ '' }}; \
+           $daemonPresent = Test-Path -LiteralPath $DaemonPath -PathType Leaf; \
+           $keyPresent = Test-Path -LiteralPath $KeyPath -PathType Leaf; \
+           if ($svcStatus -eq 'Running' -and $daemonPresent -and $nodeId.Length -gt 0 -and $role -eq 'admin' -and $keyPresent) {{ \
+             $probeOut = & $DaemonPath windows-mesh-status-check --max-age-seconds 120 2>&1; \
+             $probeExit = $LASTEXITCODE; \
+             $probeText = [string]::Join(\"`n\", @($probeOut)); \
+             if ($probeExit -eq 0) {{ \
+               $probeJson = $probeText | ConvertFrom-Json -ErrorAction Stop; \
+               if ($probeJson.overall_ok -eq $true) {{ \
+                 Write-Output ('PROMOTED node_id=' + $nodeId + ' service=Running role=admin mesh_status=ok'); \
+                 exit 0 \
+               }} \
+             }}; \
+             $last = 'service=' + $svcStatus + ' node_id=' + $nodeId + ' role=' + $role + ' probe_exit=' + $probeExit + ' probe=' + $probeText \
+           }} else {{ \
+             $last = 'service=' + $svcStatus + ' daemon_present=' + $daemonPresent + ' env_present=' + ($envContent.Length -gt 0) + ' node_id_present=' + ($nodeId.Length -gt 0) + ' role=' + $role + ' wireguard_pub_present=' + $keyPresent \
+           }}; \
+           Start-Sleep -Seconds 2 \
+         }}; \
+         Write-Error ('timed out waiting for Windows daemon readiness on ' + $TargetAlias + '; last=' + $last); \
+         exit 1"
+    ))
+}
+
+fn windows_trust_cli_status_output(raw_output: &str) -> bool {
+    let lower = raw_output.to_ascii_lowercase();
+    lower.contains("unknown rustynet-windows-trust-cli command: status")
+        || lower.contains("usage: rustynet trust")
+}
+
+fn classify_windows_active_exit_readiness_output(
+    windows_alias: &str,
+    raw_output: &str,
+) -> Result<(), String> {
+    if raw_output.contains("PROMOTED") {
+        return Ok(());
+    }
+    if windows_trust_cli_status_output(raw_output) {
+        return Err(format!(
+            "Windows daemon readiness for {windows_alias} received trust-CLI status output; rustynet.exe is not a daemon status CLI. Expected SCM Running plus rustynetd.exe windows-mesh-status-check readiness."
+        ));
+    }
+    Err(format!(
+        "Windows daemon on {windows_alias} did not reach SCM/env/probe readiness within {WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS}s: {raw_output}"
+    ))
+}
 
 fn capture_windows_exit_evidence_artifacts(
     windows_alias: &str,
@@ -34152,6 +34220,67 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             script.ends_with("windows-runtime-acls-check --no-fail-on-drift"),
             "script must end with subcommand + fail-closed flag: {script:?}"
         );
+    }
+
+    #[test]
+    fn windows_active_exit_readiness_uses_daemon_probe_not_trust_cli_status() {
+        let script = super::build_windows_active_exit_readiness_script("windows-utm-1", 60)
+            .expect("readiness script must build");
+        assert!(
+            script.contains("& $DaemonPath windows-mesh-status-check --max-age-seconds 120"),
+            "readiness must invoke daemon-owned probe: {script}"
+        );
+        assert!(
+            script.contains("ConvertFrom-Json"),
+            "readiness must parse typed daemon-probe JSON: {script}"
+        );
+        assert!(
+            script.contains("Get-Service -Name RustyNet"),
+            "readiness must check SCM state: {script}"
+        );
+        assert!(
+            script.contains(r"C:\ProgramData\RustyNet\config\rustynetd.env"),
+            "readiness must inspect reviewed env file: {script}"
+        );
+        assert!(
+            script.contains(r"C:\ProgramData\RustyNet\keys\wireguard.pub"),
+            "readiness must require generated WireGuard public key: {script}"
+        );
+        assert!(
+            !script.contains("rustynet.exe"),
+            "readiness must not invoke Windows trust CLI: {script}"
+        );
+        assert!(
+            !script.contains(" status 2>"),
+            "readiness must not fall back to status CLI parsing: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_active_exit_readiness_rejects_trust_cli_status_output() {
+        let err = super::classify_windows_active_exit_readiness_output(
+            "windows-utm-1",
+            "unknown rustynet-windows-trust-cli command: status\nusage: rustynet trust <keygen|export-verifier-key|issue> [options]",
+        )
+        .expect_err("trust CLI status output must fail closed");
+        assert!(
+            err.contains("rustynet.exe is not a daemon status CLI")
+                && err.contains("rustynetd.exe windows-mesh-status-check"),
+            "readiness error must be actionable: {err}"
+        );
+        assert!(
+            !err.contains("node_id="),
+            "trust CLI usage output must not be parsed as node-id: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_active_exit_readiness_accepts_promoted_probe_output() {
+        super::classify_windows_active_exit_readiness_output(
+            "windows-utm-1",
+            "PROMOTED node_id=windows-exit service=Running role=admin mesh_status=ok",
+        )
+        .expect("PROMOTED probe output should pass");
     }
 
     #[test]
