@@ -229,13 +229,12 @@ install_rust_toolchain_hardened() {
 
   # Check if stable toolchain already installed.
   if as_user "${brew_rustup}" toolchain list 2>/dev/null | grep -q "stable-.*apple-darwin"; then
-    echo "[prereqs] Rust stable toolchain already present"
-    as_user "${brew_rustup}" toolchain install stable --profile minimal 2>&1 | tail -3
+    echo "[prereqs] Rust stable toolchain already present (skipping update; offline-safe)"
   else
     echo "[prereqs] Installing Rust stable toolchain as ${REAL_USER}..."
     as_user "${brew_rustup}" toolchain install stable --profile minimal
   fi
-  as_user "${brew_rustup}" default stable
+  as_user "${brew_rustup}" default stable 2>&1 | tail -3 || true
 
   local rustc_ver
   rustc_ver="$(as_user "${brew_rustup}" run stable rustc --version 2>/dev/null)"
