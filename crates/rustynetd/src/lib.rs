@@ -16,6 +16,7 @@ pub mod ipc;
 pub mod key_material;
 pub mod linux_authenticode;
 pub mod linux_dns_failclosed;
+pub mod linux_exit_nat_lifecycle;
 pub mod linux_key_custody;
 pub mod linux_killswitch_boot;
 pub mod linux_mesh_status;

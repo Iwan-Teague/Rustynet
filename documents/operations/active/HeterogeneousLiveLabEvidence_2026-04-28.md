@@ -310,3 +310,25 @@ done:
 - Connect the offline signed-state fixtures to a live daemon ingestion/rejection
   proof once the operator is ready for live-lab mutation; current coverage is
   hermetic fixture generation and report contract validation only.
+
+## 9) Linux Exit-Role Orchestration Parity — 2026-05-23 Evidence
+
+This section tracks the Linux producer/orchestrator parity work that brings
+Linux exit-role evidence up to the same deeper stage model as macOS and
+Windows. This is code-only evidence until the operator runs the clean Debian
+13 lab.
+
+### 9.1) Code Surfaces Shipped
+
+| Step | Deliverable | Files |
+|---|---|---|
+| L1 | Linux exit NAT lifecycle producer + validator. `rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]` emits a single-phase nftables NAT + `/proc/sys` forwarding snapshot. `capture_linux_exit_nat_lifecycle.sh` performs the destructive two-phase stop/start capture and writes the merged artefact consumed by `validate_linux_exit_nat_lifecycle`. | `crates/rustynetd/src/linux_exit_nat_lifecycle.rs`, `crates/rustynetd/src/main.rs`, `scripts/e2e/capture_linux_exit_nat_lifecycle.sh`, `crates/rustynet-cli/src/vm_lab/mod.rs` |
+| L1 CI | Hermetic Linux exit-role gate plus cross-platform gate references. | `scripts/ci/linux_exit_role_gates.sh`, `scripts/ci/cross_platform_role_gates.sh` |
+
+### 9.2) Remaining Linux Parity Work
+
+- Add Linux exit DNS fail-closed producer and `validate_linux_exit_dns_failclosed`.
+- Add Linux killswitch precedence producer and `validate_linux_exit_killswitch_precedence`.
+- Add Linux relay lifecycle, anchor bundle-pull, and membership genesis validator stages.
+- Flip Linux/macOS NAT lifecycle schemas to v2 for IPv6 parity once dual-stack
+  membership detection is wired.

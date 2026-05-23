@@ -575,3 +575,13 @@ across stages.
   `scripts/ci/chaos_gates.sh` now asserts the signed-state report is `pass`,
   `reject_fail_closed`, and `production_accepted=false`. This is hermetic only;
   live daemon ingestion/rejection proof remains a later opt-in live-lab slice.
+- 2026-05-23 — Linux orchestration parity L1 landed. Added
+  `rustynetd linux-exit-nat-lifecycle-snapshot`, the
+  `linux_exit_nat_lifecycle` producer module, destructive two-phase
+  `scripts/e2e/capture_linux_exit_nat_lifecycle.sh`, and the
+  `validate_linux_exit_nat_lifecycle` orchestrator stage with skip-when-artefact-
+  absent behavior. Added hermetic producer→validator round-trip tests and
+  `scripts/ci/linux_exit_role_gates.sh`; extended
+  `scripts/ci/cross_platform_role_gates.sh` to include the Linux producer. DNS
+  fail-closed, killswitch precedence, relay, anchor, genesis, and IPv6 schema-v2
+  parity remain follow-up Linux slices.
