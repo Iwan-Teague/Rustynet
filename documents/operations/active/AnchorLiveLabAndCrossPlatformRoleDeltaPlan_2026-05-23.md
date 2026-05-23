@@ -554,3 +554,14 @@ across stages.
   The category harnesses emit structured dry-run reports today; live host
   mutation, tcpdump leak proofs, and measured recovery deadlines remain the
   next Track C slices.
+- 2026-05-23 — Track C C1.1 daemon-fault live slice started. The
+  `chaos_daemon_kill_during_reconcile` sub-stage now has a live-capable Rust
+  harness path that requires explicit target/client/identity arguments, verifies
+  pinned known_hosts and passwordless sudo, starts client exit-path traffic,
+  registers remote teardown before injecting `systemctl kill -s KILL`, captures
+  a tcpdump plaintext-leak window on the exit host's default-route interface,
+  measures daemon socket recovery against the encoded deadline, and emits a
+  structured report. Orchestrator `--enable-chaos-suite` now wires this daemon
+  KILL proof; default runs still skip chaos. The OOM, SIGSTOP/SIGCONT, and
+  helper-socket daemon-fault sub-stages remain skipped until their live-safe
+  implementations land.
