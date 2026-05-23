@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+LIVE_LAB_CHAOS_TEARDOWNS=()
+
 live_lab_require_command() {
   local cmd="$1"
   if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -63,9 +65,82 @@ live_lab_init() {
 }
 
 live_lab_cleanup() {
+  live_lab_chaos_release_all
   if [[ -n "${LIVE_LAB_WORK_DIR:-}" && -d "${LIVE_LAB_WORK_DIR}" ]]; then
     rm -rf "$LIVE_LAB_WORK_DIR"
   fi
+}
+
+live_lab_chaos_init() {
+  LIVE_LAB_CHAOS_MANIFEST="${1:?chaos manifest path required}"
+  LIVE_LAB_CHAOS_TEARDOWNS=()
+  mkdir -p "$(dirname "$LIVE_LAB_CHAOS_MANIFEST")"
+  {
+    printf 'schema_version=1\n'
+    printf 'created_at_unix=%s\n' "$(date +%s)"
+  } > "$LIVE_LAB_CHAOS_MANIFEST"
+}
+
+live_lab_chaos_register_teardown() {
+  local label="${1:?chaos teardown label required}"
+  local callback="${2:?chaos teardown callback required}"
+  if [[ ! "$label" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+    echo "invalid chaos teardown label: $label" >&2
+    return 2
+  fi
+  if [[ ! "$callback" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "invalid chaos teardown callback: $callback" >&2
+    return 2
+  fi
+  LIVE_LAB_CHAOS_TEARDOWNS+=("${label}	${callback}")
+  if [[ -n "${LIVE_LAB_CHAOS_MANIFEST:-}" ]]; then
+    printf 'teardown_registered\t%s\t%s\n' "$(date +%s)" "$label" >> "$LIVE_LAB_CHAOS_MANIFEST"
+  fi
+}
+
+live_lab_chaos_inject() {
+  local label="${1:?chaos label required}"
+  local recovery_deadline_secs="${2:?chaos recovery deadline required}"
+  if [[ ! "$label" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+    echo "invalid chaos label: $label" >&2
+    return 2
+  fi
+  if [[ ! "$recovery_deadline_secs" =~ ^[0-9]+$ || "$recovery_deadline_secs" -le 0 ]]; then
+    echo "invalid chaos recovery deadline: $recovery_deadline_secs" >&2
+    return 2
+  fi
+  if [[ -n "${LIVE_LAB_CHAOS_MANIFEST:-}" ]]; then
+    printf 'fault_window_start\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$recovery_deadline_secs" >> "$LIVE_LAB_CHAOS_MANIFEST"
+  fi
+}
+
+live_lab_chaos_release() {
+  local label="${1:?chaos label required}"
+  if [[ -n "${LIVE_LAB_CHAOS_MANIFEST:-}" ]]; then
+    printf 'fault_window_end\t%s\t%s\n' "$(date +%s)" "$label" >> "$LIVE_LAB_CHAOS_MANIFEST"
+  fi
+}
+
+live_lab_chaos_release_all() {
+  local item label callback teardown_rc
+  if [[ "${#LIVE_LAB_CHAOS_TEARDOWNS[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  set +e
+  for item in "${LIVE_LAB_CHAOS_TEARDOWNS[@]}"; do
+    label="${item%%	*}"
+    callback="${item#*	}"
+    if [[ -n "${LIVE_LAB_CHAOS_MANIFEST:-}" ]]; then
+      printf 'teardown_start\t%s\t%s\n' "$(date +%s)" "$label" >> "$LIVE_LAB_CHAOS_MANIFEST"
+    fi
+    "$callback"
+    teardown_rc="$?"
+    if [[ -n "${LIVE_LAB_CHAOS_MANIFEST:-}" ]]; then
+      printf 'teardown_end\t%s\t%s\t%s\n' "$(date +%s)" "$label" "$teardown_rc" >> "$LIVE_LAB_CHAOS_MANIFEST"
+    fi
+  done
+  LIVE_LAB_CHAOS_TEARDOWNS=()
+  set -e
 }
 
 live_lab_require_known_hosts_file() {
