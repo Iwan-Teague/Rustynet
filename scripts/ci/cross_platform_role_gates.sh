@@ -13,7 +13,9 @@ required_files=(
   crates/rustynet-cli/src/vm_lab/topology.rs
   crates/rustynet-cli/src/ops_install_systemd_exit.rs
   crates/rustynet-cli/src/ops_install_macos_exit.rs
+  crates/rustynetd/src/linux_exit_nat_lifecycle.rs
   crates/rustynetd/src/macos_exit_nat_lifecycle.rs
+  scripts/e2e/capture_linux_exit_nat_lifecycle.sh
   scripts/e2e/capture_macos_exit_nat_lifecycle.sh
   scripts/systemd/rustynet-exit.service
   scripts/launchd/com.rustynet.exit.plist
@@ -68,6 +70,13 @@ rg -q 'macos-exit-nat-lifecycle-snapshot' crates/rustynetd/src/main.rs
 rg -q 'build_macos_exit_nat_lifecycle_snapshot' crates/rustynetd/src/macos_exit_nat_lifecycle.rs
 rg -q 'merge_macos_exit_nat_lifecycle_artifact' crates/rustynetd/src/macos_exit_nat_lifecycle.rs
 
+# Producer side: Linux NAT lifecycle snapshot subcommand + library
+# functions feeding the validator's two-phase artefact contract.
+rg -q 'linux-exit-nat-lifecycle-snapshot' crates/rustynetd/src/main.rs
+rg -q 'build_linux_exit_nat_lifecycle_snapshot' crates/rustynetd/src/linux_exit_nat_lifecycle.rs
+rg -q 'merge_linux_exit_nat_lifecycle_artifact' crates/rustynetd/src/linux_exit_nat_lifecycle.rs
+rg -q 'validate_linux_exit_nat_lifecycle' crates/rustynet-cli/src/vm_lab/mod.rs
+
 # Unit tests covering the surfaces above. Each `-p rustynet-cli` test
 # target is a single hermetic binary, so the gate doesn't need a live
 # VM lab to run; it is safe in PR-time CI.
@@ -94,5 +103,8 @@ cargo test -p rustynet-cli --bin rustynet-cli \
 cargo test -p rustynet-cli --bin rustynet-cli \
   vm_lab::tests::macos_exit_nat_lifecycle_producer_round_trip_rejects_forwarding_not_restored -- --nocapture
 cargo test -p rustynetd --lib macos_exit_nat_lifecycle:: -- --nocapture
+cargo test -p rustynet-cli --bin rustynet-cli \
+  vm_lab::tests::linux_exit_nat_lifecycle_producer_to_validator_round_trip -- --nocapture
+cargo test -p rustynetd --lib linux_exit_nat_lifecycle:: -- --nocapture
 
 echo "Cross-platform role CI gates: PASS"

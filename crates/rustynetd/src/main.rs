@@ -203,6 +203,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "linux-dns-failclosed-check" => {
                 run_linux_dns_failclosed_check_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "linux-exit-nat-lifecycle-snapshot" => {
+                run_linux_exit_nat_lifecycle_snapshot_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "macos-runtime-acls-check" => {
                 run_macos_runtime_acls_check_command(rest)
             }
@@ -1143,6 +1146,60 @@ fn run_macos_exit_nat_lifecycle_snapshot_command(args: &[String]) -> Result<(), 
         "{}",
         serde_json::to_string_pretty(&snapshot).map_err(|err| {
             format!("serialize macos-exit-nat-lifecycle snapshot failed: {err}")
+        })?
+    );
+    Ok(())
+}
+
+/// Linux exit-mode NAT lifecycle producer.
+///
+/// Captures the current nftables NAT table + Linux forwarding state
+/// and emits a single-phase snapshot to stdout. The orchestrator runs
+/// this twice (during exit mode + after daemon stop) and merges into
+/// the two-phase artefact the
+/// `evaluate_linux_exit_nat_lifecycle_artifact` validator reads.
+fn run_linux_exit_nat_lifecycle_snapshot_command(args: &[String]) -> Result<(), String> {
+    let mut mesh_cidr: Option<String> = None;
+    let mut nat_table: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--mesh-cidr") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-exit-nat-lifecycle-snapshot: --mesh-cidr requires a value".to_owned()
+                })?;
+                mesh_cidr = Some(value.clone());
+                index += 2;
+            }
+            Some("--nat-table") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "linux-exit-nat-lifecycle-snapshot: --nat-table requires a value".to_owned()
+                })?;
+                nat_table = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown linux-exit-nat-lifecycle-snapshot argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let mesh_cidr = mesh_cidr
+        .ok_or_else(|| "linux-exit-nat-lifecycle-snapshot: --mesh-cidr is required".to_owned())?;
+    let options = rustynetd::linux_exit_nat_lifecycle::LinuxExitNatLifecycleOptions {
+        mesh_cidr,
+        nat_table: nat_table.unwrap_or_else(|| {
+            rustynetd::linux_exit_nat_lifecycle::DEFAULT_LINUX_EXIT_NAT_TABLE.to_owned()
+        }),
+    };
+    let snapshot =
+        rustynetd::linux_exit_nat_lifecycle::collect_linux_exit_nat_lifecycle_snapshot(&options);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot).map_err(|err| {
+            format!("serialize linux-exit-nat-lifecycle snapshot failed: {err}")
         })?
     );
     Ok(())
@@ -2983,6 +3040,7 @@ fn help_text() -> String {
         "  rustynetd linux-authenticode-check [--no-fail-on-drift]",
         "  rustynetd linux-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
+        "  rustynetd linux-exit-nat-lifecycle-snapshot --mesh-cidr <cidr> [--nat-table <name>]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
         "  rustynetd macos-exit-killswitch-precedence-check --output <path> [--pf-anchor <name>]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",

@@ -7092,6 +7092,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             }
             if let Some(ref macos_alias) = config.macos_vm {
                 let macos_outcomes = run_macos_orchestration_stages(
+                    &config,
                     macos_alias.as_str(),
                     inventory_path.as_path(),
                     config.ssh_identity_file.as_path(),
@@ -7210,6 +7211,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             }
             if let Some(ref macos_alias) = config.macos_vm {
                 let macos_outcomes = run_macos_orchestration_stages(
+                    &config,
                     macos_alias.as_str(),
                     inventory_path.as_path(),
                     config.ssh_identity_file.as_path(),
@@ -7294,6 +7296,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
             }
             if let Some(ref macos_alias) = config.macos_vm {
                 let macos_outcomes = run_macos_orchestration_stages(
+                    &config,
                     macos_alias.as_str(),
                     inventory_path.as_path(),
                     config.ssh_identity_file.as_path(),
@@ -7557,6 +7560,7 @@ const MACOS_ENV_FILE_REMOTE: &str = "/tmp/rustynet-macos-bootstrap.env";
 /// signed bundle set.
 #[allow(clippy::too_many_arguments)]
 fn run_macos_orchestration_stages(
+    config: &VmLabOrchestrateLiveLabConfig,
     macos_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
@@ -8204,14 +8208,82 @@ fn run_macos_orchestration_stages(
     let mesh_join_passed = validate_outcome.status == VmLabStageStatus::Pass;
     outcomes.push(validate_outcome);
 
-    // ── Stage 6: validate_macos_exit_nat_lifecycle ────────────────────────
+    let is_macos_active_exit = config
+        .macos_vm
+        .as_deref()
+        .zip(config.exit_vm.as_deref())
+        .is_some_and(|(macos, exit)| macos == exit);
+    let macos_exit_artifact_root = report_dir.join("macos_exit_evidence");
+
+    // ── Stage 6: capture_macos_exit_evidence_artifacts ───────────────────
+    let capture_macos_exit_log_path = logs_dir.join("capture_macos_exit_evidence_artifacts.log");
+    let capture_macos_exit_outcome = if dry_run {
+        stage_outcome(
+            "capture_macos_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would capture macOS Exit evidence artifacts for {macos_alias} when active exit"
+            ),
+            vec![],
+        )
+    } else if !is_macos_active_exit {
+        stage_outcome(
+            "capture_macos_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!(
+                "skipped: macOS host {macos_alias} is not the active exit; exit_vm={}",
+                config.exit_vm.as_deref().unwrap_or("<unset>")
+            ),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "capture_macos_exit_evidence_artifacts",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match capture_macos_exit_evidence_artifacts(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+            macos_exit_artifact_root.as_path(),
+        ) {
+            Ok((summary, raw_log, copied_paths)) => {
+                let _ = fs::write(&capture_macos_exit_log_path, raw_log.as_str());
+                stage_outcome(
+                    "capture_macos_exit_evidence_artifacts",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    std::iter::once(capture_macos_exit_log_path.clone())
+                        .chain(copied_paths)
+                        .collect(),
+                )
+            }
+            Err((reason, raw_log)) => {
+                let _ = fs::write(&capture_macos_exit_log_path, raw_log.as_str());
+                stage_outcome(
+                    "capture_macos_exit_evidence_artifacts",
+                    VmLabStageStatus::Fail,
+                    format!("macOS Exit evidence capture failed for {macos_alias}: {reason}"),
+                    vec![capture_macos_exit_log_path.clone()],
+                )
+            }
+        }
+    };
+    let macos_exit_capture_passed =
+        capture_macos_exit_outcome.status == VmLabStageStatus::Pass || !is_macos_active_exit;
+    outcomes.push(capture_macos_exit_outcome);
+
+    // ── Stage 7: validate_macos_exit_nat_lifecycle ────────────────────────
     //
     // Mirrors the Windows `validate_windows_exit_nat_lifecycle` stage but
     // looks for a pf-anchor / `net.inet.ip.forwarding` lifecycle artefact
     // under `<report_dir>/macos_exit_evidence/`. The artefact is produced
     // by a macOS-on-host exit-mode test bin; if it isn't present we skip
     // cleanly so default runs (macOS-as-client) don't fail.
-    let macos_exit_artifact_root = report_dir.join("macos_exit_evidence");
     let exit_nat_lifecycle_log_path = logs_dir.join("validate_macos_exit_nat_lifecycle.log");
     let exit_nat_lifecycle_outcome = if dry_run {
         stage_outcome(
@@ -8225,6 +8297,13 @@ fn run_macos_orchestration_stages(
             "validate_macos_exit_nat_lifecycle",
             VmLabStageStatus::Skipped,
             format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else if !macos_exit_capture_passed {
+        stage_outcome(
+            "validate_macos_exit_nat_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"),
             vec![],
         )
     } else {
@@ -8272,7 +8351,7 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(exit_nat_lifecycle_outcome);
 
-    // ── Stage 7: validate_macos_exit_dns_failclosed ───────────────────────
+    // ── Stage 8: validate_macos_exit_dns_failclosed ───────────────────────
     let exit_dns_leak_log_path = logs_dir.join("validate_macos_exit_dns_failclosed.log");
     let exit_dns_leak_outcome = if dry_run {
         stage_outcome(
@@ -8286,6 +8365,13 @@ fn run_macos_orchestration_stages(
             "validate_macos_exit_dns_failclosed",
             VmLabStageStatus::Skipped,
             format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else if !macos_exit_capture_passed {
+        stage_outcome(
+            "validate_macos_exit_dns_failclosed",
+            VmLabStageStatus::Skipped,
+            format!("skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"),
             vec![],
         )
     } else {
@@ -8337,7 +8423,7 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(exit_dns_leak_outcome);
 
-    // ── Stage 8: validate_macos_exit_killswitch_precedence ────────────────
+    // ── Stage 9: validate_macos_exit_killswitch_precedence ────────────────
     let exit_killswitch_log_path = logs_dir.join("validate_macos_exit_killswitch_precedence.log");
     let exit_killswitch_outcome = if dry_run {
         stage_outcome(
@@ -8353,6 +8439,13 @@ fn run_macos_orchestration_stages(
             "validate_macos_exit_killswitch_precedence",
             VmLabStageStatus::Skipped,
             format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else if !macos_exit_capture_passed {
+        stage_outcome(
+            "validate_macos_exit_killswitch_precedence",
+            VmLabStageStatus::Skipped,
+            format!("skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"),
             vec![],
         )
     } else {
@@ -11966,6 +12059,66 @@ fn evaluate_macos_exit_nat_lifecycle_artifact(
     ))
 }
 
+/// Linux NAT lifecycle artefact validator. Mirrors the macOS shape
+/// but asserts the runtime's nftables `ip` NAT table and Linux
+/// `/proc/sys/net/ipv4/ip_forward` lifecycle. The producer captures a
+/// single phase; the wrapper merges during-run + after-stop snapshots
+/// into this two-phase JSON shape.
+fn evaluate_linux_exit_nat_lifecycle_artifact(
+    linux_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: Value = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse linux exit NAT lifecycle artifact failed: {err}"))?;
+    require_json_u64(&report, "schema_version")?
+        .eq(&1)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "linux exit NAT lifecycle artifact returned unsupported schema_version={}",
+                require_json_u64(&report, "schema_version").unwrap_or_default()
+            )
+        })?;
+    let mesh_cidr = require_json_str(&report, "mesh_cidr")?;
+    validate_cidr_like("mesh_cidr", mesh_cidr)?;
+    let nat_table = require_json_str(&report, "nat_table")?;
+    if nat_table.trim().is_empty() {
+        return Err("linux exit NAT lifecycle artifact has empty nat_table".to_owned());
+    }
+    let during = require_json_value(&report, "during_run")?;
+    if !require_json_bool(during, "nat_table_present")? {
+        return Err(
+            "linux exit NAT lifecycle artifact did not prove nftables NAT table present during run"
+                .to_owned(),
+        );
+    }
+    let internal_prefix = require_json_str(during, "internal_prefix")?;
+    if internal_prefix != mesh_cidr {
+        return Err(format!(
+            "linux exit NAT lifecycle artifact internal_prefix {internal_prefix:?} did not match mesh_cidr {mesh_cidr:?}"
+        ));
+    }
+    require_forwarding_enabled_macos(during, "tunnel_forwarding")?;
+    require_forwarding_enabled_macos(during, "egress_forwarding")?;
+
+    let after = require_json_value(&report, "after_stop")?;
+    if require_json_bool(after, "nat_table_present")? {
+        return Err(
+            "linux exit NAT lifecycle artifact left nftables NAT table present after daemon stop"
+                .to_owned(),
+        );
+    }
+    if !require_json_bool(after, "forwarding_restored")? {
+        return Err(
+            "linux exit NAT lifecycle artifact did not prove ip_forward was restored after stop"
+                .to_owned(),
+        );
+    }
+    Ok(format!(
+        "Linux exit NAT lifecycle verified on {linux_alias} (nat_table={nat_table}, mesh_cidr={mesh_cidr})"
+    ))
+}
+
 /// macOS DNS fail-closed artefact-directory validator. Parallel to the
 /// Windows variant. Required files in the artefact directory:
 ///
@@ -13696,6 +13849,7 @@ fn run_linux_orchestration_stages_with_options(
     let authenticode_log_path = logs_dir.join("validate_linux_authenticode.log");
     let hardening_log_path = logs_dir.join("validate_linux_service_hardening.log");
     let dns_failclosed_log_path = logs_dir.join("validate_linux_dns_failclosed.log");
+    let exit_nat_lifecycle_log_path = logs_dir.join("validate_linux_exit_nat_lifecycle.log");
 
     type LinuxStageFn =
         fn(&str, &Path, &Path, Option<&Path>) -> Result<(String, String), (String, String)>;
@@ -13821,6 +13975,73 @@ fn run_linux_orchestration_stages_with_options(
     };
     let dns_failclosed_passed = dns_failclosed_outcome.status == VmLabStageStatus::Pass;
 
+    let exit_nat_lifecycle_outcome = if options.dry_run {
+        stage_outcome(
+            "validate_linux_exit_nat_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would validate Linux Exit NAT lifecycle artifact for {linux_alias}"),
+            vec![],
+        )
+    } else if !runtime_acls_passed {
+        make_skipped(
+            "validate_linux_exit_nat_lifecycle",
+            "validate_linux_runtime_acls",
+        )
+    } else if !key_custody_passed {
+        make_skipped(
+            "validate_linux_exit_nat_lifecycle",
+            "validate_linux_key_custody",
+        )
+    } else if !hardening_passed {
+        make_skipped(
+            "validate_linux_exit_nat_lifecycle",
+            "validate_linux_service_hardening",
+        )
+    } else {
+        let artifact_path = report_dir
+            .join("linux_exit_evidence")
+            .join("linux_exit_nat_lifecycle.json");
+        if !artifact_path.exists() {
+            stage_outcome(
+                "validate_linux_exit_nat_lifecycle",
+                VmLabStageStatus::Skipped,
+                format!(
+                    "skipped: Linux Exit NAT lifecycle artifact not present at {}; Linux host is not proving active exit lifecycle",
+                    artifact_path.display()
+                ),
+                vec![],
+            )
+        } else {
+            match fs::read_to_string(&artifact_path)
+                .map_err(|err| format!("read {} failed: {err}", artifact_path.display()))
+                .and_then(|raw| {
+                    evaluate_linux_exit_nat_lifecycle_artifact(linux_alias, raw.as_str())
+                        .map(|summary| (summary, raw))
+                }) {
+                Ok((summary, raw)) => {
+                    let _ = fs::write(&exit_nat_lifecycle_log_path, raw.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_nat_lifecycle",
+                        VmLabStageStatus::Pass,
+                        summary,
+                        vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+                Err(reason) => {
+                    let _ = fs::write(&exit_nat_lifecycle_log_path, reason.as_str());
+                    stage_outcome(
+                        "validate_linux_exit_nat_lifecycle",
+                        VmLabStageStatus::Fail,
+                        format!(
+                            "Linux Exit NAT lifecycle artifact validation failed for {linux_alias}: {reason}"
+                        ),
+                        vec![exit_nat_lifecycle_log_path.clone()],
+                    )
+                }
+            }
+        }
+    };
+
     let mesh_status_outcome = if !runtime_acls_passed && !options.dry_run {
         make_skipped("validate_linux_mesh_status", "validate_linux_runtime_acls")
     } else if !key_custody_passed && !options.dry_run {
@@ -13891,6 +14112,7 @@ fn run_linux_orchestration_stages_with_options(
         hardening_outcome,
         authenticode_outcome,
         dns_failclosed_outcome,
+        exit_nat_lifecycle_outcome,
         mesh_status_outcome,
     ]
 }
@@ -30221,6 +30443,140 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         )
         .expect_err("unknown schema_version must fail");
         assert!(err.contains("schema_version=99"), "unexpected error: {err}");
+    }
+
+    fn reviewed_linux_exit_nat_lifecycle_artifact() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "mesh_cidr": "100.64.0.0/16",
+            "nat_table": "rustynet_nat_g1",
+            "during_run": {
+                "nat_table_present": true,
+                "internal_prefix": "100.64.0.0/16",
+                "tunnel_forwarding": "Enabled",
+                "egress_forwarding": "Enabled",
+                "ipv6_tunnel_forwarding": "Disabled",
+                "ipv6_egress_forwarding": "Disabled"
+            },
+            "after_stop": {
+                "nat_table_present": false,
+                "forwarding_restored": true,
+                "ipv6_forwarding_restored": true
+            }
+        })
+    }
+
+    #[test]
+    fn evaluate_linux_exit_nat_lifecycle_artifact_accepts_reviewed_payload() {
+        let summary = super::evaluate_linux_exit_nat_lifecycle_artifact(
+            "debian-headless-1",
+            reviewed_linux_exit_nat_lifecycle_artifact()
+                .to_string()
+                .as_str(),
+        )
+        .expect("reviewed Linux NAT lifecycle artifact must validate");
+        assert!(
+            summary.contains("debian-headless-1")
+                && summary.contains("rustynet_nat_g1")
+                && summary.contains("mesh_cidr=100.64.0.0/16"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn linux_exit_nat_lifecycle_producer_to_validator_round_trip() {
+        let during = rustynetd::linux_exit_nat_lifecycle::build_linux_exit_nat_lifecycle_snapshot(
+            1,
+            "100.64.0.0/16",
+            "rustynet_nat_g1",
+            "table ip rustynet_nat_g1 {\n chain postrouting {\n  oifname \"enp0s1\" masquerade\n }\n}\n",
+            "1\n",
+            "0\n",
+        );
+        let after = rustynetd::linux_exit_nat_lifecycle::build_linux_exit_nat_lifecycle_snapshot(
+            2,
+            "100.64.0.0/16",
+            "rustynet_nat_g1",
+            "",
+            "0\n",
+            "0\n",
+        );
+        let merged = rustynetd::linux_exit_nat_lifecycle::merge_linux_exit_nat_lifecycle_artifact(
+            &during, &after,
+        );
+        let summary = super::evaluate_linux_exit_nat_lifecycle_artifact(
+            "debian-headless-1",
+            merged.to_string().as_str(),
+        )
+        .expect("producer-built Linux artifact must validate");
+        assert!(
+            summary.contains("debian-headless-1")
+                && summary.contains("rustynet_nat_g1")
+                && summary.contains("mesh_cidr=100.64.0.0/16"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn linux_exit_nat_lifecycle_producer_round_trip_rejects_forwarding_not_restored() {
+        let during = rustynetd::linux_exit_nat_lifecycle::build_linux_exit_nat_lifecycle_snapshot(
+            1,
+            "100.64.0.0/16",
+            "rustynet_nat_g1",
+            "table ip rustynet_nat_g1 {\n chain postrouting {\n  oifname \"enp0s1\" masquerade\n }\n}\n",
+            "1\n",
+            "0\n",
+        );
+        let after = rustynetd::linux_exit_nat_lifecycle::build_linux_exit_nat_lifecycle_snapshot(
+            2,
+            "100.64.0.0/16",
+            "rustynet_nat_g1",
+            "",
+            "1\n",
+            "0\n",
+        );
+        let merged = rustynetd::linux_exit_nat_lifecycle::merge_linux_exit_nat_lifecycle_artifact(
+            &during, &after,
+        );
+        let err = super::evaluate_linux_exit_nat_lifecycle_artifact(
+            "debian-headless-1",
+            merged.to_string().as_str(),
+        )
+        .expect_err("not-restored forwarding must fail");
+        assert!(
+            err.contains("ip_forward") || err.contains("restored"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_nat_lifecycle_artifact_rejects_leftover_nat_after_stop() {
+        let mut payload = reviewed_linux_exit_nat_lifecycle_artifact();
+        payload["after_stop"]["nat_table_present"] = serde_json::Value::Bool(true);
+        let err = super::evaluate_linux_exit_nat_lifecycle_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("leftover NAT table after stop must fail");
+        assert!(
+            err.contains("left nftables NAT table present after daemon stop"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_linux_exit_nat_lifecycle_artifact_rejects_internal_prefix_drift() {
+        let mut payload = reviewed_linux_exit_nat_lifecycle_artifact();
+        payload["during_run"]["internal_prefix"] = serde_json::Value::String("10.0.0.0/8".into());
+        let err = super::evaluate_linux_exit_nat_lifecycle_artifact(
+            "debian-headless-1",
+            payload.to_string().as_str(),
+        )
+        .expect_err("internal_prefix drift must fail");
+        assert!(
+            err.contains("did not match mesh_cidr"),
+            "unexpected error: {err}"
+        );
     }
 
     fn reviewed_macos_exit_killswitch_precedence_artifact() -> serde_json::Value {
