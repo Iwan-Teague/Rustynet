@@ -130,6 +130,32 @@
       "ssh_user": "debian"
     },
     {
+      "alias": "debian-headless-5",
+      "controller": {
+        "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/debian-headless-5.utm",
+        "type": "local_utm",
+        "utm_name": "debian-headless-5"
+      },
+      "exit_capable": false,
+      "lab_role": "extra",
+      "last_known_ip": "192.168.65.7",
+      "last_known_network": "utm-shared-192.168.65.0/24",
+      "live_ips": [
+        "192.168.65.7",
+        "fe80::7ffa:3176:cf30:8856"
+      ],
+      "mesh_ip": "100.64.0.5",
+      "network_group": "utm-shared-192.168.65.0/24",
+      "node_id": "extra-1",
+      "os": "Debian/Linux",
+      "parent_device": "iwan's MacBook Pro",
+      "relay_capable": false,
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "ssh_password": "tempo",
+      "ssh_target": "192.168.65.7",
+      "ssh_user": "debian"
+    },
+    {
       "alias": "macos-utm-1",
       "controller": {
         "bundle_path": "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents/macOS.utm",
