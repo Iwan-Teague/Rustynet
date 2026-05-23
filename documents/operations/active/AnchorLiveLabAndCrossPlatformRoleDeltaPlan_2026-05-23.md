@@ -404,3 +404,99 @@ across stages.
   stages) added: eight categories, 30+ proposed chaos stages, shared
   tooling (impairment harness, signed-bundle forger, chaos coordinator,
   chaos CI gate). Risks R5-R7 added covering chaos-specific safety.
+- 2026-05-23 — Track A code scaffold added: `live_linux_anchor_test` Rust
+  harness, `scripts/e2e/live_linux_anchor_test.sh`, orchestrator
+  `live_anchor` hook, and `scripts/ci/anchor_live_lab_gates.sh`. The harness
+  is non-destructive today: signed anchor-capability check, loopback
+  bundle-pull byte-for-byte check, invalid-token rejection, authority
+  capability check, and daemon status availability. Enrollment/downgrade
+  destructive sub-stages remain separate follow-up work before `live_anchor`
+  can become release-gate required.
+- 2026-05-23 — Anchor harness made platform-aware for Linux/macOS dry-run
+  coverage and macOS POSIX digest tooling (`shasum -a 256`). Added
+  `scripts/e2e/live_macos_anchor_test.sh`; CI now exercises Linux + macOS
+  report generation without touching live hosts.
+- 2026-05-23 — macOS `validate_macos_anchor_bundle_pull` stage upgraded from
+  a pure reserved slot to a non-destructive executable plan check: after macOS
+  mesh join it runs `rustynet anchor init --dry-run --node-id <macos-node>`
+  over SSH and verifies the output contains anchor advertisement, all five
+  anchor sub-capabilities, and the loopback bundle-pull listener plan.
+- 2026-05-23 — Track B steps 1-6 landed:
+  - **Step 1 (B1.5 + B1.1)** topology selection: new
+    `crates/rustynet-cli/src/vm_lab/topology.rs` module with
+    `TopologyProfile` JSON schema, `TopologyPlatform` selector,
+    `resolve_topology` planner, and
+    `apply_topology_overrides_to_orchestrate_config` orchestrator
+    wrapper. New CLI flags: `--topology-profile <path>`,
+    `--exit-platform <linux|macos|windows>`, `--relay-platform`,
+    `--anchor-platform`. Default behaviour preserved byte-for-byte
+    (default Linux-exit runs are unchanged). 21 unit tests.
+  - **Step 2 (M1)** macOS exit-mode validators: three new orchestrator
+    stages (`validate_macos_exit_nat_lifecycle`,
+    `validate_macos_exit_dns_failclosed`,
+    `validate_macos_exit_killswitch_precedence`) + pure evaluator
+    functions parsing pf-anchor lifecycle + pf-block-rules + tampered
+    assertion artefacts. Stages skip cleanly when the artefact files
+    are absent. 13 new unit tests.
+  - **Step 3 (B1.4) + Step 5 (M5 + W4)** platform-aware role
+    transition planner: new `ConcreteAction::DeployExitService` /
+    `UndeployExitService` planner variants, `admin → exit` emits
+    `[AdvertiseDefaultRoute, DeployExitService]` (advertise-then-prep),
+    `exit → admin` emits `[UndeployExitService, RetractDefaultRoute]`
+    (undeploy-then-revoke). New installer modules
+    `ops_install_systemd_exit.rs` (Linux) and
+    `ops_install_macos_exit.rs` (macOS) follow the existing
+    systemd_relay / macos_relay pattern. New
+    `Install-RustyNetWindowsExitService.ps1` /
+    `Uninstall-RustyNetWindowsExitService.ps1` cover Windows via
+    `Set-NetIPInterface -Forwarding {Enabled,Disabled}`. Per-OS
+    dispatch via `execute_platform_exit_service_action` /
+    `execute_platform_relay_service_action` in `main.rs`. The relay
+    dispatcher now also dispatches to Windows.
+  - **Step 4 (W1)** Windows active-exit promotion stage: new
+    `promote_windows_exit_active` stage gated on
+    `windows_vm == exit_vm`; runs the reviewed
+    install-windows-exit-service preflight on the Windows host then
+    polls daemon IPC for `node_role=admin serving_exit_node=true`
+    (60s cap). Skip-with-reason when topology did not elect Windows.
+  - **Step 6 (W2 / W3 / M2 / M3)** macOS + Windows relay/anchor
+    live-lab stage slots: substantive
+    `validate_macos_relay_service_lifecycle` drives
+    `ops install-macos-relay --dry-run` over SSH and parses the
+    bootout/bootstrap/kickstart plan. `validate_macos_anchor_bundle_pull`
+    runs a non-destructive anchor-init dry-run on macOS, and
+    `validate_windows_anchor_bundle_pull` now validates the local Windows
+    anchor bundle-pull plan contract without guest mutation. Both still defer
+    real listener/token traffic to Track A / Track C.
+    `validate_windows_relay_service_lifecycle` is now a non-mutating SCM helper
+    contract gate; real Windows SCM install/start/traffic/uninstall remains
+    Track C.
+  - **Step 7 (B1.2)** non-Linux genesis: explicitly deferred per spec
+    ("optional, last"). The current genesis path still runs on Linux.
+  - New CI gate `scripts/ci/cross_platform_role_gates.sh` covers all
+    of the above hermetically (no VM required).
+  - Evidence appended to
+    [`HeterogeneousLiveLabEvidence_2026-04-28.md`](./HeterogeneousLiveLabEvidence_2026-04-28.md)
+    §7.
+  - Track-A enrollment / downgrade destructive sub-stages and Track-C
+    chaos work remain out of scope for this Track-B run.
+- 2026-05-23 — Windows relay lifecycle slot upgraded from a pure reserved
+  placeholder to a non-mutating SCM helper contract gate. The
+  `validate_windows_relay_service_lifecycle` stage now verifies the reviewed
+  install/uninstall PowerShell helpers contain the fail-closed path guards,
+  loopback-only health bind gate, Authenticode signing, service SID, ACL
+  repair, JSON arg-file handoff, failure actions, hardening check, and
+  non-recursive uninstall preservation controls before reporting pass. It
+  still does **not** install, start, stop, or delete a Windows service; the
+  live SCM mutation + relay traffic exercise remains Track C / operator-opt-in.
+  `live_anchor` was added to the full release-gate required stage list so the
+  anchor role cannot silently fall out of release completeness once live
+  topology evidence is present.
+- 2026-05-23 — Windows anchor bundle-pull slot upgraded from a pure reserved
+  placeholder to a non-mutating dry-run plan contract gate. The
+  `validate_windows_anchor_bundle_pull` stage now fails closed unless the
+  selected Windows inventory entry is actually Windows, has a node ID, and the
+  `anchor init` planner renders anchor advertisement, all five anchor
+  sub-capabilities, relay co-deploy, and loopback bundle-pull listener
+  enablement at `127.0.0.1:51822`. It does not bind a socket, consume a token,
+  or mutate the Windows guest; live token/listener proof remains Track A / C.

@@ -180,3 +180,72 @@ orchestrator install path can both be exercised.
    §3.1 hang). May require investigation + fix landing first.
 4. Run full `vm-lab-orchestrate-live-lab --windows-vm windows-utm-1
    --validate-linux-daemon-state` once §3.1 hang is resolved.
+
+## 7) Track B (Cross-Platform Role) — 2026-05-23 evidence
+
+This section records what landed under Track B of
+[`AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md`](./AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md)
+so the orchestrator can host a Windows or macOS active exit /
+relay / anchor instead of locking the mesh exit to Linux exit-1.
+
+### 7.1) Code surfaces shipped
+
+| Step | Deliverable | Files |
+|---|---|---|
+| B1.5 + B1.1 | Topology profile + `--exit/relay/anchor-platform` selectors. Default Linux-exit byte-for-byte preserved. | `crates/rustynet-cli/src/vm_lab/topology.rs`, CLI flags in `main.rs`, plumbing in `vm_lab/mod.rs::execute_ops_vm_lab_orchestrate_live_lab` |
+| M1 | Three new macOS exit-mode validators + evaluators. Skip cleanly when artefacts absent. | `validate_macos_exit_nat_lifecycle` / `validate_macos_exit_dns_failclosed` / `validate_macos_exit_killswitch_precedence` + `evaluate_macos_exit_*` in `vm_lab/mod.rs` |
+| B1.4 | Platform-aware role transition planner. `admin → exit` emits `[AdvertiseDefaultRoute, DeployExitService]`; `exit → admin` emits `[UndeployExitService, RetractDefaultRoute]`. | `role_cli.rs` (planner + tests), `execute_platform_exit_service_action` in `main.rs` |
+| M5 + W4 (combined with B1.4) | New per-OS exit installers (systemd, launchd, Windows PS). | `ops_install_systemd_exit.rs`, `ops_install_macos_exit.rs`, `ops_e2e.rs::execute_ops_install_windows_exit_service`, `scripts/systemd/rustynet-exit.service`, `scripts/launchd/com.rustynet.exit.plist`, `scripts/bootstrap/windows/{Install,Uninstall}-RustyNetWindowsExitService.ps1` |
+| W1 | Windows active-exit promotion stage. Gated on `windows_vm == exit_vm`. | `promote_windows_exit_active` stage + `promote_windows_to_active_exit` helper in `vm_lab/mod.rs` |
+| W2 / W3 / M2 / M3 | Relay + anchor live-lab stage slots. macOS relay lifecycle substantive (dry-run via SSH); the other three are skip-with-reason placeholders referencing Track A / W2 / chaos Track C. | `validate_macos_relay_service_lifecycle` (substantive), `validate_macos_anchor_bundle_pull`, `validate_windows_relay_service_lifecycle`, `validate_windows_anchor_bundle_pull` in `vm_lab/mod.rs` |
+
+Step B1.2 (non-Linux genesis) is deferred — Track B step 7 in the
+delta plan is explicitly marked optional. The current genesis path
+still requires a Linux host running `rustynet ops e2e-bootstrap`.
+
+### 7.2) CI gate added
+
+`scripts/ci/cross_platform_role_gates.sh` runs in PR-time CI without a
+live lab: it verifies the new files exist, the topology selector
+surface compiles, the planner emits the new ConcreteAction variants,
+and runs the per-area unit tests. Hermetic — no VM required.
+
+### 7.3) Operator next steps to capture live evidence
+
+The deliverables above land the code path. Capturing live evidence of
+a Windows or macOS active exit run still requires:
+
+1. A heterogeneous live lab with at least one Debian VM, one Windows
+   VM (`windows-utm-1`), and one macOS VM (`macos-utm-1`) reachable
+   over SSH with key-based auth.
+2. A topology profile JSON containing `{ "exit": "windows-utm-1" }`
+   (or `{ "exit": "macos-utm-1" }`).
+3. `./target/release/rustynet-cli ops vm-lab-orchestrate-live-lab
+   --inventory documents/operations/active/vm_lab_inventory.json
+   --exit-vm debian-headless-1 --client-vm debian-headless-2
+   --windows-vm windows-utm-1 --macos-vm macos-utm-1
+   --topology-profile <profile.json>
+   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+   --report-dir /tmp/track-b-windows-exit
+   --legacy-bash-orchestrator --skip-gates --skip-soak
+   --skip-cross-network --no-fail-on-authenticode`
+4. The equivalent `--topology-profile` pointing at `macos-utm-1`
+   captures macOS-as-exit evidence.
+
+Both runs are expected to land `overall_status=pass` for the
+baseline + `validate_windows_exit_*` (or `validate_macos_exit_*`)
+stages once the per-platform on-host test bins that produce the
+NAT-lifecycle / DNS-failclosed / killswitch-precedence artefacts are
+in place. The orchestrator-side shape contract is ready; the
+producer-side bins are the gating dependency.
+
+### 7.4) Verification of default-run preservation
+
+`cargo test -p rustynet-cli --bin rustynet-cli
+vm_lab::topology::tests::resolve_topology_default_linux_exit_remains_implicit`
+asserts the byte-for-byte invariant: when neither `--topology-profile`
+nor any `--*-platform` selector is set and the operator passes only
+`--exit-vm`, the topology resolver leaves `config.exit_vm` untouched
+and reports zero overrides. Default Linux-exit live-lab runs continue
+to produce the same `setup_live_lab_profile.env` as before this
+change.
