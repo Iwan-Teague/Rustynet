@@ -8398,7 +8398,141 @@ fn run_macos_orchestration_stages(
     };
     outcomes.push(exit_killswitch_outcome);
 
+    // ── Track B Step 6 (M2 + M3): macOS relay + anchor live stages ────────
+    //
+    // Small lifecycle stages exercising the role-transition planner's
+    // platform-specific installer surfaces. The relay lifecycle stage
+    // drives the reviewed `ops install-macos-relay --dry-run` verb on
+    // the macOS host so the launchctl bootout/bootstrap/kickstart plan
+    // is exercised end-to-end without leaving a live LaunchDaemon on
+    // the guest — chaos-grade testing lives in Track C. The anchor
+    // bundle-pull stage is intentionally a skip-with-reason today; the
+    // signed bundle-pull test bin lives in Track A.
+    let macos_relay_lifecycle_log_path =
+        logs_dir.join("validate_macos_relay_service_lifecycle.log");
+    let macos_relay_lifecycle_outcome = if dry_run {
+        stage_outcome(
+            "validate_macos_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!(
+                "dry-run: would exercise rustynet-relay launchd lifecycle on {macos_alias} (ops install-macos-relay --dry-run + --uninstall --dry-run)"
+            ),
+            vec![],
+        )
+    } else if !mesh_join_passed {
+        stage_outcome(
+            "validate_macos_relay_service_lifecycle",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
+            vec![],
+        )
+    } else {
+        match exercise_macos_relay_lifecycle_dry_run(
+            macos_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        ) {
+            Ok(summary) => {
+                let _ = std::fs::write(&macos_relay_lifecycle_log_path, summary.as_str());
+                stage_outcome(
+                    "validate_macos_relay_service_lifecycle",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![macos_relay_lifecycle_log_path.clone()],
+                )
+            }
+            Err(reason) => {
+                let _ = std::fs::write(&macos_relay_lifecycle_log_path, reason.as_str());
+                stage_outcome(
+                    "validate_macos_relay_service_lifecycle",
+                    VmLabStageStatus::Fail,
+                    format!("macOS relay lifecycle validation failed for {macos_alias}: {reason}"),
+                    vec![macos_relay_lifecycle_log_path.clone()],
+                )
+            }
+        }
+    };
+    outcomes.push(macos_relay_lifecycle_outcome);
+
+    outcomes.push(stage_outcome(
+        "validate_macos_anchor_bundle_pull",
+        VmLabStageStatus::Skipped,
+        format!(
+            "skipped: anchor bundle-pull live test bin is Track A scope; macOS reserved slot for {macos_alias}"
+        ),
+        vec![],
+    ));
+
     outcomes
+}
+
+/// Track B Step 6 (M2) — drive the rustynet-relay launchd installer
+/// in dry-run mode on the remote macOS host so the install +
+/// bootstrap + kickstart + bootout + remove plan is exercised through
+/// the reviewed argv-only `launchctl` invocations without leaving a
+/// live LaunchDaemon on the guest. The chaos-grade end-to-end test
+/// (real service install + traffic flow + tear-down) is Track C scope.
+fn exercise_macos_relay_lifecycle_dry_run(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])?;
+    let target = targets
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no target resolved for alias {macos_alias}"))?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            target.platform_profile.platform.as_str()
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let install_script =
+        "/usr/local/bin/rustynet ops install-macos-relay --dry-run 2>&1".to_owned();
+    let install_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        install_script.as_str(),
+        timeout,
+    )
+    .map_err(|err| format!("install-macos-relay --dry-run on {macos_alias} failed: {err}"))?;
+    if !install_output.contains("install+bootstrap")
+        || !install_output.contains("would run: launchctl bootstrap system")
+    {
+        return Err(format!(
+            "install-macos-relay --dry-run on {macos_alias} did not report expected lifecycle steps: {install_output}"
+        ));
+    }
+
+    let uninstall_script =
+        "/usr/local/bin/rustynet ops install-macos-relay --uninstall --dry-run 2>&1".to_owned();
+    let uninstall_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        uninstall_script.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        format!("install-macos-relay --uninstall --dry-run on {macos_alias} failed: {err}")
+    })?;
+    if !uninstall_output.contains("bootout+remove")
+        || !uninstall_output.contains("would run: launchctl bootout system/com.rustynet.relay")
+    {
+        return Err(format!(
+            "install-macos-relay --uninstall --dry-run on {macos_alias} did not report expected lifecycle steps: {uninstall_output}"
+        ));
+    }
+    Ok(format!(
+        "macOS relay launchd lifecycle dry-run verified on {macos_alias}: install+bootstrap → bootout+remove"
+    ))
 }
 
 struct WindowsBundleLocalPaths {
@@ -10006,6 +10140,32 @@ fn run_windows_orchestration_stages_with_options(
         }
     };
 
+    // ── Track B Step 6 (W2 + W3): Windows relay + anchor live stages ─────
+    //
+    // Skip-with-reason placeholders that reserve the stage slots so
+    // future work wiring real SCM install + verify + uninstall does
+    // not need to edit the orchestration shape, only the live
+    // invocation. Live SCM lifecycle on Windows requires admin
+    // privileges + a persistent service install on the guest; the
+    // chaos-grade end-to-end variant lives in Track C, and the anchor
+    // bundle-pull test bin lives in Track A.
+    let windows_relay_lifecycle_outcome = stage_outcome(
+        "validate_windows_relay_service_lifecycle",
+        VmLabStageStatus::Skipped,
+        format!(
+            "skipped: Windows SCM relay-service lifecycle live test pending (W2 follow-up); reserved slot for {windows_alias}"
+        ),
+        vec![],
+    );
+    let windows_anchor_bundle_pull_outcome = stage_outcome(
+        "validate_windows_anchor_bundle_pull",
+        VmLabStageStatus::Skipped,
+        format!(
+            "skipped: anchor bundle-pull live test bin is Track A scope; Windows reserved slot for {windows_alias}"
+        ),
+        vec![],
+    );
+
     vec![
         bootstrap_outcome,
         validate_outcome,
@@ -10020,6 +10180,8 @@ fn run_windows_orchestration_stages_with_options(
         exit_nat_lifecycle_outcome,
         exit_dns_leak_outcome,
         exit_killswitch_outcome,
+        windows_relay_lifecycle_outcome,
+        windows_anchor_bundle_pull_outcome,
         amend_membership_outcome,
         issue_windows_assignment_outcome,
         distribute_membership_outcome,
