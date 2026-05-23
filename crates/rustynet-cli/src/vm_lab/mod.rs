@@ -8303,7 +8303,9 @@ fn run_macos_orchestration_stages(
         stage_outcome(
             "validate_macos_exit_nat_lifecycle",
             VmLabStageStatus::Skipped,
-            format!("skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"),
+            format!(
+                "skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"
+            ),
             vec![],
         )
     } else {
@@ -8371,7 +8373,9 @@ fn run_macos_orchestration_stages(
         stage_outcome(
             "validate_macos_exit_dns_failclosed",
             VmLabStageStatus::Skipped,
-            format!("skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"),
+            format!(
+                "skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"
+            ),
             vec![],
         )
     } else {
@@ -8445,7 +8449,9 @@ fn run_macos_orchestration_stages(
         stage_outcome(
             "validate_macos_exit_killswitch_precedence",
             VmLabStageStatus::Skipped,
-            format!("skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"),
+            format!(
+                "skipped: capture_macos_exit_evidence_artifacts did not pass for {macos_alias}"
+            ),
             vec![],
         )
     } else {
@@ -8598,6 +8604,224 @@ fn run_macos_orchestration_stages(
     outcomes.push(macos_anchor_bundle_pull_outcome);
 
     outcomes
+}
+
+const MACOS_EXIT_EVIDENCE_REMOTE_ROOT: &str = "/tmp/rustynet-macos-exit-evidence";
+const MACOS_EXIT_EVIDENCE_MESH_CIDR: &str = "100.64.0.0/10";
+const MACOS_EXIT_EVIDENCE_LAN_IFACE: &str = "en0";
+const MACOS_EXIT_EVIDENCE_MESH_HOSTNAME: &str = "exit-1.rustynet";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacosExitEvidenceArtifactSpec {
+    remote_relative_path: &'static str,
+    local_relative_path: &'static str,
+}
+
+fn macos_exit_evidence_artifact_specs() -> &'static [MacosExitEvidenceArtifactSpec] {
+    &[
+        MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "macos_exit_nat_lifecycle.json",
+            local_relative_path: "macos_exit_nat_lifecycle.json",
+        },
+        MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "dns_leak_proof/pf_block_rules.json",
+            local_relative_path: "dns_leak_proof/pf_block_rules.json",
+        },
+        MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "dns_leak_proof/udp_block_pcap.txt",
+            local_relative_path: "dns_leak_proof/udp_block_pcap.txt",
+        },
+        MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "dns_leak_proof/tcp_block_pcap.txt",
+            local_relative_path: "dns_leak_proof/tcp_block_pcap.txt",
+        },
+        MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "dns_leak_proof/tunnel_path_resolves.json",
+            local_relative_path: "dns_leak_proof/tunnel_path_resolves.json",
+        },
+        MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "dns_leak_proof/macos_dns_failclosed_check.json",
+            local_relative_path: "dns_leak_proof/macos_dns_failclosed_check.json",
+        },
+        MacosExitEvidenceArtifactSpec {
+            remote_relative_path: "macos_exit_killswitch_precedence.json",
+            local_relative_path: "macos_exit_killswitch_precedence.json",
+        },
+    ]
+}
+
+fn capture_macos_exit_evidence_artifacts(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    local_artifact_root: &Path,
+) -> Result<(String, String, Vec<PathBuf>), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[macos_alias.to_owned()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {macos_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Macos {
+        return Err((
+            format!(
+                "alias {macos_alias} resolved to non-macOS platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+
+    fs::create_dir_all(local_artifact_root).map_err(|err| {
+        (
+            format!(
+                "create macOS Exit local artifact root failed ({}): {err}",
+                local_artifact_root.display()
+            ),
+            String::new(),
+        )
+    })?;
+
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script_specs = [
+        (
+            "capture_macos_exit_nat_lifecycle.sh",
+            workspace_root_path().join("scripts/e2e/capture_macos_exit_nat_lifecycle.sh"),
+        ),
+        (
+            "capture_macos_exit_dns_failclosed.sh",
+            workspace_root_path().join("scripts/e2e/capture_macos_exit_dns_failclosed.sh"),
+        ),
+        (
+            "capture_macos_exit_killswitch_precedence.sh",
+            workspace_root_path().join("scripts/e2e/capture_macos_exit_killswitch_precedence.sh"),
+        ),
+    ];
+    let suffix = unique_suffix();
+    let mut remote_scripts = Vec::new();
+    for (name, local_path) in script_specs {
+        if !local_path.is_file() {
+            return Err((
+                format!(
+                    "macOS Exit capture wrapper not found: {}",
+                    local_path.display()
+                ),
+                String::new(),
+            ));
+        }
+        let remote_path = format!("/tmp/rustynet-{suffix}-{name}");
+        ensure_success_status(
+            scp_to_remote_for_target(
+                &target,
+                None,
+                Some(ssh_identity_file),
+                known_hosts_path,
+                local_path.as_path(),
+                remote_path.as_str(),
+                timeout,
+            )
+            .map_err(|err| {
+                (
+                    format!("upload macOS Exit capture wrapper {name} failed: {err}"),
+                    String::new(),
+                )
+            })?,
+            format!("upload macOS Exit capture wrapper {name}").as_str(),
+        )
+        .map_err(|err| (err, String::new()))?;
+        remote_scripts.push(remote_path);
+    }
+
+    let remote_root = shell_quote(MACOS_EXIT_EVIDENCE_REMOTE_ROOT);
+    let nat_script = shell_quote(remote_scripts[0].as_str());
+    let dns_script = shell_quote(remote_scripts[1].as_str());
+    let killswitch_script = shell_quote(remote_scripts[2].as_str());
+    let mesh_cidr = shell_quote(MACOS_EXIT_EVIDENCE_MESH_CIDR);
+    let lan_iface = shell_quote(MACOS_EXIT_EVIDENCE_LAN_IFACE);
+    let mesh_hostname = shell_quote(MACOS_EXIT_EVIDENCE_MESH_HOSTNAME);
+    let remote_script = format!(
+        r#"set -euo pipefail
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${{PATH:-}}"
+ROOT={remote_root}
+rm -rf "$ROOT"
+mkdir -p "$ROOT/dns_leak_proof"
+chmod 700 {nat_script} {dns_script} {killswitch_script}
+sudo bash {nat_script} --mesh-cidr {mesh_cidr} --output "$ROOT/macos_exit_nat_lifecycle.json"
+sudo bash {dns_script} --output "$ROOT/dns_leak_proof" --lan-iface {lan_iface} --mesh-hostname {mesh_hostname}
+sudo bash {killswitch_script} --output "$ROOT/macos_exit_killswitch_precedence.json"
+find "$ROOT" -type f -print | sort
+"#
+    );
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        remote_script.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote macOS Exit evidence capture failed: {err}"),
+            String::new(),
+        )
+    })?;
+
+    let mut copied_paths = Vec::new();
+    for spec in macos_exit_evidence_artifact_specs() {
+        let remote_path = format!(
+            "{}/{}",
+            MACOS_EXIT_EVIDENCE_REMOTE_ROOT, spec.remote_relative_path
+        );
+        let local_path = local_artifact_root.join(Path::new(spec.local_relative_path));
+        let status = scp_from_remote(
+            &target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            remote_path.as_str(),
+            local_path.as_path(),
+            timeout,
+        )
+        .map_err(|err| {
+            (
+                format!("copy macOS Exit evidence artifact {remote_path} failed: {err}"),
+                raw_output.clone(),
+            )
+        })?;
+        if !status.success() {
+            return Err((
+                format!(
+                    "copy macOS Exit evidence artifact {remote_path} exited non-zero: {}",
+                    status_code(status)
+                ),
+                raw_output,
+            ));
+        }
+        if !local_path.is_file() {
+            return Err((
+                format!(
+                    "copy macOS Exit evidence artifact {remote_path} reported success but local file is missing: {}",
+                    local_path.display()
+                ),
+                raw_output,
+            ));
+        }
+        copied_paths.push(local_path);
+    }
+
+    Ok((
+        format!(
+            "captured {} macOS Exit evidence artifact(s) from {macos_alias} into {}",
+            copied_paths.len(),
+            local_artifact_root.display()
+        ),
+        raw_output,
+        copied_paths,
+    ))
 }
 
 /// Track B Step 6 (M2) — drive the rustynet-relay launchd installer
