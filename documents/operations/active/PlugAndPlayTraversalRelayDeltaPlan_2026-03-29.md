@@ -947,6 +947,48 @@ Use this section as the execution log while implementing the plan.
 For each completed slice, append an entry using this format:
 
 ```text
+Date: 2026-05-23
+Phase / Slice: Gap 1 relay runtime failover hardening
+Files changed:
+  - crates/rustynetd/src/daemon.rs
+    - Relay keepalive send failures now close the stale session immediately, force one authoritative-transport
+      relay re-establishment attempt, and fail-close the controller if the re-establishment also fails.
+    - Relay sessions are now closed when their peer is no longer managed by the dataplane, both after
+      successful reconcile peer removal and during traversal sync if stale probe state outlives the peer.
+    - Added daemon tests for keepalive failure re-establishment, keepalive re-establish fail-closed behavior,
+      and peer-removal relay-session cleanup.
+  - crates/rustynet-cli/src/vm_lab/mod.rs
+    - Updated the Linux daemon-validator dry-run stage-count assertion to the current 11-stage parity set so
+      the workspace test gate reflects the already-landed Linux orchestration expansion.
+Tests and gates run:
+  - `cargo fmt --all -- --check`
+  - `git diff --check`
+  - `cargo check -p rustynetd --all-targets --all-features`
+  - `cargo check --workspace --all-targets --all-features`
+  - `cargo clippy -p rustynetd --all-targets --all-features -- -D warnings`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  - `cargo test -p rustynetd daemon_runtime_relay --all-features`
+  - `cargo test -p rustynetd daemon_runtime_peer_removal_tears_down_associated_relay_session --all-features`
+  - `cargo test -p rustynetd --all-features`
+  - `cargo test -p rustynet-cli run_linux_daemon_validators_for_aliases_dry_run_prefixes_stage_names_per_alias --all-features`
+  - `cargo test --workspace --all-targets --all-features`
+  - `cargo audit --deny warnings`
+  - `cargo deny check bans licenses sources advisories`
+  - `scripts/ci/phase10_hp2_gates.sh`
+Security invariants re-verified:
+  - Relay recovery uses the backend authoritative shared transport only; no daemon-owned side socket or fallback
+    transport is introduced.
+  - A failed relay keepalive cannot leave a stale relay session live in memory.
+  - A second relay failure during recovery drives the dataplane fail-closed instead of retaining relay_programmed
+    state.
+  - Peer removal tears down the associated relay client session so relay session state cannot leak past membership
+    or assignment removal.
+What remains blocked:
+  - The single-host mock-relay integration proof and real cross-network relay traffic proof remain separate live/test
+    slices; this entry is code-path hardening plus unit coverage only.
+```
+
+```text
 Date: 2026-03-30
 Phase / Slice: Audit rollback before continued implementation
 Files reviewed:

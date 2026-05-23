@@ -5011,6 +5011,7 @@ impl DaemonRuntime {
 
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
         let now_unix = unix_now();
+        let mut relay_keepalive_failed_peers = BTreeSet::new();
         if let Some(mut relay_client) = self.relay_client.take() {
             let freshness_secs = self.traversal_probe_handshake_freshness_secs;
             let active_relay_peers = self
@@ -5045,6 +5046,8 @@ impl DaemonRuntime {
                             "rustynetd: relay keepalive failed for peer {}: {err}",
                             peer_node_id.as_str()
                         );
+                        relay_client.close_session(&peer_node_id);
+                        relay_keepalive_failed_peers.insert(peer_node_id);
                     }
                 }
             }
@@ -5086,6 +5089,15 @@ impl DaemonRuntime {
             self.build_verified_traversal_index(&self.membership_directory, &envelope)?;
         let managed_peer_ids = self.controller.managed_peer_ids();
         let managed_peer_set = managed_peer_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let stale_probe_peers = self
+            .traversal_probe_statuses
+            .keys()
+            .filter(|node_id| !managed_peer_set.contains(*node_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for stale_peer in stale_probe_peers {
+            self.close_relay_session(&stale_peer);
+        }
         let indexed_peer_set = traversal_index.keys().cloned().collect::<BTreeSet<_>>();
         let extra_peers = indexed_peer_set
             .difference(&managed_peer_set)
@@ -5159,17 +5171,30 @@ impl DaemonRuntime {
                 now_unix,
                 force_reprobe,
             );
+            let relay_keepalive_recovery_due =
+                relay_keepalive_failed_peers.contains(&remote_node_id);
 
             let relay_endpoint = if self.relay_client.is_some() {
                 if probe_due
                     || relay_refresh_due
+                    || relay_keepalive_recovery_due
                     || matches!(current.path, Some(PathMode::Relay))
                     || matches!(
                         existing_status.map(|status| status.decision),
                         Some(TraversalProbeDecision::Relay)
                     )
                 {
-                    self.resolve_relay_client_endpoint(&remote_node_id, bundle, now_unix)?
+                    match self.resolve_relay_client_endpoint(&remote_node_id, bundle, now_unix) {
+                        Ok(endpoint) => endpoint,
+                        Err(err) => {
+                            if relay_keepalive_recovery_due {
+                                let _ = self
+                                    .controller
+                                    .force_fail_closed("relay_keepalive_recovery_failed");
+                            }
+                            return Err(err);
+                        }
+                    }
                 } else {
                     self.relay_client
                         .as_ref()
@@ -7499,6 +7524,11 @@ impl DaemonRuntime {
             };
 
             let routes = sanitize_dataplane_routes_for_node_role(self.node_role, routes);
+            let previously_managed_peer_ids = self
+                .controller
+                .managed_peer_ids()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
             let apply_result = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
@@ -7530,6 +7560,16 @@ impl DaemonRuntime {
 
             match (apply_result, cleanup_result) {
                 (Ok(()), Ok(())) => {
+                    let current_managed_peer_ids = self
+                        .controller
+                        .managed_peer_ids()
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    for removed_peer in
+                        previously_managed_peer_ids.difference(&current_managed_peer_ids)
+                    {
+                        self.close_relay_session(removed_peer);
+                    }
                     self.membership_state = Some(membership_state);
                     self.membership_directory = membership_directory;
                     self.refresh_dns_zone_state(auto_bundle.as_ref());
@@ -13393,7 +13433,7 @@ mod tests {
     };
 
     use ed25519_dalek::{Signer, SigningKey};
-    use rustynet_backend_api::{NodeId, Route, RouteKind, SocketEndpoint};
+    use rustynet_backend_api::{BackendError, NodeId, Route, RouteKind, SocketEndpoint};
     #[cfg(feature = "test-harness")]
     use rustynet_backend_api::{RuntimeContext, TunnelBackend};
     use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperationKind;
@@ -19575,6 +19615,218 @@ mod tests {
             status
                 .message
                 .contains("transport_socket_identity_local_addr=0.0.0.0:51820")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_relay_keepalive_failure_reestablishes_once_on_authoritative_transport() {
+        let relay_addr: SocketAddr = "203.0.113.34:40024".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-keepalive-reestablish",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
+
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x45; 16],
+            61_045,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+        runtime
+            .relay_client
+            .as_mut()
+            .expect("relay client should be configured")
+            .set_session_last_activity_for_test(
+                &exit_node,
+                Instant::now() - Duration::from_secs(60),
+            );
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_send_result_for_test(Err(BackendError::internal(
+                "simulated relay keepalive send failure",
+            )))
+            .expect("relay authoritative keepalive failure should be scriptable");
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x46; 16],
+            61_046,
+        );
+
+        runtime
+            .sync_traversal_runtime_state(false)
+            .expect("relay keepalive failure should re-establish once");
+
+        assert_eq!(
+            runtime.controller.managed_peer_endpoint(&exit_node),
+            Some(SocketEndpoint {
+                addr: relay_addr.ip(),
+                port: 61_046,
+            })
+        );
+        assert!(
+            runtime
+                .relay_client
+                .as_ref()
+                .expect("relay client should remain configured")
+                .has_session(&exit_node)
+        );
+
+        let operations = runtime
+            .controller
+            .backend_mut_for_test()
+            .authoritative_transport_operations_for_test();
+        assert!(
+            operations.iter().any(
+                |operation| operation.kind == RecordedAuthoritativeTransportOperationKind::Send
+            ),
+            "keepalive send must use authoritative transport"
+        );
+        assert!(
+            operations.iter().any(|operation| operation.kind
+                == RecordedAuthoritativeTransportOperationKind::RoundTrip
+                && operation.remote_addr == relay_addr),
+            "re-establish must use authoritative relay round trip"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_relay_keepalive_reestablish_failure_fail_closes() {
+        let relay_addr: SocketAddr = "203.0.113.35:40025".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-keepalive-reestablish-fail",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
+
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x47; 16],
+            61_047,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+        runtime
+            .relay_client
+            .as_mut()
+            .expect("relay client should be configured")
+            .set_session_last_activity_for_test(
+                &exit_node,
+                Instant::now() - Duration::from_secs(60),
+            );
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_send_result_for_test(Err(BackendError::internal(
+                "simulated relay keepalive send failure",
+            )))
+            .expect("relay authoritative keepalive failure should be scriptable");
+        runtime
+            .controller
+            .backend_mut_for_test()
+            .script_authoritative_round_trip_for_test(Err(BackendError::internal(
+                "simulated relay re-establish failure",
+            )))
+            .expect("relay authoritative re-establish failure should be scriptable");
+
+        let err = runtime
+            .sync_traversal_runtime_state(false)
+            .expect_err("second relay failure must fail closed");
+        assert!(err.contains("relay session establishment failed"));
+        assert_eq!(runtime.controller.state(), DataplaneState::FailClosed);
+        assert!(
+            !runtime
+                .relay_client
+                .as_ref()
+                .expect("relay client should remain configured")
+                .has_session(&exit_node)
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn daemon_runtime_peer_removal_tears_down_associated_relay_session() {
+        let relay_addr: SocketAddr = "203.0.113.36:40026".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-relay-peer-removal",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        let exit_node = NodeId::new("node-exit".to_owned()).expect("node id should parse");
+
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+        script_runtime_authoritative_relay_ack(
+            &mut runtime,
+            relay_addr,
+            authoritative_local_addr,
+            [0x48; 16],
+            61_048,
+        );
+        runtime.relay_client = Some(build_test_relay_client(
+            "daemon-local",
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+            Vec::new(),
+        ));
+
+        runtime.bootstrap();
+        assert!(
+            runtime
+                .relay_client
+                .as_ref()
+                .expect("relay client should be configured")
+                .has_session(&exit_node)
+        );
+
+        runtime
+            .controller
+            .apply_revocation(&exit_node)
+            .expect("test peer removal should apply");
+        let _ = runtime.sync_traversal_runtime_state(false);
+
+        assert_eq!(runtime.controller.peer_path(&exit_node), None);
+        assert!(
+            !runtime
+                .relay_client
+                .as_ref()
+                .expect("relay client should remain configured")
+                .has_session(&exit_node),
+            "peer removal must not leak relay sessions"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);

@@ -34032,8 +34032,30 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             report_dir.as_path(),
             true,
         );
-        // 6 stages × 2 aliases.
-        assert_eq!(outcomes.len(), 12);
+        let expected_stages = [
+            "validate_linux_runtime_acls",
+            "validate_linux_key_custody",
+            "validate_linux_service_hardening",
+            "validate_linux_authenticode",
+            "validate_linux_dns_failclosed",
+            "validate_linux_exit_nat_lifecycle",
+            "validate_linux_exit_dns_failclosed",
+            "validate_linux_relay_service_lifecycle",
+            "validate_linux_anchor_bundle_pull",
+            "validate_linux_membership_genesis",
+            "validate_linux_mesh_status",
+        ];
+        assert_eq!(outcomes.len(), expected_stages.len() * aliases.len());
+        for alias in &aliases {
+            for expected_stage in expected_stages {
+                assert!(
+                    outcomes
+                        .iter()
+                        .any(|outcome| outcome.stage == format!("{alias}::{expected_stage}")),
+                    "missing dry-run stage {alias}::{expected_stage}",
+                );
+            }
+        }
         for outcome in &outcomes {
             assert!(
                 outcome.stage.contains("::"),
