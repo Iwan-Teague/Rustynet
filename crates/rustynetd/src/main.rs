@@ -224,6 +224,9 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "macos-exit-dns-failclosed-capture" => {
                 run_macos_exit_dns_failclosed_capture_command(rest)
             }
+            [cmd, rest @ ..] if cmd == "macos-exit-killswitch-precedence-check" => {
+                run_macos_exit_killswitch_precedence_check_command(rest)
+            }
             [cmd, rest @ ..] if cmd == "macos-exit-nat-lifecycle-snapshot" => {
                 run_macos_exit_nat_lifecycle_snapshot_command(rest)
             }
@@ -1228,6 +1231,52 @@ fn run_macos_exit_dns_failclosed_capture_command(args: &[String]) -> Result<(), 
     )?;
     println!(
         "macos exit DNS fail-closed artifacts written to {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn run_macos_exit_killswitch_precedence_check_command(args: &[String]) -> Result<(), String> {
+    let mut output: Option<PathBuf> = None;
+    let mut pf_anchor: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--output") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-exit-killswitch-precedence-check: --output requires a value".to_owned()
+                })?;
+                output = Some(PathBuf::from(value));
+                index += 2;
+            }
+            Some("--pf-anchor") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "macos-exit-killswitch-precedence-check: --pf-anchor requires a value"
+                        .to_owned()
+                })?;
+                pf_anchor = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown macos-exit-killswitch-precedence-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let output = output
+        .ok_or_else(|| "macos-exit-killswitch-precedence-check: --output is required".to_owned())?;
+    let options =
+        rustynetd::macos_exit_killswitch_precedence::MacosExitKillswitchPrecedenceOptions {
+            pf_anchor,
+        };
+    rustynetd::macos_exit_killswitch_precedence::write_macos_exit_killswitch_precedence_report(
+        output.as_path(),
+        &options,
+    )?;
+    println!(
+        "macos exit killswitch precedence artifact written to {}",
         output.display()
     );
     Ok(())
@@ -2935,6 +2984,7 @@ fn help_text() -> String {
         "  rustynetd linux-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd linux-dns-failclosed-check [--no-fail-on-drift]",
         "  rustynetd macos-exit-dns-failclosed-capture --output <dir> --lan-iface <name> [--mesh-hostname <name>]",
+        "  rustynetd macos-exit-killswitch-precedence-check --output <path> [--pf-anchor <name>]",
         "  rustynetd windows-service-hardening-check [--no-fail-on-drift]",
         "  rustynetd windows-key-custody-check [--no-fail-on-drift]",
         "  rustynetd windows-authenticode-check [--binary-path <path>] [--no-fail-on-drift]",
@@ -3022,7 +3072,8 @@ fn help_text() -> String {
 mod tests {
     use super::{
         classify_top_level_error, help_text, parse_daemon_config,
-        run_macos_exit_dns_failclosed_capture_command, run_windows_authenticode_check_command,
+        run_macos_exit_dns_failclosed_capture_command,
+        run_macos_exit_killswitch_precedence_check_command, run_windows_authenticode_check_command,
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
         run_windows_key_custody_check_command, run_windows_killswitch_assert_command,
         run_windows_mesh_status_check_command, run_windows_registry_acls_check_command,
@@ -3352,6 +3403,42 @@ mod tests {
         let err = run_macos_exit_dns_failclosed_capture_command(&[
             "--lan-iface".to_owned(),
             "en0".to_owned(),
+        ])
+        .expect_err("missing output must reject");
+        assert!(
+            err.contains("--output is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_text_advertises_macos_exit_killswitch_precedence_subcommand() {
+        let help = help_text();
+        assert!(
+            help.contains("macos-exit-killswitch-precedence-check"),
+            "help text must advertise macos-exit-killswitch-precedence-check subcommand"
+        );
+        assert!(
+            help.contains("--pf-anchor"),
+            "help text must advertise --pf-anchor"
+        );
+    }
+
+    #[test]
+    fn run_macos_exit_killswitch_precedence_check_command_rejects_unknown_flags() {
+        let err = run_macos_exit_killswitch_precedence_check_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(
+            err.contains("unknown macos-exit-killswitch-precedence-check argument"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_macos_exit_killswitch_precedence_check_command_requires_output() {
+        let err = run_macos_exit_killswitch_precedence_check_command(&[
+            "--pf-anchor".to_owned(),
+            "com.apple/rustynet_g1".to_owned(),
         ])
         .expect_err("missing output must reject");
         assert!(

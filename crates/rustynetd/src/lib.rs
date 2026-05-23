@@ -25,6 +25,7 @@ pub mod linux_service_hardening;
 pub mod macos_authenticode;
 pub mod macos_dns_failclosed;
 pub mod macos_exit_dns_failclosed;
+pub mod macos_exit_killswitch_precedence;
 pub mod macos_exit_nat_lifecycle;
 pub mod macos_key_custody;
 pub mod macos_mesh_status;
