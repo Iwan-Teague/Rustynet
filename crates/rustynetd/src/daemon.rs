@@ -8130,25 +8130,21 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
 /// Decide whether this node should call `PortMappingSupervisor::bring_up`.
 ///
 /// Returns `None` (proceed) when:
-/// - No anchor capability is advertised in the mesh (including when membership
-///   state is not yet loaded): self is the only reasonable actor.
 /// - Self is the elected lex-min authority node.
 ///
-/// Returns `Some(reason)` (skip) when another node is the elected authority.
+/// Returns `Some(reason)` (skip) when membership is unavailable, no authority
+/// is advertised, or another node is the elected authority.
 fn port_mapping_bring_up_skip_reason(
     self_node_id: &str,
     membership_state: Option<&MembershipState>,
 ) -> Option<String> {
-    // When membership state is not yet loaded, no anchor capability has been
-    // advertised, so this node is the only possible actor: proceed.
-    let authority_id = membership_state.and_then(|state| {
-        crate::gossip_runtime::anchor_runtime_view_from_membership(state)
-            .port_mapping_authority_node_id
-    });
+    let Some(state) = membership_state else {
+        return Some("deferred: authority unavailable".to_owned());
+    };
+    let authority_id = crate::gossip_runtime::anchor_runtime_view_from_membership(state)
+        .port_mapping_authority_node_id;
     match authority_id.as_deref() {
-        // No anchor capability advertised in mesh (or membership not yet
-        // loaded): self is the only node, proceed.
-        None => None,
+        None => Some("deferred: no anchor port-mapping authority".to_owned()),
         // Self is the elected lex-min authority: proceed.
         Some(node_id) if node_id == self_node_id => None,
         // Another node is the elected authority: defer.
@@ -13554,23 +13550,24 @@ mod tests {
     }
 
     #[test]
-    fn port_mapping_proceeds_when_no_anchor_in_mesh() {
-        // No node advertises AnchorPortMappingAuthoritative — bring_up must
-        // proceed (default behaviour preserved for meshes without anchors and
-        // for single-node deployments).
+    fn port_mapping_skipped_when_authority_unavailable() {
+        // No node advertises AnchorPortMappingAuthoritative, or membership is
+        // unavailable: fail closed and avoid racing an unknown authority.
         let state =
             make_membership_state_with_capabilities("node-self", vec![RoleCapability::ExitServer]);
         let reason = port_mapping_bring_up_skip_reason("node-self", Some(&state));
         assert!(
-            reason.is_none(),
-            "skip reason must be None when no anchor capability is in the mesh"
+            reason
+                .as_deref()
+                .is_some_and(|value| value.contains("no anchor port-mapping authority")),
+            "skip reason must name missing authority: {reason:?}"
         );
-        // Also verify with no membership state at all (membership not yet
-        // loaded): self is the only possible actor, must proceed.
         let reason_no_state = port_mapping_bring_up_skip_reason("node-self", None);
         assert!(
-            reason_no_state.is_none(),
-            "skip reason must be None when membership state is unavailable"
+            reason_no_state
+                .as_deref()
+                .is_some_and(|value| value.contains("authority unavailable")),
+            "skip reason must fail closed when membership is unavailable: {reason_no_state:?}"
         );
     }
 
