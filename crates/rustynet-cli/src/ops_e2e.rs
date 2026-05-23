@@ -1473,6 +1473,7 @@ pub fn execute_ops_e2e_membership_set_capabilities(
             &[],
             "membership apply-update failed",
         )?;
+        emit_anchor_bundle_pull_capability_audit(capabilities.as_str())?;
         Ok(())
     })();
     let restore_result = set_membership_state_permissions_local(MEMBERSHIP_STATE_OWNER_GROUP);
@@ -1492,6 +1493,35 @@ pub fn execute_ops_e2e_membership_set_capabilities(
     Ok(format!(
         "e2e membership set-capabilities complete: node_id={node_id} capabilities={capabilities}",
     ))
+}
+
+fn emit_anchor_bundle_pull_capability_audit(capabilities: &str) -> Result<(), String> {
+    use rustynet_control::role_audit::{
+        CapabilityMutationKind, RoleTransitionEvent, RoleTransitionOutcome,
+    };
+    use rustynet_control::role_presets::Capability;
+
+    let mutation = if capabilities
+        .split(',')
+        .any(|capability| capability.trim() == "anchor.bundle_pull")
+    {
+        CapabilityMutationKind::Add
+    } else {
+        CapabilityMutationKind::Remove
+    };
+    let path = crate::role_cli::resolve_audit_log_path();
+    rustynet_control::role_audit::append_role_audit_entry(
+        &path,
+        unix_now(),
+        &RoleTransitionEvent::CapabilityMutation {
+            capability: Capability::AnchorBundlePull,
+            mutation,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        },
+    )
+    .map(|_| ())
+    .map_err(|err| format!("role-transition audit append failed: {err}"))
 }
 
 pub fn execute_ops_e2e_issue_assignments(

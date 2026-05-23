@@ -176,6 +176,14 @@ fn run() -> Result<(), String> {
         json!({ "summary": gossip_priority }),
     ));
 
+    let downgrade_revocation =
+        validate_anchor_downgrade_revocation(identity, &work_known_hosts, &config)?;
+    subchecks.push(Subcheck::pass(
+        "validate_anchor_downgrade_revocation",
+        "anchor.bundle_pull revocation stops new pulls, preserves prior pull, emits audit, and restores capability",
+        json!({ "summary": downgrade_revocation }),
+    ));
+
     let daemon_status = capture_daemon_status(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
         "validate_anchor_daemon_status_available",
@@ -342,6 +350,126 @@ fn validate_lex_min_anchor_authority(
         ));
     }
     Ok(())
+}
+
+fn validate_anchor_downgrade_revocation(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+) -> Result<String, String> {
+    let owner_approver_id = config.owner_approver_id.as_deref().ok_or_else(|| {
+        "--owner-approver-id is required for validate_anchor_downgrade_revocation".to_owned()
+    })?;
+
+    let pre_revocation_pull = validate_bundle_pull_loopback(identity, known_hosts, config)?;
+    let audit_bytes_before =
+        capture_role_audit_log_size(identity, known_hosts, &config.anchor_host)
+            .map_err(|err| format!("capture audit size before revocation failed: {err}"))?;
+
+    set_membership_capabilities(
+        identity,
+        known_hosts,
+        &config.anchor_host,
+        config.anchor_node_id.as_str(),
+        "anchor,relay_host,anchor.gossip_seed,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
+        owner_approver_id,
+    )
+    .map_err(|err| format!("revoke anchor.bundle_pull from {} failed: {err}", config.anchor_node_id))?;
+
+    let validation = (|| -> Result<String, String> {
+        let fail_closed = wait_for_bundle_pull_fail_closed(identity, known_hosts, config)?;
+        let audit_bytes_after =
+            capture_role_audit_log_size(identity, known_hosts, &config.anchor_host)
+                .map_err(|err| format!("capture audit size after revocation failed: {err}"))?;
+        if audit_bytes_after <= audit_bytes_before {
+            return Err(format!(
+                "role-transition audit did not grow after downgrade: before={audit_bytes_before} after={audit_bytes_after}"
+            ));
+        }
+        Ok(format!(
+            "pre_revocation_pull=ok({pre_revocation_pull}) post_revocation={fail_closed} audit_bytes_before={audit_bytes_before} audit_bytes_after={audit_bytes_after}"
+        ))
+    })();
+
+    let restore = set_membership_capabilities(
+        identity,
+        known_hosts,
+        &config.anchor_host,
+        config.anchor_node_id.as_str(),
+        "anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
+        owner_approver_id,
+    );
+
+    match (validation, restore) {
+        (Ok(summary), Ok(_)) => Ok(format!("{summary} restore=ok")),
+        (Err(err), Ok(_)) => Err(err),
+        (Ok(_), Err(restore_err)) => Err(format!(
+            "downgrade validation passed but anchor.bundle_pull restore failed for {}: {restore_err}",
+            config.anchor_node_id
+        )),
+        (Err(err), Err(restore_err)) => Err(format!(
+            "{err}; anchor.bundle_pull restore failed for {}: {restore_err}",
+            config.anchor_node_id
+        )),
+    }
+}
+
+fn capture_role_audit_log_size(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+) -> Result<u64, String> {
+    let script = r#"set -eu
+path="${RUSTYNET_ROLE_AUDIT_LOG:-/var/lib/rustynet/role_transitions.audit.log}"
+if [ -e "$path" ]; then
+  wc -c < "$path" | tr -d '[:space:]'
+else
+  printf '0\n'
+fi
+"#;
+    let out = capture_root(identity, known_hosts, host, script)
+        .map_err(|err| format!("role audit size capture failed on {host}: {err}"))?;
+    out.trim()
+        .parse::<u64>()
+        .map_err(|err| format!("role audit size parse failed: {err}: {out:?}"))
+}
+
+fn wait_for_bundle_pull_fail_closed(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+) -> Result<String, String> {
+    let addr = parse_nc_addr(&config.anchor_bundle_pull_addr)?;
+    let script = format!(
+        r#"set -eu
+command -v nc >/dev/null
+test -r {token_path}
+token="$(cat {token_path})"
+case "$token" in
+  *[! -~]*|'') printf 'invalid token material shape\n' >&2; exit 1;;
+esac
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  response="$(mktemp)"
+  printf '%s\n' "$token" | nc -w 3 {addr_host} {addr_port} > "$response" || true
+  header="$(sed -n '1p' "$response" || true)"
+  rm -f "$response"
+  case "$header" in
+    OK\ *) sleep 2 ;;
+    *) printf 'fail_closed_header=%s attempts=%s\n' "$header" "$attempt"; exit 0 ;;
+  esac
+  attempt=$((attempt + 1))
+done
+printf 'bundle-pull still accepted after anchor.bundle_pull revocation\n' >&2
+exit 1
+"#,
+        token_path = shell_quote(config.anchor_token_path.as_str()),
+        addr_host = shell_quote(addr.host.as_str()),
+        addr_port = shell_quote(addr.port.as_str()),
+    );
+    capture_root(identity, known_hosts, &config.anchor_host, &script)
+        .map(|out| out.trim().to_owned())
+        .map_err(|err| format!("post-revocation bundle-pull fail-closed check failed: {err}"))
 }
 
 fn validate_bundle_pull_loopback(
