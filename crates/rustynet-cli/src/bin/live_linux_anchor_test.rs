@@ -505,21 +505,38 @@ fn validate_anchor_downgrade_revocation(
     })?;
 
     let pre_revocation_pull = validate_bundle_pull_loopback(identity, known_hosts, config)?;
+    let inflight_work_dir = start_inflight_bundle_pull(identity, known_hosts, config)?;
     let audit_bytes_before =
         capture_role_audit_log_size(identity, known_hosts, &config.anchor_host)
             .map_err(|err| format!("capture audit size before revocation failed: {err}"))?;
 
-    set_membership_capabilities(
+    if let Err(err) = set_membership_capabilities(
         identity,
         known_hosts,
         &config.anchor_host,
         config.anchor_node_id.as_str(),
         "anchor,relay_host,anchor.gossip_seed,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
         owner_approver_id,
-    )
-    .map_err(|err| format!("revoke anchor.bundle_pull from {} failed: {err}", config.anchor_node_id))?;
+    ) {
+        let _ = finish_inflight_bundle_pull(
+            identity,
+            known_hosts,
+            &config.anchor_host,
+            &inflight_work_dir,
+        );
+        return Err(format!(
+            "revoke anchor.bundle_pull from {} failed: {err}",
+            config.anchor_node_id
+        ));
+    }
 
     let validation = (|| -> Result<String, String> {
+        let inflight_pull = finish_inflight_bundle_pull(
+            identity,
+            known_hosts,
+            &config.anchor_host,
+            &inflight_work_dir,
+        )?;
         let fail_closed = wait_for_bundle_pull_fail_closed(identity, known_hosts, config)?;
         let audit_bytes_after =
             capture_role_audit_log_size(identity, known_hosts, &config.anchor_host)
@@ -530,7 +547,7 @@ fn validate_anchor_downgrade_revocation(
             ));
         }
         Ok(format!(
-            "pre_revocation_pull=ok({pre_revocation_pull}) post_revocation={fail_closed} audit_bytes_before={audit_bytes_before} audit_bytes_after={audit_bytes_after}"
+            "pre_revocation_pull=ok({pre_revocation_pull}) inflight_pull=ok({inflight_pull}) post_revocation={fail_closed} audit_bytes_before={audit_bytes_before} audit_bytes_after={audit_bytes_after}"
         ))
     })();
 
@@ -555,6 +572,96 @@ fn validate_anchor_downgrade_revocation(
             config.anchor_node_id
         )),
     }
+}
+
+fn start_inflight_bundle_pull(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+) -> Result<String, String> {
+    let addr = parse_nc_addr(&config.anchor_bundle_pull_addr)?;
+    let script = format!(
+        r#"set -eu
+command -v mktemp >/dev/null
+command -v nc >/dev/null
+test -r {token_path}
+work="$(mktemp -d /tmp/rustynet-anchor-inflight.XXXXXX)"
+chmod 700 "$work"
+response="$work/response"
+status="$work/status"
+stderr="$work/stderr"
+nohup sh -c '
+  token="$(cat "$1")"
+  printf "%s\n" "$token" | nc -w 10 "$2" "$3" > "$4" 2> "$6"
+  printf "%s\n" "$?" > "$5"
+' rustynet-anchor-inflight {token_path} {addr_host} {addr_port} "$response" "$status" "$stderr" >/dev/null 2>&1 &
+pid="$!"
+printf '%s\n' "$pid" > "$work/pid"
+printf 'work_dir=%s pid=%s\n' "$work" "$pid"
+"#,
+        token_path = shell_quote(config.anchor_token_path.as_str()),
+        addr_host = shell_quote(addr.host.as_str()),
+        addr_port = shell_quote(addr.port.as_str()),
+    );
+    let output = capture_root(identity, known_hosts, &config.anchor_host, &script)
+        .map_err(|err| format!("start in-flight bundle-pull failed: {err}"))?;
+    parse_summary_field(&output, "work_dir")
+        .ok_or_else(|| format!("start in-flight bundle-pull missing work_dir: {output:?}"))
+}
+
+fn finish_inflight_bundle_pull(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    work_dir: &str,
+) -> Result<String, String> {
+    ensure_safe_token("in-flight bundle-pull work dir", work_dir)?;
+    let script = format!(
+        r#"set -eu
+work={work_dir}
+test -d "$work"
+status="$work/status"
+response="$work/response"
+stderr="$work/stderr"
+attempt=0
+while [ "$attempt" -lt 20 ]; do
+  if [ -s "$status" ]; then
+    break
+  fi
+  sleep 1
+  attempt=$((attempt + 1))
+done
+if [ ! -s "$status" ]; then
+  cat "$stderr" >&2 2>/dev/null || true
+  rm -rf "$work"
+  printf 'in-flight bundle-pull did not finish before timeout\n' >&2
+  exit 1
+fi
+code="$(cat "$status")"
+if [ "$code" != "0" ]; then
+  cat "$stderr" >&2 2>/dev/null || true
+  rm -rf "$work"
+  printf 'in-flight bundle-pull exited with status %s\n' "$code" >&2
+  exit 1
+fi
+header="$(sed -n '1p' "$response")"
+case "$header" in
+  OK\ *) ;;
+  *)
+    rm -rf "$work"
+    printf 'in-flight bundle-pull header was not OK: %s\n' "$header" >&2
+    exit 1
+    ;;
+esac
+bytes="$(sed '1d' "$response" | wc -c | tr -d '[:space:]')"
+rm -rf "$work"
+printf 'header=%s bytes=%s\n' "$header" "$bytes"
+"#,
+        work_dir = shell_quote(work_dir),
+    );
+    capture_root(identity, known_hosts, host, &script)
+        .map(|out| out.trim().to_owned())
+        .map_err(|err| format!("finish in-flight bundle-pull failed: {err}"))
 }
 
 fn capture_role_audit_log_size(
@@ -816,6 +923,14 @@ fn first_line(value: &str) -> String {
         .chars()
         .take(240)
         .collect()
+}
+
+fn parse_summary_field(summary: &str, key: &str) -> Option<String> {
+    summary.split_whitespace().find_map(|field| {
+        field
+            .split_once('=')
+            .and_then(|(field_key, value)| (field_key == key).then(|| value.to_owned()))
+    })
 }
 
 fn validate_identity(path: &Path) -> Result<(), String> {
@@ -1293,6 +1408,16 @@ mod tests {
         );
         assert!(parse_nc_addr("127.0.0.1").is_err());
         assert!(parse_nc_addr("127.0.0.1;rm:51822").is_err());
+    }
+
+    #[test]
+    fn parse_summary_field_extracts_work_dir() {
+        let summary = "work_dir=/tmp/rustynet-anchor-inflight.a1B2 pid=1234\n";
+        assert_eq!(
+            parse_summary_field(summary, "work_dir").as_deref(),
+            Some("/tmp/rustynet-anchor-inflight.a1B2")
+        );
+        assert_eq!(parse_summary_field(summary, "missing"), None);
     }
 
     #[test]
