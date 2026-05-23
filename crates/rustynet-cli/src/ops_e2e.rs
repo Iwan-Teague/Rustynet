@@ -1376,6 +1376,124 @@ pub fn execute_ops_e2e_membership_add(
     ))
 }
 
+pub fn execute_ops_e2e_membership_set_capabilities(
+    node_id: String,
+    capabilities: String,
+    owner_approver_id: String,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    ensure_safe_token("node-id", node_id.as_str())?;
+    ensure_safe_token("owner-approver-id", owner_approver_id.as_str())?;
+    let capabilities = role_capability_csv(
+        &rustynet_control::roles::parse_role_capability_csv(&capabilities)
+            .map_err(|err| err.to_string())?,
+    );
+
+    let passphrase_path = format!(
+        "/tmp/rustynet-membership-passphrase.{}.{}",
+        std::process::id(),
+        unique_suffix()
+    );
+    let work_dir = PathBuf::from(format!(
+        "/tmp/rustynet-membership-update.{}.{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::create_dir_all(work_dir.as_path())
+        .map_err(|err| format!("failed creating {}: {err}", work_dir.display()))?;
+    set_unix_mode(work_dir.as_path(), 0o700)?;
+    let record_path = work_dir.join("set-capabilities.record");
+    let signed_path = work_dir.join("set-capabilities.signed");
+
+    let result = (|| -> Result<(), String> {
+        run_status(
+            "systemd-creds",
+            &[
+                "decrypt",
+                "--name=signing_key_passphrase",
+                "/etc/rustynet/credentials/signing_key_passphrase.cred",
+                passphrase_path.as_str(),
+            ],
+            &[],
+            "decrypting signing passphrase credential failed",
+        )?;
+        set_unix_mode(Path::new(passphrase_path.as_str()), 0o600)?;
+        set_membership_state_permissions_local(ROOT_OWNER_GROUP)?;
+
+        run_status(
+            "rustynet",
+            &[
+                "membership",
+                "propose-set-capabilities",
+                "--node-id",
+                node_id.as_str(),
+                "--capabilities",
+                capabilities.as_str(),
+                "--output",
+                record_path.to_string_lossy().as_ref(),
+                "--snapshot",
+                "/var/lib/rustynet/membership.snapshot",
+                "--log",
+                "/var/lib/rustynet/membership.log",
+            ],
+            &[],
+            "membership propose-set-capabilities failed",
+        )?;
+        run_status(
+            "rustynet",
+            &[
+                "membership",
+                "sign-update",
+                "--record",
+                record_path.to_string_lossy().as_ref(),
+                "--approver-id",
+                owner_approver_id.as_str(),
+                "--signing-key",
+                "/etc/rustynet/membership.owner.key",
+                "--signing-key-passphrase-file",
+                passphrase_path.as_str(),
+                "--output",
+                signed_path.to_string_lossy().as_ref(),
+            ],
+            &[],
+            "membership sign-update failed",
+        )?;
+        run_status(
+            "rustynet",
+            &[
+                "membership",
+                "apply-update",
+                "--signed-update",
+                signed_path.to_string_lossy().as_ref(),
+                "--snapshot",
+                "/var/lib/rustynet/membership.snapshot",
+                "--log",
+                "/var/lib/rustynet/membership.log",
+            ],
+            &[],
+            "membership apply-update failed",
+        )?;
+        Ok(())
+    })();
+    let restore_result = set_membership_state_permissions_local(MEMBERSHIP_STATE_OWNER_GROUP);
+    secure_remove_file(Path::new(passphrase_path.as_str()));
+    let _ = fs::remove_dir_all(work_dir);
+    match (result, restore_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(err), Ok(())) => return Err(err),
+        (Ok(()), Err(restore_err)) => return Err(restore_err),
+        (Err(err), Err(restore_err)) => {
+            return Err(format!(
+                "{err}; membership ownership restore failed: {restore_err}"
+            ));
+        }
+    }
+
+    Ok(format!(
+        "e2e membership set-capabilities complete: node_id={node_id} capabilities={capabilities}",
+    ))
+}
+
 pub fn execute_ops_e2e_issue_assignments(
     exit_node_id: String,
     client_node_id: String,

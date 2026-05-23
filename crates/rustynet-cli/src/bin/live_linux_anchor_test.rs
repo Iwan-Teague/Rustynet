@@ -24,6 +24,29 @@ const REQUIRED_ANCHOR_CAPS: &[&str] = &[
     "anchor.port_mapping_authoritative",
 ];
 
+const ANCHOR_LIVE_SUBSTAGES: &[(&str, &str)] = &[
+    (
+        "validate_anchor_membership_advertise",
+        "signed anchor membership advertises all required anchor sub-capabilities",
+    ),
+    (
+        "validate_anchor_bundle_pull",
+        "token-gated loopback bundle-pull returns signed membership byte-for-byte and rejects invalid tokens",
+    ),
+    (
+        "validate_anchor_gossip_priority",
+        "multi-anchor gossip prefers lex-min authority and keeps secondary anchor passive for port mapping",
+    ),
+    (
+        "validate_anchor_enrollment_endpoint",
+        "fresh node enrollment uses anchor-minted token, sealed bundle, and anchor-signed approver attestation",
+    ),
+    (
+        "validate_anchor_downgrade_revocation",
+        "owner-signed anchor.bundle_pull revocation stops new pulls, preserves in-flight pulls, and records audit",
+    ),
+];
+
 fn main() {
     if let Err(err) = run() {
         let code = classify_live_lab_error(err.as_str());
@@ -134,34 +157,21 @@ fn run() -> Result<(), String> {
     let anchor_list = capture_anchor_list(identity, &work_known_hosts, &config)?;
     validate_anchor_capabilities(&anchor_list, config.anchor_node_id.as_str())?;
     subchecks.push(Subcheck::pass(
-        "anchor_membership_advertise",
+        "validate_anchor_membership_advertise",
         "signed membership advertises required anchor capabilities",
         json!({ "anchor_node_id": config.anchor_node_id, "capabilities": REQUIRED_ANCHOR_CAPS }),
     ));
 
     let pull_summary = validate_bundle_pull_loopback(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
-        "anchor_bundle_pull_loopback",
-        "loopback bundle-pull listener returned membership snapshot byte-for-byte",
-        json!({ "summary": pull_summary }),
-    ));
-
-    let rejection_summary = validate_invalid_token_rejected(identity, &work_known_hosts, &config)?;
-    subchecks.push(Subcheck::pass(
-        "anchor_bundle_pull_rejects_invalid_token",
-        "bundle-pull listener rejected invalid token without returning bundle body",
-        json!({ "summary": rejection_summary }),
-    ));
-
-    subchecks.push(Subcheck::pass(
-        "anchor_port_mapping_authority_capability",
-        "anchor advertises lex-min port-mapping authority capability",
-        json!({ "anchor_node_id": config.anchor_node_id }),
+        "validate_anchor_bundle_pull",
+        "loopback bundle-pull listener returned membership snapshot byte-for-byte and rejected invalid token",
+        json!({ "pull": pull_summary, "invalid_token": validate_invalid_token_rejected(identity, &work_known_hosts, &config)? }),
     ));
 
     let daemon_status = capture_daemon_status(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
-        "anchor_daemon_status_available",
+        "validate_anchor_daemon_status_available",
         "daemon IPC status command completed for anchor host",
         json!({ "status_excerpt": first_line(&daemon_status) }),
     ));
@@ -294,16 +304,10 @@ fn capture_daemon_status(
 }
 
 fn dry_run_subchecks() -> Vec<Subcheck> {
-    [
-        "anchor_membership_advertise",
-        "anchor_bundle_pull_loopback",
-        "anchor_bundle_pull_rejects_invalid_token",
-        "anchor_port_mapping_authority_capability",
-        "anchor_daemon_status_available",
-    ]
-    .into_iter()
-    .map(|name| Subcheck::skipped(name, "dry-run: not executed"))
-    .collect()
+    ANCHOR_LIVE_SUBSTAGES
+        .iter()
+        .map(|(name, detail)| Subcheck::skipped(name, detail))
+        .collect()
 }
 
 fn render_report(
@@ -338,6 +342,13 @@ fn render_report(
         "platform": config.platform.as_str(),
         "anchor_host": config.anchor_host,
         "anchor_node_id": config.anchor_node_id,
+        "second_anchor_host": config.second_anchor_host,
+        "second_anchor_node_id": config.second_anchor_node_id,
+        "leaf_client_host": config.leaf_client_host,
+        "leaf_client_node_id": config.leaf_client_node_id,
+        "enrollee_host": config.enrollee_host,
+        "enrollee_node_id": config.enrollee_node_id,
+        "owner_approver_id": config.owner_approver_id,
         "anchor_bundle_pull_addr": config.anchor_bundle_pull_addr,
         "membership_snapshot_path": config.membership_snapshot_path,
         "subchecks": checks,
@@ -398,6 +409,13 @@ struct Config {
     platform: AnchorPlatform,
     anchor_host: String,
     anchor_node_id: String,
+    second_anchor_host: Option<String>,
+    second_anchor_node_id: Option<String>,
+    leaf_client_host: Option<String>,
+    leaf_client_node_id: Option<String>,
+    enrollee_host: Option<String>,
+    enrollee_node_id: Option<String>,
+    owner_approver_id: Option<String>,
     anchor_bundle_pull_addr: String,
     anchor_token_path: String,
     membership_snapshot_path: String,
@@ -415,6 +433,13 @@ impl Config {
             platform: AnchorPlatform::Linux,
             anchor_host: "debian@192.168.64.13".to_owned(),
             anchor_node_id: "exit-1".to_owned(),
+            second_anchor_host: None,
+            second_anchor_node_id: None,
+            leaf_client_host: None,
+            leaf_client_node_id: None,
+            enrollee_host: None,
+            enrollee_node_id: None,
+            owner_approver_id: None,
             anchor_bundle_pull_addr: "127.0.0.1:51822".to_owned(),
             anchor_token_path: "/var/lib/rustynet/anchor-bundle-pull.token".to_owned(),
             membership_snapshot_path: "/var/lib/rustynet/membership.snapshot".to_owned(),
@@ -434,6 +459,25 @@ impl Config {
                 }
                 "--anchor-host" => config.anchor_host = next_value(&mut iter, &arg)?,
                 "--anchor-node-id" => config.anchor_node_id = next_value(&mut iter, &arg)?,
+                "--second-anchor-host" => {
+                    config.second_anchor_host = Some(next_value(&mut iter, &arg)?)
+                }
+                "--second-anchor-node-id" => {
+                    config.second_anchor_node_id = Some(next_value(&mut iter, &arg)?)
+                }
+                "--leaf-client-host" => {
+                    config.leaf_client_host = Some(next_value(&mut iter, &arg)?)
+                }
+                "--leaf-client-node-id" => {
+                    config.leaf_client_node_id = Some(next_value(&mut iter, &arg)?)
+                }
+                "--enrollee-host" => config.enrollee_host = Some(next_value(&mut iter, &arg)?),
+                "--enrollee-node-id" => {
+                    config.enrollee_node_id = Some(next_value(&mut iter, &arg)?)
+                }
+                "--owner-approver-id" => {
+                    config.owner_approver_id = Some(next_value(&mut iter, &arg)?)
+                }
                 "--anchor-bundle-pull-addr" => {
                     config.anchor_bundle_pull_addr = next_value(&mut iter, &arg)?
                 }
@@ -464,6 +508,40 @@ impl Config {
     fn validate(&self) -> Result<(), String> {
         ensure_safe_token("anchor host", &self.anchor_host)?;
         ensure_safe_token("anchor node id", &self.anchor_node_id)?;
+        for (label, value) in [
+            ("second anchor host", self.second_anchor_host.as_deref()),
+            (
+                "second anchor node id",
+                self.second_anchor_node_id.as_deref(),
+            ),
+            ("leaf client host", self.leaf_client_host.as_deref()),
+            ("leaf client node id", self.leaf_client_node_id.as_deref()),
+            ("enrollee host", self.enrollee_host.as_deref()),
+            ("enrollee node id", self.enrollee_node_id.as_deref()),
+            ("owner approver id", self.owner_approver_id.as_deref()),
+        ] {
+            if let Some(value) = value {
+                ensure_safe_token(label, value)?;
+            }
+        }
+        require_pair(
+            "--second-anchor-host",
+            &self.second_anchor_host,
+            "--second-anchor-node-id",
+            &self.second_anchor_node_id,
+        )?;
+        require_pair(
+            "--leaf-client-host",
+            &self.leaf_client_host,
+            "--leaf-client-node-id",
+            &self.leaf_client_node_id,
+        )?;
+        require_pair(
+            "--enrollee-host",
+            &self.enrollee_host,
+            "--enrollee-node-id",
+            &self.enrollee_node_id,
+        )?;
         ensure_safe_token("anchor bundle-pull addr", &self.anchor_bundle_pull_addr)?;
         parse_nc_addr(&self.anchor_bundle_pull_addr)?;
         if self.anchor_token_path.contains('\0')
@@ -584,8 +662,22 @@ fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<Str
         .ok_or_else(|| format!("missing required value for {flag}"))
 }
 
+fn require_pair<T>(
+    left_flag: &str,
+    left: &Option<T>,
+    right_flag: &str,
+    right: &Option<T>,
+) -> Result<(), String> {
+    if left.is_some() != right.is_some() {
+        return Err(format!(
+            "{left_flag} and {right_flag} must be provided together"
+        ));
+    }
+    Ok(())
+}
+
 fn usage() -> String {
-    "usage: live_linux_anchor_test --ssh-identity-file <path> [options]\n\noptions:\n  --platform <linux|macos|windows>\n  --anchor-host <user@host>\n  --anchor-node-id <id>\n  --anchor-bundle-pull-addr <host:port>\n  --anchor-token-path <path>\n  --membership-snapshot-path <path>\n  --known-hosts <path>\n  --report-path <path>\n  --log-path <path>\n  --git-commit <sha>\n  --dry-run".to_owned()
+    "usage: live_linux_anchor_test --ssh-identity-file <path> [options]\n\noptions:\n  --platform <linux|macos|windows>\n  --anchor-host <user@host>\n  --anchor-node-id <id>\n  --second-anchor-host <user@host>\n  --second-anchor-node-id <id>\n  --leaf-client-host <user@host>\n  --leaf-client-node-id <id>\n  --enrollee-host <user@host>\n  --enrollee-node-id <id>\n  --owner-approver-id <id>\n  --anchor-bundle-pull-addr <host:port>\n  --anchor-token-path <path>\n  --membership-snapshot-path <path>\n  --known-hosts <path>\n  --report-path <path>\n  --log-path <path>\n  --git-commit <sha>\n  --dry-run".to_owned()
 }
 
 #[cfg(test)]
@@ -606,9 +698,14 @@ mod tests {
             "--dry-run".to_owned(),
             "--platform".to_owned(),
             "macos".to_owned(),
+            "--second-anchor-host".to_owned(),
+            "mac@192.168.64.18".to_owned(),
+            "--second-anchor-node-id".to_owned(),
+            "macos-anchor-1".to_owned(),
         ])
         .expect("macos dry-run parses");
         assert_eq!(cfg.platform, AnchorPlatform::Macos);
+        assert_eq!(cfg.second_anchor_node_id.as_deref(), Some("macos-anchor-1"));
     }
 
     #[test]
@@ -650,6 +747,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_unpaired_topology_nodes() {
+        let err = Config::parse(vec![
+            "--dry-run".to_owned(),
+            "--second-anchor-host".to_owned(),
+            "debian@192.168.64.6".to_owned(),
+        ])
+        .expect_err("unpaired second anchor rejected");
+        assert!(err.contains("--second-anchor-host"));
+    }
+
+    #[test]
     fn parse_nc_addr_splits_host_port_for_nc() {
         let addr = parse_nc_addr("127.0.0.1:51822").unwrap();
         assert_eq!(addr.host, "127.0.0.1");
@@ -683,5 +791,21 @@ mod tests {
         assert_eq!(parsed["stage"], "live_anchor");
         assert_eq!(parsed["status"], "pass");
         assert_eq!(parsed["subchecks"].as_array().unwrap().len(), 5);
+        let names = parsed["subchecks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "validate_anchor_membership_advertise",
+                "validate_anchor_bundle_pull",
+                "validate_anchor_gossip_priority",
+                "validate_anchor_enrollment_endpoint",
+                "validate_anchor_downgrade_revocation",
+            ]
+        );
     }
 }

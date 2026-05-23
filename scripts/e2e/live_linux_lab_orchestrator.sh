@@ -3958,6 +3958,13 @@ stage_run_live_anchor() {
     --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --anchor-host "$(node_target_for_label exit)" \
     --anchor-node-id "$(node_id_for_label exit)" \
+    --second-anchor-host "$(node_target_for_label entry)" \
+    --second-anchor-node-id "$(node_id_for_label entry)" \
+    --leaf-client-host "$(node_target_for_label aux)" \
+    --leaf-client-node-id "$(node_id_for_label aux)" \
+    --enrollee-host "$(node_target_for_label extra)" \
+    --enrollee-node-id "$(node_id_for_label extra)" \
+    --owner-approver-id "$(node_id_for_label exit)" \
     --anchor-bundle-pull-addr "127.0.0.1:51822" \
     --report-path "$report_path" \
     --log-path "$log_path"

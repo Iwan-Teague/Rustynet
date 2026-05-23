@@ -1060,6 +1060,11 @@ enum OpsCommand {
         capabilities: String,
         owner_approver_id: String,
     },
+    E2eMembershipSetCapabilities {
+        node_id: String,
+        capabilities: String,
+        owner_approver_id: String,
+    },
     E2eIssueAssignments {
         exit_node_id: String,
         client_node_id: String,
@@ -4257,6 +4262,11 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 .unwrap_or_else(|| "client".to_owned()),
             owner_approver_id: parser.required("--owner-approver-id")?,
         }),
+        "e2e-membership-set-capabilities" => Ok(OpsCommand::E2eMembershipSetCapabilities {
+            node_id: parser.required("--node-id")?,
+            capabilities: parser.required("--capabilities")?,
+            owner_approver_id: parser.required("--owner-approver-id")?,
+        }),
         "e2e-issue-assignments" => Ok(OpsCommand::E2eIssueAssignments {
             exit_node_id: parser.required("--exit-node-id")?,
             client_node_id: parser.required("--client-node-id")?,
@@ -4401,6 +4411,22 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
                     MembershipOperation::RotateNodeKey {
                         node_id: node_id.clone(),
                         new_pubkey_hex,
+                    },
+                    node_id,
+                )?,
+            })
+        }
+        "propose-set-capabilities" => {
+            let node_id = parser.required("--node-id")?;
+            let capabilities = parse_role_capability_csv(&parser.required("--capabilities")?)
+                .map_err(|err| err.to_string())?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    &parser,
+                    paths,
+                    MembershipOperation::SetNodeCapabilities {
+                        node_id: node_id.clone(),
+                        capabilities,
                     },
                     node_id,
                 )?,
@@ -6627,6 +6653,15 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         } => ops_e2e::execute_ops_e2e_membership_add(
             client_node_id,
             client_pubkey_hex,
+            capabilities,
+            owner_approver_id,
+        ),
+        OpsCommand::E2eMembershipSetCapabilities {
+            node_id,
+            capabilities,
+            owner_approver_id,
+        } => ops_e2e::execute_ops_e2e_membership_set_capabilities(
+            node_id,
             capabilities,
             owner_approver_id,
         ),
@@ -16883,6 +16918,7 @@ fn help_text() -> String {
         "  membership propose-revoke --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-restore --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-rotate-key --node-id <id> --new-pubkey <hex> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
+        "  membership propose-set-capabilities --node-id <id> --capabilities <csv> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-set-quorum --threshold <n> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-rotate-approver --approver-id <id> --approver-pubkey <hex> --role <owner|guardian> --status <active|revoked> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership sign-update --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
@@ -17036,6 +17072,7 @@ fn help_text() -> String {
         "  ops e2e-bootstrap-windows --node-id <id> --network-id <id> --passphrase-file <absolute-path>",
         "  ops e2e-enforce-host --role <role> --node-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]>",
         "  ops e2e-membership-add --client-node-id <id> --client-pubkey-hex <hex> --owner-approver-id <id> [--capabilities <csv>]",
+        "  ops e2e-membership-set-capabilities --node-id <id> --capabilities <csv> --owner-approver-id <id>",
         "  ops e2e-issue-assignments --exit-node-id <id> --client-node-id <id> --exit-endpoint <host:port> --client-endpoint <host:port> --exit-pubkey-hex <hex> --client-pubkey-hex <hex> [--artifact-dir <absolute-path>]",
         "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
@@ -18547,14 +18584,15 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorCommand, CliCommand, DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE,
-        MembershipEvidenceSummary, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform,
-        Phase6ProbeMetadataView, RoleCapability, build_membership_audit_replay_json,
-        build_membership_evidence_diff_json, classify_cli_error, command_supports_json_render,
-        contains_ip_rule_lookup_table, detect_tampered_log, execute, extract_json_flag, help_text,
-        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
-        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
-        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        AnchorCommand, CliCommand, DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, MembershipCommand,
+        MembershipEvidenceSummary, MembershipOperation, PHASE6_MAX_EVIDENCE_AGE_SECS,
+        Phase6Platform, Phase6ProbeMetadataView, RoleCapability,
+        build_membership_audit_replay_json, build_membership_evidence_diff_json,
+        classify_cli_error, command_supports_json_render, contains_ip_rule_lookup_table,
+        detect_tampered_log, execute, extract_json_flag, help_text, is_interface_absent_detail,
+        launchd_xml_escape, load_dns_zone_records_manifest, load_signing_key,
+        managed_dns_resolver_server_arg, managed_dns_routing_already_absent, parse_bool_value,
+        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
         persist_encrypted_secret_material, phase6_stage_probe_from_source,
         phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
@@ -19281,6 +19319,30 @@ mod tests {
             "/tmp/membership.log".to_owned(),
         ]);
         assert!(format!("{command:?}").contains("Membership"));
+
+        let set_capabilities = parse_command(&[
+            "membership".to_owned(),
+            "propose-set-capabilities".to_owned(),
+            "--node-id".to_owned(),
+            "relay-1".to_owned(),
+            "--capabilities".to_owned(),
+            "client,relay_host,anchor.bundle_pull".to_owned(),
+            "--output".to_owned(),
+            "/tmp/set-caps.record".to_owned(),
+        ]);
+        match set_capabilities {
+            CliCommand::Membership(command) => match *command {
+                MembershipCommand::Propose { config } => {
+                    assert_eq!(config.target, "relay-1");
+                    assert!(matches!(
+                        config.operation,
+                        MembershipOperation::SetNodeCapabilities { .. }
+                    ));
+                }
+                other => panic!("expected membership proposal, got {other:?}"),
+            },
+            other => panic!("expected Membership command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -20834,6 +20896,20 @@ mod tests {
             "exit-node-owner".to_owned(),
         ]);
         assert!(format!("{membership:?}").contains("E2eMembershipAdd"));
+
+        let membership_set_capabilities = parse_command(&[
+            "ops".to_owned(),
+            "e2e-membership-set-capabilities".to_owned(),
+            "--node-id".to_owned(),
+            "client-node".to_owned(),
+            "--capabilities".to_owned(),
+            "client,anchor.bundle_pull".to_owned(),
+            "--owner-approver-id".to_owned(),
+            "exit-node-owner".to_owned(),
+        ]);
+        assert!(
+            format!("{membership_set_capabilities:?}").contains("E2eMembershipSetCapabilities")
+        );
 
         let assignments = parse_command(&[
             "ops".to_owned(),
