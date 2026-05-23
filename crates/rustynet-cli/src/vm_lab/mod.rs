@@ -3,6 +3,7 @@
 mod bootstrap;
 pub mod capability;
 pub mod orchestrator;
+pub mod topology;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -859,6 +860,30 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// which rejects an empty value, so the flag is effectively required
     /// for `--node`-driven live lab runs.
     pub orchestrate_ssh_allow_cidrs: Option<String>,
+    /// Track B Step 1 — optional `--topology-profile <path>` JSON
+    /// document mapping `exit` / `relay` / `anchor` / `blind_exit`
+    /// roles onto inventory aliases. Empty / unset = the orchestrator
+    /// uses today's Linux-exit defaults and the explicit per-role
+    /// `--exit-vm` etc flags. See `crates/rustynet-cli/src/vm_lab/topology.rs`.
+    pub topology_profile: Option<PathBuf>,
+    /// Track B Step 1 — convenience `--exit-platform <linux|macos|windows>`
+    /// selector that picks the first inventory entry whose platform
+    /// matches the requested value. Mutually exclusive with
+    /// `--exit-vm` and with a topology-profile `exit` entry; the
+    /// resolver enforces fail-closed in
+    /// [`topology::resolve_topology`].
+    pub exit_platform: Option<String>,
+    /// Counterpart of [`Self::exit_platform`] for the relay role
+    /// slot. The relay alias is propagated to the bash orchestrator
+    /// via `RELAY_VM` / `RELAY_PLATFORM` profile env entries when set;
+    /// unset leaves today's implicit behaviour intact.
+    pub relay_platform: Option<String>,
+    /// Counterpart of [`Self::exit_platform`] for the anchor role
+    /// slot. Anchor live-lab capability tests live in Track A, but
+    /// the topology layer needs to accept the selector now so the
+    /// orchestrator can stamp `ANCHOR_VM` / `ANCHOR_PLATFORM` in the
+    /// profile env without a follow-up flag-plumbing churn.
+    pub anchor_platform: Option<String>,
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
@@ -965,6 +990,34 @@ pub fn execute_ops_vm_lab_diff_orchestrator_parity(
 /// bash orchestrator stays default until W5.5 parity is proven). Once
 /// proven, the default flips and the warning escalates the operator's
 /// migration path.
+/// Track B Step 1 — emit a single stderr line per role whose alias was
+/// resolved by the topology layer FROM A NON-EXPLICIT source (i.e.
+/// `--topology-profile` or `--exit-platform / --relay-platform /
+/// --anchor-platform`). Roles resolved from the existing explicit
+/// `--exit-vm` etc flags stay silent so default Linux-exit runs
+/// produce byte-identical stderr output.
+fn log_topology_resolution_overrides(resolution: &topology::TopologyResolution) {
+    for resolved in [
+        resolution.exit.as_ref(),
+        resolution.relay.as_ref(),
+        resolution.anchor.as_ref(),
+        resolution.blind_exit.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if resolved.source == topology::TopologySource::ExplicitCliAlias {
+            continue;
+        }
+        eprintln!(
+            "topology: {} alias resolved to {:?} (source: {:?})",
+            resolved.role.as_str(),
+            resolved.alias,
+            resolved.source
+        );
+    }
+}
+
 pub fn legacy_role_flags_deprecation_warnings(
     config: &VmLabOrchestrateLiveLabConfig,
 ) -> Vec<String> {
@@ -1238,7 +1291,7 @@ pub struct VmLabRunSuiteConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum VmController {
+pub(crate) enum VmController {
     LocalUtm {
         utm_name: String,
         bundle_path: PathBuf,
@@ -1580,30 +1633,30 @@ fn windows_service_host_smoke_helper_script_local_path() -> PathBuf {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VmInventoryEntry {
-    alias: String,
-    ssh_target: String,
-    ssh_user: Option<String>,
-    ssh_password: Option<String>,
-    include_in_all: Option<bool>,
-    os: Option<String>,
-    last_known_ip: Option<String>,
-    parent_device: Option<String>,
-    last_known_network: Option<String>,
-    network_group: Option<String>,
-    node_id: Option<String>,
-    lab_role: Option<String>,
-    mesh_ip: Option<String>,
-    exit_capable: Option<bool>,
-    relay_capable: Option<bool>,
-    remote_temp_dir: Option<String>,
-    utm_staging_dir: Option<String>,
-    rustynet_src_dir: Option<String>,
-    platform: Option<VmGuestPlatform>,
-    remote_shell: Option<VmRemoteShell>,
-    guest_exec_mode: Option<VmGuestExecMode>,
-    service_manager: Option<VmServiceManager>,
-    controller: Option<VmController>,
+pub(crate) struct VmInventoryEntry {
+    pub(crate) alias: String,
+    pub(crate) ssh_target: String,
+    pub(crate) ssh_user: Option<String>,
+    pub(crate) ssh_password: Option<String>,
+    pub(crate) include_in_all: Option<bool>,
+    pub(crate) os: Option<String>,
+    pub(crate) last_known_ip: Option<String>,
+    pub(crate) parent_device: Option<String>,
+    pub(crate) last_known_network: Option<String>,
+    pub(crate) network_group: Option<String>,
+    pub(crate) node_id: Option<String>,
+    pub(crate) lab_role: Option<String>,
+    pub(crate) mesh_ip: Option<String>,
+    pub(crate) exit_capable: Option<bool>,
+    pub(crate) relay_capable: Option<bool>,
+    pub(crate) remote_temp_dir: Option<String>,
+    pub(crate) utm_staging_dir: Option<String>,
+    pub(crate) rustynet_src_dir: Option<String>,
+    pub(crate) platform: Option<VmGuestPlatform>,
+    pub(crate) remote_shell: Option<VmRemoteShell>,
+    pub(crate) guest_exec_mode: Option<VmGuestExecMode>,
+    pub(crate) service_manager: Option<VmServiceManager>,
+    pub(crate) controller: Option<VmController>,
 }
 
 impl VmInventoryEntry {
@@ -6599,6 +6652,15 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
     let orchestration_dir = report_dir.join("orchestration");
     let pre_setup_orchestration_dir = create_orchestration_staging_dir()?;
     let inventory_path = resolve_absolute_path(config.inventory_path.as_path())?;
+    // Track B Step 1 — apply the optional topology selectors before
+    // resolving Linux VM aliases. The override only mutates exit_vm
+    // when the operator passed --topology-profile or --exit-platform;
+    // explicit --exit-vm + an unset topology layer leave the config
+    // byte-identical so existing Linux-default runs are unchanged.
+    let inventory_entries = load_inventory(inventory_path.as_path())?;
+    let (config, topology_resolution) =
+        topology::apply_topology_overrides_to_orchestrate_config(config, &inventory_entries)?;
+    log_topology_resolution_overrides(&topology_resolution);
     let selected_aliases = resolve_live_lab_vm_aliases(
         inventory_path.as_path(),
         config.exit_vm.as_deref(),
@@ -31335,6 +31397,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             legacy_bash_orchestrator: false,
             orchestrate_ssh_allow_cidrs: None,
             no_fail_on_authenticode: false,
+            topology_profile: None,
+            exit_platform: None,
+            relay_platform: None,
+            anchor_platform: None,
         }
     }
 
