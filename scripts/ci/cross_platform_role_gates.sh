@@ -54,6 +54,12 @@ rg -q 'validate_macos_anchor_bundle_pull' crates/rustynet-cli/src/vm_lab/mod.rs
 rg -q 'validate_windows_relay_service_lifecycle' crates/rustynet-cli/src/vm_lab/mod.rs
 rg -q 'validate_windows_anchor_bundle_pull' crates/rustynet-cli/src/vm_lab/mod.rs
 
+# Step 7 (B1.2) non-Linux genesis verbs.
+rg -q 'E2eBootstrapMacos' crates/rustynet-cli/src/main.rs
+rg -q 'E2eBootstrapWindows' crates/rustynet-cli/src/main.rs
+rg -q 'execute_ops_e2e_bootstrap_macos' crates/rustynet-cli/src/ops_e2e.rs
+rg -q 'execute_ops_e2e_bootstrap_windows' crates/rustynet-cli/src/ops_e2e.rs
+
 # Unit tests covering the surfaces above. Each `-p rustynet-cli` test
 # target is a single hermetic binary, so the gate doesn't need a live
 # VM lab to run; it is safe in PR-time CI.

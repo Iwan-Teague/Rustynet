@@ -937,6 +937,27 @@ enum OpsCommand {
     /// the `exit` preset on Windows.
     InstallWindowsExitService,
     UninstallWindowsExitService,
+    /// Track B Step 7 (B1.2) — non-Linux genesis driver for macOS.
+    /// Runs `rustynetd membership init` against the canonical macOS
+    /// state paths (`/usr/local/var/rustynet/membership/`). Operator
+    /// stages the owner-signing-key passphrase file separately; this
+    /// verb consumes it via the same `--passphrase-file` flag the
+    /// Linux variant uses.
+    E2eBootstrapMacos {
+        node_id: String,
+        network_id: String,
+        passphrase_file: PathBuf,
+    },
+    /// Track B Step 7 (B1.2) — non-Linux genesis driver for Windows.
+    /// Runs `rustynetd membership init` against the canonical
+    /// `C:\ProgramData\RustyNet\membership\` paths. Operator runs
+    /// `Install-RustyNetWindowsService.ps1` first to lay down the
+    /// state tree + ACLs.
+    E2eBootstrapWindows {
+        node_id: String,
+        network_id: String,
+        passphrase_file: PathBuf,
+    },
     PrepareSystemDirs,
     RestartRuntimeService,
     StopRuntimeService,
@@ -3933,6 +3954,36 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             }
             Ok(OpsCommand::UninstallWindowsExitService)
         }
+        "e2e-bootstrap-macos" => {
+            // Track B Step 7 (B1.2) — non-Linux genesis driver on macOS.
+            let node_id = parser
+                .value("--node-id")
+                .ok_or_else(|| "ops e2e-bootstrap-macos: --node-id is required".to_owned())?;
+            let network_id = parser
+                .value("--network-id")
+                .ok_or_else(|| "ops e2e-bootstrap-macos: --network-id is required".to_owned())?;
+            let passphrase_file = parser.required_path("--passphrase-file")?;
+            Ok(OpsCommand::E2eBootstrapMacos {
+                node_id,
+                network_id,
+                passphrase_file,
+            })
+        }
+        "e2e-bootstrap-windows" => {
+            // Track B Step 7 (B1.2) — non-Linux genesis driver on Windows.
+            let node_id = parser
+                .value("--node-id")
+                .ok_or_else(|| "ops e2e-bootstrap-windows: --node-id is required".to_owned())?;
+            let network_id = parser
+                .value("--network-id")
+                .ok_or_else(|| "ops e2e-bootstrap-windows: --network-id is required".to_owned())?;
+            let passphrase_file = parser.required_path("--passphrase-file")?;
+            Ok(OpsCommand::E2eBootstrapWindows {
+                node_id,
+                network_id,
+                passphrase_file,
+            })
+        }
         "prepare-system-dirs" => {
             if args.len() != 1 {
                 return Err("ops prepare-system-dirs does not accept options".to_owned());
@@ -6437,6 +6488,16 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         OpsCommand::UninstallWindowsExitService => {
             ops_e2e::execute_ops_uninstall_windows_exit_service()
         }
+        OpsCommand::E2eBootstrapMacos {
+            node_id,
+            network_id,
+            passphrase_file,
+        } => ops_e2e::execute_ops_e2e_bootstrap_macos(node_id, network_id, passphrase_file),
+        OpsCommand::E2eBootstrapWindows {
+            node_id,
+            network_id,
+            passphrase_file,
+        } => ops_e2e::execute_ops_e2e_bootstrap_windows(node_id, network_id, passphrase_file),
         OpsCommand::PrepareSystemDirs => execute_ops_prepare_system_dirs(),
         OpsCommand::RestartRuntimeService => execute_ops_restart_runtime_service(),
         OpsCommand::StopRuntimeService => execute_ops_stop_runtime_service(),
@@ -16971,6 +17032,8 @@ fn help_text() -> String {
         "  ops peer-store-list --config-dir <absolute-path> --peers-file <absolute-path> [--role <role>] [--node-id <id>]",
         "  ops run-debian-two-node-e2e --exit-host <host|user@host> --client-host <host|user@host> --ssh-allow-cidrs <cidr[,cidr...]> [--ssh-user <user>] [--ssh-sudo <auto|always|never>] [--sudo-password-file <path>] [--ssh-port <port>] [--ssh-identity <path>] [--ssh-known-hosts-file <path>] [--exit-node-id <id>] [--client-node-id <id>] [--network-id <id>] [--remote-root <abs-path>] [--repo-ref <git-ref>] [--skip-apt] [--report-path <path>]",
         "  ops e2e-bootstrap-host --role <role> --node-id <id> --network-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]> [--skip-apt]",
+        "  ops e2e-bootstrap-macos --node-id <id> --network-id <id> --passphrase-file <absolute-path>",
+        "  ops e2e-bootstrap-windows --node-id <id> --network-id <id> --passphrase-file <absolute-path>",
         "  ops e2e-enforce-host --role <role> --node-id <id> --src-dir <absolute-path> --ssh-allow-cidrs <cidr[,cidr...]>",
         "  ops e2e-membership-add --client-node-id <id> --client-pubkey-hex <hex> --owner-approver-id <id> [--capabilities <csv>]",
         "  ops e2e-issue-assignments --exit-node-id <id> --client-node-id <id> --exit-endpoint <host:port> --client-endpoint <host:port> --exit-pubkey-hex <hex> --client-pubkey-hex <hex> [--artifact-dir <absolute-path>]",
@@ -20515,6 +20578,33 @@ mod tests {
             "uninstall-windows-exit-service".to_owned(),
         ]);
         assert!(format!("{windows_exit_uninstaller:?}").contains("UninstallWindowsExitService"));
+
+        // Track B Step 7 (B1.2) — non-Linux genesis verb parsing.
+        // Execution is cfg-gated to the matching target OS; this
+        // assertion only proves the OpsCommand variant routes
+        // correctly via the parser.
+        let macos_genesis = parse_command(&[
+            "ops".to_owned(),
+            "e2e-bootstrap-macos".to_owned(),
+            "--node-id".to_owned(),
+            "macos-exit-1".to_owned(),
+            "--network-id".to_owned(),
+            "rustynet".to_owned(),
+            "--passphrase-file".to_owned(),
+            "/tmp/passphrase".to_owned(),
+        ]);
+        assert!(format!("{macos_genesis:?}").contains("E2eBootstrapMacos"));
+        let windows_genesis = parse_command(&[
+            "ops".to_owned(),
+            "e2e-bootstrap-windows".to_owned(),
+            "--node-id".to_owned(),
+            "windows-exit-1".to_owned(),
+            "--network-id".to_owned(),
+            "rustynet".to_owned(),
+            "--passphrase-file".to_owned(),
+            "/tmp/passphrase".to_owned(),
+        ]);
+        assert!(format!("{windows_genesis:?}").contains("E2eBootstrapWindows"));
 
         let prepare_dirs = parse_command(&["ops".to_owned(), "prepare-system-dirs".to_owned()]);
         assert!(format!("{prepare_dirs:?}").contains("PrepareSystemDirs"));

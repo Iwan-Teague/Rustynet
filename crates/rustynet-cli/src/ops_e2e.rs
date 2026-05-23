@@ -800,6 +800,223 @@ pub fn execute_ops_uninstall_windows_exit_service() -> Result<String, String> {
     Err("ops uninstall-windows-exit-service is only supported on Windows hosts".to_owned())
 }
 
+// ─── Track B Step 7 (B1.2): non-Linux genesis helpers ──────────────────
+//
+// Mirror `ops e2e-bootstrap-host` on the non-Linux platforms by running
+// `rustynetd membership init` against the platform's canonical state
+// roots, so an operator-driven genesis run on a macOS or Windows host
+// produces the same signed-membership starting point the Linux path
+// does. The orchestrator only invokes these when `--topology-profile`
+// elects a non-Linux exit, preserving the default Linux-exit run.
+
+/// macOS state root used by the daemon (matches
+/// `crates/rustynetd/src/macos_runtime_acls.rs`).
+#[cfg(target_os = "macos")]
+pub(crate) const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
+
+/// macOS membership state subdir under the state root.
+#[cfg(target_os = "macos")]
+const MACOS_MEMBERSHIP_DIR: &str = "/usr/local/var/rustynet/membership";
+
+/// macOS owner signing key path. Plaintext custody is rejected by the
+/// daemon's macOS preflight; the operator stages the key via Keychain
+/// or via this file with 0600/root permissions only.
+#[cfg(target_os = "macos")]
+const MACOS_OWNER_SIGNING_KEY_PATH: &str = "/usr/local/etc/rustynet/membership.owner.key";
+
+/// Track B Step 7 (B1.2) — macOS genesis driver.
+///
+/// Mirrors the Linux `e2e-bootstrap-host` membership-init step on
+/// macOS: ensures the canonical state directory tree exists with
+/// 0700 permissions, then invokes `rustynetd membership init` with
+/// macOS state paths to mint the genesis snapshot. Binary install +
+/// service start are owned by
+/// `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` (the operator
+/// runs that first); this verb is the genesis follow-up.
+///
+/// `passphrase_file` is an absolute path to a 0600 owner-signing-key
+/// passphrase file the operator has already staged. The daemon
+/// reads it via the same `--owner-signing-key-passphrase-file` flag
+/// the Linux path uses.
+///
+/// On non-macOS hosts this always returns an error.
+#[cfg(not(target_os = "macos"))]
+pub fn execute_ops_e2e_bootstrap_macos(
+    _node_id: String,
+    _network_id: String,
+    _passphrase_file: PathBuf,
+) -> Result<String, String> {
+    Err("ops e2e-bootstrap-macos is only supported on macOS hosts".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+pub fn execute_ops_e2e_bootstrap_macos(
+    node_id: String,
+    network_id: String,
+    passphrase_file: PathBuf,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    ensure_safe_token("node-id", node_id.as_str())?;
+    ensure_safe_token("network-id", network_id.as_str())?;
+    if !passphrase_file.is_absolute() {
+        return Err(format!(
+            "--passphrase-file must be absolute: {}",
+            passphrase_file.display()
+        ));
+    }
+    if !passphrase_file.is_file() {
+        return Err(format!(
+            "passphrase file not found: {}",
+            passphrase_file.display()
+        ));
+    }
+    let passphrase_text = passphrase_file.display().to_string();
+    ensure_safe_token("passphrase-file", passphrase_text.as_str())?;
+
+    // Ensure the canonical macOS state tree exists with 0700
+    // permissions before the daemon tries to write membership state.
+    // The daemon's macos_runtime_acls verifier rejects looser modes
+    // at startup, so this preflight matches that contract.
+    run_status(
+        "install",
+        &["-d", "-m", "0700", MACOS_STATE_ROOT],
+        &[],
+        "creating macOS state root failed",
+    )?;
+    run_status(
+        "install",
+        &["-d", "-m", "0700", MACOS_MEMBERSHIP_DIR],
+        &[],
+        "creating macOS membership directory failed",
+    )?;
+    run_status(
+        "install",
+        &["-d", "-m", "0700", "/usr/local/etc/rustynet"],
+        &[],
+        "creating macOS config directory failed",
+    )?;
+
+    let snapshot = format!("{MACOS_MEMBERSHIP_DIR}/membership.snapshot");
+    let log = format!("{MACOS_MEMBERSHIP_DIR}/membership.log");
+    let watermark = format!("{MACOS_MEMBERSHIP_DIR}/membership.watermark");
+
+    run_status(
+        "rustynetd",
+        &[
+            "membership",
+            "init",
+            "--snapshot",
+            snapshot.as_str(),
+            "--log",
+            log.as_str(),
+            "--watermark",
+            watermark.as_str(),
+            "--owner-signing-key",
+            MACOS_OWNER_SIGNING_KEY_PATH,
+            "--owner-signing-key-passphrase-file",
+            passphrase_text.as_str(),
+            "--node-id",
+            node_id.as_str(),
+            "--network-id",
+            network_id.as_str(),
+            "--force",
+        ],
+        &[],
+        "rustynetd membership init failed during macOS e2e bootstrap",
+    )?;
+
+    Ok(format!(
+        "macOS membership genesis initialized: node_id={node_id}, network_id={network_id}, snapshot={snapshot}"
+    ))
+}
+
+/// Track B Step 7 (B1.2) — Windows genesis driver.
+///
+/// Mirrors the Linux `e2e-bootstrap-host` membership-init step on
+/// Windows: ensures the canonical
+/// `C:\ProgramData\RustyNet\membership` tree exists, then invokes
+/// `rustynetd membership init` with Windows state paths to mint the
+/// genesis snapshot. Service install is owned by
+/// `Install-RustyNetWindowsService.ps1`; this verb is the genesis
+/// follow-up.
+///
+/// On non-Windows hosts this always returns an error.
+#[cfg(not(windows))]
+pub fn execute_ops_e2e_bootstrap_windows(
+    _node_id: String,
+    _network_id: String,
+    _passphrase_file: PathBuf,
+) -> Result<String, String> {
+    Err("ops e2e-bootstrap-windows is only supported on Windows hosts".to_owned())
+}
+
+#[cfg(windows)]
+pub fn execute_ops_e2e_bootstrap_windows(
+    node_id: String,
+    network_id: String,
+    passphrase_file: PathBuf,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    ensure_safe_token("node-id", node_id.as_str())?;
+    ensure_safe_token("network-id", network_id.as_str())?;
+    if !passphrase_file.is_absolute() {
+        return Err(format!(
+            "--passphrase-file must be absolute: {}",
+            passphrase_file.display()
+        ));
+    }
+    if !passphrase_file.is_file() {
+        return Err(format!(
+            "passphrase file not found: {}",
+            passphrase_file.display()
+        ));
+    }
+    let passphrase_text = passphrase_file.display().to_string();
+    ensure_safe_token("passphrase-file", passphrase_text.as_str())?;
+
+    // The membership directory is already created by
+    // `Install-RustyNetWindowsService.ps1` with SYSTEM/Administrators
+    // ACLs; reuse it directly. If somehow absent, fail-closed — the
+    // operator must run the service install first.
+    let membership_dir =
+        std::path::Path::new(rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_ROOT);
+    if !membership_dir.is_dir() {
+        return Err(format!(
+            "Windows membership directory not found at {}; run Install-RustyNetWindowsService.ps1 first",
+            membership_dir.display()
+        ));
+    }
+
+    run_status(
+        "rustynetd",
+        &[
+            "membership",
+            "init",
+            "--snapshot",
+            rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH,
+            "--log",
+            rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH,
+            "--watermark",
+            rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH,
+            "--owner-signing-key",
+            rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "--owner-signing-key-passphrase-file",
+            passphrase_text.as_str(),
+            "--node-id",
+            node_id.as_str(),
+            "--network-id",
+            network_id.as_str(),
+            "--force",
+        ],
+        &[],
+        "rustynetd membership init failed during Windows e2e bootstrap",
+    )?;
+
+    Ok(format!(
+        "Windows membership genesis initialized: node_id={node_id}, network_id={network_id}"
+    ))
+}
+
 /// Install the `rustynetd` Windows service.
 ///
 /// Runs `Install-RustyNetWindowsService.ps1` from the source root resolved via
