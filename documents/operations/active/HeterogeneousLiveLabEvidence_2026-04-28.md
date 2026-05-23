@@ -273,11 +273,11 @@ was applied to a live VM.
 
 | Area | Deliverable | Files |
 |---|---|---|
-| Chaos category harnesses | Eight bins emit structured per-category dry-run reports with stage names, fault descriptions, recovery deadlines, and leak-proof placeholders. | `crates/rustynet-cli/src/bin/live_chaos_*_test.rs`, `crates/rustynet-cli/src/bin/live_chaos_support/mod.rs` |
+| Chaos category harnesses | Eight bins emit structured per-category reports with stage names, fault descriptions, recovery deadlines, and leak-proof fields. `live_chaos_daemon_fault_test` now has one live-capable daemon KILL sub-stage; the remaining chaos sub-stages still emit dry-run or skipped outcomes until implemented. | `crates/rustynet-cli/src/bin/live_chaos_*_test.rs`, `crates/rustynet-cli/src/bin/live_chaos_support/mod.rs` |
 | Signed-state adversarial input generator | `live_signed_bundle_forger` creates offline reject-only fixtures for truncation, future-dating, forged signature, replay watermark, and quorum-starvation scenarios. It is gated behind Cargo feature `chaos-forger`. | `crates/rustynet-cli/src/bin/live_signed_bundle_forger.rs`, `crates/rustynet-cli/Cargo.toml` |
 | Impairment harness | Plan/apply/clear wrapper validates platform, interface, direction, and profile; `plan` is hermetic, `apply/clear` are Linux-only and require an explicit interface allow-list. | `scripts/e2e/chaos_impair_link.sh` |
 | Chaos coordinator scaffold | Shared helpers record fault windows and teardown callbacks; cleanup invokes registered callbacks before removing the live-lab workspace. | `scripts/e2e/live_lab_common.sh` |
-| Orchestrator opt-in | `--enable-chaos-suite` adds eight `chaos_*` stages after managed DNS. Default runs record explicit skips, preserving current live-lab duration and behaviour. | `scripts/e2e/live_linux_lab_orchestrator.sh`, `scripts/e2e/live_chaos_*_test.sh` |
+| Orchestrator opt-in | `--enable-chaos-suite` adds eight `chaos_*` stages after managed DNS. Default runs record explicit skips, preserving current live-lab duration and behaviour. The daemon-fault category now runs an opt-in live KILL/recovery/leak-proof stage against the exit host; other categories remain scaffolded. | `scripts/e2e/live_linux_lab_orchestrator.sh`, `scripts/e2e/live_chaos_*_test.sh` |
 | Hermetic CI gate | `scripts/ci/chaos_gates.sh` validates impairment parser rejection, forger output, and all eight dry-run category reports. | `scripts/ci/chaos_gates.sh` |
 
 ### 8.2) Verification performed
@@ -304,3 +304,6 @@ done:
   recovery deadline.
 - Add post-run invariants proving clocks, qdisc/pf/netsh rules, filesystem
   state, daemon service state, and signed-state files returned to baseline.
+- Expand `live_chaos_daemon_fault_test` beyond the first implemented
+  `chaos_daemon_kill_during_reconcile` sub-stage to cover OOM, SIGSTOP/SIGCONT,
+  and privileged-helper socket races.

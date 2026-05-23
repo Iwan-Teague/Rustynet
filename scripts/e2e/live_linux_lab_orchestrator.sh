@@ -152,7 +152,7 @@ options:
   --traversal-ttl-secs <secs>    Signed traversal bundle TTL for issued lab bundles (1-120, default: ${TRAVERSAL_TTL_SECS})
   --skip-gates                   Skip local full gate suite
   --skip-soak                    Skip extended soak/reboot stages
-  --enable-chaos-suite           Run opt-in chaos/fault-injection scaffold stages after managed DNS
+  --enable-chaos-suite           Run opt-in chaos/fault-injection stages after managed DNS
   --skip-cross-network           Skip cross-network validator stages
   --force-cross-network          Force cross-network validator stages even on same-prefix underlay targets
   --cross-network-nat-profiles <csv>
@@ -5319,7 +5319,16 @@ stage_run_chaos_category() {
 }
 
 stage_run_chaos_daemon_fault() {
-  stage_run_chaos_category chaos_daemon_fault live_chaos_daemon_fault_test.sh
+  local report_path="$REPORT_DIR/chaos_daemon_fault_report.json"
+  local log_path="$REPORT_DIR/chaos_daemon_fault.log"
+  bash "$ROOT_DIR/scripts/e2e/live_chaos_daemon_fault_test.sh" \
+    --git-commit "$(current_run_git_commit)" \
+    --report-path "$report_path" \
+    --log-path "$log_path" \
+    --target-host "$(node_target_for_label exit)" \
+    --client-host "$(node_target_for_label client)" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts-file "$SSH_KNOWN_HOSTS_FILE"
 }
 
 stage_run_chaos_clock_attack() {
@@ -5352,17 +5361,17 @@ stage_run_chaos_privileged_boundary() {
 
 run_or_skip_chaos_suite() {
   if [[ "$ENABLE_CHAOS_SUITE" -ne 1 ]]; then
-    record_stage_skip chaos_daemon_fault hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
-    record_stage_skip chaos_clock_attack hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
-    record_stage_skip chaos_signed_state_adversarial hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
-    record_stage_skip chaos_crash_recovery hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
-    record_stage_skip chaos_resource_exhaustion hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
-    record_stage_skip chaos_network_impairment hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
-    record_stage_skip chaos_membership_adversarial hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
-    record_stage_skip chaos_privileged_boundary hard 'skipped by default; pass --enable-chaos-suite to run chaos scaffold'
+    record_stage_skip chaos_daemon_fault hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_clock_attack hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_signed_state_adversarial hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_crash_recovery hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_resource_exhaustion hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_network_impairment hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_membership_adversarial hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
+    record_stage_skip chaos_privileged_boundary hard 'skipped by default; pass --enable-chaos-suite to run opt-in chaos stages'
     return 0
   fi
-  run_stage hard chaos_daemon_fault 'run daemon process fault-injection scaffold' stage_run_chaos_daemon_fault
+  run_stage hard chaos_daemon_fault 'run daemon KILL fault-injection proof' stage_run_chaos_daemon_fault
   run_stage hard chaos_clock_attack 'run clock attack scaffold' stage_run_chaos_clock_attack
   run_stage hard chaos_signed_state_adversarial 'run signed-state adversarial scaffold' stage_run_chaos_signed_state_adversarial
   run_stage hard chaos_crash_recovery 'run crash recovery scaffold' stage_run_chaos_crash_recovery
