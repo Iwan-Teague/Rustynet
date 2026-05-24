@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
     WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
@@ -21,7 +21,8 @@ use rustynet_windows_native::{
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+// Unconditional: SecretKey::Drop and the key-envelope helpers zeroize derived
+// key material on every platform, so the trait must always be in scope.
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -57,7 +58,10 @@ impl fmt::Debug for SecretKey {
 
 impl Drop for SecretKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        // zeroize() guarantees the write is not elided by the optimizer (unlike
+        // a plain fill(0), which a dead-store pass may remove since the buffer
+        // is never read afterward).
+        self.0.zeroize();
     }
 }
 
@@ -458,6 +462,13 @@ fn is_valid_key_identifier(value: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
+    // Validate the identifier before it is interpolated into the keychain
+    // service name, mirroring the file-fallback and Windows custody paths.
+    // The CLI invocation is already argv-only (no shell), so this is
+    // defense-in-depth against keychain-namespace confusion, not injection.
+    if !is_valid_key_identifier(key_id) {
+        return Err(CryptoError::InvalidLength);
+    }
     store_macos_generic_password(
         format!("rustynet.{key_id}").as_str(),
         "rustynet",
@@ -467,6 +478,9 @@ fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), Cryp
 
 #[cfg(target_os = "macos")]
 fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    if !is_valid_key_identifier(key_id) {
+        return Err(CryptoError::InvalidLength);
+    }
     let mut value = load_macos_generic_password(format!("rustynet.{key_id}").as_str(), "rustynet")
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
 
@@ -800,8 +814,11 @@ impl SigningProvider for Ed25519SigningProvider {
         let mut bytes = [0u8; 64];
         bytes.copy_from_slice(signature);
         let signature = Signature::from_bytes(&bytes);
+        // verify_strict rejects non-canonical S and small-order/torsion points
+        // (RFC 8032 strict / ZIP-215), eliminating ed25519 malleability so a
+        // valid signature cannot be mauled into a distinct accepted encoding.
         self.verifying_key
-            .verify(payload, &signature)
+            .verify_strict(payload, &signature)
             .map_err(|_| CryptoError::AttestationVerificationFailed)
     }
 }
@@ -943,12 +960,12 @@ pub fn encrypt_private_key_envelope(
     let ciphertext = match cipher.encrypt(XNonce::from_slice(&nonce), plaintext) {
         Ok(value) => value,
         Err(_) => {
-            key.fill(0);
+            key.zeroize();
             return Err(CryptoError::EncryptionFailed);
         }
     };
 
-    key.fill(0);
+    key.zeroize();
 
     Ok(EncryptedKeyBlob {
         salt,
@@ -971,12 +988,12 @@ pub fn decrypt_private_key_envelope(
     {
         Ok(value) => value,
         Err(_) => {
-            key.fill(0);
+            key.zeroize();
             return Err(CryptoError::DecryptionFailed);
         }
     };
 
-    key.fill(0);
+    key.zeroize();
 
     Ok(plaintext)
 }
@@ -1190,11 +1207,11 @@ mod tests {
     use super::{
         AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
         Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
-        NodeKeyPair, OsStoreFallbackPolicy, SigningProviderKind, SigningProviderPolicy,
-        create_provider_attestation, decrypt_private_key_envelope, encrypt_private_key_envelope,
-        generate_key_custody_material, read_encrypted_key_file, try_generate_key_custody_material,
-        validate_key_custody_permissions, validate_signing_provider_policy,
-        verify_provider_attestation, write_encrypted_key_file,
+        NodeKeyPair, OsStoreFallbackPolicy, SigningProvider, SigningProviderKind,
+        SigningProviderPolicy, create_provider_attestation, decrypt_private_key_envelope,
+        encrypt_private_key_envelope, generate_key_custody_material, read_encrypted_key_file,
+        try_generate_key_custody_material, validate_key_custody_permissions,
+        validate_signing_provider_policy, verify_provider_attestation, write_encrypted_key_file,
     };
 
     /// Regression: `try_generate_key_custody_material` must (1) succeed on a
@@ -1619,5 +1636,54 @@ mod tests {
         b[0] = 2;
         let b = super::SecretKey(b);
         assert_eq!(a.ct_eq(&b).unwrap_u8(), 0);
+    }
+
+    /// Add the ed25519 group order ℓ (little-endian) to the S scalar (the
+    /// second 32 bytes) of a signature, with carry. For a canonical S < ℓ the
+    /// result fits in 32 bytes and is a non-canonical encoding of the same
+    /// scalar mod ℓ.
+    fn add_ed25519_order_to_s(sig: &mut [u8; 64]) {
+        const ORDER_LE: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(sig[32 + i]) + u16::from(ORDER_LE[i]) + carry;
+            sig[32 + i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+    }
+
+    /// RN-22: attestation verification must use ed25519 `verify_strict`, which
+    /// rejects non-canonical signatures. Mauling `S := S + ℓ` yields a distinct
+    /// byte encoding that still satisfies the non-strict verification equation
+    /// (`[ℓ]B` is the identity), so a non-strict verifier would accept it.
+    /// `verify_strict` must reject it, eliminating signature malleability.
+    #[test]
+    fn verify_attestation_rejects_non_canonical_malleable_signature() {
+        let provider = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/malleability",
+            [9; 32],
+        );
+        let payload = b"malleability-canary";
+        let signature = provider.sign_attestation(payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+        provider
+            .verify_attestation(payload, &signature)
+            .expect("canonical signature must verify");
+
+        let mut mauled = [0u8; 64];
+        mauled.copy_from_slice(&signature);
+        add_ed25519_order_to_s(&mut mauled);
+        assert_ne!(mauled[32..], signature[32..], "S must change");
+
+        assert_eq!(
+            provider.verify_attestation(payload, &mauled).err(),
+            Some(CryptoError::AttestationVerificationFailed),
+            "verify_strict must reject the non-canonical (mauled) signature"
+        );
     }
 }
