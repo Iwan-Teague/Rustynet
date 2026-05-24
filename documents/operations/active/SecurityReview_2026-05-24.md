@@ -659,3 +659,60 @@ audit: `SecurityHardeningAudit_2026-04-28.md`. Related:
   non-canonical `S` and small-order points (RFC 8032 strict / ZIP-215).
 - **TOCTOU:** time-of-check to time-of-use race between validating a resource
   and using it.
+
+## 21. Retest / acceptance-criteria matrix
+
+For sign-off tracking: the concrete condition that must hold for each finding
+to be closed, and how it is verified. "Verify" names the gate/test/lab step
+that demonstrates the criterion. Re-run the standard gates
+(`cargo fmt --all -- --check`, `clippy --workspace --all-targets --all-features
+-- -D warnings`, `test --workspace`, `cargo audit`, `cargo deny`) for every
+change; the rows below add the finding-specific acceptance bar.
+
+### Fixed — retest = regression guard must stay green
+| ID | Acceptance criterion | Verify |
+|---|---|---|
+| RN-01 | Oversized `node_count`/`approver_count`/`sig_count` returns `InvalidFormat`, never aborts; counts capped before allocation | `cargo test -p rustynet-control --lib` (`decode_*_rejects_oversized_*`, `bounded_count_*`) |
+| RN-14 | Workspace `unsafe_code = "forbid"` compiler-enforced for all non-FFI crates | `grep -L 'workspace = true' crates/*/Cargo.toml` = only `rustynet-windows-native`; `cargo check --workspace` |
+| RN-22 | A non-canonical (mauled) ed25519 signature is rejected; all legitimate signatures still verify | crypto `verify_attestation_rejects_non_canonical_malleable_signature` + control 237-test suite green |
+| RN-24 | Derived key material + `SecretKey` cleared via `zeroize()` (no `fill(0)` on secret buffers) | `grep -n 'fill(0)' crates/rustynet-crypto/src/lib.rs` returns none on key buffers; envelope round-trip tests pass |
+| RN-23 | Malformed macOS keychain `key_id` rejected before keychain call | unit test asserting `is_valid_key_identifier` gate on store/load (add when next on macOS) |
+
+### Accepted (won't-fix) — criterion to re-open
+| ID | Re-open if | 
+|---|---|
+| RN-21 | The denylisted-algorithm compatibility-exception mechanism becomes a wanted feature; then it lands with its own review and the mis-pinned test is corrected to assert acceptance of a valid denylisted exception. |
+
+### Open — acceptance criteria for the fix
+| ID | Acceptance criterion | Verify |
+|---|---|---|
+| RN-02 | No dead enforcement module masquerades as the killswitch authority: `dataplane.rs` is either deleted or wired into the live path; the security-audit catalog + tests reference the executing path (`phase10.rs`) | `grep -rn LinuxDataplane crates` shows production construction or the module is gone; catalog points at live tests |
+| RN-03 | A failed `force_fail_closed` is never silently swallowed: on error the daemon escalates (terminate-on-bootstrap / retry-and-refuse) | injected `block_all_egress` failure on first boot → daemon refuses to serve / exits; new test + lab fault-injection |
+| RN-04 | No interface-up-without-killswitch window: `policy drop` (or a mandatory boot killswitch) is in place before `backend.start()` and route apply | apply-order test asserts killswitch precedes backend start; boot-killswitch `ExecStartPre` is mandatory in the shipped unit |
+| RN-05 | Revocation applies to non-`node:` selectors: a revoked identity expressed via `group:`/`tag:`/`user:` is denied; unresolvable trust-sensitive selectors rejected | policy tests: revoked identity denied per selector type |
+| RN-06 | Windows killswitch blocks all non-bootstrap egress (not just DNS): only WG/STUN/management allowed on the LAN interface | Windows lab: with tunnel routing down, non-DNS app traffic is blocked; `assert_killswitch` covers it |
+| RN-07 | Windows IPv6 egress is blocked (not just RA suppressed); autoconf global v6 flushed | Windows lab dual-stack: no IPv6 egress outside tunnel; `assert_killswitch` covers v6 |
+| RN-08 | Encrypted key envelope binds magic+version+salt+nonce as AAD; a versioned prefix is validated before decrypt; **existing key files still decrypt** (compat read path) | new envelope round-trip + tamper tests; migration test reads a v0 blob |
+| RN-09 | systemd-credential group-read mask honored only when parent dir is uid-0 `0o700` and group is a reviewed gid | unit tests over the permission matrix incl. negative (shared-group/world) cases |
+| RN-10 | Corrupt rotation ledger → bootstrap refusal (not genesis reset); absent ledger still → genesis | tests: corrupt/truncated/monotonicity-violation refuse boot; absent yields genesis; operator runbook entry added |
+| RN-11 | Empty/unloadable membership directory denies by default unless explicit `--membership-governance=disabled`; configured-but-unloadable snapshot fails closed | policy/phase10 tests for empty-deny, opt-out-allow, unloadable-fail-closed |
+| RN-12 | On exit-serving nodes the DNS drop precedes the broad egress accept (Do53 forced through tunnel) | nft rule-order test + `assert_exit_serving` covers ordering |
+| RN-13 | Production handshake-flood protection exists on the live path (or boringtun behavior is documented as sufficient); if `dataplane.rs` survives, its source map evicts empty keys + caps total | decision recorded; if implemented, a flood test bounds memory |
+| RN-15 | All CI cargo invocations use `--locked`; lockfile drift fails CI | `.github/workflows/*` audited; a drift-introducing change fails the job |
+| RN-16 | Every `uses:` is pinned to a full commit SHA; enforced by `actionlint`/`zizmor` | workflow audit + lint step |
+| RN-17 | Helper client re-checks peer credentials on the connected fd (not path metadata) | code review + a test exercising a swapped socket path is rejected post-connect |
+| RN-18 | Helper authorizes only the configured daemon uid (no blanket `uid == 0`) unless a documented second caller is gated by flag | unit test: a uid-0 peer that is not the configured daemon is rejected when the flag is off |
+| RN-19 | The helper-less direct exec path runs `validate_request` (symmetric gate) | unit test: a schema-violating argv is rejected on the direct path |
+| RN-20 | `LinuxCommandRunner`/`in_memory` resolve binaries via absolute validated paths, or are `#[cfg(test)]`-gated off the privileged path | code review; no bare-name `Command::new` reachable from a root path |
+| RN-25 | Coordination replay window persists across restarts (watermark spool) or the per-process scope is documented as acceptable | persistence test or documented decision |
+| RN-26 | `ConsumedTokenLedger` prunes expired entries at load (schema carries `expires_at`) | unbounded-growth test; expiry-prune test |
+| RN-27 | `block_all_egress` verifies chain `policy drop` and no `accept` precedes the drop (or atomically rebuilds) | tamper test: an inserted higher-priority accept is detected/overwritten |
+| RN-28 | `validate_policy_safety` evaluates effective `*→*` coverage (per-protocol) and runs on `PolicySet`/`ContextualPolicySet` ingestion | tests: per-protocol allow-all + direct-load allow-all both rejected |
+| RN-29 | Protected modes do not broadly allow 443 on the egress interface (encrypted-DNS exfil blocked by default-deny); Do53-only scope documented | rule audit + doc note |
+| RN-30 | CI honors `rust-toolchain.toml` (single toolchain source of truth) | workflows use the pinned channel; no divergent `rustup default` |
+| RN-31 | `deny.toml [advisories]` sets `yanked = "deny"` and `unmaintained = "all"` | `cargo deny check advisories` fails on a yanked/unmaintained crate |
+| RN-32 | macOS bootstrap removes the temp sudoers via `trap … EXIT`, scopes it to brew, and pins/verifies the Homebrew installer | script review; interrupted-run leaves no sudoers file |
+| RN-33 | Windows key-custody permission validator wired to the SDDL inspector (or fails closed) | Windows test: a weak-ACL key file is rejected |
+| RN-34–36 | Helper pins private-key/pf-rules paths to the daemon key/temp prefix; `--allowed-uid 0` refused | validator tests for path-prefix pinning + uid sanity |
+| RN-37 | Passphrase passed by reference (not cloned) in the encrypt round, or residency justified | code review |
+| RN-38 | `secret_log_audit` audited roots extended to crypto/control/relay/local-security; generic expose-then-Debug heuristic added | scanner self-tests + whole-tree sweep |
