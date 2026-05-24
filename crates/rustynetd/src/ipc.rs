@@ -79,6 +79,19 @@ pub enum IpcCommand {
         pubkey_b64: String,
         push_addr: String,
     },
+    /// Membership governance signed-update apply entry point.
+    /// Carries the canonical signed-update envelope bytes (UTF-8
+    /// key=value text from `encode_signed_update`). The daemon
+    /// re-runs every signature/freshness/replay/threshold/state-root
+    /// check in `apply_signed_update` before any snapshot/log
+    /// mutation: passing the daemon's local IPC peer-credential gate
+    /// is NOT sufficient on its own — quorum-signed approval remains
+    /// mandatory. The envelope itself is a public artifact (its
+    /// signatures bind the content), so the wire form transports the
+    /// raw bytes base64-url-safe-no-pad encoded.
+    MembershipApply {
+        signed_update_wire: Vec<u8>,
+    },
     Unknown(String),
 }
 
@@ -97,6 +110,7 @@ impl IpcCommand {
                 | IpcCommand::KeyRevoke
                 | IpcCommand::PushGossipBundle { .. }
                 | IpcCommand::EnrollmentConsume { .. }
+                | IpcCommand::MembershipApply { .. }
         )
     }
 
@@ -126,6 +140,13 @@ impl IpcCommand {
                 pubkey_b64,
                 push_addr,
             } => format!("enrollment consume {token} {pubkey_b64} {push_addr}"),
+            IpcCommand::MembershipApply { signed_update_wire } => {
+                use base64::Engine;
+                format!(
+                    "membership apply {}",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signed_update_wire)
+                )
+            }
             IpcCommand::Unknown(raw) => raw.clone(),
         }
     }
@@ -221,6 +242,26 @@ pub fn parse_command(raw: &str) -> IpcCommand {
             use base64::Engine;
             match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) {
                 Ok(wire_bytes) => IpcCommand::PushGossipBundle { wire_bytes },
+                Err(_) => IpcCommand::Unknown(raw.trim().to_owned()),
+            }
+        }
+        [cmd, subcmd, payload_b64] if cmd == "membership" && subcmd == "apply" => {
+            // Gap 2 daemon-side apply: the third token is the URL-
+            // safe-base64-no-pad encoding of the canonical signed
+            // membership update envelope (UTF-8 key=value text
+            // produced by `encode_signed_update`). The envelope
+            // carries its own approver Ed25519 signatures and the
+            // daemon-side handler re-runs every threshold / signer-
+            // authorisation / freshness / replay check via
+            // `apply_signed_update` before any snapshot/log
+            // mutation. Local IPC peer-credential authorisation
+            // alone is NOT sufficient to mutate membership.
+            // Malformed base64 dispatches as `Unknown` so the
+            // operator sees an explicit error string instead of a
+            // silent accept of empty payload.
+            use base64::Engine;
+            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) {
+                Ok(signed_update_wire) => IpcCommand::MembershipApply { signed_update_wire },
                 Err(_) => IpcCommand::Unknown(raw.trim().to_owned()),
             }
         }
@@ -516,6 +557,52 @@ mod tests {
         // string. Specifically: must NOT silently produce a
         // PushGossipBundle with an empty wire payload.
         let parsed = parse_command("gossip push !@#$%not-base64");
+        assert!(
+            matches!(parsed, IpcCommand::Unknown(_)),
+            "malformed base64 must dispatch as Unknown; got {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_and_wire_round_trips_membership_apply() {
+        // Gap 2 wire-form pin: the verb must round-trip a canonical
+        // signed-update envelope payload exactly. The envelope is
+        // UTF-8 text in production; we round-trip arbitrary bytes
+        // here so the wire form does not silently truncate non-text
+        // bytes that a future schema bump might include.
+        let payload =
+            b"payload_hex=deadbeef\nsig_count=1\nsig.0.approver_id=owner\nsig.0.signature_hex=00\n"
+                .to_vec();
+        let cmd = IpcCommand::MembershipApply {
+            signed_update_wire: payload.clone(),
+        };
+        let wire = cmd.as_wire();
+        assert!(
+            wire.starts_with("membership apply "),
+            "wire form must start with the verb prefix; got: {wire}"
+        );
+        assert!(
+            cmd.is_mutating(),
+            "MembershipApply must classify as mutating"
+        );
+        let parsed = parse_command(&wire);
+        match parsed {
+            IpcCommand::MembershipApply { signed_update_wire } => {
+                assert_eq!(signed_update_wire, payload);
+            }
+            other => panic!("expected MembershipApply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_rejects_malformed_base64_for_membership_apply() {
+        // A `membership apply <not-base64>` envelope must fall
+        // through to Unknown rather than silently produce an empty
+        // MembershipApply. The daemon-side handler trusts that an
+        // explicit MembershipApply variant always carries a
+        // base64-decoded payload that was at least syntactically
+        // well-formed at the IPC layer.
+        let parsed = parse_command("membership apply !@#$%not-base64");
         assert!(
             matches!(parsed, IpcCommand::Unknown(_)),
             "malformed base64 must dispatch as Unknown; got {parsed:?}"

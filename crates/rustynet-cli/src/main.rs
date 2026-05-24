@@ -373,6 +373,15 @@ enum MembershipCommand {
         paths: MembershipPaths,
         now_unix: u64,
         dry_run: bool,
+        /// When true, submit the signed update to the running daemon
+        /// over IPC so the daemon's `apply_signed_update` security
+        /// gate re-runs every threshold / signer-authorisation /
+        /// freshness / replay check before any snapshot/log
+        /// mutation. The daemon-submit path NEVER substitutes its
+        /// caller's identity for quorum: passing the local IPC peer-
+        /// credential check is necessary but not sufficient. Use the
+        /// file-based path when a daemon is not running.
+        via_daemon: bool,
     },
     VerifyLog {
         paths: MembershipPaths,
@@ -4488,6 +4497,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             paths,
             now_unix,
             dry_run: parser.has_flag("--dry-run"),
+            via_daemon: parser.has_flag("--daemon"),
         }),
         _ => Err(format!("unknown membership subcommand: {subcommand}")),
     }
@@ -5963,29 +5973,68 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             paths,
             now_unix,
             dry_run,
+            via_daemon,
         } => {
-            let (_, entries, state) = load_current_membership_state(&paths, now_unix)?;
-            let signed_payload = fs::read_to_string(&signed_update_path)
-                .map_err(|err| format!("read signed update failed: {err}"))?;
-            let signed = decode_signed_update(&signed_payload).map_err(|err| err.to_string())?;
-            let mut replay_cache = replay_cache_from_entries(&entries)?;
-            let next = apply_signed_update(&state, &signed, now_unix, &mut replay_cache)
-                .map_err(|err| err.to_string())?;
-            if dry_run {
-                return Ok(format!(
-                    "membership apply dry-run passed: epoch_new={}",
+            if via_daemon {
+                if dry_run {
+                    return Err("--dry-run is incompatible with --daemon (the daemon path \
+                         always mutates on success); run the file-based apply for \
+                         dry-runs"
+                        .to_owned());
+                }
+                // Daemon-submit path. Read the signed-update envelope
+                // file, base64-encode the bytes, and submit via IPC.
+                // The daemon re-runs every threshold / freshness /
+                // replay check before any snapshot/log mutation —
+                // local IPC peer-credential authorisation is NOT a
+                // substitute for quorum.
+                let signed_payload = fs::read(&signed_update_path).map_err(|err| {
+                    format!(
+                        "read signed update {} failed: {err}",
+                        signed_update_path.display()
+                    )
+                })?;
+                match send_command(IpcCommand::MembershipApply {
+                    signed_update_wire: signed_payload,
+                }) {
+                    Ok(response) => {
+                        if response.ok {
+                            Ok(format!(
+                                "membership update applied via daemon: {}",
+                                response.message
+                            ))
+                        } else {
+                            Err(response.message)
+                        }
+                    }
+                    Err(err) => Err(format!("daemon unreachable: {err}")),
+                }
+            } else {
+                let (_, entries, state) = load_current_membership_state(&paths, now_unix)?;
+                let signed_payload = fs::read_to_string(&signed_update_path)
+                    .map_err(|err| format!("read signed update failed: {err}"))?;
+                let signed =
+                    decode_signed_update(&signed_payload).map_err(|err| err.to_string())?;
+                let mut replay_cache = replay_cache_from_entries(&entries)?;
+                let next = apply_signed_update(&state, &signed, now_unix, &mut replay_cache)
+                    .map_err(|err| err.to_string())?;
+                if dry_run {
+                    return Ok(format!(
+                        "membership apply dry-run passed: epoch_new={}",
+                        next.epoch
+                    ));
+                }
+                append_membership_log_entry(&paths.log_path, &signed)
+                    .map_err(|err| err.to_string())?;
+                persist_membership_snapshot(&paths.snapshot_path, &next)
+                    .map_err(|err| err.to_string())?;
+                Ok(format!(
+                    "membership update applied: snapshot={} log={} epoch_new={}",
+                    paths.snapshot_path.display(),
+                    paths.log_path.display(),
                     next.epoch
-                ));
+                ))
             }
-            append_membership_log_entry(&paths.log_path, &signed).map_err(|err| err.to_string())?;
-            persist_membership_snapshot(&paths.snapshot_path, &next)
-                .map_err(|err| err.to_string())?;
-            Ok(format!(
-                "membership update applied: snapshot={} log={} epoch_new={}",
-                paths.snapshot_path.display(),
-                paths.log_path.display(),
-                next.epoch
-            ))
         }
         MembershipCommand::VerifyLog {
             paths,
@@ -17083,8 +17132,8 @@ fn help_text() -> String {
         "  membership sign-update --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
         "  membership sign --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
         "  membership verify-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
-        "  membership apply-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
-        "  membership apply --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
+        "  membership apply-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run] [--daemon]",
+        "  membership apply --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run] [--daemon]",
         "  membership verify-log [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]",
         "  membership verify [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]",
         "  membership generate-evidence [--snapshot <path>] [--log <path>] [--output-dir <dir>] [--environment <label>] [--now <unix>]",
@@ -19594,6 +19643,65 @@ mod tests {
             verify_alias,
             CliCommand::Membership(command) if matches!(*command, MembershipCommand::VerifyLog { .. })
         ));
+
+        // Gap 2: --daemon flag routes the apply request to the
+        // running daemon via IPC instead of the file-based path.
+        // Both `apply` and `apply-update` aliases must honour it.
+        let apply_daemon = parse_command(&[
+            "membership".to_owned(),
+            "apply".to_owned(),
+            "--signed-update".to_owned(),
+            "/tmp/update.signed".to_owned(),
+            "--daemon".to_owned(),
+        ]);
+        match apply_daemon {
+            CliCommand::Membership(command) => match *command {
+                MembershipCommand::ApplyUpdate {
+                    via_daemon,
+                    dry_run,
+                    ..
+                } => {
+                    assert!(via_daemon, "--daemon must set via_daemon=true");
+                    assert!(!dry_run, "--daemon alone must not set dry_run");
+                }
+                other => panic!("expected ApplyUpdate, got {other:?}"),
+            },
+            other => panic!("expected Membership command, got {other:?}"),
+        }
+
+        let apply_update_daemon = parse_command(&[
+            "membership".to_owned(),
+            "apply-update".to_owned(),
+            "--signed-update".to_owned(),
+            "/tmp/update.signed".to_owned(),
+            "--daemon".to_owned(),
+        ]);
+        match apply_update_daemon {
+            CliCommand::Membership(command) => match *command {
+                MembershipCommand::ApplyUpdate { via_daemon, .. } => {
+                    assert!(via_daemon, "apply-update --daemon must set via_daemon=true");
+                }
+                other => panic!("expected ApplyUpdate, got {other:?}"),
+            },
+            other => panic!("expected Membership command, got {other:?}"),
+        }
+
+        // Default (no --daemon) keeps the file-based path: via_daemon=false.
+        let apply_default = parse_command(&[
+            "membership".to_owned(),
+            "apply".to_owned(),
+            "--signed-update".to_owned(),
+            "/tmp/update.signed".to_owned(),
+        ]);
+        match apply_default {
+            CliCommand::Membership(command) => match *command {
+                MembershipCommand::ApplyUpdate { via_daemon, .. } => {
+                    assert!(!via_daemon, "default apply must NOT route through daemon");
+                }
+                other => panic!("expected ApplyUpdate, got {other:?}"),
+            },
+            other => panic!("expected Membership command, got {other:?}"),
+        }
     }
 
     #[test]
