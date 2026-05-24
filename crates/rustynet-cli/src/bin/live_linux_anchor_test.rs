@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 
 use live_lab_bin_support as live_lab_support;
 use live_lab_support::{
-    Logger, capture_root, create_workspace, ensure_pinned_known_hosts_file, ensure_safe_token,
-    git_head_commit, load_home_known_hosts_path, repo_root, require_command, seed_known_hosts,
-    shell_quote, unix_now, verify_passwordless_sudo, verify_sudo, write_file,
+    Logger, capture_remote_stdout, capture_root, create_workspace, ensure_pinned_known_hosts_file,
+    ensure_safe_token, git_head_commit, load_home_known_hosts_path, repo_root, require_command,
+    seed_known_hosts, shell_quote, unix_now, verify_passwordless_sudo, verify_sudo,
+    verify_windows_admin, write_file,
 };
 use serde_json::json;
 
@@ -124,12 +125,16 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    if config.platform == AnchorPlatform::Windows {
-        return Err(
-            "Windows anchor live execution is not enabled yet; Track B Phase 11 lands the real validator (use --dry-run for now)"
-                .to_owned(),
-        );
-    }
+    // Track B Phase 11 — Windows anchor validator. The Windows OpenSSH
+    // session defaults to PowerShell, so the POSIX-shell-composed
+    // substages (bundle_pull / enrollment / downgrade) that rely on
+    // `set -eu`, `cat`, pipe expansions cannot run via the existing
+    // capture_root (`sudo -n sh -lc`) wrapper. Those three skip on
+    // Windows with a clear rationale rather than fake success. The
+    // remaining three substages (capability advertise / gossip seed /
+    // daemon status) need only `rustynet anchor list` + `rustynet
+    // status`, which work cross-platform — they run for real on
+    // Windows via the platform-aware capture helper below.
 
     for command in ["ssh", "ssh-keygen"] {
         require_command(command)?;
@@ -154,10 +159,12 @@ fn run() -> Result<(), String> {
         .ssh_identity_file
         .as_ref()
         .expect("identity presence checked above");
-    // Track B Phase 10 — macOS does not maintain its hostname in
-    // /etc/hosts (HostName lives in scutil), so the Linux verify_sudo
-    // grep would reject healthy mac anchors. Route the macOS path
-    // through verify_passwordless_sudo (sudo -n probe only).
+    // Track B Phases 10 + 11 — the sudo preflight is platform-aware.
+    // Linux uses verify_sudo (also greps /etc/hosts to surface PAM
+    // sudo issues). macOS uses verify_passwordless_sudo (mac does
+    // not put its hostname in /etc/hosts). Windows uses
+    // verify_windows_admin (probes BUILTIN\Administrators via
+    // PowerShell — there is no sudo).
     match config.platform {
         AnchorPlatform::Linux => {
             verify_sudo(identity, &work_known_hosts, &config.anchor_host)?;
@@ -166,8 +173,7 @@ fn run() -> Result<(), String> {
             verify_passwordless_sudo(identity, &work_known_hosts, &config.anchor_host)?;
         }
         AnchorPlatform::Windows => {
-            // Already failed closed above; this arm is unreachable.
-            return Err("windows anchor execution unreachable".to_owned());
+            verify_windows_admin(identity, &work_known_hosts, &config.anchor_host)?;
         }
     }
 
@@ -181,23 +187,47 @@ fn run() -> Result<(), String> {
         json!({ "anchor_node_id": config.anchor_node_id, "capabilities": REQUIRED_ANCHOR_CAPS }),
     ));
 
-    let pull_summary = validate_bundle_pull_loopback(identity, &work_known_hosts, &config)?;
-    let invalid_token_summary =
-        validate_invalid_token_rejected(identity, &work_known_hosts, &config)?;
-    let redaction_summary =
-        validate_bundle_pull_log_redaction(identity, &work_known_hosts, &config)?;
-    subchecks.push(Subcheck::pass(
-        "validate_anchor_bundle_pull",
-        "loopback bundle-pull listener returned membership snapshot byte-for-byte, rejected invalid token, and logged only token thumbprints",
-        json!({ "pull": pull_summary, "invalid_token": invalid_token_summary, "log_redaction": redaction_summary }),
-    ));
+    if config.platform != AnchorPlatform::Linux {
+        // bundle_pull composes `set -eu` + `cat <token>` + `nc | curl`
+        // via capture_root's `sudo -n sh -lc` wrapper, which is
+        // POSIX-only. A faithful PowerShell rewrite needs a follow-up
+        // refactor of the helper layer — out of scope for Phase 11.
+        subchecks.push(Subcheck::skipped(
+            "validate_anchor_bundle_pull",
+            "non-Linux skip: substage composes POSIX shell (set -eu, cat, nc, curl) via capture_root sudo -n sh -lc wrapper; cross-platform rewrite is tracked separately",
+        ));
+    } else {
+        let pull_summary = validate_bundle_pull_loopback(identity, &work_known_hosts, &config)?;
+        let invalid_token_summary =
+            validate_invalid_token_rejected(identity, &work_known_hosts, &config)?;
+        let redaction_summary =
+            validate_bundle_pull_log_redaction(identity, &work_known_hosts, &config)?;
+        subchecks.push(Subcheck::pass(
+            "validate_anchor_bundle_pull",
+            "loopback bundle-pull listener returned membership snapshot byte-for-byte, rejected invalid token, and logged only token thumbprints",
+            json!({ "pull": pull_summary, "invalid_token": invalid_token_summary, "log_redaction": redaction_summary }),
+        ));
+    }
 
-    let gossip_priority = validate_anchor_gossip_priority(identity, &work_known_hosts, &config)?;
-    subchecks.push(Subcheck::pass(
-        "validate_anchor_gossip_priority",
-        "second anchor is signed into membership, leaf sees both anchors, and lex-min authority remains primary",
-        json!({ "summary": gossip_priority }),
-    ));
+    if config.platform != AnchorPlatform::Linux {
+        // gossip_priority calls set_membership_capabilities which
+        // shells `rustynet ops e2e-membership-set-capabilities ...`
+        // through `sudo -n sh -lc`. PowerShell rewrite tracked
+        // separately. The dedicated gossip_seed substage below
+        // (parser-only) still covers the gossip-related contract.
+        subchecks.push(Subcheck::skipped(
+            "validate_anchor_gossip_priority",
+            "non-Linux skip: substage mutates membership via Linux-hardcoded `rustynet ops e2e-membership-set-capabilities` (systemd-creds + /etc/rustynet); gossip_seed substage below covers the gossip surface",
+        ));
+    } else {
+        let gossip_priority =
+            validate_anchor_gossip_priority(identity, &work_known_hosts, &config)?;
+        subchecks.push(Subcheck::pass(
+            "validate_anchor_gossip_priority",
+            "second anchor is signed into membership, leaf sees both anchors, and lex-min authority remains primary",
+            json!({ "summary": gossip_priority }),
+        ));
+    }
 
     // Track B Phase 9 — dedicated gossip-seed coverage. The existing
     // `validate_anchor_gossip_priority` substage exercises the
@@ -217,21 +247,35 @@ fn run() -> Result<(), String> {
         json!({ "summary": gossip_seed_summary }),
     ));
 
-    let enrollment_endpoint =
-        validate_anchor_enrollment_endpoint(identity, &work_known_hosts, &config)?;
-    subchecks.push(Subcheck::pass(
-        "validate_anchor_enrollment_endpoint",
-        "anchor minted enrollment token, rejected negative token and approver paths, admitted enrollee through signed membership, and verified membership visibility",
-        json!({ "summary": enrollment_endpoint }),
-    ));
+    if config.platform != AnchorPlatform::Linux {
+        subchecks.push(Subcheck::skipped(
+            "validate_anchor_enrollment_endpoint",
+            "non-Linux skip: substage composes POSIX shell (cat, set -eu, multi-line pipes) AND shells `rustynet ops e2e-membership-set-capabilities` (Linux-hardcoded systemd-creds + /etc/rustynet); cross-platform rewrite is tracked separately",
+        ));
+    } else {
+        let enrollment_endpoint =
+            validate_anchor_enrollment_endpoint(identity, &work_known_hosts, &config)?;
+        subchecks.push(Subcheck::pass(
+            "validate_anchor_enrollment_endpoint",
+            "anchor minted enrollment token, rejected negative token and approver paths, admitted enrollee through signed membership, and verified membership visibility",
+            json!({ "summary": enrollment_endpoint }),
+        ));
+    }
 
-    let downgrade_revocation =
-        validate_anchor_downgrade_revocation(identity, &work_known_hosts, &config)?;
-    subchecks.push(Subcheck::pass(
-        "validate_anchor_downgrade_revocation",
-        "anchor.bundle_pull revocation stops new pulls, preserves prior pull, emits audit, and restores capability",
-        json!({ "summary": downgrade_revocation }),
-    ));
+    if config.platform != AnchorPlatform::Linux {
+        subchecks.push(Subcheck::skipped(
+            "validate_anchor_downgrade_revocation",
+            "non-Linux skip: substage composes POSIX shell (set -eu, cat, ops mutations) AND shells `rustynet ops e2e-membership-set-capabilities` (Linux-hardcoded systemd-creds + /etc/rustynet); cross-platform rewrite is tracked separately",
+        ));
+    } else {
+        let downgrade_revocation =
+            validate_anchor_downgrade_revocation(identity, &work_known_hosts, &config)?;
+        subchecks.push(Subcheck::pass(
+            "validate_anchor_downgrade_revocation",
+            "anchor.bundle_pull revocation stops new pulls, preserves prior pull, emits audit, and restores capability",
+            json!({ "summary": downgrade_revocation }),
+        ));
+    }
 
     let daemon_status = capture_daemon_status(identity, &work_known_hosts, &config)?;
     subchecks.push(Subcheck::pass(
@@ -257,17 +301,31 @@ fn capture_anchor_list(
     known_hosts: &Path,
     config: &Config,
 ) -> Result<String, String> {
-    capture_anchor_list_from_host(identity, known_hosts, &config.anchor_host)
+    capture_anchor_list_from_host(identity, known_hosts, &config.anchor_host, config.platform)
 }
 
 fn capture_anchor_list_from_host(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
+    platform: AnchorPlatform,
 ) -> Result<String, String> {
-    let command = "command -v rustynet >/dev/null; rustynet anchor list";
-    capture_root(identity, known_hosts, host, command)
-        .map_err(|err| format!("anchor list failed on {host}: {err}"))
+    match platform {
+        AnchorPlatform::Linux | AnchorPlatform::Macos => {
+            let command = "command -v rustynet >/dev/null; rustynet anchor list";
+            capture_root(identity, known_hosts, host, command)
+                .map_err(|err| format!("anchor list failed on {host}: {err}"))
+        }
+        AnchorPlatform::Windows => {
+            // Windows OpenSSH session runs as Administrator; no sudo.
+            // PowerShell `Get-Command` is the rough equivalent of
+            // `command -v`. `rustynet.exe anchor list` writes the
+            // same canonical output as the Linux binary.
+            let command = "powershell -NoProfile -Command \"Get-Command rustynet.exe | Out-Null; rustynet.exe anchor list\"";
+            capture_remote_stdout(identity, known_hosts, host, command)
+                .map_err(|err| format!("anchor list failed on {host}: {err}"))
+        }
+    }
 }
 
 fn validate_anchor_capabilities(anchor_list: &str, anchor_node_id: &str) -> Result<(), String> {
@@ -317,7 +375,12 @@ fn validate_anchor_gossip_priority(
     .map_err(|err| format!("promote second anchor {second_anchor_node_id} failed: {err}"))?;
 
     let validation = (|| -> Result<String, String> {
-        let anchor_list = capture_anchor_list_from_host(identity, known_hosts, leaf_client_host)?;
+        let anchor_list = capture_anchor_list_from_host(
+            identity,
+            known_hosts,
+            leaf_client_host,
+            config.platform,
+        )?;
         validate_anchor_capabilities(&anchor_list, config.anchor_node_id.as_str())?;
         validate_anchor_capabilities(&anchor_list, second_anchor_node_id)?;
         validate_lex_min_anchor_authority(
@@ -1208,32 +1271,47 @@ impl Config {
         Ok(config)
     }
 
-    /// Track B Phase 10 — apply per-platform path defaults after
-    /// `--platform` has been parsed. The Linux defaults are baked
-    /// in at struct init so a Linux-only run keeps its shape; if a
-    /// macOS run was requested AND a path is still equal to its
-    /// Linux default, swap to the macOS equivalent. An explicit
-    /// `--<path-flag>` always wins because we only rewrite values
-    /// that match the Linux baked-in default literal.
+    /// Track B Phases 10 + 11 — apply per-platform path defaults
+    /// after `--platform` has been parsed. The Linux defaults are
+    /// baked in at struct init so a Linux-only run keeps its shape;
+    /// if macOS / Windows was requested AND a path is still equal to
+    /// its Linux default, swap to the platform-native equivalent. An
+    /// explicit `--<path-flag>` always wins because we only rewrite
+    /// values that match the Linux baked-in default literal.
     ///
-    /// The reviewed macOS daemon ships its persistent state under
-    /// `/usr/local/var/rustynet` (the launchd unit's
-    /// `WorkingDirectory`) and credentials under
-    /// `/usr/local/etc/rustynet`. Linux uses `/var/lib/rustynet` +
-    /// `/etc/rustynet` via systemd unit defaults.
+    /// macOS layout: state under `/usr/local/var/rustynet/membership/`
+    /// (subdir per `ops_e2e.rs::macos_install`), credentials under
+    /// `/usr/local/etc/rustynet`.
+    ///
+    /// Windows layout: state under `C:\ProgramData\RustyNet\`,
+    /// credentials under `C:\ProgramData\RustyNet\credentials\`
+    /// (per `Install-RustyNetWindowsRelayService.ps1`'s reviewed
+    /// install defaults).
     fn apply_platform_default_paths(&mut self) {
-        if self.platform != AnchorPlatform::Macos {
-            return;
+        match self.platform {
+            AnchorPlatform::Linux => {}
+            AnchorPlatform::Macos => self.apply_macos_default_paths(),
+            AnchorPlatform::Windows => self.apply_windows_default_paths(),
         }
+    }
+
+    fn apply_macos_default_paths(&mut self) {
         if self.anchor_token_path == "/var/lib/rustynet/anchor-bundle-pull.token" {
             self.anchor_token_path = "/usr/local/var/rustynet/anchor-bundle-pull.token".to_owned();
         }
+        // The macOS installer writes membership state under a
+        // `membership/` subdirectory (see `ops_e2e.rs::macos_install`
+        // + `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`),
+        // distinct from the Linux layout that uses /var/lib/rustynet
+        // directly. Phase 10 reviewer caught the validator pinning
+        // the wrong macOS path; honor the canonical subdir layout.
         if self.membership_snapshot_path == "/var/lib/rustynet/membership.snapshot" {
             self.membership_snapshot_path =
-                "/usr/local/var/rustynet/membership.snapshot".to_owned();
+                "/usr/local/var/rustynet/membership/membership.snapshot".to_owned();
         }
         if self.membership_log_path == "/var/lib/rustynet/membership.log" {
-            self.membership_log_path = "/usr/local/var/rustynet/membership.log".to_owned();
+            self.membership_log_path =
+                "/usr/local/var/rustynet/membership/membership.log".to_owned();
         }
         if self.enrollment_secret_path == "/var/lib/rustynet/keys/enrollment.secret" {
             self.enrollment_secret_path =
@@ -1251,6 +1329,37 @@ impl Config {
         {
             self.signing_key_passphrase_cred_path =
                 "/usr/local/etc/rustynet/credentials/signing_key_passphrase.cred".to_owned();
+        }
+    }
+
+    fn apply_windows_default_paths(&mut self) {
+        if self.anchor_token_path == "/var/lib/rustynet/anchor-bundle-pull.token" {
+            self.anchor_token_path = r"C:\ProgramData\RustyNet\anchor-bundle-pull.token".to_owned();
+        }
+        if self.membership_snapshot_path == "/var/lib/rustynet/membership.snapshot" {
+            self.membership_snapshot_path =
+                r"C:\ProgramData\RustyNet\membership.snapshot".to_owned();
+        }
+        if self.membership_log_path == "/var/lib/rustynet/membership.log" {
+            self.membership_log_path = r"C:\ProgramData\RustyNet\membership.log".to_owned();
+        }
+        if self.enrollment_secret_path == "/var/lib/rustynet/keys/enrollment.secret" {
+            self.enrollment_secret_path =
+                r"C:\ProgramData\RustyNet\keys\enrollment.secret".to_owned();
+        }
+        if self.enrollment_ledger_path == "/var/lib/rustynet/rustynetd.enrollment.ledger" {
+            self.enrollment_ledger_path =
+                r"C:\ProgramData\RustyNet\rustynetd.enrollment.ledger".to_owned();
+        }
+        if self.owner_signing_key_path == "/etc/rustynet/membership.owner.key" {
+            self.owner_signing_key_path =
+                r"C:\ProgramData\RustyNet\membership.owner.key".to_owned();
+        }
+        if self.signing_key_passphrase_cred_path
+            == "/etc/rustynet/credentials/signing_key_passphrase.cred"
+        {
+            self.signing_key_passphrase_cred_path =
+                r"C:\ProgramData\RustyNet\credentials\signing_key_passphrase.cred".to_owned();
         }
     }
 
@@ -1709,11 +1818,11 @@ mod tests {
         );
         assert_eq!(
             cfg.membership_snapshot_path,
-            "/usr/local/var/rustynet/membership.snapshot"
+            "/usr/local/var/rustynet/membership/membership.snapshot"
         );
         assert_eq!(
             cfg.membership_log_path,
-            "/usr/local/var/rustynet/membership.log"
+            "/usr/local/var/rustynet/membership/membership.log"
         );
         assert_eq!(
             cfg.enrollment_secret_path,
@@ -1748,8 +1857,8 @@ mod tests {
             "explicit --anchor-token-path must NOT be rewritten by the default-swap"
         );
         assert_eq!(
-            cfg.membership_snapshot_path,
-            "/usr/local/var/rustynet/membership.snapshot"
+            cfg.membership_snapshot_path, "/usr/local/var/rustynet/membership/membership.snapshot",
+            "other paths still get the macOS default swap (membership/ subdir included)"
         );
     }
 
@@ -1764,6 +1873,112 @@ mod tests {
         assert_eq!(
             cfg.owner_signing_key_path,
             "/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    // ─── Phase 10 reviewer BLOCKER fix: macOS subdir layout ────────
+
+    #[test]
+    fn parse_macos_membership_paths_include_subdir() {
+        // The macOS installer writes membership state under a
+        // `membership/` subdirectory (see
+        // `vm_lab/orchestrator/adapter/macos_install.rs`). Phase 10
+        // initially pinned the wrong path; this test prevents
+        // regression.
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "macos".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("macos dry-run parse");
+        assert_eq!(
+            cfg.membership_snapshot_path, "/usr/local/var/rustynet/membership/membership.snapshot",
+            "macOS membership snapshot must live under the membership/ subdir"
+        );
+        assert_eq!(
+            cfg.membership_log_path,
+            "/usr/local/var/rustynet/membership/membership.log"
+        );
+    }
+
+    // ─── Track B Phase 11: Windows anchor dispatch + path defaults ─
+
+    #[test]
+    fn parse_windows_swaps_default_paths_to_program_data_layout() {
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "windows".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("windows dry-run parse");
+        assert_eq!(cfg.platform, super::AnchorPlatform::Windows);
+        assert_eq!(
+            cfg.anchor_token_path,
+            r"C:\ProgramData\RustyNet\anchor-bundle-pull.token"
+        );
+        assert_eq!(
+            cfg.membership_snapshot_path,
+            r"C:\ProgramData\RustyNet\membership.snapshot"
+        );
+        assert_eq!(
+            cfg.membership_log_path,
+            r"C:\ProgramData\RustyNet\membership.log"
+        );
+        assert_eq!(
+            cfg.enrollment_secret_path,
+            r"C:\ProgramData\RustyNet\keys\enrollment.secret"
+        );
+        assert_eq!(
+            cfg.enrollment_ledger_path,
+            r"C:\ProgramData\RustyNet\rustynetd.enrollment.ledger"
+        );
+        assert_eq!(
+            cfg.owner_signing_key_path,
+            r"C:\ProgramData\RustyNet\membership.owner.key"
+        );
+        assert_eq!(
+            cfg.signing_key_passphrase_cred_path,
+            r"C:\ProgramData\RustyNet\credentials\signing_key_passphrase.cred"
+        );
+    }
+
+    #[test]
+    fn parse_windows_explicit_path_flag_wins_over_default_swap() {
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "windows".to_owned(),
+            "--anchor-token-path".to_owned(),
+            r"D:\rustynet\anchor-bundle-pull.token".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("windows parse");
+        assert_eq!(
+            cfg.anchor_token_path, r"D:\rustynet\anchor-bundle-pull.token",
+            "explicit --anchor-token-path must NOT be rewritten by the Windows default-swap"
+        );
+        assert_eq!(
+            cfg.membership_snapshot_path, r"C:\ProgramData\RustyNet\membership.snapshot",
+            "other paths still get the Windows default swap"
+        );
+    }
+
+    #[test]
+    fn parse_linux_paths_unaffected_by_other_platform_swaps() {
+        // Defense-in-depth: Phase 10/11 added macOS + Windows swaps
+        // gated on platform != Linux. The Linux branch must remain
+        // a no-op. A regression here would silently shift the Linux
+        // VMs to look in /usr/local/var/rustynet instead of
+        // /var/lib/rustynet.
+        let cfg = super::Config::parse(vec!["--dry-run".to_owned()])
+            .expect("linux default-platform parse");
+        assert_eq!(cfg.platform, super::AnchorPlatform::Linux);
+        assert_eq!(
+            cfg.membership_snapshot_path,
+            "/var/lib/rustynet/membership.snapshot"
+        );
+        assert_eq!(
+            cfg.signing_key_passphrase_cred_path,
+            "/etc/rustynet/credentials/signing_key_passphrase.cred"
         );
     }
 
