@@ -1,40 +1,52 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::uninlined_format_args)]
 
-//! Track B Phase 12 — mixed-OS topology integration validator.
+//! Track B Phases 12 + 13 — mixed-OS topology integration validator.
 //!
-//! Closes Track B with a single live-lab stage that proves Linux,
-//! macOS, and Windows nodes share one signed membership view AND
-//! see each other in their per-host `rustynet anchor list` output.
+//! Proves Linux + macOS + Windows nodes share one signed membership
+//! view AND have actually exchanged recent WireGuard handshakes with
+//! each other — the convergence + datapath check that closes Track B.
 //!
 //! Track B Phases 4-11 land per-host validators (exit-handoff /
 //! relay-service-lifecycle / anchor) that prove each platform
-//! correctly runs its role in isolation. Phase 12 is the
-//! convergence check: it captures `rustynet anchor list` from all
-//! three hosts in one orchestrator pass and asserts that every host
-//! observes every OTHER host. That's the minimum proof of "different
-//! OS communicating without issue" the user asked for at the start
-//! of Track B.
+//! correctly runs its role in isolation. Phase 12 added the
+//! membership-convergence check using `rustynet anchor list`; Phase
+//! 13 strengthened that with two upgrades:
 //!
-//! The bin reuses the cross-platform anchor-list capture from
-//! `live_linux_anchor_test.rs` so the dispatch matrix and the
-//! sudo/admin preflights stay in lockstep across both bins.
+//!   1. switched the membership probe from `rustynet anchor list`
+//!      (anchor-only) to `rustynet membership status`
+//!      (all active members regardless of capability) so non-anchor
+//!      hosts can appear in the visibility check;
+//!   2. added a datapath probe via `rustynet status` that pulls
+//!      `path_live_proven`, `path_live_peer_count`, and
+//!      `path_latest_live_handshake_unix`, then asserts every host
+//!      has a proven live datapath with at least N-1 live peers and
+//!      a handshake within the configurable freshness window
+//!      (default 600 s).
 //!
 //! Substages:
-//!   1. capture_anchor_list_each_host — drive `rustynet anchor list`
-//!      on each of the three nodes (Linux via systemctl + sudo,
-//!      macOS via launchd + sudo -n, Windows via PowerShell over
-//!      SSH-Administrator).
-//!   2. verify_mutual_membership_visibility — every host must list
-//!      every other host's node_id in its anchor table.
-//!   3. emit_topology_report — canonical envelope (phase, mode,
+//!   1. capture_membership_status_each_host — drive
+//!      `rustynet membership status` on each of the three nodes
+//!      (capture_root + POSIX shell on Linux/macOS, PowerShell over
+//!      Administrator SSH on Windows).
+//!   2. capture_daemon_status_each_host — drive `rustynet status` via
+//!      the cross-platform `capture_daemon_status_for_platform`
+//!      helper from `live_lab_bin_support`.
+//!   3. verify_mutual_membership_visibility — every host must list
+//!      every OTHER host's node_id in its membership snapshot.
+//!   4. verify_datapath_freshness — every host must have
+//!      `path_live_proven=true`, ≥ N-1 live peers, and a handshake
+//!      within `--handshake-freshness-secs` (default 600).
+//!   5. emit_topology_report — canonical envelope (phase, mode,
 //!      evidence_mode, captured_at, captured_at_unix, git_commit,
-//!      source_artifacts, status) with a per-host coverage matrix.
+//!      source_artifacts, status) with a per-host coverage matrix
+//!      including the datapath snapshot.
 //!
 //! The validator fails closed when any host cannot be reached, any
-//! host's anchor list is missing a peer it should observe, or any
-//! capture errors out. There is no PASS without ALL hosts present
-//! in ALL views.
+//! host's membership snapshot is missing a peer it should observe,
+//! any host's datapath is not proven live, or any capture errors
+//! out. There is no PASS without ALL hosts present in ALL views
+//! AND every host carrying a fresh handshake to at least N-1 peers.
 
 mod live_lab_bin_support;
 
@@ -43,9 +55,10 @@ use std::path::{Path, PathBuf};
 
 use live_lab_bin_support as live_lab_support;
 use live_lab_support::{
-    capture_remote_stdout, capture_root, create_workspace, ensure_pinned_known_hosts_file,
-    ensure_safe_token, git_head_commit, load_home_known_hosts_path, repo_root, require_command,
-    seed_known_hosts, verify_passwordless_sudo, verify_sudo, verify_windows_admin, write_file,
+    capture_daemon_status_for_platform, capture_remote_stdout, capture_root, create_workspace,
+    ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit, load_home_known_hosts_path,
+    repo_root, require_command, seed_known_hosts, verify_passwordless_sudo, verify_sudo,
+    verify_windows_admin, write_file,
 };
 use serde::Serialize;
 
@@ -98,12 +111,18 @@ fn run() -> Result<(), String> {
         }
     }
 
-    // Capture `rustynet anchor list` on each host. Drop into a
-    // per-host record so the report can show which view came from
-    // where.
+    // Capture `rustynet anchor list` AND `rustynet status` on each
+    // host. The anchor list proves signed membership convergence;
+    // the status line proves the daemon has actually exchanged a
+    // recent WireGuard handshake with at least N-1 peers (where N
+    // is the topology size). Membership convergence without
+    // datapath traffic would still pass the older visibility check
+    // — Phase 13 adds the handshake-freshness assertion to close
+    // that gap.
+    let now_unix = unix_now_secs();
     let mut views: Vec<HostView> = Vec::with_capacity(hosts.len());
     for host in &hosts {
-        let anchor_list = capture_anchor_list(
+        let membership_status = capture_membership_status(
             &config.ssh_identity_file,
             &work_known_hosts,
             host.target.as_str(),
@@ -111,24 +130,40 @@ fn run() -> Result<(), String> {
         )
         .map_err(|err| {
             format!(
-                "rustynet anchor list capture failed for {} ({}): {err}",
+                "rustynet membership status capture failed for {} ({}): {err}",
                 host.label,
                 host.platform.as_str()
             )
         })?;
-        let observed = parse_observed_node_ids(anchor_list.as_str());
+        let observed = parse_active_node_ids(membership_status.as_str());
+        let status_line = capture_daemon_status_for_platform(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            host.target.as_str(),
+            host.platform.as_str(),
+        )
+        .map_err(|err| {
+            format!(
+                "rustynet status capture failed for {} ({}): {err}",
+                host.label,
+                host.platform.as_str()
+            )
+        })?;
+        let datapath = parse_datapath_status(status_line.as_str());
         views.push(HostView {
             label: host.label.clone(),
             target: host.target.clone(),
             platform: host.platform,
             node_id: host.node_id.clone(),
             observed,
-            raw_anchor_list_excerpt: first_lines(anchor_list.as_str(), 24),
+            raw_membership_excerpt: first_lines(membership_status.as_str(), 4),
+            datapath,
+            raw_status_excerpt: first_lines(status_line.as_str(), 4),
         });
     }
 
     // Verify mutual visibility — every host must see every OTHER
-    // host's node_id in its anchor list.
+    // host's node_id in its membership snapshot.
     let mut failures: Vec<String> = Vec::new();
     for view in &views {
         for other in &hosts {
@@ -137,12 +172,60 @@ fn run() -> Result<(), String> {
             }
             if !view.observed.iter().any(|node| node == &other.node_id) {
                 failures.push(format!(
-                    "{} ({}) does NOT observe peer {} ({}) in its anchor list",
+                    "{} ({}) does NOT observe peer {} ({}) in its membership snapshot",
                     view.label,
                     view.platform.as_str(),
                     other.label,
                     other.node_id,
                 ));
+            }
+        }
+    }
+
+    // Verify datapath freshness — each host must have
+    // `path_live_proven=true`, at least N-1 live peers, and a
+    // handshake within the freshness window. Configurable via
+    // --handshake-freshness-secs (default 600s); 0 disables.
+    if config.handshake_freshness_secs > 0 {
+        let required_live_peers = (hosts.len() as u32).saturating_sub(1);
+        for view in &views {
+            if !view.datapath.path_live_proven {
+                failures.push(format!(
+                    "{} ({}) datapath NOT proven live (path_live_proven=false)",
+                    view.label,
+                    view.platform.as_str(),
+                ));
+            }
+            if view.datapath.path_live_peer_count < required_live_peers {
+                failures.push(format!(
+                    "{} ({}) has only {} live peer(s); expected at least {} for {}-host topology",
+                    view.label,
+                    view.platform.as_str(),
+                    view.datapath.path_live_peer_count,
+                    required_live_peers,
+                    hosts.len(),
+                ));
+            }
+            match view.datapath.path_latest_live_handshake_unix {
+                Some(handshake_ts) => {
+                    let age = now_unix.saturating_sub(handshake_ts as i64);
+                    if age > config.handshake_freshness_secs as i64 {
+                        failures.push(format!(
+                            "{} ({}) handshake stale ({}s old, freshness window {}s)",
+                            view.label,
+                            view.platform.as_str(),
+                            age,
+                            config.handshake_freshness_secs,
+                        ));
+                    }
+                }
+                None => {
+                    failures.push(format!(
+                        "{} ({}) has NO observed handshake (path_latest_live_handshake_unix missing)",
+                        view.label,
+                        view.platform.as_str(),
+                    ));
+                }
             }
         }
     }
@@ -259,7 +342,22 @@ struct HostView {
     platform: HostPlatform,
     node_id: String,
     observed: Vec<String>,
-    raw_anchor_list_excerpt: String,
+    raw_membership_excerpt: String,
+    datapath: DatapathStatus,
+    raw_status_excerpt: String,
+}
+
+/// Subset of the `rustynet status` line that the mixed-topology
+/// validator needs to prove datapath traffic between hosts. The
+/// full status line is enormous (see `daemon.rs::run`); we only
+/// extract three fields here. The serde shape is stable so the
+/// orchestrator can read the per-host datapath snapshot from the
+/// report without re-parsing the raw line.
+#[derive(Debug, Default, Serialize)]
+struct DatapathStatus {
+    path_live_proven: bool,
+    path_live_peer_count: u32,
+    path_latest_live_handshake_unix: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,6 +386,13 @@ struct Config {
     macos_node_id: String,
     windows_host: String,
     windows_node_id: String,
+    /// Phase 13 — handshake-freshness window (seconds). The
+    /// datapath assertion fails if a host's
+    /// `path_latest_live_handshake_unix` is older than this many
+    /// seconds at capture time. Default 600s; `0` disables the
+    /// datapath check entirely (used by smoke tests that only care
+    /// about membership convergence).
+    handshake_freshness_secs: u64,
     report_path: PathBuf,
     log_path: PathBuf,
     git_commit: Option<String>,
@@ -304,6 +409,7 @@ impl Config {
             macos_node_id: "relay-mac".to_owned(),
             windows_host: "admin@192.168.18.40".to_owned(),
             windows_node_id: "client-win".to_owned(),
+            handshake_freshness_secs: 600,
             report_path: PathBuf::from("artifacts/phase10/live_mixed_topology_report.json"),
             log_path: PathBuf::from("artifacts/phase10/source/live_mixed_topology.log"),
             git_commit: env::var("RUSTYNET_EXPECTED_GIT_COMMIT").ok(),
@@ -324,6 +430,12 @@ impl Config {
                 "--macos-node-id" => config.macos_node_id = next_value(&mut iter, &arg)?,
                 "--windows-host" => config.windows_host = next_value(&mut iter, &arg)?,
                 "--windows-node-id" => config.windows_node_id = next_value(&mut iter, &arg)?,
+                "--handshake-freshness-secs" => {
+                    let raw = next_value(&mut iter, &arg)?;
+                    config.handshake_freshness_secs = raw.parse::<u64>().map_err(|err| {
+                        format!("--handshake-freshness-secs must be a non-negative integer: {err}")
+                    })?;
+                }
                 "--report-path" => {
                     config.report_path = PathBuf::from(next_value(&mut iter, &arg)?);
                 }
@@ -403,6 +515,7 @@ fn print_usage() {
          \x20\x20--macos-node-id <id>              macOS signed-membership node id\n\
          \x20\x20--windows-host <user@host>        Windows SSH target\n\
          \x20\x20--windows-node-id <id>            Windows signed-membership node id\n\
+         \x20\x20--handshake-freshness-secs <n>   datapath WireGuard handshake freshness window (default 600; 0 disables)\n\
          \x20\x20--known-hosts <path>              pinned SSH known_hosts\n\
          \x20\x20--report-path <path>              JSON report output\n\
          \x20\x20--log-path <path>                 human-readable log output\n\
@@ -412,12 +525,24 @@ fn print_usage() {
 
 // ─── per-platform `rustynet anchor list` capture ──────────────────
 
-/// Same shape as `live_linux_anchor_test.rs::capture_anchor_list_from_host`,
-/// reproduced here so the two bins stay independent (each bin can be
-/// renamed / rewritten / dropped without breaking the other). The
-/// Windows path runs PowerShell directly — Windows SSH session is
-/// already Administrator and has no sudo.
-fn capture_anchor_list(
+/// Capture the canonical `rustynet membership status` line.
+/// Phase 12 originally used `rustynet anchor list` here, but
+/// Phase 12 reviewer caught that anchor list ONLY emits
+/// anchor-capable nodes (see `crates/rustynet-cli/src/main.rs`
+/// render_anchor_list) — a client-only Windows node would never
+/// appear and the mutual-visibility check would fail by
+/// construction. `membership status` instead emits an
+/// `active_nodes=<csv>` field that lists every active member
+/// regardless of capability — exactly the right surface for
+/// proving cross-OS membership convergence.
+///
+/// POSIX path uses `&&` to short-circuit: if `rustynet` is not on
+/// PATH, the second command does not run and the failure is
+/// surfaced through capture_root's non-zero exit handling. The
+/// previous `;` separator would have run `rustynet membership
+/// status` anyway and produced an empty body that the parser
+/// would misclassify as "no peers observed".
+fn capture_membership_status(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
@@ -425,40 +550,83 @@ fn capture_anchor_list(
 ) -> Result<String, String> {
     match platform {
         HostPlatform::Linux | HostPlatform::Macos => {
-            let command = "command -v rustynet >/dev/null; rustynet anchor list";
+            let command = "command -v rustynet >/dev/null && rustynet membership status";
             capture_root(identity, known_hosts, host, command)
         }
         HostPlatform::Windows => {
-            // Use `if (-not (Get-Command ...))` so a missing
-            // `rustynet.exe` short-circuits with an explicit
-            // diagnostic. The Phase 11 reviewer flagged the naive
-            // `Get-Command | Out-Null` pattern as not actually
-            // short-circuiting — it just drops stdout and lets the
-            // second statement throw later.
-            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe anchor list\"";
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe membership status\"";
             capture_remote_stdout(identity, known_hosts, host, command)
         }
     }
 }
 
-/// Parse `rustynet anchor list` stdout into the set of node ids the
-/// daemon advertises. The canonical format (see
-/// `crates/rustynet-cli/src/main.rs::render_anchor_list`) is
-/// `<node_id> capabilities=<csv>` lines, prefixed by an `anchor
-/// nodes:` header. Pull the node id from each line that contains
-/// `capabilities=` so a header / blank line does not pollute the
-/// observed set.
-fn parse_observed_node_ids(anchor_list: &str) -> Vec<String> {
-    let mut out: Vec<String> = anchor_list
-        .lines()
-        .filter_map(|line| {
-            line.split_once(" capabilities=")
-                .map(|(node_id, _)| node_id.trim().to_owned())
-        })
-        .filter(|node_id| !node_id.is_empty() && node_id != "anchor nodes:")
-        .collect();
+/// Parse `rustynet membership status` stdout into the set of
+/// active node ids the daemon's signed membership snapshot
+/// carries. The canonical format (see
+/// `crates/rustynet-cli/src/main.rs::MembershipCommand::Status`)
+/// is a single line:
+///
+/// ```text
+/// membership status: network_id=<id> epoch=<n> quorum_threshold=<n> active_nodes=<csv> state_root=<hex>
+/// ```
+///
+/// Extract the `active_nodes=` CSV; tolerate trailing whitespace
+/// and additional space-delimited key=value pairs after it.
+fn parse_active_node_ids(membership_status: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in membership_status.lines() {
+        let trimmed = line.trim();
+        let Some(active_idx) = trimmed.find("active_nodes=") else {
+            continue;
+        };
+        let csv = &trimmed[active_idx + "active_nodes=".len()..];
+        // The next key=value pair is space-separated, so cut on the
+        // first space.
+        let csv = csv.split_whitespace().next().unwrap_or("");
+        for entry in csv.split(',') {
+            let entry = entry.trim();
+            if !entry.is_empty() {
+                out.push(entry.to_owned());
+            }
+        }
+        break;
+    }
     out.sort();
     out.dedup();
+    out
+}
+
+/// Parse selected datapath fields from the canonical single-line
+/// `rustynet status` output. The line is space-separated `key=value`
+/// pairs (see `crates/rustynetd/src/daemon.rs::run`); pull the three
+/// we care about for cross-OS proof:
+///   * path_live_proven=true|false
+///   * path_live_peer_count=<u32>
+///   * path_latest_live_handshake_unix=<u64|empty>
+fn parse_datapath_status(status_line: &str) -> DatapathStatus {
+    let mut out = DatapathStatus::default();
+    let trimmed = status_line.trim();
+    for pair in trimmed.split_whitespace() {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key {
+            "path_live_proven" => {
+                out.path_live_proven = value.eq_ignore_ascii_case("true");
+            }
+            "path_live_peer_count" => {
+                out.path_live_peer_count = value.parse::<u32>().unwrap_or(0);
+            }
+            "path_latest_live_handshake_unix" => {
+                out.path_latest_live_handshake_unix = if value.is_empty() {
+                    None
+                } else {
+                    value.parse::<u64>().ok().filter(|ts| *ts > 0)
+                };
+            }
+            _ => {}
+        }
+    }
     out
 }
 
@@ -562,31 +730,79 @@ mod tests {
     }
 
     #[test]
-    fn parse_observed_node_ids_extracts_each_node_from_anchor_list() {
-        let body = "anchor nodes:\n\
-                    exit-1 capabilities=anchor,relay_host,anchor.gossip_seed\n\
-                    relay-mac capabilities=anchor,relay_host\n\
-                    client-win capabilities=client\n";
-        let observed = super::parse_observed_node_ids(body);
+    fn parse_active_node_ids_extracts_csv_from_membership_status_line() {
+        // Canonical format from
+        // `crates/rustynet-cli/src/main.rs::MembershipCommand::Status`:
+        // single line with space-separated key=value pairs. The
+        // `active_nodes=` value is a CSV that lists every active
+        // member — anchor capability is NOT required.
+        let body = "membership status: network_id=abc epoch=7 quorum_threshold=2 active_nodes=client-win,exit-1,relay-mac state_root=deadbeef\n";
+        let observed = super::parse_active_node_ids(body);
         assert_eq!(observed, vec!["client-win", "exit-1", "relay-mac"]);
     }
 
     #[test]
-    fn parse_observed_node_ids_returns_empty_for_header_only() {
-        let body = "anchor nodes:\n";
-        let observed = super::parse_observed_node_ids(body);
+    fn parse_active_node_ids_returns_empty_when_active_nodes_csv_missing() {
+        let body =
+            "membership status: network_id=abc epoch=7 quorum_threshold=2 state_root=deadbeef\n";
+        let observed = super::parse_active_node_ids(body);
         assert!(observed.is_empty());
     }
 
     #[test]
-    fn parse_observed_node_ids_dedupes_repeated_node_id() {
-        // Defense-in-depth: if the daemon ever emits a duplicate row,
-        // the observed set must not double-count.
-        let body = "anchor nodes:\n\
-                    exit-1 capabilities=anchor\n\
-                    exit-1 capabilities=anchor,relay_host\n";
-        let observed = super::parse_observed_node_ids(body);
-        assert_eq!(observed, vec!["exit-1"]);
+    fn parse_active_node_ids_dedupes_repeated_node_id() {
+        // Defense-in-depth: if the daemon ever emits a duplicate
+        // node id, the observed set must not double-count.
+        let body = "membership status: active_nodes=exit-1,exit-1,relay-mac state_root=cafef00d\n";
+        let observed = super::parse_active_node_ids(body);
+        assert_eq!(observed, vec!["exit-1", "relay-mac"]);
+    }
+
+    #[test]
+    fn parse_active_node_ids_tolerates_trailing_whitespace_and_extra_keys() {
+        let body = "  membership status: active_nodes=alpha,beta extra=ignored  \n";
+        let observed = super::parse_active_node_ids(body);
+        assert_eq!(observed, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn parse_datapath_status_extracts_live_proven_count_and_handshake() {
+        let line = "node_id=exit-1 path_live_proven=true path_live_peer_count=2 path_latest_live_handshake_unix=1700000000 other=ignore\n";
+        let datapath = super::parse_datapath_status(line);
+        assert!(datapath.path_live_proven);
+        assert_eq!(datapath.path_live_peer_count, 2);
+        assert_eq!(datapath.path_latest_live_handshake_unix, Some(1700000000));
+    }
+
+    #[test]
+    fn parse_datapath_status_treats_zero_handshake_as_missing() {
+        // The daemon emits `path_latest_live_handshake_unix=0` when
+        // no peer has ever handshaken. Treat zero as missing so the
+        // freshness assertion fails closed rather than parse 0 as
+        // a recent timestamp.
+        let line =
+            "path_live_proven=false path_live_peer_count=0 path_latest_live_handshake_unix=0\n";
+        let datapath = super::parse_datapath_status(line);
+        assert!(!datapath.path_live_proven);
+        assert_eq!(datapath.path_live_peer_count, 0);
+        assert!(datapath.path_latest_live_handshake_unix.is_none());
+    }
+
+    #[test]
+    fn parse_datapath_status_handles_missing_fields() {
+        let datapath = super::parse_datapath_status("node_id=alone\n");
+        assert!(!datapath.path_live_proven);
+        assert_eq!(datapath.path_live_peer_count, 0);
+        assert!(datapath.path_latest_live_handshake_unix.is_none());
+    }
+
+    #[test]
+    fn parse_datapath_status_rejects_non_boolean_path_live_proven() {
+        // Strict bool — anything other than `true` is `false`.
+        let line = "path_live_proven=maybe path_live_peer_count=3\n";
+        let datapath = super::parse_datapath_status(line);
+        assert!(!datapath.path_live_proven);
+        assert_eq!(datapath.path_live_peer_count, 3);
     }
 
     #[test]
@@ -608,7 +824,15 @@ mod tests {
             platform: super::HostPlatform::Linux,
             node_id: "exit-1".to_owned(),
             observed: vec!["relay-mac".to_owned(), "client-win".to_owned()],
-            raw_anchor_list_excerpt: "anchor nodes:\nexit-1 capabilities=anchor".to_owned(),
+            raw_membership_excerpt: "membership status: active_nodes=exit-1,relay-mac,client-win"
+                .to_owned(),
+            datapath: super::DatapathStatus {
+                path_live_proven: true,
+                path_live_peer_count: 2,
+                path_latest_live_handshake_unix: Some(1700000000),
+            },
+            raw_status_excerpt: "node_id=exit-1 path_live_proven=true path_live_peer_count=2"
+                .to_owned(),
         };
         let report = super::MixedTopologyReport {
             schema_version: 1,
@@ -633,9 +857,42 @@ mod tests {
         assert_eq!(parsed["host_count"], 3);
         assert_eq!(parsed["views"][0]["platform"], "linux");
         assert_eq!(parsed["views"][0]["observed"][0], "relay-mac");
+        assert_eq!(parsed["views"][0]["datapath"]["path_live_proven"], true);
+        assert_eq!(parsed["views"][0]["datapath"]["path_live_peer_count"], 2);
+        assert_eq!(
+            parsed["views"][0]["datapath"]["path_latest_live_handshake_unix"],
+            1700000000
+        );
         assert_eq!(
             parsed["views"][0]["target"], "debian@192.168.18.49 \" inject \n more",
             "embedded quote/newline must survive serde escaping"
+        );
+    }
+
+    #[test]
+    fn config_parse_accepts_handshake_freshness_secs_override() {
+        let mut args = base_args();
+        args.push("--handshake-freshness-secs".to_owned());
+        args.push("120".to_owned());
+        let cfg = Config::parse(args).expect("parse");
+        assert_eq!(cfg.handshake_freshness_secs, 120);
+    }
+
+    #[test]
+    fn config_parse_rejects_non_numeric_freshness_secs() {
+        let mut args = base_args();
+        args.push("--handshake-freshness-secs".to_owned());
+        args.push("not-a-number".to_owned());
+        let err = Config::parse(args).expect_err("non-numeric must fail");
+        assert!(err.contains("--handshake-freshness-secs"));
+    }
+
+    #[test]
+    fn config_parse_default_freshness_window_is_600s() {
+        let cfg = Config::parse(base_args()).expect("default parse");
+        assert_eq!(
+            cfg.handshake_freshness_secs, 600,
+            "default freshness window is 10 minutes — change with care, mixed-OS handshake refresh cadence varies"
         );
     }
 }
