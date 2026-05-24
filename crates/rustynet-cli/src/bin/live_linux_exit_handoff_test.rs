@@ -2162,6 +2162,35 @@ use rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_EXIT_NAT_NAME as WIND
 use rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_TUNNEL_ALIAS as WINDOWS_TUNNEL_ALIAS;
 const WINDOWS_SCM_SERVICE: &str = "rustynetd";
 
+/// Sanitize an interface alias that came back from a previous SSH
+/// PowerShell capture so it is safe to embed inside the
+/// single-quoted PowerShell argument of the follow-up
+/// `Get-NetIPInterface -InterfaceAlias '<alias>' ...` invocation.
+/// A compromised target host could otherwise return an alias
+/// containing `'`, `;`, `"`, `\n`, etc. to break out of the quote
+/// and inject shell commands. CLAUDE.md mandates no shell
+/// construction with untrusted values.
+///
+/// We accept only Windows-realistic alias characters:
+/// `A-Z a-z 0-9 space . _ - ( )` (PowerShell interface aliases
+/// such as `Ethernet`, `Wi-Fi`, `vEthernet (Default Switch)`).
+/// Anything else collapses the alias to an empty string, which
+/// makes the caller treat the egress as missing and surface that
+/// in the report rather than emit a malformed PowerShell command.
+fn sanitize_windows_interface_alias(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 96 {
+        return String::new();
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '_' | '-' | '(' | ')'))
+    {
+        return String::new();
+    }
+    trimmed.to_owned()
+}
+
 #[derive(Debug, serde::Serialize)]
 struct WindowsExitHandoffReport {
     schema_version: u32,
@@ -2250,19 +2279,20 @@ fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
     .map_err(|err| {
         format!("windows exit-handoff: during-run tunnel forwarding capture failed: {err}")
     })?;
-    let egress_alias_during = live_lab_support::capture_remote_stdout(
+    let egress_alias_during_raw = live_lab_support::capture_remote_stdout(
         &config.ssh_identity_file,
         &work_known_hosts,
         exit_target,
         egress_alias_cmd.as_str(),
     )
     .unwrap_or_default();
-    let egress_fwd_during = if egress_alias_during.trim().is_empty() {
+    let egress_alias_during = sanitize_windows_interface_alias(egress_alias_during_raw.as_str());
+    let egress_fwd_during = if egress_alias_during.is_empty() {
         "Error: no non-tunnel default egress interface detected".to_owned()
     } else {
         let cmd = format!(
             "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
-            egress_alias_during.trim()
+            egress_alias_during
         );
         live_lab_support::capture_remote_stdout(
             &config.ssh_identity_file,
@@ -2287,7 +2317,7 @@ fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
             netnat_json_during.as_str(),
             tunnel_fwd_during.as_str(),
             egress_fwd_during.as_str(),
-            egress_alias_during.trim(),
+            egress_alias_during.as_str(),
             portproxy_during.as_str(),
         )
         .map_err(|err| format!("windows exit-handoff: during-run snapshot build failed: {err}"))?;
@@ -2319,19 +2349,20 @@ fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
         tunnel_forwarding_cmd.as_str(),
     )
     .unwrap_or_else(|_| "Disabled".to_owned());
-    let egress_alias_after = live_lab_support::capture_remote_stdout(
+    let egress_alias_after_raw = live_lab_support::capture_remote_stdout(
         &config.ssh_identity_file,
         &work_known_hosts,
         exit_target,
         egress_alias_cmd.as_str(),
     )
     .unwrap_or_default();
-    let egress_fwd_after = if egress_alias_after.trim().is_empty() {
+    let egress_alias_after = sanitize_windows_interface_alias(egress_alias_after_raw.as_str());
+    let egress_fwd_after = if egress_alias_after.is_empty() {
         "Disabled".to_owned()
     } else {
         let cmd = format!(
             "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
-            egress_alias_after.trim()
+            egress_alias_after
         );
         live_lab_support::capture_remote_stdout(
             &config.ssh_identity_file,
@@ -2356,7 +2387,7 @@ fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
             netnat_json_after.as_str(),
             tunnel_fwd_after.as_str(),
             egress_fwd_after.as_str(),
-            egress_alias_after.trim(),
+            egress_alias_after.as_str(),
             portproxy_after.as_str(),
         )
         .map_err(|err| format!("windows exit-handoff: after-stop snapshot build failed: {err}"))?;
@@ -3141,5 +3172,63 @@ peer.1.endpoint=192.168.128.26:51820
         // Defense-in-depth: pin the SCM service identifier the
         // validator stops/restarts so a future rename surfaces here.
         assert_eq!(super::WINDOWS_SCM_SERVICE, "rustynetd");
+    }
+
+    #[test]
+    fn sanitize_windows_interface_alias_keeps_realistic_aliases() {
+        for ok in [
+            "Ethernet",
+            "Wi-Fi",
+            "vEthernet (Default Switch)",
+            "Local Area Connection 3",
+        ] {
+            assert_eq!(
+                super::sanitize_windows_interface_alias(ok),
+                ok,
+                "alias {ok:?} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_windows_interface_alias_strips_trailing_newline_carriage_return() {
+        assert_eq!(
+            super::sanitize_windows_interface_alias("Ethernet\r\n"),
+            "Ethernet"
+        );
+    }
+
+    #[test]
+    fn sanitize_windows_interface_alias_rejects_powershell_quote_escape() {
+        // A compromised target host could return an alias designed to
+        // break out of the single-quoted argument and inject
+        // additional PowerShell commands. Must collapse to empty.
+        for bad in [
+            "Ethernet'; Remove-Item C:\\Windows",
+            "evil`whoami",
+            "evil\"injection",
+            "evil$(echo pwn)",
+            "evil; del /q *",
+            "evil\\nmkdir foo",
+            "<script>",
+        ] {
+            assert_eq!(
+                super::sanitize_windows_interface_alias(bad),
+                "",
+                "alias {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_windows_interface_alias_rejects_oversized_input() {
+        let long = "A".repeat(200);
+        assert_eq!(super::sanitize_windows_interface_alias(&long), "");
+    }
+
+    #[test]
+    fn sanitize_windows_interface_alias_returns_empty_for_blank() {
+        assert_eq!(super::sanitize_windows_interface_alias(""), "");
+        assert_eq!(super::sanitize_windows_interface_alias("   "), "");
     }
 }

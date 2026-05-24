@@ -8,6 +8,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use rustynetd::macos_service_hardening::{
+    REVIEWED_MACOS_RELAY_LAUNCHD_LABEL, REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchdRelayMode {
     InstallAndBootstrap,
@@ -29,8 +33,8 @@ impl InstallMacosRelayConfig {
         Self {
             mode: LaunchdRelayMode::InstallAndBootstrap,
             source_plist_path: PathBuf::from("scripts/launchd/com.rustynet.relay.plist"),
-            dest_plist_path: PathBuf::from("/Library/LaunchDaemons/com.rustynet.relay.plist"),
-            label: "com.rustynet.relay".to_owned(),
+            dest_plist_path: PathBuf::from(REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH),
+            label: REVIEWED_MACOS_RELAY_LAUNCHD_LABEL.to_owned(),
             domain: "system".to_owned(),
             dry_run: false,
         }
@@ -40,8 +44,8 @@ impl InstallMacosRelayConfig {
         Self {
             mode: LaunchdRelayMode::DisableAndRemove,
             source_plist_path: PathBuf::from("scripts/launchd/com.rustynet.relay.plist"),
-            dest_plist_path: PathBuf::from("/Library/LaunchDaemons/com.rustynet.relay.plist"),
-            label: "com.rustynet.relay".to_owned(),
+            dest_plist_path: PathBuf::from(REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH),
+            label: REVIEWED_MACOS_RELAY_LAUNCHD_LABEL.to_owned(),
             domain: "system".to_owned(),
             dry_run: false,
         }
