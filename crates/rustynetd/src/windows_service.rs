@@ -4,6 +4,10 @@ use crate::windows_backend_gate::{
     WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL, WindowsBackendMode,
     parse_windows_backend_mode, require_supported_windows_backend,
 };
+use crate::windows_backend_readiness::{
+    WindowsBackendReadinessReport, auto_select_windows_backend_mode,
+    collect_windows_backend_readiness_report,
+};
 use crate::windows_paths::validate_windows_runtime_file_path;
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,7 +58,12 @@ pub enum WindowsBackendRequest {
     Missing,
     NonWindows(String),
     ExplicitUnsupported(WindowsBackendMode),
+    AutoSelected(WindowsBackendMode),
     Reviewed(WindowsBackendMode),
+    ReadinessBlocked {
+        requested_label: String,
+        drift_reasons: Vec<String>,
+    },
     Unknown(String),
 }
 
@@ -69,7 +78,15 @@ impl WindowsBackendRequest {
                 require_supported_windows_backend(*mode)
                     .expect_err("explicit Windows unsupported mode must fail closed"),
             ),
+            Self::AutoSelected(_) => None,
             Self::Reviewed(_) => None,
+            Self::ReadinessBlocked {
+                requested_label,
+                drift_reasons,
+            } => Some(format!(
+                "windows-runtime-backend-readiness-blocked: requested backend '{requested_label}' cannot start because reviewed windows-wireguard-nt prerequisites failed: {}",
+                drift_reasons.join("; ")
+            )),
             Self::Unknown(label) => Some(format!(
                 "windows-runtime-backend-not-recognized: backend '{label}' is not a reviewed Windows backend label on the current branch. Expected {WINDOWS_UNSUPPORTED_BACKEND_LABEL} or {WINDOWS_WIREGUARD_NT_BACKEND_LABEL}."
             )),
@@ -165,12 +182,14 @@ pub fn prepare_windows_service_host(
     validate_windows_runtime_file_path(&options.env_file, "windows service env-file")?;
 
     let runtime_input = load_windows_service_runtime_input(&options.env_file)?;
-    let backend_request = classify_windows_backend_request(&runtime_input.daemon_args)?;
+    let readiness = collect_windows_backend_readiness_report();
+    let (daemon_args, backend_request) =
+        resolve_windows_backend_request(runtime_input.daemon_args, readiness)?;
 
     Ok(PreparedWindowsServiceHost {
         service_name: options.service_name.clone(),
         env_file: runtime_input.env_file,
-        daemon_args: runtime_input.daemon_args,
+        daemon_args,
         backend_request,
     })
 }
@@ -261,6 +280,80 @@ pub fn classify_windows_backend_request(args: &[String]) -> Result<WindowsBacken
         Ok(mode) => Ok(WindowsBackendRequest::Reviewed(mode)),
         Err(_) => Ok(WindowsBackendRequest::Unknown(backend)),
     }
+}
+
+pub fn resolve_windows_backend_request(
+    daemon_args: Vec<String>,
+    readiness: WindowsBackendReadinessReport,
+) -> Result<(Vec<String>, WindowsBackendRequest), String> {
+    let request = classify_windows_backend_request(&daemon_args)?;
+    match request {
+        WindowsBackendRequest::Missing => match auto_select_windows_backend_mode(&readiness) {
+            Ok(mode) => Ok((
+                with_single_windows_backend_arg(daemon_args, WINDOWS_WIREGUARD_NT_BACKEND_LABEL),
+                WindowsBackendRequest::AutoSelected(mode),
+            )),
+            Err(_) => Ok((
+                daemon_args,
+                WindowsBackendRequest::ReadinessBlocked {
+                    requested_label: "(missing --backend)".to_owned(),
+                    drift_reasons: readiness.drift_reasons,
+                },
+            )),
+        },
+        WindowsBackendRequest::ExplicitUnsupported(_) => {
+            match auto_select_windows_backend_mode(&readiness) {
+                Ok(mode) => Ok((
+                    with_single_windows_backend_arg(
+                        daemon_args,
+                        WINDOWS_WIREGUARD_NT_BACKEND_LABEL,
+                    ),
+                    WindowsBackendRequest::AutoSelected(mode),
+                )),
+                Err(_) => Ok((
+                    daemon_args,
+                    WindowsBackendRequest::ReadinessBlocked {
+                        requested_label: WINDOWS_UNSUPPORTED_BACKEND_LABEL.to_owned(),
+                        drift_reasons: readiness.drift_reasons,
+                    },
+                )),
+            }
+        }
+        WindowsBackendRequest::Reviewed(mode) => {
+            if readiness.overall_ok {
+                Ok((daemon_args, WindowsBackendRequest::Reviewed(mode)))
+            } else {
+                Ok((
+                    daemon_args,
+                    WindowsBackendRequest::ReadinessBlocked {
+                        requested_label: WINDOWS_WIREGUARD_NT_BACKEND_LABEL.to_owned(),
+                        drift_reasons: readiness.drift_reasons,
+                    },
+                ))
+            }
+        }
+        WindowsBackendRequest::NonWindows(_)
+        | WindowsBackendRequest::Unknown(_)
+        | WindowsBackendRequest::AutoSelected(_)
+        | WindowsBackendRequest::ReadinessBlocked { .. } => Ok((daemon_args, request)),
+    }
+}
+
+fn with_single_windows_backend_arg(mut args: Vec<String>, label: &str) -> Vec<String> {
+    let mut index = 0usize;
+    while index < args.len() {
+        if args[index] == "--backend" {
+            if let Some(value) = args.get_mut(index + 1) {
+                *value = label.to_owned();
+                return args;
+            }
+            break;
+        }
+        index += 1;
+    }
+    args.push("--backend".to_owned());
+    args.push(label.to_owned());
+    args
 }
 
 fn parse_windows_env_file(text: &str) -> Result<BTreeMap<String, String>, String> {
@@ -505,6 +598,88 @@ mod windows_only {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::windows_backend_readiness::{
+        REVIEWED_NETSH_EXE_PATH, REVIEWED_POWERSHELL_EXE_PATH, REVIEWED_SC_EXE_PATH,
+        REVIEWED_WG_EXE_PATH, REVIEWED_WIREGUARD_DLL_PATH, REVIEWED_WIREGUARD_EXE_PATH,
+        WindowsBackendReadinessEntry, build_windows_backend_readiness_report,
+    };
+
+    fn good_backend_readiness_report() -> WindowsBackendReadinessReport {
+        build_windows_backend_readiness_report(vec![
+            WindowsBackendReadinessEntry {
+                label: "wireguard.exe".to_owned(),
+                path: REVIEWED_WIREGUARD_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "wg.exe".to_owned(),
+                path: REVIEWED_WG_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "wireguard.dll".to_owned(),
+                path: REVIEWED_WIREGUARD_DLL_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "netsh.exe".to_owned(),
+                path: REVIEWED_NETSH_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "sc.exe".to_owned(),
+                path: REVIEWED_SC_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "PowerShell.exe".to_owned(),
+                path: REVIEWED_POWERSHELL_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "Windows version".to_owned(),
+                path: "Environment.OSVersion.Version".to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "elevated administrator token".to_owned(),
+                path: REVIEWED_POWERSHELL_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "required Win32 API surface".to_owned(),
+                path: "CryptProtectData/CryptUnprotectData".to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+        ])
+    }
+
+    fn bad_backend_readiness_report() -> WindowsBackendReadinessReport {
+        let mut report = good_backend_readiness_report();
+        report.overall_ok = false;
+        report.drift_reasons = vec![
+            "wg.exe not present at reviewed path C:\\Program Files\\WireGuard\\wg.exe".to_owned(),
+        ];
+        report
+    }
 
     #[test]
     fn strip_windows_service_args_returns_standard_args_when_mode_not_requested() {
@@ -643,6 +818,82 @@ mod tests {
             classify_windows_backend_request(&["--node-id".to_owned(), "node-a".to_owned()])
                 .expect("backend classification should parse");
         assert_eq!(request, WindowsBackendRequest::Missing);
+    }
+
+    #[test]
+    fn resolve_windows_backend_request_auto_selects_when_backend_missing_and_ready() {
+        let (args, request) = resolve_windows_backend_request(
+            vec!["--node-id".to_owned(), "node-a".to_owned()],
+            good_backend_readiness_report(),
+        )
+        .expect("selection should succeed");
+        assert_eq!(
+            request,
+            WindowsBackendRequest::AutoSelected(WindowsBackendMode::WireguardNt)
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--node-id".to_owned(),
+                "node-a".to_owned(),
+                "--backend".to_owned(),
+                WINDOWS_WIREGUARD_NT_BACKEND_LABEL.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_windows_backend_request_replaces_explicit_unsupported_when_ready() {
+        let (args, request) = resolve_windows_backend_request(
+            vec![
+                "--backend".to_owned(),
+                WINDOWS_UNSUPPORTED_BACKEND_LABEL.to_owned(),
+                "--node-id".to_owned(),
+                "node-a".to_owned(),
+            ],
+            good_backend_readiness_report(),
+        )
+        .expect("selection should succeed");
+        assert_eq!(
+            request,
+            WindowsBackendRequest::AutoSelected(WindowsBackendMode::WireguardNt)
+        );
+        assert_eq!(args[1], WINDOWS_WIREGUARD_NT_BACKEND_LABEL);
+    }
+
+    #[test]
+    fn resolve_windows_backend_request_blocks_reviewed_mode_when_readiness_drifts() {
+        let (_args, request) = resolve_windows_backend_request(
+            vec![
+                "--backend".to_owned(),
+                WINDOWS_WIREGUARD_NT_BACKEND_LABEL.to_owned(),
+            ],
+            bad_backend_readiness_report(),
+        )
+        .expect("resolution should return structured blocker");
+        match request {
+            WindowsBackendRequest::ReadinessBlocked {
+                requested_label,
+                drift_reasons,
+            } => {
+                assert_eq!(requested_label, WINDOWS_WIREGUARD_NT_BACKEND_LABEL);
+                assert!(drift_reasons.iter().any(|reason| reason.contains("wg.exe")));
+            }
+            other => panic!("expected readiness blocker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn readiness_blocker_reason_surfaces_structured_drift() {
+        let request = WindowsBackendRequest::ReadinessBlocked {
+            requested_label: WINDOWS_WIREGUARD_NT_BACKEND_LABEL.to_owned(),
+            drift_reasons: vec!["not elevated".to_owned()],
+        };
+        let reason = request
+            .blocker_reason()
+            .expect("readiness blocker should produce reason");
+        assert!(reason.contains("windows-runtime-backend-readiness-blocked"));
+        assert!(reason.contains("not elevated"));
     }
 
     #[test]

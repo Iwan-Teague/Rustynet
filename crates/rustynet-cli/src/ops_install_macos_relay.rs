@@ -159,6 +159,18 @@ pub fn execute_install_macos_relay(
     })
 }
 
+pub fn install(dry_run: bool) -> Result<InstallMacosRelayReport, String> {
+    let mut config = InstallMacosRelayConfig::default_install();
+    config.dry_run = dry_run;
+    execute_install_macos_relay(config)
+}
+
+pub fn uninstall(dry_run: bool) -> Result<InstallMacosRelayReport, String> {
+    let mut config = InstallMacosRelayConfig::default_uninstall();
+    config.dry_run = dry_run;
+    execute_install_macos_relay(config)
+}
+
 fn validate_launchd_target(config: &InstallMacosRelayConfig) -> Result<(), String> {
     validate_label(&config.label)?;
     validate_domain(&config.domain)?;
@@ -311,11 +323,7 @@ mod tests {
 
     #[test]
     fn dry_run_uninstall_reports_planned_bootout() {
-        let cfg = InstallMacosRelayConfig {
-            dry_run: true,
-            ..InstallMacosRelayConfig::default_uninstall()
-        };
-        let report = execute_install_macos_relay(cfg).unwrap();
+        let report = uninstall(true).unwrap();
         assert_eq!(report.mode, LaunchdRelayMode::DisableAndRemove);
         assert!(
             report
@@ -328,6 +336,34 @@ mod tests {
                 .steps
                 .iter()
                 .any(|step| step.contains("would remove"))
+        );
+    }
+
+    #[test]
+    fn install_wrapper_uses_launchd_install_shape_in_dry_run() {
+        let report = install(true).expect("dry-run install should not require host mutation");
+        assert_eq!(report.mode, LaunchdRelayMode::InstallAndBootstrap);
+        assert!(report.dry_run);
+        assert_eq!(report.label, "com.rustynet.relay");
+        assert_eq!(report.domain, "system");
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.contains("would run: launchctl bootstrap system"))
+        );
+    }
+
+    #[test]
+    fn uninstall_wrapper_uses_launchd_remove_shape_in_dry_run() {
+        let report = uninstall(true).expect("dry-run uninstall should not require host mutation");
+        assert_eq!(report.mode, LaunchdRelayMode::DisableAndRemove);
+        assert!(report.dry_run);
+        assert!(
+            report
+                .steps
+                .iter()
+                .any(|step| step.contains("would run: launchctl bootout system/com.rustynet.relay"))
         );
     }
 

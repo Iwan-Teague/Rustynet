@@ -16665,13 +16665,7 @@ fn execute_platform_relay_service_action(install: bool) -> Result<String, String
             .map(|report| report.summary());
     }
     if cfg!(target_os = "macos") {
-        let config = if install {
-            ops_install_macos_relay::InstallMacosRelayConfig::default_install()
-        } else {
-            ops_install_macos_relay::InstallMacosRelayConfig::default_uninstall()
-        };
-        return ops_install_macos_relay::execute_install_macos_relay(config)
-            .map(|report| report.summary());
+        return execute_macos_relay_service_action(install, false);
     }
     if cfg!(target_os = "windows") {
         // Track B Step 3 (B1.4) — Windows relay role-transition now
@@ -16688,6 +16682,13 @@ fn execute_platform_relay_service_action(install: bool) -> Result<String, String
         "relay service role transition is not supported on {}",
         std::env::consts::OS
     ))
+}
+
+fn execute_macos_relay_service_action(install: bool, dry_run: bool) -> Result<String, String> {
+    if install {
+        return ops_install_macos_relay::install(dry_run).map(|report| report.summary());
+    }
+    ops_install_macos_relay::uninstall(dry_run).map(|report| report.summary())
 }
 
 fn execute_platform_exit_service_action(install: bool) -> Result<String, String> {
@@ -18746,10 +18747,10 @@ mod tests {
         Phase6Platform, Phase6ProbeMetadataView, RoleCapability,
         build_membership_audit_replay_json, build_membership_evidence_diff_json,
         classify_cli_error, command_supports_json_render, contains_ip_rule_lookup_table,
-        detect_tampered_log, execute, extract_json_flag, help_text, is_interface_absent_detail,
-        launchd_xml_escape, load_dns_zone_records_manifest, load_signing_key,
-        managed_dns_resolver_server_arg, managed_dns_routing_already_absent, parse_bool_value,
-        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        detect_tampered_log, execute, execute_macos_relay_service_action, extract_json_flag,
+        help_text, is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
+        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
+        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
         persist_encrypted_secret_material, phase6_stage_probe_from_source,
         phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
@@ -18771,6 +18772,26 @@ mod tests {
             "192.168.1.0/24".to_owned(),
         ]);
         assert!(format!("{command:?}").contains("RouteAdvertise"));
+    }
+
+    #[test]
+    fn macos_relay_dispatch_install_uses_launchd_wrapper_in_dry_run() {
+        let summary = execute_macos_relay_service_action(true, true)
+            .expect("macOS relay dry-run install should render launchd plan");
+        assert!(summary.contains("rustynet-relay launchd service"));
+        assert!(summary.contains("install+bootstrap"));
+        assert!(summary.contains("dry-run"));
+        assert!(summary.contains("launchctl bootstrap system"));
+    }
+
+    #[test]
+    fn macos_relay_dispatch_uninstall_uses_launchd_wrapper_in_dry_run() {
+        let summary = execute_macos_relay_service_action(false, true)
+            .expect("macOS relay dry-run uninstall should render launchd plan");
+        assert!(summary.contains("rustynet-relay launchd service"));
+        assert!(summary.contains("bootout+remove"));
+        assert!(summary.contains("dry-run"));
+        assert!(summary.contains("launchctl bootout system/com.rustynet.relay"));
     }
 
     #[test]
