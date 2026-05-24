@@ -25,6 +25,7 @@ pub mod linux_runtime_acls;
 pub mod linux_runtime_nftables;
 pub mod linux_service_hardening;
 pub mod macos_authenticode;
+pub mod macos_blind_exit;
 pub mod macos_dns_failclosed;
 pub mod macos_exit_dns_failclosed;
 pub mod macos_exit_killswitch_precedence;

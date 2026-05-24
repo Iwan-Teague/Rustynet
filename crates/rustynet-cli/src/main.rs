@@ -924,7 +924,8 @@ enum OpsCommand {
     },
     /// Track B Step 3 (B1.4) — install / uninstall the
     /// com.rustynet.exit launchd service. Used by the role-transition
-    /// orchestrator when entering / leaving the `exit` preset on macOS.
+    /// orchestrator when entering / leaving the `exit` / `blind_exit`
+    /// preset on macOS.
     InstallMacosExit {
         config: ops_install_macos_exit::InstallMacosExitConfig,
     },
@@ -11145,9 +11146,12 @@ fn execute_ops_init_membership() -> Result<String, String> {
         ));
     }
     if node_role == "blind_exit"
-        && !matches!(config.host_profile, SigningPassphraseHostProfile::Linux)
+        && !matches!(
+            config.host_profile,
+            SigningPassphraseHostProfile::Linux | SigningPassphraseHostProfile::Macos
+        )
     {
-        return Err("blind_exit role is supported on Linux only".to_owned());
+        return Err("blind_exit role is supported on Linux/macOS only".to_owned());
     }
 
     let snapshot_path = env_path_or_default(

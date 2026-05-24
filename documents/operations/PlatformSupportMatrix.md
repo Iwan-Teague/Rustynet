@@ -110,7 +110,7 @@ work are listed honestly here even when wizard UX shows them as
 | `client` | yes | yes | yes (today: `runtime-host-capable only`; full client when D7/D9 land) | yes | yes |
 | `admin` | yes | yes | yes (gated on D7/D9 same as Windows client) | no | no |
 | `exit` | yes | yes (admin-installed network tools required) | yes (gated on D7 NetNat + killswitch evidence) | no | no |
-| `blind_exit` | yes | no (PF-based killswitch parity work needed) | no (not in current dataplane plan) | no | no |
+| `blind_exit` | yes | yes (PF-backed hard-lock; live evidence pending) | no (not in current dataplane plan) | no | no |
 | `relay` | yes | yes (`rustynet-relay` builds on macOS) | yes (gated on D7/D9; `rustynet-relay` already builds with SCM feature) | no | no |
 | `anchor` | yes | yes | yes (gated on D7/D9) | no (consume-only) | no (consume-only) |
 
@@ -124,8 +124,11 @@ Notes:
   dataplane execution plan land. Today every Windows non-client
   role fails closed at the wizard surface with an explicit
   "platform-blocked" message.
-- macOS `blind_exit` is intentionally blocked. `start.sh` enforces
-  blind-exit-is-Linux-only.
+- macOS `blind_exit` now has a reviewed PF hard-lock path. `start.sh`
+  permits it on macOS, and the Rust-native lab role mapper resolves
+  macOS `exit` to daemon `blind_exit`. Full promotion still needs live
+  evidence for PF anchor installation, DNS precedence, and hard-lock
+  persistence.
 - The `anchor` row here is the higher-level role-eligibility view.
   The earlier two anchor-capability rows in the Capability Matrix
   (host capability + bundle-pull client) remain accurate at the
