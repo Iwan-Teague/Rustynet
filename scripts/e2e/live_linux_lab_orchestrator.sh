@@ -4225,6 +4225,72 @@ stage_run_live_relay() {
     --log-path "$log_path"
 }
 
+# Track B Phase 12 — mixed-OS topology mutual-visibility validator.
+# Walks the entry / aux / extra labels (in that order) and assigns
+# the first Linux host to `linux_*`, the first macOS host to
+# `macos_*`, and the first Windows host to `windows_*`. If any of
+# the three OSes is absent from the inventory, the stage fails
+# closed rather than fabricating a default.
+stage_run_live_mixed_topology() {
+  local linux_host="" linux_node_id=""
+  local macos_host="" macos_node_id=""
+  local windows_host="" windows_node_id=""
+  local label platform target node_id
+  local wrapper report_path log_path
+
+  for label in entry aux extra; do
+    if ! has_label "$label"; then
+      continue
+    fi
+    platform="$(node_platform_for_label "$label")"
+    target="$(node_target_for_label "$label")"
+    node_id="$(node_id_for_label "$label")"
+    case "$platform" in
+      linux)
+        if [[ -z "$linux_host" ]]; then
+          linux_host="$target"
+          linux_node_id="$node_id"
+        fi
+        ;;
+      macos)
+        if [[ -z "$macos_host" ]]; then
+          macos_host="$target"
+          macos_node_id="$node_id"
+        fi
+        ;;
+      windows)
+        if [[ -z "$windows_host" ]]; then
+          windows_host="$target"
+          windows_node_id="$node_id"
+        fi
+        ;;
+    esac
+  done
+
+  if [[ -z "$linux_host" || -z "$macos_host" || -z "$windows_host" ]]; then
+    printf 'live_mixed_topology requires one linux + one macos + one windows host across entry/aux/extra; got linux=%q macos=%q windows=%q\n' \
+      "$linux_host" "$macos_host" "$windows_host" >&2
+    return 1
+  fi
+
+  wrapper="$ROOT_DIR/scripts/e2e/live_mixed_topology_test.sh"
+  report_path="$REPORT_DIR/live_mixed_topology_report.json"
+  log_path="$REPORT_DIR/live_mixed_topology.log"
+
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
+    --linux-host "$linux_host" \
+    --linux-node-id "$linux_node_id" \
+    --macos-host "$macos_host" \
+    --macos-node-id "$macos_node_id" \
+    --windows-host "$windows_host" \
+    --windows-node-id "$windows_node_id" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
 assert_json_report_status_pass() {
   local report_path="$1"
   local label="$2"
@@ -6923,6 +6989,17 @@ main() {
     run_stage hard live_relay 'run live relay role validation' stage_run_live_relay
   else
     record_stage_skip live_relay hard 'requires entry or aux target as the relay role host'
+  fi
+
+  # Track B Phase 12 — mixed-OS topology mutual-visibility stage.
+  # Requires exactly one Linux + one macOS + one Windows host across
+  # the entry / aux / extra labels. The stage itself fails closed
+  # when that mix is not present, so the orchestrator only needs to
+  # check the label presence here.
+  if has_label entry && has_label aux && has_label extra; then
+    run_stage hard live_mixed_topology 'run mixed-OS topology visibility validation' stage_run_live_mixed_topology
+  else
+    record_stage_skip live_mixed_topology hard 'requires entry + aux + extra labels with one Linux + one macOS + one Windows host'
   fi
 
   if has_four_node_live_topology; then
