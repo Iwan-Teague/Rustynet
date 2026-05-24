@@ -2267,8 +2267,16 @@ fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
     // a single PowerShell expression with -NoProfile -Command for
     // hermetic behaviour. Use Compress for compact JSON so the
     // builder's parse_netnat_json can consume it deterministically.
+    // `Out-String -Width 32767` keeps PowerShell's default
+    // Out-Default formatter from wrapping the JSON at host width
+    // (~80 in non-interactive SSH). ConvertTo-Json -Compress emits
+    // a single line but the rendering stage still wraps; the
+    // explicit Out-String + max-int width prevents the parser from
+    // seeing a truncated JSON body. Width-32767 matches the safer
+    // default the Phase 14 reviewer recommended over 4096 for
+    // long-lived per-host status lines.
     let netnat_cmd = format!(
-        "powershell -NoProfile -Command \"Get-NetNat -Name '{}' -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 -Compress\"",
+        "powershell -NoProfile -Command \"Get-NetNat -Name '{}' -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 -Compress | Out-String -Width 32767\"",
         WINDOWS_NAT_NAME
     );
     let tunnel_forwarding_cmd = format!(

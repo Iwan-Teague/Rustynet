@@ -1026,7 +1026,7 @@ fn capture_windows_relay_lifecycle_snapshot(
             // listener row at the host's terminal width, which would
             // break windows_endpoint_summary_has_row's non-empty-line
             // detection on a continuation line.
-            "powershell -NoProfile -Command \"Get-NetUDPEndpoint -LocalPort {} -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String -Width 4096\"",
+            "powershell -NoProfile -Command \"Get-NetUDPEndpoint -LocalPort {} -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String -Width 32767\"",
             REVIEWED_WINDOWS_RELAY_BIND_PORT
         ),
     )
@@ -1037,7 +1037,7 @@ fn capture_windows_relay_lifecycle_snapshot(
         relay_target,
         &format!(
             // Same `-Width 4096` rationale as the UDP capture above.
-            "powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String -Width 4096\"",
+            "powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String -Width 32767\"",
             REVIEWED_WINDOWS_RELAY_HEALTH_PORT
         ),
     )
