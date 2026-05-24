@@ -2080,6 +2080,16 @@ fn run_macos_exit_handoff(config: &Config) -> Result<(), String> {
             after_snapshot.tunnel_forwarding, after_snapshot.egress_forwarding
         ));
     }
+    // Reviewer-flagged regression: the restart phase must assert
+    // success, not just capture the outcome. A silent launchctl
+    // bootstrap failure left the macOS exit daemon offline under a
+    // passing status.
+    if daemon_restart_status.starts_with("restart_failed:") {
+        failures.push(format!(
+            "post-test launchctl bootstrap failed; macOS exit daemon is OFFLINE — {}",
+            daemon_restart_status
+        ));
+    }
 
     let status = if failures.is_empty() { "pass" } else { "fail" };
     let detail = if failures.is_empty() {
@@ -2167,24 +2177,33 @@ const WINDOWS_SCM_SERVICE: &str = "rustynetd";
 /// single-quoted PowerShell argument of the follow-up
 /// `Get-NetIPInterface -InterfaceAlias '<alias>' ...` invocation.
 /// A compromised target host could otherwise return an alias
-/// containing `'`, `;`, `"`, `\n`, etc. to break out of the quote
-/// and inject shell commands. CLAUDE.md mandates no shell
+/// containing `'`, `;`, `"`, newline, etc. to break out of the
+/// quote and inject shell commands. CLAUDE.md mandates no shell
 /// construction with untrusted values.
 ///
-/// We accept only Windows-realistic alias characters:
-/// `A-Z a-z 0-9 space . _ - ( )` (PowerShell interface aliases
-/// such as `Ethernet`, `Wi-Fi`, `vEthernet (Default Switch)`).
-/// Anything else collapses the alias to an empty string, which
-/// makes the caller treat the egress as missing and surface that
-/// in the report rather than emit a malformed PowerShell command.
+/// PowerShell interface aliases are localized on non-English
+/// Windows hosts (e.g. `イーサネット`, `Ethernet-Verbindung`), so an
+/// ASCII-only allowlist would surface those healthy interfaces as
+/// missing. We use a denylist: reject the bytes that have meaning
+/// to PowerShell single-quote parsing or could terminate the outer
+/// ssh-bash command, plus any C0/C1 control character. Everything
+/// else — including non-ASCII letters/digits, paren / dot / dash /
+/// underscore / space — survives.
+///
+/// Length cap of 96 bytes mirrors the PowerShell InterfaceAlias
+/// maximum and keeps a single capture's failure from being able to
+/// inflate the formatted command beyond the SSH argv budget.
 fn sanitize_windows_interface_alias(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 96 {
         return String::new();
     }
-    if !trimmed
+    const FORBIDDEN: &[char] = &[
+        '\'', '"', '`', '$', ';', '|', '&', '<', '>', '\\', '{', '}', '\n', '\r', '\t', '\0',
+    ];
+    if trimmed
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '.' | '_' | '-' | '(' | ')'))
+        .any(|ch| ch.is_control() || FORBIDDEN.contains(&ch))
     {
         return String::new();
     }
@@ -2453,6 +2472,16 @@ fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
         failures.push(format!(
             "after-stop forwarding NOT restored (tunnel={:?}, egress={:?})",
             after_snapshot.tunnel_forwarding, after_snapshot.egress_forwarding
+        ));
+    }
+    // Reviewer-flagged regression: the restart phase must assert
+    // success, not just capture the outcome. A silent SCM restart
+    // failure left the Windows exit daemon offline under a passing
+    // status.
+    if daemon_restart_status.starts_with("restart_failed:") {
+        failures.push(format!(
+            "post-test Start-Service failed; Windows exit daemon is OFFLINE — {}",
+            daemon_restart_status
         ));
     }
 
@@ -3186,6 +3215,26 @@ peer.1.endpoint=192.168.128.26:51820
                 super::sanitize_windows_interface_alias(ok),
                 ok,
                 "alias {ok:?} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_windows_interface_alias_accepts_localized_unicode_aliases() {
+        // Real-world non-English Windows interface alias names.
+        // An ASCII-only allowlist would surface these as missing
+        // and cause spurious failures on JP/DE/FR/KR hosts.
+        for ok in [
+            "イーサネット",
+            "Ethernet-Verbindung",
+            "Сетевое подключение",
+            "이더넷",
+            "vEthernet (既定のスイッチ)",
+        ] {
+            assert_eq!(
+                super::sanitize_windows_interface_alias(ok),
+                ok,
+                "localized alias {ok:?} must pass the denylist sanitizer"
             );
         }
     }

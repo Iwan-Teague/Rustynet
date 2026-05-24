@@ -35,12 +35,16 @@ use std::path::{Path, PathBuf};
 
 use live_lab_bin_support::{
     LiveLabPlatform, capture_remote_stdout, capture_root, create_workspace,
-    enforce_linux_only_until_validator_lands, ensure_pinned_known_hosts_file, ensure_safe_token,
-    git_head_commit, load_home_known_hosts_path, repo_root, require_command, run_root,
-    seed_known_hosts, verify_passwordless_sudo, verify_sudo, write_file,
+    ensure_pinned_known_hosts_file, ensure_safe_token, git_head_commit, load_home_known_hosts_path,
+    repo_root, require_command, run_root, seed_known_hosts, verify_passwordless_sudo, verify_sudo,
+    verify_windows_admin, write_file,
 };
 use rustynetd::macos_service_hardening::{
     REVIEWED_MACOS_RELAY_LAUNCHD_LABEL, REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH,
+};
+use rustynetd::windows_service_hardening::{
+    REVIEWED_WINDOWS_RELAY_BIND_PORT, REVIEWED_WINDOWS_RELAY_HEALTH_PORT,
+    REVIEWED_WINDOWS_RELAY_SERVICE_NAME,
 };
 use serde::Serialize;
 
@@ -57,23 +61,9 @@ fn run() -> Result<(), String> {
     match config.platform {
         LiveLabPlatform::Linux => run_linux_relay(&config),
         LiveLabPlatform::MacOs => run_macos_relay(&config),
-        LiveLabPlatform::Windows => {
-            // Track B Phase 8 lands the Windows SCM relay installer
-            // and the real validator. Until then, fail closed at the
-            // dispatcher so a misconfigured run cannot silently
-            // report success.
-            enforce_linux_only_until_validator_lands(
-                LiveLabPlatform::Windows,
-                STAGE_NAME,
-                PHASE_NOTE,
-            )
-        }
+        LiveLabPlatform::Windows => run_windows_relay(&config),
     }
 }
-
-const STAGE_NAME: &str = "relay-service-lifecycle";
-const PHASE_NOTE: &str =
-    "Windows lands in Track B Phase 8 (needs SCM-driven rustynet-relay installer first)";
 
 const SYSTEMD_RELAY_UNIT: &str = "rustynet-relay.service";
 /// Reviewed UDP bind port for the relay datapath. The rustynet-relay
@@ -717,26 +707,37 @@ fn capture_macos_relay_lifecycle_snapshot(
 }
 
 /// Parse `launchctl print system/<label>` stdout into a state word
-/// that mirrors `systemctl is-active` ("active" / "inactive" /
-/// "failed"). launchctl returns multi-line output containing a `pid`
-/// field when the daemon is running and a `state = running` line.
+/// that mirrors `systemctl is-active` ("active" / "inactive").
+///
+/// launchctl reports daemon state two complementary ways:
+///   * a `state = <word>` line — `running` is live; `waiting` and
+///     `spawn scheduled` are KeepAlive cooldown intermediates and
+///     classify as `active` (the daemon will respawn imminently);
+///     every other word (`exited`, `not running`, ...) classifies
+///     as `inactive`.
+///   * a `pid = <N>` line — used as a fallback when the truncated
+///     output omits the explicit `state =` line. A non-zero pid is
+///     classified as `active`.
+///
 /// When the service is not loaded launchctl writes
-/// "Could not find service" to stderr (which we redirect to stdout
-/// via `2>&1`).
+/// `Could not find service` to stderr (we redirect to stdout via
+/// `2>&1`).
 fn parse_macos_launchctl_print_state(stdout: &str) -> String {
     let lower = stdout.to_ascii_lowercase();
     if lower.contains("could not find service") || lower.contains("service not loaded") {
         return "inactive".to_owned();
     }
-    // launchctl uses `state = running` (with surrounding whitespace).
-    if stdout
-        .lines()
-        .any(|line| line.trim().starts_with("state =") && line.contains("running"))
-    {
-        return "active".to_owned();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("state =") {
+            let word = rest.trim().to_ascii_lowercase();
+            return match word.as_str() {
+                "running" | "waiting" | "spawn scheduled" => "active".to_owned(),
+                _ => "inactive".to_owned(),
+            };
+        }
     }
-    // A pid field with a non-zero numeric value implies the daemon
-    // is up. launchctl prints `pid = <NNN>` for live daemons.
+    // No `state =` line — fall back to the pid heuristic.
     if stdout.lines().any(|line| {
         let trimmed = line.trim();
         trimmed.starts_with("pid =")
@@ -746,9 +747,6 @@ fn parse_macos_launchctl_print_state(stdout: &str) -> String {
                 .is_some_and(|pid| pid != 0)
     }) {
         return "active".to_owned();
-    }
-    if stdout.trim().is_empty() {
-        return "inactive".to_owned();
     }
     "inactive".to_owned()
 }
@@ -762,6 +760,7 @@ fn macos_tcp_listener_summary_contains_port(summary: &str, port: u16) -> bool {
         format!("127.0.0.1:{}", port),
         format!("*:{}", port),
         format!("[::1]:{}", port),
+        format!("[::]:{}", port),
     ];
     summary.lines().any(|line| {
         let trimmed = line.trim();
@@ -782,13 +781,328 @@ fn macos_udp_listener_summary_contains_port(summary: &str, port: u16) -> bool {
         format!("127.0.0.1:{}", port),
         format!("*:{}", port),
         format!("[::1]:{}", port),
+        format!("[::]:{}", port),
     ];
     summary.lines().any(|line| {
         let trimmed = line.trim();
+        // `contains` (not `ends_with`) so trailing whitespace or
+        // platform-specific zone-id suffixes don't break the match.
+        // The `->` exclusion still rules out outbound sockets that
+        // share the port number.
         trimmed.contains(" UDP ")
             && !trimmed.contains("->")
-            && needles.iter().any(|needle| trimmed.ends_with(needle))
+            && needles.iter().any(|needle| trimmed.contains(needle))
     })
+}
+
+// ─── Track B Phase 8: Windows relay-service-lifecycle validator ───
+//
+// Mirrors `run_macos_relay` but uses PowerShell + SCM. Windows binds
+// the relay datapath on UDP 0.0.0.0:4500 and the health/metrics
+// endpoint on TCP 127.0.0.1:9100 (per the reviewed installer at
+// `scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1`).
+// The shared `RelayLifecycleSnapshot` / `RelayLifecycleArtifact` /
+// `RelayLifecycleReport` types stay in lockstep with Linux + macOS
+// so a schema change forces all three platforms to update.
+fn run_windows_relay(config: &Config) -> Result<(), String> {
+    for command in ["ssh", "ssh-keygen"] {
+        require_command(command)?;
+    }
+    validate_identity(&config.ssh_identity_file)?;
+    let pinned_known_hosts = match config.pinned_known_hosts_file.as_ref() {
+        Some(path) => path.clone(),
+        None => load_home_known_hosts_path()?,
+    };
+    ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
+    let workspace = create_workspace("windows-relay-lifecycle")?;
+    let work_known_hosts = workspace.path().join("known_hosts");
+    seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
+
+    let relay_target = config.relay_host.as_str();
+    // Without BUILTIN\Administrators the Stop-Service / Start-Service
+    // + Get-NetUDPEndpoint calls below return access-denied opaquely.
+    verify_windows_admin(&config.ssh_identity_file, &work_known_hosts, relay_target)?;
+
+    let during_snapshot = capture_windows_relay_lifecycle_snapshot(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+    )
+    .map_err(|err| format!("windows relay: during-run capture failed: {err}"))?;
+
+    // Stop the SCM service. -Force handles dependent service cleanup.
+    let _ = capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+        &format!(
+            "powershell -NoProfile -Command \"Stop-Service -Name '{}' -Force\"",
+            REVIEWED_WINDOWS_RELAY_SERVICE_NAME
+        ),
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let after_snapshot = capture_windows_relay_lifecycle_snapshot(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+    )
+    .map_err(|err| format!("windows relay: after-stop capture failed: {err}"))?;
+
+    let daemon_restart_status = match capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+        &format!(
+            "powershell -NoProfile -Command \"Start-Service -Name '{}'\"",
+            REVIEWED_WINDOWS_RELAY_SERVICE_NAME
+        ),
+    ) {
+        Ok(_) => "restarted".to_owned(),
+        Err(err) => format!("restart_failed: {err}"),
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    if !during_snapshot.unit_state.eq_ignore_ascii_case("active") {
+        failures.push(format!(
+            "during-run unit_state {:?} expected 'active' — SCM service not Running?",
+            during_snapshot.unit_state
+        ));
+    }
+    if !during_snapshot.listener_bound_4500 {
+        failures.push(format!(
+            "during-run relay UDP listener on :{} was NOT bound",
+            REVIEWED_WINDOWS_RELAY_BIND_PORT
+        ));
+    }
+    if !during_snapshot.listener_bound_4501 {
+        failures.push(format!(
+            "during-run relay health TCP listener on :{} was NOT bound",
+            REVIEWED_WINDOWS_RELAY_HEALTH_PORT
+        ));
+    }
+    if !during_snapshot.health_status.eq_ignore_ascii_case("ok") {
+        failures.push(format!(
+            "during-run /healthz returned status {:?} expected 'ok'",
+            during_snapshot.health_status
+        ));
+    }
+    if after_snapshot.unit_state.eq_ignore_ascii_case("active") {
+        failures.push(
+            "after-stop unit_state still 'active' — Stop-Service did not take effect".to_owned(),
+        );
+    }
+    if after_snapshot.listener_bound_4500 {
+        failures.push(format!(
+            "after-stop relay UDP listener on :{} was STILL bound (teardown leaked it)",
+            REVIEWED_WINDOWS_RELAY_BIND_PORT
+        ));
+    }
+    if after_snapshot.listener_bound_4501 {
+        failures.push(format!(
+            "after-stop relay health TCP listener on :{} was STILL bound (teardown leaked it)",
+            REVIEWED_WINDOWS_RELAY_HEALTH_PORT
+        ));
+    }
+    if after_snapshot.health_status.eq_ignore_ascii_case("ok") {
+        failures.push(format!(
+            "after-stop /healthz still answers with status {:?} — daemon socket was not released",
+            after_snapshot.health_status
+        ));
+    }
+    if daemon_restart_status.starts_with("restart_failed:") {
+        failures.push(format!(
+            "post-test {} restart failed; Windows relay is OFFLINE — {}",
+            REVIEWED_WINDOWS_RELAY_SERVICE_NAME, daemon_restart_status
+        ));
+    }
+
+    let teardown_complete = !after_snapshot.listener_bound_4500
+        && !after_snapshot.listener_bound_4501
+        && !after_snapshot.unit_state.eq_ignore_ascii_case("active");
+    let status = if failures.is_empty() { "pass" } else { "fail" };
+    let detail = if failures.is_empty() {
+        "all invariants held".to_owned()
+    } else {
+        failures.join("; ")
+    };
+
+    let log_path = if config.log_path.is_absolute() {
+        config.log_path.clone()
+    } else {
+        repo_root()?.join(&config.log_path)
+    };
+    let report_path = if config.report_path.is_absolute() {
+        config.report_path.clone()
+    } else {
+        repo_root()?.join(&config.report_path)
+    };
+    let root = repo_root()?;
+    let git_commit = config
+        .git_commit
+        .clone()
+        .unwrap_or_else(|| git_head_commit(&root).unwrap_or_else(|_| "unknown".to_owned()));
+    let lifecycle = serde_json::to_value(RelayLifecycleArtifact {
+        schema_version: 1,
+        unit_name: REVIEWED_WINDOWS_RELAY_SERVICE_NAME,
+        bind_port: REVIEWED_WINDOWS_RELAY_BIND_PORT,
+        health_port: REVIEWED_WINDOWS_RELAY_HEALTH_PORT,
+        during_run: &during_snapshot,
+        after_stop: &after_snapshot,
+        teardown_complete,
+    })
+    .map_err(|err| format!("serialize relay lifecycle artifact failed: {err}"))?;
+
+    let report = RelayLifecycleReport {
+        schema_version: 1,
+        phase: "phase10",
+        mode: "live_windows_relay_lifecycle",
+        evidence_mode: "measured",
+        status,
+        platform: "windows",
+        captured_at: utc_now_string(),
+        captured_at_unix: after_snapshot.captured_at_unix.max(0) as u64,
+        git_commit,
+        relay_host: config.relay_host.clone(),
+        relay_node_id: config.relay_node_id.clone(),
+        peer_host: config.peer_host.clone(),
+        peer_node_id: config.peer_node_id.clone(),
+        unit_name: REVIEWED_WINDOWS_RELAY_SERVICE_NAME,
+        daemon_restart_status,
+        lifecycle,
+        source_artifacts: vec![log_path.display().to_string()],
+        detail: detail.clone(),
+    };
+    let mut body = serde_json::to_string(&report)
+        .map_err(|err| format!("serialize windows relay report failed: {err}"))?;
+    body.push('\n');
+    write_file(&report_path, body.as_str())?;
+
+    let log_body = format!(
+        "[windows-relay-lifecycle] status={status} relay_host={} relay_node_id={} peer_host={} peer_node_id={} detail={}\n",
+        config.relay_host, config.relay_node_id, config.peer_host, config.peer_node_id, detail
+    );
+    write_file(&log_path, log_body.as_str())?;
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "windows relay lifecycle invariants failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn capture_windows_relay_lifecycle_snapshot(
+    identity: &Path,
+    known_hosts: &Path,
+    relay_target: &str,
+) -> Result<RelayLifecycleSnapshot, String> {
+    // Get-Service returns a single object with a Status property. We
+    // ExpandProperty so the captured stdout carries the bare status
+    // word (`Running` / `Stopped` / `Paused` / ...) which the parser
+    // maps to active/inactive mirroring `systemctl is-active`.
+    let svc_status = capture_remote_stdout(
+        identity,
+        known_hosts,
+        relay_target,
+        &format!(
+            "powershell -NoProfile -Command \"(Get-Service -Name '{}' -ErrorAction SilentlyContinue).Status\"",
+            REVIEWED_WINDOWS_RELAY_SERVICE_NAME
+        ),
+    )?;
+    let unit_state = parse_windows_get_service_status(svc_status.as_str());
+
+    // Get-NetUDPEndpoint -LocalPort prints zero rows when no socket
+    // is bound (exit 0, empty stdout) and a tabular block when one
+    // is. Get-NetTCPConnection -State Listen has the same shape.
+    let udp_summary = capture_remote_stdout(
+        identity,
+        known_hosts,
+        relay_target,
+        &format!(
+            "powershell -NoProfile -Command \"Get-NetUDPEndpoint -LocalPort {} -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String\"",
+            REVIEWED_WINDOWS_RELAY_BIND_PORT
+        ),
+    )
+    .unwrap_or_default();
+    let tcp_summary = capture_remote_stdout(
+        identity,
+        known_hosts,
+        relay_target,
+        &format!(
+            "powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String\"",
+            REVIEWED_WINDOWS_RELAY_HEALTH_PORT
+        ),
+    )
+    .unwrap_or_default();
+    let listener_bound_4500 = windows_endpoint_summary_has_row(udp_summary.as_str());
+    let listener_bound_4501 = windows_endpoint_summary_has_row(tcp_summary.as_str());
+
+    // Invoke-WebRequest -UseBasicParsing emits the body content of a
+    // successful response. On connection refused, PowerShell errors
+    // (ErrorAction Stop) — catch via `try { ... } catch { '' }` so a
+    // failed probe collapses to empty stdout, which the parser
+    // classifies as `unreachable`.
+    let health_body = capture_remote_stdout(
+        identity,
+        known_hosts,
+        relay_target,
+        &format!(
+            "powershell -NoProfile -Command \"try {{ (Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:{}{} -TimeoutSec 2).Content }} catch {{ '' }}\"",
+            REVIEWED_WINDOWS_RELAY_HEALTH_PORT, RELAY_HEALTH_PATH
+        ),
+    )
+    .unwrap_or_default();
+    let (health_status, health_active_sessions) = parse_relay_health_body(health_body.as_str());
+
+    let mut listener_summary = String::new();
+    for (label, body) in [("udp", udp_summary.as_str()), ("tcp", tcp_summary.as_str())] {
+        for line in body.lines().filter(|line| !line.trim().is_empty()).take(2) {
+            listener_summary.push_str(label);
+            listener_summary.push(' ');
+            listener_summary.push_str(line);
+            listener_summary.push('\n');
+        }
+    }
+
+    Ok(RelayLifecycleSnapshot {
+        captured_at_unix: unix_now_secs(),
+        unit_state,
+        listener_bound_4500,
+        listener_bound_4501,
+        health_status,
+        health_active_sessions,
+        listener_summary: listener_summary.trim_end().to_owned(),
+    })
+}
+
+/// Map the PowerShell Get-Service status word to the cross-platform
+/// active/inactive value. `Running` is the live SCM state; every
+/// other published value (Stopped, Paused, StartPending, ...) is
+/// classified as `inactive` so a half-started service is not
+/// reported as live.
+fn parse_windows_get_service_status(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return "inactive".to_owned();
+    }
+    if trimmed.eq_ignore_ascii_case("running") {
+        return "active".to_owned();
+    }
+    "inactive".to_owned()
+}
+
+/// `Get-NetUDPEndpoint` / `Get-NetTCPConnection` with
+/// `-ErrorAction SilentlyContinue` returns ZERO rows when no socket
+/// is bound — the pipeline produces empty stdout. Any non-empty
+/// non-whitespace line indicates a returned object, i.e. a bound
+/// listener. `Format-Table -HideTableHeaders` keeps the output
+/// machine-parseable without a leading column header that might
+/// otherwise be mistaken for a row.
+fn windows_endpoint_summary_has_row(summary: &str) -> bool {
+    summary.lines().any(|line| !line.trim().is_empty())
 }
 
 fn capture_relay_lifecycle_snapshot(
@@ -1032,21 +1346,6 @@ mod tests {
     // scaffold so the dispatch arms in run() cannot be silently
     // dropped without a compile or test break.
 
-    #[test]
-    fn platform_gate_fails_closed_for_windows_with_phase_8_note() {
-        // Track B Phase 7 ships macOS; Windows still fails closed
-        // until Phase 8 lands the SCM-driven installer + validator.
-        let err = super::enforce_linux_only_until_validator_lands(
-            LiveLabPlatform::Windows,
-            super::STAGE_NAME,
-            super::PHASE_NOTE,
-        )
-        .expect_err("Windows must fail closed in Phase 7");
-        assert!(err.contains("Windows"));
-        assert!(err.contains(super::STAGE_NAME));
-        assert!(err.contains("Phase 8"));
-    }
-
     // Parser / pure-input helper coverage.
 
     #[test]
@@ -1228,6 +1527,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_macos_launchctl_print_state_treats_waiting_as_active() {
+        // launchd `waiting` is the KeepAlive cooldown state — the
+        // daemon will respawn imminently. The cross-platform
+        // contract treats it as `active` so a brief restart hiccup
+        // does not flap the live-lab assertion.
+        let stdout = "system/com.rustynet.relay = {\n\tstate = waiting\n}\n";
+        assert_eq!(super::parse_macos_launchctl_print_state(stdout), "active");
+    }
+
+    #[test]
+    fn parse_macos_launchctl_print_state_treats_exited_as_inactive() {
+        let stdout = "system/com.rustynet.relay = {\n\tstate = exited\n\tlast exit code = 1\n}\n";
+        assert_eq!(super::parse_macos_launchctl_print_state(stdout), "inactive");
+    }
+
+    #[test]
+    fn parse_macos_launchctl_print_state_treats_not_running_as_inactive() {
+        let stdout = "system/com.rustynet.relay = {\n\tstate = not running\n}\n";
+        assert_eq!(super::parse_macos_launchctl_print_state(stdout), "inactive");
+    }
+
+    #[test]
     fn macos_tcp_listener_summary_matches_loopback_listen_for_health_port() {
         let body = "COMMAND  PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
                     rustynet 123 r    11u IPv4 0xabd      0t0  TCP 127.0.0.1:4501 (LISTEN)\n";
@@ -1268,5 +1589,157 @@ mod tests {
         // NOT satisfy the UDP matcher.
         let body = "rustynet 123 r    11u IPv4 0xabd      0t0  TCP 127.0.0.1:4500 (LISTEN)\n";
         assert!(!super::macos_udp_listener_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn macos_listener_summary_accepts_ipv6_wildcard_bind() {
+        // Operator widens --bind to all interfaces including IPv6;
+        // lsof prints `[::]:4500`. Both TCP and UDP matchers must
+        // accept it — Linux already does (`[::]:` is in its needle
+        // list); this keeps the cross-platform contract symmetric.
+        let tcp = "rustynet 123 r    11u IPv6 0xabd      0t0  TCP [::]:4501 (LISTEN)\n";
+        assert!(super::macos_tcp_listener_summary_contains_port(tcp, 4501));
+        let udp = "rustynet 123 r    10u IPv6 0xabc      0t0  UDP [::]:4500\n";
+        assert!(super::macos_udp_listener_summary_contains_port(udp, 4500));
+    }
+
+    // ─── Track B Phase 8: Windows parser coverage ──────────────────
+
+    #[test]
+    fn parse_windows_get_service_status_recognises_running() {
+        assert_eq!(
+            super::parse_windows_get_service_status("Running\r\n"),
+            "active"
+        );
+        assert_eq!(super::parse_windows_get_service_status("Running"), "active");
+        assert_eq!(super::parse_windows_get_service_status("running"), "active");
+    }
+
+    #[test]
+    fn parse_windows_get_service_status_classifies_non_running_as_inactive() {
+        for word in ["Stopped", "Paused", "StartPending", "StopPending", ""] {
+            assert_eq!(
+                super::parse_windows_get_service_status(word),
+                "inactive",
+                "{word:?} must classify as inactive"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_endpoint_summary_has_row_detects_bound_listener() {
+        // Get-NetUDPEndpoint emits non-empty tabular output when a
+        // socket is bound. Any non-whitespace line counts.
+        let body = "\n0.0.0.0                                       4500\n\n";
+        assert!(super::windows_endpoint_summary_has_row(body));
+    }
+
+    #[test]
+    fn windows_endpoint_summary_has_row_returns_false_for_empty() {
+        // ErrorAction SilentlyContinue + no matching endpoint => zero
+        // rows, empty stdout. Must be classified as no listener.
+        assert!(!super::windows_endpoint_summary_has_row(""));
+        assert!(!super::windows_endpoint_summary_has_row("   \n\n\t"));
+    }
+
+    #[test]
+    fn relay_lifecycle_report_windows_envelope_round_trips() {
+        // Mirror the Linux + macOS report shape with windows-specific
+        // identifiers. The schema is shared across the three
+        // platforms — a divergent envelope here would surface as a
+        // test break.
+        let during = super::RelayLifecycleSnapshot {
+            captured_at_unix: 100,
+            unit_state: "active".to_owned(),
+            listener_bound_4500: true,
+            listener_bound_4501: true,
+            health_status: "ok".to_owned(),
+            health_active_sessions: Some(1),
+            listener_summary: "udp 0.0.0.0 4500".to_owned(),
+        };
+        let after = super::RelayLifecycleSnapshot {
+            captured_at_unix: 200,
+            unit_state: "inactive".to_owned(),
+            listener_bound_4500: false,
+            listener_bound_4501: false,
+            health_status: "unreachable".to_owned(),
+            health_active_sessions: None,
+            listener_summary: String::new(),
+        };
+        let lifecycle = serde_json::to_value(super::RelayLifecycleArtifact {
+            schema_version: 1,
+            unit_name: super::REVIEWED_WINDOWS_RELAY_SERVICE_NAME,
+            bind_port: super::REVIEWED_WINDOWS_RELAY_BIND_PORT,
+            health_port: super::REVIEWED_WINDOWS_RELAY_HEALTH_PORT,
+            during_run: &during,
+            after_stop: &after,
+            teardown_complete: true,
+        })
+        .expect("artifact serialize");
+        let report = super::RelayLifecycleReport {
+            schema_version: 1,
+            phase: "phase10",
+            mode: "live_windows_relay_lifecycle",
+            evidence_mode: "measured",
+            status: "fail",
+            platform: "windows",
+            captured_at: "1970-01-01T00:00:00Z".to_owned(),
+            captured_at_unix: 200,
+            git_commit: "deadbeef".to_owned(),
+            relay_host: "admin@192.168.18.40 \" inject \n more".to_owned(),
+            relay_node_id: "relay-40".to_owned(),
+            peer_host: "debian@192.168.18.65".to_owned(),
+            peer_node_id: "client-65".to_owned(),
+            unit_name: super::REVIEWED_WINDOWS_RELAY_SERVICE_NAME,
+            daemon_restart_status: "restart_failed: SCM access denied".to_owned(),
+            lifecycle,
+            source_artifacts: vec!["live-lab/windows-relay.log".to_owned()],
+            detail: "all invariants held".to_owned(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("round-trip JSON");
+        assert_eq!(parsed["status"], "fail");
+        assert_eq!(parsed["platform"], "windows");
+        assert_eq!(parsed["mode"], "live_windows_relay_lifecycle");
+        assert_eq!(
+            parsed["unit_name"],
+            super::REVIEWED_WINDOWS_RELAY_SERVICE_NAME
+        );
+        assert_eq!(
+            parsed["lifecycle"]["bind_port"],
+            super::REVIEWED_WINDOWS_RELAY_BIND_PORT
+        );
+        assert_eq!(
+            parsed["lifecycle"]["health_port"],
+            super::REVIEWED_WINDOWS_RELAY_HEALTH_PORT
+        );
+        assert_eq!(
+            parsed["lifecycle"]["during_run"]["listener_bound_4500"],
+            true
+        );
+        assert_eq!(
+            parsed["lifecycle"]["after_stop"]["listener_bound_4500"],
+            false
+        );
+        assert_eq!(parsed["lifecycle"]["teardown_complete"], true);
+        assert_eq!(
+            parsed["daemon_restart_status"], "restart_failed: SCM access denied",
+            "SCM restart failure must be visible in the report"
+        );
+        assert_eq!(
+            parsed["relay_host"], "admin@192.168.18.40 \" inject \n more",
+            "embedded quote/newline must survive serde escaping"
+        );
+    }
+
+    #[test]
+    fn windows_relay_service_constant_is_canonical_install_default() {
+        // Defense-in-depth: pin the SCM service identifier the
+        // validator targets so a rename of the
+        // Install-RustyNetWindowsRelayService.ps1 default surfaces
+        // here.
+        assert_eq!(super::REVIEWED_WINDOWS_RELAY_SERVICE_NAME, "RustyNetRelay");
+        assert_eq!(super::REVIEWED_WINDOWS_RELAY_BIND_PORT, 4500);
+        assert_eq!(super::REVIEWED_WINDOWS_RELAY_HEALTH_PORT, 9100);
     }
 }

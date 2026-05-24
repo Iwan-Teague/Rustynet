@@ -4169,12 +4169,12 @@ stage_run_live_relay() {
   local relay_label relay_target relay_node_id peer_label peer_target peer_node_id
   local relay_platform wrapper report_path log_path
 
-  # Track B Phase 3 — new relay live stage. The relay host is the
-  # entry node (which carries relay_host capability in the canonical
-  # topology); the peer that establishes the relay session is the
-  # client. Phase 3 scaffolds the bin + dispatcher; the real Linux
-  # validator (service-lifecycle + datapath probe) lands in Phase 3b,
-  # macOS in Phase 6, Windows in Phase 7.
+  # Track B relay live stage. The relay host is the entry node
+  # (which carries relay_host capability in the canonical topology);
+  # the peer that establishes the relay session is the client. Phase
+  # 3 scaffolded the bin + dispatcher; Phases 6 / 7 / 8 land the
+  # real Linux / macOS / Windows validators respectively. All three
+  # validators emit the canonical RelayLifecycleReport envelope.
   if has_label entry; then
     relay_label="entry"
   elif has_label aux; then

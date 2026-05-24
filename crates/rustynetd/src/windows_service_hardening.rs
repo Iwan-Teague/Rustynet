@@ -23,6 +23,26 @@ pub const REVIEWED_WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const REVIEWED_WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
 pub const REVIEWED_WINDOWS_BINARY_FILE_NAME: &str = "rustynetd.exe";
 
+/// Reviewed Windows SCM service name for the sibling rustynet-relay
+/// daemon. Mirrors the default in
+/// `scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1`.
+/// Kept next to the daemon service constants so the live-lab
+/// validator + the installer + `ops_install_windows_relay_service`
+/// share one source of truth — a future rename surfaces as a compile
+/// break in every call site.
+pub const REVIEWED_WINDOWS_RELAY_SERVICE_NAME: &str = "RustyNetRelay";
+
+/// Reviewed Windows relay datapath UDP port. The `rustynet-relay`
+/// daemon binds UDP on 0.0.0.0:4500 by default — operators may widen
+/// the bind address but the port stays pinned.
+pub const REVIEWED_WINDOWS_RELAY_BIND_PORT: u16 = 4500;
+
+/// Reviewed Windows relay health TCP port. The Windows installer
+/// pins :9100 (distinct from the Linux + macOS default of 4501) to
+/// avoid collisions with other 4500-range services that ship on
+/// hardened Windows hosts.
+pub const REVIEWED_WINDOWS_RELAY_HEALTH_PORT: u16 = 9100;
+
 /// Allowed service SID types for the reviewed hardened profile. SID type
 /// `None` is rejected because it removes the per-service SID isolation that
 /// the reviewed install relies on.
