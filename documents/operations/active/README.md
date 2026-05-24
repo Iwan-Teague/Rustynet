@@ -51,6 +51,7 @@ phase checklists that finished (Phase 1, 2, 3, 5) have moved to
 - [RustyfinExtensionTrustPlan_2026-05-10.md](./RustyfinExtensionTrustPlan_2026-05-10.md)
 - [RustynetComparativeVpnExploitCoverage_2026-03-14.md](./RustynetComparativeVpnExploitCoverage_2026-03-14.md)
 - [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md)
+- [TestCoverageImprovementPlan_2026-05-24.md](./TestCoverageImprovementPlan_2026-05-24.md) — owning ledger for the test-coverage track; prioritized P0/P1/P2 workstreams (roles.rs zero-coverage, signed-state/crypto/dns-zone negative tests, sysinfo parse/IO split, dataplane default-deny truth tables, gossip anti-replay persistence) plus tooling levers (llvm-cov ratchet, proptest, expanded fuzzing, broadened coverage-gate floors)
 - [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
 - [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
 - [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](./UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
