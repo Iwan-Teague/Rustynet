@@ -4316,8 +4316,8 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
     let now_unix = parser.parse_u64_or_default("--now", unix_now())?;
 
     match subcommand {
-        "status" => Ok(MembershipCommand::Status { paths }),
-        "verify-log" => {
+        "status" | "list" => Ok(MembershipCommand::Status { paths }),
+        "verify-log" | "verify" => {
             let audit_output_path = parser.path_or_default(
                 "--audit-output",
                 PathBuf::from("artifacts/membership/membership_audit_integrity.log"),
@@ -4337,6 +4337,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
                 .value("--environment")
                 .unwrap_or_else(|| "unknown".to_owned()),
         }),
+        "propose" => parse_membership_generic_proposal(&parser, paths, now_unix),
         "propose-add" => {
             let node_id = parser.required("--node-id")?;
             let node_pubkey_hex = parser.required("--node-pubkey")?;
@@ -4467,7 +4468,7 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
                 config: proposal_config(&parser, paths, operation, approver_id)?,
             })
         }
-        "sign-update" => Ok(MembershipCommand::SignUpdate {
+        "sign-update" | "sign" => Ok(MembershipCommand::SignUpdate {
             record_path: parser.required_path("--record")?,
             approver_id: parser.required("--approver-id")?,
             signing_key_path: parser.required_path("--signing-key")?,
@@ -4481,13 +4482,164 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
             now_unix,
             dry_run: parser.has_flag("--dry-run"),
         }),
-        "apply-update" => Ok(MembershipCommand::ApplyUpdate {
+        "apply-update" | "apply" => Ok(MembershipCommand::ApplyUpdate {
             signed_update_path: parser.required_path("--signed-update")?,
             paths,
             now_unix,
             dry_run: parser.has_flag("--dry-run"),
         }),
         _ => Err(format!("unknown membership subcommand: {subcommand}")),
+    }
+}
+
+fn parse_membership_generic_proposal(
+    parser: &OptionParser,
+    paths: MembershipPaths,
+    now_unix: u64,
+) -> Result<MembershipCommand, String> {
+    let operation_name = parser.required("--operation")?;
+    match operation_name.as_str() {
+        "add-node" | "add" => {
+            let node_id = parser.required("--node-id")?;
+            let node_pubkey_hex = parser.required("--node-pubkey")?;
+            let owner = parser.required("--owner")?;
+            let roles = parser
+                .value("--roles")
+                .map_or_else(|| vec!["tag:members".to_owned()], split_csv);
+            let capabilities = parser.value("--capabilities").map_or_else(
+                || Ok(vec![RoleCapability::Client]),
+                |value| parse_role_capability_csv(&value).map_err(|err| err.to_string()),
+            )?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::AddNode(MembershipNode {
+                        node_id: node_id.clone(),
+                        node_pubkey_hex,
+                        owner,
+                        status: MembershipNodeStatus::Active,
+                        roles,
+                        capabilities,
+                        joined_at_unix: now_unix,
+                        updated_at_unix: now_unix,
+                    }),
+                    node_id,
+                )?,
+            })
+        }
+        "remove-node" | "remove" => {
+            let node_id = parser.required("--node-id")?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::RemoveNode {
+                        node_id: node_id.clone(),
+                    },
+                    node_id,
+                )?,
+            })
+        }
+        "revoke-node" | "revoke" => {
+            let node_id = parser.required("--node-id")?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::RevokeNode {
+                        node_id: node_id.clone(),
+                    },
+                    node_id,
+                )?,
+            })
+        }
+        "restore-node" | "restore" => {
+            let node_id = parser.required("--node-id")?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::RestoreNode {
+                        node_id: node_id.clone(),
+                    },
+                    node_id,
+                )?,
+            })
+        }
+        "rotate-node-key" | "rotate-key" => {
+            let node_id = parser.required("--node-id")?;
+            let new_pubkey_hex = parser.required("--new-pubkey")?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::RotateNodeKey {
+                        node_id: node_id.clone(),
+                        new_pubkey_hex,
+                    },
+                    node_id,
+                )?,
+            })
+        }
+        "set-node-capabilities" | "set-capabilities" => {
+            let node_id = parser.required("--node-id")?;
+            let capabilities = parse_role_capability_csv(&parser.required("--capabilities")?)
+                .map_err(|err| err.to_string())?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::SetNodeCapabilities {
+                        node_id: node_id.clone(),
+                        capabilities,
+                    },
+                    node_id,
+                )?,
+            })
+        }
+        "set-quorum" => {
+            let threshold = parser.parse_u8_required("--threshold")?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::SetQuorum { threshold },
+                    "quorum".to_owned(),
+                )?,
+            })
+        }
+        "rotate-approver" => {
+            let approver_id = parser.required("--approver-id")?;
+            let approver_pubkey_hex = parser.required("--approver-pubkey")?;
+            let role = match parser.required("--role")?.as_str() {
+                "owner" => MembershipApproverRole::Owner,
+                "guardian" => MembershipApproverRole::Guardian,
+                _ => return Err("invalid --role: expected owner|guardian".to_owned()),
+            };
+            let status = match parser.value("--status").as_deref().unwrap_or("active") {
+                "active" => MembershipApproverStatus::Active,
+                "revoked" => MembershipApproverStatus::Revoked,
+                _ => return Err("invalid --status: expected active|revoked".to_owned()),
+            };
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::RotateApprover(MembershipApprover {
+                        approver_id: approver_id.clone(),
+                        approver_pubkey_hex,
+                        role,
+                        status,
+                        created_at_unix: now_unix,
+                    }),
+                    approver_id,
+                )?,
+            })
+        }
+        other => Err(format!(
+            "unknown membership proposal operation: {other}; expected add-node|remove-node|revoke-node|restore-node|rotate-node-key|set-node-capabilities|set-quorum|rotate-approver"
+        )),
     }
 }
 
@@ -16913,6 +17065,8 @@ fn help_text() -> String {
         "    node_specs format: node_id|endpoint|public_key_hex[|owner|hostname|os|tags_csv|capabilities_csv];... ",
         "    allow_specs format: source_node_id|destination_node_id;...",
         "  membership status [--snapshot <path>] [--log <path>]",
+        "  membership list [--snapshot <path>] [--log <path>]",
+        "  membership propose --operation <add-node|remove-node|revoke-node|restore-node|rotate-node-key|set-node-capabilities|set-quorum|rotate-approver> --output <path> [operation flags] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
         "  membership propose-add --node-id <id> --node-pubkey <hex> --owner <owner> --output <path> [--roles <csv>] [--capabilities <csv>] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
         "  membership propose-remove --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-revoke --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
@@ -16922,9 +17076,12 @@ fn help_text() -> String {
         "  membership propose-set-quorum --threshold <n> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-rotate-approver --approver-id <id> --approver-pubkey <hex> --role <owner|guardian> --status <active|revoked> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership sign-update --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
+        "  membership sign --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
         "  membership verify-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
         "  membership apply-update --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
+        "  membership apply --signed-update <path> [--snapshot <path>] [--log <path>] [--now <unix>] [--dry-run]",
         "  membership verify-log [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]",
+        "  membership verify [--snapshot <path>] [--log <path>] [--audit-output <path>] [--now <unix>]",
         "  membership generate-evidence [--snapshot <path>] [--log <path>] [--output-dir <dir>] [--environment <label>] [--now <unix>]",
         "  trust keygen --signing-key-output <path> --signing-key-passphrase-file <path> --verifier-key-output <path> [--force]",
         "  trust export-verifier-key --signing-key <path> --signing-key-passphrase-file <path> --output <path>",
@@ -19320,6 +19477,38 @@ mod tests {
         ]);
         assert!(format!("{command:?}").contains("Membership"));
 
+        let list_alias = parse_command(&["membership".to_owned(), "list".to_owned()]);
+        assert!(matches!(
+            list_alias,
+            CliCommand::Membership(command) if matches!(*command, MembershipCommand::Status { .. })
+        ));
+
+        let generic_set_capabilities = parse_command(&[
+            "membership".to_owned(),
+            "propose".to_owned(),
+            "--operation".to_owned(),
+            "set-node-capabilities".to_owned(),
+            "--node-id".to_owned(),
+            "relay-1".to_owned(),
+            "--capabilities".to_owned(),
+            "client,relay_host".to_owned(),
+            "--output".to_owned(),
+            "/tmp/set-caps.record".to_owned(),
+        ]);
+        match generic_set_capabilities {
+            CliCommand::Membership(command) => match *command {
+                MembershipCommand::Propose { config } => {
+                    assert_eq!(config.target, "relay-1");
+                    assert!(matches!(
+                        config.operation,
+                        MembershipOperation::SetNodeCapabilities { .. }
+                    ));
+                }
+                other => panic!("expected membership generic proposal, got {other:?}"),
+            },
+            other => panic!("expected Membership command, got {other:?}"),
+        }
+
         let set_capabilities = parse_command(&[
             "membership".to_owned(),
             "propose-set-capabilities".to_owned(),
@@ -19343,6 +19532,43 @@ mod tests {
             },
             other => panic!("expected Membership command, got {other:?}"),
         }
+
+        let sign_alias = parse_command(&[
+            "membership".to_owned(),
+            "sign".to_owned(),
+            "--record".to_owned(),
+            "/tmp/update.record".to_owned(),
+            "--approver-id".to_owned(),
+            "owner".to_owned(),
+            "--signing-key".to_owned(),
+            "/tmp/membership.owner.key".to_owned(),
+            "--signing-key-passphrase-file".to_owned(),
+            "/tmp/membership.owner.pass".to_owned(),
+            "--output".to_owned(),
+            "/tmp/update.signed".to_owned(),
+        ]);
+        assert!(matches!(
+            sign_alias,
+            CliCommand::Membership(command) if matches!(*command, MembershipCommand::SignUpdate { .. })
+        ));
+
+        let apply_alias = parse_command(&[
+            "membership".to_owned(),
+            "apply".to_owned(),
+            "--signed-update".to_owned(),
+            "/tmp/update.signed".to_owned(),
+            "--dry-run".to_owned(),
+        ]);
+        assert!(matches!(
+            apply_alias,
+            CliCommand::Membership(command) if matches!(*command, MembershipCommand::ApplyUpdate { dry_run: true, .. })
+        ));
+
+        let verify_alias = parse_command(&["membership".to_owned(), "verify".to_owned()]);
+        assert!(matches!(
+            verify_alias,
+            CliCommand::Membership(command) if matches!(*command, MembershipCommand::VerifyLog { .. })
+        ));
     }
 
     #[test]

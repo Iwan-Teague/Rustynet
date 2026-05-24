@@ -1244,7 +1244,7 @@ Track C — Status & Evidence (updated):
 
 - M3 (Persistence & integrity): Snapshot and append-only log implemented: persist_membership_snapshot, load_membership_snapshot, append_membership_log_entry, load_membership_log, replay_membership_snapshot_and_log, atomic_write with tmp+fsync+rename and permission checks on Unix. Tests: snapshot_and_log_roundtrip_integrity, loading_empty_membership_log_is_supported. Status: Implemented.
 
-- M4–M8 (Integration, daemon gate, CLI, runbooks, CI gates): Parts are present: `crates/rustynetd/src/daemon.rs` references membership load/replay functions and default paths; scripts for CI gating and incident drill exist (`scripts/ci/membership_gates.sh`, `scripts/operations/membership_incident_drill.sh`). CLI wiring and runbook document are partly missing or require additional integration testing on Debian hosts. Status: Partial — integration and CI gate execution on Linux required to finalize.
+- M4–M8 (Integration, daemon gate, CLI, runbooks, CI gates): Implemented. `crates/rustynetd/src/daemon.rs` verifies membership snapshot/log state before runtime peer provisioning. `crates/rustynet-control/src/membership.rs::apply_signed_update` is the single mutation gate for signed membership updates and enforces threshold quorum, authorized approvers, owner-signature requirements, expiry, future-date rejection, previous-root matching, epoch monotonicity, and replay protection before persistence. `crates/rustynet-cli/src/main.rs` exposes the operator surface as `rustynet membership propose|sign|apply|list|verify` with compatibility aliases for the older `propose-*`, `sign-update`, `apply-update`, `status`, and `verify-log` forms. `documents/operations/MembershipGovernanceRunbook.md` now documents the canonical verbs and daemon gate invariants. Status: Code-complete for CLI/governance gate; live multi-approver mesh proof remains separate evidence work.
 
 Test execution note:
 - I ran the targeted membership unit tests and linter in this environment:
@@ -1275,9 +1275,9 @@ Files of interest / tests added:
   - snapshot_and_log_roundtrip_integrity
 
 Next steps to finish Track C:
-1. Run full test/gate on Debian host and fix any platform-specific build errors (e.g., missing types in lib.rs).
-2. Implement CLI glue (rustynet membership ...) in `crates/rustynet-cli` and wire apply to daemon IPC.
-3. Author `documents/operations/MembershipGovernanceRunbook.md` and add CI gate evidence artifacts.
+1. Run the live 3-approver mesh proof: propose AddNode, collect 2-of-3 signatures, apply, verify snapshot/log convergence, and capture evidence.
+2. Decide whether membership `apply` should remain the hardened local operator path or gain an explicit daemon IPC submission path; any IPC path must still call `apply_signed_update` and must not allow root to bypass quorum.
+3. Keep `scripts/ci/membership_gates.sh` and workspace gates green for every membership-surface change.
 
 ---
 
@@ -1742,6 +1742,7 @@ When Debian-host tests and integration runs are available I will complete code c
 | 2026-03-23 | A3+A4+B2+B3 | A4 adversarial tests (forged/replay/flooding), B2 EndpointMonitor, B3 schedule_proactive_refresh in traversal.rs | 10b2f54 |
 | 2026-03-23 | B2 daemon wiring | EndpointMonitor field in DaemonRuntime, collect_linux_interface_addrs() via nix::ifaddrs, poll_endpoint_monitor_and_maybe_refresh() in event loop | c898c6b |
 | 2026-03-23 | M4–M8 | M4+M5 committed (prev session); M6 CLI confirmed present; M7 runbook confirmed; M8: create artifacts/phase10/membership_report.json, update membership_gates.sh with report validation and M5 policy tests | 859bda9 |
+| 2026-05-23 | M4–M8 CLI/governance refresh | Added canonical `membership propose|sign|apply|list|verify` aliases on top of the existing signed-update path; documented the single `apply_signed_update` gate and live-proof follow-up | this commit |
 | 2026-03-23 | M8 StateFetcher | Refactor DaemonConfig URL fields (trust_url, traversal_url, etc.) from env::var at call time to stored fields; eliminate unsafe set_var/remove_var in tests | 859bda9 |
 | 2026-03-23 | A3-b | Create scripts/e2e/live_linux_path_handoff_under_load_test.sh with full test flow (iperf3 load, iptables block/unblock, SLO 30s, leak/ACL/DNS checks) | cca395b |
 | 2026-03-23 | A4 gates | Add test_a4_forged_signature_coordination_record_rejected, test_a4_replayed_coordination_record_rejected, test_a4_candidate_flooding_rejected_no_panic to traversal_adversarial_gates REQUIRED_TESTS | cca395b |
