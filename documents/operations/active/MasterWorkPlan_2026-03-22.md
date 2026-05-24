@@ -1610,6 +1610,47 @@ Residual:
 
 ---
 
+### G6 — Daemon-Side Membership Apply (Prompt 1 Gap 2 Recovery)
+
+**Status:** DONE — 2026-05-24. Code-complete on main; 9 new dedicated tests pass; live evidence pending.
+
+Scope from the original Prompt 1 verification: membership governance had a CLI/reducer/runbook for the file-based `rustynet membership apply` path but no daemon IPC apply path. Operators wanting to apply a signed-update envelope against a running daemon had to either (a) stop the daemon, run the file-based apply, restart, or (b) trust a side channel to update the daemon's view. Both options weaken the operational story for live deployments and leave a gap in the "the daemon enforces every gate, even for root" property.
+
+Files landed:
+- `crates/rustynetd/src/ipc.rs` — new `IpcCommand::MembershipApply { signed_update_wire: Vec<u8> }` variant. Wire form `membership apply <base64-url-safe-no-pad>` mirrors `gossip push` (no whitespace conflicts with the envelope payload). Classified as mutating so the role gate + restricted-safe-mode gate both fire. Malformed base64 dispatches as `Unknown` so the daemon answers with an explicit error instead of silently accepting an empty payload.
+- `crates/rustynetd/src/daemon.rs` — new `handle_membership_apply()` method on `DaemonRuntime`. Loads snapshot + log fail-closed from disk, replays to current state, seeds the replay cache from every observed `update_id`/`epoch_new`, then calls `apply_signed_update`. On success: `append_membership_log_entry` → `persist_membership_snapshot` → `persist_membership_watermark` → refresh `self.membership_state` + `self.membership_directory`. Each persistence helper is individually atomic (temp + fsync + rename); a crash between log append and snapshot persist is tolerated because the next bootstrap's `replay_membership_snapshot_and_log` reconstructs the same target state from the appended log entry against the old snapshot. The handler is wired into the `handle_command` dispatch and Admin-only via the existing `NodeRole::allows_command` matrix.
+- `crates/rustynet-cli/src/main.rs` — extended `MembershipCommand::ApplyUpdate` with `via_daemon: bool`. Parser accepts `--daemon` on both `apply` and `apply-update` aliases. Executor base64-encodes the signed-update file contents and submits via the existing `send_command` IPC path. `--dry-run + --daemon` is rejected fail-closed (the daemon-submit path always mutates on success; use the file-based path for dry-runs). Usage strings updated.
+- `documents/operations/MembershipGovernanceRunbook.md` — documents the `--daemon` path and the "root identity at IPC does NOT bypass quorum" property under "Daemon gating and policy".
+
+Security gates re-enforced by the daemon-side handler (all surface as `MembershipError` variants from `apply_signed_update`, mapped to `IpcResponse::err` strings):
+- Threshold quorum (`ThresholdNotMet`).
+- Authorised signer keys (`SignerNotAuthorized`).
+- Owner-signature requirement on owner-sensitive operations (`OwnerSignatureRequired`).
+- Expiry rejection (`Expired`).
+- Future-dated rejection beyond `MEMBERSHIP_CLOCK_SKEW_SECS` (`FutureDated`).
+- Stale `prev_state_root` (`PrevStateRootMismatch`).
+- New-state-root mismatch (`NewStateRootMismatch`).
+- Epoch chain monotonicity (`InvalidTransition`).
+- Duplicate `update_id` (`ReplayDetected`).
+- Local IPC peer-credential gate still applies at the accept loop (Gap 7's `authorize_local_peer`), but is layered: even root cannot apply a sub-quorum envelope through the daemon.
+
+Tests (all passing on main):
+- `ipc::tests::parse_and_wire_round_trips_membership_apply`.
+- `ipc::tests::parse_command_rejects_malformed_base64_for_membership_apply`.
+- `daemon::tests::membership_apply_via_ipc_commits_signed_two_of_three_add_node` — valid 2-of-3 add-node apply mutates snapshot/log/watermark and refreshes the in-memory state.
+- `daemon::tests::membership_apply_via_ipc_rejects_sub_quorum_and_leaves_files_unchanged`.
+- `daemon::tests::membership_apply_via_ipc_rejects_expired_and_leaves_files_unchanged`.
+- `daemon::tests::membership_apply_via_ipc_rejects_stale_prev_state_root_and_leaves_files_unchanged`.
+- `daemon::tests::membership_apply_via_ipc_rejects_duplicate_update_id_and_leaves_files_unchanged`.
+- `daemon::tests::membership_apply_via_ipc_rejects_malformed_envelope_payload`.
+- `daemon::tests::membership_apply_role_gate_rejects_non_admin_caller` — confirms `NodeRole::Client` and `NodeRole::BlindExit` are denied at the role gate before the handler runs.
+- `tests::parse_supports_membership_commands` (CLI) — extended to cover `--daemon` on both aliases and the default (file-based) path.
+
+Residual:
+- No live cross-network evidence yet — Gap 2 closure is the code/test path. A live operator-driven `rustynet membership apply --daemon` against a real Debian lab daemon is the natural next evidence step but is out of scope for this commit (live labs deferred per scope).
+
+---
+
 ### G5 — macOS Blind Exit PF Hard-Lock (Prompt 1 Gap 6 Recovery)
 
 **Status:** DONE — 2026-05-24 (commit `f83ad23`). Code-complete on main; live evidence pending.

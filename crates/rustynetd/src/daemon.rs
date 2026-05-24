@@ -6877,6 +6877,12 @@ impl DaemonRuntime {
                 Ok(summary) => IpcResponse::ok(summary),
                 Err(err) => IpcResponse::err(err),
             },
+            IpcCommand::MembershipApply { signed_update_wire } => {
+                match self.handle_membership_apply(&signed_update_wire) {
+                    Ok(summary) => IpcResponse::ok(summary),
+                    Err(err) => IpcResponse::err(err),
+                }
+            }
             IpcCommand::Unknown(raw) => IpcResponse::err(format!("unknown command: {raw}")),
         }
     }
@@ -7091,6 +7097,124 @@ impl DaemonRuntime {
             "enrollment accepted node={prefix} expires_at_unix={}",
             outcome.token_expires_at_unix
         ))
+    }
+
+    /// Daemon-side membership governance apply.
+    ///
+    /// Receives the canonical signed-update envelope bytes from IPC,
+    /// re-runs every security gate enforced by
+    /// [`rustynet_control::membership::apply_signed_update`] —
+    /// threshold quorum, authorised signer keys, owner signature where
+    /// required, expiry, future-date rejection, stale `prev_state_root`
+    /// rejection, duplicate `update_id` rejection, epoch chain
+    /// monotonicity — and only then mutates the on-disk snapshot/log
+    /// and refreshes the in-memory membership state + directory.
+    ///
+    /// Passing the daemon's local-IPC peer-credential gate (root,
+    /// socket owner uid, or reviewed local-control group) is NOT
+    /// sufficient on its own: the quorum-signed approval is mandatory.
+    /// A root caller still cannot apply a sub-quorum or expired or
+    /// replayed signed-update envelope. SecurityMinimumBar §3.6 +
+    /// `MembershipConsensus.md` jointly require this dual gate.
+    ///
+    /// On failure, no snapshot/log/watermark file is mutated.
+    /// On success, the order is:
+    ///   1. `append_membership_log_entry` (atomic temp+rename).
+    ///   2. `persist_membership_snapshot` (atomic temp+rename).
+    ///   3. bump the on-disk `membership_watermark` so the next
+    ///      bootstrap replay rejects any rollback to an earlier
+    ///      committed state.
+    ///   4. refresh `self.membership_state` + `self.membership_directory`.
+    ///
+    /// A crash between (1) and (2) is tolerated because the next
+    /// bootstrap's `replay_membership_snapshot_and_log` reconstructs
+    /// the new state from the old snapshot + the appended log entry.
+    fn handle_membership_apply(&mut self, signed_update_wire: &[u8]) -> Result<String, String> {
+        use rustynet_control::membership::{
+            MembershipReplayCache, append_membership_log_entry, apply_signed_update,
+            decode_signed_update, load_membership_log, load_membership_snapshot,
+            persist_membership_snapshot, replay_membership_snapshot_and_log,
+        };
+
+        let payload = std::str::from_utf8(signed_update_wire)
+            .map_err(|err| format!("membership apply rejected: payload is not utf-8: {err}"))?;
+        let signed = decode_signed_update(payload)
+            .map_err(|err| format!("membership apply rejected: decode failed: {err}"))?;
+
+        if !self.membership_snapshot_path.exists() {
+            return Err("membership apply rejected: snapshot file missing".to_owned());
+        }
+        let snapshot = load_membership_snapshot(&self.membership_snapshot_path)
+            .map_err(|err| format!("membership apply rejected: snapshot load failed: {err}"))?;
+        let entries = if self.membership_log_path.exists() {
+            load_membership_log(&self.membership_log_path)
+                .map_err(|err| format!("membership apply rejected: log load failed: {err}"))?
+        } else {
+            Vec::new()
+        };
+        let now_unix = unix_now();
+        let state = replay_membership_snapshot_and_log(&snapshot, &entries, now_unix)
+            .map_err(|err| format!("membership apply rejected: replay failed: {err}"))?;
+
+        // Replay cache mirrors the file-based CLI apply (see
+        // `replay_cache_from_entries`): seed it with every already-
+        // observed update_id + epoch so duplicates are rejected fail-
+        // closed.
+        let mut replay_cache = MembershipReplayCache::default();
+        for entry in &entries {
+            replay_cache
+                .observe(
+                    entry.signed_update.record.update_id.as_str(),
+                    entry.signed_update.record.epoch_new,
+                )
+                .map_err(|err| {
+                    format!("membership apply rejected: replay cache seed failed: {err}")
+                })?;
+        }
+
+        // Single hardened security gate. Sub-quorum, expired, future-
+        // dated, stale `prev_state_root`, duplicate `update_id`, and
+        // unauthorised signer all surface here as typed
+        // `MembershipError` variants and propagate out as
+        // `IpcResponse::err` without any file mutation.
+        let next = apply_signed_update(&state, &signed, now_unix, &mut replay_cache)
+            .map_err(|err| format!("membership apply rejected: {err}"))?;
+
+        // Persistence boundary. `append_membership_log_entry` and
+        // `persist_membership_snapshot` are each individually atomic
+        // (temp + fsync + rename). If the log append succeeds but the
+        // snapshot persist fails, the next bootstrap replays the new
+        // log entry against the old snapshot and reconstructs the
+        // same `next` state — so the in-memory refresh below is the
+        // canonical source of truth between persist and next bootstrap.
+        append_membership_log_entry(&self.membership_log_path, &signed)
+            .map_err(|err| format!("membership apply persist failed: log append failed: {err}"))?;
+        persist_membership_snapshot(&self.membership_snapshot_path, &next).map_err(|err| {
+            format!("membership apply persist failed: snapshot persist failed: {err}")
+        })?;
+
+        // Bump the membership watermark so the next bootstrap rejects
+        // any disk rollback to an earlier committed epoch. Re-using
+        // the same helper the bootstrap path consults keeps a single
+        // hardened watermark format across both call sites.
+        let new_state_root = next.state_root_hex().map_err(|err| {
+            format!("membership apply persist failed: state root compute failed: {err}")
+        })?;
+        let watermark = MembershipWatermark {
+            epoch: next.epoch,
+            state_root: new_state_root.clone(),
+        };
+        persist_membership_watermark(&self.membership_watermark_path, &watermark).map_err(
+            |err| format!("membership apply persist failed: watermark persist failed: {err}"),
+        )?;
+
+        let summary = format!(
+            "membership update applied: epoch_prev={} epoch_new={} state_root={}",
+            state.epoch, next.epoch, new_state_root
+        );
+        self.membership_directory = membership_directory_from_state(&next);
+        self.membership_state = Some(next);
+        Ok(summary)
     }
 
     /// Hardened local rotation entrypoint.
@@ -26097,5 +26221,415 @@ mod tests {
         };
         assert_eq!(unknown.uid_status(), "uid=unavailable");
         assert_eq!(unknown.gid_status(), "gid=unavailable");
+    }
+
+    // ─── Gap 2: daemon-side membership apply via IPC ─────────────
+
+    fn build_multi_approver_membership_runtime(
+        test_dir: &std::path::Path,
+    ) -> (DaemonRuntime, MembershipState, [SigningKey; 3]) {
+        use rustynet_control::membership::persist_membership_snapshot;
+
+        let snapshot_path = test_dir.join("membership.snapshot");
+        let log_path = test_dir.join("membership.log");
+        let watermark_path = test_dir.join("membership.watermark");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let state_path = test_dir.join("daemon.state");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+
+        // Build a 1-owner + 2-guardian approver set with quorum=2
+        // (true Byzantine-style threshold, not 1-of-1). Owner is
+        // key byte 1; guardians are 2 and 3.
+        let owner_signing = SigningKey::from_bytes(&[1u8; 32]);
+        let guardian1_signing = SigningKey::from_bytes(&[2u8; 32]);
+        let guardian2_signing = SigningKey::from_bytes(&[3u8; 32]);
+
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "net-gap2".to_owned(),
+            epoch: 1,
+            nodes: vec![MembershipNode {
+                node_id: "daemon-local".to_owned(),
+                node_pubkey_hex: hex_encode(&[9u8; 32]),
+                owner: "owner@example.local".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec!["tag:servers".to_owned()],
+                capabilities: vec![RoleCapability::Anchor, RoleCapability::Client],
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            }],
+            approver_set: vec![
+                MembershipApprover {
+                    approver_id: "owner-1".to_owned(),
+                    approver_pubkey_hex: hex_encode(owner_signing.verifying_key().as_bytes()),
+                    role: MembershipApproverRole::Owner,
+                    status: MembershipApproverStatus::Active,
+                    created_at_unix: 100,
+                },
+                MembershipApprover {
+                    approver_id: "guardian-1".to_owned(),
+                    approver_pubkey_hex: hex_encode(guardian1_signing.verifying_key().as_bytes()),
+                    role: MembershipApproverRole::Guardian,
+                    status: MembershipApproverStatus::Active,
+                    created_at_unix: 100,
+                },
+                MembershipApprover {
+                    approver_id: "guardian-2".to_owned(),
+                    approver_pubkey_hex: hex_encode(guardian2_signing.verifying_key().as_bytes()),
+                    role: MembershipApproverRole::Guardian,
+                    status: MembershipApproverStatus::Active,
+                    created_at_unix: 100,
+                },
+            ],
+            quorum_threshold: 2,
+            metadata_hash: None,
+        };
+        persist_membership_snapshot(&snapshot_path, &state).expect("test snapshot should persist");
+
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&log_path).expect("log open");
+        file.write_all(b"version=1\n").expect("log header");
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path: snapshot_path,
+            membership_log_path: log_path,
+            membership_watermark_path: watermark_path,
+            gossip_watermark_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            node_role: NodeRole::Admin,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime ctor");
+        runtime.bootstrap();
+        (
+            runtime,
+            state,
+            [owner_signing, guardian1_signing, guardian2_signing],
+        )
+    }
+
+    fn snapshot_and_log_digests(
+        runtime: &DaemonRuntime,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let snapshot = std::fs::read_to_string(&runtime.membership_snapshot_path).ok();
+        let log = std::fs::read_to_string(&runtime.membership_log_path).ok();
+        let watermark = std::fs::read_to_string(&runtime.membership_watermark_path).ok();
+        (snapshot, log, watermark)
+    }
+
+    fn build_add_node_record(
+        state: &MembershipState,
+        new_node_id: &str,
+        new_node_pubkey_byte: u8,
+        update_id: &str,
+        now_unix: u64,
+    ) -> rustynet_control::membership::MembershipUpdateRecord {
+        use rustynet_control::membership::{
+            MembershipOperation, MembershipUpdateRecord, preview_next_state,
+        };
+        let new_node = MembershipNode {
+            node_id: new_node_id.to_owned(),
+            node_pubkey_hex: hex_encode(&[new_node_pubkey_byte; 32]),
+            owner: "owner@example.local".to_owned(),
+            status: MembershipNodeStatus::Active,
+            roles: vec!["tag:members".to_owned()],
+            capabilities: vec![RoleCapability::Client],
+            joined_at_unix: now_unix,
+            updated_at_unix: now_unix,
+        };
+        let next = preview_next_state(state, &MembershipOperation::AddNode(new_node.clone()))
+            .expect("preview next state");
+        MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: update_id.to_owned(),
+            operation: MembershipOperation::AddNode(new_node),
+            target: new_node_id.to_owned(),
+            prev_state_root: state.state_root_hex().expect("state root"),
+            new_state_root: next.state_root_hex().expect("next root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: now_unix,
+            expires_at_unix: now_unix + 600,
+            reason_code: "test-add".to_owned(),
+            policy_context: None,
+        }
+    }
+
+    fn sign_record(
+        record: &rustynet_control::membership::MembershipUpdateRecord,
+        signers: &[(&str, &SigningKey)],
+    ) -> rustynet_control::membership::SignedMembershipUpdate {
+        use rustynet_control::membership::{SignedMembershipUpdate, sign_update_record};
+        let mut signatures = Vec::with_capacity(signers.len());
+        for (approver_id, key) in signers {
+            signatures.push(sign_update_record(record, approver_id, key).expect("sign update"));
+        }
+        SignedMembershipUpdate {
+            record: record.clone(),
+            approver_signatures: signatures,
+        }
+    }
+
+    fn encode_apply_command(
+        signed: &rustynet_control::membership::SignedMembershipUpdate,
+    ) -> IpcCommand {
+        use rustynet_control::membership::encode_signed_update;
+        let envelope = encode_signed_update(signed).expect("encode envelope");
+        IpcCommand::MembershipApply {
+            signed_update_wire: envelope.into_bytes(),
+        }
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_commits_signed_two_of_three_add_node() {
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-commit");
+        let (mut runtime, state, keys) = build_multi_approver_membership_runtime(&test_dir);
+        let now_unix = unix_now();
+        let record = build_add_node_record(&state, "node-new", 21, "update-commit", now_unix);
+        let signed = sign_record(&record, &[("owner-1", &keys[0]), ("guardian-1", &keys[1])]);
+        let (snapshot_before, log_before, _) = snapshot_and_log_digests(&runtime);
+
+        let response = runtime.handle_command(encode_apply_command(&signed));
+        assert!(
+            response.ok,
+            "valid 2-of-3 apply must succeed: {}",
+            response.message
+        );
+        assert!(response.message.contains("epoch_new=2"));
+
+        let (snapshot_after, log_after, watermark_after) = snapshot_and_log_digests(&runtime);
+        assert_ne!(snapshot_before, snapshot_after, "snapshot must mutate");
+        assert_ne!(log_before, log_after, "log must mutate");
+        assert!(
+            watermark_after.is_some(),
+            "watermark must be persisted after successful apply"
+        );
+        let watermark_body = watermark_after.unwrap();
+        assert!(
+            watermark_body.contains("epoch=2"),
+            "watermark must reflect new epoch: {watermark_body}"
+        );
+        let new_state = runtime
+            .membership_state
+            .as_ref()
+            .expect("membership state must refresh");
+        assert!(
+            new_state.nodes.iter().any(|n| n.node_id == "node-new"),
+            "in-memory membership state must include new node"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_rejects_sub_quorum_and_leaves_files_unchanged() {
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-subquorum");
+        let (mut runtime, state, keys) = build_multi_approver_membership_runtime(&test_dir);
+        let now_unix = unix_now();
+        let record = build_add_node_record(&state, "node-subq", 22, "update-subq", now_unix);
+        // Only the owner signs — 1 of 3 — fails the quorum=2 threshold.
+        let signed = sign_record(&record, &[("owner-1", &keys[0])]);
+        let (snapshot_before, log_before, watermark_before) = snapshot_and_log_digests(&runtime);
+
+        let response = runtime.handle_command(encode_apply_command(&signed));
+        assert!(
+            !response.ok,
+            "sub-quorum apply must fail: got ok with message: {}",
+            response.message
+        );
+        assert!(
+            response.message.contains("threshold"),
+            "sub-quorum failure should mention threshold: {}",
+            response.message
+        );
+
+        let (snapshot_after, log_after, watermark_after) = snapshot_and_log_digests(&runtime);
+        assert_eq!(snapshot_before, snapshot_after, "snapshot must NOT mutate");
+        assert_eq!(log_before, log_after, "log must NOT mutate");
+        assert_eq!(
+            watermark_before, watermark_after,
+            "watermark must NOT mutate"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_rejects_expired_and_leaves_files_unchanged() {
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-expired");
+        let (mut runtime, state, keys) = build_multi_approver_membership_runtime(&test_dir);
+        let now_unix = unix_now();
+        // Build a record whose expires_at_unix is strictly less than
+        // now_unix so apply_signed_update returns Expired.
+        let mut record = build_add_node_record(&state, "node-exp", 23, "update-exp", now_unix);
+        record.created_at_unix = now_unix.saturating_sub(2000);
+        record.expires_at_unix = now_unix.saturating_sub(1000);
+        let signed = sign_record(&record, &[("owner-1", &keys[0]), ("guardian-1", &keys[1])]);
+        let (snapshot_before, log_before, _) = snapshot_and_log_digests(&runtime);
+
+        let response = runtime.handle_command(encode_apply_command(&signed));
+        assert!(!response.ok, "expired apply must fail");
+        assert!(
+            response.message.to_ascii_lowercase().contains("expir"),
+            "expired failure should surface expiry reason: {}",
+            response.message
+        );
+
+        let (snapshot_after, log_after, _) = snapshot_and_log_digests(&runtime);
+        assert_eq!(snapshot_before, snapshot_after);
+        assert_eq!(log_before, log_after);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_rejects_stale_prev_state_root_and_leaves_files_unchanged() {
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-stale-root");
+        let (mut runtime, state, keys) = build_multi_approver_membership_runtime(&test_dir);
+        let now_unix = unix_now();
+        let mut record = build_add_node_record(&state, "node-stale", 24, "update-stale", now_unix);
+        // Corrupt the prev_state_root so apply_signed_update returns
+        // PrevStateRootMismatch.
+        record.prev_state_root = "0".repeat(64);
+        let signed = sign_record(&record, &[("owner-1", &keys[0]), ("guardian-1", &keys[1])]);
+        let (snapshot_before, log_before, _) = snapshot_and_log_digests(&runtime);
+
+        let response = runtime.handle_command(encode_apply_command(&signed));
+        assert!(!response.ok, "stale prev_state_root must fail");
+        assert!(
+            response
+                .message
+                .to_ascii_lowercase()
+                .contains("previous state root"),
+            "stale prev_state_root should surface in message: {}",
+            response.message
+        );
+
+        let (snapshot_after, log_after, _) = snapshot_and_log_digests(&runtime);
+        assert_eq!(snapshot_before, snapshot_after);
+        assert_eq!(log_before, log_after);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_rejects_duplicate_update_id_and_leaves_files_unchanged() {
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-dup");
+        let (mut runtime, state, keys) = build_multi_approver_membership_runtime(&test_dir);
+        let now_unix = unix_now();
+        // First apply a valid update so the update_id lands in the
+        // on-disk log + replay cache.
+        let first_record =
+            build_add_node_record(&state, "node-first", 25, "update-shared-id", now_unix);
+        let first_signed = sign_record(
+            &first_record,
+            &[("owner-1", &keys[0]), ("guardian-1", &keys[1])],
+        );
+        let first_response = runtime.handle_command(encode_apply_command(&first_signed));
+        assert!(
+            first_response.ok,
+            "first apply must succeed: {}",
+            first_response.message
+        );
+
+        // Now build a SECOND update with a different operation but
+        // the SAME update_id. The daemon's replay cache must reject
+        // it before any persistence.
+        let post_state = runtime
+            .membership_state
+            .as_ref()
+            .expect("state refreshed after first apply")
+            .clone();
+        let dup_record =
+            build_add_node_record(&post_state, "node-dup", 26, "update-shared-id", now_unix);
+        let dup_signed = sign_record(
+            &dup_record,
+            &[("owner-1", &keys[0]), ("guardian-1", &keys[1])],
+        );
+        let (snapshot_before, log_before, _) = snapshot_and_log_digests(&runtime);
+
+        let response = runtime.handle_command(encode_apply_command(&dup_signed));
+        assert!(!response.ok, "duplicate update_id must fail");
+        assert!(
+            response.message.to_ascii_lowercase().contains("replay"),
+            "duplicate should surface as replay: {}",
+            response.message
+        );
+
+        let (snapshot_after, log_after, _) = snapshot_and_log_digests(&runtime);
+        assert_eq!(snapshot_before, snapshot_after);
+        assert_eq!(log_before, log_after);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_apply_via_ipc_rejects_malformed_envelope_payload() {
+        let test_dir = secure_test_dir("rustynetd-gap2-apply-malformed");
+        let (mut runtime, _state, _keys) = build_multi_approver_membership_runtime(&test_dir);
+        let (snapshot_before, log_before, _) = snapshot_and_log_digests(&runtime);
+
+        // The IPC parser already rejects non-base64 at the wire
+        // layer; here we exercise the handler-side path where the
+        // base64 decode succeeded but the decoded bytes are not a
+        // valid signed-update envelope.
+        let command = IpcCommand::MembershipApply {
+            signed_update_wire: b"this-is-not-a-canonical-envelope".to_vec(),
+        };
+        let response = runtime.handle_command(command);
+        assert!(!response.ok, "malformed envelope must fail");
+        assert!(
+            response.message.contains("decode failed"),
+            "decode failure should be surfaced: {}",
+            response.message
+        );
+
+        let (snapshot_after, log_after, _) = snapshot_and_log_digests(&runtime);
+        assert_eq!(snapshot_before, snapshot_after);
+        assert_eq!(log_before, log_after);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn membership_apply_role_gate_rejects_non_admin_caller() {
+        // The role gate runs at the top of handle_command and is the
+        // first line of defence: a non-admin role must receive the
+        // same "not permitted" response that other admin-only verbs
+        // surface, regardless of payload validity. Combined with the
+        // signed-quorum re-verification inside the handler, this
+        // gives layered enforcement: even if an attacker bypassed the
+        // role gate, the quorum check still fires.
+        assert!(
+            NodeRole::Admin.allows_command(&IpcCommand::MembershipApply {
+                signed_update_wire: Vec::new()
+            })
+        );
+        assert!(
+            !NodeRole::Client.allows_command(&IpcCommand::MembershipApply {
+                signed_update_wire: Vec::new()
+            })
+        );
+        assert!(
+            !NodeRole::BlindExit.allows_command(&IpcCommand::MembershipApply {
+                signed_update_wire: Vec::new()
+            })
+        );
     }
 }
