@@ -426,3 +426,236 @@ rather than unilaterally change fail-closed/leak semantics.
   clear operator runbook entry for recovery.
 - **Tests:** corrupt-digest / truncated / monotonicity-violation ledgers cause
   bootstrap refusal; absent ledger still yields genesis.
+
+## 12. Scope, assets, and trust boundaries
+
+**Review baseline:** static source review of `main` as synced 2026-05-24
+(merge `36c2af9`). Remediations in §10 were authored on branch
+`claude/test-coverage-analysis-FDUBe` after the baseline; the master tracker
+(§18) records per-finding status against that branch.
+
+**In scope:** all Rust crates under `crates/` (daemon, CLI, control, crypto,
+policy, relay, dns-zone, local-security, backends, sysinfo), the privileged
+helper, the IPC/control surface, the dataplane/killswitch/policy enforcement,
+`deny.toml`, `Cargo.lock`, the `.github/workflows` CI, `start.sh` + `scripts/`.
+
+**Out of scope / not exercised** (see also §14): vendored `third_party/`
+(`boringtun`, `rustynet-tun`) internals beyond interface review; live dynamic
+exploitation; a fuzzing campaign; live-host validation of the Windows/macOS
+firewall findings; exhaustive timing-side-channel analysis.
+
+### 12.1 Assets (what is being protected)
+| ID | Asset | Primary findings touching it |
+|---|---|---|
+| AS1 | Node WireGuard private key (at rest + in memory) | RN-09, RN-24, RN-33, RN-34 |
+| AS2 | Signing keys + passphrases (trust / assignment / membership-owner) | RN-08, RN-09, RN-22, RN-24 |
+| AS3 | Signed trust / membership state + rotation epoch | RN-01, RN-10, RN-22 |
+| AS4 | Tunnel traffic confidentiality (the killswitch guarantee) | RN-02, RN-03, RN-04, RN-05, RN-06, RN-07, RN-11 |
+| AS5 | DNS resolution privacy in protected modes | RN-06, RN-07, RN-12, RN-29 |
+| AS6 | Daemon availability | RN-01, RN-13 |
+| AS7 | Released binary / build integrity | RN-14, RN-15, RN-16, RN-30, RN-31, RN-32 |
+
+### 12.2 Trust boundaries
+- **TB1 Network → daemon:** untrusted bytes from peers, relays, STUN, UPnP gateways, DNS (RN-13 domain; parsers mostly sound).
+- **TB2 IPC control socket → daemon:** local clients; `0o600` + per-command SO_PEERCRED authz; quorum-gated mutation (RN-01 reachable here).
+- **TB3 daemon → privileged helper:** argv-only, peer-cred, program-allowlist (RN-17, RN-18, RN-19, RN-34/35/36).
+- **TB4 on-disk artifacts → daemon:** integrity-gated snapshots/ledgers (RN-01 on-disk path, RN-10).
+- **TB5 process memory ↔ at-rest storage:** key custody, zeroization, permissions (RN-08, RN-09, RN-24, RN-33).
+- **TB6 build/CI → released artifact:** dependency + workflow integrity (RN-14/15/16/30/31/32).
+
+## 13. Threat model (actor profiles)
+
+| Actor | Capability assumed | Findings most relevant |
+|---|---|---|
+| A1 Malicious/compromised mesh peer | Can send signed/wire traffic into the mesh | RN-05, RN-13, RN-22, RN-25 |
+| A2 Compromised/rogue relay | Relays/observes traffic; can attempt MITM/token replay | RN-17 (output spoofing), RN-22 |
+| A3 On-path network / MITM | Controls STUN/UPnP gateway responses, DNS path | RN-06, RN-07, RN-12, RN-29 |
+| A4 Local unprivileged user | Connects to IPC socket; may influence config | RN-01 (IPC), RN-05/RN-11 |
+| A5 Local user in `rustynetd` group | Reaches the helper socket + state dir | RN-17 (TOCTOU), RN-09 |
+| A6 Local root / sandboxed-root process | May use the helper to launder privileged syscalls | RN-18 |
+| A7 Attacker with write access to state/config/artifact files | Tamper on-disk artifacts | RN-01 (snapshot), RN-03 (no killswitch table), RN-10 |
+| A8 Supply-chain attacker | Compromises a dependency or CI action | RN-15, RN-16, RN-14, RN-32 |
+| A9 Memory-disclosure adversary | Core dump / swap / cold-boot read | RN-24, RN-37 |
+| A10 Offline/physical attacker | Reads key files at rest | RN-08, RN-09, RN-33 |
+
+## 14. Methodology, limitations, and residual-risk statement
+
+- **Method:** six parallel domain reviews (agent-assisted) plus first-hand
+  verification of every load-bearing finding (§9). Read-only; no code was
+  changed during the review phase (fixes came after, tracked in §10).
+- **Static only:** no dynamic exploitation, no running daemon was attacked,
+  no fuzzing campaign was executed. Where a finding asserts a panic/leak, it
+  is reasoned from code; the High items were verified by code path, not by a
+  live PoC (except RN-01's payload, which is mechanically derivable — §19).
+- **Platform coverage:** Linux paths were read in full; the Windows/macOS
+  firewall + keychain findings (RN-06, RN-07, RN-23, RN-33) were reviewed
+  statically and **not validated on a live host** — confirm in a lab before
+  sign-off.
+- **Vendored code:** `third_party/boringtun` and `rustynet-tun` (the only
+  crates carrying `unsafe`) were reviewed at the interface level, not as a
+  full FFI/memory-safety audit.
+- **Indicative line numbers:** captured at the baseline commit; re-confirm
+  when remediating.
+- **Residual risk:** with the landed fixes (RN-01/14/22/23/24), the headline
+  remote/authenticated DoS and the signature-malleability class are closed.
+  The **highest residual risk is the dataplane fail-open / leak cluster**
+  (RN-02/03/04/05/06/07/11): until addressed, a transient nft/helper fault on
+  first bootstrap, an empty/unloadable membership directory, or a Windows host
+  whose tunnel routing falters can egress user traffic in cleartext. These are
+  behavioral changes deferred for owner direction (§11).
+
+## 15. Indicative CVSS 3.1 base scores
+
+CVSS base poorly models *fail-open*, *assurance*, and *condition-gated leak*
+classes (it has no "control silently does not run" axis), so scores are given
+only where they are meaningful and are **supplementary** to the qualitative
+severity, which is authoritative. Vectors are conservative/indicative.
+
+| ID | CVSS 3.1 vector | Base | Note |
+|---|---|---|---|
+| RN-01 | AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H | 5.5 (Med) | Local/authenticated DoS by base; rated **High** operationally because it defeats fail-closed startup and is the sole uncapped decoder. |
+| RN-22 | AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N | 3.7 (Low) | Malleability; only impactful if a signature is used as a unique id — none today, hence Low. |
+| RN-06 | AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N | 6.5 (Med→High) | Windows non-DNS LAN egress leak; High operationally given it negates the killswitch. |
+| RN-07 | AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N | 6.5 (Med→High) | Native-IPv6 leak; same rationale as RN-06. |
+| RN-03 | AV:L/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N | 4.7 (Med) | Condition-gated (fault during first-boot fail-close); operationally **High** as a fail-closed defeat. |
+| RN-05 | AV:N/AC:L/PR:H/UI:N/S:U/C:L/I:H/A:N | 5.3 (Med) | Revocation bypass for non-`node:` rules; integrity of access control. |
+| RN-15 | AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:H | 8.1 (High) | Supply-chain (unlocked deps in CI); scope-changed if a malicious patch lands. |
+| RN-16 | AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:H | 8.1 (High) | Mutable action tags; release-pipeline RCE if an action is compromised. |
+| RN-14 | — | N/A | Assurance/insecure-default (lint not enforced); no direct exploit. |
+| RN-02 | — | N/A | Assurance (control does not run); CVSS inapplicable. |
+
+CVSS is intentionally omitted for the remaining Low/Info findings; their
+qualitative rating + likelihood/impact narrative in §3–§6 is authoritative.
+
+## 16. Compound risk / exploit chains
+
+Individual findings understate risk where they combine:
+
+- **CH-1 (cleartext leak on first boot):** RN-03 (swallowed `force_fail_closed`)
+  × RN-04 (no killswitch before backend up) × RN-10 (corrupt ledger →
+  proceed). A node booting with a transient nft/helper fault brings up the
+  tunnel + routes with no `policy drop` and silently swallows the failure →
+  user traffic egresses cleartext while the daemon reports "restricted."
+- **CH-2 (revocation bypass at scale):** RN-11 (empty membership = allow-all)
+  × RN-05 (non-`node:` selectors skip the revocation gate). An attacker who
+  prevents the membership snapshot from populating, or who relies on
+  `group:`/`tag:` rules, defeats revocation entirely.
+- **CH-3 (Windows full leak):** RN-06 (non-DNS LAN egress allowed) × RN-07
+  (native IPv6 not blocked). On a dual-stack Windows host whose WireGuard-NT
+  routing flaps, both IPv4 (non-DNS) and IPv6 app traffic egress outside the
+  tunnel; only Do53 is protected.
+- **CH-4 (memory-then-disk key recovery):** RN-24 (pre-fix: derived key not
+  guaranteed zeroized) × RN-09 (group-readable passphrase) × RN-08 (no
+  envelope versioning) — a memory-disclosure or group-read foothold widens
+  toward the node private key. RN-24 is now fixed, breaking the memory leg.
+
+## 17. CLAUDE.md / SecurityMinimumBar compliance matrix
+
+| Mandate (CLAUDE.md §3/§4) | Findings against it | Status |
+|---|---|---|
+| Fail closed when trust/security state missing/invalid/stale | RN-03, RN-04, RN-10, RN-11 | **Open** |
+| Default-deny across ACL/routes | RN-05, RN-11 | **Open** |
+| Anti-replay / rollback protection | RN-10, RN-13, RN-25, RN-26 | **Open** |
+| Signed control/trust-state validation before mutation | RN-22 | **Fixed** |
+| No custom cryptography in production paths | — | **Upheld** |
+| Strict key custody (OS store / encrypted-at-rest + startup perm checks) | RN-08, RN-09, RN-33 | **Open** (RN-23/24 fixed) |
+| Never log secrets / private key material | RN-38 (coverage) | **Upheld** |
+| Preserve tunnel + DNS fail-closed in protected modes | RN-06, RN-07, RN-12, RN-29 | **Open** |
+| Argv-only exec for privileged helpers; strict input validation | RN-19, RN-20, RN-34/35/36 | **Upheld** (DiD gaps open) |
+| One hardened execution path; no fallback/downgrade/legacy branch | RN-02, RN-03 (direct vs helper), RN-19 | **Open** |
+| No TODO/FIXME/placeholders in completed deliverables | RN-13, RN-26 | **Open** |
+| `forbid(unsafe_code)` enforced | RN-14 | **Fixed** |
+| Each security control has enforcement + verification test | cross-ref TestCoverageImprovementPlan | **Partial** |
+
+## 18. Master finding-status tracker
+
+Status: **Fixed** (landed + tested), **Open** (not started), **Accepted**
+(won't-fix, with rationale).
+
+| ID | Sev | Domain | Status | Ref |
+|---|---|---|---|---|
+| RN-01 | High | Untrusted input | **Fixed** | RL-1 |
+| RN-02 | High | Dataplane | Open | §11 |
+| RN-03 | High | Dataplane | Open | §11 |
+| RN-04 | High | Dataplane | Open | §11 |
+| RN-05 | High | Policy | Open | §11 |
+| RN-06 | High | Dataplane (Win) | Open | §11 |
+| RN-07 | High | Dataplane (Win) | Open | §11 |
+| RN-08 | Med | Crypto | Open | — |
+| RN-09 | Med | Key custody | Open | — |
+| RN-10 | Med | Trust | Open | §11 |
+| RN-11 | Med | Policy | Open | §11 |
+| RN-12 | Med | Dataplane | Open | — |
+| RN-13 | Med | Dataplane | Open | — |
+| RN-14 | Med | Supply chain | **Fixed** | RL-2 |
+| RN-15 | Med | Supply chain | Open | — |
+| RN-16 | Med | Supply chain | Open | — |
+| RN-17 | Low | Priv | Open | — |
+| RN-18 | Low | Priv | Open | — |
+| RN-19 | Low | Priv | Open | — |
+| RN-20 | Low | Priv | Open | — |
+| RN-21 | Low | Crypto | **Accepted** (fail-closed) | RL note |
+| RN-22 | Low | Crypto | **Fixed** | RL-3 |
+| RN-23 | Low | Crypto | **Fixed** | RL-5 |
+| RN-24 | Low | Crypto | **Fixed** | RL-4 |
+| RN-25 | Low | Trust | Open | — |
+| RN-26 | Low | Trust | Open | — |
+| RN-27 | Low | Dataplane | Open | — |
+| RN-28 | Low | Policy | Open | — |
+| RN-29 | Low | Dataplane | Open | — |
+| RN-30 | Low | Supply chain | Open | — |
+| RN-31 | Low | Supply chain | Open | — |
+| RN-32 | Low | Shell | Open | — |
+| RN-33 | Low | Key custody | Open | — |
+| RN-34–38 | Info | various | Open | — |
+
+Progress: **5 Fixed**, **1 Accepted**, **32 Open** (7 High / 8 Med / 11 Low /
+5 Info remaining open). All High remaining are the behavioral dataplane/policy
+items deferred for owner direction (§11).
+
+## 19. Reproduction notes (top findings)
+
+- **RN-01 (verified, now fixed):** craft a membership payload with a hostile
+  count and feed it to the public decoder:
+  ```
+  version=1\nnetwork_id=net-1\nepoch=1\nquorum_threshold=2\n
+  metadata_hash=\nnode_count=18446744073709551615\napprover_count=0\n
+  ```
+  Pre-fix: `decode_membership_state` aborts (capacity overflow); a value like
+  `100000000` instead requests ~13 GB. Reachable via IPC `membership apply
+  <base64-of-signed-update>` (the same shape with `sig_count=…`) and via a
+  tampered on-disk snapshot (unkeyed SHA-256 digest is recomputable). Post-fix:
+  returns `InvalidFormat`. Regression test: `decode_*_rejects_oversized_*`.
+- **RN-22 (verified, now fixed):** sign a payload, add the group order ℓ to the
+  S half of the 64-byte signature (little-endian, with carry) → a non-canonical
+  signature that a non-strict verifier accepts. Pre-fix `verify()` accepted it;
+  `verify_strict()` rejects. Test: `verify_attestation_rejects_non_canonical_malleable_signature`.
+- **RN-14 (verified, now fixed):** `grep -L 'workspace = true' crates/*/Cargo.toml`
+  pre-fix showed no crate opted into the workspace `unsafe_code = "forbid"`
+  lint; post-fix 13 crates opt in (FFI crate excluded).
+
+## 20. References & glossary
+
+**References:** CWE-789/1284/400 (allocation/quantity/resource DoS), CWE-636
+(failing securely), CWE-347 (signature verification), CWE-732 (permission
+assignment), CWE-829/494 (supply chain), CWE-1188 (insecure default); RFC 8032
+§8.4 (ed25519 strict verification) and ZIP-215 (canonical/cofactor bounds);
+OWASP Argon2id parameter guidance; cargo-deny / cargo-audit advisory model;
+GitHub Actions SHA-pinning guidance (`actions/checkout` hardening). Prior
+audit: `SecurityHardeningAudit_2026-04-28.md`. Related:
+`TestCoverageImprovementPlan_2026-05-24.md`.
+
+**Glossary:**
+- **Fail-closed / fail-open:** on error, deny (fail-closed) vs allow
+  (fail-open). The project mandates fail-closed for trust/security state.
+- **Killswitch:** the firewall `policy drop` posture that black-holes egress
+  unless it leaves via the tunnel; prevents cleartext leaks.
+- **Watermark:** persisted high-water mark (sequence/nonce/epoch) that is the
+  durable anti-replay authority across restarts.
+- **Quorum / epoch / state-root:** signed-membership controls — N-of-M
+  approver signatures, a monotonic version counter, and a hash chaining the
+  state so updates cannot be reordered/rolled back.
+- **verify_strict:** ed25519 verification that additionally rejects
+  non-canonical `S` and small-order points (RFC 8032 strict / ZIP-215).
+- **TOCTOU:** time-of-check to time-of-use race between validating a resource
+  and using it.
