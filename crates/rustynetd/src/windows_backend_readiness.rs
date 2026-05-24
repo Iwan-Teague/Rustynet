@@ -14,9 +14,16 @@
 //! * `wg.exe` from the same installer at
 //!   `C:\Program Files\WireGuard\wg.exe`. Used for low-level peer
 //!   sync + transfer-stat queries.
-//! * `netsh.exe` from the OS at `C:\Windows\System32\netsh.exe`.
-//!   Used for route / DNS lifecycle. Always present on Windows but
-//!   recorded for forensic completeness.
+//! * `wireguard.dll` from the same installer. This is the reviewed
+//!   WireGuardNT provider surface the official tunnel-service path
+//!   depends on; probing the library avoids a false blocker on hosts
+//!   where no Rustynet tunnel service exists yet.
+//! * `netsh.exe`, `sc.exe`, and `powershell.exe` from `System32`.
+//!   Used for route / DNS lifecycle, service-control visibility, and
+//!   fixed-shape host readiness probes. Always present on reviewed
+//!   Windows installs but recorded for forensic completeness.
+//! * Windows version, elevated Administrator/SYSTEM token, and DPAPI
+//!   Win32 API availability.
 //!
 //! When any required binary is missing the report's `overall_ok`
 //! is false and the daemon-side install helper / orchestrator can
@@ -31,7 +38,13 @@ use serde::{Deserialize, Serialize};
 
 pub const REVIEWED_WIREGUARD_EXE_PATH: &str = r"C:\Program Files\WireGuard\wireguard.exe";
 pub const REVIEWED_WG_EXE_PATH: &str = r"C:\Program Files\WireGuard\wg.exe";
+pub const REVIEWED_WIREGUARD_DLL_PATH: &str = r"C:\Program Files\WireGuard\wireguard.dll";
 pub const REVIEWED_NETSH_EXE_PATH: &str = r"C:\Windows\System32\netsh.exe";
+pub const REVIEWED_SC_EXE_PATH: &str = r"C:\Windows\System32\sc.exe";
+pub const REVIEWED_POWERSHELL_EXE_PATH: &str =
+    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+pub const MIN_WINDOWS_MAJOR_VERSION: u32 = 10;
+pub const MIN_WINDOWS_BUILD_NUMBER: u32 = 17763;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowsBackendReadinessEntry {
@@ -114,9 +127,30 @@ pub fn collect_windows_backend_readiness_report() -> WindowsBackendReadinessRepo
             REVIEWED_WIREGUARD_EXE_PATH,
         ),
         probe_canonical_binary("wg.exe (from WireGuard for Windows)", REVIEWED_WG_EXE_PATH),
+        probe_canonical_binary(
+            "wireguard.dll (WireGuardNT provider)",
+            REVIEWED_WIREGUARD_DLL_PATH,
+        ),
         probe_canonical_binary("netsh.exe", REVIEWED_NETSH_EXE_PATH),
+        probe_canonical_binary("sc.exe", REVIEWED_SC_EXE_PATH),
+        probe_canonical_binary("PowerShell.exe", REVIEWED_POWERSHELL_EXE_PATH),
+        probe_windows_version(),
+        probe_windows_administrator_token(),
+        probe_windows_required_api_surface(),
     ];
     build_windows_backend_readiness_report(entries)
+}
+
+pub fn auto_select_windows_backend_mode(
+    report: &WindowsBackendReadinessReport,
+) -> Result<crate::windows_backend_gate::WindowsBackendMode, String> {
+    if report.overall_ok {
+        return Ok(crate::windows_backend_gate::WindowsBackendMode::WireguardNt);
+    }
+    Err(format!(
+        "windows-backend-autoselect-blocked: windows-wireguard-nt prerequisites failed: {}",
+        report.drift_reasons.join("; ")
+    ))
 }
 
 #[cfg(windows)]
@@ -147,8 +181,196 @@ fn probe_canonical_binary(label: &str, path: &str) -> WindowsBackendReadinessEnt
     }
 }
 
+#[cfg(windows)]
+fn probe_windows_version() -> WindowsBackendReadinessEntry {
+    let output = std::process::Command::new(REVIEWED_POWERSHELL_EXE_PATH)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "[Environment]::OSVersion.Version | ForEach-Object { \"$($_.Major).$($_.Minor).$($_.Build)\" }",
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let body = String::from_utf8_lossy(&output.stdout);
+            match parse_windows_version_triplet(body.trim()) {
+                Some((major, _minor, build))
+                    if major > MIN_WINDOWS_MAJOR_VERSION
+                        || (major == MIN_WINDOWS_MAJOR_VERSION
+                            && build >= MIN_WINDOWS_BUILD_NUMBER) =>
+                {
+                    WindowsBackendReadinessEntry {
+                        label: "Windows version".to_owned(),
+                        path: "Environment.OSVersion.Version".to_owned(),
+                        present: true,
+                        probed: true,
+                        reason: None,
+                    }
+                }
+                Some((major, minor, build)) => WindowsBackendReadinessEntry {
+                    label: "Windows version".to_owned(),
+                    path: "Environment.OSVersion.Version".to_owned(),
+                    present: false,
+                    probed: true,
+                    reason: Some(format!(
+                        "Windows {major}.{minor}.{build} is below reviewed minimum {MIN_WINDOWS_MAJOR_VERSION}.0.{MIN_WINDOWS_BUILD_NUMBER}"
+                    )),
+                },
+                None => WindowsBackendReadinessEntry {
+                    label: "Windows version".to_owned(),
+                    path: "Environment.OSVersion.Version".to_owned(),
+                    present: false,
+                    probed: true,
+                    reason: Some(format!("could not parse Windows version output: {body:?}")),
+                },
+            }
+        }
+        Ok(output) => WindowsBackendReadinessEntry {
+            label: "Windows version".to_owned(),
+            path: "Environment.OSVersion.Version".to_owned(),
+            present: false,
+            probed: true,
+            reason: Some(format!(
+                "version probe failed with exit {}: {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        },
+        Err(err) => WindowsBackendReadinessEntry {
+            label: "Windows version".to_owned(),
+            path: "Environment.OSVersion.Version".to_owned(),
+            present: false,
+            probed: true,
+            reason: Some(format!("version probe exec failed: {err}")),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn probe_windows_version() -> WindowsBackendReadinessEntry {
+    unsupported_runtime_entry("Windows version", "Environment.OSVersion.Version")
+}
+
+#[cfg(windows)]
+fn probe_windows_administrator_token() -> WindowsBackendReadinessEntry {
+    probe_fixed_command(
+        "elevated administrator token",
+        REVIEWED_POWERSHELL_EXE_PATH,
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "$id=[Security.Principal.WindowsIdentity]::GetCurrent(); $p=[Security.Principal.WindowsPrincipal]::new($id); if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet Windows backend requires elevated Administrator/SYSTEM token' }",
+        ],
+        "process token is not elevated administrator/SYSTEM",
+    )
+}
+
+#[cfg(not(windows))]
+fn probe_windows_administrator_token() -> WindowsBackendReadinessEntry {
+    unsupported_runtime_entry("elevated administrator token", "WindowsPrincipal.IsInRole")
+}
+
+#[cfg(windows)]
+fn probe_windows_required_api_surface() -> WindowsBackendReadinessEntry {
+    match rustynet_windows_native::dpapi_protect(
+        b"rustynet-windows-backend-readiness",
+        rustynet_windows_native::WindowsDpapiScope::LocalMachine,
+        "RustyNet Windows backend readiness probe",
+    )
+    .and_then(|blob| rustynet_windows_native::dpapi_unprotect(&blob))
+    {
+        Ok(plaintext) if plaintext == b"rustynet-windows-backend-readiness" => {
+            WindowsBackendReadinessEntry {
+                label: "required Win32 API surface".to_owned(),
+                path: "CryptProtectData/CryptUnprotectData".to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            }
+        }
+        Ok(_) => WindowsBackendReadinessEntry {
+            label: "required Win32 API surface".to_owned(),
+            path: "CryptProtectData/CryptUnprotectData".to_owned(),
+            present: false,
+            probed: true,
+            reason: Some("DPAPI round-trip returned unexpected plaintext".to_owned()),
+        },
+        Err(err) => WindowsBackendReadinessEntry {
+            label: "required Win32 API surface".to_owned(),
+            path: "CryptProtectData/CryptUnprotectData".to_owned(),
+            present: false,
+            probed: true,
+            reason: Some(format!("DPAPI round-trip failed: {err}")),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn probe_windows_required_api_surface() -> WindowsBackendReadinessEntry {
+    unsupported_runtime_entry(
+        "required Win32 API surface",
+        "CryptProtectData/CryptUnprotectData",
+    )
+}
+
+#[cfg(windows)]
+fn probe_fixed_command(
+    label: &str,
+    path: &str,
+    args: &[&str],
+    failure_prefix: &str,
+) -> WindowsBackendReadinessEntry {
+    match std::process::Command::new(path).args(args).output() {
+        Ok(output) if output.status.success() => WindowsBackendReadinessEntry {
+            label: label.to_owned(),
+            path: path.to_owned(),
+            present: true,
+            probed: true,
+            reason: None,
+        },
+        Ok(output) => WindowsBackendReadinessEntry {
+            label: label.to_owned(),
+            path: path.to_owned(),
+            present: false,
+            probed: true,
+            reason: Some(format!(
+                "{failure_prefix} (exit={}): {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        },
+        Err(err) => WindowsBackendReadinessEntry {
+            label: label.to_owned(),
+            path: path.to_owned(),
+            present: false,
+            probed: true,
+            reason: Some(format!("{failure_prefix}: exec failed: {err}")),
+        },
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_windows_version_triplet(value: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = value.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let build = parts.next()?.parse().ok()?;
+    Some((major, minor, build))
+}
+
 #[cfg(not(windows))]
 fn probe_canonical_binary(label: &str, path: &str) -> WindowsBackendReadinessEntry {
+    unsupported_runtime_entry(label, path)
+}
+
+#[cfg(not(windows))]
+fn unsupported_runtime_entry(label: &str, path: &str) -> WindowsBackendReadinessEntry {
     WindowsBackendReadinessEntry {
         label: label.to_owned(),
         path: path.to_owned(),
@@ -179,8 +401,50 @@ mod tests {
                 reason: None,
             },
             WindowsBackendReadinessEntry {
+                label: "wireguard.dll".to_owned(),
+                path: REVIEWED_WIREGUARD_DLL_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
                 label: "netsh.exe".to_owned(),
                 path: REVIEWED_NETSH_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "sc.exe".to_owned(),
+                path: REVIEWED_SC_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "PowerShell.exe".to_owned(),
+                path: REVIEWED_POWERSHELL_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "Windows version".to_owned(),
+                path: "Environment.OSVersion.Version".to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "elevated administrator token".to_owned(),
+                path: REVIEWED_POWERSHELL_EXE_PATH.to_owned(),
+                present: true,
+                probed: true,
+                reason: None,
+            },
+            WindowsBackendReadinessEntry {
+                label: "required Win32 API surface".to_owned(),
+                path: "CryptProtectData/CryptUnprotectData".to_owned(),
                 present: true,
                 probed: true,
                 reason: None,
@@ -247,7 +511,42 @@ mod tests {
         let report = build_windows_backend_readiness_report(reviewed_present_entries());
         assert!(report.overall_ok);
         assert!(report.drift_reasons.is_empty());
-        assert_eq!(report.entries.len(), 3);
+        assert_eq!(report.entries.len(), 9);
+    }
+
+    #[test]
+    fn auto_select_accepts_clean_readiness_report() {
+        let report = build_windows_backend_readiness_report(reviewed_present_entries());
+        let mode = auto_select_windows_backend_mode(&report).expect("clean report selects backend");
+        assert_eq!(
+            mode,
+            crate::windows_backend_gate::WindowsBackendMode::WireguardNt
+        );
+    }
+
+    #[test]
+    fn auto_select_rejects_drifted_readiness_report() {
+        let mut entries = reviewed_present_entries();
+        entries[7].present = false;
+        entries[7].reason = Some("not elevated".to_owned());
+        let report = build_windows_backend_readiness_report(entries);
+        let err =
+            auto_select_windows_backend_mode(&report).expect_err("drift must block selection");
+        assert!(err.contains("windows-backend-autoselect-blocked"));
+        assert!(err.contains("not present"));
+    }
+
+    #[test]
+    fn parse_windows_version_triplet_accepts_three_numbers() {
+        assert_eq!(
+            parse_windows_version_triplet("10.0.22631"),
+            Some((10, 0, 22631))
+        );
+    }
+
+    #[test]
+    fn parse_windows_version_triplet_rejects_malformed_value() {
+        assert_eq!(parse_windows_version_triplet("Windows 11"), None);
     }
 
     #[test]
@@ -292,6 +591,6 @@ mod tests {
                 entry.reason
             );
         }
-        assert_eq!(report.entries.len(), 3);
+        assert_eq!(report.entries.len(), 9);
     }
 }
