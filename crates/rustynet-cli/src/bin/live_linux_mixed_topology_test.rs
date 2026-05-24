@@ -554,7 +554,11 @@ fn capture_membership_status(
             capture_root(identity, known_hosts, host, command)
         }
         HostPlatform::Windows => {
-            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe membership status\"";
+            // `Out-String -Width 4096` so the long membership-status
+            // line is not wrapped at terminal width; the parser
+            // requires the active_nodes=... CSV to live on a single
+            // physical line.
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe membership status | Out-String -Width 4096\"";
             capture_remote_stdout(identity, known_hosts, host, command)
         }
     }
@@ -602,7 +606,11 @@ fn parse_active_node_ids(membership_status: &str) -> Vec<String> {
 /// we care about for cross-OS proof:
 ///   * path_live_proven=true|false
 ///   * path_live_peer_count=<u32>
-///   * path_latest_live_handshake_unix=<u64|empty>
+///   * path_latest_live_handshake_unix=<u64|"none"|empty>
+///     (the daemon emits the literal string "none" when no peer
+///     has ever handshaken; the parser maps "none" / "0" / unparseable
+///     values to `None` so the freshness check fails closed on a
+///     stale or never-established datapath)
 fn parse_datapath_status(status_line: &str) -> DatapathStatus {
     let mut out = DatapathStatus::default();
     let trimmed = status_line.trim();
@@ -803,6 +811,38 @@ mod tests {
         let datapath = super::parse_datapath_status(line);
         assert!(!datapath.path_live_proven);
         assert_eq!(datapath.path_live_peer_count, 3);
+    }
+
+    #[test]
+    fn parse_datapath_status_treats_literal_none_as_missing_handshake() {
+        // Phase 13 reviewer MEDIUM: the daemon emits the literal
+        // string `none` (not empty) when no peer has handshaken.
+        // The parser must collapse "none" to `None` so the
+        // freshness check fails closed on a never-established
+        // datapath rather than parse `none` as a recent timestamp.
+        let line =
+            "path_live_proven=false path_live_peer_count=0 path_latest_live_handshake_unix=none\n";
+        let datapath = super::parse_datapath_status(line);
+        assert!(!datapath.path_live_proven);
+        assert!(
+            datapath.path_latest_live_handshake_unix.is_none(),
+            "literal 'none' must parse as missing"
+        );
+    }
+
+    #[test]
+    fn config_parse_freshness_zero_disables_datapath_check() {
+        // Phase 13 reviewer HIGH: the freshness=0 disable surface
+        // was claimed but never tested. Pin the round-trip so a
+        // future change to argument parsing surfaces here.
+        let mut args = base_args();
+        args.push("--handshake-freshness-secs".to_owned());
+        args.push("0".to_owned());
+        let cfg = Config::parse(args).expect("freshness 0 must parse");
+        assert_eq!(
+            cfg.handshake_freshness_secs, 0,
+            "freshness=0 is the documented disable surface; must round-trip exactly"
+        );
     }
 
     #[test]
