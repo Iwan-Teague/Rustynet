@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(unix)]
 use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
@@ -1000,7 +1000,7 @@ fn verify_membership_signatures(
         let signature_bytes = decode_hex_to_fixed::<64>(&signature.signature_hex)?;
         let signature_obj = Signature::from_bytes(&signature_bytes);
         verifying_key
-            .verify(payload, &signature_obj)
+            .verify_strict(payload, &signature_obj)
             .map_err(|_| MembershipError::SignatureInvalid)?;
     }
 
@@ -1094,7 +1094,7 @@ pub fn verify_epoch_tagged_bundle(
         .map_err(EpochTaggedBundleError::Membership)?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify(bundle.payload.as_slice(), &signature)
+        .verify_strict(bundle.payload.as_slice(), &signature)
         .map_err(|_| EpochTaggedBundleError::Membership(MembershipError::SignatureInvalid))
 }
 

@@ -22,7 +22,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 #[cfg(unix)]
@@ -1571,7 +1571,7 @@ pub fn verify_signed_relay_fleet_bundle_with_key(
     };
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify(bundle.payload.as_bytes(), &signature)
+        .verify_strict(bundle.payload.as_bytes(), &signature)
         .is_ok()
 }
 
@@ -1852,7 +1852,7 @@ impl RelaySessionToken {
         let payload = self.canonical_payload();
         let signature = Signature::from_bytes(&self.signature);
         verifying_key
-            .verify(payload.as_bytes(), &signature)
+            .verify_strict(payload.as_bytes(), &signature)
             .map_err(|e| format!("signature verification failed: {e}"))?;
         Ok(())
     }
@@ -2492,7 +2492,9 @@ impl ControlPlaneCore {
             Err(_) => return false,
         };
         let payload = token_claims_payload(&token.claims);
-        verifying_key.verify(payload.as_bytes(), &signature).is_ok()
+        verifying_key
+            .verify_strict(payload.as_bytes(), &signature)
+            .is_ok()
     }
 
     pub fn validate_signed_token_and_nonce(
@@ -3154,7 +3156,7 @@ impl ControlPlaneCore {
             Err(_) => return false,
         };
         verifying_key
-            .verify(bundle.payload.as_bytes(), &signature)
+            .verify_strict(bundle.payload.as_bytes(), &signature)
             .is_ok()
     }
 
@@ -3222,7 +3224,7 @@ impl ControlPlaneCore {
             Err(_) => return false,
         };
         verifying_key
-            .verify(record.payload.as_bytes(), &signature)
+            .verify_strict(record.payload.as_bytes(), &signature)
             .is_ok()
     }
 
@@ -3307,7 +3309,7 @@ impl ControlPlaneCore {
             Err(_) => return false,
         };
         verifying_key
-            .verify(bundle.payload.as_bytes(), &signature)
+            .verify_strict(bundle.payload.as_bytes(), &signature)
             .is_ok()
     }
 
@@ -3409,7 +3411,9 @@ impl ControlPlaneCore {
             Ok(key) => key,
             Err(_) => return false,
         };
-        verifying_key.verify(payload.as_bytes(), &signature).is_ok()
+        verifying_key
+            .verify_strict(payload.as_bytes(), &signature)
+            .is_ok()
     }
 }
 

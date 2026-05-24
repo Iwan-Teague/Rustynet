@@ -185,10 +185,10 @@ guarantee.
 | RN-18 | Priv | Helper authorizes any uid==0 peer, not just daemon uid | `privileged_helper.rs:393-394` | Drop `|| uid == 0` unless a concrete second caller needs it; gate behind a flag |
 | RN-19 | Priv | Direct (helper-less) exec path skips `validate_request` | `phase10.rs:730-746` | Call `validate_request` on the direct branch too (symmetric gate) |
 | RN-20 | Priv | Backend runners use PATH-resolved bare program names | `backend-wireguard/in_memory.rs:105`, `linux_command.rs:41` | Resolve via absolute validated paths or `#[cfg(test)]`-gate |
-| RN-21 | Crypto | Dead algorithm-exception code (unconditional reject) | `rustynet-crypto/lib.rs:182-193` | Fix inverted guard; correct the test that pins broken behavior |
-| RN-22 | Crypto | Ed25519 uses non-strict `verify()` (malleability) | `rustynet-crypto/lib.rs:803`; `control` 1574/1855/2495/3157/3225 | Switch to `verify_strict()` everywhere; add mauled-sig negative test |
-| RN-23 | Crypto | macOS keychain `key_id` not validated before use | `rustynet-crypto/lib.rs:460-487` | Call `is_valid_key_identifier` (mirror file/Windows paths); fix misleading comment |
-| RN-24 | Crypto | `SecretKey`/derived keys wiped via `fill(0)` not `zeroize` | `rustynet-crypto/lib.rs:58-62, 946/951/973/979` | Use `Zeroizing`/`zeroize()` (crate already depends on it) |
+| RN-21 | Crypto | Dead algorithm-exception code (unconditional reject) | `rustynet-crypto/lib.rs:182-193` | **Intentionally not changed** — current over-rejection is already fail-closed; "fixing" it re-enables a downgrade-exception mechanism (a product decision, not a security gain). See RL note. |
+| RN-22 | Crypto | Ed25519 uses non-strict `verify()` (malleability) | `rustynet-crypto/lib.rs:803`; `control` 1574/1855/2495/3157/3225 | **FIXED (RL-3)** — `verify_strict()` at all 10 sites + malleability negative test |
+| RN-23 | Crypto | macOS keychain `key_id` not validated before use | `rustynet-crypto/lib.rs:460-487` | **FIXED (RL-5)** — `is_valid_key_identifier` on both keychain paths |
+| RN-24 | Crypto | `SecretKey`/derived keys wiped via `fill(0)` not `zeroize` | `rustynet-crypto/lib.rs:58-62, 946/951/973/979` | **FIXED (RL-4)** — `zeroize()` on Drop + all four derived-key wipes |
 | RN-25 | Trust | Coordination replay window is in-memory only | `traversal.rs:833-852` | Persist seen-nonce set (watermark spool pattern) or document per-process scope |
 | RN-26 | Trust | `ConsumedTokenLedger::purge_expired` is a no-op stub | `enrollment_token.rs:386-393` | Spool `token_id+expires_at`; prune at load (needs schema change) |
 | RN-27 | Dataplane | `block_all_egress` trusts single drop-rule presence | `phase10.rs:2146-2150` | Verify chain `policy drop` + no `accept` above drop, or flush+rebuild |
@@ -305,6 +305,58 @@ project mandate: an enforcement point in code plus a verification test.
 - **Pre-existing note:** the workspace check surfaces an unrelated
   `unused_mut` warning in `rustynetd` lib tests (not introduced here); worth a
   separate cleanup since the CI gate runs clippy `-D warnings`.
+
+### RL-3 — RN-22 ed25519 `verify_strict` everywhere (signature malleability) **(landed)**
+- **Files:** `crates/rustynet-crypto/src/lib.rs` (attestation verify),
+  `crates/rustynet-control/src/lib.rs` (7 sites), `crates/rustynet-control/src/membership.rs` (2 sites).
+- **Change:** replaced every `VerifyingKey::verify(...)` with
+  `verify_strict(...)` (10 sites total), which enforces canonical `S` and
+  rejects small-order/torsion points (RFC 8032 strict / ZIP-215), eliminating
+  the ed25519 malleability class outright. Dropped the now-unused `Verifier`
+  trait import from all three files.
+- **Why safe for users:** honestly-produced ed25519-dalek signatures are
+  always canonical, so `verify_strict` accepts every legitimate signature —
+  confirmed by the full control suite (237 tests, all signature-verification
+  paths) still passing unchanged. Zero UX impact.
+- **Test added:** `verify_attestation_rejects_non_canonical_malleable_signature`
+  (crypto) signs a payload, mauls `S := S + ℓ` (group order, little-endian,
+  with carry) to produce a non-canonical-but-equation-satisfying signature,
+  and asserts `verify_strict` rejects it (`AttestationVerificationFailed`)
+  while the canonical signature verifies.
+- **Verification:** `cargo fmt` + `clippy -p rustynet-crypto -p rustynet-control
+  --all-targets --all-features -- -D warnings` clean; crypto 24 tests pass
+  (incl. the new one), control 237 pass; `cargo check --workspace` compiles.
+
+### RL-4 — RN-24 zeroize derived key material **(landed)**
+- **Files:** `crates/rustynet-crypto/src/lib.rs`.
+- **Change:** `SecretKey::drop` now calls `self.0.zeroize()` instead of
+  `fill(0)`, and the four Argon2-derived AEAD key wipes in
+  `encrypt_private_key_envelope` / `decrypt_private_key_envelope` use
+  `key.zeroize()`. `zeroize()` carries a compiler/optimizer barrier so the
+  clearing write cannot be elided as a dead store (which `fill(0)` permits).
+  Un-gated the `zeroize::Zeroize` import (now used unconditionally via Drop).
+- **Verification:** clippy clean; existing envelope round-trip + wrong-passphrase
+  tests still pass.
+
+### RL-5 — RN-23 validate macOS keychain key_id **(landed)**
+- **Files:** `crates/rustynet-crypto/src/lib.rs`.
+- **Change:** `store_in_macos_keychain` / `load_from_macos_keychain` now call
+  `is_valid_key_identifier(key_id)` before interpolating it into the keychain
+  service name, mirroring the file-fallback and Windows custody paths
+  (returns `InvalidLength` on a malformed id). Defense-in-depth — the keychain
+  CLI invocation is already argv-only, so this guards against keychain-namespace
+  confusion, not injection. macOS-gated code; compiles on the Linux CI host but
+  exercised on macOS.
+
+### RL note — RN-21 deliberately left as-is
+`AlgorithmPolicy::with_exceptions` currently rejects *all* non-empty exception
+lists (the dead-guard). That over-rejection is **fail-closed** and is the more
+secure state: repairing it would re-enable the time-boxed
+denylisted-algorithm compatibility-exception mechanism, which is a deliberate
+product/governance decision rather than a security improvement. Per the
+"choose the most secure option" directive it is intentionally not changed; if
+the exception mechanism is wanted, it should land as a scoped feature with its
+own review (and the mis-pinned test corrected at that time).
 
 ## 11. Remediation design notes for the remaining P0s (pre-implementation)
 
