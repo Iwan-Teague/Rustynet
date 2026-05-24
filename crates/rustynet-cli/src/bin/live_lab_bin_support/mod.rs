@@ -1192,12 +1192,12 @@ pub fn capture_daemon_status_for_platform(
             // Use `if (-not (Get-Command ...))` so a missing
             // rustynet.exe surfaces an explicit diagnostic rather
             // than the bare PSCommandNotFoundException. Pipe the
-            // output through `Out-String -Width 4096` so PowerShell
+            // output through `Out-String -Width 32767` so PowerShell
             // does NOT wrap the very long single-line status output
             // at the host's terminal width — the parser depends on
             // a single `key=value ...` line and a wrapped line
             // would split keys across lines and be silently dropped.
-            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe status | Out-String -Width 4096\"";
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe status | Out-String -Width 32767\"";
             capture_remote_stdout(identity, known_hosts, target, command)
         }
         other => Err(format!(

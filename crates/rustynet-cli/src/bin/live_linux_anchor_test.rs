@@ -214,15 +214,16 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    if config.platform != AnchorPlatform::Linux {
-        // gossip_priority calls set_membership_capabilities which
-        // shells `rustynet ops e2e-membership-set-capabilities ...`
-        // through `sudo -n sh -lc`. PowerShell rewrite tracked
-        // separately. The dedicated gossip_seed substage below
-        // (parser-only) still covers the gossip-related contract.
+    // Track B Phase 15 — gossip_priority now runs on macOS too via
+    // the cross-platform 3-step membership mutation flow
+    // (set_membership_capabilities_three_step). Windows still skips
+    // because no Windows-side mutation helper exists; the dedicated
+    // gossip_seed substage below (parser-only) still covers the
+    // gossip-related contract there.
+    if config.platform == AnchorPlatform::Windows {
         subchecks.push(Subcheck::skipped(
             "validate_anchor_gossip_priority",
-            "non-Linux skip: substage mutates membership via Linux-hardcoded `rustynet ops e2e-membership-set-capabilities` (systemd-creds + /etc/rustynet); gossip_seed substage below covers the gossip surface",
+            "Windows skip: cross-platform membership mutation helper not yet wired for PowerShell; macOS + Linux run for real via Phase 15's three-step flow",
         ));
     } else {
         let gossip_priority =
@@ -345,11 +346,11 @@ fn capture_anchor_list_from_host(
             // `rustynet.exe` short-circuits with an explicit
             // diagnostic instead of falling through to a confusing
             // PSCommandNotFoundException from the second statement.
-            // `Out-String -Width 4096` prevents PowerShell from
+            // `Out-String -Width 32767` prevents PowerShell from
             // wrapping long anchor-list rows at terminal width —
             // wrapped rows would split `<node_id> capabilities=...`
             // and break the parser's anchor-row matcher.
-            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe anchor list | Out-String -Width 4096\"";
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe anchor list | Out-String -Width 32767\"";
             capture_remote_stdout(identity, known_hosts, host, command)
                 .map_err(|err| format!("anchor list failed on {host}: {err}"))
         }
@@ -395,6 +396,7 @@ fn validate_anchor_gossip_priority(
     set_membership_capabilities(
         identity,
         known_hosts,
+        config,
         &config.anchor_host,
         second_anchor_node_id,
         "anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
@@ -425,6 +427,7 @@ fn validate_anchor_gossip_priority(
     let restore = set_membership_capabilities(
         identity,
         known_hosts,
+        config,
         &config.anchor_host,
         second_anchor_node_id,
         "client,relay_host",
@@ -443,7 +446,55 @@ fn validate_anchor_gossip_priority(
     }
 }
 
+/// Mutate the signed-membership capability set for a single node.
+///
+/// Linux path keeps the existing `rustynet ops e2e-membership-set-capabilities`
+/// verb, which uses systemd-creds to decrypt the signing passphrase.
+/// macOS path routes through a cross-platform 3-step flow (propose +
+/// sign + apply) using the per-platform path defaults the operator
+/// pre-stages — Track B Phase 15 unlock. Both paths land the same
+/// signed-membership mutation on disk; the daemon then reconciles
+/// via its membership watermark.
+///
+/// Windows is not yet wired here — the helper continues to error
+/// closed for Windows so the caller's skip arm stays explicit.
 fn set_membership_capabilities(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+    target_host: &str,
+    node_id: &str,
+    capabilities: &str,
+    owner_approver_id: &str,
+) -> Result<String, String> {
+    match config.platform {
+        AnchorPlatform::Linux => set_membership_capabilities_linux_ops_verb(
+            identity,
+            known_hosts,
+            target_host,
+            node_id,
+            capabilities,
+            owner_approver_id,
+        ),
+        AnchorPlatform::Macos => set_membership_capabilities_three_step(
+            identity,
+            known_hosts,
+            config,
+            target_host,
+            node_id,
+            capabilities,
+            owner_approver_id,
+        ),
+        AnchorPlatform::Windows => Err(
+            "set_membership_capabilities is not implemented for Windows; the substage must skip in run() before reaching this helper"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Phase 15 — Linux path keeps the existing one-shot ops verb that
+/// handles systemd-creds decryption + propose/sign/apply atomically.
+fn set_membership_capabilities_linux_ops_verb(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
@@ -452,7 +503,7 @@ fn set_membership_capabilities(
     owner_approver_id: &str,
 ) -> Result<String, String> {
     let command = format!(
-        "command -v rustynet >/dev/null; rustynet ops e2e-membership-set-capabilities --node-id {node_id} --capabilities {capabilities} --owner-approver-id {owner}",
+        "command -v rustynet >/dev/null && rustynet ops e2e-membership-set-capabilities --node-id {node_id} --capabilities {capabilities} --owner-approver-id {owner}",
         node_id = shell_quote(node_id),
         capabilities = shell_quote(capabilities),
         owner = shell_quote(owner_approver_id),
@@ -460,6 +511,66 @@ fn set_membership_capabilities(
     capture_root(identity, known_hosts, host, &command)
         .map(|out| out.trim().to_owned())
         .map_err(|err| format!("membership capability mutation failed on {host}: {err}"))
+}
+
+/// Phase 15 — macOS path. Runs the three cross-platform CLI verbs
+/// directly: `membership propose-set-capabilities`, `membership
+/// sign-update`, `membership apply-update`. Reads the plaintext
+/// signing-key passphrase from `config.signing_key_passphrase_cred_path`
+/// (the operator pre-stages it under `/usr/local/etc/rustynet/credentials/`
+/// — the macOS layout's default per `apply_macos_default_paths`).
+///
+/// The work dir uses `mktemp -d` so concurrent runs do not collide.
+/// Cleanup runs even when validation fails so plaintext key material
+/// never lingers in /tmp.
+fn set_membership_capabilities_three_step(
+    identity: &Path,
+    known_hosts: &Path,
+    config: &Config,
+    host: &str,
+    node_id: &str,
+    capabilities: &str,
+    owner_approver_id: &str,
+) -> Result<String, String> {
+    let work_root = "/tmp";
+    let work_dir = format!("{work_root}/rustynet-membership-update.XXXXXX");
+    // Single shell pipeline so the mktemp result + cleanup live in
+    // the same script execution. macOS sh (bash) is POSIX-compatible
+    // for mktemp -d. The capabilities CSV is quoted via shell_quote
+    // so an attacker-controlled CSV cannot inject shell metachars.
+    let script = format!(
+        r#"set -eu
+work="$(/usr/bin/mktemp -d {work_dir})"
+trap '/bin/rm -rf -- "$work"' EXIT
+rustynet membership propose-set-capabilities \
+  --node-id {node_id} \
+  --capabilities {capabilities} \
+  --output "$work/record.bin" \
+  --snapshot {snapshot} \
+  --log {log_path}
+rustynet membership sign-update \
+  --record "$work/record.bin" \
+  --approver-id {approver} \
+  --signing-key {signing_key} \
+  --signing-key-passphrase-file {passphrase} \
+  --output "$work/signed.bin"
+rustynet membership apply-update \
+  --signed-update "$work/signed.bin" \
+  --snapshot {snapshot} \
+  --log {log_path}
+"#,
+        work_dir = shell_quote(work_dir.as_str()),
+        node_id = shell_quote(node_id),
+        capabilities = shell_quote(capabilities),
+        approver = shell_quote(owner_approver_id),
+        snapshot = shell_quote(config.membership_snapshot_path.as_str()),
+        log_path = shell_quote(config.membership_log_path.as_str()),
+        signing_key = shell_quote(config.owner_signing_key_path.as_str()),
+        passphrase = shell_quote(config.signing_key_passphrase_cred_path.as_str()),
+    );
+    capture_root(identity, known_hosts, host, &script)
+        .map(|out| out.trim().to_owned())
+        .map_err(|err| format!("macos membership capability mutation failed on {host}: {err}"))
 }
 
 /// Track B Phase 9 — dedicated gossip-seed advertisement check.
@@ -714,6 +825,7 @@ fn validate_anchor_downgrade_revocation(
     if let Err(err) = set_membership_capabilities(
         identity,
         known_hosts,
+        config,
         &config.anchor_host,
         config.anchor_node_id.as_str(),
         "anchor,relay_host,anchor.gossip_seed,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
@@ -755,6 +867,7 @@ fn validate_anchor_downgrade_revocation(
     let restore = set_membership_capabilities(
         identity,
         known_hosts,
+        config,
         &config.anchor_host,
         config.anchor_node_id.as_str(),
         "anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
@@ -2068,6 +2181,45 @@ mod tests {
         assert!(
             err.contains("no node in anchor list advertises anchor.gossip_seed"),
             "got: {err}"
+        );
+    }
+
+    // ─── Track B Phase 15: cross-platform membership mutation ─────
+
+    #[test]
+    fn set_membership_capabilities_rejects_windows_platform_with_explicit_message() {
+        // Phase 15 helper supports Linux (ops verb) and macOS
+        // (three-step flow). Windows is intentionally
+        // unimplemented; the run() dispatcher arm skips the
+        // substage BEFORE reaching this helper. If somebody wires
+        // a Windows caller in the future without adding a helper,
+        // the explicit error here surfaces the contract.
+        let mut cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "windows".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("windows dry-run parse");
+        // Path::new("/tmp/id") + arbitrary host args — we expect the
+        // platform check to short-circuit BEFORE any SSH call.
+        cfg.ssh_identity_file = Some(std::path::PathBuf::from("/tmp/id"));
+        let err = super::set_membership_capabilities(
+            std::path::Path::new("/tmp/id"),
+            std::path::Path::new("/tmp/known_hosts"),
+            &cfg,
+            "admin@example.invalid",
+            "test-node",
+            "client",
+            "owner-1",
+        )
+        .expect_err("windows must be rejected by the helper");
+        assert!(
+            err.contains("Windows"),
+            "rejection message must name the platform: {err}"
+        );
+        assert!(
+            err.contains("not implemented"),
+            "rejection must say the helper is not implemented: {err}"
         );
     }
 }

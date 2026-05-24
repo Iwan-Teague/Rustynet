@@ -554,11 +554,11 @@ fn capture_membership_status(
             capture_root(identity, known_hosts, host, command)
         }
         HostPlatform::Windows => {
-            // `Out-String -Width 4096` so the long membership-status
+            // `Out-String -Width 32767` so the long membership-status
             // line is not wrapped at terminal width; the parser
             // requires the active_nodes=... CSV to live on a single
             // physical line.
-            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe membership status | Out-String -Width 4096\"";
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe membership status | Out-String -Width 32767\"";
             capture_remote_stdout(identity, known_hosts, host, command)
         }
     }
