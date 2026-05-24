@@ -192,14 +192,19 @@ fn run() -> Result<(), String> {
         json!({ "anchor_node_id": config.anchor_node_id, "capabilities": REQUIRED_ANCHOR_CAPS }),
     ));
 
-    if config.platform != AnchorPlatform::Linux {
-        // bundle_pull composes `set -eu` + `cat <token>` + `nc | curl`
-        // via capture_root's `sudo -n sh -lc` wrapper, which is
-        // POSIX-only. A faithful PowerShell rewrite needs a follow-up
-        // refactor of the helper layer — out of scope for Phase 11.
+    // Track B Phase 16 — bundle_pull now runs on macOS too.
+    // The composing helpers (set -eu, cat, nc, sed, cmp, wc) are
+    // POSIX-shell — all available on macOS BSD userland. The
+    // log-redaction helper still skips internally on non-Linux
+    // because journalctl is Linux-only (see
+    // validate_bundle_pull_log_redaction). Windows continues to
+    // skip the substage because PowerShell does not provide a
+    // drop-in `nc` and the multi-step composition assumes POSIX
+    // shell.
+    if config.platform == AnchorPlatform::Windows {
         subchecks.push(Subcheck::skipped(
             "validate_anchor_bundle_pull",
-            "non-Linux skip: substage composes POSIX shell (set -eu, cat, nc, curl) via capture_root sudo -n sh -lc wrapper; cross-platform rewrite is tracked separately",
+            "Windows skip: substage composes POSIX shell (set -eu, cat, nc, sed, cmp) via capture_root sudo -n sh -lc wrapper; macOS + Linux run for real",
         ));
     } else {
         let pull_summary = validate_bundle_pull_loopback(identity, &work_known_hosts, &config)?;
@@ -268,10 +273,17 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    if config.platform != AnchorPlatform::Linux {
+    // Track B Phase 16 — downgrade_revocation now runs on macOS
+    // too. The composing helpers are POSIX-shell (mktemp, nc, cat,
+    // sed, wc, printf — all available on macOS BSD userland), the
+    // capability mutation goes through the Phase 15 cross-platform
+    // three-step flow, and the role-audit-log size capture reads
+    // its path from the platform-aware config field added in this
+    // phase. Windows still skips: no `nc` drop-in in PowerShell.
+    if config.platform == AnchorPlatform::Windows {
         subchecks.push(Subcheck::skipped(
             "validate_anchor_downgrade_revocation",
-            "non-Linux skip: substage composes POSIX shell (set -eu, cat, ops mutations) AND shells `rustynet ops e2e-membership-set-capabilities` (Linux-hardcoded systemd-creds + /etc/rustynet); cross-platform rewrite is tracked separately",
+            "Windows skip: substage composes POSIX shell (set -eu, mktemp, nc, sed, wc) via capture_root sudo -n sh -lc wrapper; macOS + Linux run for real",
         ));
     } else {
         let downgrade_revocation =
@@ -819,7 +831,7 @@ fn validate_anchor_downgrade_revocation(
     let pre_revocation_pull = validate_bundle_pull_loopback(identity, known_hosts, config)?;
     let inflight_work_dir = start_inflight_bundle_pull(identity, known_hosts, config)?;
     let audit_bytes_before =
-        capture_role_audit_log_size(identity, known_hosts, &config.anchor_host)
+        capture_role_audit_log_size(identity, known_hosts, config, &config.anchor_host)
             .map_err(|err| format!("capture audit size before revocation failed: {err}"))?;
 
     if let Err(err) = set_membership_capabilities(
@@ -852,7 +864,7 @@ fn validate_anchor_downgrade_revocation(
         )?;
         let fail_closed = wait_for_bundle_pull_fail_closed(identity, known_hosts, config)?;
         let audit_bytes_after =
-            capture_role_audit_log_size(identity, known_hosts, &config.anchor_host)
+            capture_role_audit_log_size(identity, known_hosts, config, &config.anchor_host)
                 .map_err(|err| format!("capture audit size after revocation failed: {err}"))?;
         if audit_bytes_after <= audit_bytes_before {
             return Err(format!(
@@ -981,17 +993,26 @@ printf 'header=%s bytes=%s\n' "$header" "$bytes"
 fn capture_role_audit_log_size(
     identity: &Path,
     known_hosts: &Path,
+    config: &Config,
     host: &str,
 ) -> Result<u64, String> {
-    let script = r#"set -eu
-path="${RUSTYNET_ROLE_AUDIT_LOG:-/var/lib/rustynet/role_transitions.audit.log}"
+    // Phase 16 — read the audit-log path from the platform-aware
+    // Config field instead of the Linux-only literal. macOS uses
+    // /usr/local/var/rustynet/role_transitions.audit.log;
+    // Windows uses C:\ProgramData\RustyNet\role_transitions.audit.log
+    // (Windows execution still skips at the dispatcher arm).
+    let script = format!(
+        r#"set -eu
+path={audit_path}
 if [ -e "$path" ]; then
   wc -c < "$path" | tr -d '[:space:]'
 else
   printf '0\n'
 fi
-"#;
-    let out = capture_root(identity, known_hosts, host, script)
+"#,
+        audit_path = shell_quote(config.role_audit_log_path.as_str()),
+    );
+    let out = capture_root(identity, known_hosts, host, &script)
         .map_err(|err| format!("role audit size capture failed on {host}: {err}"))?;
     out.trim()
         .parse::<u64>()
@@ -1290,6 +1311,14 @@ struct Config {
     enrollment_ledger_path: String,
     owner_signing_key_path: String,
     signing_key_passphrase_cred_path: String,
+    /// Phase 16 — platform-aware default for the role-transitions
+    /// audit log. The downgrade_revocation substage measures this
+    /// file's size before + after revocation to prove the
+    /// revocation event was audited. Linux default
+    /// `/var/lib/rustynet/role_transitions.audit.log` (matches
+    /// `role_cli::DEFAULT_ROLE_AUDIT_LOG_PATH`); macOS swap goes
+    /// under `/usr/local/var/rustynet/`.
+    role_audit_log_path: String,
     ssh_identity_file: Option<PathBuf>,
     pinned_known_hosts_file: Option<PathBuf>,
     report_path: PathBuf,
@@ -1317,6 +1346,7 @@ impl Config {
             membership_log_path: "/var/lib/rustynet/membership.log".to_owned(),
             enrollment_secret_path: "/var/lib/rustynet/keys/enrollment.secret".to_owned(),
             enrollment_ledger_path: "/var/lib/rustynet/rustynetd.enrollment.ledger".to_owned(),
+            role_audit_log_path: "/var/lib/rustynet/role_transitions.audit.log".to_owned(),
             owner_signing_key_path: "/etc/rustynet/membership.owner.key".to_owned(),
             signing_key_passphrase_cred_path:
                 "/etc/rustynet/credentials/signing_key_passphrase.cred".to_owned(),
@@ -1370,6 +1400,9 @@ impl Config {
                 }
                 "--enrollment-ledger-path" => {
                     config.enrollment_ledger_path = next_value(&mut iter, &arg)?
+                }
+                "--role-audit-log-path" => {
+                    config.role_audit_log_path = next_value(&mut iter, &arg)?
                 }
                 "--owner-signing-key-path" => {
                     config.owner_signing_key_path = next_value(&mut iter, &arg)?
@@ -1448,6 +1481,10 @@ impl Config {
             self.enrollment_ledger_path =
                 "/usr/local/var/rustynet/rustynetd.enrollment.ledger".to_owned();
         }
+        if self.role_audit_log_path == "/var/lib/rustynet/role_transitions.audit.log" {
+            self.role_audit_log_path =
+                "/usr/local/var/rustynet/role_transitions.audit.log".to_owned();
+        }
         if self.owner_signing_key_path == "/etc/rustynet/membership.owner.key" {
             self.owner_signing_key_path = "/usr/local/etc/rustynet/membership.owner.key".to_owned();
         }
@@ -1482,6 +1519,10 @@ impl Config {
         if self.enrollment_ledger_path == "/var/lib/rustynet/rustynetd.enrollment.ledger" {
             self.enrollment_ledger_path =
                 format!(r"{DEFAULT_WINDOWS_STATE_ROOT}\rustynetd.enrollment.ledger");
+        }
+        if self.role_audit_log_path == "/var/lib/rustynet/role_transitions.audit.log" {
+            self.role_audit_log_path =
+                format!(r"{DEFAULT_WINDOWS_STATE_ROOT}\role_transitions.audit.log");
         }
         if self.owner_signing_key_path == "/etc/rustynet/membership.owner.key" {
             self.owner_signing_key_path =
@@ -2185,6 +2226,61 @@ mod tests {
     }
 
     // ─── Track B Phase 15: cross-platform membership mutation ─────
+
+    // ─── Track B Phase 16: role-audit-log path platform-aware ─────
+
+    #[test]
+    fn parse_linux_role_audit_log_path_uses_canonical_var_lib_default() {
+        let cfg = super::Config::parse(vec!["--dry-run".to_owned()]).expect("linux parse");
+        assert_eq!(
+            cfg.role_audit_log_path, "/var/lib/rustynet/role_transitions.audit.log",
+            "linux default must match crates/rustynet-cli/src/role_cli.rs::DEFAULT_ROLE_AUDIT_LOG_PATH"
+        );
+    }
+
+    #[test]
+    fn parse_macos_role_audit_log_path_swaps_to_usr_local_var() {
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "macos".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("macos parse");
+        assert_eq!(
+            cfg.role_audit_log_path, "/usr/local/var/rustynet/role_transitions.audit.log",
+            "macOS default-swap must mirror the macOS install layout (state under /usr/local/var/rustynet)"
+        );
+    }
+
+    #[test]
+    fn parse_windows_role_audit_log_path_swaps_to_program_data() {
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "windows".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("windows parse");
+        assert_eq!(
+            cfg.role_audit_log_path, r"C:\ProgramData\RustyNet\role_transitions.audit.log",
+            "windows default-swap must mirror the canonical ProgramData layout"
+        );
+    }
+
+    #[test]
+    fn parse_explicit_role_audit_log_path_flag_wins_over_default_swap() {
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "macos".to_owned(),
+            "--role-audit-log-path".to_owned(),
+            "/Users/admin/rustynet/audit.log".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("parse");
+        assert_eq!(
+            cfg.role_audit_log_path, "/Users/admin/rustynet/audit.log",
+            "explicit --role-audit-log-path must NOT be rewritten by the macOS default-swap"
+        );
+    }
 
     #[test]
     fn set_membership_capabilities_rejects_windows_platform_with_explicit_message() {
