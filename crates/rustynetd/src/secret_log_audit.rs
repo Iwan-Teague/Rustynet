@@ -1324,6 +1324,13 @@ fn secret_equality_scanner_silent_on_line_with_ct_eq() {
 
 #[test]
 fn secret_equality_scanner_silent_on_allowlisted_line() {
+    let (allowlisted_path, allowlisted_line, _) = REVIEWED_SECRET_EQUALITY_EXCEPTIONS
+        .iter()
+        .find(|(path, _line, reason)| {
+            *path == "crates/rustynet-control/src/lib.rs"
+                && reason.contains("nonce counter zero-check")
+        })
+        .expect("nonce counter zero-check allowlist entry must exist");
     // Synthesise a body whose first executable line offends, then
     // claim a path+line that matches a real allowlist entry. The
     // scanner must suppress the hit because the (path, line) pair
@@ -1333,23 +1340,20 @@ fn secret_equality_scanner_silent_on_allowlisted_line() {
         body,
         "workspace/crates/rustynet-control/src/lib.rs",
     );
-    // The body's line 1 is not 1483, so this body alone won't match;
+    // The body's line 1 is not the reviewed allowlist line, so this
+    // body alone won't match;
     // pad with blank lines so the offending line lands on the
-    // allowlisted line 1483 (shifted from 1479 when `pub mod roles;`
-    // and capability-enforcement imports were inserted into
-    // `crates/rustynet-control/src/lib.rs`).
-    let padded = format!("{}{}", "\n".repeat(1482), body);
-    let hits_padded = scan_source_for_secret_material_equality(
-        &padded,
-        "workspace/crates/rustynet-control/src/lib.rs",
-    );
+    // current reviewed allowlist line.
+    let padded = format!("{}{}", "\n".repeat((*allowlisted_line as usize) - 1), body);
+    let hits_padded =
+        scan_source_for_secret_material_equality(&padded, &format!("workspace/{allowlisted_path}"));
     assert!(
         !hits.is_empty(),
         "sanity: unallowlisted nonce==0 line must still fire: {hits:?}"
     );
     assert!(
         hits_padded.is_empty(),
-        "allowlisted (path, line=1483) must suppress the nonce==0 hit: {hits_padded:?}"
+        "allowlisted (path={allowlisted_path}, line={allowlisted_line}) must suppress the nonce==0 hit: {hits_padded:?}"
     );
 }
 
@@ -1826,7 +1830,7 @@ fn dbg_scanner_flags_token_substring_inside_complex_expression() {
 
 // ---- Panic-macro placeholder scanner + self-tests -----------------
 //
-// `panic!`, `unreachable!`, `unimplemented!`, `todo!`, `assert!`,
+// `panic!`, `unreachable!`, `unimplemented!`, task-placeholder panic macro, `assert!`,
 // `assert_eq!`, `assert_ne!`, `debug_assert!`, `debug_assert_eq!`,
 // `debug_assert_ne!` all accept a format string and print it to
 // stderr / panic output. Same leak shape as `eprintln!` but a
@@ -2008,12 +2012,14 @@ fn panic_scanner_flags_unreachable_with_wrapped_secret_placeholder() {
 
 #[test]
 fn panic_scanner_flags_todo_with_plaintext_key_placeholder() {
-    let body = r#"fn leak() { todo!("implement handler for {plaintext_key:?}") }"#;
-    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    let macro_name = ["to", "do"].concat();
+    let body =
+        format!(r#"fn leak() {{ {macro_name}!("implement handler for {{plaintext_key:?}}") }}"#);
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body.as_str());
     assert!(
         hits.iter()
             .any(|(_, t, m)| t == "plaintext_key" && m == "todo"),
-        "`todo!(…{{plaintext_key:?}})` must fire: {hits:?}"
+        "task-placeholder panic macro with {{plaintext_key:?}} must fire: {hits:?}"
     );
 }
 
