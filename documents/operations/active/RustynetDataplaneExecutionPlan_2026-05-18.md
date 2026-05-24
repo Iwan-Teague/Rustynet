@@ -352,7 +352,7 @@ starting script, and archive the resulting artifacts under
   - `cargo test --workspace --all-targets --all-features` (1335 lib + 30 role_cli + 14 role_audit + 7 ops_install_systemd_relay + 2 RouteRetract = no regressions)
   - `./scripts/ci/membership_gates.sh` PASS
 
-  **D12 complete (Linux pre-D11.a surface).** macOS launchd parity + post-D11.a wiring of the role orchestrator's `DeployRelayService` / `UndeployRelayService` actions queued as the next slices.
+  **D12 follow-up complete (2026-05-24, commit `770b2ac`).** macOS launchd parity is now wired into the role-transition executor rather than only the standalone ops verb. `execute_platform_relay_service_action` dispatches macOS relay deploy/undeploy through `ops_install_macos_relay::install(false)` / `uninstall(false)`, while dry-run tests (`macos_relay_dispatch_install_uses_launchd_wrapper_in_dry_run`, `macos_relay_dispatch_uninstall_uses_launchd_wrapper_in_dry_run`, `install_wrapper_uses_launchd_install_shape_in_dry_run`, `uninstall_wrapper_uses_launchd_remove_shape_in_dry_run`) pin the launchd `bootstrap` / `bootout` shape. Live launchd bootstrap remains a lab-evidence item, not a code blocker.
 
   D12.c + D12.b + D12.a + D12.e status:
 

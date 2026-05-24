@@ -1089,6 +1089,7 @@ landed, where the artifact lives.
 | `c61f4a4` | Capture install helper native stderr for key/trust commands | Code + diagnostics hardening |
 | `2530ed7` | Restore custody ACL owner before rekey | Code + security hardening; fixes DPAPI/key-custody owner rejection after ACL repair |
 | `0cabab0` | Add Windows daemon readiness polling after service start | Code + live-lab blocker proof; revealed invalid `rustynet.exe status` assumption because Windows `rustynet.exe` is trust CLI |
+| `770b2ac` | Windows backend mode auto-selection from reviewed readiness probes | Code only: Windows service startup now rechecks `wireguard.exe`, `wg.exe`, `wireguard.dll`, `netsh.exe`, `sc.exe`, `PowerShell.exe`, Windows version, elevated token, and DPAPI API surface; selects `windows-wireguard-nt` in memory only when all pass, otherwise fails closed with structured drift |
 
 §A.1 (live SCM-context NAT lifecycle) — blocked on §3 readiness/node-id fix and stable Windows service. Evidence capture path works but skips on client-only host. Active exit NetNat/forwarding lifecycle not proven.
 §A.2 (live DNS leak proof) — blocked on §3 and §A.1. DNS block rules are code-present, but exit-context live proof is pending because daemon has not yet reached active exit-serving mode.
