@@ -13,6 +13,11 @@ use live_lab_support::{
     seed_known_hosts, shell_quote, unix_now, verify_passwordless_sudo, verify_sudo,
     verify_windows_admin, write_file,
 };
+use rustynetd::windows_paths::{
+    DEFAULT_WINDOWS_KEYS_ROOT, DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH,
+    DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH,
+    DEFAULT_WINDOWS_SECRET_ROOT, DEFAULT_WINDOWS_STATE_ROOT,
+};
 use serde_json::json;
 
 const REQUIRED_ANCHOR_CAPS: &[&str] = &[
@@ -277,12 +282,25 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    let daemon_status = capture_daemon_status(identity, &work_known_hosts, &config)?;
-    subchecks.push(Subcheck::pass(
-        "validate_anchor_daemon_status_available",
-        "daemon IPC status command completed for anchor host",
-        json!({ "status_excerpt": first_line(&daemon_status) }),
-    ));
+    // Phase 11 reviewer BLOCKER #1 fix: capture_daemon_status uses
+    // `capture_root` (`sudo -n sh -lc`), which only works on POSIX
+    // shells. Windows OpenSSH defaults to PowerShell so this would
+    // explode. Linux + macOS run it for real; Windows skips with a
+    // clear rationale until the daemon-status capture is rewritten
+    // to be cross-platform.
+    if config.platform == AnchorPlatform::Windows {
+        subchecks.push(Subcheck::skipped(
+            "validate_anchor_daemon_status_available",
+            "Windows skip: capture_daemon_status wraps the command in `sudo -n sh -lc` via capture_root, which is POSIX-only; cross-platform rewrite is tracked separately",
+        ));
+    } else {
+        let daemon_status = capture_daemon_status(identity, &work_known_hosts, &config)?;
+        subchecks.push(Subcheck::pass(
+            "validate_anchor_daemon_status_available",
+            "daemon IPC status command completed for anchor host",
+            json!({ "status_excerpt": first_line(&daemon_status) }),
+        ));
+    }
 
     let report = render_report(&config, &git_commit, subchecks, Some(&anchor_list))?;
     write_file(&config.report_path, &report)?;
@@ -321,7 +339,11 @@ fn capture_anchor_list_from_host(
             // PowerShell `Get-Command` is the rough equivalent of
             // `command -v`. `rustynet.exe anchor list` writes the
             // same canonical output as the Linux binary.
-            let command = "powershell -NoProfile -Command \"Get-Command rustynet.exe | Out-Null; rustynet.exe anchor list\"";
+            // Use `if (-not (Get-Command ...))` so a missing
+            // `rustynet.exe` short-circuits with an explicit
+            // diagnostic instead of falling through to a confusing
+            // PSCommandNotFoundException from the second statement.
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe anchor list\"";
             capture_remote_stdout(identity, known_hosts, host, command)
                 .map_err(|err| format!("anchor list failed on {host}: {err}"))
         }
@@ -1332,34 +1354,39 @@ impl Config {
         }
     }
 
+    /// Phase 11 reviewer BLOCKER #2 fix: pin Windows defaults to
+    /// the canonical layout from `rustynetd::windows_paths`.
+    /// Membership state lives under `...\membership\`, secret
+    /// material under `...\secrets\` (not `...\credentials\`).
+    /// Imports the canonical constants so a future rename surfaces
+    /// here as a compile break instead of a silent path drift.
     fn apply_windows_default_paths(&mut self) {
         if self.anchor_token_path == "/var/lib/rustynet/anchor-bundle-pull.token" {
-            self.anchor_token_path = r"C:\ProgramData\RustyNet\anchor-bundle-pull.token".to_owned();
+            self.anchor_token_path =
+                format!(r"{DEFAULT_WINDOWS_STATE_ROOT}\anchor-bundle-pull.token");
         }
         if self.membership_snapshot_path == "/var/lib/rustynet/membership.snapshot" {
-            self.membership_snapshot_path =
-                r"C:\ProgramData\RustyNet\membership.snapshot".to_owned();
+            self.membership_snapshot_path = DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH.to_owned();
         }
         if self.membership_log_path == "/var/lib/rustynet/membership.log" {
-            self.membership_log_path = r"C:\ProgramData\RustyNet\membership.log".to_owned();
+            self.membership_log_path = DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH.to_owned();
         }
         if self.enrollment_secret_path == "/var/lib/rustynet/keys/enrollment.secret" {
-            self.enrollment_secret_path =
-                r"C:\ProgramData\RustyNet\keys\enrollment.secret".to_owned();
+            self.enrollment_secret_path = format!(r"{DEFAULT_WINDOWS_KEYS_ROOT}\enrollment.secret");
         }
         if self.enrollment_ledger_path == "/var/lib/rustynet/rustynetd.enrollment.ledger" {
             self.enrollment_ledger_path =
-                r"C:\ProgramData\RustyNet\rustynetd.enrollment.ledger".to_owned();
+                format!(r"{DEFAULT_WINDOWS_STATE_ROOT}\rustynetd.enrollment.ledger");
         }
         if self.owner_signing_key_path == "/etc/rustynet/membership.owner.key" {
             self.owner_signing_key_path =
-                r"C:\ProgramData\RustyNet\membership.owner.key".to_owned();
+                DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH.to_owned();
         }
         if self.signing_key_passphrase_cred_path
             == "/etc/rustynet/credentials/signing_key_passphrase.cred"
         {
             self.signing_key_passphrase_cred_path =
-                r"C:\ProgramData\RustyNet\credentials\signing_key_passphrase.cred".to_owned();
+                format!(r"{DEFAULT_WINDOWS_SECRET_ROOT}\signing_key_passphrase.cred");
         }
     }
 
@@ -1904,7 +1931,11 @@ mod tests {
     // ─── Track B Phase 11: Windows anchor dispatch + path defaults ─
 
     #[test]
-    fn parse_windows_swaps_default_paths_to_program_data_layout() {
+    fn parse_windows_swaps_default_paths_to_canonical_layout() {
+        // Phase 11 reviewer caught that the first Windows-path swap
+        // diverged from the canonical layout from
+        // `rustynetd::windows_paths`. Pin the expected paths to the
+        // canonical constants so a future rename surfaces here.
         let cfg = super::Config::parse(vec![
             "--platform".to_owned(),
             "windows".to_owned(),
@@ -1916,13 +1947,15 @@ mod tests {
             cfg.anchor_token_path,
             r"C:\ProgramData\RustyNet\anchor-bundle-pull.token"
         );
+        // Membership state lives under the membership/ subdir
+        // (NOT flat under the state root).
         assert_eq!(
             cfg.membership_snapshot_path,
-            r"C:\ProgramData\RustyNet\membership.snapshot"
+            r"C:\ProgramData\RustyNet\membership\membership.snapshot"
         );
         assert_eq!(
             cfg.membership_log_path,
-            r"C:\ProgramData\RustyNet\membership.log"
+            r"C:\ProgramData\RustyNet\membership\membership.log"
         );
         assert_eq!(
             cfg.enrollment_secret_path,
@@ -1932,13 +1965,16 @@ mod tests {
             cfg.enrollment_ledger_path,
             r"C:\ProgramData\RustyNet\rustynetd.enrollment.ledger"
         );
+        // Owner signing key lives next to the snapshot in the
+        // membership/ subdir.
         assert_eq!(
             cfg.owner_signing_key_path,
-            r"C:\ProgramData\RustyNet\membership.owner.key"
+            r"C:\ProgramData\RustyNet\membership\membership.owner.key"
         );
+        // Secret material lives under secrets/ (NOT credentials/).
         assert_eq!(
             cfg.signing_key_passphrase_cred_path,
-            r"C:\ProgramData\RustyNet\credentials\signing_key_passphrase.cred"
+            r"C:\ProgramData\RustyNet\secrets\signing_key_passphrase.cred"
         );
     }
 
@@ -1956,9 +1992,10 @@ mod tests {
             cfg.anchor_token_path, r"D:\rustynet\anchor-bundle-pull.token",
             "explicit --anchor-token-path must NOT be rewritten by the Windows default-swap"
         );
+        // Other paths still get the canonical Windows default swap.
         assert_eq!(
-            cfg.membership_snapshot_path, r"C:\ProgramData\RustyNet\membership.snapshot",
-            "other paths still get the Windows default swap"
+            cfg.membership_snapshot_path, r"C:\ProgramData\RustyNet\membership\membership.snapshot",
+            "membership snapshot still uses the canonical membership/ subdir layout"
         );
     }
 
