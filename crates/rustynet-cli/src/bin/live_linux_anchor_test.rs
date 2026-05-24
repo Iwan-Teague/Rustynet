@@ -282,25 +282,27 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    // Phase 11 reviewer BLOCKER #1 fix: capture_daemon_status uses
-    // `capture_root` (`sudo -n sh -lc`), which only works on POSIX
-    // shells. Windows OpenSSH defaults to PowerShell so this would
-    // explode. Linux + macOS run it for real; Windows skips with a
-    // clear rationale until the daemon-status capture is rewritten
-    // to be cross-platform.
-    if config.platform == AnchorPlatform::Windows {
-        subchecks.push(Subcheck::skipped(
-            "validate_anchor_daemon_status_available",
-            "Windows skip: capture_daemon_status wraps the command in `sudo -n sh -lc` via capture_root, which is POSIX-only; cross-platform rewrite is tracked separately",
-        ));
-    } else {
-        let daemon_status = capture_daemon_status(identity, &work_known_hosts, &config)?;
-        subchecks.push(Subcheck::pass(
-            "validate_anchor_daemon_status_available",
-            "daemon IPC status command completed for anchor host",
-            json!({ "status_excerpt": first_line(&daemon_status) }),
-        ));
-    }
+    // Track B Phase 13 — unlock daemon_status_available on
+    // Windows by routing through the new platform-aware helper in
+    // `live_lab_bin_support::capture_daemon_status_for_platform`.
+    // Phase 11 had to skip Windows because the bin-local
+    // `capture_daemon_status` wraps the command in `sudo -n sh -lc`
+    // via capture_root (POSIX-only). The new helper dispatches per
+    // platform: capture_root + Linux socket on Linux, capture_root
+    // + macOS socket on macOS, capture_remote_stdout + PowerShell
+    // `rustynet.exe status` on Windows.
+    let daemon_status = live_lab_support::capture_daemon_status_for_platform(
+        identity,
+        &work_known_hosts,
+        &config.anchor_host,
+        config.platform.as_str(),
+    )
+    .map_err(|err| format!("daemon status capture failed: {err}"))?;
+    subchecks.push(Subcheck::pass(
+        "validate_anchor_daemon_status_available",
+        "daemon IPC status command completed for anchor host",
+        json!({ "status_excerpt": first_line(&daemon_status) }),
+    ));
 
     let report = render_report(&config, &git_commit, subchecks, Some(&anchor_list))?;
     write_file(&config.report_path, &report)?;
@@ -1035,20 +1037,6 @@ printf 'token_thumbprint=%s raw_token_leaked=false\n' "$thumbprint"
     capture_root(identity, known_hosts, &config.anchor_host, &script)
         .map(|out| out.trim().to_owned())
         .map_err(|err| format!("bundle-pull log redaction check failed: {err}"))
-}
-
-fn capture_daemon_status(
-    identity: &Path,
-    known_hosts: &Path,
-    config: &Config,
-) -> Result<String, String> {
-    capture_root(
-        identity,
-        known_hosts,
-        &config.anchor_host,
-        "command -v rustynet >/dev/null; rustynet status",
-    )
-    .map_err(|err| format!("daemon status failed on {}: {err}", config.anchor_host))
 }
 
 fn dry_run_subchecks() -> Vec<Subcheck> {

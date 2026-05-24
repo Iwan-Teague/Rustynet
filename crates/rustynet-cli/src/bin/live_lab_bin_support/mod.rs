@@ -1147,6 +1147,52 @@ pub fn status(identity: &Path, known_hosts: &Path, target: &str) -> Result<Strin
     )
 }
 
+/// Cross-platform daemon-status capture. Track B Phase 13 — the
+/// canonical `status` helper above wraps the command in `sudo -n
+/// sh -lc` via capture_root, which only works on POSIX shells.
+/// macOS works via the same POSIX wrap (sudo is available) but the
+/// daemon socket path is different from Linux. Windows has no sudo
+/// and an Administrator OpenSSH session by default; run PowerShell
+/// against `rustynet.exe status` instead.
+///
+/// Returns the canonical single-line `node_id=... node_role=...
+/// ... path_live_proven=... path_latest_live_handshake_unix=...`
+/// status output emitted by `crates/rustynetd/src/daemon.rs` so the
+/// caller can parse handshake freshness, live peer count, and
+/// proven-path state without knowing the platform.
+pub fn capture_daemon_status_for_platform(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+    platform_label: &str,
+) -> Result<String, String> {
+    let trimmed = platform_label.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "linux" => capture_root(
+            identity,
+            known_hosts,
+            target,
+            "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
+        ),
+        "macos" | "darwin" => capture_root(
+            identity,
+            known_hosts,
+            target,
+            "env RUSTYNET_DAEMON_SOCKET=/usr/local/var/rustynet/rustynetd.sock rustynet status",
+        ),
+        "windows" | "win32" => {
+            // Use `if (-not (Get-Command ...))` so a missing
+            // rustynet.exe surfaces an explicit diagnostic rather
+            // than the bare PSCommandNotFoundException.
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe status\"";
+            capture_remote_stdout(identity, known_hosts, target, command)
+        }
+        other => Err(format!(
+            "capture_daemon_status_for_platform: unsupported platform label {other:?}"
+        )),
+    }
+}
+
 pub fn no_plaintext_passphrase_check(
     identity: &Path,
     known_hosts: &Path,
