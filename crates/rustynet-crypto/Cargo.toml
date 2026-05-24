@@ -17,3 +17,6 @@ rustynet-windows-native = { path = "../rustynet-windows-native" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
+
+[lints]
+workspace = true

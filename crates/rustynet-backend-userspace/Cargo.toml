@@ -13,3 +13,6 @@ rustynet-backend-wireguard = { path = "../rustynet-backend-wireguard" }
 [dev-dependencies]
 base64 = "0.22"
 tempfile = "3"
+
+[lints]
+workspace = true

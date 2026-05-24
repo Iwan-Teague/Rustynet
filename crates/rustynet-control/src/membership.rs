@@ -44,6 +44,19 @@ pub const MAX_MEMBERSHIP_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 /// downstream to catch corruption.
 pub const MAX_MEMBERSHIP_LOG_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bounds on the `*_count` length fields in the membership text
+/// encoding. These cap the `Vec::with_capacity` pre-allocations in the
+/// decoders so a malformed or hostile count cannot trigger a capacity-overflow
+/// panic (`count * size_of::<T>()` exceeding `isize::MAX`) or a
+/// memory-exhaustion abort before any structural validation or signature check
+/// runs. The values sit far above any realistic mesh while keeping the worst
+/// case pre-allocation small. Counts are additionally bounded by the parsed
+/// field total in [`bounded_count`], which closes the hole even on the tightly
+/// size-capped IPC path.
+pub const MAX_MEMBERSHIP_NODE_COUNT: usize = 65_536;
+pub const MAX_MEMBERSHIP_APPROVER_COUNT: usize = 4_096;
+pub const MAX_MEMBERSHIP_SIGNATURE_COUNT: usize = 4_096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MembershipNodeStatus {
     Active,
@@ -1199,7 +1212,12 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
     } else {
         Some(metadata_hash_raw)
     };
-    let node_count = parse_usize_field(&fields, "node_count")?;
+    let node_count = bounded_count(
+        "node_count",
+        parse_usize_field(&fields, "node_count")?,
+        MAX_MEMBERSHIP_NODE_COUNT,
+        fields.len(),
+    )?;
     let mut nodes = Vec::with_capacity(node_count);
     for index in 0..node_count {
         let node = MembershipNode {
@@ -1226,7 +1244,12 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
         };
         nodes.push(node);
     }
-    let approver_count = parse_usize_field(&fields, "approver_count")?;
+    let approver_count = bounded_count(
+        "approver_count",
+        parse_usize_field(&fields, "approver_count")?,
+        MAX_MEMBERSHIP_APPROVER_COUNT,
+        fields.len(),
+    )?;
     let mut approver_set = Vec::with_capacity(approver_count);
     for index in 0..approver_count {
         let approver = MembershipApprover {
@@ -1272,7 +1295,12 @@ fn parse_signed_update_envelope(value: &str) -> Result<SignedMembershipUpdate, M
         .map_err(|_| MembershipError::InvalidFormat("update payload is not utf8".to_owned()))?;
     let record = parse_membership_update_payload(&payload)?;
 
-    let sig_count = parse_usize_field(&fields, "sig_count")?;
+    let sig_count = bounded_count(
+        "sig_count",
+        parse_usize_field(&fields, "sig_count")?,
+        MAX_MEMBERSHIP_SIGNATURE_COUNT,
+        fields.len(),
+    )?;
     let mut signatures = Vec::with_capacity(sig_count);
     for index in 0..sig_count {
         signatures.push(MembershipSignature {
@@ -1557,6 +1585,33 @@ fn parse_usize_field(
     required_field(fields, key)?
         .parse::<usize>()
         .map_err(|_| MembershipError::InvalidFormat(format!("invalid usize field {key}")))
+}
+
+/// Validate a decoder length/count field before it is used to pre-allocate a
+/// `Vec`. Rejects counts above the hard `max` ceiling and, as a second bound,
+/// any count exceeding the number of parsed fields: every element contributes
+/// at least one indexed `key=value` line, so a legitimate count can never
+/// exceed `field_total`. Because `field_total` is itself bounded by the
+/// size-capped input (the 4 KiB IPC envelope or the 8 MiB snapshot read cap),
+/// this prevents capacity-overflow / memory-exhaustion aborts from a hostile
+/// count regardless of which path the payload arrived on.
+fn bounded_count(
+    label: &str,
+    count: usize,
+    max: usize,
+    field_total: usize,
+) -> Result<usize, MembershipError> {
+    if count > max {
+        return Err(MembershipError::InvalidFormat(format!(
+            "{label} {count} exceeds maximum {max}"
+        )));
+    }
+    if count > field_total {
+        return Err(MembershipError::InvalidFormat(format!(
+            "{label} {count} exceeds parsed field count {field_total}"
+        )));
+    }
+    Ok(count)
 }
 
 fn validate_membership_node_capabilities(node: &MembershipNode) -> Result<(), MembershipError> {
@@ -2374,6 +2429,80 @@ mod tests {
         std::fs::write(&log, tampered).expect("tampered log should write");
         let bad = load_membership_log(&log);
         assert!(bad.is_err());
+    }
+
+    // --- RN-01: decoder count fields must be bounded before pre-allocation ---
+
+    #[test]
+    fn bounded_count_rejects_over_max_and_over_field_total() {
+        use super::{MAX_MEMBERSHIP_NODE_COUNT, bounded_count};
+        // Over the hard ceiling.
+        assert!(
+            bounded_count(
+                "c",
+                MAX_MEMBERSHIP_NODE_COUNT + 1,
+                MAX_MEMBERSHIP_NODE_COUNT,
+                usize::MAX
+            )
+            .is_err()
+        );
+        // Within the ceiling but exceeding the parsed field total.
+        assert!(bounded_count("c", 10, MAX_MEMBERSHIP_NODE_COUNT, 5).is_err());
+        // Legitimate count is accepted unchanged.
+        assert_eq!(
+            bounded_count("c", 3, MAX_MEMBERSHIP_NODE_COUNT, 7).expect("valid count"),
+            3
+        );
+    }
+
+    #[test]
+    fn decode_membership_state_rejects_oversized_node_count() {
+        // A hostile node_count must be rejected (not abort via capacity
+        // overflow / OOM) before any node fields are read.
+        let payload = "version=1\nnetwork_id=net-1\nepoch=1\nquorum_threshold=2\n\
+                       metadata_hash=\nnode_count=18446744073709551615\napprover_count=0\n";
+        let err = super::decode_membership_state(payload)
+            .expect_err("oversized node_count must be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn decode_membership_state_rejects_oversized_approver_count() {
+        let payload = "version=1\nnetwork_id=net-1\nepoch=1\nquorum_threshold=2\n\
+                       metadata_hash=\nnode_count=0\napprover_count=18446744073709551615\n";
+        let err = super::decode_membership_state(payload)
+            .expect_err("oversized approver_count must be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn decode_signed_update_rejects_oversized_sig_count() {
+        // Build a valid inner update record so parsing reaches sig_count.
+        let state = base_state();
+        let new_node = active_node("node-b", 12);
+        let mut candidate = state.clone();
+        candidate.nodes.push(new_node.clone());
+        candidate.epoch += 1;
+        let record = MembershipUpdateRecord {
+            network_id: state.network_id.clone(),
+            update_id: "update-bounds".to_owned(),
+            operation: MembershipOperation::AddNode(new_node),
+            target: "node-b".to_owned(),
+            prev_state_root: state.state_root_hex().expect("root"),
+            new_state_root: candidate.state_root_hex().expect("root"),
+            epoch_prev: state.epoch,
+            epoch_new: state.epoch + 1,
+            created_at_unix: 120,
+            expires_at_unix: 600,
+            reason_code: "join".to_owned(),
+            policy_context: Some("enrollment".to_owned()),
+        };
+        let payload = super::encode_update_record(&record).expect("encode record");
+        let payload_hex = hex_encode(payload.as_bytes());
+        let envelope = format!("payload_hex={payload_hex}\nsig_count=18446744073709551615\n");
+        let err = super::decode_signed_update(&envelope)
+            .expect_err("oversized sig_count must be rejected");
+        assert!(matches!(err, MembershipError::InvalidFormat(_)));
     }
 }
 

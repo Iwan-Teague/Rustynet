@@ -26,3 +26,6 @@ daemon = ["tokio", "tracing", "serde", "serde_json", "windows-service"]
 [[bin]]
 name = "rustynet-relay"
 required-features = ["daemon"]
+
+[lints]
+workspace = true
