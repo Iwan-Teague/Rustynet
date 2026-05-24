@@ -75,6 +75,7 @@ guarantee.
 - **Description:** `node_count`, `approver_count`, `sig_count` are read from the text body and passed straight to `Vec::with_capacity(count)` before validation or signature checks. No upper bound and no field-count cross-check. Verified: there is no max-count constant in `membership.rs`, in direct contrast to the sibling `rustynet-dns-zone` parser which caps `record_count > MAX_RECORD_COUNT` and cross-checks `fields.len()` before allocating.
 - **Impact / scenario:** `node_count=18446744073709551615` → capacity-overflow panic (process abort); `node_count=100000000` → ~13 GB request → allocation abort. Reachable two ways: (a) authenticated IPC `membership apply <b64>` (`daemon.rs:7141`) — the 4096-byte command cap is no protection since `sig_count=99999999999` is ~22 bytes, and the crash precedes signature/quorum checks; (b) an attacker-influenceable on-disk snapshot — its integrity gate is an **unkeyed SHA-256** over the payload, so a malicious `node_count` with a matching digest crashes the daemon at next decode, defeating fail-closed startup.
 - **Remediation:** Add `MAX_MEMBERSHIP_NODE_COUNT` / `_APPROVER_COUNT` / `_SIG_COUNT` constants and reject oversized counts before allocation; add the `fields.len() == expected_field_count` cross-check (mirror dns-zone). Defense-in-depth: use `Vec::new()` + `push`. Add negative tests and structured seeds to the two membership fuzz targets (the count fields sit behind a `version` gate, which is why fuzzing hasn't reached them).
+- **Status: FIXED 2026-05-24** — see Remediation log RL-1.
 
 ### RN-02 — The audited dataplane module (`dataplane.rs`) is dead code; its killswitch/ACL/fail-closed controls never run **[verified]**
 - **Domain:** Dataplane · **CWE-1164 / CWE-684** · **Confidence: High**
@@ -162,6 +163,7 @@ guarantee.
 - **Location:** `Cargo.toml:29-30` declares `[workspace.lints.rust] unsafe_code = "forbid"`; verified no crate manifest contains `[lints] workspace = true`.
 - **Description:** Cargo only applies `[workspace.lints]` to members that opt in; none do, so the compiler never enforces it. The property holds today via per-file `#![forbid(unsafe_code)]` on 13/14 crate roots (only the FFI crate `rustynet-windows-native` lacks it, as expected) plus the `ops check-no-unsafe-rust-sources` scanner — but the manifest-level control is doing nothing, and a newly-added crate without the per-file attribute could slip through.
 - **Remediation:** Add `[lints]\nworkspace = true` to each member crate; let `rustynet-windows-native` locally override with a documented allow.
+- **Status: FIXED 2026-05-24** — see Remediation log RL-2.
 
 ### RN-15 — CI build/test/clippy do not use `--locked` (lockfile integrity not enforced)
 - **Domain:** Supply chain · **CWE-829** · **Confidence: High**
@@ -248,5 +250,127 @@ The review explicitly credits these as present and correct:
 - Privileged-boundary controls (RN-17..20 context): program enum → hardcoded absolute binary candidates → root-owned/non-writable validation; argv-only exec; SO_PEERCRED + 0660 socket. **Confirmed.**
 
 The remaining findings are domain-review results that should be reproduced
-against the cited `file:line` before fix sign-off; none required code changes
-during this review (read-only).
+against the cited `file:line` before fix sign-off.
+
+## 10. Remediation log
+
+Fixes landed on branch `claude/test-coverage-analysis-FDUBe`. Each follows the
+project mandate: an enforcement point in code plus a verification test.
+
+### RL-1 — RN-01 membership decoder count bounds **(landed)**
+- **Files:** `crates/rustynet-control/src/membership.rs`.
+- **Change:** Added three ceilings — `MAX_MEMBERSHIP_NODE_COUNT = 65_536`,
+  `MAX_MEMBERSHIP_APPROVER_COUNT = 4_096`, `MAX_MEMBERSHIP_SIGNATURE_COUNT =
+  4_096` — and a `bounded_count(label, count, max, field_total)` helper that
+  rejects any count above the ceiling **or** above the parsed field total
+  (every element needs ≥1 indexed field, so a legitimate count can never
+  exceed `fields.len()`; and `fields.len()` is itself bounded by the 4 KiB IPC
+  envelope cap / 8 MiB snapshot read cap). Wired it at all three
+  `Vec::with_capacity` sites (`node_count`, `approver_count`, `sig_count`)
+  before allocation, so the guard runs before any element is read and well
+  before signature/quorum verification.
+- **Why this shape:** the `> field_total` bound closes the hole on every
+  arrival path (IPC and on-disk artifact) regardless of the ceiling, while the
+  named ceilings document intent and bound the worst-case pre-allocation. This
+  mirrors the existing `rustynet-dns-zone` discipline.
+- **Tests added (4):** `bounded_count_rejects_over_max_and_over_field_total`
+  (unit), `decode_membership_state_rejects_oversized_node_count`,
+  `decode_membership_state_rejects_oversized_approver_count`,
+  `decode_signed_update_rejects_oversized_sig_count` (each drives the public
+  decode entry with a `…=18446744073709551615` count and asserts a graceful
+  `InvalidFormat`, not an abort).
+- **Verification:** `cargo fmt -p rustynet-control -- --check` clean;
+  `cargo clippy -p rustynet-control --all-targets --all-features -- -D warnings`
+  clean; `cargo test -p rustynet-control --lib` → 237 passed (incl. the 4 new).
+- **Follow-up (not yet done):** add structured seed corpora to the
+  `membership_decode_state` / `membership_decode_signed_update` fuzz targets so
+  the count fields (behind the `version` gate) become reachable by the fuzzer.
+
+### RL-2 — RN-14 make the workspace `unsafe_code` lint real **(landed)**
+- **Files:** the 13 member crate `Cargo.toml`s that already carry per-file
+  `#![forbid(unsafe_code)]` (`rustynet-backend-api`, `-backend-stub`,
+  `-backend-userspace`, `-backend-wireguard`, `-cli`, `-control`, `-crypto`,
+  `-dns-zone`, `-local-security`, `-policy`, `-relay`, `-sysinfo`, `rustynetd`).
+- **Change:** appended `[lints]\nworkspace = true` so each crate inherits the
+  workspace-level `unsafe_code = "forbid"`, making the compiler enforce it (not
+  just the per-file attribute + the `ops check-no-unsafe-rust-sources` scanner).
+- **Deliberately excluded:** `rustynet-windows-native` (legitimate Win32 FFI;
+  the source scanner already allowlists it). Opting it in would force-forbid
+  its required `unsafe` and break the build — so it is left without the stanza,
+  matching the finding's prescribed remediation.
+- **Verification:** `cargo check --workspace --all-targets --all-features`
+  compiles (no `unsafe_code` violations surfaced; the workspace lint is now
+  active for all 13 opted-in crates). A newly-added crate that opts into
+  workspace lints now gets compiler-enforced `forbid(unsafe_code)` for free.
+- **Pre-existing note:** the workspace check surfaces an unrelated
+  `unused_mut` warning in `rustynetd` lib tests (not introduced here); worth a
+  separate cleanup since the CI gate runs clippy `-D warnings`.
+
+## 11. Remediation design notes for the remaining P0s (pre-implementation)
+
+These P0s are **behavioral/semantic** changes that carry real regression risk
+(breaking legitimate traffic, or refusing to boot) or encode a policy
+decision. They are scoped here so the implementer (and owner) can choose the
+exact behavior before code lands — recommended to confirm direction first
+rather than unilaterally change fail-closed/leak semantics.
+
+### RN-03 / RN-04 — fail-open on `force_fail_closed` + pre-killswitch bootstrap window
+- **Design choice to confirm:** on `force_fail_closed` error, **terminate** the
+  process (let systemd + a *mandatory* boot killswitch backstop) vs **retry**
+  `block_all_egress` with backoff while refusing to serve. Recommendation:
+  terminate on the bootstrap (`Init`, no prior table) path where there is no
+  `policy drop` backstop; retry-with-refuse on the steady-state path where a
+  prior generation table already enforces `policy drop`.
+- **Concrete steps:** (1) change the ~10 `let _ = …force_fail_closed(…)` sites
+  to match on the Result and escalate; (2) make the `linux_killswitch_boot.rs`
+  `ExecStartPre` installer mandatory in the shipped unit and gate
+  `backend.start()` on the boot killswitch table being present; (3) reorder
+  `apply_dataplane_generation` so the `policy drop` killswitch is programmed
+  **before** `backend.start()` and route apply. Regression risk: a too-early
+  killswitch could black-hole bootstrap traffic (control-plane fetch, STUN) —
+  ensure the loopback/established/WG-port/control carve-outs are added in the
+  same atomic step as the `policy drop`.
+- **Tests:** simulate `block_all_egress` failure on first boot (inject an nft
+  error) and assert the daemon refuses to serve / exits rather than running
+  open; assert no interface-up-without-killswitch window in the apply order.
+
+### RN-05 / RN-11 — policy default-allow (non-`node:` selectors + empty membership)
+- **Policy decision to confirm:** how should revocation apply to
+  `group:`/`tag:`/`user:` selectors? Recommendation: the policy compiler
+  resolves each non-`node:` source selector to its constituent member node set
+  at evaluation (or compile) time and denies if **any** required member is
+  revoked/unknown; selectors that cannot be resolved to membership-checked
+  nodes are rejected for trust-sensitive rules. For RN-11, default an empty
+  membership directory to **deny** unless an explicit
+  `--membership-governance=disabled` opt-out is set, and always fail closed if
+  a snapshot path was configured but failed to load.
+- **Regression risk:** flipping empty-directory to deny will break
+  pre-governance / first-bring-up deployments that currently rely on the
+  permissive default — hence the explicit opt-out flag. Confirm the deployment
+  story before flipping.
+- **Tests:** revoked identity expressed via each selector type is denied;
+  empty directory denies unless opt-out; configured-but-unloadable snapshot
+  fails closed.
+
+### RN-06 / RN-07 — Windows killswitch + IPv6 parity with Linux
+- **Design:** scope the Windows `interfacetype=lan` egress allow to exactly the
+  bootstrap set (WG UDP to peer/relay endpoints + STUN + management), mirroring
+  Linux's narrow `oifname <egress> udp dport <wgport> accept`; everything else
+  hits the global `blockoutbound`. Add an explicit IPv6 outbound block
+  (advfirewall block for non-tunnel `::/0`, or unbind IPv6 on the egress
+  adapter) and flush autoconfigured global IPv6 addresses; assert both in
+  `assert_killswitch`.
+- **Regression risk:** narrowing the Windows allow can break management/roaming
+  if the bootstrap set is under-specified — enumerate every legitimate
+  bootstrap flow first. Needs a Windows lab run to validate (no Linux-CI
+  coverage for the firewall rules).
+
+### RN-10 — corrupt rotation ledger must fail closed (P1, contained)
+- **Design:** in `load_rotation_ledger`, distinguish *absent* (→ `genesis()`,
+  already correct) from *corrupt/unparseable* (→ propagate the error and refuse
+  to enter key-bearing operation), matching the function's own doc contract.
+- **Regression risk:** a genuinely-corrupt-but-recoverable ledger would now
+  block boot — that is the intended fail-closed behavior, but pair it with a
+  clear operator runbook entry for recovery.
+- **Tests:** corrupt-digest / truncated / monotonicity-violation ledgers cause
+  bootstrap refusal; absent ledger still yields genesis.

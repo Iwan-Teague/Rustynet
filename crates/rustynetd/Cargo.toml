@@ -38,3 +38,6 @@ test-harness = ["rustynet-backend-wireguard/test-harness"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true
