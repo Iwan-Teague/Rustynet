@@ -3974,6 +3974,7 @@ stage_run_live_anchor() {
 
 stage_run_live_exit_handoff() {
   local alternate_label alternate_target alternate_node_id
+  local exit_platform wrapper report_path log_path monitor_log
   if has_label entry; then
     alternate_label="entry"
   elif has_label aux; then
@@ -3984,8 +3985,42 @@ stage_run_live_exit_handoff() {
   fi
   alternate_target="$(node_target_for_label "$alternate_label")"
   alternate_node_id="$(node_id_for_label "$alternate_label")"
+
+  # Track B Phase 1: dispatch the exit-handoff stage per active-exit
+  # platform, mirroring stage_run_live_anchor. Today only the linux
+  # wrapper drives a real validator end-to-end; the macos / windows
+  # wrappers exist as the dispatcher fabric and fail closed with a
+  # Phase 3/4 marker. This keeps the orchestrator's per-platform
+  # contract symmetric across exit/relay/anchor and avoids silently
+  # running Linux assertions against a non-Linux host.
+  exit_platform="$(node_platform_for_label exit)"
+  case "$exit_platform" in
+    linux)
+      wrapper="$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh"
+      report_path="$REPORT_DIR/live_linux_exit_handoff_report.json"
+      log_path="$REPORT_DIR/live_linux_exit_handoff.log"
+      monitor_log="$REPORT_DIR/live_linux_exit_handoff_monitor.log"
+      ;;
+    macos)
+      wrapper="$ROOT_DIR/scripts/e2e/live_macos_exit_handoff_test.sh"
+      report_path="$REPORT_DIR/live_macos_exit_handoff_report.json"
+      log_path="$REPORT_DIR/live_macos_exit_handoff.log"
+      monitor_log="$REPORT_DIR/live_macos_exit_handoff_monitor.log"
+      ;;
+    windows)
+      wrapper="$ROOT_DIR/scripts/e2e/live_windows_exit_handoff_test.sh"
+      report_path="$REPORT_DIR/live_windows_exit_handoff_report.json"
+      log_path="$REPORT_DIR/live_windows_exit_handoff.log"
+      monitor_log="$REPORT_DIR/live_windows_exit_handoff_monitor.log"
+      ;;
+    *)
+      printf 'unsupported exit platform for live_exit_handoff: %s\n' "$exit_platform" >&2
+      return 1
+      ;;
+  esac
+
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_exit_handoff_test.sh" \
+  bash "$wrapper" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --exit-a-host "$(node_target_for_label exit)" \
@@ -3995,9 +4030,9 @@ stage_run_live_exit_handoff() {
     --exit-b-host "$alternate_target" \
     --exit-b-node-id "$alternate_node_id" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/live_linux_exit_handoff_report.json" \
-    --log-path "$REPORT_DIR/live_linux_exit_handoff.log" \
-    --monitor-log "$REPORT_DIR/live_linux_exit_handoff_monitor.log"
+    --report-path "$report_path" \
+    --log-path "$log_path" \
+    --monitor-log "$monitor_log"
 }
 
 stage_run_live_two_hop() {
