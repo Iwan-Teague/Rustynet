@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod enrollment;
 pub mod ga;
+pub mod key_rotation;
 pub mod membership;
 pub mod operations;
 pub mod persistence;

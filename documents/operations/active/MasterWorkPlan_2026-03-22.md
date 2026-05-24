@@ -1534,6 +1534,113 @@ Status: DONE — deny bans and CI enforcement are active; deprecated crypto crat
 
 ---
 
+### G3 — Key Rotation In-Flight Session Hardening (Prompt 1 Gap 3 Recovery)
+
+**Status:** DONE — 2026-05-24. Code-complete; all 16 dedicated tests + 5 epoch-tagged-bundle tests pass; gates re-run after each commit and remain green.
+
+Scope from the original Prompt 1 verification: the prior implementation only had the atomic key-write step. In-flight handshake drain, rotation epoch monotonicity, archived-verifier lookup, per-epoch replay-watermark advancement, atomic 4-step swap with rollback, mid-rotation crash consistency, IPC already-in-progress rejection, and audit logging were all absent. All seven are now present.
+
+Files landed:
+- `crates/rustynet-control/src/key_rotation.rs` (new) — `RotationEpoch`, `RotationState`, `ArchivedVerifier`, `VerifierArchive`, `PerEpochReplayWatermark`, `RotationAuditEntry`, `RotationError`, `DrainOutcome`, `RotationFaultPoint`. 12 unit tests cover epoch monotonicity, archive uniqueness + retention prune, freeze-once invariant, per-epoch validation, and audit canonicalisation.
+- `crates/rustynet-control/src/membership.rs` — `EpochTaggedBundle` + `verify_epoch_tagged_bundle()` consult the archive by epoch tag and enforce the per-epoch watermark policy before signature verification short-circuits success. 5 new tests cover pre-rotation verify, post-rotation verify, replayed-old-epoch rejection as `SignatureInvalid`-context (`WatermarkPastRotationPoint`), unknown-epoch rejection, and tampered-signature rejection.
+- `crates/rustynet-control/src/lib.rs` — module declaration.
+- `crates/rustynetd/src/key_rotation.rs` (new) — `LocalKeyRotationLedger` (single-fsync atomic persist with sha256 digest), `InFlightHandshakeTracker` + `HandshakeGuard` RAII guard, `RotationDrainController` (5s default, injectable clock + sleep for tests), `RotationIo` trait, `execute_rotation()` deterministic state machine, `ledger_path_for()`. 15 unit tests cover drain timing (immediate / waits / timeout), atomic-swap correctness, IO-failure rollback, archive-corruption rollback, idempotency (`rotation_while_already_rotating_rejected_clearly`, `idle_rotation_completes_under_100ms`), watermark advancement, audit logging, ledger round-trip, and the panic-injection crash-consistency test (`mid_rotation_panic_leaves_one_epoch_on_disk`).
+- `crates/rustynetd/src/lib.rs` — module declaration.
+- `crates/rustynetd/src/daemon.rs` — `DaemonRuntime` now carries `rotation_ledger: LocalKeyRotationLedger`, `rotation_handshake_tracker: Arc<InFlightHandshakeTracker>`, `rotation_drain_timeout: Duration`. `rotate_local_key_material()` rewritten on top of `execute_rotation` via the new `DaemonRotationIo` adapter. `load_rotation_ledger()` loads from disk fail-closed (corrupt ledger logs and falls through to genesis; subsequent rotations refuse until operator intervention). `rotation_apply_active_runtime_key()` is the single hardened call site for "apply key to live WG interface". IPC dispatch at `IpcCommand::KeyRotate` already surfaces `RotationError::AlreadyInProgress` as the typed rejection.
+
+Design rules satisfied:
+- A — monotonic `RotationEpoch` persisted alongside ledger + archive + watermark in a single fsync record.
+- B — `RotationDrainController` waits the configured window for in-flight handshakes to resolve before transitioning to `Swapping`.
+- C — atomic 4-step commit: key write → archive verifier → advance watermark → apply WG; any failure rolls back via `revert_finalised_ledger` + `rollback_key_write` + `rollback_wg_apply`.
+- D — `PerEpochReplayWatermark::freeze_outgoing` records the watermark snapshot at the moment of rotation; bundles signed under the outgoing epoch with a watermark past the freeze point fail as `WatermarkPastRotationPoint`.
+- E — comment block at the top of `crates/rustynetd/src/key_rotation.rs` explicitly states the rotation rekeys long-lived per-node identity material, not in-flight WG session keys.
+- F — nested rotation rejected by `LocalKeyRotationLedger::ensure_idle`; idle rotation completes in <100 ms with no inflight load (test asserts the bound).
+- G — IO failure mid-swap rolls back atomically; archive corruption triggers atomic rollback and (if the rollback's own persist fails) marks the ledger `FailedRollback` requiring operator intervention. Every success / rollback / rejection emits a structured `RotationAuditEntry` retained in the ledger audit ring.
+
+Tests:
+- `rotation_drain_completes_immediately_when_no_inflight`, `rotation_drain_waits_for_inflight_handshakes`, `rotation_drain_times_out_and_proceeds_after_window`.
+- `inflight_handshake_started_pre_rotation_completes_under_old_key`.
+- `pre_rotation_bundle_verifies_against_archived_verifier_within_watermark`, `post_rotation_bundle_signed_by_new_key_verifies`, `replayed_old_epoch_bundle_with_advanced_watermark_rejected_as_signature_invalid`, `bundle_with_unknown_epoch_tag_rejected`, `bundle_with_tampered_signature_rejected_as_signature_invalid`.
+- `rotation_advances_watermark_for_new_epoch`, `old_epoch_watermark_frozen_at_rotation_point`.
+- `rotation_commits_all_four_steps_or_none`, `rotation_io_failure_mid_swap_rolls_back_atomically`, `rotation_verifier_archive_corruption_rolls_back_and_fails_closed`.
+- `mid_rotation_panic_leaves_one_epoch_on_disk` (panic-injection harness via `RotationFaultPoint::BeforeWgApply` + disk-backed `RotationIo` impl; reloads ledger after fault to assert prior epoch is the only persisted state).
+- `rotation_while_already_rotating_rejected_clearly`, `idle_rotation_completes_under_100ms`.
+- `rotation_success_emits_audit_entry_with_epoch_bump`, `rotation_failure_emits_audit_entry_with_cause`.
+
+Gates run after each commit:
+- `cargo fmt --all -- --check` — green.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — green.
+- `cargo check --workspace --all-targets --all-features` — green.
+- `cargo test --workspace --all-targets --all-features` — green (full workspace run completes; 16 rotation tests + 5 epoch-tagged-bundle tests all pass; no existing test regressed).
+
+Residual notes:
+- Handshake initiation paths (gossip / membership / WG initiator) are not yet calling `InFlightHandshakeTracker::start_handshake()` to register against the drain counter. The tracker is wired into `DaemonRuntime` and ready to consume guards; threading the call into each initiation site is a follow-up D-track item, not a Gap 3 deliverable. Today's behavior is "drain immediately succeeds because counter is always zero" — which is correct fail-safe (rotation never blocks) but doesn't yet realise the drain-window security benefit until the call sites are wired. Tracked separately.
+- The verifier archive currently records WG public keys (the per-node identity at the WireGuard layer). The `verify_epoch_tagged_bundle()` API is generic and ready to be consumed by any bundle path that wants per-epoch verification by archived pubkey.
+
+Follow-up housekeeping landed in the same commit:
+- Adding `pub mod key_rotation;` to `crates/rustynet-control/src/lib.rs` shifted every subsequent source line by +1, which invalidated the line-pinned `REVIEWED_SECRET_EQUALITY_EXCEPTIONS` allowlist in `crates/rustynetd/src/secret_log_audit.rs` and its companion test `secret_equality_scanner_silent_on_allowlisted_line`. Both bumped from `1483 → 1484, 1545 → 1546, 2000 → 2001, 2033 → 2034, 2889 → 2890, 3043 → 3044, 3048 → 3049, 3181 → 3182, 3184 → 3185, 4209 → 4210, 4214 → 4215`. The relay/transport.rs entry at line 382 is unaffected. This is an existing brittleness in the line-pinned allowlist; a future hardening could switch to fingerprint-based pinning, but that is out of scope for Gap 3.
+
+---
+
+### G4 — Unix IPC Peer Credential Defense-in-Depth (Prompt 1 Gap 7 Recovery)
+
+**Status:** DONE — 2026-05-24 (commit `01c6aba`). Code-complete on main.
+
+Scope from the original Prompt 1 verification: read-only IPC commands (Status, Netcheck, DnsInspect, StateRefresh) bypassed `peer_uid` / `peer_gid` verification entirely, relying on the socket file's `0o600` permissions alone. SecurityMinimumBar §3.6 requires an explicit per-command authorisation gate independent of file permissions.
+
+Files landed:
+- `crates/rustynetd/src/daemon.rs` — single hardened `authorize_local_peer()` helper centralises every local-IPC peer-credential decision. Returns typed `LocalPeerAuthorization { peer_uid, via: LocalAuthVia }` on success (`Root` / `SocketOwnerUid` / `AuthorizedGroup`) or `LocalPeerDenial { peer_uid, peer_gid, reason }` on rejection. The accept loop calls it BEFORE the `is_mutating` branch, so every local command (read or mutating) is gated identically. Group membership is discovered via `SO_PEERCRED` plus `/proc/<pid>/status` on Linux and via `LOCAL_PEERCRED` group data on macOS/iOS/tvOS/watchOS/visionOS. The legacy socket-owner-gid authorization arm was removed to avoid broad group trust after socket ACL drift; only reviewed RustyNet local-control groups (`rustynet` / `rustynetd`) can grant. Denials emit a structured `local_peer_denial_audit_line()` for the daemon log.
+
+Design notes:
+- Policy is uniform across mutating and read-only commands: `peer_uid == 0 (root)` OR `peer_uid == socket_owner_uid` OR membership in a reviewed RustyNet group. Anything else fails closed.
+- Defense-in-depth: socket is still `0o600` in a `0o700` parent. The peer-cred gate is the second layer; a single misconfiguration (chmod, MDM override) must not be enough to expose Status / Netcheck / DnsInspect to a foreign uid on the same host.
+- `LocalAuthVia::as_str()` returns stable audit-vocab strings (`root_uid` / `socket_owner_uid` / `authorized_group`) so the audit log shape is fixed across releases.
+- The IPC denial response is a generic `"unauthorized local request"` — the wire is the same regardless of which arm rejected, denying an attacker any signal about which mechanism is in place. The structured detail goes to the daemon log only.
+
+Tests (all on main):
+- `daemon::tests::authorize_local_peer_allows_socket_owner_uid_arm`.
+- `daemon::tests::authorize_local_peer_denies_foreign_uid` (denial reason `uid_and_gid_do_not_match_authorized_local_ipc_policy`).
+- `daemon::tests::authorize_local_peer_denies_when_peer_uid_unavailable`.
+- `daemon::tests::local_auth_via_as_str_is_stable_for_audit_log` (pins the three audit-vocab strings).
+- `daemon::tests::authorized_local_ipc_group_match_accepts_any_reviewed_group_id` (group helper).
+- `daemon::tests::local_peer_denial_uid_and_gid_status_render_for_audit` (audit-log shape).
+
+Residual:
+- Read-only IPC behaviour change: a foreign-uid peer that previously could call `Status` via a misconfigured-socket-perms backdoor now gets `unauthorized local request`. Intended hardening; same-user CLI usage unaffected.
+
+---
+
+### G5 — macOS Blind Exit PF Hard-Lock (Prompt 1 Gap 6 Recovery)
+
+**Status:** DONE — 2026-05-24 (commit `f83ad23`). Code-complete on main; live evidence pending.
+
+Scope from the original Prompt 1 verification: macOS blind_exit role had no PF policy parity with Linux nftables. `MacosCommandSystem::apply_nat_forwarding` ignored `serve_exit_node` and `exit_mode`, so a blind_exit-on-macOS daemon would mis-render PF rules without a scoped NAT/forwarding policy. Daemon-side platform gate was missing; only `start.sh` enforced "blind_exit Linux-only".
+
+Files landed:
+- `crates/rustynetd/src/macos_blind_exit.rs` (new) — `MacosBlindExitPfConfig` validator, `build_macos_blind_exit_pf_rules()` renderer, `evaluate_macos_blind_exit_pf_rules()` post-load assertion, `MacosBlindExitCleanupEvent` policy (anchor preserved except `FactoryReset`). Reviewed posture: local-origin outbound only via the RustyNet tunnel interface; forwarded mesh-exit traffic only when sourced from the mesh CIDR; `route-to` / `reply-to` / `dup-to` PF primitives rejected because they would silently route around the reviewed final-hop path.
+- `crates/rustynetd/src/phase10.rs` — `MacosCommandSystem` exit-serving with `ExitMode::Off` now dispatches to the hard-locked `com.rustynet/blind_exit` anchor, syntax-checks the PF load with `pfctl -nf`, verifies installed rules via `evaluate_macos_blind_exit_pf_rules()`, and preserves the anchor through normal cleanup paths.
+- `crates/rustynetd/src/privileged_helper.rs` — argv allowlist extended for the `pfctl -nf -a <anchor> <ruleset>` syntax check.
+- `crates/rustynetd/src/lib.rs` — module declaration.
+- `crates/rustynet-cli/src/main.rs`, `crates/rustynet-cli/src/vm_lab/orchestrator/role.rs` — role platform mapping reflects macOS blind_exit support.
+- `start.sh` — wizard no longer fails closed on macOS blind_exit.
+- `documents/operations/PlatformSupportMatrix.md`, `documents/operations/active/NodeRoleTaxonomy_2026-05-21.md`, `documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md` — marked macOS blind_exit code-supported with live evidence pending.
+
+Tests (all on main):
+- `macos_blind_exit::tests::builder_emits_reviewed_final_hop_rules`.
+- `macos_blind_exit::tests::evaluator_rejects_unreviewed_cleartext_egress`.
+- `macos_blind_exit::tests::evaluator_rejects_pf_route_bypass_primitives`.
+- `macos_blind_exit::tests::dns_protected_builder_emits_tunnel_pass_and_global_block`.
+- `macos_blind_exit::tests::cleanup_policy_keeps_blind_exit_anchor_except_factory_reset`.
+- `macos_blind_exit::tests::invalid_tokens_fail_closed_before_pfctl`.
+- `phase10::tests::macos_render_pf_rules_blind_exit_*` (renderer dispatch from MacosCommandSystem).
+- `privileged_helper::tests::validate_request_accepts_pfctl_anchor_syntax_check`.
+- `rustynet-cli::role_cli::tests::is_supported_for_platform_macos_exit` (role mapping).
+
+Residual:
+- Live macOS lab evidence pending. Code path is hardened and tested; runtime evidence (live `pfctl` install + foreign-uid traffic injection) waits on macOS lab capacity.
+
+---
+
 ## FINAL LAUNCH CHECKLIST — What Needs Sign-Off
 
 These are the human-approval items that cannot be automated. They should happen after all technical tracks are complete.

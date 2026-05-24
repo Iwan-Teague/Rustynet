@@ -14,6 +14,7 @@ pub mod peer_gossip;
 
 pub mod ipc;
 pub mod key_material;
+pub mod key_rotation;
 pub mod linux_authenticode;
 pub mod linux_dns_failclosed;
 pub mod linux_exit_dns_failclosed;
