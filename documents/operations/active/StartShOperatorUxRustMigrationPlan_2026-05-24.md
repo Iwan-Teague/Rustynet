@@ -507,3 +507,1298 @@ Rust, and the last direct shell mutations removed from the active path.
 
 Recommended first slice: **Phase 1, section 4.1 (CONFIG core)** — pure,
 high security value, immediately gate-able, and it unblocks the menu wiring.
+
+## Appendix A — Ready-to-paste reference implementations
+
+These are complete, faithful Rust ports of the pure-logic `start.sh`
+functions, written for the new `crates/rustynet-operator` crate. They are
+`std`-only, `#![forbid(unsafe_code)]`-clean, Rust 2024 edition, and include
+unit tests. Behavior mirrors the shell exactly (including its quirks, which
+are called out in comments). The `print_warn`/`print_err` side effects are
+replaced by returned `Vec<String>` warnings / `Result` errors so the logic
+is pure and testable; the CLI layer prints them.
+
+Drop each block at the path in its header comment. Known shell limitations
+that are intentionally preserved are flagged with `// NOTE(parity):`.
+
+### A.0 — Crate manifest
+
+```toml
+# crates/rustynet-operator/Cargo.toml
+[package]
+name = "rustynet-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Pure-logic core needs no external deps. When wiring config<->capabilities,
+# add: rustynet-control = { path = "../rustynet-control" }
+# When delegating permission checks, add:
+# rustynet-local-security = { path = "../rustynet-local-security" }
+
+[lints]
+workspace = true
+```
+
+Remember to add `"crates/rustynet-operator"` to the root `Cargo.toml`
+`members` list.
+
+### A.1 — `host.rs`
+
+```rust
+//! crates/rustynet-operator/src/host.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostProfile {
+    Linux,
+    Macos,
+    Windows,
+    Unsupported,
+}
+
+impl HostProfile {
+    /// Detect the current host. Mirrors apply_host_profile_defaults (L133):
+    /// anything that is not Linux/macOS/Windows is Unsupported.
+    pub fn detect() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Unsupported
+        }
+    }
+}
+```
+
+### A.2 — `role.rs`
+
+```rust
+//! crates/rustynet-operator/src/role.rs
+use crate::host::HostProfile;
+use crate::launch::{ExitChain, ExitChainHops, LanMode, LaunchProfile};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRole {
+    Admin,
+    Client,
+    BlindExit,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Client => "client",
+            Self::BlindExit => "blind_exit",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "admin" => Some(Self::Admin),
+            "client" => Some(Self::Client),
+            "blind_exit" => Some(Self::BlindExit),
+            _ => None,
+        }
+    }
+}
+
+/// The six user-selectable presets (NodeRoleTaxonomy_2026-05-21.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolePreset {
+    Anchor,
+    Admin,
+    Exit,
+    Relay,
+    Client,
+    BlindExit,
+}
+
+impl RolePreset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anchor => "anchor",
+            Self::Admin => "admin",
+            Self::Exit => "exit",
+            Self::Relay => "relay",
+            Self::Client => "client",
+            Self::BlindExit => "blind_exit",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "anchor" => Some(Self::Anchor),
+            "admin" => Some(Self::Admin),
+            "exit" => Some(Self::Exit),
+            "relay" => Some(Self::Relay),
+            "client" => Some(Self::Client),
+            "blind_exit" => Some(Self::BlindExit),
+            _ => None,
+        }
+    }
+
+    /// Preset -> daemon-side primary role (start.sh L225-229).
+    pub fn primary_role(self) -> NodeRole {
+        match self {
+            Self::Client => NodeRole::Client,
+            Self::BlindExit => NodeRole::BlindExit,
+            Self::Admin | Self::Exit | Self::Relay | Self::Anchor => NodeRole::Admin,
+        }
+    }
+}
+
+pub fn is_blind_exit_supported_host(host: HostProfile) -> bool {
+    matches!(host, HostProfile::Linux | HostProfile::Macos)
+}
+
+/// Mirrors normalize_node_role + normalize_role_preset (start.sh L176-235).
+/// Pure: returns the normalized role/preset plus operator-facing warnings.
+///
+/// NOTE(parity): the shell reverts an unsupported-host blind_exit to client
+/// BEFORE applying preset coercion, so a `blind_exit` preset can re-assert
+/// the blind_exit role on an unsupported host. This port preserves that
+/// ordering; tighten it only as a deliberate, documented behavior change.
+pub fn normalize_role(
+    raw_role: Option<&str>,
+    raw_preset: Option<&str>,
+    setup_complete: bool,
+    host: HostProfile,
+) -> (NodeRole, Option<RolePreset>, Vec<String>) {
+    let mut warnings = Vec::new();
+
+    // --- normalize_node_role (L176) ---
+    let mut role = match raw_role.map(str::trim).filter(|s| !s.is_empty()) {
+        None => {
+            if setup_complete {
+                NodeRole::Admin
+            } else {
+                NodeRole::Client
+            }
+        }
+        Some(s) => match NodeRole::parse(s) {
+            Some(r) => r,
+            None => {
+                warnings.push(format!("Invalid NODE_ROLE='{s}', defaulting to 'client'."));
+                NodeRole::Client
+            }
+        },
+    };
+    if role == NodeRole::BlindExit && !is_blind_exit_supported_host(host) {
+        warnings.push(
+            "blind_exit role is supported only on Linux/macOS hosts. Reverting to client role."
+                .to_owned(),
+        );
+        role = NodeRole::Client;
+    }
+
+    // --- normalize_role_preset (L212) ---
+    let preset = match raw_preset.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => match RolePreset::parse(s) {
+            Some(p) => Some(p),
+            None => {
+                warnings.push(format!("Invalid SETUP_ROLE_PRESET='{s}', clearing."));
+                None
+            }
+        },
+    };
+    if let Some(p) = preset {
+        let expected = p.primary_role();
+        if role != expected {
+            warnings.push(format!(
+                "NODE_ROLE='{}' does not match SETUP_ROLE_PRESET='{}'; coercing to '{}'.",
+                role.as_str(),
+                p.as_str(),
+                expected.as_str()
+            ));
+            role = expected;
+        }
+    }
+
+    (role, preset, warnings)
+}
+
+/// The role-policy fields enforce_role_policy_defaults mutates. In the full
+/// crate these are fields of OperatorConfig (see plan §4.1); this focused
+/// struct keeps the reference impl self-contained and unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolePolicyState {
+    pub node_role: NodeRole,
+    pub manual_peer_override: bool,
+    pub auto_refresh_trust: bool,
+    pub default_launch_profile: LaunchProfile,
+    pub auto_port_forward_exit: bool,
+    pub exit_chain: ExitChain,
+    pub auto_launch_on_start: bool,
+    pub auto_launch_exit_node_id: Option<String>,
+    pub auto_launch_lan_mode: LanMode,
+    pub fail_closed_ssh_allow: bool,
+    pub fail_closed_ssh_cidrs: Vec<String>,
+}
+
+/// Mirrors enforce_role_policy_defaults (start.sh L299). Pure: the caller
+/// passes whether the trust signer key file exists (the shell does a `-f`
+/// test, L306) so this stays IO-free. Assumes `node_role` is already
+/// normalized via [`normalize_role`].
+pub fn enforce_role_policy_defaults(
+    state: &mut RolePolicyState,
+    trust_signer_key_present: bool,
+    trust_signer_key_path: &str,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if state.node_role == NodeRole::Admin {
+        return warnings;
+    }
+
+    // Break-glass manual peer override is removed; force off (L305).
+    state.manual_peer_override = false;
+
+    if state.auto_refresh_trust && !trust_signer_key_present {
+        warnings.push(format!(
+            "Trust signer key {trust_signer_key_path} is unavailable; disabling \
+             AUTO_REFRESH_TRUST for role '{}'.",
+            state.node_role.as_str()
+        ));
+        state.auto_refresh_trust = false;
+    }
+
+    match state.node_role {
+        NodeRole::Client => {
+            if matches!(
+                state.default_launch_profile,
+                LaunchProfile::QuickExitNode | LaunchProfile::QuickHybrid
+            ) {
+                warnings.push(format!(
+                    "Launch profile '{}' is admin-only; forcing 'quick-connect' for client role.",
+                    state.default_launch_profile.as_str()
+                ));
+                state.default_launch_profile = LaunchProfile::QuickConnect;
+            }
+            state.auto_port_forward_exit = false;
+        }
+        NodeRole::BlindExit => {
+            if state.default_launch_profile != LaunchProfile::QuickExitNode {
+                warnings.push(
+                    "blind_exit role enforces default launch profile 'quick-exit-node'."
+                        .to_owned(),
+                );
+                state.default_launch_profile = LaunchProfile::QuickExitNode;
+            }
+            state.exit_chain = ExitChain {
+                hops: ExitChainHops::One,
+                entry: None,
+                final_node: None,
+            };
+            state.auto_launch_on_start = true;
+            state.auto_launch_exit_node_id = None;
+            state.auto_launch_lan_mode = LanMode::Off;
+            state.fail_closed_ssh_allow = false;
+            state.fail_closed_ssh_cidrs.clear();
+        }
+        NodeRole::Admin => {}
+    }
+
+    warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_role_defaults_by_setup_state() {
+        let (r, _, _) = normalize_role(None, None, true, HostProfile::Linux);
+        assert_eq!(r, NodeRole::Admin);
+        let (r, _, _) = normalize_role(None, None, false, HostProfile::Linux);
+        assert_eq!(r, NodeRole::Client);
+    }
+
+    #[test]
+    fn invalid_role_falls_back_to_client_with_warning() {
+        let (r, _, w) = normalize_role(Some("wizard"), None, true, HostProfile::Linux);
+        assert_eq!(r, NodeRole::Client);
+        assert!(w.iter().any(|m| m.contains("Invalid NODE_ROLE")));
+    }
+
+    #[test]
+    fn blind_exit_reverts_on_unsupported_host() {
+        let (r, _, w) = normalize_role(Some("blind_exit"), None, true, HostProfile::Windows);
+        assert_eq!(r, NodeRole::Client);
+        assert!(w.iter().any(|m| m.contains("Reverting to client")));
+    }
+
+    #[test]
+    fn preset_coerces_node_role() {
+        let (r, p, w) = normalize_role(Some("client"), Some("exit"), true, HostProfile::Linux);
+        assert_eq!(r, NodeRole::Admin); // exit preset -> admin primary
+        assert_eq!(p, Some(RolePreset::Exit));
+        assert!(w.iter().any(|m| m.contains("coercing")));
+    }
+
+    #[test]
+    fn blind_exit_enforces_locked_posture() {
+        let mut state = RolePolicyState {
+            node_role: NodeRole::BlindExit,
+            manual_peer_override: true,
+            auto_refresh_trust: true,
+            default_launch_profile: LaunchProfile::Menu,
+            auto_port_forward_exit: true,
+            exit_chain: ExitChain {
+                hops: ExitChainHops::Two,
+                entry: Some("a".to_owned()),
+                final_node: Some("b".to_owned()),
+            },
+            auto_launch_on_start: false,
+            auto_launch_exit_node_id: Some("x".to_owned()),
+            auto_launch_lan_mode: LanMode::On,
+            fail_closed_ssh_allow: true,
+            fail_closed_ssh_cidrs: vec!["10.0.0.0/8".to_owned()],
+        };
+        let _ = enforce_role_policy_defaults(&mut state, true, "/etc/rustynet/trust.key");
+        assert_eq!(state.default_launch_profile, LaunchProfile::QuickExitNode);
+        assert_eq!(state.exit_chain.hops, ExitChainHops::One);
+        assert!(state.exit_chain.entry.is_none());
+        assert!(state.auto_launch_on_start);
+        assert_eq!(state.auto_launch_lan_mode, LanMode::Off);
+        assert!(!state.fail_closed_ssh_allow);
+        assert!(state.fail_closed_ssh_cidrs.is_empty());
+        assert!(!state.manual_peer_override);
+    }
+
+    #[test]
+    fn client_downgrades_admin_only_profile_and_disables_port_forward() {
+        let mut state = RolePolicyState {
+            node_role: NodeRole::Client,
+            manual_peer_override: false,
+            auto_refresh_trust: false,
+            default_launch_profile: LaunchProfile::QuickHybrid,
+            auto_port_forward_exit: true,
+            exit_chain: ExitChain { hops: ExitChainHops::One, entry: None, final_node: None },
+            auto_launch_on_start: false,
+            auto_launch_exit_node_id: None,
+            auto_launch_lan_mode: LanMode::Skip,
+            fail_closed_ssh_allow: false,
+            fail_closed_ssh_cidrs: Vec::new(),
+        };
+        let w = enforce_role_policy_defaults(&mut state, true, "/etc/rustynet/trust.key");
+        assert_eq!(state.default_launch_profile, LaunchProfile::QuickConnect);
+        assert!(!state.auto_port_forward_exit);
+        assert!(w.iter().any(|m| m.contains("admin-only")));
+    }
+
+    #[test]
+    fn missing_trust_signer_disables_auto_refresh_for_non_admin() {
+        let mut state = RolePolicyState {
+            node_role: NodeRole::Client,
+            manual_peer_override: false,
+            auto_refresh_trust: true,
+            default_launch_profile: LaunchProfile::QuickConnect,
+            auto_port_forward_exit: false,
+            exit_chain: ExitChain { hops: ExitChainHops::One, entry: None, final_node: None },
+            auto_launch_on_start: false,
+            auto_launch_exit_node_id: None,
+            auto_launch_lan_mode: LanMode::Skip,
+            fail_closed_ssh_allow: false,
+            fail_closed_ssh_cidrs: Vec::new(),
+        };
+        let _ = enforce_role_policy_defaults(&mut state, false, "/etc/rustynet/trust.key");
+        assert!(!state.auto_refresh_trust);
+    }
+}
+```
+
+### A.3 — `launch.rs`
+
+```rust
+//! crates/rustynet-operator/src/launch.rs
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchProfile {
+    Menu,
+    QuickConnect,
+    QuickExitNode,
+    QuickHybrid,
+}
+
+impl LaunchProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Menu => "menu",
+            Self::QuickConnect => "quick-connect",
+            Self::QuickExitNode => "quick-exit-node",
+            Self::QuickHybrid => "quick-hybrid",
+        }
+    }
+
+    /// Mirrors is_valid_launch_profile (start.sh L724).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "menu" => Some(Self::Menu),
+            "quick-connect" => Some(Self::QuickConnect),
+            "quick-exit-node" => Some(Self::QuickExitNode),
+            "quick-hybrid" => Some(Self::QuickHybrid),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanMode {
+    Skip,
+    On,
+    Off,
+}
+
+impl LanMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// Mirrors is_valid_lan_mode (start.sh L731).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "skip" => Some(Self::Skip),
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitChainHops {
+    One,
+    Two,
+}
+
+impl ExitChainHops {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::One => "1",
+            Self::Two => "2",
+        }
+    }
+
+    /// Mirrors is_valid_exit_chain_hops (start.sh L738).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "1" => Some(Self::One),
+            "2" => Some(Self::Two),
+            _ => None,
+        }
+    }
+}
+
+/// Mirrors is_valid_node_id_value (start.sh L2813): ^[A-Za-z0-9._-]+$.
+pub fn is_valid_node_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitChain {
+    pub hops: ExitChainHops,
+    pub entry: Option<String>,
+    pub final_node: Option<String>,
+}
+
+impl ExitChain {
+    /// Mirrors sanitize_exit_chain_defaults (start.sh L745). Invalid node ids
+    /// are cleared with a warning; a non-2-hop chain drops the final node;
+    /// blind_exit forces a bare 1-hop chain.
+    ///
+    /// NOTE(parity): the shell also coerces an unparseable EXIT_CHAIN_HOPS
+    /// string to "1" with a warning (L746-749). In the typed model that
+    /// happens at parse time (see config/validate.rs), so `hops` is already
+    /// valid here.
+    pub fn sanitize(mut self, is_blind_exit: bool) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+
+        if let Some(id) = &self.entry {
+            if !is_valid_node_id(id) {
+                warnings.push(format!(
+                    "Invalid EXIT_CHAIN_ENTRY_NODE_ID='{id}', clearing."
+                ));
+                self.entry = None;
+            }
+        }
+        if let Some(id) = &self.final_node {
+            if !is_valid_node_id(id) {
+                warnings.push(format!(
+                    "Invalid EXIT_CHAIN_FINAL_NODE_ID='{id}', clearing."
+                ));
+                self.final_node = None;
+            }
+        }
+        if self.hops != ExitChainHops::Two {
+            self.final_node = None;
+        }
+        if is_blind_exit {
+            self.hops = ExitChainHops::One;
+            self.entry = None;
+            self.final_node = None;
+        }
+
+        (self, warnings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_and_lan_round_trip() {
+        for p in [
+            LaunchProfile::Menu,
+            LaunchProfile::QuickConnect,
+            LaunchProfile::QuickExitNode,
+            LaunchProfile::QuickHybrid,
+        ] {
+            assert_eq!(LaunchProfile::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(LaunchProfile::parse("bogus"), None);
+        for m in [LanMode::Skip, LanMode::On, LanMode::Off] {
+            assert_eq!(LanMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(LanMode::parse("maybe"), None);
+    }
+
+    #[test]
+    fn node_id_charset() {
+        assert!(is_valid_node_id("node-1.host_A"));
+        assert!(!is_valid_node_id(""));
+        assert!(!is_valid_node_id("bad id"));
+        assert!(!is_valid_node_id("slash/here"));
+    }
+
+    #[test]
+    fn sanitize_clears_invalid_and_couples_hops() {
+        let chain = ExitChain {
+            hops: ExitChainHops::One,
+            entry: Some("ok-id".to_owned()),
+            final_node: Some("also-ok".to_owned()),
+        };
+        let (c, _) = chain.sanitize(false);
+        // 1-hop drops the final node.
+        assert!(c.final_node.is_none());
+        assert_eq!(c.entry.as_deref(), Some("ok-id"));
+
+        let chain = ExitChain {
+            hops: ExitChainHops::Two,
+            entry: Some("bad id".to_owned()),
+            final_node: Some("good".to_owned()),
+        };
+        let (c, w) = chain.sanitize(false);
+        assert!(c.entry.is_none());
+        assert_eq!(c.final_node.as_deref(), Some("good"));
+        assert!(w.iter().any(|m| m.contains("ENTRY_NODE_ID")));
+    }
+
+    #[test]
+    fn blind_exit_forces_bare_single_hop() {
+        let chain = ExitChain {
+            hops: ExitChainHops::Two,
+            entry: Some("a".to_owned()),
+            final_node: Some("b".to_owned()),
+        };
+        let (c, _) = chain.sanitize(true);
+        assert_eq!(c.hops, ExitChainHops::One);
+        assert!(c.entry.is_none() && c.final_node.is_none());
+    }
+}
+```
+
+### A.4 — `args.rs`
+
+```rust
+//! crates/rustynet-operator/src/args.rs
+use crate::launch::{LanMode, LaunchProfile};
+
+/// `--auto` / `--profile auto` request the saved default; `--profile <p>`
+/// requests a specific profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestedLaunch {
+    SavedDefault,
+    Profile(LaunchProfile),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StartArgs {
+    pub requested_profile: Option<RequestedLaunch>,
+    pub auto_only: bool,
+    pub requested_exit_node_id: Option<String>,
+    pub requested_lan_mode: Option<LanMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgsOutcome {
+    Run(StartArgs),
+    ShowHelp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgsError(pub String);
+
+/// Mirrors parse_start_arguments (start.sh L805) + the post-parse validation
+/// at L849-862. Fail-closed on missing values and unknown flags.
+pub fn parse_start_args<I>(argv: I) -> Result<ArgsOutcome, ArgsError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = StartArgs::default();
+    let mut requested_profile_raw: Option<String> = None;
+    let mut it = argv.into_iter();
+
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--profile" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| ArgsError("--profile requires a value.".to_owned()))?;
+                requested_profile_raw = Some(v);
+            }
+            "--auto" => {
+                args.requested_profile = Some(RequestedLaunch::SavedDefault);
+                args.auto_only = true;
+            }
+            "--exit-node-id" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| ArgsError("--exit-node-id requires a value.".to_owned()))?;
+                args.requested_exit_node_id = Some(v);
+            }
+            "--lan" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| ArgsError("--lan requires a value (skip|on|off).".to_owned()))?;
+                let mode = LanMode::parse(&v).ok_or_else(|| {
+                    ArgsError(format!("Invalid --lan value '{v}'. Expected skip|on|off."))
+                })?;
+                args.requested_lan_mode = Some(mode);
+            }
+            "--help" | "-h" => return Ok(ArgsOutcome::ShowHelp),
+            other => return Err(ArgsError(format!("Unknown argument: {other}"))),
+        }
+    }
+
+    // Post-parse profile handling (start.sh L849-857). "auto" is a pseudo
+    // profile meaning "use saved default"; it skips profile validation.
+    if let Some(raw) = requested_profile_raw {
+        if raw == "auto" {
+            args.requested_profile = Some(RequestedLaunch::SavedDefault);
+            args.auto_only = true;
+        } else {
+            let profile = LaunchProfile::parse(&raw)
+                .ok_or_else(|| ArgsError(format!("Invalid --profile value '{raw}'.")))?;
+            args.requested_profile = Some(RequestedLaunch::Profile(profile));
+            // Any non-menu profile applies once and exits.
+            if profile != LaunchProfile::Menu {
+                args.auto_only = true;
+            }
+        }
+    }
+
+    Ok(ArgsOutcome::Run(args))
+}
+
+pub fn help_text() -> &'static str {
+    "Rustynet startup options:\n  \
+     ./start.sh\n    Interactive menu mode.\n    \
+     Exit-node selection supports 1-hop and 2-hop chain prompts.\n\n  \
+     ./start.sh --profile <menu|quick-connect|quick-exit-node|quick-hybrid>\n    \
+     Apply a launch profile once. Non-menu profiles apply and exit.\n    \
+     blind_exit role accepts only 'menu' or 'quick-exit-node'.\n\n  \
+     ./start.sh --auto\n    Apply saved default launch profile once and exit.\n\n  \
+     Optional modifiers:\n    \
+     --exit-node-id <node-id>   Override configured exit node id for this run.\n    \
+     --lan <skip|on|off>        Override configured LAN mode for this run.\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn parses_explicit_profile_and_sets_auto_only() {
+        let out = parse_start_args(argv(&["--profile", "quick-connect"])).unwrap();
+        let ArgsOutcome::Run(a) = out else { panic!("expected run") };
+        assert_eq!(
+            a.requested_profile,
+            Some(RequestedLaunch::Profile(LaunchProfile::QuickConnect))
+        );
+        assert!(a.auto_only);
+    }
+
+    #[test]
+    fn menu_profile_stays_interactive() {
+        let ArgsOutcome::Run(a) = parse_start_args(argv(&["--profile", "menu"])).unwrap() else {
+            panic!()
+        };
+        assert!(!a.auto_only);
+    }
+
+    #[test]
+    fn auto_flag_requests_saved_default() {
+        let ArgsOutcome::Run(a) = parse_start_args(argv(&["--auto"])).unwrap() else { panic!() };
+        assert_eq!(a.requested_profile, Some(RequestedLaunch::SavedDefault));
+        assert!(a.auto_only);
+    }
+
+    #[test]
+    fn missing_values_are_rejected() {
+        assert!(parse_start_args(argv(&["--profile"])).is_err());
+        assert!(parse_start_args(argv(&["--exit-node-id"])).is_err());
+        assert!(parse_start_args(argv(&["--lan"])).is_err());
+    }
+
+    #[test]
+    fn invalid_values_and_unknown_flags_are_rejected() {
+        assert!(parse_start_args(argv(&["--profile", "turbo"])).is_err());
+        assert!(parse_start_args(argv(&["--lan", "perhaps"])).is_err());
+        assert!(parse_start_args(argv(&["--frobnicate"])).is_err());
+    }
+
+    #[test]
+    fn help_short_circuits() {
+        assert_eq!(parse_start_args(argv(&["--help"])).unwrap(), ArgsOutcome::ShowHelp);
+        assert_eq!(parse_start_args(argv(&["-h"])).unwrap(), ArgsOutcome::ShowHelp);
+    }
+}
+```
+
+### A.5 — `egress.rs`
+
+```rust
+//! crates/rustynet-operator/src/egress.rs
+use crate::launch::ExitChainHops;
+
+/// Extract the host from a `[v6]:port` or `v4:port` endpoint string.
+/// Mirrors endpoint_host_from_value (start.sh L943).
+///
+/// NOTE(parity): like the shell regex, the IPv4 form is not octet-range
+/// checked (it accepts e.g. `999.1.1.1:51820`). Add range validation only as
+/// a deliberate change.
+pub fn endpoint_host_from_value(endpoint: &str) -> Option<String> {
+    // Bracketed IPv6: [<hex/colon/dot>]:<digits>
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &rest[..close];
+        let after = &rest[close + 1..];
+        let port = after.strip_prefix(':')?;
+        let host_ok = !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+        let port_ok = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+        return (host_ok && port_ok).then(|| host.to_owned());
+    }
+
+    // IPv4: a.b.c.d:port
+    let (host, port) = endpoint.rsplit_once(':')?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let octets: Vec<&str> = host.split('.').collect();
+    let ipv4_shaped = octets.len() == 4
+        && octets
+            .iter()
+            .all(|o| !o.is_empty() && o.bytes().all(|b| b.is_ascii_digit()));
+    ipv4_shaped.then(|| host.to_owned())
+}
+
+/// Parse `ip -o -4 route show to default` -> egress iface.
+/// Mirrors detect_default_egress Linux branch (awk NR==1 {print $5}, L926).
+///
+/// NOTE(parity): assumes the `default via <gw> dev <iface> ...` shape, where
+/// the iface is the 5th whitespace field. A `default dev <iface>` line (no
+/// gateway) would mis-index, exactly as the shell awk does.
+pub fn parse_linux_default_route_iface(ip_output: &str) -> Option<String> {
+    let line = ip_output.lines().next()?;
+    line.split_whitespace().nth(4).map(str::to_owned)
+}
+
+/// Parse macOS `route -n get default` -> iface.
+/// Mirrors detect_default_egress macOS branch (awk /interface:/{print $2}, L930).
+pub fn parse_macos_default_route_iface(route_output: &str) -> Option<String> {
+    route_output
+        .lines()
+        .find(|line| line.contains("interface:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(str::to_owned)
+}
+
+/// Parse `ip -o -{4,6} route get <host>` -> dev name.
+/// Mirrors route_interface_for_host (awk find "dev" then next token, L956).
+pub fn parse_route_get_dev(ip_output: &str) -> Option<String> {
+    let line = ip_output.lines().next()?;
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    toks.iter()
+        .position(|&t| t == "dev")
+        .and_then(|i| toks.get(i + 1))
+        .map(|s| (*s).to_owned())
+}
+
+/// Mirrors effective_selected_exit_node_for_egress (start.sh L935): on a
+/// 2-hop chain where this device is the entry, the egress-relevant node is
+/// the final hop; otherwise it is the entry.
+pub fn effective_selected_exit_node_for_egress(
+    hops: ExitChainHops,
+    entry: Option<&str>,
+    final_node: Option<&str>,
+    device_node_id: &str,
+) -> Option<String> {
+    if hops == ExitChainHops::Two && entry == Some(device_node_id) {
+        return final_node.map(str::to_owned);
+    }
+    entry.map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_host_ipv4_and_ipv6() {
+        assert_eq!(endpoint_host_from_value("192.168.1.5:51820").as_deref(), Some("192.168.1.5"));
+        assert_eq!(endpoint_host_from_value("[fd00::1]:51820").as_deref(), Some("fd00::1"));
+        assert_eq!(endpoint_host_from_value("[::ffff:1.2.3.4]:1").as_deref(), Some("::ffff:1.2.3.4"));
+        assert_eq!(endpoint_host_from_value("not-an-endpoint"), None);
+        assert_eq!(endpoint_host_from_value("192.168.1.5"), None); // no port
+        assert_eq!(endpoint_host_from_value("[fd00::1]:notaport"), None);
+    }
+
+    #[test]
+    fn linux_default_route_field_five() {
+        let out = "default via 10.0.0.1 dev eth0 proto dhcp metric 100";
+        assert_eq!(parse_linux_default_route_iface(out).as_deref(), Some("eth0"));
+        assert_eq!(parse_linux_default_route_iface(""), None);
+    }
+
+    #[test]
+    fn macos_default_route_interface_line() {
+        let out = "   route to: default\n   gateway: 10.0.0.1\n   interface: en0\n";
+        assert_eq!(parse_macos_default_route_iface(out).as_deref(), Some("en0"));
+    }
+
+    #[test]
+    fn route_get_dev_token() {
+        let out = "10.0.0.1 dev wlan0 src 10.0.0.5 uid 1000";
+        assert_eq!(parse_route_get_dev(out).as_deref(), Some("wlan0"));
+        assert_eq!(parse_route_get_dev("blackhole 10.0.0.1"), None);
+    }
+
+    #[test]
+    fn effective_exit_selects_final_on_two_hop_self_entry() {
+        assert_eq!(
+            effective_selected_exit_node_for_egress(ExitChainHops::Two, Some("me"), Some("dst"), "me")
+                .as_deref(),
+            Some("dst")
+        );
+        assert_eq!(
+            effective_selected_exit_node_for_egress(ExitChainHops::Two, Some("other"), Some("dst"), "me")
+                .as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            effective_selected_exit_node_for_egress(ExitChainHops::One, Some("entry"), None, "me")
+                .as_deref(),
+            Some("entry")
+        );
+    }
+}
+```
+
+### A.6 — `config/keys.rs`
+
+```rust
+//! crates/rustynet-operator/src/config/keys.rs
+
+/// The persistable-key allowlist. Mirrors is_allowed_config_key (start.sh
+/// L341) exactly — keep this in sync with OperatorConfig's fields and with
+/// save_config's emitted keys (L867-919).
+pub fn is_allowed_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "SOCKET_PATH"
+            | "STATE_PATH"
+            | "TRUST_EVIDENCE_PATH"
+            | "TRUST_VERIFIER_KEY_PATH"
+            | "TRUST_WATERMARK_PATH"
+            | "AUTO_TUNNEL_ENFORCE"
+            | "AUTO_TUNNEL_BUNDLE_PATH"
+            | "AUTO_TUNNEL_VERIFIER_KEY_PATH"
+            | "AUTO_TUNNEL_WATERMARK_PATH"
+            | "AUTO_TUNNEL_MAX_AGE_SECS"
+            | "TRAVERSAL_BUNDLE_PATH"
+            | "TRAVERSAL_VERIFIER_KEY_PATH"
+            | "TRAVERSAL_WATERMARK_PATH"
+            | "TRAVERSAL_MAX_AGE_SECS"
+            | "WG_INTERFACE"
+            | "WG_LISTEN_PORT"
+            | "AUTO_PORT_FORWARD_EXIT"
+            | "AUTO_PORT_FORWARD_LEASE_SECS"
+            | "WG_PRIVATE_KEY_PATH"
+            | "WG_ENCRYPTED_PRIVATE_KEY_PATH"
+            | "WG_KEY_PASSPHRASE_PATH"
+            | "WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH"
+            | "SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH"
+            | "WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT"
+            | "WG_PUBLIC_KEY_PATH"
+            | "EGRESS_INTERFACE"
+            | "MEMBERSHIP_SNAPSHOT_PATH"
+            | "MEMBERSHIP_LOG_PATH"
+            | "MEMBERSHIP_WATERMARK_PATH"
+            | "MEMBERSHIP_OWNER_SIGNING_KEY_PATH"
+            | "BACKEND_MODE"
+            | "DATAPLANE_MODE"
+            | "PRIVILEGED_HELPER_SOCKET_PATH"
+            | "PRIVILEGED_HELPER_TIMEOUT_MS"
+            | "RECONCILE_INTERVAL_MS"
+            | "MAX_RECONCILE_FAILURES"
+            | "FAIL_CLOSED_SSH_ALLOW"
+            | "FAIL_CLOSED_SSH_ALLOW_CIDRS"
+            | "TRUST_SIGNER_KEY_PATH"
+            | "AUTO_REFRESH_TRUST"
+            | "DEVICE_NODE_ID"
+            | "SETUP_COMPLETE"
+            | "NODE_ROLE"
+            | "SETUP_ROLE_PRESET"
+            | "MANUAL_PEER_OVERRIDE"
+            | "MANUAL_PEER_AUDIT_LOG"
+            | "DEFAULT_LAUNCH_PROFILE"
+            | "AUTO_LAUNCH_ON_START"
+            | "AUTO_LAUNCH_EXIT_NODE_ID"
+            | "AUTO_LAUNCH_LAN_MODE"
+            | "EXIT_CHAIN_HOPS"
+            | "EXIT_CHAIN_ENTRY_NODE_ID"
+            | "EXIT_CHAIN_FINAL_NODE_ID"
+            | "HOST_PROFILE"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_known_keys_and_rejects_unknown() {
+        assert!(is_allowed_config_key("NODE_ROLE"));
+        assert!(is_allowed_config_key("WG_LISTEN_PORT"));
+        assert!(!is_allowed_config_key("DROP_ALL_TABLES"));
+        assert!(!is_allowed_config_key("node_role")); // case-sensitive
+        assert!(!is_allowed_config_key(""));
+    }
+}
+```
+
+### A.7 — `config/parse.rs`
+
+```rust
+//! crates/rustynet-operator/src/config/parse.rs
+use crate::config::keys::is_allowed_config_key;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ParsedConfig {
+    pub values: BTreeMap<String, String>,
+    pub warnings: Vec<String>,
+}
+
+/// Strip a single layer of surrounding single quotes.
+/// Mirrors normalize_config_value (start.sh L350).
+pub fn normalize_config_value(value: &str) -> String {
+    if value == "''" {
+        return String::new();
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+        return value[1..value.len() - 1].to_owned();
+    }
+    value.to_owned()
+}
+
+/// Parse wizard.env *text* into an allowlisted key/value map plus warnings.
+/// No filesystem access. Mirrors load_config_file's line loop (start.sh
+/// L413-428):
+///   * skip blank lines and lines whose first non-space char is '#'
+///   * a line must match `^[A-Z0-9_]+=.*$`, else warn "malformed" and skip
+///   * unknown (non-allowlisted) keys warn and are skipped
+///   * the value has one layer of surrounding quotes stripped
+///
+/// NOTE(parity): `str::lines()` already strips a trailing `\r`, so the shell's
+/// explicit CR trim (L426) is unnecessary here.
+pub fn parse_wizard_env(text: &str) -> ParsedConfig {
+    let mut out = ParsedConfig::default();
+
+    for line in text.lines() {
+        let lead_trimmed = line.trim_start();
+        if lead_trimmed.is_empty() || lead_trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some(eq) = line.find('=') else {
+            out.warnings.push("Ignoring malformed config line.".to_owned());
+            continue;
+        };
+        let key = &line[..eq];
+        let raw_value = &line[eq + 1..];
+
+        let key_shaped = !key.is_empty()
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+        if !key_shaped {
+            out.warnings.push("Ignoring malformed config line.".to_owned());
+            continue;
+        }
+
+        if !is_allowed_config_key(key) {
+            out.warnings
+                .push(format!("Ignoring unknown config key '{key}'."));
+            continue;
+        }
+
+        out.values
+            .insert(key.to_owned(), normalize_config_value(raw_value));
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_one_quote_layer() {
+        assert_eq!(normalize_config_value("''"), "");
+        assert_eq!(normalize_config_value("'abc'"), "abc");
+        assert_eq!(normalize_config_value("plain"), "plain");
+        assert_eq!(normalize_config_value("'a'b'"), "a'b"); // greedy outer strip
+    }
+
+    #[test]
+    fn parses_allowlisted_keys_only() {
+        let text = "\
+# comment line
+   # indented comment
+
+NODE_ROLE=admin
+WG_LISTEN_PORT='51820'
+UNKNOWN_KEY=whatever
+not a config line
+lowercase=skip
+";
+        let parsed = parse_wizard_env(text);
+        assert_eq!(parsed.values.get("NODE_ROLE").map(String::as_str), Some("admin"));
+        assert_eq!(parsed.values.get("WG_LISTEN_PORT").map(String::as_str), Some("51820"));
+        assert!(!parsed.values.contains_key("UNKNOWN_KEY"));
+        assert!(!parsed.values.contains_key("lowercase"));
+        // one "unknown key" warning + two "malformed line" warnings
+        assert!(parsed.warnings.iter().any(|w| w.contains("unknown config key 'UNKNOWN_KEY'")));
+        assert_eq!(parsed.warnings.iter().filter(|w| w.contains("malformed")).count(), 2);
+    }
+}
+```
+
+### A.8 — `config/persist.rs` (Unix)
+
+```rust
+//! crates/rustynet-operator/src/config/persist.rs
+use std::fs::{self, OpenOptions, Permissions};
+use std::io::Write;
+use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+#[derive(Debug)]
+pub enum ConfigError {
+    Io(String),
+    Insecure(String),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(m) => write!(f, "config io error: {m}"),
+            Self::Insecure(m) => write!(f, "config security error: {m}"),
+        }
+    }
+}
+impl std::error::Error for ConfigError {}
+
+/// Atomic 0600 write. Replaces save_config's templated write + chmod
+/// (start.sh L865-921): write to a sibling temp file created mode-0600,
+/// fsync, then rename over the target so readers never see a torn file.
+/// Consider delegating the final owner/mode assertion to
+/// `rustynet-local-security` to keep one hardened permission path.
+#[cfg(unix)]
+pub fn save_config_atomic(path: &Path, serialized: &str) -> Result<(), ConfigError> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| ConfigError::Io("config path has no parent directory".to_owned()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| ConfigError::Io("config path has no file name".to_owned()))?;
+    let tmp = dir.join(format!(".{file_name}.tmp"));
+
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| ConfigError::Io(format!("open temp {}: {e}", tmp.display())))?;
+        f.write_all(serialized.as_bytes())
+            .map_err(|e| ConfigError::Io(format!("write temp: {e}")))?;
+        // Re-assert mode in case a permissive umask altered create().
+        f.set_permissions(Permissions::from_mode(0o600))
+            .map_err(|e| ConfigError::Io(format!("chmod temp: {e}")))?;
+        f.sync_all()
+            .map_err(|e| ConfigError::Io(format!("fsync temp: {e}")))?;
+    }
+
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        ConfigError::Io(format!("rename temp into place: {e}"))
+    })
+}
+
+/// File-security gate. Mirrors validate_config_file_security (start.sh L363):
+/// a missing file is OK; reject symlinks, owners other than the current uid
+/// or root, and group/world-writable modes.
+#[cfg(unix)]
+pub fn assert_config_file_secure(path: &Path, current_uid: u32) -> Result<(), ConfigError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(ConfigError::Io(format!("stat config: {e}"))),
+    };
+
+    if meta.file_type().is_symlink() {
+        return Err(ConfigError::Insecure(format!(
+            "Refusing to load symlink config file: {}",
+            path.display()
+        )));
+    }
+
+    let owner = meta.uid();
+    if owner != current_uid && owner != 0 {
+        return Err(ConfigError::Insecure(format!(
+            "Config file owner is not trusted ({}, uid={owner}).",
+            path.display()
+        )));
+    }
+
+    let mode = meta.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(ConfigError::Insecure(format!(
+            "Config file must not be group/world writable: {} (mode {:03o}).",
+            path.display(),
+            mode & 0o777
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn atomic_write_sets_0600_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("rustynet-op-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wizard.env");
+        save_config_atomic(&path, "NODE_ROLE=admin\n").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "NODE_ROLE=admin\n");
+
+        // no leftover temp file
+        assert!(!dir.join(".wizard.env.tmp").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_file_is_secure() {
+        let path = std::env::temp_dir().join("rustynet-nonexistent-cfg-xyz.env");
+        let _ = fs::remove_file(&path);
+        assert!(assert_config_file_secure(&path, 1000).is_ok());
+    }
+
+    #[test]
+    fn group_writable_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("rustynet-op-gw-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wizard.env");
+        fs::write(&path, "x").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o660)).unwrap();
+        let current = nix_uid();
+        let res = assert_config_file_secure(&path, current);
+        assert!(matches!(res, Err(ConfigError::Insecure(_))));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // Minimal uid fetch without adding a dependency: read from metadata of a
+    // file we just created (owned by us).
+    fn nix_uid() -> u32 {
+        let probe = std::env::temp_dir().join(format!("rustynet-uid-probe-{}", std::process::id()));
+        fs::write(&probe, "").unwrap();
+        let uid = fs::metadata(&probe).unwrap().uid();
+        let _ = fs::remove_file(&probe);
+        uid
+    }
+}
+```
+
+### A.9 — Wiring notes for the implementer
+
+- **`lib.rs`** should declare `#![forbid(unsafe_code)]` and the module tree:
+  `pub mod host; pub mod role; pub mod launch; pub mod args; pub mod egress;
+  pub mod config { pub mod keys; pub mod parse; pub mod persist; }`.
+- **Load pipeline** (replaces the shell startup sequence at L4502+):
+  `assert_config_file_secure` → read (bounded) → `parse_wizard_env` →
+  build a typed config → `normalize_role` → per-field validators →
+  `enforce_role_policy_defaults` → `ExitChain::sanitize`. Each step collects
+  warnings; the CLI prints them and hard-errors on the `Result::Err` cases
+  that the shell `*_or_die` functions exit on.
+- **`config/validate.rs`** (the one module left as signatures in §4.1) maps
+  the parsed string map onto the typed `OperatorConfig`, turning
+  `EXIT_CHAIN_HOPS`/`WG_LISTEN_PORT`/booleans into typed values with the
+  fail-closed errors from §4.1; reuse `ExitChainHops::parse`,
+  `LaunchProfile::parse`, `LanMode::parse`, and `is_valid_node_id` above.
+- **Serializer** for `save_config_atomic`: emit `KEY=value\n` in the exact
+  order of `save_config` (L867-919) so diffs against the shell output stay
+  empty during the parity phase.
+- **Windows**: `config/persist.rs` is `#[cfg(unix)]`; add a `#[cfg(windows)]`
+  sibling that enforces an ACL granting only the owner + SYSTEM (mirror the
+  approach in `rustynetd`'s `windows_paths`/`windows_key_custody` modules),
+  and an atomic `ReplaceFileW`/rename. Track this as the Windows slice of
+  Phase 3.
+- **Tests gate**: once these modules land, add `rustynet-operator` module
+  names to `scripts/ci/regression_coverage_gates.sh` floors so the coverage
+  cannot silently regress.
