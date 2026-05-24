@@ -1802,3 +1802,731 @@ mod tests {
 - **Tests gate**: once these modules land, add `rustynet-operator` module
   names to `scripts/ci/regression_coverage_gates.sh` floors so the coverage
   cannot silently regress.
+
+### A.10 — `config/validate.rs` (the typed model + map→config + enforcement)
+
+This is the module §4.1 left as signatures. It defines the full
+`OperatorConfig`, coerces the allowlisted string map into typed fields, runs
+the fail-closed validation pipeline (mirroring `validate_loaded_config_or_die`
+L431 and every `enforce_*` at L485-541), and serializes back in `save_config`
+order for byte-parity during rollout.
+
+First, extend the `ConfigError` from A.8 with a validation variant:
+
+```rust
+// add to crates/rustynet-operator/src/config/persist.rs ConfigError:
+//     Validation(String),
+// and to Display:
+//     Self::Validation(m) => write!(f, "config validation error: {m}"),
+```
+
+```rust
+//! crates/rustynet-operator/src/config/validate.rs
+use crate::config::parse::ParsedConfig;
+use crate::config::persist::ConfigError;
+use crate::host::HostProfile;
+use crate::launch::{is_valid_node_id, ExitChain, ExitChainHops, LanMode, LaunchProfile};
+use crate::role::{self, NodeRole, RolePolicyState, RolePreset};
+use std::path::PathBuf;
+
+/// Tunnel backend selection. Mirrors enforce_backend_mode (start.sh L485):
+/// each host accepts its kernel mode or its userspace-shared mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendMode {
+    LinuxWireguard,
+    LinuxWireguardUserspaceShared,
+    MacosWireguard,
+    MacosWireguardUserspaceShared,
+}
+
+impl BackendMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LinuxWireguard => "linux-wireguard",
+            Self::LinuxWireguardUserspaceShared => "linux-wireguard-userspace-shared",
+            Self::MacosWireguard => "macos-wireguard",
+            Self::MacosWireguardUserspaceShared => "macos-wireguard-userspace-shared",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "linux-wireguard" => Some(Self::LinuxWireguard),
+            "linux-wireguard-userspace-shared" => Some(Self::LinuxWireguardUserspaceShared),
+            "macos-wireguard" => Some(Self::MacosWireguard),
+            "macos-wireguard-userspace-shared" => Some(Self::MacosWireguardUserspaceShared),
+            _ => None,
+        }
+    }
+
+    fn valid_for_host(self, host: HostProfile) -> bool {
+        match host {
+            HostProfile::Linux => {
+                matches!(self, Self::LinuxWireguard | Self::LinuxWireguardUserspaceShared)
+            }
+            HostProfile::Macos => {
+                matches!(self, Self::MacosWireguard | Self::MacosWireguardUserspaceShared)
+            }
+            // Windows/Unsupported: no backend mode is valid in start.sh today.
+            _ => false,
+        }
+    }
+}
+
+/// Typed mirror of wizard.env. One field per allowlisted key (config/keys.rs),
+/// plus `host_profile` which is host-derived, not trusted from the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorConfig {
+    pub socket_path: PathBuf,
+    pub state_path: PathBuf,
+    pub trust_evidence_path: PathBuf,
+    pub trust_verifier_key_path: PathBuf,
+    pub trust_watermark_path: PathBuf,
+    pub auto_tunnel_enforce: bool,
+    pub auto_tunnel_bundle_path: PathBuf,
+    pub auto_tunnel_verifier_key_path: PathBuf,
+    pub auto_tunnel_watermark_path: PathBuf,
+    pub auto_tunnel_max_age_secs: u64,
+    pub traversal_bundle_path: PathBuf,
+    pub traversal_verifier_key_path: PathBuf,
+    pub traversal_watermark_path: PathBuf,
+    pub traversal_max_age_secs: u64,
+    pub wg_interface: String,
+    pub wg_listen_port: u16,
+    pub auto_port_forward_exit: bool,
+    pub auto_port_forward_lease_secs: u64,
+    pub wg_private_key_path: PathBuf,
+    pub wg_encrypted_private_key_path: PathBuf,
+    pub wg_key_passphrase_path: PathBuf,
+    pub wg_key_passphrase_credential_blob_path: PathBuf,
+    pub signing_key_passphrase_credential_blob_path: PathBuf,
+    pub wg_key_passphrase_keychain_account: String,
+    pub wg_public_key_path: PathBuf,
+    pub egress_interface: String,
+    pub membership_snapshot_path: PathBuf,
+    pub membership_log_path: PathBuf,
+    pub membership_watermark_path: PathBuf,
+    pub membership_owner_signing_key_path: PathBuf,
+    pub backend_mode: BackendMode,
+    pub dataplane_mode: String,
+    pub privileged_helper_socket_path: PathBuf,
+    pub privileged_helper_timeout_ms: u64,
+    pub reconcile_interval_ms: u64,
+    pub max_reconcile_failures: u64,
+    pub fail_closed_ssh_allow: bool,
+    pub fail_closed_ssh_cidrs: Vec<String>,
+    pub trust_signer_key_path: PathBuf,
+    pub auto_refresh_trust: bool,
+    pub device_node_id: String,
+    pub setup_complete: bool,
+    pub node_role: NodeRole,
+    pub setup_role_preset: Option<RolePreset>,
+    pub manual_peer_override: bool,
+    pub manual_peer_audit_log: PathBuf,
+    pub default_launch_profile: LaunchProfile,
+    pub auto_launch_on_start: bool,
+    pub auto_launch_exit_node_id: Option<String>,
+    pub auto_launch_lan_mode: LanMode,
+    pub exit_chain: ExitChain,
+    pub host_profile: HostProfile,
+}
+
+impl OperatorConfig {
+    /// Built-in defaults (start.sh L13-98). Linux paths are the baseline;
+    /// macOS/Windows path bases are overridden by the platform profile
+    /// (apply_host_profile_defaults, L133) — wire those in the host module
+    /// when porting `__rustynet_{linux,macos}_apply_profile_defaults`.
+    pub fn defaults_for_host(host: HostProfile, device_node_id: String) -> Self {
+        let backend_mode = match host {
+            HostProfile::Macos => BackendMode::MacosWireguard,
+            _ => BackendMode::LinuxWireguard,
+        };
+        Self {
+            socket_path: "/run/rustynet/rustynetd.sock".into(),
+            state_path: "/var/lib/rustynet/rustynetd.state".into(),
+            trust_evidence_path: "/var/lib/rustynet/rustynetd.trust".into(),
+            trust_verifier_key_path: "/etc/rustynet/trust-evidence.pub".into(),
+            trust_watermark_path: "/var/lib/rustynet/rustynetd.trust.watermark".into(),
+            auto_tunnel_enforce: false,
+            auto_tunnel_bundle_path: "/var/lib/rustynet/rustynetd.assignment".into(),
+            auto_tunnel_verifier_key_path: "/etc/rustynet/assignment.pub".into(),
+            auto_tunnel_watermark_path: "/var/lib/rustynet/rustynetd.assignment.watermark".into(),
+            auto_tunnel_max_age_secs: 300,
+            traversal_bundle_path: "/var/lib/rustynet/rustynetd.traversal".into(),
+            traversal_verifier_key_path: "/etc/rustynet/traversal.pub".into(),
+            traversal_watermark_path: "/var/lib/rustynet/rustynetd.traversal.watermark".into(),
+            traversal_max_age_secs: 120,
+            wg_interface: "rustynet0".to_owned(),
+            wg_listen_port: 51820,
+            auto_port_forward_exit: false,
+            auto_port_forward_lease_secs: 1200,
+            wg_private_key_path: "/run/rustynet/wireguard.key".into(),
+            wg_encrypted_private_key_path: "/var/lib/rustynet/keys/wireguard.key.enc".into(),
+            wg_key_passphrase_path: "/var/lib/rustynet/keys/wireguard.passphrase".into(),
+            wg_key_passphrase_credential_blob_path:
+                "/etc/rustynet/credentials/wg_key_passphrase.cred".into(),
+            signing_key_passphrase_credential_blob_path:
+                "/etc/rustynet/credentials/signing_key_passphrase.cred".into(),
+            wg_key_passphrase_keychain_account: String::new(),
+            wg_public_key_path: "/var/lib/rustynet/keys/wireguard.pub".into(),
+            egress_interface: String::new(),
+            membership_snapshot_path: "/var/lib/rustynet/membership.snapshot".into(),
+            membership_log_path: "/var/lib/rustynet/membership.log".into(),
+            membership_watermark_path: "/var/lib/rustynet/membership.watermark".into(),
+            membership_owner_signing_key_path: "/etc/rustynet/membership.owner.key".into(),
+            backend_mode,
+            dataplane_mode: "hybrid-native".to_owned(),
+            privileged_helper_socket_path: "/run/rustynet/rustynetd-privileged.sock".into(),
+            privileged_helper_timeout_ms: 2000,
+            reconcile_interval_ms: 1000,
+            max_reconcile_failures: 5,
+            fail_closed_ssh_allow: false,
+            fail_closed_ssh_cidrs: Vec::new(),
+            trust_signer_key_path: "/etc/rustynet/trust-evidence.key".into(),
+            auto_refresh_trust: false,
+            device_node_id,
+            setup_complete: false,
+            node_role: NodeRole::Client, // placeholder; set by normalize
+            setup_role_preset: None,
+            manual_peer_override: false,
+            manual_peer_audit_log: "/var/log/rustynet/manual-peer-override.log".into(),
+            default_launch_profile: LaunchProfile::Menu,
+            auto_launch_on_start: false,
+            auto_launch_exit_node_id: None,
+            auto_launch_lan_mode: LanMode::Skip,
+            exit_chain: ExitChain { hops: ExitChainHops::One, entry: None, final_node: None },
+            host_profile: host,
+        }
+    }
+}
+
+// --- coercion helpers -------------------------------------------------------
+
+fn err(msg: impl Into<String>) -> ConfigError {
+    ConfigError::Validation(msg.into())
+}
+
+/// Lenient bool, matching the shell `[[ x == "1" ]]` / `!= "1"` style used by
+/// AUTO_TUNNEL_ENFORCE, AUTO_PORT_FORWARD_EXIT, FAIL_CLOSED_SSH_ALLOW,
+/// AUTO_REFRESH_TRUST, SETUP_COMPLETE (anything not "1" is false).
+fn bool_lenient(value: &str) -> bool {
+    value == "1"
+}
+
+/// Strict bool: only "0"/"1" accepted. Mirrors the AUTO_LAUNCH_ON_START check
+/// at start.sh L469 (hard error otherwise).
+fn bool_strict(key: &str, value: &str) -> Result<bool, ConfigError> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        other => Err(err(format!("Invalid persisted {key}='{other}'. Expected 0 or 1."))),
+    }
+}
+
+fn u16_field(key: &str, value: &str) -> Result<u16, ConfigError> {
+    value
+        .parse::<u16>()
+        .map_err(|_| err(format!("Invalid persisted {key}='{value}'. Expected an integer.")))
+}
+
+fn u64_field(key: &str, value: &str) -> Result<u64, ConfigError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| err(format!("Invalid persisted {key}='{value}'. Expected an integer.")))
+}
+
+/// Split FAIL_CLOSED_SSH_ALLOW_CIDRS on whitespace and commas, dropping empties.
+fn parse_cidrs(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Build a fully validated, policy-enforced OperatorConfig from a parsed
+/// wizard.env map. `trust_signer_key_present` is the result of the caller's
+/// `-f` test on TRUST_SIGNER_KEY_PATH (kept out of this pure function).
+///
+/// Pipeline (faithful to start.sh startup order):
+///   1. start from host defaults, overlay the file values with typed coercion
+///      (numeric/bool/enum parse failures are hard ConfigError::Validation),
+///   2. strict file-value checks (validate_loaded_config_or_die, L431),
+///   3. normalize role/preset (normalize_node_role + normalize_role_preset),
+///   4. enforce_role_policy_defaults, then ExitChain::sanitize,
+///   5. enforce_backend_mode / auto_tunnel / fail_closed_ssh / wg_port /
+///      auto_port_forward (L485-541).
+/// Returns the config plus accumulated operator-facing warnings.
+///
+/// NOTE(hardening): the shell does not numerically validate the *_MS /
+/// *_MAX_AGE_SECS / MAX_RECONCILE_FAILURES fields; this port parses them as
+/// u64 and hard-errors on garbage. That is intentionally stricter (fail
+/// closed). Flip to lenient-with-default only as a documented change.
+pub fn build_and_enforce(
+    parsed: &ParsedConfig,
+    host: HostProfile,
+    device_node_id: String,
+    trust_signer_key_present: bool,
+) -> Result<(OperatorConfig, Vec<String>), ConfigError> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut cfg = OperatorConfig::defaults_for_host(host, device_node_id);
+
+    // Carried raw strings that need post-overlay normalization.
+    let mut raw_node_role: Option<String> = None;
+    let mut raw_preset: Option<String> = None;
+
+    // --- step 1: typed overlay -------------------------------------------
+    for (key, value) in &parsed.values {
+        match key.as_str() {
+            "SOCKET_PATH" => cfg.socket_path = value.into(),
+            "STATE_PATH" => cfg.state_path = value.into(),
+            "TRUST_EVIDENCE_PATH" => cfg.trust_evidence_path = value.into(),
+            "TRUST_VERIFIER_KEY_PATH" => cfg.trust_verifier_key_path = value.into(),
+            "TRUST_WATERMARK_PATH" => cfg.trust_watermark_path = value.into(),
+            "AUTO_TUNNEL_ENFORCE" => cfg.auto_tunnel_enforce = bool_lenient(value),
+            "AUTO_TUNNEL_BUNDLE_PATH" => cfg.auto_tunnel_bundle_path = value.into(),
+            "AUTO_TUNNEL_VERIFIER_KEY_PATH" => cfg.auto_tunnel_verifier_key_path = value.into(),
+            "AUTO_TUNNEL_WATERMARK_PATH" => cfg.auto_tunnel_watermark_path = value.into(),
+            "AUTO_TUNNEL_MAX_AGE_SECS" => {
+                cfg.auto_tunnel_max_age_secs = u64_field(key, value)?
+            }
+            "TRAVERSAL_BUNDLE_PATH" => cfg.traversal_bundle_path = value.into(),
+            "TRAVERSAL_VERIFIER_KEY_PATH" => cfg.traversal_verifier_key_path = value.into(),
+            "TRAVERSAL_WATERMARK_PATH" => cfg.traversal_watermark_path = value.into(),
+            "TRAVERSAL_MAX_AGE_SECS" => cfg.traversal_max_age_secs = u64_field(key, value)?,
+            "WG_INTERFACE" => cfg.wg_interface = value.clone(),
+            "WG_LISTEN_PORT" => cfg.wg_listen_port = u16_field(key, value)?,
+            "AUTO_PORT_FORWARD_EXIT" => cfg.auto_port_forward_exit = bool_lenient(value),
+            "AUTO_PORT_FORWARD_LEASE_SECS" => {
+                cfg.auto_port_forward_lease_secs = u64_field(key, value)?
+            }
+            "WG_PRIVATE_KEY_PATH" => cfg.wg_private_key_path = value.into(),
+            "WG_ENCRYPTED_PRIVATE_KEY_PATH" => cfg.wg_encrypted_private_key_path = value.into(),
+            "WG_KEY_PASSPHRASE_PATH" => cfg.wg_key_passphrase_path = value.into(),
+            "WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH" => {
+                cfg.wg_key_passphrase_credential_blob_path = value.into()
+            }
+            "SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH" => {
+                cfg.signing_key_passphrase_credential_blob_path = value.into()
+            }
+            "WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT" => {
+                cfg.wg_key_passphrase_keychain_account = value.clone()
+            }
+            "WG_PUBLIC_KEY_PATH" => cfg.wg_public_key_path = value.into(),
+            "EGRESS_INTERFACE" => cfg.egress_interface = value.clone(),
+            "MEMBERSHIP_SNAPSHOT_PATH" => cfg.membership_snapshot_path = value.into(),
+            "MEMBERSHIP_LOG_PATH" => cfg.membership_log_path = value.into(),
+            "MEMBERSHIP_WATERMARK_PATH" => cfg.membership_watermark_path = value.into(),
+            "MEMBERSHIP_OWNER_SIGNING_KEY_PATH" => {
+                cfg.membership_owner_signing_key_path = value.into()
+            }
+            "BACKEND_MODE" => {
+                cfg.backend_mode = BackendMode::parse(value)
+                    .ok_or_else(|| err(format!("Invalid persisted BACKEND_MODE='{value}'.")))?
+            }
+            "DATAPLANE_MODE" => cfg.dataplane_mode = value.clone(),
+            "PRIVILEGED_HELPER_SOCKET_PATH" => cfg.privileged_helper_socket_path = value.into(),
+            "PRIVILEGED_HELPER_TIMEOUT_MS" => {
+                cfg.privileged_helper_timeout_ms = u64_field(key, value)?
+            }
+            "RECONCILE_INTERVAL_MS" => cfg.reconcile_interval_ms = u64_field(key, value)?,
+            "MAX_RECONCILE_FAILURES" => cfg.max_reconcile_failures = u64_field(key, value)?,
+            "FAIL_CLOSED_SSH_ALLOW" => cfg.fail_closed_ssh_allow = bool_lenient(value),
+            "FAIL_CLOSED_SSH_ALLOW_CIDRS" => cfg.fail_closed_ssh_cidrs = parse_cidrs(value),
+            "TRUST_SIGNER_KEY_PATH" => cfg.trust_signer_key_path = value.into(),
+            "AUTO_REFRESH_TRUST" => cfg.auto_refresh_trust = bool_lenient(value),
+            "DEVICE_NODE_ID" => {
+                if !value.is_empty() {
+                    cfg.device_node_id = value.clone();
+                }
+            }
+            "SETUP_COMPLETE" => cfg.setup_complete = bool_lenient(value),
+            "NODE_ROLE" => raw_node_role = Some(value.clone()),
+            "SETUP_ROLE_PRESET" => raw_preset = Some(value.clone()),
+            "MANUAL_PEER_OVERRIDE" => {
+                // start.sh L478: must be exactly "0" (break-glass removed).
+                if value != "0" {
+                    return Err(err(format!(
+                        "Invalid persisted MANUAL_PEER_OVERRIDE='{value}'. \
+                         Manual peer break-glass is removed. Set MANUAL_PEER_OVERRIDE=0."
+                    )));
+                }
+                cfg.manual_peer_override = false;
+            }
+            "MANUAL_PEER_AUDIT_LOG" => cfg.manual_peer_audit_log = value.into(),
+            "DEFAULT_LAUNCH_PROFILE" => {
+                cfg.default_launch_profile = LaunchProfile::parse(value).ok_or_else(|| {
+                    err(format!("Invalid persisted DEFAULT_LAUNCH_PROFILE='{value}'."))
+                })?
+            }
+            "AUTO_LAUNCH_ON_START" => cfg.auto_launch_on_start = bool_strict(key, value)?,
+            "AUTO_LAUNCH_EXIT_NODE_ID" => {
+                cfg.auto_launch_exit_node_id =
+                    if value.is_empty() { None } else { Some(value.clone()) }
+            }
+            "AUTO_LAUNCH_LAN_MODE" => {
+                cfg.auto_launch_lan_mode = LanMode::parse(value).ok_or_else(|| {
+                    err(format!(
+                        "Invalid persisted AUTO_LAUNCH_LAN_MODE='{value}'. \
+                         Allowed values: skip, on, off."
+                    ))
+                })?
+            }
+            "EXIT_CHAIN_HOPS" => {
+                cfg.exit_chain.hops = ExitChainHops::parse(value).ok_or_else(|| {
+                    err(format!(
+                        "Invalid persisted EXIT_CHAIN_HOPS='{value}'. Allowed values: 1 or 2."
+                    ))
+                })?
+            }
+            "EXIT_CHAIN_ENTRY_NODE_ID" => {
+                cfg.exit_chain.entry = if value.is_empty() { None } else { Some(value.clone()) }
+            }
+            "EXIT_CHAIN_FINAL_NODE_ID" => {
+                cfg.exit_chain.final_node =
+                    if value.is_empty() { None } else { Some(value.clone()) }
+            }
+            // HOST_PROFILE is host-derived; ignore any persisted value.
+            "HOST_PROFILE" => {}
+            // parse_wizard_env already dropped non-allowlisted keys; anything
+            // here is a key we forgot to map. Fail closed.
+            other => return Err(err(format!("Unhandled config key '{other}'."))),
+        }
+    }
+
+    // --- step 2: strict file-value checks (validate_loaded_config_or_die) -
+    // EXIT_CHAIN_*_NODE_ID charset (L456-463).
+    if let Some(id) = &cfg.exit_chain.entry {
+        if !is_valid_node_id(id) {
+            return Err(err(format!("Invalid persisted EXIT_CHAIN_ENTRY_NODE_ID='{id}'.")));
+        }
+    }
+    if let Some(id) = &cfg.exit_chain.final_node {
+        if !is_valid_node_id(id) {
+            return Err(err(format!("Invalid persisted EXIT_CHAIN_FINAL_NODE_ID='{id}'.")));
+        }
+    }
+    // NODE_ROLE: a non-empty persisted value must be valid (L434-443), and a
+    // persisted blind_exit on an unsupported host is a hard error (L445-449)
+    // — distinct from the warn-and-revert path normalize_role uses for
+    // unpersisted/default values.
+    if let Some(r) = raw_node_role.as_deref() {
+        if !r.is_empty() {
+            let role = NodeRole::parse(r).ok_or_else(|| {
+                err(format!(
+                    "Invalid persisted NODE_ROLE='{r}'. Set NODE_ROLE to admin, client, or blind_exit."
+                ))
+            })?;
+            if role == NodeRole::BlindExit && !role::is_blind_exit_supported_host(host) {
+                return Err(err(
+                    "Invalid persisted NODE_ROLE='blind_exit' on unsupported host. \
+                     Set NODE_ROLE=client on this host."
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+
+    // --- step 3: normalize role + preset ---------------------------------
+    let (role, preset, role_warnings) = role::normalize_role(
+        raw_node_role.as_deref(),
+        raw_preset.as_deref(),
+        cfg.setup_complete,
+        host,
+    );
+    warnings.extend(role_warnings);
+    cfg.node_role = role;
+    cfg.setup_role_preset = preset;
+
+    // --- step 4: role policy + exit-chain sanitize -----------------------
+    warnings.extend(sync_role_policy(&mut cfg, trust_signer_key_present));
+    let is_blind_exit = cfg.node_role == NodeRole::BlindExit;
+    let (chain, chain_warnings) = cfg.exit_chain.clone().sanitize(is_blind_exit);
+    cfg.exit_chain = chain;
+    warnings.extend(chain_warnings);
+
+    // --- step 5: remaining enforce_* policies ----------------------------
+    // enforce_backend_mode (L485)
+    if !cfg.backend_mode.valid_for_host(host) {
+        return Err(err(format!(
+            "Invalid backend '{}' for host profile {:?}.",
+            cfg.backend_mode.as_str(),
+            host
+        )));
+    }
+    // enforce_auto_tunnel_policy (L498): unsigned/manual is never allowed.
+    if !cfg.auto_tunnel_enforce {
+        warnings.push(
+            "Unsigned/manual tunnel assignment is not allowed by default; forcing AUTO_TUNNEL_ENFORCE=1."
+                .to_owned(),
+        );
+        cfg.auto_tunnel_enforce = true;
+    }
+    // enforce_fail_closed_ssh_policy (L505)
+    if cfg.fail_closed_ssh_allow {
+        if cfg.fail_closed_ssh_cidrs.is_empty() {
+            return Err(err(
+                "FAIL_CLOSED_SSH_ALLOW_CIDRS is required when FAIL_CLOSED_SSH_ALLOW=1.".to_owned(),
+            ));
+        }
+    } else {
+        cfg.fail_closed_ssh_cidrs.clear();
+    }
+    // enforce_wg_listen_port_policy (L518): u16 already bounds <=65535; reject 0.
+    if cfg.wg_listen_port == 0 {
+        return Err(err("Invalid WG_LISTEN_PORT '0'. Expected numeric range 1..65535.".to_owned()));
+    }
+    // enforce_auto_port_forward_policy (L525)
+    if cfg.auto_port_forward_lease_secs < 60 {
+        return Err(err(format!(
+            "Invalid AUTO_PORT_FORWARD_LEASE_SECS '{}'. Expected numeric value >= 60.",
+            cfg.auto_port_forward_lease_secs
+        )));
+    }
+    if cfg.auto_port_forward_exit && host != HostProfile::Linux {
+        warnings.push(
+            "Auto port-forward is currently supported only on Linux. Forcing AUTO_PORT_FORWARD_EXIT=0."
+                .to_owned(),
+        );
+        cfg.auto_port_forward_exit = false;
+    }
+    if cfg.auto_port_forward_exit
+        && !matches!(cfg.node_role, NodeRole::Admin | NodeRole::BlindExit)
+    {
+        warnings.push(format!(
+            "Auto port-forward applies only to exit-serving roles. Forcing \
+             AUTO_PORT_FORWARD_EXIT=0 for role '{}'.",
+            cfg.node_role.as_str()
+        ));
+        cfg.auto_port_forward_exit = false;
+    }
+
+    Ok((cfg, warnings))
+}
+
+/// Bridge OperatorConfig <-> RolePolicyState (A.2) so role enforcement has a
+/// single implementation. In the production crate you may instead make
+/// `enforce_role_policy_defaults` take `&mut OperatorConfig` directly and drop
+/// this bridge.
+fn sync_role_policy(cfg: &mut OperatorConfig, trust_signer_key_present: bool) -> Vec<String> {
+    let mut state = RolePolicyState {
+        node_role: cfg.node_role,
+        manual_peer_override: cfg.manual_peer_override,
+        auto_refresh_trust: cfg.auto_refresh_trust,
+        default_launch_profile: cfg.default_launch_profile,
+        auto_port_forward_exit: cfg.auto_port_forward_exit,
+        exit_chain: cfg.exit_chain.clone(),
+        auto_launch_on_start: cfg.auto_launch_on_start,
+        auto_launch_exit_node_id: cfg.auto_launch_exit_node_id.clone(),
+        auto_launch_lan_mode: cfg.auto_launch_lan_mode,
+        fail_closed_ssh_allow: cfg.fail_closed_ssh_allow,
+        fail_closed_ssh_cidrs: cfg.fail_closed_ssh_cidrs.clone(),
+    };
+    let warnings = role::enforce_role_policy_defaults(
+        &mut state,
+        trust_signer_key_present,
+        &cfg.trust_signer_key_path.to_string_lossy(),
+    );
+    cfg.node_role = state.node_role;
+    cfg.manual_peer_override = state.manual_peer_override;
+    cfg.auto_refresh_trust = state.auto_refresh_trust;
+    cfg.default_launch_profile = state.default_launch_profile;
+    cfg.auto_port_forward_exit = state.auto_port_forward_exit;
+    cfg.exit_chain = state.exit_chain;
+    cfg.auto_launch_on_start = state.auto_launch_on_start;
+    cfg.auto_launch_exit_node_id = state.auto_launch_exit_node_id;
+    cfg.auto_launch_lan_mode = state.auto_launch_lan_mode;
+    cfg.fail_closed_ssh_allow = state.fail_closed_ssh_allow;
+    cfg.fail_closed_ssh_cidrs = state.fail_closed_ssh_cidrs;
+    warnings
+}
+
+/// Serialize back to wizard.env text. Emits keys in the exact order of
+/// save_config (start.sh L867-919) so a diff against the shell output is empty
+/// during the parity phase. Feed the result to `save_config_atomic`.
+pub fn to_wizard_env(cfg: &OperatorConfig) -> String {
+    fn b(v: bool) -> &'static str {
+        if v { "1" } else { "0" }
+    }
+    let mut out = String::new();
+    let mut line = |k: &str, v: &str| {
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+        out.push('\n');
+    };
+
+    line("SOCKET_PATH", &cfg.socket_path.to_string_lossy());
+    line("STATE_PATH", &cfg.state_path.to_string_lossy());
+    line("TRUST_EVIDENCE_PATH", &cfg.trust_evidence_path.to_string_lossy());
+    line("TRUST_VERIFIER_KEY_PATH", &cfg.trust_verifier_key_path.to_string_lossy());
+    line("TRUST_WATERMARK_PATH", &cfg.trust_watermark_path.to_string_lossy());
+    line("AUTO_TUNNEL_ENFORCE", b(cfg.auto_tunnel_enforce));
+    line("AUTO_TUNNEL_BUNDLE_PATH", &cfg.auto_tunnel_bundle_path.to_string_lossy());
+    line("AUTO_TUNNEL_VERIFIER_KEY_PATH", &cfg.auto_tunnel_verifier_key_path.to_string_lossy());
+    line("AUTO_TUNNEL_WATERMARK_PATH", &cfg.auto_tunnel_watermark_path.to_string_lossy());
+    line("AUTO_TUNNEL_MAX_AGE_SECS", &cfg.auto_tunnel_max_age_secs.to_string());
+    line("TRAVERSAL_BUNDLE_PATH", &cfg.traversal_bundle_path.to_string_lossy());
+    line("TRAVERSAL_VERIFIER_KEY_PATH", &cfg.traversal_verifier_key_path.to_string_lossy());
+    line("TRAVERSAL_WATERMARK_PATH", &cfg.traversal_watermark_path.to_string_lossy());
+    line("TRAVERSAL_MAX_AGE_SECS", &cfg.traversal_max_age_secs.to_string());
+    line("WG_INTERFACE", &cfg.wg_interface);
+    line("WG_LISTEN_PORT", &cfg.wg_listen_port.to_string());
+    line("AUTO_PORT_FORWARD_EXIT", b(cfg.auto_port_forward_exit));
+    line("AUTO_PORT_FORWARD_LEASE_SECS", &cfg.auto_port_forward_lease_secs.to_string());
+    line("WG_PRIVATE_KEY_PATH", &cfg.wg_private_key_path.to_string_lossy());
+    line("WG_ENCRYPTED_PRIVATE_KEY_PATH", &cfg.wg_encrypted_private_key_path.to_string_lossy());
+    line("WG_KEY_PASSPHRASE_PATH", &cfg.wg_key_passphrase_path.to_string_lossy());
+    line(
+        "WG_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH",
+        &cfg.wg_key_passphrase_credential_blob_path.to_string_lossy(),
+    );
+    line(
+        "SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH",
+        &cfg.signing_key_passphrase_credential_blob_path.to_string_lossy(),
+    );
+    line("WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT", &cfg.wg_key_passphrase_keychain_account);
+    line("WG_PUBLIC_KEY_PATH", &cfg.wg_public_key_path.to_string_lossy());
+    line("EGRESS_INTERFACE", &cfg.egress_interface);
+    line("MEMBERSHIP_SNAPSHOT_PATH", &cfg.membership_snapshot_path.to_string_lossy());
+    line("MEMBERSHIP_LOG_PATH", &cfg.membership_log_path.to_string_lossy());
+    line("MEMBERSHIP_WATERMARK_PATH", &cfg.membership_watermark_path.to_string_lossy());
+    line(
+        "MEMBERSHIP_OWNER_SIGNING_KEY_PATH",
+        &cfg.membership_owner_signing_key_path.to_string_lossy(),
+    );
+    line("BACKEND_MODE", cfg.backend_mode.as_str());
+    line("DATAPLANE_MODE", &cfg.dataplane_mode);
+    line("PRIVILEGED_HELPER_SOCKET_PATH", &cfg.privileged_helper_socket_path.to_string_lossy());
+    line("PRIVILEGED_HELPER_TIMEOUT_MS", &cfg.privileged_helper_timeout_ms.to_string());
+    line("RECONCILE_INTERVAL_MS", &cfg.reconcile_interval_ms.to_string());
+    line("MAX_RECONCILE_FAILURES", &cfg.max_reconcile_failures.to_string());
+    line("FAIL_CLOSED_SSH_ALLOW", b(cfg.fail_closed_ssh_allow));
+    line("FAIL_CLOSED_SSH_ALLOW_CIDRS", &cfg.fail_closed_ssh_cidrs.join(" "));
+    line("TRUST_SIGNER_KEY_PATH", &cfg.trust_signer_key_path.to_string_lossy());
+    line("AUTO_REFRESH_TRUST", b(cfg.auto_refresh_trust));
+    line("DEVICE_NODE_ID", &cfg.device_node_id);
+    line("HOST_PROFILE", host_profile_token(cfg.host_profile));
+    line("SETUP_COMPLETE", b(cfg.setup_complete));
+    line("NODE_ROLE", cfg.node_role.as_str());
+    line("MANUAL_PEER_OVERRIDE", b(cfg.manual_peer_override));
+    line("MANUAL_PEER_AUDIT_LOG", &cfg.manual_peer_audit_log.to_string_lossy());
+    line("DEFAULT_LAUNCH_PROFILE", cfg.default_launch_profile.as_str());
+    line("AUTO_LAUNCH_ON_START", b(cfg.auto_launch_on_start));
+    line("AUTO_LAUNCH_EXIT_NODE_ID", cfg.auto_launch_exit_node_id.as_deref().unwrap_or(""));
+    line("AUTO_LAUNCH_LAN_MODE", cfg.auto_launch_lan_mode.as_str());
+    line("EXIT_CHAIN_HOPS", cfg.exit_chain.hops.as_str());
+    line("EXIT_CHAIN_ENTRY_NODE_ID", cfg.exit_chain.entry.as_deref().unwrap_or(""));
+    line("EXIT_CHAIN_FINAL_NODE_ID", cfg.exit_chain.final_node.as_deref().unwrap_or(""));
+    // NOTE(parity): save_config also emits SETUP_ROLE_PRESET in configure
+    // flows; include it if your save_config variant does. The L867-919 block
+    // shown here omits it, so it is omitted to keep byte-parity.
+    out
+}
+
+fn host_profile_token(host: HostProfile) -> &'static str {
+    match host {
+        HostProfile::Linux => "linux",
+        HostProfile::Macos => "macos",
+        HostProfile::Windows => "windows",
+        HostProfile::Unsupported => "unsupported",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::parse::parse_wizard_env;
+
+    fn build(text: &str, host: HostProfile) -> Result<(OperatorConfig, Vec<String>), ConfigError> {
+        let parsed = parse_wizard_env(text);
+        build_and_enforce(&parsed, host, "test-node".to_owned(), true)
+    }
+
+    #[test]
+    fn defaults_only_yields_valid_config() {
+        let (cfg, _w) = build("", HostProfile::Linux).unwrap();
+        // empty file -> all defaults; node_role normalizes to client (setup
+        // incomplete) and auto_tunnel_enforce is forced on.
+        assert_eq!(cfg.node_role, NodeRole::Client);
+        assert!(cfg.auto_tunnel_enforce);
+        assert_eq!(cfg.wg_listen_port, 51820);
+    }
+
+    #[test]
+    fn invalid_node_role_is_hard_error() {
+        let res = build("NODE_ROLE=wizard\n", HostProfile::Linux);
+        assert!(matches!(res, Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn persisted_blind_exit_on_windows_is_rejected() {
+        let res = build("NODE_ROLE=blind_exit\n", HostProfile::Windows);
+        assert!(matches!(res, Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn manual_peer_override_must_be_zero() {
+        assert!(build("MANUAL_PEER_OVERRIDE=1\n", HostProfile::Linux).is_err());
+        assert!(build("MANUAL_PEER_OVERRIDE=0\n", HostProfile::Linux).is_ok());
+    }
+
+    #[test]
+    fn fail_closed_ssh_requires_cidrs() {
+        assert!(build("FAIL_CLOSED_SSH_ALLOW=1\n", HostProfile::Linux).is_err());
+        let (cfg, _) = build(
+            "FAIL_CLOSED_SSH_ALLOW=1\nFAIL_CLOSED_SSH_ALLOW_CIDRS=10.0.0.0/8 192.168.0.0/16\n",
+            HostProfile::Linux,
+        )
+        .unwrap();
+        assert!(cfg.fail_closed_ssh_allow);
+        assert_eq!(cfg.fail_closed_ssh_cidrs.len(), 2);
+    }
+
+    #[test]
+    fn bad_port_and_lease_are_rejected() {
+        assert!(build("WG_LISTEN_PORT=0\n", HostProfile::Linux).is_err());
+        assert!(build("WG_LISTEN_PORT=70000\n", HostProfile::Linux).is_err()); // u16 overflow
+        assert!(build("AUTO_PORT_FORWARD_LEASE_SECS=30\n", HostProfile::Linux).is_err());
+        assert!(build("AUTO_TUNNEL_MAX_AGE_SECS=notnum\n", HostProfile::Linux).is_err());
+    }
+
+    #[test]
+    fn wrong_backend_for_host_is_rejected() {
+        assert!(build("BACKEND_MODE=macos-wireguard\n", HostProfile::Linux).is_err());
+        assert!(build("BACKEND_MODE=linux-wireguard\n", HostProfile::Linux).is_ok());
+    }
+
+    #[test]
+    fn preset_coerces_role_and_round_trips_serialization() {
+        let (cfg, _) = build(
+            "NODE_ROLE=client\nSETUP_ROLE_PRESET=exit\nSETUP_COMPLETE=1\n",
+            HostProfile::Linux,
+        )
+        .unwrap();
+        assert_eq!(cfg.node_role, NodeRole::Admin); // exit preset -> admin
+        // serialize -> reparse -> rebuild is a fixed point on the typed fields.
+        let text = to_wizard_env(&cfg);
+        let (cfg2, _) = build(&text, HostProfile::Linux).unwrap();
+        assert_eq!(cfg.node_role, cfg2.node_role);
+        assert_eq!(cfg.backend_mode, cfg2.backend_mode);
+        assert_eq!(cfg.wg_listen_port, cfg2.wg_listen_port);
+    }
+
+    #[test]
+    fn admin_only_profile_downgraded_for_client() {
+        let (cfg, w) = build(
+            "NODE_ROLE=client\nDEFAULT_LAUNCH_PROFILE=quick-hybrid\n",
+            HostProfile::Linux,
+        )
+        .unwrap();
+        assert_eq!(cfg.default_launch_profile, LaunchProfile::QuickConnect);
+        assert!(w.iter().any(|m| m.contains("admin-only")));
+    }
+}
+```
+
+With A.10 in place, the only logic still requiring bespoke work is the
+interactive menu loop, the process-dispatch glue, and the dependency-bootstrap
+exec (plan §4.5/§4.7) — everything in the config/role/validation core is now
+copy-paste-and-test.
