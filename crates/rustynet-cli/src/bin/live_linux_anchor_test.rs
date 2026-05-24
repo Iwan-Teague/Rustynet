@@ -345,7 +345,11 @@ fn capture_anchor_list_from_host(
             // `rustynet.exe` short-circuits with an explicit
             // diagnostic instead of falling through to a confusing
             // PSCommandNotFoundException from the second statement.
-            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe anchor list\"";
+            // `Out-String -Width 4096` prevents PowerShell from
+            // wrapping long anchor-list rows at terminal width —
+            // wrapped rows would split `<node_id> capabilities=...`
+            // and break the parser's anchor-row matcher.
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe anchor list | Out-String -Width 4096\"";
             capture_remote_stdout(identity, known_hosts, host, command)
                 .map_err(|err| format!("anchor list failed on {host}: {err}"))
         }

@@ -1178,13 +1178,26 @@ pub fn capture_daemon_status_for_platform(
             identity,
             known_hosts,
             target,
-            "env RUSTYNET_DAEMON_SOCKET=/usr/local/var/rustynet/rustynetd.sock rustynet status",
+            // Phase 13 reviewer BLOCKER fix — the macOS daemon
+            // listens on /private/var/run/rustynet/rustynetd.sock
+            // (see crates/rustynetd/src/daemon.rs ~line 158 +
+            // vm_lab/orchestrator/adapter/macos_install.rs). The
+            // /usr/local/var/rustynet path is the macOS STATE root,
+            // not the IPC socket dir — first Phase 13 commit had
+            // that wrong and every macOS status capture would have
+            // failed to connect.
+            "env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock rustynet status",
         ),
         "windows" | "win32" => {
             // Use `if (-not (Get-Command ...))` so a missing
             // rustynet.exe surfaces an explicit diagnostic rather
-            // than the bare PSCommandNotFoundException.
-            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe status\"";
+            // than the bare PSCommandNotFoundException. Pipe the
+            // output through `Out-String -Width 4096` so PowerShell
+            // does NOT wrap the very long single-line status output
+            // at the host's terminal width — the parser depends on
+            // a single `key=value ...` line and a wrapped line
+            // would split keys across lines and be silently dropped.
+            let command = "powershell -NoProfile -Command \"if (-not (Get-Command rustynet.exe -ErrorAction SilentlyContinue)) { Write-Error 'rustynet.exe not on PATH'; exit 1 }; rustynet.exe status | Out-String -Width 4096\"";
             capture_remote_stdout(identity, known_hosts, target, command)
         }
         other => Err(format!(
