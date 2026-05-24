@@ -97,26 +97,21 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
 
-    // Track B Phase 1: the dispatcher fabric exists so the
-    // orchestrator can ask for an exit-handoff on macOS or Windows,
-    // but the per-platform validators (systemd → launchd / SCM,
-    // nftables → PF / NetNat, iproute2 → route / Get-NetRoute) land
-    // in Phases 3 + 4. Until then a non-Linux invocation fails closed
-    // with an honest message — exactly mirroring the Windows arm in
-    // `live_linux_anchor_test`. Silently falling through to the Linux
-    // path would emit Linux assertions against a non-Linux host and
-    // produce false-positive evidence.
+    // Track B per-platform dispatch. Linux runs the full handoff
+    // validator (existing path). macOS runs the Track B Phase 4
+    // pf+sysctl lifecycle validator (during-run snapshot, daemon
+    // stop, after-stop snapshot, merge, assert killswitch + NAT +
+    // forwarding all properly initialised and torn down). Windows
+    // still fails closed with a Phase 5 marker until the NetNat +
+    // SCM equivalent lands.
     match config.platform {
         ExitHandoffPlatform::Linux => {}
         ExitHandoffPlatform::MacOs => {
-            return Err("macOS exit-handoff live execution is not enabled yet; \
-                 the platform-aware validators land in Track B Phase 4. \
-                 Use --platform linux for the existing Linux-host coverage."
-                .to_owned());
+            return run_macos_exit_handoff(&config);
         }
         ExitHandoffPlatform::Windows => {
             return Err("Windows exit-handoff live execution is not enabled yet; \
-                 the platform-aware validators land in Track B Phase 3. \
+                 the platform-aware validators land in Track B Phase 5. \
                  Use --platform linux for the existing Linux-host coverage."
                 .to_owned());
         }
@@ -1862,6 +1857,265 @@ fn validate_positive_integer(name: &str, value: usize) -> Result<(), String> {
     }
 }
 
+// ─── Track B Phase 4: macOS exit-handoff live validator ────────────
+//
+// Real (not scaffold) macOS exit-mode validator. Captures pf + sysctl
+// state on the exit_a_host while the daemon is serving exit, stops
+// the daemon via launchctl, re-captures, merges into the canonical
+// macOS_exit_nat_lifecycle artifact shape, and asserts the same
+// invariants `evaluate_macos_exit_nat_lifecycle_artifact` in
+// `crates/rustynet-cli/src/vm_lab/mod.rs` enforces for static
+// artifacts:
+//
+// * during_run:  pf anchor present, internal_prefix matches mesh_cidr,
+//                tunnel_forwarding=Enabled, egress_forwarding=Enabled.
+// * after_stop:  pf anchor removed, forwarding_restored=true (both
+//                tunnel + egress sysctl back to Disabled).
+//
+// On any assertion failure the bin returns Err so the orchestrator's
+// `assert_json_report_status_pass` helper surfaces the failure. The
+// JSON report `status` is `pass` only when every assertion holds.
+//
+// The bin reuses the pure builder helpers from
+// `rustynetd::macos_exit_nat_lifecycle` so the parser shape stays in
+// lockstep with the daemon-side single-phase snapshot collector
+// (`collect_macos_exit_nat_lifecycle_snapshot`).
+const MACOS_PF_ANCHOR: &str = "com.rustynet/nat";
+const MACOS_DAEMON_LAUNCHD_LABEL: &str = "com.rustynet.daemon";
+
+#[derive(Debug, serde::Serialize)]
+struct MacosExitHandoffReport {
+    schema_version: u32,
+    status: &'static str,
+    platform: &'static str,
+    exit_host: String,
+    exit_node_id: String,
+    pf_anchor: String,
+    mesh_cidr: String,
+    during_run_pf_anchor_present: bool,
+    during_run_internal_prefix: String,
+    during_run_tunnel_forwarding: String,
+    during_run_egress_forwarding: String,
+    after_stop_pf_anchor_present: bool,
+    after_stop_forwarding_restored: bool,
+    captured_at_unix_during: i64,
+    captured_at_unix_after: i64,
+    detail: String,
+}
+
+fn run_macos_exit_handoff(config: &Config) -> Result<(), String> {
+    for command in ["ssh", "ssh-keygen"] {
+        require_command(command)?;
+    }
+    validate_identity(&config.ssh_identity_file)?;
+    let pinned_known_hosts = match config.pinned_known_hosts_file.as_ref() {
+        Some(path) => path.clone(),
+        None => load_home_known_hosts_path()?,
+    };
+    ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
+    let workspace = create_workspace("macos-exit-handoff")?;
+    let work_known_hosts = workspace.path().join("known_hosts");
+    seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
+
+    let exit_target = config.exit_a_host.as_str();
+    let mesh_cidr = "100.64.0.0/10".to_owned(); // canonical Rustynet mesh CIDR
+
+    // Phase 1: during-run snapshot. Capture pfctl anchor state +
+    // sysctl forwarding while the daemon is serving exit. Both
+    // captures are run via sudo so the helper has the privilege to
+    // call /sbin/pfctl and read kernel sysctls.
+    let during_pf = capture_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        &format!("/sbin/pfctl -a {} -s nat", MACOS_PF_ANCHOR),
+    )
+    .map_err(|err| format!("macos exit-handoff: during-run pfctl capture failed: {err}"))?;
+    let during_sysctl = capture_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        "/usr/sbin/sysctl -n net.inet.ip.forwarding",
+    )
+    .map_err(|err| {
+        format!("macos exit-handoff: during-run sysctl forwarding capture failed: {err}")
+    })?;
+    let captured_at_during = unix_now() as i64;
+    let during_snapshot =
+        rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            captured_at_during,
+            mesh_cidr.as_str(),
+            MACOS_PF_ANCHOR,
+            during_pf.as_str(),
+            during_sysctl.as_str(),
+        );
+
+    // Phase 2: stop the daemon via launchctl so the killswitch
+    // teardown path runs. `bootout` is the canonical macOS daemon
+    // stop verb; we accept a non-zero exit code (daemon may already
+    // be loaded under a different domain) but we DO require the
+    // subsequent pfctl/sysctl captures to prove the cleanup happened.
+    let _ = run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        &format!(
+            "/bin/launchctl bootout system/{} 2>/dev/null || /bin/launchctl unload /Library/LaunchDaemons/{}.plist 2>/dev/null || true",
+            MACOS_DAEMON_LAUNCHD_LABEL, MACOS_DAEMON_LAUNCHD_LABEL
+        ),
+    );
+    // Give the daemon a couple of seconds to release pf + sysctl.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // Phase 3: after-stop snapshot. Same captures; the validator
+    // expects pf anchor gone + ip.forwarding back to 0.
+    let after_pf = capture_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        &format!(
+            "/sbin/pfctl -a {} -s nat 2>/dev/null || true",
+            MACOS_PF_ANCHOR
+        ),
+    )
+    .map_err(|err| format!("macos exit-handoff: after-stop pfctl capture failed: {err}"))?;
+    let after_sysctl = capture_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        "/usr/sbin/sysctl -n net.inet.ip.forwarding",
+    )
+    .map_err(|err| {
+        format!("macos exit-handoff: after-stop sysctl forwarding capture failed: {err}")
+    })?;
+    let captured_at_after = unix_now() as i64;
+    let after_snapshot =
+        rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            captured_at_after,
+            mesh_cidr.as_str(),
+            MACOS_PF_ANCHOR,
+            after_pf.as_str(),
+            after_sysctl.as_str(),
+        );
+
+    // Phase 4: restart the daemon so subsequent stages (or the
+    // operator) inherit a running mesh. Best-effort — assertions
+    // already used the after-stop snapshot above.
+    let _ = run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        &format!(
+            "/bin/launchctl bootstrap system /Library/LaunchDaemons/{}.plist 2>/dev/null || /bin/launchctl load /Library/LaunchDaemons/{}.plist 2>/dev/null || true",
+            MACOS_DAEMON_LAUNCHD_LABEL, MACOS_DAEMON_LAUNCHD_LABEL
+        ),
+    );
+
+    // Phase 5: assert invariants. Mirror
+    // `evaluate_macos_exit_nat_lifecycle_artifact` from vm_lab/mod.rs.
+    // Each failure produces a precise diagnostic.
+    let mut failures: Vec<String> = Vec::new();
+    if !during_snapshot.pf_anchor_present {
+        failures.push("during-run pf anchor was NOT present (daemon not serving exit?)".to_owned());
+    }
+    if during_snapshot.pf_anchor_present && during_snapshot.internal_prefix != mesh_cidr {
+        failures.push(format!(
+            "during-run pf NAT internal_prefix {:?} did not match mesh_cidr {:?}",
+            during_snapshot.internal_prefix, mesh_cidr
+        ));
+    }
+    if !during_snapshot
+        .tunnel_forwarding
+        .eq_ignore_ascii_case("enabled")
+    {
+        failures.push(format!(
+            "during-run tunnel_forwarding {:?} expected 'Enabled'",
+            during_snapshot.tunnel_forwarding
+        ));
+    }
+    if !during_snapshot
+        .egress_forwarding
+        .eq_ignore_ascii_case("enabled")
+    {
+        failures.push(format!(
+            "during-run egress_forwarding {:?} expected 'Enabled'",
+            during_snapshot.egress_forwarding
+        ));
+    }
+    if after_snapshot.pf_anchor_present {
+        failures.push(
+            "after-stop pf anchor was STILL present (daemon teardown leaked the anchor)".to_owned(),
+        );
+    }
+    let forwarding_restored = after_snapshot
+        .tunnel_forwarding
+        .eq_ignore_ascii_case("disabled")
+        && after_snapshot
+            .egress_forwarding
+            .eq_ignore_ascii_case("disabled");
+    if !forwarding_restored {
+        failures.push(format!(
+            "after-stop forwarding NOT restored (tunnel={:?}, egress={:?})",
+            after_snapshot.tunnel_forwarding, after_snapshot.egress_forwarding
+        ));
+    }
+
+    let status = if failures.is_empty() { "pass" } else { "fail" };
+    let detail = if failures.is_empty() {
+        "all invariants held".to_owned()
+    } else {
+        failures.join("; ")
+    };
+
+    let report = MacosExitHandoffReport {
+        schema_version: 1,
+        status,
+        platform: "macos",
+        exit_host: config.exit_a_host.clone(),
+        exit_node_id: config.exit_a_node_id.clone(),
+        pf_anchor: MACOS_PF_ANCHOR.to_owned(),
+        mesh_cidr,
+        during_run_pf_anchor_present: during_snapshot.pf_anchor_present,
+        during_run_internal_prefix: during_snapshot.internal_prefix.clone(),
+        during_run_tunnel_forwarding: during_snapshot.tunnel_forwarding.clone(),
+        during_run_egress_forwarding: during_snapshot.egress_forwarding.clone(),
+        after_stop_pf_anchor_present: after_snapshot.pf_anchor_present,
+        after_stop_forwarding_restored: forwarding_restored,
+        captured_at_unix_during: captured_at_during,
+        captured_at_unix_after: captured_at_after,
+        detail: detail.clone(),
+    };
+    let mut body = serde_json::to_string(&report)
+        .map_err(|err| format!("serialize macos exit-handoff report failed: {err}"))?;
+    body.push('\n');
+    let report_path = if config.report_path.is_absolute() {
+        config.report_path.clone()
+    } else {
+        live_lab_support::repo_root()?.join(&config.report_path)
+    };
+    write_file(&report_path, body.as_str())?;
+
+    let log_path = if config.log_path.is_absolute() {
+        config.log_path.clone()
+    } else {
+        live_lab_support::repo_root()?.join(&config.log_path)
+    };
+    let log_body = format!(
+        "[macos-exit-handoff] status={status} exit_host={} exit_node_id={} detail={}\n",
+        config.exit_a_host, config.exit_a_node_id, detail
+    );
+    write_file(&log_path, log_body.as_str())?;
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "macos exit-handoff invariants failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
 fn validate_identity(path: &Path) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("missing ssh identity file: {}", path.display()));
@@ -2165,5 +2419,86 @@ peer.1.endpoint=192.168.128.26:51820
         assert_eq!(super::ExitHandoffPlatform::Linux.as_str(), "linux");
         assert_eq!(super::ExitHandoffPlatform::MacOs.as_str(), "macos");
         assert_eq!(super::ExitHandoffPlatform::Windows.as_str(), "windows");
+    }
+
+    // ─── Track B Phase 4: macOS exit-handoff validator ────────────
+    //
+    // The macOS run_macos_exit_handoff function is end-to-end SSH-
+    // driven and can't be exercised hermetically here, but the
+    // snapshot-parsing helpers it relies on (the
+    // `build_macos_exit_nat_lifecycle_snapshot` builder from
+    // `rustynetd::macos_exit_nat_lifecycle`) are pure-input. Pin the
+    // expected parser behaviour for the EXACT pfctl + sysctl outputs
+    // the bin captures so a future refactor of either side surfaces
+    // here.
+
+    #[test]
+    fn macos_during_run_capture_parses_pf_anchor_present() {
+        let pfctl_output = "nat-anchor \"com.rustynet/nat\" all\nnat on en0 inet from 100.64.0.0/10 to any -> en0:0\n";
+        let snapshot = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            100,
+            "100.64.0.0/10",
+            "com.rustynet/nat",
+            pfctl_output,
+            "1\n",
+        );
+        assert!(
+            snapshot.pf_anchor_present,
+            "pf anchor must parse as present"
+        );
+        assert_eq!(snapshot.internal_prefix, "100.64.0.0/10");
+        assert_eq!(snapshot.tunnel_forwarding, "Enabled");
+        assert_eq!(snapshot.egress_forwarding, "Enabled");
+    }
+
+    #[test]
+    fn macos_after_stop_capture_parses_anchor_absent_and_forwarding_disabled() {
+        let snapshot = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            200,
+            "100.64.0.0/10",
+            "com.rustynet/nat",
+            "",
+            "0\n",
+        );
+        assert!(
+            !snapshot.pf_anchor_present,
+            "empty pfctl output must parse as anchor-absent"
+        );
+        assert_eq!(snapshot.tunnel_forwarding, "Disabled");
+        assert_eq!(snapshot.egress_forwarding, "Disabled");
+    }
+
+    #[test]
+    fn macos_exit_handoff_report_serializes_with_serde() {
+        // The report struct must round-trip through serde_json so a
+        // malicious operator-supplied exit_host string can't break
+        // the report parser downstream.
+        let report = super::MacosExitHandoffReport {
+            schema_version: 1,
+            status: "fail",
+            platform: "macos",
+            exit_host: "admin@192.168.18.49 \" inject \n more".to_owned(),
+            exit_node_id: "exit-49".to_owned(),
+            pf_anchor: "com.rustynet/nat".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            during_run_pf_anchor_present: true,
+            during_run_internal_prefix: "100.64.0.0/10".to_owned(),
+            during_run_tunnel_forwarding: "Enabled".to_owned(),
+            during_run_egress_forwarding: "Enabled".to_owned(),
+            after_stop_pf_anchor_present: false,
+            after_stop_forwarding_restored: true,
+            captured_at_unix_during: 100,
+            captured_at_unix_after: 200,
+            detail: "all invariants held".to_owned(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("must produce valid JSON round-trip");
+        assert_eq!(parsed["status"], "fail");
+        assert_eq!(parsed["platform"], "macos");
+        assert_eq!(
+            parsed["exit_host"], "admin@192.168.18.49 \" inject \n more",
+            "embedded quote/newline must survive serde escaping"
+        );
     }
 }
