@@ -37,7 +37,10 @@ use live_lab_bin_support::{
     LiveLabPlatform, capture_remote_stdout, capture_root, create_workspace,
     enforce_linux_only_until_validator_lands, ensure_pinned_known_hosts_file, ensure_safe_token,
     git_head_commit, load_home_known_hosts_path, repo_root, require_command, run_root,
-    seed_known_hosts, verify_sudo, write_file,
+    seed_known_hosts, verify_passwordless_sudo, verify_sudo, write_file,
+};
+use rustynetd::macos_service_hardening::{
+    REVIEWED_MACOS_RELAY_LAUNCHD_LABEL, REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH,
 };
 use serde::Serialize;
 
@@ -53,21 +56,34 @@ fn run() -> Result<(), String> {
     let config = Config::parse(args)?;
     match config.platform {
         LiveLabPlatform::Linux => run_linux_relay(&config),
-        platform @ (LiveLabPlatform::MacOs | LiveLabPlatform::Windows) => {
-            // Track B Phase 6 ships only the Linux real validator;
-            // macOS + Windows validators land in Phases 7 + 8. The
-            // gate keeps the orchestrator honest until then so a
-            // misconfigured run cannot silently report success.
-            enforce_linux_only_until_validator_lands(platform, STAGE_NAME, PHASE_NOTE)
+        LiveLabPlatform::MacOs => run_macos_relay(&config),
+        LiveLabPlatform::Windows => {
+            // Track B Phase 8 lands the Windows SCM relay installer
+            // and the real validator. Until then, fail closed at the
+            // dispatcher so a misconfigured run cannot silently
+            // report success.
+            enforce_linux_only_until_validator_lands(
+                LiveLabPlatform::Windows,
+                STAGE_NAME,
+                PHASE_NOTE,
+            )
         }
     }
 }
 
 const STAGE_NAME: &str = "relay-service-lifecycle";
-const PHASE_NOTE: &str = "macOS lands in Track B Phase 7, Windows in Phase 8";
+const PHASE_NOTE: &str =
+    "Windows lands in Track B Phase 8 (needs SCM-driven rustynet-relay installer first)";
 
 const SYSTEMD_RELAY_UNIT: &str = "rustynet-relay.service";
+/// Reviewed UDP bind port for the relay datapath. The rustynet-relay
+/// daemon binds the datapath via `UdpSocket::bind`
+/// (`crates/rustynet-relay/src/main.rs`) so `ss` and `lsof` listener
+/// captures MUST include UDP, otherwise the during-run check is
+/// guaranteed to misclassify a healthy relay as down.
 const RELAY_BIND_PORT: u16 = 4500;
+/// Reviewed TCP bind port for the relay health/metrics endpoint
+/// (loopback by default). TCP-LISTEN — distinct from `RELAY_BIND_PORT`.
 const RELAY_HEALTH_PORT: u16 = 4501;
 const RELAY_HEALTH_PATH: &str = "/healthz";
 
@@ -322,6 +338,22 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
             RELAY_HEALTH_PORT
         ));
     }
+    if after_snapshot.health_status.eq_ignore_ascii_case("ok") {
+        failures.push(format!(
+            "after-stop /healthz still answers with status {:?} — daemon socket was not released",
+            after_snapshot.health_status
+        ));
+    }
+    // The restart phase is part of the contract: the orchestrator
+    // hands the host back to subsequent stages, so a silent restart
+    // failure must surface as a failed report rather than hide
+    // under a passing status.
+    if daemon_restart_status.starts_with("restart_failed:") {
+        failures.push(format!(
+            "post-test {} restart failed; relay role is OFFLINE — {}",
+            SYSTEMD_RELAY_UNIT, daemon_restart_status
+        ));
+    }
 
     let teardown_complete = !after_snapshot.listener_bound_4500
         && !after_snapshot.listener_bound_4501
@@ -400,6 +432,365 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
     }
 }
 
+// ─── Track B Phase 7: macOS relay-service-lifecycle validator ─────
+//
+// Mirrors `run_linux_relay` but uses launchctl + the macOS-native
+// listener / health probe stack. The shared snapshot type
+// `RelayLifecycleSnapshot` and the orchestrator-visible report
+// envelope `RelayLifecycleReport` keep both platforms in lockstep so
+// a future schema change forces an update on both.
+fn run_macos_relay(config: &Config) -> Result<(), String> {
+    for command in ["ssh", "ssh-keygen"] {
+        require_command(command)?;
+    }
+    validate_identity(&config.ssh_identity_file)?;
+    let pinned_known_hosts = match config.pinned_known_hosts_file.as_ref() {
+        Some(path) => path.clone(),
+        None => load_home_known_hosts_path()?,
+    };
+    ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
+    let workspace = create_workspace("macos-relay-lifecycle")?;
+    let work_known_hosts = workspace.path().join("known_hosts");
+    seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
+
+    let relay_target = config.relay_host.as_str();
+    // verify_sudo's /etc/hosts grep is Linux-PAM-specific; macOS uses
+    // verify_passwordless_sudo so a healthy macOS host without its
+    // hostname in /etc/hosts is not rejected spuriously.
+    verify_passwordless_sudo(&config.ssh_identity_file, &work_known_hosts, relay_target)?;
+
+    let during_snapshot = capture_macos_relay_lifecycle_snapshot(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+    )
+    .map_err(|err| format!("macos relay: during-run capture failed: {err}"))?;
+
+    // launchctl bootout is the canonical macOS daemon-stop verb.
+    // Accept a non-zero exit (the daemon may be loaded under a
+    // different domain) but require the subsequent listener capture
+    // to prove the cleanup happened — we never trust the stop verb's
+    // success on its own.
+    let _ = run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+        &format!(
+            "/bin/launchctl bootout system/{} 2>/dev/null || /bin/launchctl unload {} 2>/dev/null || true",
+            REVIEWED_MACOS_RELAY_LAUNCHD_LABEL, REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH
+        ),
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let after_snapshot = capture_macos_relay_lifecycle_snapshot(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+    )
+    .map_err(|err| format!("macos relay: after-stop capture failed: {err}"))?;
+
+    let daemon_restart_status = match run_root(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        relay_target,
+        &format!(
+            "/bin/launchctl bootstrap system {} 2>/dev/null || /bin/launchctl load {}",
+            REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH, REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH
+        ),
+    ) {
+        Ok(()) => "restarted".to_owned(),
+        Err(err) => format!("restart_failed: {err}"),
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    if !during_snapshot.unit_state.eq_ignore_ascii_case("active") {
+        failures.push(format!(
+            "during-run unit_state {:?} expected 'active' — launchd PID not found?",
+            during_snapshot.unit_state
+        ));
+    }
+    if !during_snapshot.listener_bound_4500 {
+        failures.push(format!(
+            "during-run relay listener on :{} was NOT bound",
+            RELAY_BIND_PORT
+        ));
+    }
+    if !during_snapshot.listener_bound_4501 {
+        failures.push(format!(
+            "during-run health listener on :{} was NOT bound",
+            RELAY_HEALTH_PORT
+        ));
+    }
+    if !during_snapshot.health_status.eq_ignore_ascii_case("ok") {
+        failures.push(format!(
+            "during-run /healthz returned status {:?} expected 'ok'",
+            during_snapshot.health_status
+        ));
+    }
+    if after_snapshot.unit_state.eq_ignore_ascii_case("active") {
+        failures.push(
+            "after-stop unit_state still 'active' — launchctl bootout did not take effect"
+                .to_owned(),
+        );
+    }
+    if after_snapshot.listener_bound_4500 {
+        failures.push(format!(
+            "after-stop relay listener on :{} was STILL bound (teardown leaked it)",
+            RELAY_BIND_PORT
+        ));
+    }
+    if after_snapshot.listener_bound_4501 {
+        failures.push(format!(
+            "after-stop health listener on :{} was STILL bound (teardown leaked it)",
+            RELAY_HEALTH_PORT
+        ));
+    }
+    if after_snapshot.health_status.eq_ignore_ascii_case("ok") {
+        failures.push(format!(
+            "after-stop /healthz still answers with status {:?} — daemon socket was not released",
+            after_snapshot.health_status
+        ));
+    }
+    if daemon_restart_status.starts_with("restart_failed:") {
+        failures.push(format!(
+            "post-test launchctl bootstrap failed; macOS relay is OFFLINE — {}",
+            daemon_restart_status
+        ));
+    }
+
+    let teardown_complete = !after_snapshot.listener_bound_4500
+        && !after_snapshot.listener_bound_4501
+        && !after_snapshot.unit_state.eq_ignore_ascii_case("active");
+    let status = if failures.is_empty() { "pass" } else { "fail" };
+    let detail = if failures.is_empty() {
+        "all invariants held".to_owned()
+    } else {
+        failures.join("; ")
+    };
+
+    let log_path = if config.log_path.is_absolute() {
+        config.log_path.clone()
+    } else {
+        repo_root()?.join(&config.log_path)
+    };
+    let report_path = if config.report_path.is_absolute() {
+        config.report_path.clone()
+    } else {
+        repo_root()?.join(&config.report_path)
+    };
+    let root = repo_root()?;
+    let git_commit = config
+        .git_commit
+        .clone()
+        .unwrap_or_else(|| git_head_commit(&root).unwrap_or_else(|_| "unknown".to_owned()));
+    let lifecycle = serde_json::to_value(RelayLifecycleArtifact {
+        schema_version: 1,
+        unit_name: REVIEWED_MACOS_RELAY_LAUNCHD_LABEL,
+        bind_port: RELAY_BIND_PORT,
+        health_port: RELAY_HEALTH_PORT,
+        during_run: &during_snapshot,
+        after_stop: &after_snapshot,
+        teardown_complete,
+    })
+    .map_err(|err| format!("serialize relay lifecycle artifact failed: {err}"))?;
+
+    let report = RelayLifecycleReport {
+        schema_version: 1,
+        phase: "phase10",
+        mode: "live_macos_relay_lifecycle",
+        evidence_mode: "measured",
+        status,
+        platform: "macos",
+        captured_at: utc_now_string(),
+        captured_at_unix: after_snapshot.captured_at_unix.max(0) as u64,
+        git_commit,
+        relay_host: config.relay_host.clone(),
+        relay_node_id: config.relay_node_id.clone(),
+        peer_host: config.peer_host.clone(),
+        peer_node_id: config.peer_node_id.clone(),
+        unit_name: REVIEWED_MACOS_RELAY_LAUNCHD_LABEL,
+        daemon_restart_status,
+        lifecycle,
+        source_artifacts: vec![log_path.display().to_string()],
+        detail: detail.clone(),
+    };
+    let mut body = serde_json::to_string(&report)
+        .map_err(|err| format!("serialize macos relay report failed: {err}"))?;
+    body.push('\n');
+    write_file(&report_path, body.as_str())?;
+
+    let log_body = format!(
+        "[macos-relay-lifecycle] status={status} relay_host={} relay_node_id={} peer_host={} peer_node_id={} detail={}\n",
+        config.relay_host, config.relay_node_id, config.peer_host, config.peer_node_id, detail
+    );
+    write_file(&log_path, log_body.as_str())?;
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "macos relay lifecycle invariants failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn capture_macos_relay_lifecycle_snapshot(
+    identity: &Path,
+    known_hosts: &Path,
+    relay_target: &str,
+) -> Result<RelayLifecycleSnapshot, String> {
+    // `launchctl print system/<label>` exits non-zero when the
+    // service is not loaded — pipe through `|| true` so the captured
+    // stdout carries the diagnostic (or stays empty for absent
+    // services) rather than triggering a shell error.
+    let launchctl_print = capture_root(
+        identity,
+        known_hosts,
+        relay_target,
+        &format!(
+            "/bin/launchctl print system/{} 2>&1 || true",
+            REVIEWED_MACOS_RELAY_LAUNCHD_LABEL
+        ),
+    )?;
+    let unit_state = parse_macos_launchctl_print_state(launchctl_print.as_str());
+    // Mirror the Linux path: capture UDP and TCP separately so each
+    // port is matched against the right protocol. lsof has no LISTEN
+    // state for UDP — a bound UDP socket prints without `(LISTEN)`,
+    // so the UDP matcher must NOT require it.
+    let udp_listeners = capture_root(
+        identity,
+        known_hosts,
+        relay_target,
+        "/usr/sbin/lsof -nP -iUDP 2>/dev/null || true",
+    )?;
+    let tcp_listeners = capture_root(
+        identity,
+        known_hosts,
+        relay_target,
+        "/usr/sbin/lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null || true",
+    )?;
+    let listener_bound_4500 =
+        macos_udp_listener_summary_contains_port(udp_listeners.as_str(), RELAY_BIND_PORT);
+    let listener_bound_4501 =
+        macos_tcp_listener_summary_contains_port(tcp_listeners.as_str(), RELAY_HEALTH_PORT);
+    let health_body = capture_remote_stdout(
+        identity,
+        known_hosts,
+        relay_target,
+        &format!(
+            "/usr/bin/curl --silent --max-time 2 http://127.0.0.1:{}{} || true",
+            RELAY_HEALTH_PORT, RELAY_HEALTH_PATH
+        ),
+    )
+    .unwrap_or_default();
+    let (health_status, health_active_sessions) = parse_relay_health_body(health_body.as_str());
+
+    let mut listener_summary = String::new();
+    for (label, body) in [
+        ("udp", udp_listeners.as_str()),
+        ("tcp", tcp_listeners.as_str()),
+    ] {
+        for line in body
+            .lines()
+            .filter(|line| {
+                line.contains(&format!(":{}", RELAY_BIND_PORT))
+                    || line.contains(&format!(":{}", RELAY_HEALTH_PORT))
+            })
+            .take(4)
+        {
+            listener_summary.push_str(label);
+            listener_summary.push(' ');
+            listener_summary.push_str(line);
+            listener_summary.push('\n');
+        }
+    }
+    Ok(RelayLifecycleSnapshot {
+        captured_at_unix: unix_now_secs(),
+        unit_state,
+        listener_bound_4500,
+        listener_bound_4501,
+        health_status,
+        health_active_sessions,
+        listener_summary: listener_summary.trim_end().to_owned(),
+    })
+}
+
+/// Parse `launchctl print system/<label>` stdout into a state word
+/// that mirrors `systemctl is-active` ("active" / "inactive" /
+/// "failed"). launchctl returns multi-line output containing a `pid`
+/// field when the daemon is running and a `state = running` line.
+/// When the service is not loaded launchctl writes
+/// "Could not find service" to stderr (which we redirect to stdout
+/// via `2>&1`).
+fn parse_macos_launchctl_print_state(stdout: &str) -> String {
+    let lower = stdout.to_ascii_lowercase();
+    if lower.contains("could not find service") || lower.contains("service not loaded") {
+        return "inactive".to_owned();
+    }
+    // launchctl uses `state = running` (with surrounding whitespace).
+    if stdout
+        .lines()
+        .any(|line| line.trim().starts_with("state =") && line.contains("running"))
+    {
+        return "active".to_owned();
+    }
+    // A pid field with a non-zero numeric value implies the daemon
+    // is up. launchctl prints `pid = <NNN>` for live daemons.
+    if stdout.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("pid =")
+            && trimmed
+                .split_once('=')
+                .and_then(|(_, rest)| rest.trim().parse::<u32>().ok())
+                .is_some_and(|pid| pid != 0)
+    }) {
+        return "active".to_owned();
+    }
+    if stdout.trim().is_empty() {
+        return "inactive".to_owned();
+    }
+    "inactive".to_owned()
+}
+
+/// lsof `-iTCP -sTCP:LISTEN` lines look like
+/// `rustynet-r  1234 rustynetd   10u  IPv4 0xabc      0t0  TCP 127.0.0.1:4501 (LISTEN)`.
+/// Match on `(LISTEN)` plus the explicit port suffix so an ephemeral
+/// outbound TCP connection on the same port cannot satisfy the check.
+fn macos_tcp_listener_summary_contains_port(summary: &str, port: u16) -> bool {
+    let needles = [
+        format!("127.0.0.1:{}", port),
+        format!("*:{}", port),
+        format!("[::1]:{}", port),
+    ];
+    summary.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains("(LISTEN)") && needles.iter().any(|needle| trimmed.contains(needle))
+    })
+}
+
+/// lsof `-iUDP` lines look like
+/// `rustynet-r  1234 rustynetd   11u  IPv4 0xabd      0t0  UDP 127.0.0.1:4500`.
+/// Bound UDP sockets have no `(LISTEN)` state — they are
+/// connectionless — and lsof does not print one for them. Match on
+/// the `UDP` protocol token plus the port suffix. We also require
+/// the line NOT to contain `->` so an outbound UDP socket that has
+/// learnt a peer endpoint (`127.0.0.1:4500->10.0.0.1:5555`) cannot
+/// satisfy the bound-listener check.
+fn macos_udp_listener_summary_contains_port(summary: &str, port: u16) -> bool {
+    let needles = [
+        format!("127.0.0.1:{}", port),
+        format!("*:{}", port),
+        format!("[::1]:{}", port),
+    ];
+    summary.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains(" UDP ")
+            && !trimmed.contains("->")
+            && needles.iter().any(|needle| trimmed.ends_with(needle))
+    })
+}
+
 fn capture_relay_lifecycle_snapshot(
     identity: &Path,
     known_hosts: &Path,
@@ -418,16 +809,26 @@ fn capture_relay_lifecycle_snapshot(
             SYSTEMD_RELAY_UNIT
         ),
     )?;
-    let listener_summary = capture_root(
+    // The relay datapath binds UDP on :4500 and the health/metrics
+    // endpoint binds TCP on :4501. `ss -tlnp` would miss the UDP
+    // listener entirely — capture both protocols separately so each
+    // port is checked against the right parser.
+    let udp_summary = capture_root(
         identity,
         known_hosts,
         relay_target,
-        "/usr/sbin/ss -tlnp 2>/dev/null || /bin/ss -tlnp 2>/dev/null || true",
+        "/usr/sbin/ss -ulnp 2>/dev/null || /bin/ss -ulnp 2>/dev/null || /usr/bin/ss -ulnp 2>/dev/null || true",
+    )?;
+    let tcp_summary = capture_root(
+        identity,
+        known_hosts,
+        relay_target,
+        "/usr/sbin/ss -tlnp 2>/dev/null || /bin/ss -tlnp 2>/dev/null || /usr/bin/ss -tlnp 2>/dev/null || true",
     )?;
     let listener_bound_4500 =
-        listener_summary_contains_port(listener_summary.as_str(), RELAY_BIND_PORT);
+        linux_udp_summary_contains_port(udp_summary.as_str(), RELAY_BIND_PORT);
     let listener_bound_4501 =
-        listener_summary_contains_port(listener_summary.as_str(), RELAY_HEALTH_PORT);
+        linux_tcp_summary_contains_listen_port(tcp_summary.as_str(), RELAY_HEALTH_PORT);
     let health_body = capture_remote_stdout(
         identity,
         known_hosts,
@@ -440,6 +841,23 @@ fn capture_relay_lifecycle_snapshot(
     .unwrap_or_default();
     let (health_status, health_active_sessions) = parse_relay_health_body(health_body.as_str());
 
+    let mut listener_summary = String::new();
+    for (label, body) in [("udp", udp_summary.as_str()), ("tcp", tcp_summary.as_str())] {
+        for line in body
+            .lines()
+            .filter(|line| {
+                line.contains(&format!(":{}", RELAY_BIND_PORT))
+                    || line.contains(&format!(":{}", RELAY_HEALTH_PORT))
+            })
+            .take(4)
+        {
+            listener_summary.push_str(label);
+            listener_summary.push(' ');
+            listener_summary.push_str(line);
+            listener_summary.push('\n');
+        }
+    }
+
     Ok(RelayLifecycleSnapshot {
         captured_at_unix: unix_now_secs(),
         unit_state: unit_state.trim().to_owned(),
@@ -447,26 +865,45 @@ fn capture_relay_lifecycle_snapshot(
         listener_bound_4501,
         health_status,
         health_active_sessions,
-        listener_summary: listener_summary
-            .lines()
-            .filter(|line| {
-                line.contains(&format!(":{}", RELAY_BIND_PORT))
-                    || line.contains(&format!(":{}", RELAY_HEALTH_PORT))
-                    || line.contains("LISTEN")
-            })
-            .take(8)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        listener_summary: listener_summary.trim_end().to_owned(),
     })
 }
 
-fn listener_summary_contains_port(summary: &str, port: u16) -> bool {
-    let needle_v4 = format!(":{}", port);
-    let needle_loopback = format!("127.0.0.1:{}", port);
+/// `ss -ulnp` lines for UDP look like
+/// `UNCONN 0 0 127.0.0.1:4500 0.0.0.0:* users:(("rustynet-relay",...))`.
+/// A bound UDP socket is reported as state `UNCONN` (UDP is
+/// connectionless, so there is no LISTEN state). Match on `UNCONN`
+/// plus the explicit port suffix preceded by an interface or
+/// wildcard so an outbound UDP socket on the same port number
+/// cannot be confused for a bound listener.
+fn linux_udp_summary_contains_port(summary: &str, port: u16) -> bool {
+    let needles = [
+        format!("127.0.0.1:{}", port),
+        format!("0.0.0.0:{}", port),
+        format!("*:{}", port),
+        format!("[::1]:{}", port),
+        format!("[::]:{}", port),
+    ];
     summary.lines().any(|line| {
         let trimmed = line.trim();
-        trimmed.contains("LISTEN")
-            && (trimmed.contains(&needle_v4) || trimmed.contains(&needle_loopback))
+        trimmed.starts_with("UNCONN") && needles.iter().any(|needle| trimmed.contains(needle))
+    })
+}
+
+/// `ss -tlnp` TCP-LISTEN lines start with `LISTEN`. Require the
+/// LISTEN state so an ESTABLISHED outbound socket on the same port
+/// number cannot satisfy the check.
+fn linux_tcp_summary_contains_listen_port(summary: &str, port: u16) -> bool {
+    let needles = [
+        format!("127.0.0.1:{}", port),
+        format!("0.0.0.0:{}", port),
+        format!("*:{}", port),
+        format!("[::1]:{}", port),
+        format!("[::]:{}", port),
+    ];
+    summary.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("LISTEN") && needles.iter().any(|needle| trimmed.contains(needle))
     })
 }
 
@@ -596,48 +1033,56 @@ mod tests {
     // dropped without a compile or test break.
 
     #[test]
-    fn platform_gate_fails_closed_for_macos_with_phase_note() {
-        let err = super::enforce_linux_only_until_validator_lands(
-            LiveLabPlatform::MacOs,
-            super::STAGE_NAME,
-            super::PHASE_NOTE,
-        )
-        .expect_err("macOS must fail closed in Phase 6");
-        assert!(err.contains("macOS"));
-        assert!(err.contains(super::STAGE_NAME));
-        assert!(err.contains("Phase 7"));
-    }
-
-    #[test]
-    fn platform_gate_fails_closed_for_windows_with_phase_note() {
+    fn platform_gate_fails_closed_for_windows_with_phase_8_note() {
+        // Track B Phase 7 ships macOS; Windows still fails closed
+        // until Phase 8 lands the SCM-driven installer + validator.
         let err = super::enforce_linux_only_until_validator_lands(
             LiveLabPlatform::Windows,
             super::STAGE_NAME,
             super::PHASE_NOTE,
         )
-        .expect_err("Windows must fail closed in Phase 6");
+        .expect_err("Windows must fail closed in Phase 7");
         assert!(err.contains("Windows"));
+        assert!(err.contains(super::STAGE_NAME));
         assert!(err.contains("Phase 8"));
     }
 
     // Parser / pure-input helper coverage.
 
     #[test]
-    fn listener_summary_contains_port_matches_loopback_listen_line() {
+    fn linux_tcp_summary_matches_loopback_listen_for_health_port() {
         let body = "State        Recv-Q Send-Q Local Address:Port   Peer Address:Port\n\
-                    LISTEN       0      128    127.0.0.1:4500       0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=10))\n\
                     LISTEN       0      128    127.0.0.1:4501       0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=11))\n";
-        assert!(super::listener_summary_contains_port(body, 4500));
-        assert!(super::listener_summary_contains_port(body, 4501));
-        assert!(!super::listener_summary_contains_port(body, 4502));
+        assert!(super::linux_tcp_summary_contains_listen_port(body, 4501));
+        assert!(!super::linux_tcp_summary_contains_listen_port(body, 4502));
     }
 
     #[test]
-    fn listener_summary_rejects_non_listen_lines_for_same_port() {
+    fn linux_tcp_summary_rejects_non_listen_lines_for_same_port() {
         // ESTAB lines must not satisfy the LISTEN check — the daemon
         // could have an outbound socket on the port without binding.
-        let body = "ESTAB        0      0      127.0.0.1:4500       127.0.0.1:55512     users:((\"curl\",pid=4321,fd=4))\n";
-        assert!(!super::listener_summary_contains_port(body, 4500));
+        let body = "ESTAB        0      0      127.0.0.1:4501       127.0.0.1:55512     users:((\"curl\",pid=4321,fd=4))\n";
+        assert!(!super::linux_tcp_summary_contains_listen_port(body, 4501));
+    }
+
+    #[test]
+    fn linux_udp_summary_matches_unconn_bound_socket_for_relay_port() {
+        // `ss -ulnp` prints UDP bound sockets with state `UNCONN`
+        // since UDP has no LISTEN state. The matcher must accept
+        // UNCONN + the explicit port suffix.
+        let body = "State        Recv-Q Send-Q Local Address:Port   Peer Address:Port\n\
+                    UNCONN       0      0      127.0.0.1:4500       0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=10))\n";
+        assert!(super::linux_udp_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn linux_udp_summary_rejects_tcp_listen_lines() {
+        // A TCP LISTEN on the same port number must NOT satisfy the
+        // UDP check (defense-in-depth — the validator captures
+        // protocols separately, but if the captures are crossed by
+        // mistake the parser should still refuse).
+        let body = "LISTEN       0      128    127.0.0.1:4500       0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=10))\n";
+        assert!(!super::linux_udp_summary_contains_port(body, 4500));
     }
 
     #[test]
@@ -742,5 +1187,86 @@ mod tests {
             parsed["relay_host"], "debian@192.168.18.49 \" inject \n more",
             "embedded quote/newline must survive serde escaping"
         );
+    }
+
+    // ─── Track B Phase 7: macOS parser coverage ────────────────────
+
+    #[test]
+    fn parse_macos_launchctl_print_state_recognises_running_daemon() {
+        let stdout = "system/com.rustynet.relay = {\n\
+                      \tpid = 12345\n\
+                      \tstate = running\n\
+                      \tprogram = /usr/local/bin/rustynet-relay\n\
+                      }\n";
+        assert_eq!(super::parse_macos_launchctl_print_state(stdout), "active");
+    }
+
+    #[test]
+    fn parse_macos_launchctl_print_state_recognises_unloaded_service() {
+        // launchctl writes "Could not find service" to stderr when
+        // the label is not loaded; the validator redirects 2>&1 so
+        // we see it on stdout. Must classify as `inactive`.
+        let stdout = "Could not find service \"com.rustynet.relay\" in domain for system\n";
+        assert_eq!(super::parse_macos_launchctl_print_state(stdout), "inactive");
+    }
+
+    #[test]
+    fn parse_macos_launchctl_print_state_recognises_pid_only_form() {
+        // Some launchctl print outputs omit the explicit `state =
+        // running` line and only carry the `pid = ` field. A live
+        // pid must still be classified as `active`.
+        let stdout = "system/com.rustynet.relay = {\n\
+                      \tpid = 5678\n\
+                      \tprogram = /usr/local/bin/rustynet-relay\n\
+                      }\n";
+        assert_eq!(super::parse_macos_launchctl_print_state(stdout), "active");
+    }
+
+    #[test]
+    fn parse_macos_launchctl_print_state_returns_inactive_for_empty_stdout() {
+        assert_eq!(super::parse_macos_launchctl_print_state(""), "inactive");
+    }
+
+    #[test]
+    fn macos_tcp_listener_summary_matches_loopback_listen_for_health_port() {
+        let body = "COMMAND  PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
+                    rustynet 123 r    11u IPv4 0xabd      0t0  TCP 127.0.0.1:4501 (LISTEN)\n";
+        assert!(super::macos_tcp_listener_summary_contains_port(body, 4501));
+        assert!(!super::macos_tcp_listener_summary_contains_port(body, 4502));
+    }
+
+    #[test]
+    fn macos_tcp_listener_summary_rejects_established_connections_on_same_port() {
+        let body = "rustynet 123 r    20u IPv4 0xfff      0t0  TCP 127.0.0.1:4501->127.0.0.1:55512 (ESTABLISHED)\n";
+        assert!(!super::macos_tcp_listener_summary_contains_port(body, 4501));
+    }
+
+    #[test]
+    fn macos_tcp_listener_summary_accepts_wildcard_bind_form() {
+        let body = "rustynet 123 r    11u IPv4 0xabd      0t0  TCP *:4501 (LISTEN)\n";
+        assert!(super::macos_tcp_listener_summary_contains_port(body, 4501));
+    }
+
+    #[test]
+    fn macos_udp_listener_summary_matches_bound_relay_port() {
+        // macOS lsof prints bound UDP sockets WITHOUT `(LISTEN)`.
+        let body = "rustynet 123 r    10u IPv4 0xabc      0t0  UDP 127.0.0.1:4500\n";
+        assert!(super::macos_udp_listener_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn macos_udp_listener_summary_rejects_outbound_with_peer_endpoint() {
+        // lsof prints outbound UDP sockets with a learnt peer as
+        // `local->remote`. Must NOT satisfy the bound-listener check.
+        let body = "rustynet 123 r    20u IPv4 0xfff      0t0  UDP 127.0.0.1:4500->10.0.0.1:5555\n";
+        assert!(!super::macos_udp_listener_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn macos_udp_listener_summary_rejects_tcp_listen_for_same_port() {
+        // Defense-in-depth: TCP LISTEN on the same port number must
+        // NOT satisfy the UDP matcher.
+        let body = "rustynet 123 r    11u IPv4 0xabd      0t0  TCP 127.0.0.1:4500 (LISTEN)\n";
+        assert!(!super::macos_udp_listener_summary_contains_port(body, 4500));
     }
 }

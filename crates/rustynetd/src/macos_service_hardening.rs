@@ -29,6 +29,18 @@ use std::collections::BTreeMap;
 pub const REVIEWED_LAUNCHDAEMON_PLIST: &str = "/Library/LaunchDaemons/com.rustynet.daemon.plist";
 pub const REVIEWED_SERVICE_LABEL: &str = "com.rustynet.daemon";
 
+/// Reviewed launchd label for the sibling rustynet-relay daemon on
+/// macOS. Mirrors `scripts/launchd/com.rustynet.relay.plist`. Kept
+/// next to the daemon constants so the live-lab validator and the
+/// `ops install-macos-relay` installer share one source of truth — a
+/// future rename surfaces as a compile break in both call sites.
+pub const REVIEWED_MACOS_RELAY_LAUNCHD_LABEL: &str = "com.rustynet.relay";
+
+/// Reviewed install path for the macOS rustynet-relay launchd plist.
+/// Same rationale as `REVIEWED_MACOS_RELAY_LAUNCHD_LABEL`.
+pub const REVIEWED_MACOS_RELAY_LAUNCHD_PLIST_PATH: &str =
+    "/Library/LaunchDaemons/com.rustynet.relay.plist";
+
 /// Reviewed plist key=value pairs.
 const REVIEWED_PLIST_DIRECTIVES: &[(&str, &str)] = &[
     ("UserName", "rustynetd"),
