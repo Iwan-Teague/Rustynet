@@ -6914,6 +6914,17 @@ main() {
     record_stage_skip live_exit_handoff hard 'requires entry or aux target'
   fi
 
+  # Track B Phase 3 follow-up: wire the new relay live stage into
+  # the canonical run loop. The stage requires entry (preferred) or
+  # aux as the relay role host. Linux is currently the scaffolded
+  # path; macOS/Windows wrappers fail closed honestly until the per-
+  # platform validators land (Phases 6 + 7).
+  if has_label entry || has_label aux; then
+    run_stage hard live_relay 'run live relay role validation' stage_run_live_relay
+  else
+    record_stage_skip live_relay hard 'requires entry or aux target as the relay role host'
+  fi
+
   if has_four_node_live_topology; then
     run_stage hard live_two_hop 'run live two-hop validation' stage_run_live_two_hop
     run_stage hard live_lan_toggle 'run LAN access toggle / blind-exit validation' stage_run_live_lan_toggle

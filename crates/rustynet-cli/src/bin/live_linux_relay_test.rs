@@ -30,6 +30,7 @@ use live_lab_bin_support::{
     LiveLabPlatform, enforce_linux_only_until_validator_lands, ensure_safe_token, repo_root,
     write_file,
 };
+use serde::Serialize;
 
 fn main() {
     if let Err(err) = run() {
@@ -77,24 +78,25 @@ fn run() -> Result<(), String> {
     );
     write_file(&log_path, log_body.as_str())?;
 
-    let report_body = format!(
-        "{{\
-\"schema_version\":1,\
-\"status\":\"scaffold\",\
-\"platform\":\"{}\",\
-\"relay_host\":\"{}\",\
-\"relay_node_id\":\"{}\",\
-\"peer_host\":\"{}\",\
-\"peer_node_id\":\"{}\",\
-\"phase\":\"track-b-phase-3-scaffold\",\
-\"next_step\":\"phase-3b-linux-validator\"\
-}}\n",
-        config.platform.as_str(),
-        config.relay_host,
-        config.relay_node_id,
-        config.peer_host,
-        config.peer_node_id,
-    );
+    // Phase 3 reviewer finding #2 — use serde_json on a typed
+    // struct rather than hand-rolled format! interpolation. Removes
+    // the foot-gun where a future maintainer dropping
+    // ensure_safe_token from a field would silently produce invalid
+    // (or worse, attacker-controlled) JSON.
+    let report = ScaffoldReport {
+        schema_version: 1,
+        status: "scaffold",
+        platform: config.platform.as_str(),
+        relay_host: &config.relay_host,
+        relay_node_id: &config.relay_node_id,
+        peer_host: &config.peer_host,
+        peer_node_id: &config.peer_node_id,
+        phase: "track-b-phase-3-scaffold",
+        next_step: "phase-3b-linux-validator",
+    };
+    let mut report_body = serde_json::to_string(&report)
+        .map_err(|err| format!("serialize relay scaffold report failed: {err}"))?;
+    report_body.push('\n');
     write_file(&report_path, report_body.as_str())?;
 
     // Surface the scaffold state to stdout so an interactive operator
@@ -187,6 +189,24 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+/// Phase 3 reviewer finding #2 — typed report payload so
+/// serde_json can serialise it safely. A future maintainer who
+/// adds a new field or drops `ensure_safe_token` from an existing
+/// field cannot accidentally produce attacker-controlled JSON
+/// because serde escapes everything.
+#[derive(Serialize)]
+struct ScaffoldReport<'a> {
+    schema_version: u32,
+    status: &'static str,
+    platform: &'static str,
+    relay_host: &'a str,
+    relay_node_id: &'a str,
+    peer_host: &'a str,
+    peer_node_id: &'a str,
+    phase: &'static str,
+    next_step: &'static str,
 }
 
 /// Canonical stage name passed to the platform gate. Lifted to a
@@ -292,6 +312,34 @@ mod tests {
             super::PHASE_NOTE,
         )
         .expect("Linux must always pass the gate");
+    }
+
+    #[test]
+    fn scaffold_report_serializer_escapes_problematic_chars() {
+        // Phase 3 reviewer finding #2 — verify that even if a
+        // future maintainer relaxes ensure_safe_token, the typed
+        // serde struct still produces well-formed JSON. The double
+        // quote + backslash + newline below would have broken the
+        // old hand-rolled format!() approach.
+        let report = super::ScaffoldReport {
+            schema_version: 1,
+            status: "scaffold",
+            platform: "linux",
+            relay_host: "user@host\" injected\n more",
+            relay_node_id: "relay-\\1",
+            peer_host: "peer",
+            peer_node_id: "client",
+            phase: "track-b-phase-3-scaffold",
+            next_step: "phase-3b-linux-validator",
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("round-trip must produce valid JSON");
+        assert_eq!(
+            parsed["relay_host"], "user@host\" injected\n more",
+            "embedded quote/newline must survive serde roundtrip"
+        );
+        assert_eq!(parsed["relay_node_id"], "relay-\\1");
     }
 
     #[test]
