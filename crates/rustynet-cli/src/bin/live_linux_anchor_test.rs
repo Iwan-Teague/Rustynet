@@ -38,6 +38,10 @@ const ANCHOR_LIVE_SUBSTAGES: &[(&str, &str)] = &[
         "multi-anchor gossip prefers lex-min authority and keeps secondary anchor passive for port mapping",
     ),
     (
+        "validate_anchor_gossip_seed",
+        "anchor.gossip_seed capability is advertised in the running membership and identifies the expected seed nodes",
+    ),
+    (
         "validate_anchor_enrollment_endpoint",
         "fresh node enrollment uses anchor-minted token, sealed bundle, and anchor-signed approver attestation",
     ),
@@ -122,7 +126,17 @@ fn run() -> Result<(), String> {
 
     if config.platform == AnchorPlatform::Windows {
         return Err(
-            "Windows anchor live execution is not enabled yet; use --platform windows --dry-run"
+            "Windows anchor live execution is not enabled yet; Track B Phase 11 lands the real validator (use --dry-run for now)"
+                .to_owned(),
+        );
+    }
+    if config.platform == AnchorPlatform::Macos {
+        // The Linux substages below shell out to systemd / sudo /
+        // Linux-specific file paths. macOS would silently
+        // misclassify. Fail closed at the dispatcher until Track B
+        // Phase 10 lands the launchd-driven validator.
+        return Err(
+            "macOS anchor live execution is not enabled yet; Track B Phase 10 lands the real validator (use --dry-run for now)"
                 .to_owned(),
         );
     }
@@ -178,6 +192,24 @@ fn run() -> Result<(), String> {
         "validate_anchor_gossip_priority",
         "second anchor is signed into membership, leaf sees both anchors, and lex-min authority remains primary",
         json!({ "summary": gossip_priority }),
+    ));
+
+    // Track B Phase 9 — dedicated gossip-seed coverage. The existing
+    // `validate_anchor_gossip_priority` substage exercises the
+    // port-mapping-authority lex-min path and incidentally promotes
+    // the second anchor with the gossip_seed capability, but it does
+    // not directly assert that ALL anchor.gossip_seed capability
+    // holders show up in the running daemon's anchor list (the data
+    // the daemon hashes into `anchor_gossip_seed_peer_ids_from_membership`
+    // at gossip_runtime.rs:483). Split the assertion so a future
+    // change that drops `anchor.gossip_seed` from the canonical
+    // anchor capability set or stops surfacing it in the snapshot
+    // surfaces here.
+    let gossip_seed_summary = validate_anchor_gossip_seed(&anchor_list, &config)?;
+    subchecks.push(Subcheck::pass(
+        "validate_anchor_gossip_seed",
+        "anchor.gossip_seed capability is advertised in the running membership and identifies the expected seed nodes",
+        json!({ "summary": gossip_seed_summary }),
     ));
 
     let enrollment_endpoint =
@@ -329,6 +361,59 @@ fn set_membership_capabilities(
     capture_root(identity, known_hosts, host, &command)
         .map(|out| out.trim().to_owned())
         .map_err(|err| format!("membership capability mutation failed on {host}: {err}"))
+}
+
+/// Track B Phase 9 — dedicated gossip-seed advertisement check.
+///
+/// Reads the `rustynet anchor list` output that the running daemon
+/// derived from its in-memory membership snapshot and asserts:
+///   * the primary anchor carries `anchor.gossip_seed`
+///   * at least one node total advertises `anchor.gossip_seed`
+///   * a node WITHOUT the capability (when configured) does not
+///     accidentally inherit it
+///
+/// The daemon hashes this same view into the runtime
+/// `anchor_gossip_seed_peer_ids` set used by gossip re-broadcast
+/// targeting (see `gossip_runtime.rs::anchor_gossip_seed_peer_ids_from_membership`),
+/// so an advertisement-side regression would also break runtime
+/// targeting. The substage is intentionally parser-only (no host
+/// mutation) so it is cheap to run on every live-lab pass.
+fn validate_anchor_gossip_seed(anchor_list: &str, config: &Config) -> Result<String, String> {
+    let seed_rows: Vec<&str> = anchor_list
+        .lines()
+        .filter(|line| line.contains("anchor.gossip_seed"))
+        .collect();
+    if seed_rows.is_empty() {
+        return Err(
+            "no node in anchor list advertises anchor.gossip_seed — daemon membership view is missing the capability"
+                .to_owned(),
+        );
+    }
+    let primary_row = anchor_list
+        .lines()
+        .find(|line| line.starts_with(config.anchor_node_id.as_str()))
+        .ok_or_else(|| {
+            format!(
+                "primary anchor {} missing from anchor list while checking gossip_seed",
+                config.anchor_node_id
+            )
+        })?;
+    if !primary_row.contains("anchor.gossip_seed") {
+        return Err(format!(
+            "primary anchor {} is missing anchor.gossip_seed capability: {primary_row}",
+            config.anchor_node_id
+        ));
+    }
+    let seed_node_ids: Vec<String> = seed_rows
+        .iter()
+        .filter_map(|line| line.split_once(' ').map(|(node_id, _)| node_id.to_owned()))
+        .collect();
+    Ok(format!(
+        "primary={} seed_count={} seeds={}",
+        config.anchor_node_id,
+        seed_node_ids.len(),
+        seed_node_ids.join(",")
+    ))
 }
 
 fn validate_lex_min_anchor_authority(
@@ -1444,7 +1529,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
         assert_eq!(parsed["stage"], "live_anchor");
         assert_eq!(parsed["status"], "pass");
-        assert_eq!(parsed["subchecks"].as_array().unwrap().len(), 5);
+        assert_eq!(parsed["subchecks"].as_array().unwrap().len(), 6);
         let names = parsed["subchecks"]
             .as_array()
             .unwrap()
@@ -1457,9 +1542,81 @@ mod tests {
                 "validate_anchor_membership_advertise",
                 "validate_anchor_bundle_pull",
                 "validate_anchor_gossip_priority",
+                "validate_anchor_gossip_seed",
                 "validate_anchor_enrollment_endpoint",
                 "validate_anchor_downgrade_revocation",
             ]
+        );
+    }
+
+    // ─── Track B Phase 9: gossip-seed parser coverage ──────────────
+
+    fn gossip_seed_sample_config() -> super::Config {
+        let mut cfg = super::Config::parse(vec!["--dry-run".to_owned()]).expect("dry-run parse");
+        cfg.anchor_node_id = "exit-1".to_owned();
+        cfg
+    }
+
+    #[test]
+    fn validate_anchor_gossip_seed_accepts_primary_carrying_capability() {
+        let anchor_list = "anchor nodes:\n\
+                           exit-1 capabilities=anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative\n\
+                           entry-2 capabilities=anchor,relay_host,anchor.gossip_seed\n";
+        let cfg = gossip_seed_sample_config();
+        let summary = super::validate_anchor_gossip_seed(anchor_list, &cfg).expect("must pass");
+        assert!(
+            summary.contains("seed_count=2"),
+            "expected 2 seed nodes: {summary}"
+        );
+        assert!(summary.contains("primary=exit-1"));
+        assert!(summary.contains("exit-1"));
+        assert!(summary.contains("entry-2"));
+    }
+
+    #[test]
+    fn validate_anchor_gossip_seed_rejects_when_no_node_carries_capability() {
+        // A snapshot that has lost the anchor.gossip_seed capability
+        // entirely must fail closed — gossip re-broadcast targeting
+        // would otherwise silently degrade to no targeted seeds.
+        let anchor_list = "anchor nodes:\n\
+                           exit-1 capabilities=anchor,relay_host\n";
+        let cfg = gossip_seed_sample_config();
+        let err =
+            super::validate_anchor_gossip_seed(anchor_list, &cfg).expect_err("must fail closed");
+        assert!(
+            err.contains("no node in anchor list advertises anchor.gossip_seed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_anchor_gossip_seed_rejects_when_primary_missing_capability() {
+        // The primary anchor must always carry gossip_seed. A
+        // snapshot where a SECONDARY anchor carries it but the
+        // primary does not is a configuration drift that must
+        // surface as a failure rather than be silently accepted.
+        let anchor_list = "anchor nodes:\n\
+                           exit-1 capabilities=anchor,relay_host\n\
+                           entry-2 capabilities=anchor,relay_host,anchor.gossip_seed\n";
+        let cfg = gossip_seed_sample_config();
+        let err =
+            super::validate_anchor_gossip_seed(anchor_list, &cfg).expect_err("must fail closed");
+        assert!(
+            err.contains("primary anchor exit-1 is missing anchor.gossip_seed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_anchor_gossip_seed_rejects_when_primary_absent_from_list() {
+        let anchor_list = "anchor nodes:\n\
+                           other-node capabilities=anchor,relay_host,anchor.gossip_seed\n";
+        let cfg = gossip_seed_sample_config();
+        let err =
+            super::validate_anchor_gossip_seed(anchor_list, &cfg).expect_err("must fail closed");
+        assert!(
+            err.contains("primary anchor exit-1 missing from anchor list"),
+            "got: {err}"
         );
     }
 }

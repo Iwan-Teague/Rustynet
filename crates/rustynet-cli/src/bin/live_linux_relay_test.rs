@@ -189,8 +189,8 @@ fn print_usage() {
 struct RelayLifecycleSnapshot {
     captured_at_unix: i64,
     unit_state: String,
-    listener_bound_4500: bool,
-    listener_bound_4501: bool,
+    listener_bound_datapath: bool,
+    listener_bound_health: bool,
     health_status: String,
     health_active_sessions: Option<u64>,
     listener_summary: String,
@@ -293,13 +293,13 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
             during_snapshot.unit_state
         ));
     }
-    if !during_snapshot.listener_bound_4500 {
+    if !during_snapshot.listener_bound_datapath {
         failures.push(format!(
             "during-run relay listener on :{} was NOT bound",
             RELAY_BIND_PORT
         ));
     }
-    if !during_snapshot.listener_bound_4501 {
+    if !during_snapshot.listener_bound_health {
         failures.push(format!(
             "during-run health listener on :{} was NOT bound",
             RELAY_HEALTH_PORT
@@ -316,13 +316,13 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
             "after-stop unit_state still 'active' — systemctl stop did not take effect".to_owned(),
         );
     }
-    if after_snapshot.listener_bound_4500 {
+    if after_snapshot.listener_bound_datapath {
         failures.push(format!(
             "after-stop relay listener on :{} was STILL bound (teardown leaked it)",
             RELAY_BIND_PORT
         ));
     }
-    if after_snapshot.listener_bound_4501 {
+    if after_snapshot.listener_bound_health {
         failures.push(format!(
             "after-stop health listener on :{} was STILL bound (teardown leaked it)",
             RELAY_HEALTH_PORT
@@ -345,8 +345,8 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
         ));
     }
 
-    let teardown_complete = !after_snapshot.listener_bound_4500
-        && !after_snapshot.listener_bound_4501
+    let teardown_complete = !after_snapshot.listener_bound_datapath
+        && !after_snapshot.listener_bound_health
         && !after_snapshot.unit_state.eq_ignore_ascii_case("active");
     let status = if failures.is_empty() { "pass" } else { "fail" };
     let detail = if failures.is_empty() {
@@ -499,13 +499,13 @@ fn run_macos_relay(config: &Config) -> Result<(), String> {
             during_snapshot.unit_state
         ));
     }
-    if !during_snapshot.listener_bound_4500 {
+    if !during_snapshot.listener_bound_datapath {
         failures.push(format!(
             "during-run relay listener on :{} was NOT bound",
             RELAY_BIND_PORT
         ));
     }
-    if !during_snapshot.listener_bound_4501 {
+    if !during_snapshot.listener_bound_health {
         failures.push(format!(
             "during-run health listener on :{} was NOT bound",
             RELAY_HEALTH_PORT
@@ -523,13 +523,13 @@ fn run_macos_relay(config: &Config) -> Result<(), String> {
                 .to_owned(),
         );
     }
-    if after_snapshot.listener_bound_4500 {
+    if after_snapshot.listener_bound_datapath {
         failures.push(format!(
             "after-stop relay listener on :{} was STILL bound (teardown leaked it)",
             RELAY_BIND_PORT
         ));
     }
-    if after_snapshot.listener_bound_4501 {
+    if after_snapshot.listener_bound_health {
         failures.push(format!(
             "after-stop health listener on :{} was STILL bound (teardown leaked it)",
             RELAY_HEALTH_PORT
@@ -548,8 +548,8 @@ fn run_macos_relay(config: &Config) -> Result<(), String> {
         ));
     }
 
-    let teardown_complete = !after_snapshot.listener_bound_4500
-        && !after_snapshot.listener_bound_4501
+    let teardown_complete = !after_snapshot.listener_bound_datapath
+        && !after_snapshot.listener_bound_health
         && !after_snapshot.unit_state.eq_ignore_ascii_case("active");
     let status = if failures.is_empty() { "pass" } else { "fail" };
     let detail = if failures.is_empty() {
@@ -660,9 +660,9 @@ fn capture_macos_relay_lifecycle_snapshot(
         relay_target,
         "/usr/sbin/lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null || true",
     )?;
-    let listener_bound_4500 =
+    let listener_bound_datapath =
         macos_udp_listener_summary_contains_port(udp_listeners.as_str(), RELAY_BIND_PORT);
-    let listener_bound_4501 =
+    let listener_bound_health =
         macos_tcp_listener_summary_contains_port(tcp_listeners.as_str(), RELAY_HEALTH_PORT);
     let health_body = capture_remote_stdout(
         identity,
@@ -698,8 +698,8 @@ fn capture_macos_relay_lifecycle_snapshot(
     Ok(RelayLifecycleSnapshot {
         captured_at_unix: unix_now_secs(),
         unit_state,
-        listener_bound_4500,
-        listener_bound_4501,
+        listener_bound_datapath,
+        listener_bound_health,
         health_status,
         health_active_sessions,
         listener_summary: listener_summary.trim_end().to_owned(),
@@ -869,13 +869,13 @@ fn run_windows_relay(config: &Config) -> Result<(), String> {
             during_snapshot.unit_state
         ));
     }
-    if !during_snapshot.listener_bound_4500 {
+    if !during_snapshot.listener_bound_datapath {
         failures.push(format!(
             "during-run relay UDP listener on :{} was NOT bound",
             REVIEWED_WINDOWS_RELAY_BIND_PORT
         ));
     }
-    if !during_snapshot.listener_bound_4501 {
+    if !during_snapshot.listener_bound_health {
         failures.push(format!(
             "during-run relay health TCP listener on :{} was NOT bound",
             REVIEWED_WINDOWS_RELAY_HEALTH_PORT
@@ -892,13 +892,13 @@ fn run_windows_relay(config: &Config) -> Result<(), String> {
             "after-stop unit_state still 'active' — Stop-Service did not take effect".to_owned(),
         );
     }
-    if after_snapshot.listener_bound_4500 {
+    if after_snapshot.listener_bound_datapath {
         failures.push(format!(
             "after-stop relay UDP listener on :{} was STILL bound (teardown leaked it)",
             REVIEWED_WINDOWS_RELAY_BIND_PORT
         ));
     }
-    if after_snapshot.listener_bound_4501 {
+    if after_snapshot.listener_bound_health {
         failures.push(format!(
             "after-stop relay health TCP listener on :{} was STILL bound (teardown leaked it)",
             REVIEWED_WINDOWS_RELAY_HEALTH_PORT
@@ -917,8 +917,8 @@ fn run_windows_relay(config: &Config) -> Result<(), String> {
         ));
     }
 
-    let teardown_complete = !after_snapshot.listener_bound_4500
-        && !after_snapshot.listener_bound_4501
+    let teardown_complete = !after_snapshot.listener_bound_datapath
+        && !after_snapshot.listener_bound_health
         && !after_snapshot.unit_state.eq_ignore_ascii_case("active");
     let status = if failures.is_empty() { "pass" } else { "fail" };
     let detail = if failures.is_empty() {
@@ -1037,8 +1037,8 @@ fn capture_windows_relay_lifecycle_snapshot(
         ),
     )
     .unwrap_or_default();
-    let listener_bound_4500 = windows_endpoint_summary_has_row(udp_summary.as_str());
-    let listener_bound_4501 = windows_endpoint_summary_has_row(tcp_summary.as_str());
+    let listener_bound_datapath = windows_endpoint_summary_has_row(udp_summary.as_str());
+    let listener_bound_health = windows_endpoint_summary_has_row(tcp_summary.as_str());
 
     // Invoke-WebRequest -UseBasicParsing emits the body content of a
     // successful response. On connection refused, PowerShell errors
@@ -1070,8 +1070,8 @@ fn capture_windows_relay_lifecycle_snapshot(
     Ok(RelayLifecycleSnapshot {
         captured_at_unix: unix_now_secs(),
         unit_state,
-        listener_bound_4500,
-        listener_bound_4501,
+        listener_bound_datapath,
+        listener_bound_health,
         health_status,
         health_active_sessions,
         listener_summary: listener_summary.trim_end().to_owned(),
@@ -1139,9 +1139,9 @@ fn capture_relay_lifecycle_snapshot(
         relay_target,
         "/usr/sbin/ss -tlnp 2>/dev/null || /bin/ss -tlnp 2>/dev/null || /usr/bin/ss -tlnp 2>/dev/null || true",
     )?;
-    let listener_bound_4500 =
+    let listener_bound_datapath =
         linux_udp_summary_contains_port(udp_summary.as_str(), RELAY_BIND_PORT);
-    let listener_bound_4501 =
+    let listener_bound_health =
         linux_tcp_summary_contains_listen_port(tcp_summary.as_str(), RELAY_HEALTH_PORT);
     let health_body = capture_remote_stdout(
         identity,
@@ -1175,8 +1175,8 @@ fn capture_relay_lifecycle_snapshot(
     Ok(RelayLifecycleSnapshot {
         captured_at_unix: unix_now_secs(),
         unit_state: unit_state.trim().to_owned(),
-        listener_bound_4500,
-        listener_bound_4501,
+        listener_bound_datapath,
+        listener_bound_health,
         health_status,
         health_active_sessions,
         listener_summary: listener_summary.trim_end().to_owned(),
@@ -1415,8 +1415,8 @@ mod tests {
         let during = super::RelayLifecycleSnapshot {
             captured_at_unix: 100,
             unit_state: "active".to_owned(),
-            listener_bound_4500: true,
-            listener_bound_4501: true,
+            listener_bound_datapath: true,
+            listener_bound_health: true,
             health_status: "ok".to_owned(),
             health_active_sessions: Some(2),
             listener_summary: "LISTEN 0 128 127.0.0.1:4500 0.0.0.0:*".to_owned(),
@@ -1424,8 +1424,8 @@ mod tests {
         let after = super::RelayLifecycleSnapshot {
             captured_at_unix: 200,
             unit_state: "inactive".to_owned(),
-            listener_bound_4500: false,
-            listener_bound_4501: false,
+            listener_bound_datapath: false,
+            listener_bound_health: false,
             health_status: "unreachable".to_owned(),
             health_active_sessions: None,
             listener_summary: String::new(),
@@ -1470,11 +1470,11 @@ mod tests {
         assert_eq!(parsed["evidence_mode"], "measured");
         assert_eq!(parsed["unit_name"], super::SYSTEMD_RELAY_UNIT);
         assert_eq!(
-            parsed["lifecycle"]["during_run"]["listener_bound_4500"],
+            parsed["lifecycle"]["during_run"]["listener_bound_datapath"],
             true
         );
         assert_eq!(
-            parsed["lifecycle"]["after_stop"]["listener_bound_4500"],
+            parsed["lifecycle"]["after_stop"]["listener_bound_datapath"],
             false
         );
         assert_eq!(parsed["lifecycle"]["teardown_complete"], true);
@@ -1651,8 +1651,8 @@ mod tests {
         let during = super::RelayLifecycleSnapshot {
             captured_at_unix: 100,
             unit_state: "active".to_owned(),
-            listener_bound_4500: true,
-            listener_bound_4501: true,
+            listener_bound_datapath: true,
+            listener_bound_health: true,
             health_status: "ok".to_owned(),
             health_active_sessions: Some(1),
             listener_summary: "udp 0.0.0.0 4500".to_owned(),
@@ -1660,8 +1660,8 @@ mod tests {
         let after = super::RelayLifecycleSnapshot {
             captured_at_unix: 200,
             unit_state: "inactive".to_owned(),
-            listener_bound_4500: false,
-            listener_bound_4501: false,
+            listener_bound_datapath: false,
+            listener_bound_health: false,
             health_status: "unreachable".to_owned(),
             health_active_sessions: None,
             listener_summary: String::new(),
@@ -1714,11 +1714,11 @@ mod tests {
             super::REVIEWED_WINDOWS_RELAY_HEALTH_PORT
         );
         assert_eq!(
-            parsed["lifecycle"]["during_run"]["listener_bound_4500"],
+            parsed["lifecycle"]["during_run"]["listener_bound_datapath"],
             true
         );
         assert_eq!(
-            parsed["lifecycle"]["after_stop"]["listener_bound_4500"],
+            parsed["lifecycle"]["after_stop"]["listener_bound_datapath"],
             false
         );
         assert_eq!(parsed["lifecycle"]["teardown_complete"], true);
