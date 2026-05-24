@@ -18,6 +18,66 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nix::unistd::Uid;
 use serde_json::Value;
 
+/// Track B dispatcher fabric — the target platform that the
+/// orchestrator picked for the live-lab stage. Bin-level entrypoints
+/// re-export this type and gate their `run()` body on it so a
+/// non-Linux invocation surfaces an honest "not yet enabled" message
+/// instead of silently running Linux-specific assertions (systemd /
+/// nftables / iproute2) against a macOS or Windows host. Mirrors the
+/// shape of `live_linux_anchor_test::AnchorPlatform` and the Phase 1
+/// `ExitHandoffPlatform`. The duplicate definition in
+/// `live_lab_bin_support` exists because the two helper modules are
+/// not unified (1476 vs 1285 lines on this branch); future cleanup
+/// can collapse them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveLabPlatform {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl LiveLabPlatform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveLabPlatform::Linux => "linux",
+            LiveLabPlatform::MacOs => "macos",
+            LiveLabPlatform::Windows => "windows",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "linux" => Ok(LiveLabPlatform::Linux),
+            "macos" | "darwin" => Ok(LiveLabPlatform::MacOs),
+            "windows" => Ok(LiveLabPlatform::Windows),
+            other => Err(format!(
+                "unsupported --platform value {other:?}; expected linux|macos|windows"
+            )),
+        }
+    }
+}
+
+/// Helper for bin entrypoints: returns Err with an honest
+/// "Phase N pending" message when the orchestrator picked a non-
+/// Linux target before the per-platform validator landed.
+pub fn enforce_linux_only_until_validator_lands(
+    platform: LiveLabPlatform,
+    stage: &str,
+    phase_note: &str,
+) -> Result<(), String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(()),
+        LiveLabPlatform::MacOs => Err(format!(
+            "macOS {stage} live execution is not enabled yet; {phase_note}. \
+             Use --platform linux for the existing Linux-host coverage."
+        )),
+        LiveLabPlatform::Windows => Err(format!(
+            "Windows {stage} live execution is not enabled yet; {phase_note}. \
+             Use --platform linux for the existing Linux-host coverage."
+        )),
+    }
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PROCESS_POLL_INTERVAL_MILLIS: u64 = 100;
 const UTM_EXEC_TIMEOUT_SECS: u64 = 120;
@@ -1204,9 +1264,65 @@ pub fn run_remote_shell(
 #[cfg(test)]
 mod tests {
     use super::{
-        env_flag_truthy, known_hosts_lookup_host, resolved_known_hosts_candidates,
+        LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
+        known_hosts_lookup_host, resolved_known_hosts_candidates,
         resolved_target_address_from_ssh_g,
     };
+
+    #[test]
+    fn live_lab_platform_parser_accepts_canonical_strings() {
+        assert_eq!(
+            LiveLabPlatform::parse("linux").unwrap(),
+            LiveLabPlatform::Linux
+        );
+        assert_eq!(
+            LiveLabPlatform::parse("MacOS").unwrap(),
+            LiveLabPlatform::MacOs
+        );
+        assert_eq!(
+            LiveLabPlatform::parse("darwin").unwrap(),
+            LiveLabPlatform::MacOs
+        );
+        assert_eq!(
+            LiveLabPlatform::parse("WINDOWS").unwrap(),
+            LiveLabPlatform::Windows
+        );
+    }
+
+    #[test]
+    fn live_lab_platform_parser_rejects_garbage() {
+        let err = LiveLabPlatform::parse("freebsd").expect_err("garbage rejected");
+        assert!(err.contains("unsupported --platform"));
+    }
+
+    #[test]
+    fn live_lab_platform_as_str_matches_canonical_form() {
+        assert_eq!(LiveLabPlatform::Linux.as_str(), "linux");
+        assert_eq!(LiveLabPlatform::MacOs.as_str(), "macos");
+        assert_eq!(LiveLabPlatform::Windows.as_str(), "windows");
+    }
+
+    #[test]
+    fn enforce_linux_only_gate_lets_linux_pass() {
+        enforce_linux_only_until_validator_lands(LiveLabPlatform::Linux, "demo", "Phase Z")
+            .unwrap();
+    }
+
+    #[test]
+    fn enforce_linux_only_gate_fails_closed_for_macos_and_windows() {
+        for (platform, name) in [
+            (LiveLabPlatform::MacOs, "macOS"),
+            (LiveLabPlatform::Windows, "Windows"),
+        ] {
+            let err = enforce_linux_only_until_validator_lands(platform, "demo", "Phase Z")
+                .expect_err("non-linux must fail closed");
+            assert!(err.contains(name), "error must name the platform: {err}");
+            assert!(
+                err.contains("Phase Z"),
+                "error must include the phase note: {err}"
+            );
+        }
+    }
 
     #[test]
     fn env_flag_truthy_accepts_expected_values() {

@@ -3802,17 +3802,40 @@ assert_local_gate_suite_provenance() {
 
 stage_run_live_role_switch_matrix() {
   local commit_short role_report role_source role_log
+  local exit_platform wrapper
   if ! has_five_node_release_gate_topology; then
     printf 'role switch matrix requires the full five-node topology (client, entry, aux, and extra targets)\n' >&2
     return 1
   fi
+
+  # Track B Phase 2: dispatch per active-exit platform. The role-
+  # switch matrix exercises role transitions on the exit + 4 clients;
+  # the dataplane mutations being asserted (nftables / pf / NetNat)
+  # are platform-specific so the exit platform drives the validator
+  # dispatch.
+  exit_platform="$(node_platform_for_label exit)"
+  case "$exit_platform" in
+    linux)
+      wrapper="$ROOT_DIR/scripts/e2e/live_linux_role_switch_matrix_test.sh"
+      ;;
+    macos)
+      wrapper="$ROOT_DIR/scripts/e2e/live_macos_role_switch_matrix_test.sh"
+      ;;
+    windows)
+      wrapper="$ROOT_DIR/scripts/e2e/live_windows_role_switch_matrix_test.sh"
+      ;;
+    *)
+      printf 'unsupported exit platform for live_role_switch_matrix: %s\n' "$exit_platform" >&2
+      return 1
+      ;;
+  esac
   commit_short="$(current_run_git_commit_short)"
   mkdir -p "$REPORT_DIR/source"
   role_report="$REPORT_DIR/role_switch_matrix_report_${commit_short}.json"
   role_source="$REPORT_DIR/source/role_switch_matrix_${commit_short}.md"
   role_log="$REPORT_DIR/live_linux_role_switch_matrix.log"
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_role_switch_matrix_test.sh" \
+  bash "$wrapper" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --traversal-env-file "$STATE_DIR/issue_traversal.env" \
@@ -4037,6 +4060,7 @@ stage_run_live_exit_handoff() {
 
 stage_run_live_two_hop() {
   local second_client_label second_client_target second_client_node_id
+  local exit_platform wrapper report_path log_path
   if ! has_label entry || ! has_label aux; then
     printf 'two-hop requires entry and aux targets\n' >&2
     return 1
@@ -4048,8 +4072,37 @@ stage_run_live_two_hop() {
   fi
   second_client_target="$(node_target_for_label "$second_client_label")"
   second_client_node_id="$(node_id_for_label "$second_client_label")"
+
+  # Track B Phase 2: dispatch per active-exit platform (mirrors
+  # stage_run_live_exit_handoff). The two-hop topology's egress is
+  # the exit node, so the exit platform determines which validator
+  # runs. macOS/Windows wrappers fail closed honestly until the
+  # per-platform validators land.
+  exit_platform="$(node_platform_for_label exit)"
+  case "$exit_platform" in
+    linux)
+      wrapper="$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh"
+      report_path="$REPORT_DIR/live_linux_two_hop_report.json"
+      log_path="$REPORT_DIR/live_linux_two_hop.log"
+      ;;
+    macos)
+      wrapper="$ROOT_DIR/scripts/e2e/live_macos_two_hop_test.sh"
+      report_path="$REPORT_DIR/live_macos_two_hop_report.json"
+      log_path="$REPORT_DIR/live_macos_two_hop.log"
+      ;;
+    windows)
+      wrapper="$ROOT_DIR/scripts/e2e/live_windows_two_hop_test.sh"
+      report_path="$REPORT_DIR/live_windows_two_hop_report.json"
+      log_path="$REPORT_DIR/live_windows_two_hop.log"
+      ;;
+    *)
+      printf 'unsupported exit platform for live_two_hop: %s\n' "$exit_platform" >&2
+      return 1
+      ;;
+  esac
+
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_two_hop_test.sh" \
+  bash "$wrapper" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --final-exit-host "$(node_target_for_label exit)" \
@@ -4061,17 +4114,45 @@ stage_run_live_two_hop() {
     --second-client-host "$second_client_target" \
     --second-client-node-id "$second_client_node_id" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/live_linux_two_hop_report.json" \
-    --log-path "$REPORT_DIR/live_linux_two_hop.log"
+    --report-path "$report_path" \
+    --log-path "$log_path"
 }
 
 stage_run_live_lan_toggle() {
+  local exit_platform wrapper report_path log_path
   if ! has_label aux; then
     printf 'LAN toggle requires aux target\n' >&2
     return 1
   fi
+
+  # Track B Phase 2: dispatch per active-exit platform. The lan-
+  # toggle behaviour is enforced by the exit (and blind_exit aux) so
+  # the exit platform drives the validator dispatch.
+  exit_platform="$(node_platform_for_label exit)"
+  case "$exit_platform" in
+    linux)
+      wrapper="$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh"
+      report_path="$REPORT_DIR/live_linux_lan_toggle_report.json"
+      log_path="$REPORT_DIR/live_linux_lan_toggle.log"
+      ;;
+    macos)
+      wrapper="$ROOT_DIR/scripts/e2e/live_macos_lan_toggle_test.sh"
+      report_path="$REPORT_DIR/live_macos_lan_toggle_report.json"
+      log_path="$REPORT_DIR/live_macos_lan_toggle.log"
+      ;;
+    windows)
+      wrapper="$ROOT_DIR/scripts/e2e/live_windows_lan_toggle_test.sh"
+      report_path="$REPORT_DIR/live_windows_lan_toggle_report.json"
+      log_path="$REPORT_DIR/live_windows_lan_toggle.log"
+      ;;
+    *)
+      printf 'unsupported exit platform for live_lan_toggle: %s\n' "$exit_platform" >&2
+      return 1
+      ;;
+  esac
+
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
-  bash "$ROOT_DIR/scripts/e2e/live_linux_lan_toggle_test.sh" \
+  bash "$wrapper" \
     --ssh-identity-file "$SSH_IDENTITY_FILE" \
     --exit-host "$(node_target_for_label exit)" \
     --exit-node-id "$(node_id_for_label exit)" \
@@ -4080,8 +4161,8 @@ stage_run_live_lan_toggle() {
     --blind-exit-host "$(node_target_for_label aux)" \
     --blind-exit-node-id "$(node_id_for_label aux)" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
-    --report-path "$REPORT_DIR/live_linux_lan_toggle_report.json" \
-    --log-path "$REPORT_DIR/live_linux_lan_toggle.log"
+    --report-path "$report_path" \
+    --log-path "$log_path"
 }
 
 assert_json_report_status_pass() {
@@ -5047,14 +5128,38 @@ assert_no_managed_dns_service_errors() {
 
 stage_run_live_managed_dns() {
   local canonical_report canonical_log stage_report stage_log
-  local label
+  local label exit_platform wrapper
+
+  # Track B Phase 2: dispatch per active-exit platform. The managed-
+  # DNS authority is the signer (exit) so its platform drives
+  # validator dispatch.
+  exit_platform="$(node_platform_for_label exit)"
+  case "$exit_platform" in
+    linux)
+      wrapper="$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh"
+      stage_report="$REPORT_DIR/live_linux_managed_dns_report.json"
+      stage_log="$REPORT_DIR/live_linux_managed_dns.log"
+      ;;
+    macos)
+      wrapper="$ROOT_DIR/scripts/e2e/live_macos_managed_dns_test.sh"
+      stage_report="$REPORT_DIR/live_macos_managed_dns_report.json"
+      stage_log="$REPORT_DIR/live_macos_managed_dns.log"
+      ;;
+    windows)
+      wrapper="$ROOT_DIR/scripts/e2e/live_windows_managed_dns_test.sh"
+      stage_report="$REPORT_DIR/live_windows_managed_dns_report.json"
+      stage_log="$REPORT_DIR/live_windows_managed_dns.log"
+      ;;
+    *)
+      printf 'unsupported exit platform for live_managed_dns: %s\n' "$exit_platform" >&2
+      return 1
+      ;;
+  esac
   canonical_report="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.json"
   canonical_log="$ROOT_DIR/artifacts/phase10/source/managed_dns_report.log"
-  stage_report="$REPORT_DIR/live_linux_managed_dns_report.json"
-  stage_log="$REPORT_DIR/live_linux_managed_dns.log"
   local -a cmd=(
     env "RUSTYNET_EXPECTED_GIT_COMMIT=$(current_run_git_commit)"
-    bash "$ROOT_DIR/scripts/e2e/live_linux_managed_dns_test.sh"
+    bash "$wrapper"
     --ssh-identity-file "$SSH_IDENTITY_FILE"
     --signer-host "$(node_target_for_label exit)"
     --signer-node-id "$(node_id_for_label exit)"

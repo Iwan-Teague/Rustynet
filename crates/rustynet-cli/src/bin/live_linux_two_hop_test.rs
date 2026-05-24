@@ -72,6 +72,16 @@ fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
+
+    // Track B Phase 2: non-Linux fails closed honestly until the per-
+    // platform validator lands. The orchestrator dispatches per-
+    // platform via stage_run_live_two_hop wrappers.
+    live_lab_support::enforce_linux_only_until_validator_lands(
+        config.platform,
+        "two-hop",
+        "the per-platform validator lands later in Track B",
+    )?;
+
     let root_dir = live_lab_support::repo_root()?;
 
     for command in [
@@ -1051,6 +1061,7 @@ fn run() -> Result<(), String> {
 
 #[derive(Debug)]
 struct Config {
+    platform: live_lab_support::LiveLabPlatform,
     ssh_identity_file: PathBuf,
     final_exit_host: String,
     client_host: String,
@@ -1070,6 +1081,7 @@ struct Config {
 impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
+            platform: live_lab_support::LiveLabPlatform::Linux,
             ssh_identity_file: PathBuf::new(),
             final_exit_host: "debian@192.168.18.49".to_owned(),
             client_host: "debian@192.168.18.65".to_owned(),
@@ -1089,6 +1101,11 @@ impl Config {
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--platform" => {
+                    config.platform = live_lab_support::LiveLabPlatform::parse(
+                        next_value(&mut iter, &arg)?.as_str(),
+                    )?;
+                }
                 "--ssh-identity-file" => {
                     config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?);
                 }
@@ -1529,6 +1546,7 @@ mod tests {
     #[test]
     fn two_hop_runtime_ready_requires_expected_exit_chain_and_routes() {
         let config = super::Config {
+            platform: super::live_lab_support::LiveLabPlatform::Linux,
             ssh_identity_file: std::path::PathBuf::from("/tmp/key"),
             final_exit_host: "debian@192.168.64.22".to_owned(),
             client_host: "debian@192.168.64.24".to_owned(),

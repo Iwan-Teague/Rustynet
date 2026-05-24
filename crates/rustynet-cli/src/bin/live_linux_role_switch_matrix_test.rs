@@ -116,6 +116,15 @@ fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
+
+    // Track B Phase 2: non-Linux fails closed honestly until the
+    // per-platform validator lands.
+    live_lab_support::enforce_linux_only_until_validator_lands(
+        config.platform,
+        "role-switch-matrix",
+        "the per-platform validator lands later in Track B",
+    )?;
+
     let root_dir = live_lab_support::repo_root()?;
 
     for command in [
@@ -269,6 +278,7 @@ fn run() -> Result<(), String> {
 
 #[derive(Debug)]
 struct Config {
+    platform: live_lab_support::LiveLabPlatform,
     ssh_identity_file: PathBuf,
     exit_host: String,
     exit_node_id: String,
@@ -293,6 +303,7 @@ struct Config {
 impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
+            platform: live_lab_support::LiveLabPlatform::Linux,
             ssh_identity_file: PathBuf::new(),
             exit_host: "debian@192.168.18.50".to_owned(),
             exit_node_id: "exit-50".to_owned(),
@@ -317,6 +328,11 @@ impl Config {
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--platform" => {
+                    config.platform = live_lab_support::LiveLabPlatform::parse(
+                        next_value(&mut iter, &arg)?.as_str(),
+                    )?;
+                }
                 "--ssh-identity-file" => {
                     config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?);
                 }
@@ -1326,6 +1342,7 @@ mod tests {
         fs::write(&dns_zone_env, "NODES_SPEC=a\n").expect("write dns env");
 
         let mut config = Config {
+            platform: super::live_lab_support::LiveLabPlatform::Linux,
             ssh_identity_file: PathBuf::from("/tmp/key"),
             exit_host: "debian@192.168.64.8".to_owned(),
             exit_node_id: "exit-1".to_owned(),

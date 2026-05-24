@@ -87,6 +87,14 @@ fn run() -> Result<(), String> {
     let root_dir = repo_root()?;
     let config = Config::parse(env::args().skip(1).collect())?;
 
+    // Track B Phase 2: non-Linux fails closed honestly until the
+    // per-platform validator lands.
+    live_lab_support::enforce_linux_only_until_validator_lands(
+        config.platform,
+        "managed-dns",
+        "the per-platform validator lands later in Track B",
+    )?;
+
     for command in ["cargo", "git", "ssh", "scp", "ssh-keygen", "date"] {
         require_command(command)?;
     }
@@ -810,6 +818,7 @@ fn run() -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 struct Config {
+    platform: live_lab_support::LiveLabPlatform,
     ssh_identity_file: String,
     signer_host: String,
     client_host: String,
@@ -827,6 +836,7 @@ struct Config {
 impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
+            platform: live_lab_support::LiveLabPlatform::Linux,
             ssh_identity_file: String::new(),
             signer_host: "debian@192.168.18.49".to_owned(),
             client_host: "ubuntu@192.168.18.52".to_owned(),
@@ -844,6 +854,11 @@ impl Config {
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--platform" => {
+                    config.platform = live_lab_support::LiveLabPlatform::parse(
+                        next_value(&mut iter, &arg)?.as_str(),
+                    )?;
+                }
                 "--ssh-identity-file" => config.ssh_identity_file = next_value(&mut iter, &arg)?,
                 "--signer-host" => config.signer_host = next_value(&mut iter, &arg)?,
                 "--client-host" => config.client_host = next_value(&mut iter, &arg)?,
@@ -2290,6 +2305,7 @@ mod tests {
 
     fn base_config() -> Config {
         Config {
+            platform: super::live_lab_support::LiveLabPlatform::Linux,
             ssh_identity_file: "/tmp/rn-test-key".to_owned(),
             signer_host: "debian@192.168.64.22".to_owned(),
             client_host: "debian@192.168.64.24".to_owned(),
