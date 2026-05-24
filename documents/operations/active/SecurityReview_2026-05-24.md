@@ -170,6 +170,7 @@ guarantee.
 - **Location:** `.github/workflows/cross-platform-ci.yml:23-25, 47-49, 128-130` (no `--locked`); only `release-windows.yml:60` pins.
 - **Description:** Without `--locked`, Cargo can silently re-resolve `Cargo.lock` to newer semver-compatible transitive versions, so CI (and `cargo audit`/`cargo deny`) run against a tree different from the committed, reviewed lockfile.
 - **Remediation:** Add `--locked` to every cargo invocation in CI; add a `git diff --exit-code Cargo.lock` guard.
+- **Status: FIXED (RL-8)** — `--locked` added to all dep-resolving cargo invocations (clippy/check/test/run) across both workflows.
 
 ### RN-16 — GitHub Actions pinned to mutable tags, not commit SHAs
 - **Domain:** Supply chain · **CWE-829 / CWE-494** · **Confidence: High**
@@ -181,9 +182,9 @@ guarantee.
 
 | ID | Domain | Title | Location | Remediation |
 |---|---|---|---|---|
-| RN-17 | Priv | Connect-after-validate TOCTOU on helper socket path | `privileged_helper.rs:191-199` | Re-check peer creds on the connected fd (SO_PEERCRED) instead of trusting path metadata |
+| RN-17 | Priv | Connect-after-validate TOCTOU on helper socket path | `privileged_helper.rs:191-199` | **FIXED (RL-7)** — post-connect peer-cred check (root or own-uid) on the established fd |
 | RN-18 | Priv | Helper authorizes any uid==0 peer, not just daemon uid | `privileged_helper.rs:393-394` | Drop `|| uid == 0` unless a concrete second caller needs it; gate behind a flag |
-| RN-19 | Priv | Direct (helper-less) exec path skips `validate_request` | `phase10.rs:730-746` | Call `validate_request` on the direct branch too (symmetric gate) |
+| RN-19 | Priv | Direct (helper-less) exec path skips `validate_request` | `phase10.rs:730-746` | **FIXED (RL-6)** — `validate_request` now gates the direct branch |
 | RN-20 | Priv | Backend runners use PATH-resolved bare program names | `backend-wireguard/in_memory.rs:105`, `linux_command.rs:41` | Resolve via absolute validated paths or `#[cfg(test)]`-gate |
 | RN-21 | Crypto | Dead algorithm-exception code (unconditional reject) | `rustynet-crypto/lib.rs:182-193` | **Intentionally not changed** — current over-rejection is already fail-closed; "fixing" it re-enables a downgrade-exception mechanism (a product decision, not a security gain). See RL note. |
 | RN-22 | Crypto | Ed25519 uses non-strict `verify()` (malleability) | `rustynet-crypto/lib.rs:803`; `control` 1574/1855/2495/3157/3225 | **FIXED (RL-3)** — `verify_strict()` at all 10 sites + malleability negative test |
@@ -347,6 +348,43 @@ project mandate: an enforcement point in code plus a verification test.
   CLI invocation is already argv-only, so this guards against keychain-namespace
   confusion, not injection. macOS-gated code; compiles on the Linux CI host but
   exercised on macOS.
+
+### RL-6 — RN-19 symmetric argv-schema gate on the helper-less direct path **(landed)**
+- **Files:** `crates/rustynetd/src/phase10.rs`, `crates/rustynetd/src/privileged_helper.rs`.
+- **Change:** made `validate_request` `pub(crate)` and called it at the top of
+  the direct (no-client) branch of both `run_capture` implementations, so the
+  argv-schema allowlist now gates *both* the IPC-helper path and the
+  daemon-as-root direct path. Closes the structural asymmetry where the direct
+  path executed unvalidated.
+- **Test added:** `helper_less_direct_path_enforces_argv_schema_validation`
+  (phase10) builds a `LinuxCommandSystem` with no client and asserts a
+  schema-violating nft argv is rejected *before* binary resolution/spawn.
+- **Verification:** fmt clean; the new test passes; no regressions (the 12
+  pre-existing phase10 failures are environmental — they need root/nft/
+  privileged-socket capabilities the sandbox lacks — and are unchanged by this
+  batch, confirmed by stash-and-retest).
+
+### RL-7 — RN-17 post-connect peer-credential check (socket TOCTOU) **(landed)**
+- **Files:** `crates/rustynetd/src/privileged_helper.rs`.
+- **Change:** in `PrivilegedCommandClient::run_capture`, after `connect()` and
+  before sending the request, verify the connected peer via `peer_uid` on the
+  established fd: accept only **root (uid 0) or the client's own uid**, reject
+  any other uid (fail closed). This closes the connect-after-validate window —
+  a socket inode swapped between the path security check and `connect()` to a
+  *different* uid's impostor is now rejected. Same-uid (non-privsep / in-process
+  test harness) and root (production helper) are accepted.
+- **Test added:** `peer_uid_reports_connected_socket_owner_uid` verifies the
+  primitive reports the socket owner's uid on a connected pair.
+- **Verification:** fmt + (touched-file) clippy clean; helper suite 47/47 pass.
+
+### RL-8 — RN-15 `--locked` in CI **(landed)**
+- **Files:** `.github/workflows/cross-platform-ci.yml`, `release-windows.yml`.
+- **Change:** added `--locked` to every dependency-resolving cargo invocation
+  (`clippy`, `check`, `test`, and the release `cargo run`) in both the
+  `--workspace` and per-package (`"${PKGS[@]}"`) blocks, so CI builds/tests
+  against the committed, reviewed `Cargo.lock` and a silent transitive
+  re-resolution can no longer slip in unreviewed. `cargo fmt`/`audit`/`deny`
+  are left unchanged (they do not take `--locked`).
 
 ### RL note — RN-21 deliberately left as-is
 `AlgorithmPolicy::with_exceptions` currently rejects *all* non-empty exception
@@ -588,11 +626,11 @@ Status: **Fixed** (landed + tested), **Open** (not started), **Accepted**
 | RN-12 | Med | Dataplane | Open | — |
 | RN-13 | Med | Dataplane | Open | — |
 | RN-14 | Med | Supply chain | **Fixed** | RL-2 |
-| RN-15 | Med | Supply chain | Open | — |
+| RN-15 | Med | Supply chain | **Fixed** | RL-8 |
 | RN-16 | Med | Supply chain | Open | — |
-| RN-17 | Low | Priv | Open | — |
+| RN-17 | Low | Priv | **Fixed** | RL-7 |
 | RN-18 | Low | Priv | Open | — |
-| RN-19 | Low | Priv | Open | — |
+| RN-19 | Low | Priv | **Fixed** | RL-6 |
 | RN-20 | Low | Priv | Open | — |
 | RN-21 | Low | Crypto | **Accepted** (fail-closed) | RL note |
 | RN-22 | Low | Crypto | **Fixed** | RL-3 |
@@ -609,7 +647,7 @@ Status: **Fixed** (landed + tested), **Open** (not started), **Accepted**
 | RN-33 | Low | Key custody | Open | — |
 | RN-34–38 | Info | various | Open | — |
 
-Progress: **5 Fixed**, **1 Accepted**, **32 Open** (7 High / 8 Med / 11 Low /
+Progress: **8 Fixed**, **1 Accepted**, **29 Open** (7 High / 7 Med / 9 Low /
 5 Info remaining open). All High remaining are the behavioral dataplane/policy
 items deferred for owner direction (§11).
 
