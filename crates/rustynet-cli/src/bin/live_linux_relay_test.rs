@@ -1022,10 +1022,12 @@ fn capture_windows_relay_lifecycle_snapshot(
         known_hosts,
         relay_target,
         &format!(
-            // `-Width 4096` keeps Format-Table from wrapping the
+            // `-Width 32767` keeps Format-Table from wrapping the
             // listener row at the host's terminal width, which would
             // break windows_endpoint_summary_has_row's non-empty-line
-            // detection on a continuation line.
+            // detection on a continuation line. Width-32767 matches
+            // the safer convention Phase 14 reviewer recommended
+            // over 4096 for long-lived status output.
             "powershell -NoProfile -Command \"Get-NetUDPEndpoint -LocalPort {} -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String -Width 32767\"",
             REVIEWED_WINDOWS_RELAY_BIND_PORT
         ),
@@ -1036,7 +1038,7 @@ fn capture_windows_relay_lifecycle_snapshot(
         known_hosts,
         relay_target,
         &format!(
-            // Same `-Width 4096` rationale as the UDP capture above.
+            // Same `-Width 32767` rationale as the UDP capture above.
             "powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Format-Table -HideTableHeaders | Out-String -Width 32767\"",
             REVIEWED_WINDOWS_RELAY_HEALTH_PORT
         ),
