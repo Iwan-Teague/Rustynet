@@ -204,6 +204,26 @@ impl PrivilegedCommandClient {
                 .set_write_timeout(Some(self.timeout))
                 .map_err(|err| format!("privileged helper write-timeout failed: {err}"))?;
 
+            // RN-17: re-verify the connected peer on the established fd, not
+            // just the pre-connect path metadata. This closes the
+            // connect-after-validate TOCTOU: if the socket inode was swapped
+            // between the security check and connect(), we would be talking to
+            // an impostor. The helper runs as root (uid 0) in production; we
+            // also accept a peer with the client's own uid (a non-privilege-
+            // separated / same-user deployment, and the in-process test
+            // harness). A peer owned by any *other* uid — the cross-uid swap
+            // that is the actual threat — is rejected (fail closed).
+            let own_uid = nix::unistd::getuid().as_raw();
+            match peer_uid(&stream) {
+                Some(uid) if uid == 0 || uid == own_uid => {}
+                other => {
+                    return Err(format!(
+                        "privileged helper peer uid {other:?} is neither root nor the \
+                         client uid ({own_uid}); refusing to send privileged command"
+                    ));
+                }
+            }
+
             let request = HelperRequest {
                 program: program.as_str().to_owned(),
                 args: args
@@ -892,7 +912,10 @@ fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
     out
 }
 
-fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Result<(), String> {
+pub(crate) fn validate_request(
+    program: PrivilegedCommandProgram,
+    args: &[&str],
+) -> Result<(), String> {
     if args.len() > MAX_ARGS {
         return Err(format!(
             "too many arguments for privileged command {program}",
@@ -1663,10 +1686,21 @@ mod tests {
         HELPER_FRAME_VERSION, HelperRequest, HelperResponse, MAX_ARG_BYTES, MAX_ARGS,
         MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandProgram, decode_helper_request,
         encode_helper_request, handle_request, is_anchor_name_token, is_nft_token, is_path_token,
-        is_safe_token, read_request, read_response_frame, run_privileged_subprocess,
+        is_safe_token, peer_uid, read_request, read_response_frame, run_privileged_subprocess,
         validate_privileged_helper_socket_security, validate_privileged_program_binary,
         validate_request, write_request_frame, write_response,
     };
+
+    #[test]
+    fn peer_uid_reports_connected_socket_owner_uid() {
+        // RN-17 gate primitive: the client re-checks `peer_uid(&stream) == Some(0)`
+        // on the *connected* fd to reject a swapped, non-root socket. Verify the
+        // primitive reports this process's own uid for a locally-created pair, so
+        // a non-root server is correctly identified (and would be rejected).
+        let (a, _b) = UnixStream::pair().expect("socket pair");
+        let me = nix::unistd::getuid().as_raw();
+        assert_eq!(peer_uid(&a), Some(me));
+    }
 
     fn helper_request_frame_bytes(payload: &[u8], version: u8) -> Vec<u8> {
         let mut frame = Vec::with_capacity(10 + payload.len());

@@ -17,7 +17,7 @@ use crate::macos_blind_exit::{
     is_macos_blind_exit_anchor,
 };
 use crate::privileged_helper::{
-    PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
+    PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram, validate_request,
 };
 use crate::traversal::{
     CoordinationSchedule, SimultaneousOpenRuntime, SimultaneousOpenWaiter,
@@ -730,6 +730,12 @@ impl LinuxCommandSystem {
         if let Some(client) = self.privileged_client.as_ref() {
             return client.run_capture(program, args).map_err(SystemError::Io);
         }
+
+        // RN-19: the helper-less direct path must enforce the same argv-schema
+        // allowlist as the IPC helper, so the validating gate is symmetric
+        // across both execution paths and cannot be bypassed by running the
+        // daemon as root without a helper.
+        validate_request(program, args).map_err(SystemError::Io)?;
 
         let binary = resolve_binary_path_for_program(program).map_err(|err| {
             SystemError::Io(format!(
@@ -2247,6 +2253,12 @@ impl MacosCommandSystem {
         if let Some(client) = self.privileged_client.as_ref() {
             return client.run_capture(program, args).map_err(SystemError::Io);
         }
+
+        // RN-19: the helper-less direct path must enforce the same argv-schema
+        // allowlist as the IPC helper, so the validating gate is symmetric
+        // across both execution paths and cannot be bypassed by running the
+        // daemon as root without a helper.
+        validate_request(program, args).map_err(SystemError::Io)?;
 
         let binary = resolve_binary_path_for_program(program).map_err(|err| {
             SystemError::Io(format!(
@@ -7276,6 +7288,37 @@ mod tests {
                 .iter()
                 .any(|op| op == "set_relay_forwarding:true")
         );
+    }
+
+    #[test]
+    fn helper_less_direct_path_enforces_argv_schema_validation() {
+        // RN-19: with no privileged client configured (daemon-as-root direct
+        // path), run_capture must still apply the argv-schema allowlist and
+        // reject a schema-violating command *before* resolving/spawning a
+        // binary, matching the IPC helper's gate.
+        let system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            None, // no client -> direct execution path
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        // A clearly invalid nft argv (not matching any allowlisted schema).
+        let err = system
+            .run_capture(
+                PrivilegedCommandProgram::Nft,
+                &["not", "a", "valid", "nft", "schema"],
+            )
+            .expect_err("schema-violating argv must be rejected on the direct path");
+        match err {
+            SystemError::Io(message) => assert!(
+                !message.contains("spawn failed"),
+                "rejection must happen at validation, not at spawn: {message}"
+            ),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]

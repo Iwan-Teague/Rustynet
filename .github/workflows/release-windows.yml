@@ -198,7 +198,7 @@ jobs:
           # a complete dependency tree with versions, sources,
           # features, and repository links. The .sha256 is the
           # content digest for tamper-evidence.
-          cargo run --release --quiet -p rustynet-cli -- ops generate-release-sbom
+          cargo run --release --quiet --locked -p rustynet-cli -- ops generate-release-sbom
           ls -la artifacts/release/sbom.cargo-metadata.json artifacts/release/sbom.sha256
       - name: Upload SBOM to release
         if: github.event_name == 'push'

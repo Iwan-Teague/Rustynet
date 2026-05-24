@@ -20,9 +20,9 @@ jobs:
       - name: Workspace validation
         run: |
           cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-          cargo check --workspace --all-targets --all-features
-          cargo test --workspace --all-targets --all-features
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo check --workspace --all-targets --all-features --locked
+          cargo test --workspace --all-targets --all-features --locked
       - name: macOS dataplane smoke gates
         run: |
           ./scripts/ci/macos_dataplane_smoke.sh
@@ -44,9 +44,9 @@ jobs:
       - name: Workspace validation
         run: |
           cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-          cargo check --workspace --all-targets --all-features
-          cargo test --workspace --all-targets --all-features
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo check --workspace --all-targets --all-features --locked
+          cargo test --workspace --all-targets --all-features --locked
       - name: Security gates
         run: |
           cargo audit --deny warnings
@@ -125,9 +125,9 @@ jobs:
             -p rustynet-local-security
           )
           cargo fmt "${PKGS[@]}" -- --check
-          cargo clippy "${PKGS[@]}" --all-targets --all-features -- -D warnings
-          cargo check "${PKGS[@]}" --all-targets --all-features
-          cargo test "${PKGS[@]}" --all-targets --all-features
+          cargo clippy "${PKGS[@]}" --all-targets --all-features --locked -- -D warnings
+          cargo check "${PKGS[@]}" --all-targets --all-features --locked
+          cargo test "${PKGS[@]}" --all-targets --all-features --locked
       - name: Security gates
         run: |
           # cargo-audit + cargo-deny operate on Cargo.lock + the
