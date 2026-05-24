@@ -153,6 +153,7 @@ fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
 fn run() -> Result<(), String> {
     let root_dir = repo_root()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut platform = live_lab_support::LiveLabPlatform::Linux;
     let mut exit_host = String::from("debian@192.168.18.49");
     let mut client_host = String::from("debian@192.168.18.65");
     let mut blind_exit_host = String::from("fedora@192.168.18.51");
@@ -167,6 +168,12 @@ fn run() -> Result<(), String> {
     let mut idx = 0usize;
     while idx < args.len() {
         match args[idx].as_str() {
+            "--platform" => {
+                idx += 1;
+                platform = live_lab_support::LiveLabPlatform::parse(
+                    required_value(&args, idx, "--platform")?.as_str(),
+                )?;
+            }
             "--ssh-identity-file" => {
                 idx += 1;
                 ssh_identity_file = required_value(&args, idx, "--ssh-identity-file")?;
@@ -223,6 +230,18 @@ fn run() -> Result<(), String> {
         print_usage();
         return Err("missing required argument: --ssh-identity-file".to_owned());
     }
+
+    // Track B Phase 2: dispatcher fabric — non-Linux platforms fail
+    // closed honestly until the per-platform validator lands. The
+    // orchestrator's wrapper-per-platform routing depends on this
+    // gate so a foreign-platform invocation never silently runs
+    // Linux-specific assertions (systemd / nftables / iproute2)
+    // against a macOS or Windows host.
+    live_lab_support::enforce_linux_only_until_validator_lands(
+        platform,
+        "lan-toggle",
+        "the per-platform validator lands later in Track B",
+    )?;
 
     if let Some(parent) = report_path.parent() {
         ensure_dir_secure(parent)?;
