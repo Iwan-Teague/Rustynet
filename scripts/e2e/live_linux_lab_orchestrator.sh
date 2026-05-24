@@ -4165,6 +4165,66 @@ stage_run_live_lan_toggle() {
     --log-path "$log_path"
 }
 
+stage_run_live_relay() {
+  local relay_label relay_target relay_node_id peer_label peer_target peer_node_id
+  local relay_platform wrapper report_path log_path
+
+  # Track B Phase 3 — new relay live stage. The relay host is the
+  # entry node (which carries relay_host capability in the canonical
+  # topology); the peer that establishes the relay session is the
+  # client. Phase 3 scaffolds the bin + dispatcher; the real Linux
+  # validator (service-lifecycle + datapath probe) lands in Phase 3b,
+  # macOS in Phase 6, Windows in Phase 7.
+  if has_label entry; then
+    relay_label="entry"
+  elif has_label aux; then
+    relay_label="aux"
+  else
+    printf 'live_relay requires entry or aux target (relay role host)\n' >&2
+    return 1
+  fi
+  relay_target="$(node_target_for_label "$relay_label")"
+  relay_node_id="$(node_id_for_label "$relay_label")"
+  peer_label="client"
+  peer_target="$(node_target_for_label "$peer_label")"
+  peer_node_id="$(node_id_for_label "$peer_label")"
+
+  relay_platform="$(node_platform_for_label "$relay_label")"
+  case "$relay_platform" in
+    linux)
+      wrapper="$ROOT_DIR/scripts/e2e/live_linux_relay_test.sh"
+      report_path="$REPORT_DIR/live_linux_relay_report.json"
+      log_path="$REPORT_DIR/live_linux_relay.log"
+      ;;
+    macos)
+      wrapper="$ROOT_DIR/scripts/e2e/live_macos_relay_test.sh"
+      report_path="$REPORT_DIR/live_macos_relay_report.json"
+      log_path="$REPORT_DIR/live_macos_relay.log"
+      ;;
+    windows)
+      wrapper="$ROOT_DIR/scripts/e2e/live_windows_relay_test.sh"
+      report_path="$REPORT_DIR/live_windows_relay_report.json"
+      log_path="$REPORT_DIR/live_windows_relay.log"
+      ;;
+    *)
+      printf 'unsupported relay platform for live_relay: %s\n' "$relay_platform" >&2
+      return 1
+      ;;
+  esac
+
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
+    --relay-host "$relay_target" \
+    --relay-node-id "$relay_node_id" \
+    --peer-host "$peer_target" \
+    --peer-node-id "$peer_node_id" \
+    --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
 assert_json_report_status_pass() {
   local report_path="$1"
   local label="$2"
