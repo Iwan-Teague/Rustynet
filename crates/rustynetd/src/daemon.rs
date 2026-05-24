@@ -106,7 +106,7 @@ use nix::sys::socket::sockopt::LocalPeerCred;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::sockopt::PeerCredentials;
 #[cfg(not(windows))]
-use nix::unistd::{Gid, Uid};
+use nix::unistd::{Gid, Group, Uid};
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
     RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
@@ -8666,46 +8666,48 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                         })?;
                     let response = match read_command_envelope(&stream).map_err(DaemonError::Io)? {
                         CommandEnvelope::Local(parsed) => {
-                            let authorized = if parsed.is_mutating() {
-                                match (peer_uid(&stream), peer_gid(&stream)) {
-                                    (Some(peer_uid), Some(peer_gid)) => {
-                                        // Allow root uid, socket owner uid, or — only when
-                                        // we can authoritatively read the socket's owner gid —
-                                        // a peer in that owner group.
-                                        //
-                                        // The previous shape used
-                                        // `socket_owner_gid(...).unwrap_or(0)` which collapsed
-                                        // a socket-metadata read failure into a gid=0
-                                        // comparison. That meant any peer running with gid=0
-                                        // could be silently authorized whenever the daemon
-                                        // failed to stat its own socket (e.g. the socket file
-                                        // got removed mid-flight by a hostile recovery). We
-                                        // now fail-closed on the metadata-read failure: if we
-                                        // cannot resolve the owner gid, the gid arm is
-                                        // refused entirely and only the uid arms can grant
-                                        // mutation.
-                                        let owner_gid_match =
-                                            match socket_owner_gid(&config.socket_path) {
-                                                Ok(owner_gid) => peer_gid == owner_gid,
-                                                Err(_) => false,
-                                            };
-                                        peer_uid == 0
-                                            || peer_uid == socket_owner_uid
-                                            || owner_gid_match
-                                    }
-                                    (Some(peer_uid), None) => {
-                                        peer_uid == 0 || peer_uid == socket_owner_uid
-                                    }
-                                    _ => false,
+                            // Defense-in-depth: enforce peer-credential
+                            // authorisation on EVERY local IPC command —
+                            // mutating and read-only alike. Socket file
+                            // permissions are the first gate; this is the
+                            // explicit per-command gate required by
+                            // SecurityMinimumBar §3.6. A misconfigured
+                            // socket ACL must not be enough to expose
+                            // Status / Netcheck / DnsInspect to a foreign
+                            // uid running on the same host.
+                            match authorize_local_peer(
+                                &stream,
+                                socket_owner_uid,
+                                &config.socket_path,
+                            ) {
+                                Ok(decision) => {
+                                    let command_kind = parsed
+                                        .as_wire()
+                                        .split_whitespace()
+                                        .next()
+                                        .unwrap_or("?")
+                                        .to_owned();
+                                    log::debug!(
+                                        "ipc_local_authorized command={} uid={} via={}",
+                                        command_kind,
+                                        decision.peer_uid,
+                                        decision.via.as_str(),
+                                    );
+                                    runtime.handle_command(parsed)
                                 }
-                            } else {
-                                true
-                            };
-
-                            if authorized {
-                                runtime.handle_command(parsed)
-                            } else {
-                                IpcResponse::err("unauthorized mutation request")
+                                Err(denial) => {
+                                    let command_kind = parsed
+                                        .as_wire()
+                                        .split_whitespace()
+                                        .next()
+                                        .unwrap_or("?")
+                                        .to_owned();
+                                    log::warn!(
+                                        "{}",
+                                        local_peer_denial_audit_line(&command_kind, &denial)
+                                    );
+                                    IpcResponse::err("unauthorized local request")
+                                }
                             }
                         }
                         CommandEnvelope::Remote(remote_envelope) => {
@@ -13330,12 +13332,6 @@ fn socket_owner_uid(path: &Path) -> Result<u32, DaemonError> {
 }
 
 #[cfg(not(windows))]
-fn socket_owner_gid(path: &Path) -> Result<u32, DaemonError> {
-    let metadata = fs::metadata(path).map_err(|err| DaemonError::Io(err.to_string()))?;
-    Ok(metadata.gid())
-}
-
-#[cfg(not(windows))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -13359,6 +13355,13 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
     None
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    getsockopt(stream, PeerCredentials)
+        .ok()
+        .map(|cred| cred.pid())
+}
+
 #[cfg(not(windows))]
 fn peer_gid(_stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -13368,8 +13371,235 @@ fn peer_gid(_stream: &UnixStream) -> Option<u32> {
             .map(|cred| cred.gid());
     }
 
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    return getsockopt(_stream, LocalPeerCred)
+        .ok()
+        .and_then(|cred| cred.groups().first().copied());
+
     #[allow(unreachable_code)]
     None
+}
+
+#[cfg(not(windows))]
+fn peer_group_ids(stream: &UnixStream) -> Vec<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut groups = Vec::new();
+        if let Some(gid) = peer_gid(stream) {
+            groups.push(gid);
+        }
+        if let Some(pid) = peer_pid(stream) {
+            groups.extend(read_linux_peer_groups_from_proc(pid));
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        return groups;
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    return getsockopt(stream, LocalPeerCred)
+        .ok()
+        .map(|cred| {
+            let mut groups = cred.groups().to_vec();
+            groups.sort_unstable();
+            groups.dedup();
+            groups
+        })
+        .unwrap_or_default();
+
+    #[allow(unreachable_code)]
+    Vec::new()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_linux_peer_groups_from_proc(pid: i32) -> Vec<u32> {
+    if pid <= 0 {
+        return Vec::new();
+    }
+    let status_path = PathBuf::from("/proc").join(pid.to_string()).join("status");
+    let Ok(body) = fs::read_to_string(status_path) else {
+        return Vec::new();
+    };
+    body.lines()
+        .find_map(|line| line.strip_prefix("Groups:"))
+        .map(|groups| {
+            groups
+                .split_whitespace()
+                .filter_map(|token| token.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+const LOCAL_IPC_AUTHORIZED_GROUP_NAMES: &[&str] = &["rustynet", "rustynetd"];
+
+#[cfg(not(windows))]
+fn authorized_local_ipc_group_ids() -> Vec<u32> {
+    let mut ids = LOCAL_IPC_AUTHORIZED_GROUP_NAMES
+        .iter()
+        .filter_map(|name| {
+            Group::from_name(name)
+                .ok()
+                .flatten()
+                .map(|group| group.gid.as_raw())
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(not(windows))]
+fn peer_in_authorized_local_ipc_group(
+    peer_group_ids: &[u32],
+    authorized_group_ids: &[u32],
+) -> bool {
+    !authorized_group_ids.is_empty()
+        && peer_group_ids
+            .iter()
+            .any(|gid| authorized_group_ids.binary_search(gid).is_ok())
+}
+
+/// Outcome of [`authorize_local_peer`]: the peer cleared the local IPC
+/// authorisation policy and the daemon may dispatch the command. The
+/// `via` field records which authorisation arm fired so the audit log
+/// can describe success in concrete terms.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalPeerAuthorization {
+    peer_uid: u32,
+    via: LocalAuthVia,
+}
+
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalAuthVia {
+    Root,
+    SocketOwnerUid,
+    AuthorizedGroup,
+}
+
+#[cfg(not(windows))]
+impl LocalAuthVia {
+    fn as_str(self) -> &'static str {
+        match self {
+            LocalAuthVia::Root => "root_uid",
+            LocalAuthVia::SocketOwnerUid => "socket_owner_uid",
+            LocalAuthVia::AuthorizedGroup => "authorized_group",
+        }
+    }
+}
+
+/// Denial reason returned by [`authorize_local_peer`]. The struct
+/// carries enough fixed-vocab metadata to render a precise audit log
+/// line without leaking peer identity in a way that violates
+/// retention/privacy policy: peer uid/gid are administrative metadata
+/// that local-machine operators already have access to via `lsof` etc.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalPeerDenial {
+    peer_uid: Option<u32>,
+    peer_gid: Option<u32>,
+    reason: &'static str,
+}
+
+#[cfg(not(windows))]
+impl LocalPeerDenial {
+    fn uid_status(&self) -> String {
+        match self.peer_uid {
+            Some(uid) => format!("uid={uid}"),
+            None => "uid=unavailable".to_owned(),
+        }
+    }
+
+    fn gid_status(&self) -> String {
+        match self.peer_gid {
+            Some(gid) => format!("gid={gid}"),
+            None => "gid=unavailable".to_owned(),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn local_peer_denial_audit_line(command_kind: &str, denial: &LocalPeerDenial) -> String {
+    format!(
+        "ipc_peer_cred_denied command={} {} {} reason={}",
+        command_kind,
+        denial.uid_status(),
+        denial.gid_status(),
+        denial.reason
+    )
+}
+
+/// Single hardened call site for local IPC peer-credential
+/// authorisation. The policy is uniform across every local command
+/// (read AND mutating): a connecting peer must be uid 0 (root), the
+/// uid that owns the daemon socket, a member of a reviewed RustyNet
+/// local-control group (`rustynet` / `rustynetd`). Defense-in-depth:
+/// the socket file is already mode `0o600` owned by the daemon uid in
+/// a `0o700` parent directory, but a single misconfiguration must not
+/// be enough to expose Status/Netcheck/DnsInspect to a foreign uid on
+/// the same host. SecurityMinimumBar §3.6 requires the explicit
+/// per-command auth gate independent of file permissions.
+///
+/// macOS / iOS / tvOS / watchOS / visionOS: `LocalPeerCred` exposes
+/// the peer uid plus group list, so the reviewed-group arm works
+/// without `/proc`.
+#[cfg(not(windows))]
+fn authorize_local_peer(
+    stream: &UnixStream,
+    socket_owner_uid: u32,
+    _socket_path: &Path,
+) -> Result<LocalPeerAuthorization, LocalPeerDenial> {
+    let peer_uid = peer_uid(stream);
+    let peer_gid = peer_gid(stream);
+    let peer_group_ids = peer_group_ids(stream);
+    let Some(uid_value) = peer_uid else {
+        return Err(LocalPeerDenial {
+            peer_uid,
+            peer_gid,
+            reason: "peer_uid_unavailable",
+        });
+    };
+
+    if uid_value == 0 {
+        return Ok(LocalPeerAuthorization {
+            peer_uid: uid_value,
+            via: LocalAuthVia::Root,
+        });
+    }
+    if uid_value == socket_owner_uid {
+        return Ok(LocalPeerAuthorization {
+            peer_uid: uid_value,
+            via: LocalAuthVia::SocketOwnerUid,
+        });
+    }
+    let authorized_group_ids = authorized_local_ipc_group_ids();
+    if peer_in_authorized_local_ipc_group(&peer_group_ids, &authorized_group_ids) {
+        return Ok(LocalPeerAuthorization {
+            peer_uid: uid_value,
+            via: LocalAuthVia::AuthorizedGroup,
+        });
+    }
+
+    Err(LocalPeerDenial {
+        peer_uid,
+        peer_gid,
+        reason: "uid_and_gid_do_not_match_authorized_local_ipc_policy",
+    })
 }
 
 fn unix_now() -> u64 {
@@ -25513,5 +25743,130 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    // ─── Gap 7: Unix IPC peer-credential checks ─────────────────
+
+    #[test]
+    fn authorize_local_peer_allows_socket_owner_uid_arm() {
+        use super::authorize_local_peer;
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        // The current uid IS the socket owner — the typical successful
+        // path when the daemon and the CLI both run as the daemon user.
+        let current_uid = nix::unistd::Uid::effective().as_raw();
+        let socket_path = std::env::temp_dir().join(format!(
+            "rustynet-peercred-test-{}.sock",
+            std::process::id()
+        ));
+        let outcome = authorize_local_peer(&a, current_uid, &socket_path)
+            .expect("same-uid peer must authorise");
+        assert_eq!(outcome.peer_uid, current_uid);
+        assert_eq!(outcome.via, super::LocalAuthVia::SocketOwnerUid);
+    }
+
+    #[test]
+    fn authorize_local_peer_denies_foreign_uid() {
+        use super::authorize_local_peer;
+        use std::os::unix::net::UnixStream;
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let current_uid = nix::unistd::Uid::effective().as_raw();
+        if current_uid == 0 {
+            // Test is meaningful only when not root — the root arm
+            // always grants regardless of socket_owner_uid mismatch.
+            return;
+        }
+        // socket_owner_uid set to a value that cannot match the
+        // current process and is not root: peer_uid != 0, peer_uid
+        // != socket_owner_uid. The helper must deny.
+        let owner_uid = current_uid.wrapping_add(101);
+        let socket_path = std::env::temp_dir().join(format!(
+            "rustynet-peercred-deny-{}.sock",
+            std::process::id()
+        ));
+        let denial = authorize_local_peer(&a, owner_uid, &socket_path)
+            .expect_err("foreign uid must be denied fail-closed");
+        assert_eq!(denial.peer_uid, Some(current_uid));
+        assert_eq!(
+            denial.reason,
+            "uid_and_gid_do_not_match_authorized_local_ipc_policy"
+        );
+    }
+
+    #[test]
+    fn authorize_local_peer_denies_when_peer_uid_unavailable() {
+        use super::authorize_local_peer;
+        use std::os::unix::net::UnixStream;
+        // Open a stream and immediately shut both halves down so the
+        // kernel surface still answers getsockopt for the local side
+        // — but use an unconnected stream by creating only one end.
+        // A `UnixStream::pair()` always yields connected halves with
+        // valid peer credentials, so to exercise the unavailable
+        // path we wrap a stream that has been forcibly disconnected.
+        // The cheapest deterministic way: bind a non-existent socket
+        // path and `connect()` would fail, so instead we test the
+        // structured path via the public error helpers.
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        drop(b);
+        // After dropping the peer, getsockopt may still return the
+        // peer-cred snapshot captured at connect time on Linux. The
+        // helper is correct in either case — if peer_uid resolves we
+        // hit the uid-mismatch denial; if it doesn't, we hit the
+        // unavailable denial. Both are fail-closed.
+        let owner_uid = nix::unistd::Uid::effective().as_raw().wrapping_add(202);
+        let socket_path = std::env::temp_dir().join(format!(
+            "rustynet-peercred-unavail-{}.sock",
+            std::process::id()
+        ));
+        let outcome = authorize_local_peer(&a, owner_uid, &socket_path);
+        assert!(
+            outcome.is_err(),
+            "any peer-cred outcome with mismatched owner uid must fail closed"
+        );
+    }
+
+    #[test]
+    fn local_auth_via_as_str_is_stable_for_audit_log() {
+        use super::LocalAuthVia;
+        assert_eq!(LocalAuthVia::Root.as_str(), "root_uid");
+        assert_eq!(LocalAuthVia::SocketOwnerUid.as_str(), "socket_owner_uid");
+        assert_eq!(LocalAuthVia::AuthorizedGroup.as_str(), "authorized_group");
+    }
+
+    #[test]
+    fn authorized_local_ipc_group_match_accepts_any_reviewed_group_id() {
+        assert!(super::peer_in_authorized_local_ipc_group(
+            &[10, 20, 30],
+            &[20, 40]
+        ));
+        assert!(!super::peer_in_authorized_local_ipc_group(
+            &[10, 30],
+            &[20, 40]
+        ));
+        assert!(!super::peer_in_authorized_local_ipc_group(&[20], &[]));
+    }
+
+    #[test]
+    fn local_peer_denial_uid_and_gid_status_render_for_audit() {
+        use super::LocalPeerDenial;
+        let known = LocalPeerDenial {
+            peer_uid: Some(42),
+            peer_gid: Some(7),
+            reason: "uid_and_gid_do_not_match_authorized_local_ipc_policy",
+        };
+        assert_eq!(known.uid_status(), "uid=42");
+        assert_eq!(known.gid_status(), "gid=7");
+        let line = super::local_peer_denial_audit_line("status", &known);
+        assert!(line.contains("ipc_peer_cred_denied command=status"));
+        assert!(line.contains("uid=42"));
+        assert!(line.contains("gid=7"));
+        assert!(line.contains("uid_and_gid_do_not_match_authorized_local_ipc_policy"));
+        let unknown = LocalPeerDenial {
+            peer_uid: None,
+            peer_gid: None,
+            reason: "peer_uid_unavailable",
+        };
+        assert_eq!(unknown.uid_status(), "uid=unavailable");
+        assert_eq!(unknown.gid_status(), "gid=unavailable");
     }
 }
