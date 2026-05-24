@@ -96,6 +96,32 @@ fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
+
+    // Track B Phase 1: the dispatcher fabric exists so the
+    // orchestrator can ask for an exit-handoff on macOS or Windows,
+    // but the per-platform validators (systemd → launchd / SCM,
+    // nftables → PF / NetNat, iproute2 → route / Get-NetRoute) land
+    // in Phases 3 + 4. Until then a non-Linux invocation fails closed
+    // with an honest message — exactly mirroring the Windows arm in
+    // `live_linux_anchor_test`. Silently falling through to the Linux
+    // path would emit Linux assertions against a non-Linux host and
+    // produce false-positive evidence.
+    match config.platform {
+        ExitHandoffPlatform::Linux => {}
+        ExitHandoffPlatform::MacOs => {
+            return Err("macOS exit-handoff live execution is not enabled yet; \
+                 the platform-aware validators land in Track B Phase 4. \
+                 Use --platform linux for the existing Linux-host coverage."
+                .to_owned());
+        }
+        ExitHandoffPlatform::Windows => {
+            return Err("Windows exit-handoff live execution is not enabled yet; \
+                 the platform-aware validators land in Track B Phase 3. \
+                 Use --platform linux for the existing Linux-host coverage."
+                .to_owned());
+        }
+    }
+
     let root_dir = live_lab_support::repo_root()?;
 
     for command in [
@@ -899,8 +925,48 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Target platform of the host running the active mesh exit role.
+///
+/// Today the live exit-handoff stages only have a fully-implemented
+/// Linux validator (systemd + nftables + iproute2). The `--platform`
+/// flag exists so the orchestrator's `stage_run_live_exit_handoff`
+/// can dispatch per-platform symmetrically with
+/// `stage_run_live_anchor`. Non-Linux platforms fail closed with an
+/// honest "not yet enabled" message until the per-platform
+/// validators land (Track B Phases 2 + 3). Mirrors the pattern in
+/// `live_linux_anchor_test::AnchorPlatform`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitHandoffPlatform {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl ExitHandoffPlatform {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn as_str(self) -> &'static str {
+        match self {
+            ExitHandoffPlatform::Linux => "linux",
+            ExitHandoffPlatform::MacOs => "macos",
+            ExitHandoffPlatform::Windows => "windows",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "linux" => Ok(ExitHandoffPlatform::Linux),
+            "macos" | "darwin" => Ok(ExitHandoffPlatform::MacOs),
+            "windows" => Ok(ExitHandoffPlatform::Windows),
+            other => Err(format!(
+                "unsupported --platform value {other:?}; expected linux|macos|windows"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Config {
+    platform: ExitHandoffPlatform,
     ssh_identity_file: PathBuf,
     exit_a_host: String,
     exit_b_host: String,
@@ -923,6 +989,7 @@ struct Config {
 impl Config {
     fn parse(args: Vec<String>) -> Result<Self, String> {
         let mut config = Self {
+            platform: ExitHandoffPlatform::Linux,
             ssh_identity_file: PathBuf::new(),
             exit_a_host: "debian@192.168.18.49".to_owned(),
             exit_b_host: "mint@192.168.18.53".to_owned(),
@@ -947,6 +1014,10 @@ impl Config {
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--platform" => {
+                    config.platform =
+                        ExitHandoffPlatform::parse(next_value(&mut iter, &arg)?.as_str())?;
+                }
                 "--ssh-identity-file" => {
                     config.ssh_identity_file = PathBuf::from(next_value(&mut iter, &arg)?);
                 }
@@ -1842,6 +1913,7 @@ mod tests {
 
     fn sample_config() -> Config {
         Config {
+            platform: super::ExitHandoffPlatform::Linux,
             ssh_identity_file: PathBuf::from("/tmp/id"),
             exit_a_host: "debian@192.168.128.22".to_owned(),
             exit_b_host: "debian@192.168.128.26".to_owned(),
@@ -2058,5 +2130,40 @@ peer.1.endpoint=192.168.128.26:51820
             trust_idx < state_idx,
             "trust refresh must happen before signed state refresh in handoff coordination"
         );
+    }
+
+    // ─── Track B Phase 1: --platform parser + dispatcher fabric ──
+
+    #[test]
+    fn platform_parser_accepts_canonical_strings() {
+        assert_eq!(
+            super::ExitHandoffPlatform::parse("linux").unwrap(),
+            super::ExitHandoffPlatform::Linux
+        );
+        assert_eq!(
+            super::ExitHandoffPlatform::parse("MacOS").unwrap(),
+            super::ExitHandoffPlatform::MacOs
+        );
+        assert_eq!(
+            super::ExitHandoffPlatform::parse("darwin").unwrap(),
+            super::ExitHandoffPlatform::MacOs
+        );
+        assert_eq!(
+            super::ExitHandoffPlatform::parse("WINDOWS").unwrap(),
+            super::ExitHandoffPlatform::Windows
+        );
+    }
+
+    #[test]
+    fn platform_parser_rejects_garbage() {
+        let err = super::ExitHandoffPlatform::parse("freebsd").expect_err("garbage rejected");
+        assert!(err.contains("unsupported --platform"));
+    }
+
+    #[test]
+    fn platform_as_str_matches_canonical_form() {
+        assert_eq!(super::ExitHandoffPlatform::Linux.as_str(), "linux");
+        assert_eq!(super::ExitHandoffPlatform::MacOs.as_str(), "macos");
+        assert_eq!(super::ExitHandoffPlatform::Windows.as_str(), "windows");
     }
 }
