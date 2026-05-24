@@ -239,7 +239,7 @@ Existing prompt:
 Select node role:
 1) admin    — full operational console
 2) client   — limited console (status + connect/disconnect)
-3) blind_exit — hardened final-hop exit (Linux only)
+3) blind_exit — hardened final-hop exit (Linux/macOS only)
 ```
 
 New prompt (D12):
@@ -250,7 +250,7 @@ Select node role:
 3) exit        — internet egress for other peers (advertises 0.0.0.0/0)
 4) relay       — encrypted UDP forwarding for peers that can't direct-connect
 5) client      — uses the mesh; hosts nothing
-6) blind_exit  — hardened final-hop exit (Linux only; IMMUTABLE — factory reset to change)
+6) blind_exit  — hardened final-hop exit (Linux/macOS; IMMUTABLE — factory reset to change)
 ```
 
 The wizard:
@@ -278,7 +278,7 @@ Not every platform can host every role. Mobile platforms are client-only by OS c
 | `client` | yes | yes | yes (today: `runtime-host-capable only`; full client when D7/D9 land) | yes | yes |
 | `admin` | yes | yes | yes (same Windows gate) | no | no |
 | `exit` | yes | yes (with admin-installed network tools) | yes (gated on D7 NetNat + killswitch evidence) | no | no |
-| `blind_exit` | yes | no (PF-based killswitch parity work needed; defer until macOS exit parity proven) | no (gated behind Windows-as-blind-exit work, not in current dataplane plan) | no | no |
+| `blind_exit` | yes | yes (PF-backed hard-lock; live evidence pending) | no (gated behind Windows-as-blind-exit work, not in current dataplane plan) | no | no |
 | `relay` | yes | yes | yes (gated on D7/D9; `rustynet-relay` already builds with SCM feature) | no | no |
 | `anchor` | yes | yes | yes (gated on D7/D9) | no (consume-only; see anchor design §6.4) | no (consume-only; see anchor design §6.5) |
 
@@ -286,7 +286,7 @@ Not every platform can host every role. Mobile platforms are client-only by OS c
 
 **Windows is gated.** Today `runtime-host-capable only`. All non-client roles on Windows land when D7/D9 in the dataplane plan complete (same prerequisite as Windows-as-exit). The wizard shows blocked roles greyed out with a one-line "blocked until Windows dataplane parity" note.
 
-**macOS `blind_exit` is blocked.** Existing `start.sh` already enforces `blind_exit` is Linux-only (per CLAUDE.md project notes). The wizard maintains this; D12 does not extend `blind_exit` to macOS without separate work on PF-based killswitch parity.
+**macOS `blind_exit` is PF-backed.** The reviewed macOS path installs a hard-locked PF anchor for local tunnel-only egress plus mesh-CIDR-scoped final-hop forwarding. The wizard permits `blind_exit` on macOS; live evidence still has to prove anchor installation, DNS precedence, and hard-lock persistence before release promotion.
 
 ---
 

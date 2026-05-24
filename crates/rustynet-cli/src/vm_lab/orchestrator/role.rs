@@ -29,11 +29,12 @@ impl NodeRole {
     }
 
     /// Role-platform matrix currently enforced by the Rust-native path.
-    /// Windows/macOS Exit remains fail-closed until W5.4 live evidence is recorded.
+    /// Windows Exit remains fail-closed until W5.4 live evidence is recorded.
+    /// macOS Exit maps to the reviewed `blind_exit` PF posture.
     ///
     /// | Role   | Linux | Windows | macOS | iOS | Android |
     /// |--------|-------|---------|-------|-----|---------|
-    /// | Exit   | ✓     | ✗       | ✗     | ✗   | ✗       |
+    /// | Exit   | ✓     | ✗       | ✓     | ✗   | ✗       |
     /// | Client | ✓     | ✓       | ✓     | ✗   | ✗       |
     /// | Entry  | ✓     | ✓       | ✓     | ✗   | ✗       |
     /// | Aux    | ✓     | ✓       | ✓     | ✗   | ✗       |
@@ -44,8 +45,8 @@ impl NodeRole {
     pub fn is_supported_for_platform(&self, platform: &VmGuestPlatform) -> bool {
         match platform {
             VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
-            VmGuestPlatform::Linux => true,
-            VmGuestPlatform::Windows | VmGuestPlatform::Macos => !self.is_membership_owner(),
+            VmGuestPlatform::Linux | VmGuestPlatform::Macos => true,
+            VmGuestPlatform::Windows => !self.is_membership_owner(),
         }
     }
 
@@ -56,8 +57,7 @@ impl NodeRole {
     pub fn is_lab_assignable_for_platform(&self, platform: &VmGuestPlatform) -> bool {
         match platform {
             VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
-            VmGuestPlatform::Linux | VmGuestPlatform::Windows => true,
-            VmGuestPlatform::Macos => !self.is_membership_owner(),
+            VmGuestPlatform::Linux | VmGuestPlatform::Windows | VmGuestPlatform::Macos => true,
         }
     }
 
@@ -223,24 +223,46 @@ mod tests {
     }
 
     #[test]
-    fn is_supported_for_platform_windows_macos_fail_closed_for_exit_only() {
-        for platform in &[VmGuestPlatform::Windows, VmGuestPlatform::Macos] {
+    fn is_supported_for_platform_windows_fail_closed_for_exit_only() {
+        assert!(
+            !NodeRole::Exit.is_supported_for_platform(&VmGuestPlatform::Windows),
+            "Windows Exit must remain fail-closed until W5.4 live evidence exists"
+        );
+        for role in &[
+            NodeRole::Client,
+            NodeRole::Entry,
+            NodeRole::Aux,
+            NodeRole::Extra,
+        ] {
             assert!(
-                !NodeRole::Exit.is_supported_for_platform(platform),
-                "Exit must remain fail-closed on {platform:?} until W5.4 live evidence exists"
+                role.is_supported_for_platform(&VmGuestPlatform::Windows),
+                "{role:?} must be supported on Windows"
             );
-            for role in &[
-                NodeRole::Client,
-                NodeRole::Entry,
-                NodeRole::Aux,
-                NodeRole::Extra,
-            ] {
-                assert!(
-                    role.is_supported_for_platform(platform),
-                    "{role:?} must be supported on {platform:?}"
-                );
-            }
         }
+    }
+
+    #[test]
+    fn is_supported_for_platform_macos_exit_maps_to_blind_exit_pf_posture() {
+        assert!(
+            NodeRole::Exit.is_supported_for_platform(&VmGuestPlatform::Macos),
+            "macOS Exit is supported through the reviewed blind_exit PF posture"
+        );
+        assert!(
+            NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Macos),
+            "macOS Exit must be lab-assignable now that blind_exit PF parity exists"
+        );
+        assert_eq!(
+            NodeRole::Exit
+                .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
+                .unwrap(),
+            "blind_exit"
+        );
+        assert_eq!(
+            NodeRole::Exit
+                .product_capabilities_for_platform(&VmGuestPlatform::Macos)
+                .unwrap(),
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer]
+        );
     }
 
     #[test]
@@ -274,8 +296,8 @@ mod tests {
             "Windows Exit must be lab-assignable so live evidence can be generated"
         );
         assert!(
-            !NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Macos),
-            "macOS Exit remains blocked until a separate exit-node plan exists"
+            NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Macos),
+            "macOS Exit is assignable through blind_exit PF parity"
         );
     }
 

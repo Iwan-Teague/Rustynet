@@ -189,11 +189,15 @@ normalize_node_role() {
       NODE_ROLE="client"
       ;;
   esac
-  if [[ "${NODE_ROLE}" == "blind_exit" ]] && ! is_linux_host; then
-    print_warn "blind_exit role is supported only on Linux hosts. Reverting to client role."
+  if [[ "${NODE_ROLE}" == "blind_exit" ]] && ! is_blind_exit_supported_host; then
+    print_warn "blind_exit role is supported only on Linux/macOS hosts. Reverting to client role."
     NODE_ROLE="client"
   fi
   normalize_role_preset
+}
+
+is_blind_exit_supported_host() {
+  is_linux_host || is_macos_host
 }
 
 # D12.c — validate SETUP_ROLE_PRESET and ensure it stays consistent
@@ -233,7 +237,7 @@ normalize_role_preset() {
 # D12.c — render the six user-selectable presets defined in
 # documents/operations/active/NodeRoleTaxonomy_2026-05-21.md and
 # read the operator's choice. The prompt is platform-aware:
-# blind_exit is masked off on non-Linux hosts, and relay / anchor
+# blind_exit is masked off on hosts without reviewed PF/nftables support, and relay / anchor
 # are explicitly marked as gated by D11.a so the operator
 # understands the dependency before picking one.
 prompt_role_preset() {
@@ -250,10 +254,10 @@ prompt_role_preset() {
   print_info "                    [gated by D11.a capability schema; selecting today configures the closest primary"
   print_info "                     (admin) and records the preset for activation when D11.a lands]"
   print_info "  5) client      — uses the mesh; hosts nothing"
-  if is_linux_host; then
-    print_info "  6) blind_exit  — hardened final-hop exit (Linux only; IMMUTABLE — factory reset to change)"
+  if is_blind_exit_supported_host; then
+    print_info "  6) blind_exit  — hardened final-hop exit (Linux/macOS; IMMUTABLE — factory reset to change)"
   else
-    print_info "  6) blind_exit  — (blocked: Linux-only)"
+    print_info "  6) blind_exit  — (blocked: no reviewed blind-exit firewall backend)"
   fi
 
   local __selected=""
@@ -438,9 +442,9 @@ validate_loaded_config_or_die() {
     esac
   fi
 
-  if [[ "${NODE_ROLE}" == "blind_exit" ]] && ! is_linux_host; then
-    print_err "Invalid persisted NODE_ROLE='blind_exit' on non-Linux host."
-    print_info "Set NODE_ROLE=client in ${CONFIG_FILE} on macOS hosts."
+  if [[ "${NODE_ROLE}" == "blind_exit" ]] && ! is_blind_exit_supported_host; then
+    print_err "Invalid persisted NODE_ROLE='blind_exit' on unsupported host."
+    print_info "Set NODE_ROLE=client in ${CONFIG_FILE} on this host."
     exit 1
   fi
 
@@ -3397,8 +3401,8 @@ configure_values() {
         return 1
         ;;
     esac
-    if [[ "${selected_preset}" == "blind_exit" ]] && ! is_linux_host; then
-      print_err "blind_exit preset is supported only on Linux hosts."
+    if [[ "${selected_preset}" == "blind_exit" ]] && ! is_blind_exit_supported_host; then
+      print_err "blind_exit preset is supported only on Linux/macOS hosts."
       return 1
     fi
     SETUP_ROLE_PRESET="${selected_preset}"

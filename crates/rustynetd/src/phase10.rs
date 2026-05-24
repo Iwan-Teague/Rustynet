@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+use crate::macos_blind_exit::{
+    DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR, MacosBlindExitManagementCidr, MacosBlindExitPfConfig,
+    build_macos_blind_exit_pf_rules, evaluate_macos_blind_exit_pf_rules,
+    is_macos_blind_exit_anchor,
+};
 use crate::privileged_helper::{
     PrivilegedCommandClient, PrivilegedCommandOutput, PrivilegedCommandProgram,
 };
@@ -2174,6 +2179,7 @@ pub struct MacosCommandSystem {
     ipv6_blocked: bool,
     dns_protected: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
+    blind_exit_pf_config: Option<MacosBlindExitPfConfig>,
 }
 
 impl MacosCommandSystem {
@@ -2207,6 +2213,7 @@ impl MacosCommandSystem {
             ipv6_blocked: false,
             dns_protected: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
+            blind_exit_pf_config: None,
         })
     }
 
@@ -2262,6 +2269,9 @@ impl MacosCommandSystem {
     }
 
     fn current_anchor_name(&self) -> String {
+        if self.blind_exit_pf_config.is_some() {
+            return DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR.to_owned();
+        }
         format!("com.apple/rustynet_g{}", self.generation)
     }
 
@@ -2275,6 +2285,10 @@ impl MacosCommandSystem {
     }
 
     fn render_pf_rules(&self, strict_fail_closed: bool) -> Result<String, SystemError> {
+        if let Some(config) = self.blind_exit_runtime_config() {
+            return build_macos_blind_exit_pf_rules(&config)
+                .map_err(SystemError::FirewallApplyFailed);
+        }
         let mut rules = String::new();
         rules.push_str("set block-policy drop\n");
         if !strict_fail_closed {
@@ -2337,6 +2351,24 @@ impl MacosCommandSystem {
         Ok(rules)
     }
 
+    fn blind_exit_runtime_config(&self) -> Option<MacosBlindExitPfConfig> {
+        let mut config = self.blind_exit_pf_config.clone()?;
+        config.ipv6_tunnel_allowed = !self.ipv6_blocked;
+        config.dns_protected = self.dns_protected;
+        config.management_ssh_allow_cidrs = if self.fail_closed_ssh_allow {
+            self.fail_closed_ssh_allow_cidrs
+                .iter()
+                .map(|cidr| MacosBlindExitManagementCidr {
+                    family: cidr.pf_family(),
+                    cidr: cidr.to_string(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(config)
+    }
+
     fn ruleset_contains_dns_rule(
         rules: &str,
         action_token: &str,
@@ -2371,7 +2403,7 @@ impl MacosCommandSystem {
         self.ensure_pf_enabled()?;
         let next_anchor = self.current_anchor_name();
         match self.anchor_name.as_ref() {
-            Some(previous) if previous != &next_anchor => {
+            Some(previous) if previous != &next_anchor && !is_macos_blind_exit_anchor(previous) => {
                 self.run_allow_failure(
                     PrivilegedCommandProgram::Pfctl,
                     &["-a", previous.as_str(), "-F", "all"],
@@ -2385,6 +2417,13 @@ impl MacosCommandSystem {
         let tmp = tmp_path
             .to_str()
             .ok_or_else(|| SystemError::FirewallApplyFailed("pf temp path utf8".to_owned()))?;
+        if self.blind_exit_pf_config.is_some() {
+            self.run(
+                PrivilegedCommandProgram::Pfctl,
+                &["-n", "-a", next_anchor.as_str(), "-f", tmp],
+            )
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        }
         let apply_result = self.run(
             PrivilegedCommandProgram::Pfctl,
             &["-a", next_anchor.as_str(), "-f", tmp],
@@ -2392,6 +2431,29 @@ impl MacosCommandSystem {
         let _ = fs::remove_file(&tmp_path);
         apply_result.map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
         self.anchor_name = Some(next_anchor);
+        if let Some(config) = self.blind_exit_runtime_config() {
+            let anchor = self
+                .anchor_name
+                .as_deref()
+                .unwrap_or(DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR);
+            let output = self.run_capture(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor, "-s", "rules"],
+            )?;
+            if !output.success() {
+                return Err(SystemError::FirewallApplyFailed(format!(
+                    "blind_exit pf verification query failed: status={} stderr={}",
+                    output.status, output.stderr
+                )));
+            }
+            let reasons = evaluate_macos_blind_exit_pf_rules(output.stdout.as_str(), &config);
+            if !reasons.is_empty() {
+                return Err(SystemError::FirewallApplyFailed(format!(
+                    "blind_exit pf verification failed: {}",
+                    reasons.join("; ")
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2421,6 +2483,10 @@ impl MacosCommandSystem {
 
     fn flush_anchor(&mut self) {
         if let Some(anchor) = self.anchor_name.take() {
+            if is_macos_blind_exit_anchor(anchor.as_str()) {
+                self.anchor_name = Some(anchor);
+                return;
+            }
             self.run_allow_failure(
                 PrivilegedCommandProgram::Pfctl,
                 &["-a", anchor.as_str(), "-F", "all"],
@@ -2477,22 +2543,42 @@ impl DataplaneSystem for MacosCommandSystem {
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
+        if self.blind_exit_pf_config.is_some() {
+            return Ok(());
+        }
         self.flush_anchor();
         Ok(())
     }
 
     fn apply_nat_forwarding(
         &mut self,
-        _serve_exit_node: bool,
-        _exit_mode: ExitMode,
-        _mesh_cidr: &str,
+        serve_exit_node: bool,
+        exit_mode: ExitMode,
+        mesh_cidr: &str,
     ) -> Result<(), SystemError> {
-        self.allow_egress_interface = true;
+        if serve_exit_node && matches!(exit_mode, ExitMode::Off) {
+            let config = MacosBlindExitPfConfig::new(
+                self.interface_name.clone(),
+                self.egress_interface.clone(),
+                mesh_cidr.to_owned(),
+            )
+            .map_err(SystemError::NatApplyFailed)?;
+            self.blind_exit_pf_config = Some(config);
+            self.allow_egress_interface = false;
+        } else {
+            self.blind_exit_pf_config = None;
+            self.allow_egress_interface = true;
+        }
         self.apply_pf_rules(false)
             .map_err(|err| SystemError::NatApplyFailed(err.to_string()))
     }
 
     fn rollback_nat_forwarding(&mut self) -> Result<(), SystemError> {
+        if self.blind_exit_pf_config.is_some() {
+            return self
+                .apply_pf_rules(false)
+                .map_err(|err| SystemError::RollbackFailed(err.to_string()));
+        }
         self.allow_egress_interface = false;
         self.apply_pf_rules(false)
             .map_err(|err| SystemError::RollbackFailed(err.to_string()))
@@ -2599,6 +2685,34 @@ impl DataplaneSystem for MacosCommandSystem {
                 return Err(SystemError::KillSwitchAssertionFailed(
                     "pf dns tcp block rule missing".to_owned(),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_exit_serving(&mut self, _mesh_cidr: &str) -> Result<(), SystemError> {
+        self.assert_killswitch()?;
+        if let Some(config) = self.blind_exit_runtime_config() {
+            let anchor = self
+                .anchor_name
+                .as_deref()
+                .unwrap_or(DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR);
+            let output = self.run_capture(
+                PrivilegedCommandProgram::Pfctl,
+                &["-a", anchor, "-s", "rules"],
+            )?;
+            if !output.success() {
+                return Err(SystemError::KillSwitchAssertionFailed(format!(
+                    "blind_exit pf assertion query failed: status={} stderr={}",
+                    output.status, output.stderr
+                )));
+            }
+            let reasons = evaluate_macos_blind_exit_pf_rules(output.stdout.as_str(), &config);
+            if !reasons.is_empty() {
+                return Err(SystemError::KillSwitchAssertionFailed(format!(
+                    "blind_exit pf assertion failed: {}",
+                    reasons.join("; ")
+                )));
             }
         }
         Ok(())
@@ -10073,6 +10187,48 @@ mod tests {
              pass out quick inet on utun9 all keep state\n\
              pass out quick inet on en0 all keep state\n\
              block drop out quick all\n"
+        );
+    }
+
+    #[test]
+    fn macos_render_pf_rules_blind_exit_uses_hard_locked_anchor_policy() {
+        let mut system = MacosCommandSystem::new("rustynet0", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.blind_exit_pf_config =
+            Some(MacosBlindExitPfConfig::new("rustynet0", "en0", "100.64.0.0/10").unwrap());
+        system.dns_protected = true;
+        system.ipv6_blocked = true;
+
+        let rules = system
+            .render_pf_rules(false)
+            .expect("blind_exit rule render should succeed");
+
+        assert!(rules.contains("pass out quick inet on rustynet0 all keep state"));
+        assert!(rules.contains("pass out quick inet on en0 from 100.64.0.0/10 to any keep state"));
+        assert!(!rules.contains("pass out quick inet on en0 all keep state"));
+        assert!(rules.contains("block drop out quick inet6 all"));
+        assert!(rules.ends_with("block drop out quick all\n"));
+    }
+
+    #[test]
+    fn macos_blind_exit_anchor_survives_shutdown_cleanup_path() {
+        let mut system = MacosCommandSystem::new("rustynet0", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.blind_exit_pf_config =
+            Some(MacosBlindExitPfConfig::new("rustynet0", "en0", "100.64.0.0/10").unwrap());
+        system.anchor_name = Some(DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR.to_owned());
+
+        DataplaneSystem::rollback_firewall(&mut system)
+            .expect("blind_exit rollback keeps anchor installed");
+        assert_eq!(
+            system.anchor_name.as_deref(),
+            Some(DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR)
+        );
+
+        system.flush_anchor();
+        assert_eq!(
+            system.anchor_name.as_deref(),
+            Some(DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR)
         );
     }
 

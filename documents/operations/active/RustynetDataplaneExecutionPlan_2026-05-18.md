@@ -321,7 +321,7 @@ starting script, and archive the resulting artifacts under
 - **Pass criterion.** `rustynet role set anchor` on clean Debian 13 install brings the host to a working anchor (relay co-deployed, capability signed in membership). `rustynet role set client` (admin signs revocation) brings it back to clean client (relay undeployed). `rustynet role set blind_exit` configures hardened final-hop exit with irreversibility prompt + audit trail. Wizard shows 6 roles with correct per-platform gating. Mobile `client (mobile)` indicator is read-only on iOS + Android. Every transition emits tamper-evident audit log entry.
 - **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
 - **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
-- **Cross-platform note.** Linux + macOS roles all land in D12 (except macOS `blind_exit`, which stays Linux-only). Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
+- **Cross-platform note.** Linux + macOS roles land in D12, including macOS `blind_exit` through the reviewed PF hard-lock path. Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
 - **Status (2026-05-22).** **D12.a + D12.b + D12.c + D12.d (Linux + macOS relay service path) + D12.e complete.**
 
   D12.d lands the Linux service deploy/undeploy infrastructure for the relay-bearing presets:
@@ -354,6 +354,8 @@ starting script, and archive the resulting artifacts under
 
   **D12 follow-up complete (2026-05-24, commit `770b2ac`).** macOS launchd parity is now wired into the role-transition executor rather than only the standalone ops verb. `execute_platform_relay_service_action` dispatches macOS relay deploy/undeploy through `ops_install_macos_relay::install(false)` / `uninstall(false)`, while dry-run tests (`macos_relay_dispatch_install_uses_launchd_wrapper_in_dry_run`, `macos_relay_dispatch_uninstall_uses_launchd_wrapper_in_dry_run`, `install_wrapper_uses_launchd_install_shape_in_dry_run`, `uninstall_wrapper_uses_launchd_remove_shape_in_dry_run`) pin the launchd `bootstrap` / `bootout` shape. Live launchd bootstrap remains a lab-evidence item, not a code blocker.
 
+  **D12 blind-exit follow-up complete (2026-05-24, code update pending commit).** macOS `blind_exit` is no longer only a blocked taxonomy entry. `crates/rustynetd/src/macos_blind_exit.rs` defines the reviewed PF hard-lock rule builder/evaluator: local-origin egress is tunnel-only, mesh-exit forwarding is scoped to the signed mesh CIDR, DNS egress remains fail-closed, and `route-to` / `reply-to` / `dup-to` bypass primitives are rejected. `MacosCommandSystem` now switches exit-serving with `ExitMode::Off` into the hard-locked `com.rustynet/blind_exit` anchor, syntax-checks PF loads before commit, verifies the installed anchor, and refuses normal cleanup/removal except factory-reset policy. `start.sh`, the Rust-native lab role mapper, `PlatformSupportMatrix.md`, and `NodeRoleTaxonomy_2026-05-21.md` now mark macOS `blind_exit` as code-supported with live evidence pending. Tests: `macos_blind_exit::*`, `macos_render_pf_rules_blind_exit_uses_hard_locked_anchor_policy`, `macos_blind_exit_anchor_survives_shutdown_cleanup_path`, `validate_request_accepts_pfctl_anchor_syntax_check`, and `is_supported_for_platform_macos_exit_maps_to_blind_exit_pf_posture`.
+
   D12.c + D12.b + D12.a + D12.e status:
 
   D12.c lands the wizard surface in `start.sh`: the initial-setup role prompt now offers all six presets (`anchor`, `admin`, `exit`, `relay`, `client`, `blind_exit`) via the new `prompt_role_preset` helper. New tracking var `SETUP_ROLE_PRESET` records the operator's preset choice; the existing `NODE_ROLE` primary axis (`admin`/`client`/`blind_exit`) is derived deterministically by the new `normalize_role_preset` helper.
@@ -364,7 +366,7 @@ starting script, and archive the resulting artifacts under
   - `blind_exit` → `blind_exit`
 
   Per-preset wizard behaviour:
-  - `client` / `admin` / `blind_exit` — same flow as before, with the existing confirmation prompts (admin requires confirmation, blind_exit requires explicit irreversibility ack on first setup, blind_exit is Linux-only).
+  - `client` / `admin` / `blind_exit` — same flow as before, with the existing confirmation prompts (admin requires confirmation, blind_exit requires explicit irreversibility ack on first setup, blind_exit is Linux/macOS only).
   - `exit` — operator gets a follow-up notice with the exact `rustynet role set exit` / `rustynet route advertise 0.0.0.0/0` invocations to run post-setup.
   - `relay` / `anchor` — operator gets a clear, non-blocking notice that the role requires the D11.a capability schema (queued). The device is provisioned as `admin` primary today with `SETUP_ROLE_PRESET` recorded so the daemon will auto-elevate once D11.a lands. Tracking pointer to the dataplane plan included.
 

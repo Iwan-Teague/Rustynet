@@ -1008,7 +1008,7 @@ fn is_allowed_ips_token(value: &str) -> bool {
 }
 
 fn is_anchor_name_token(value: &str) -> bool {
-    if !value.starts_with("com.apple/rustynet_g") {
+    if !(value.starts_with("com.apple/rustynet_g") || value == "com.rustynet/blind_exit") {
         return false;
     }
     if !value
@@ -1596,6 +1596,9 @@ fn validate_pfctl_args(args: &[&str]) -> Result<(), String> {
         ["-s", "Anchors"] => Ok(()),
         ["-a", anchor, "-F", "all"] if is_anchor_name_token(anchor) => Ok(()),
         ["-a", anchor, "-f", path] if is_anchor_name_token(anchor) && is_path_token(path) => Ok(()),
+        ["-n", "-a", anchor, "-f", path] if is_anchor_name_token(anchor) && is_path_token(path) => {
+            Ok(())
+        }
         ["-a", anchor, "-s", "rules"] if is_anchor_name_token(anchor) => Ok(()),
         _ => Err("unsupported pfctl argument schema".to_owned()),
     }
@@ -2606,10 +2609,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_request_accepts_pfctl_anchor_syntax_check() {
+        validate_request(
+            PrivilegedCommandProgram::Pfctl,
+            &[
+                "-n",
+                "-a",
+                "com.rustynet/blind_exit",
+                "-f",
+                "/etc/rustynet/blind-exit.pf",
+            ],
+        )
+        .expect("pfctl syntax check for reviewed anchor load should be accepted");
+    }
+
+    #[test]
     fn validate_request_rejects_path_traversal_in_pfctl_anchor_name() {
         assert!(!is_anchor_name_token("com.apple/rustynet_g1/../foo"));
         assert!(!is_anchor_name_token("com.apple/rustynet_g1/.."));
         assert!(is_anchor_name_token("com.apple/rustynet_g1"));
+        assert!(is_anchor_name_token("com.rustynet/blind_exit"));
         let err = validate_request(
             PrivilegedCommandProgram::Pfctl,
             &[
