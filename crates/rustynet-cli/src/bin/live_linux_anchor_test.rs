@@ -10,7 +10,7 @@ use live_lab_bin_support as live_lab_support;
 use live_lab_support::{
     Logger, capture_root, create_workspace, ensure_pinned_known_hosts_file, ensure_safe_token,
     git_head_commit, load_home_known_hosts_path, repo_root, require_command, seed_known_hosts,
-    shell_quote, unix_now, verify_sudo, write_file,
+    shell_quote, unix_now, verify_passwordless_sudo, verify_sudo, write_file,
 };
 use serde_json::json;
 
@@ -130,16 +130,6 @@ fn run() -> Result<(), String> {
                 .to_owned(),
         );
     }
-    if config.platform == AnchorPlatform::Macos {
-        // The Linux substages below shell out to systemd / sudo /
-        // Linux-specific file paths. macOS would silently
-        // misclassify. Fail closed at the dispatcher until Track B
-        // Phase 10 lands the launchd-driven validator.
-        return Err(
-            "macOS anchor live execution is not enabled yet; Track B Phase 10 lands the real validator (use --dry-run for now)"
-                .to_owned(),
-        );
-    }
 
     for command in ["ssh", "ssh-keygen"] {
         require_command(command)?;
@@ -164,7 +154,22 @@ fn run() -> Result<(), String> {
         .ssh_identity_file
         .as_ref()
         .expect("identity presence checked above");
-    verify_sudo(identity, &work_known_hosts, &config.anchor_host)?;
+    // Track B Phase 10 — macOS does not maintain its hostname in
+    // /etc/hosts (HostName lives in scutil), so the Linux verify_sudo
+    // grep would reject healthy mac anchors. Route the macOS path
+    // through verify_passwordless_sudo (sudo -n probe only).
+    match config.platform {
+        AnchorPlatform::Linux => {
+            verify_sudo(identity, &work_known_hosts, &config.anchor_host)?;
+        }
+        AnchorPlatform::Macos => {
+            verify_passwordless_sudo(identity, &work_known_hosts, &config.anchor_host)?;
+        }
+        AnchorPlatform::Windows => {
+            // Already failed closed above; this arm is unreachable.
+            return Err("windows anchor execution unreachable".to_owned());
+        }
+    }
 
     let mut subchecks = Vec::new();
 
@@ -271,7 +276,10 @@ fn validate_anchor_capabilities(anchor_list: &str, anchor_node_id: &str) -> Resu
         .find(|line| line.starts_with(anchor_node_id))
         .ok_or_else(|| format!("anchor node {anchor_node_id} missing from anchor list"))?;
     for capability in REQUIRED_ANCHOR_CAPS {
-        if !row.contains(capability) {
+        // Word-boundary match — a substring check would accept a
+        // hypothetical future cap like `anchor.gossip_seed_v2` and
+        // hide a real drop of `anchor.gossip_seed`.
+        if !row_has_capability(row, capability) {
             return Err(format!(
                 "anchor capability {capability} missing for {anchor_node_id}: {row}"
             ));
@@ -381,7 +389,7 @@ fn set_membership_capabilities(
 fn validate_anchor_gossip_seed(anchor_list: &str, config: &Config) -> Result<String, String> {
     let seed_rows: Vec<&str> = anchor_list
         .lines()
-        .filter(|line| line.contains("anchor.gossip_seed"))
+        .filter(|line| row_has_capability(line, "anchor.gossip_seed"))
         .collect();
     if seed_rows.is_empty() {
         return Err(
@@ -398,7 +406,7 @@ fn validate_anchor_gossip_seed(anchor_list: &str, config: &Config) -> Result<Str
                 config.anchor_node_id
             )
         })?;
-    if !primary_row.contains("anchor.gossip_seed") {
+    if !row_has_capability(primary_row, "anchor.gossip_seed") {
         return Err(format!(
             "primary anchor {} is missing anchor.gossip_seed capability: {primary_row}",
             config.anchor_node_id
@@ -414,6 +422,23 @@ fn validate_anchor_gossip_seed(anchor_list: &str, config: &Config) -> Result<Str
         seed_node_ids.len(),
         seed_node_ids.join(",")
     ))
+}
+
+/// Word-boundary capability match. The daemon emits anchor rows as
+/// `<node_id> capabilities=<csv>` with CSV entries separated by `,`
+/// (see `crates/rustynet-cli/src/main.rs::render_anchor_list`). A
+/// naive `line.contains("anchor.gossip_seed")` would also match a
+/// hypothetical future capability `anchor.gossip_seed_v2` and let a
+/// drift pass silently. Anchor here on the explicit CSV separators
+/// so a future capability rename surfaces as a test break instead.
+fn row_has_capability(line: &str, capability: &str) -> bool {
+    let Some((_, csv)) = line.split_once("capabilities=") else {
+        return false;
+    };
+    // Strip a trailing newline / whitespace so the terminator
+    // boundary check works for the last entry.
+    let csv = csv.trim();
+    csv.split(',').any(|entry| entry.trim() == capability)
 }
 
 fn validate_lex_min_anchor_authority(
@@ -1178,8 +1203,55 @@ impl Config {
             }
         }
 
+        config.apply_platform_default_paths();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Track B Phase 10 — apply per-platform path defaults after
+    /// `--platform` has been parsed. The Linux defaults are baked
+    /// in at struct init so a Linux-only run keeps its shape; if a
+    /// macOS run was requested AND a path is still equal to its
+    /// Linux default, swap to the macOS equivalent. An explicit
+    /// `--<path-flag>` always wins because we only rewrite values
+    /// that match the Linux baked-in default literal.
+    ///
+    /// The reviewed macOS daemon ships its persistent state under
+    /// `/usr/local/var/rustynet` (the launchd unit's
+    /// `WorkingDirectory`) and credentials under
+    /// `/usr/local/etc/rustynet`. Linux uses `/var/lib/rustynet` +
+    /// `/etc/rustynet` via systemd unit defaults.
+    fn apply_platform_default_paths(&mut self) {
+        if self.platform != AnchorPlatform::Macos {
+            return;
+        }
+        if self.anchor_token_path == "/var/lib/rustynet/anchor-bundle-pull.token" {
+            self.anchor_token_path = "/usr/local/var/rustynet/anchor-bundle-pull.token".to_owned();
+        }
+        if self.membership_snapshot_path == "/var/lib/rustynet/membership.snapshot" {
+            self.membership_snapshot_path =
+                "/usr/local/var/rustynet/membership.snapshot".to_owned();
+        }
+        if self.membership_log_path == "/var/lib/rustynet/membership.log" {
+            self.membership_log_path = "/usr/local/var/rustynet/membership.log".to_owned();
+        }
+        if self.enrollment_secret_path == "/var/lib/rustynet/keys/enrollment.secret" {
+            self.enrollment_secret_path =
+                "/usr/local/var/rustynet/keys/enrollment.secret".to_owned();
+        }
+        if self.enrollment_ledger_path == "/var/lib/rustynet/rustynetd.enrollment.ledger" {
+            self.enrollment_ledger_path =
+                "/usr/local/var/rustynet/rustynetd.enrollment.ledger".to_owned();
+        }
+        if self.owner_signing_key_path == "/etc/rustynet/membership.owner.key" {
+            self.owner_signing_key_path = "/usr/local/etc/rustynet/membership.owner.key".to_owned();
+        }
+        if self.signing_key_passphrase_cred_path
+            == "/etc/rustynet/credentials/signing_key_passphrase.cred"
+        {
+            self.signing_key_passphrase_cred_path =
+                "/usr/local/etc/rustynet/credentials/signing_key_passphrase.cred".to_owned();
+        }
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -1616,6 +1688,141 @@ mod tests {
             super::validate_anchor_gossip_seed(anchor_list, &cfg).expect_err("must fail closed");
         assert!(
             err.contains("primary anchor exit-1 missing from anchor list"),
+            "got: {err}"
+        );
+    }
+
+    // ─── Track B Phase 10: macOS anchor dispatch + path defaults ──
+
+    #[test]
+    fn parse_macos_swaps_default_paths_to_macos_conventions() {
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "macos".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("macos dry-run parse");
+        assert_eq!(cfg.platform, super::AnchorPlatform::Macos);
+        assert_eq!(
+            cfg.anchor_token_path,
+            "/usr/local/var/rustynet/anchor-bundle-pull.token"
+        );
+        assert_eq!(
+            cfg.membership_snapshot_path,
+            "/usr/local/var/rustynet/membership.snapshot"
+        );
+        assert_eq!(
+            cfg.membership_log_path,
+            "/usr/local/var/rustynet/membership.log"
+        );
+        assert_eq!(
+            cfg.enrollment_secret_path,
+            "/usr/local/var/rustynet/keys/enrollment.secret"
+        );
+        assert_eq!(
+            cfg.enrollment_ledger_path,
+            "/usr/local/var/rustynet/rustynetd.enrollment.ledger"
+        );
+        assert_eq!(
+            cfg.owner_signing_key_path,
+            "/usr/local/etc/rustynet/membership.owner.key"
+        );
+        assert_eq!(
+            cfg.signing_key_passphrase_cred_path,
+            "/usr/local/etc/rustynet/credentials/signing_key_passphrase.cred"
+        );
+    }
+
+    #[test]
+    fn parse_macos_explicit_path_flag_wins_over_default_swap() {
+        let cfg = super::Config::parse(vec![
+            "--platform".to_owned(),
+            "macos".to_owned(),
+            "--anchor-token-path".to_owned(),
+            "/Users/admin/rustynet/anchor-bundle-pull.token".to_owned(),
+            "--dry-run".to_owned(),
+        ])
+        .expect("macos parse");
+        assert_eq!(
+            cfg.anchor_token_path, "/Users/admin/rustynet/anchor-bundle-pull.token",
+            "explicit --anchor-token-path must NOT be rewritten by the default-swap"
+        );
+        assert_eq!(
+            cfg.membership_snapshot_path,
+            "/usr/local/var/rustynet/membership.snapshot"
+        );
+    }
+
+    #[test]
+    fn parse_linux_keeps_linux_paths_unchanged() {
+        let cfg = super::Config::parse(vec!["--dry-run".to_owned()]).expect("default linux parse");
+        assert_eq!(cfg.platform, super::AnchorPlatform::Linux);
+        assert_eq!(
+            cfg.anchor_token_path,
+            "/var/lib/rustynet/anchor-bundle-pull.token"
+        );
+        assert_eq!(
+            cfg.owner_signing_key_path,
+            "/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    // ─── Phase 9 reviewer HIGH — word-boundary capability match ──
+
+    #[test]
+    fn row_has_capability_matches_exact_csv_entry() {
+        let row = "exit-1 capabilities=anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull";
+        assert!(super::row_has_capability(row, "anchor"));
+        assert!(super::row_has_capability(row, "relay_host"));
+        assert!(super::row_has_capability(row, "anchor.gossip_seed"));
+        assert!(super::row_has_capability(row, "anchor.bundle_pull"));
+    }
+
+    #[test]
+    fn row_has_capability_rejects_prefix_only_match() {
+        // A future capability named `anchor.gossip_seed_v2` must NOT
+        // satisfy a `anchor.gossip_seed` check — that would mask a
+        // real loss of the original capability. Pre-fix the matcher
+        // used `line.contains(capability)` which accepted this.
+        let row = "exit-1 capabilities=anchor,relay_host,anchor.gossip_seed_v2";
+        assert!(
+            !super::row_has_capability(row, "anchor.gossip_seed"),
+            "substring-only matcher would accept anchor.gossip_seed_v2"
+        );
+    }
+
+    #[test]
+    fn row_has_capability_rejects_suffix_only_match() {
+        let row = "exit-1 capabilities=anchor,relay_host,extra.anchor.gossip_seed";
+        assert!(
+            !super::row_has_capability(row, "anchor.gossip_seed"),
+            "substring-only matcher would accept extra.anchor.gossip_seed"
+        );
+    }
+
+    #[test]
+    fn row_has_capability_returns_false_when_capabilities_column_missing() {
+        let row = "anchor nodes:";
+        assert!(!super::row_has_capability(row, "anchor.gossip_seed"));
+    }
+
+    #[test]
+    fn row_has_capability_handles_trailing_whitespace_after_csv() {
+        let row = "exit-1 capabilities=anchor,anchor.gossip_seed\t\n";
+        assert!(super::row_has_capability(row, "anchor.gossip_seed"));
+    }
+
+    #[test]
+    fn validate_anchor_gossip_seed_rejects_prefix_collision_capability() {
+        // Concrete end-to-end regression — a node carrying only
+        // anchor.gossip_seed_v2 must NOT satisfy the substage.
+        let anchor_list = "anchor nodes:\n\
+                           exit-1 capabilities=anchor,relay_host,anchor.gossip_seed_v2,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative\n";
+        let cfg = gossip_seed_sample_config();
+        let err = super::validate_anchor_gossip_seed(anchor_list, &cfg)
+            .expect_err("must fail closed on prefix-collision");
+        assert!(
+            err.contains("no node in anchor list advertises anchor.gossip_seed"),
             "got: {err}"
         );
     }
