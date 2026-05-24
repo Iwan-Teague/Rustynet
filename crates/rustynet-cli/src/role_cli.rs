@@ -47,16 +47,36 @@ pub fn role_cli_error_category(err: &RoleCliError) -> &'static str {
 }
 
 /// Default audit-log path on Linux. Operator-overridable by setting
-/// `RUSTYNET_ROLE_AUDIT_LOG_PATH` in the env.
+/// `RUSTYNET_ROLE_AUDIT_LOG_PATH` in the env. Per-OS defaults live
+/// in [`platform_default_role_audit_log_path`] so a fresh-install
+/// daemon on each OS lands at the correct path without needing the
+/// operator to set the env var.
 pub const DEFAULT_ROLE_AUDIT_LOG_PATH: &str = "/var/lib/rustynet/role_transitions.audit.log";
+
+/// Track B Phase 17 — per-OS default for the role-transition audit
+/// log path. Mirrors the install layouts the live-lab validator
+/// uses (`/usr/local/var/rustynet/` on macOS,
+/// `C:\ProgramData\RustyNet\` on Windows). Each invocation of
+/// [`resolve_audit_log_path`] consults this when
+/// `RUSTYNET_ROLE_AUDIT_LOG_PATH` is not set so the daemon writes
+/// to the same file the live-lab + operator tooling reads.
+pub fn platform_default_role_audit_log_path() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/usr/local/var/rustynet/role_transitions.audit.log"
+    } else if cfg!(target_os = "windows") {
+        r"C:\ProgramData\RustyNet\role_transitions.audit.log"
+    } else {
+        DEFAULT_ROLE_AUDIT_LOG_PATH
+    }
+}
 
 /// Resolve the role-transition audit log path. Honours
 /// `RUSTYNET_ROLE_AUDIT_LOG_PATH` first; falls back to
-/// [`DEFAULT_ROLE_AUDIT_LOG_PATH`].
+/// [`platform_default_role_audit_log_path`] (per-OS default).
 pub fn resolve_audit_log_path() -> PathBuf {
     std::env::var_os("RUSTYNET_ROLE_AUDIT_LOG_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROLE_AUDIT_LOG_PATH))
+        .unwrap_or_else(|| PathBuf::from(platform_default_role_audit_log_path()))
 }
 
 /// One concrete side-effect the executor must perform. Returned in
@@ -1071,6 +1091,75 @@ mod tests {
                 ) => true,
                 _ => false,
             }
+        }
+    }
+
+    // ─── Track B Phase 17: per-OS audit-log defaults ──────────────
+
+    #[test]
+    fn platform_default_role_audit_log_path_picks_per_os_layout() {
+        let path = super::platform_default_role_audit_log_path();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                path, "/usr/local/var/rustynet/role_transitions.audit.log",
+                "macOS default must mirror the install layout under /usr/local/var/rustynet"
+            );
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(
+                path, r"C:\ProgramData\RustyNet\role_transitions.audit.log",
+                "windows default must mirror the install layout under C:\\ProgramData\\RustyNet"
+            );
+        } else {
+            assert_eq!(
+                path,
+                super::DEFAULT_ROLE_AUDIT_LOG_PATH,
+                "linux + other unix defaults must match the canonical /var/lib/rustynet path"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_default_role_audit_log_path_is_an_absolute_path() {
+        let path = super::platform_default_role_audit_log_path();
+        if cfg!(target_os = "windows") {
+            // Windows: drive-letter root (`C:\`) is the absolute
+            // marker. PathBuf::is_absolute mirrors this on
+            // Windows targets.
+            assert!(
+                path.starts_with(r"C:\") || path.starts_with(r"C:/"),
+                "windows default must be drive-letter rooted: {path:?}"
+            );
+        } else {
+            assert!(
+                path.starts_with('/'),
+                "unix default must be slash-rooted: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_audit_log_path_returns_path_under_canonical_root_when_env_unset() {
+        // This test does NOT mutate the process env (workspace has
+        // `#[forbid(unsafe_code)]` so the std::env::set_var helpers
+        // are not usable). It instead asserts the env-unset
+        // fallback equals the per-OS default literal — capturing
+        // the contract without depending on test ordering or env
+        // hygiene.
+        let resolved = super::resolve_audit_log_path();
+        if std::env::var_os("RUSTYNET_ROLE_AUDIT_LOG_PATH").is_none() {
+            assert_eq!(
+                resolved,
+                std::path::PathBuf::from(super::platform_default_role_audit_log_path()),
+                "env-unset fallback must equal the per-OS default for the current build target"
+            );
+        }
+        // If the env was set by an outer harness, just confirm
+        // the resolution returned a non-empty PathBuf.
+        else {
+            assert!(
+                !resolved.as_os_str().is_empty(),
+                "env-set resolve must return a non-empty path"
+            );
         }
     }
 }
