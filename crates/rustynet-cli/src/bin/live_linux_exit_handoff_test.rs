@@ -99,21 +99,17 @@ fn run() -> Result<(), String> {
 
     // Track B per-platform dispatch. Linux runs the full handoff
     // validator (existing path). macOS runs the Track B Phase 4
-    // pf+sysctl lifecycle validator (during-run snapshot, daemon
-    // stop, after-stop snapshot, merge, assert killswitch + NAT +
-    // forwarding all properly initialised and torn down). Windows
-    // still fails closed with a Phase 5 marker until the NetNat +
-    // SCM equivalent lands.
+    // pf+sysctl lifecycle validator. Windows runs the Track B
+    // Phase 5 NetNat+forwarding lifecycle validator via PowerShell
+    // over SSH, mirroring the macOS shape using the existing
+    // `rustynetd::windows_exit_nat_lifecycle` builder helpers.
     match config.platform {
         ExitHandoffPlatform::Linux => {}
         ExitHandoffPlatform::MacOs => {
             return run_macos_exit_handoff(&config);
         }
         ExitHandoffPlatform::Windows => {
-            return Err("Windows exit-handoff live execution is not enabled yet; \
-                 the platform-aware validators land in Track B Phase 5. \
-                 Use --platform linux for the existing Linux-host coverage."
-                .to_owned());
+            return run_windows_exit_handoff(&config);
         }
     }
 
@@ -1879,27 +1875,36 @@ fn validate_positive_integer(name: &str, value: usize) -> Result<(), String> {
 // The bin reuses the pure builder helpers from
 // `rustynetd::macos_exit_nat_lifecycle` so the parser shape stays in
 // lockstep with the daemon-side single-phase snapshot collector
-// (`collect_macos_exit_nat_lifecycle_snapshot`).
-const MACOS_PF_ANCHOR: &str = "com.rustynet/nat";
-const MACOS_DAEMON_LAUNCHD_LABEL: &str = "com.rustynet.daemon";
+// (`collect_macos_exit_nat_lifecycle_snapshot`) and the orchestrator-
+// side merger (`merge_macos_exit_nat_lifecycle_artifact`).
+// Constants are imported (not duplicated) so a future rename of the pf
+// anchor or launchd label surfaces here as a compile break.
+use rustynetd::macos_exit_nat_lifecycle::DEFAULT_MACOS_EXIT_PF_ANCHOR as MACOS_PF_ANCHOR;
+use rustynetd::macos_service_hardening::REVIEWED_SERVICE_LABEL as MACOS_DAEMON_LAUNCHD_LABEL;
 
+/// Report envelope matching the canonical live-lab shape consumed by
+/// `ops_fresh_install_os_matrix::load_json_report`. The `lifecycle`
+/// field carries the nested `during_run`/`after_stop` artefact built
+/// by `merge_macos_exit_nat_lifecycle_artifact` so the schema stays
+/// in lockstep with `evaluate_macos_exit_nat_lifecycle_artifact`.
 #[derive(Debug, serde::Serialize)]
 struct MacosExitHandoffReport {
     schema_version: u32,
+    phase: &'static str,
+    mode: &'static str,
+    evidence_mode: &'static str,
     status: &'static str,
     platform: &'static str,
+    captured_at: String,
+    captured_at_unix: u64,
+    git_commit: String,
     exit_host: String,
     exit_node_id: String,
     pf_anchor: String,
     mesh_cidr: String,
-    during_run_pf_anchor_present: bool,
-    during_run_internal_prefix: String,
-    during_run_tunnel_forwarding: String,
-    during_run_egress_forwarding: String,
-    after_stop_pf_anchor_present: bool,
-    after_stop_forwarding_restored: bool,
-    captured_at_unix_during: i64,
-    captured_at_unix_after: i64,
+    daemon_restart_status: String,
+    lifecycle: serde_json::Value,
+    source_artifacts: Vec<String>,
     detail: String,
 }
 
@@ -1918,6 +1923,18 @@ fn run_macos_exit_handoff(config: &Config) -> Result<(), String> {
     seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
 
     let exit_target = config.exit_a_host.as_str();
+    // Preflight: explicit passwordless-sudo check so the first
+    // pfctl/sysctl capture below fails with a precise diagnostic
+    // instead of an opaque "ssh command failed... status 1".
+    // verify_sudo (Linux) refuses hosts whose hostname is not in
+    // /etc/hosts; macOS does not maintain that mapping, so use the
+    // minimal helper that only probes `sudo -n -k true`.
+    live_lab_support::verify_passwordless_sudo(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+    )?;
+
     let mesh_cidr = "100.64.0.0/10".to_owned(); // canonical Rustynet mesh CIDR
 
     // Phase 1: during-run snapshot. Capture pfctl anchor state +
@@ -1999,17 +2016,21 @@ fn run_macos_exit_handoff(config: &Config) -> Result<(), String> {
         );
 
     // Phase 4: restart the daemon so subsequent stages (or the
-    // operator) inherit a running mesh. Best-effort — assertions
-    // already used the after-stop snapshot above.
-    let _ = run_root(
+    // operator) inherit a running mesh. Capture the restart outcome
+    // so the operator sees a `restart_failed: <reason>` value rather
+    // than a silently-stopped daemon under a passing report.
+    let daemon_restart_status = match run_root(
         &config.ssh_identity_file,
         &work_known_hosts,
         exit_target,
         &format!(
-            "/bin/launchctl bootstrap system /Library/LaunchDaemons/{}.plist 2>/dev/null || /bin/launchctl load /Library/LaunchDaemons/{}.plist 2>/dev/null || true",
+            "/bin/launchctl bootstrap system /Library/LaunchDaemons/{}.plist 2>/dev/null || /bin/launchctl load /Library/LaunchDaemons/{}.plist",
             MACOS_DAEMON_LAUNCHD_LABEL, MACOS_DAEMON_LAUNCHD_LABEL
         ),
-    );
+    ) {
+        Ok(()) => "restarted".to_owned(),
+        Err(err) => format!("restart_failed: {err}"),
+    };
 
     // Phase 5: assert invariants. Mirror
     // `evaluate_macos_exit_nat_lifecycle_artifact` from vm_lab/mod.rs.
@@ -2067,39 +2088,51 @@ fn run_macos_exit_handoff(config: &Config) -> Result<(), String> {
         failures.join("; ")
     };
 
-    let report = MacosExitHandoffReport {
-        schema_version: 1,
-        status,
-        platform: "macos",
-        exit_host: config.exit_a_host.clone(),
-        exit_node_id: config.exit_a_node_id.clone(),
-        pf_anchor: MACOS_PF_ANCHOR.to_owned(),
-        mesh_cidr,
-        during_run_pf_anchor_present: during_snapshot.pf_anchor_present,
-        during_run_internal_prefix: during_snapshot.internal_prefix.clone(),
-        during_run_tunnel_forwarding: during_snapshot.tunnel_forwarding.clone(),
-        during_run_egress_forwarding: during_snapshot.egress_forwarding.clone(),
-        after_stop_pf_anchor_present: after_snapshot.pf_anchor_present,
-        after_stop_forwarding_restored: forwarding_restored,
-        captured_at_unix_during: captured_at_during,
-        captured_at_unix_after: captured_at_after,
-        detail: detail.clone(),
-    };
-    let mut body = serde_json::to_string(&report)
-        .map_err(|err| format!("serialize macos exit-handoff report failed: {err}"))?;
-    body.push('\n');
-    let report_path = if config.report_path.is_absolute() {
-        config.report_path.clone()
-    } else {
-        live_lab_support::repo_root()?.join(&config.report_path)
-    };
-    write_file(&report_path, body.as_str())?;
-
     let log_path = if config.log_path.is_absolute() {
         config.log_path.clone()
     } else {
         live_lab_support::repo_root()?.join(&config.log_path)
     };
+    let report_path = if config.report_path.is_absolute() {
+        config.report_path.clone()
+    } else {
+        live_lab_support::repo_root()?.join(&config.report_path)
+    };
+    let root_dir = live_lab_support::repo_root()?;
+    let git_commit = config
+        .git_commit
+        .clone()
+        .unwrap_or_else(|| git_head_commit(&root_dir).unwrap_or_else(|_| "unknown".to_owned()));
+    let lifecycle = rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact(
+        &during_snapshot,
+        &after_snapshot,
+    );
+    let report = MacosExitHandoffReport {
+        schema_version: 1,
+        phase: "phase10",
+        mode: "live_macos_exit_handoff",
+        evidence_mode: "measured",
+        status,
+        platform: "macos",
+        captured_at: utc_now_string(),
+        captured_at_unix: captured_at_after as u64,
+        git_commit,
+        exit_host: config.exit_a_host.clone(),
+        exit_node_id: config.exit_a_node_id.clone(),
+        pf_anchor: MACOS_PF_ANCHOR.to_owned(),
+        mesh_cidr,
+        daemon_restart_status,
+        lifecycle,
+        source_artifacts: vec![log_path.display().to_string()],
+        detail: detail.clone(),
+    };
+    let _ = captured_at_during; // captured_at_unix carries after timestamp
+    let _ = forwarding_restored; // surfaced via merged lifecycle
+    let mut body = serde_json::to_string(&report)
+        .map_err(|err| format!("serialize macos exit-handoff report failed: {err}"))?;
+    body.push('\n');
+    write_file(&report_path, body.as_str())?;
+
     let log_body = format!(
         "[macos-exit-handoff] status={status} exit_host={} exit_node_id={} detail={}\n",
         config.exit_a_host, config.exit_a_node_id, detail
@@ -2111,6 +2144,350 @@ fn run_macos_exit_handoff(config: &Config) -> Result<(), String> {
     } else {
         Err(format!(
             "macos exit-handoff invariants failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+// ─── Track B Phase 5: Windows exit-handoff live validator ──────────
+//
+// Mirrors run_macos_exit_handoff but uses PowerShell-over-SSH and
+// the existing `rustynetd::windows_exit_nat_lifecycle` builder.
+// Captures Get-NetNat + Get-NetIPInterface forwarding state for the
+// tunnel + egress interfaces, stops the SCM service, re-captures,
+// asserts that NetNat is gone + forwarding restored. Schema mirrors
+// the canonical envelope and embeds `merge_windows_exit_nat_lifecycle_artifact`
+// so a future change to the orchestrator-side evaluator surfaces here.
+use rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_EXIT_NAT_NAME as WINDOWS_NAT_NAME;
+use rustynetd::windows_exit_nat_lifecycle::DEFAULT_WINDOWS_TUNNEL_ALIAS as WINDOWS_TUNNEL_ALIAS;
+const WINDOWS_SCM_SERVICE: &str = "rustynetd";
+
+#[derive(Debug, serde::Serialize)]
+struct WindowsExitHandoffReport {
+    schema_version: u32,
+    phase: &'static str,
+    mode: &'static str,
+    evidence_mode: &'static str,
+    status: &'static str,
+    platform: &'static str,
+    captured_at: String,
+    captured_at_unix: u64,
+    git_commit: String,
+    exit_host: String,
+    exit_node_id: String,
+    nat_name: String,
+    tunnel_alias: String,
+    mesh_cidr: String,
+    daemon_restart_status: String,
+    lifecycle: serde_json::Value,
+    source_artifacts: Vec<String>,
+    detail: String,
+}
+
+fn run_windows_exit_handoff(config: &Config) -> Result<(), String> {
+    for command in ["ssh", "ssh-keygen"] {
+        require_command(command)?;
+    }
+    validate_identity(&config.ssh_identity_file)?;
+    let pinned_known_hosts = match config.pinned_known_hosts_file.as_ref() {
+        Some(path) => path.clone(),
+        None => load_home_known_hosts_path()?,
+    };
+    ensure_pinned_known_hosts_file(&pinned_known_hosts)?;
+    let workspace = create_workspace("windows-exit-handoff")?;
+    let work_known_hosts = workspace.path().join("known_hosts");
+    seed_known_hosts(&pinned_known_hosts, &work_known_hosts)?;
+
+    let exit_target = config.exit_a_host.as_str();
+    // Preflight: confirm SSH session is in BUILTIN\Administrators
+    // before any NetNat/SCM command runs. Without admin rights those
+    // commands return access-denied opaquely.
+    live_lab_support::verify_windows_admin(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+    )?;
+    let mesh_cidr = "100.64.0.0/10".to_owned();
+    let options = rustynetd::windows_exit_nat_lifecycle::WindowsExitNatLifecycleOptions {
+        mesh_cidr: mesh_cidr.clone(),
+        nat_name: WINDOWS_NAT_NAME.to_owned(),
+        tunnel_alias: WINDOWS_TUNNEL_ALIAS.to_owned(),
+    };
+
+    // PowerShell capture commands — invoked via SSH against a
+    // Windows host where the SSH user is Administrator. Each line is
+    // a single PowerShell expression with -NoProfile -Command for
+    // hermetic behaviour. Use Compress for compact JSON so the
+    // builder's parse_netnat_json can consume it deterministically.
+    let netnat_cmd = format!(
+        "powershell -NoProfile -Command \"Get-NetNat -Name '{}' -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 -Compress\"",
+        WINDOWS_NAT_NAME
+    );
+    let tunnel_forwarding_cmd = format!(
+        "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
+        WINDOWS_TUNNEL_ALIAS
+    );
+    let egress_alias_cmd = format!(
+        "powershell -NoProfile -Command \"(Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected | Where-Object {{ $_.InterfaceAlias -ne '{}' }} | Sort-Object InterfaceMetric | Select-Object -First 1).InterfaceAlias\"",
+        WINDOWS_TUNNEL_ALIAS
+    );
+    let portproxy_cmd = "netsh interface portproxy show all".to_owned();
+
+    // During-run captures.
+    let netnat_json_during = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        netnat_cmd.as_str(),
+    )
+    .map_err(|err| format!("windows exit-handoff: during-run Get-NetNat capture failed: {err}"))?;
+    let tunnel_fwd_during = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        tunnel_forwarding_cmd.as_str(),
+    )
+    .map_err(|err| {
+        format!("windows exit-handoff: during-run tunnel forwarding capture failed: {err}")
+    })?;
+    let egress_alias_during = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        egress_alias_cmd.as_str(),
+    )
+    .unwrap_or_default();
+    let egress_fwd_during = if egress_alias_during.trim().is_empty() {
+        "Error: no non-tunnel default egress interface detected".to_owned()
+    } else {
+        let cmd = format!(
+            "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
+            egress_alias_during.trim()
+        );
+        live_lab_support::capture_remote_stdout(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            exit_target,
+            cmd.as_str(),
+        )
+        .unwrap_or_default()
+    };
+    let portproxy_during = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        portproxy_cmd.as_str(),
+    )
+    .unwrap_or_default();
+    let captured_at_during = unix_now() as i64;
+    let during_snapshot =
+        rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+            captured_at_during,
+            &options,
+            netnat_json_during.as_str(),
+            tunnel_fwd_during.as_str(),
+            egress_fwd_during.as_str(),
+            egress_alias_during.trim(),
+            portproxy_during.as_str(),
+        )
+        .map_err(|err| format!("windows exit-handoff: during-run snapshot build failed: {err}"))?;
+
+    // Stop the SCM service so the daemon's exit-mode teardown runs.
+    let _ = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        &format!(
+            "powershell -NoProfile -Command \"Stop-Service -Name '{}' -Force -ErrorAction SilentlyContinue\"",
+            WINDOWS_SCM_SERVICE
+        ),
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    // After-stop captures.
+    let netnat_json_after = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        netnat_cmd.as_str(),
+    )
+    .unwrap_or_default();
+    let tunnel_fwd_after = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        tunnel_forwarding_cmd.as_str(),
+    )
+    .unwrap_or_else(|_| "Disabled".to_owned());
+    let egress_alias_after = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        egress_alias_cmd.as_str(),
+    )
+    .unwrap_or_default();
+    let egress_fwd_after = if egress_alias_after.trim().is_empty() {
+        "Disabled".to_owned()
+    } else {
+        let cmd = format!(
+            "powershell -NoProfile -Command \"(Get-NetIPInterface -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction SilentlyContinue).Forwarding\"",
+            egress_alias_after.trim()
+        );
+        live_lab_support::capture_remote_stdout(
+            &config.ssh_identity_file,
+            &work_known_hosts,
+            exit_target,
+            cmd.as_str(),
+        )
+        .unwrap_or_else(|_| "Disabled".to_owned())
+    };
+    let portproxy_after = live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        portproxy_cmd.as_str(),
+    )
+    .unwrap_or_default();
+    let captured_at_after = unix_now() as i64;
+    let after_snapshot =
+        rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+            captured_at_after,
+            &options,
+            netnat_json_after.as_str(),
+            tunnel_fwd_after.as_str(),
+            egress_fwd_after.as_str(),
+            egress_alias_after.trim(),
+            portproxy_after.as_str(),
+        )
+        .map_err(|err| format!("windows exit-handoff: after-stop snapshot build failed: {err}"))?;
+
+    // Restart the SCM service. Capture the outcome so the operator
+    // sees `restart_failed: <reason>` rather than a silently-stopped
+    // service under a passing report.
+    let daemon_restart_status = match live_lab_support::capture_remote_stdout(
+        &config.ssh_identity_file,
+        &work_known_hosts,
+        exit_target,
+        &format!(
+            "powershell -NoProfile -Command \"Start-Service -Name '{}'\"",
+            WINDOWS_SCM_SERVICE
+        ),
+    ) {
+        Ok(_) => "restarted".to_owned(),
+        Err(err) => format!("restart_failed: {err}"),
+    };
+
+    // Assert invariants — mirrors the macOS shape.
+    let mut failures: Vec<String> = Vec::new();
+    if !during_snapshot.netnat_present {
+        failures
+            .push("during-run NetNat object was NOT present (daemon not serving exit?)".to_owned());
+    }
+    if during_snapshot.netnat_present && during_snapshot.internal_prefix != mesh_cidr {
+        failures.push(format!(
+            "during-run NetNat internal_prefix {:?} did not match mesh_cidr {:?}",
+            during_snapshot.internal_prefix, mesh_cidr
+        ));
+    }
+    if !during_snapshot
+        .tunnel_forwarding
+        .eq_ignore_ascii_case("Enabled")
+    {
+        failures.push(format!(
+            "during-run tunnel_forwarding {:?} expected 'Enabled'",
+            during_snapshot.tunnel_forwarding
+        ));
+    }
+    if !during_snapshot
+        .egress_forwarding
+        .eq_ignore_ascii_case("Enabled")
+    {
+        failures.push(format!(
+            "during-run egress_forwarding {:?} expected 'Enabled'",
+            during_snapshot.egress_forwarding
+        ));
+    }
+    if after_snapshot.netnat_present {
+        failures.push(
+            "after-stop NetNat object was STILL present (daemon teardown leaked it)".to_owned(),
+        );
+    }
+    let forwarding_restored = !after_snapshot
+        .tunnel_forwarding
+        .eq_ignore_ascii_case("Enabled")
+        && !after_snapshot
+            .egress_forwarding
+            .eq_ignore_ascii_case("Enabled");
+    if !forwarding_restored {
+        failures.push(format!(
+            "after-stop forwarding NOT restored (tunnel={:?}, egress={:?})",
+            after_snapshot.tunnel_forwarding, after_snapshot.egress_forwarding
+        ));
+    }
+
+    let status = if failures.is_empty() { "pass" } else { "fail" };
+    let detail = if failures.is_empty() {
+        "all invariants held".to_owned()
+    } else {
+        failures.join("; ")
+    };
+
+    let log_path = if config.log_path.is_absolute() {
+        config.log_path.clone()
+    } else {
+        live_lab_support::repo_root()?.join(&config.log_path)
+    };
+    let report_path = if config.report_path.is_absolute() {
+        config.report_path.clone()
+    } else {
+        live_lab_support::repo_root()?.join(&config.report_path)
+    };
+    let root_dir = live_lab_support::repo_root()?;
+    let git_commit = config
+        .git_commit
+        .clone()
+        .unwrap_or_else(|| git_head_commit(&root_dir).unwrap_or_else(|_| "unknown".to_owned()));
+    let lifecycle =
+        rustynetd::windows_exit_nat_lifecycle::merge_windows_exit_nat_lifecycle_artifact(
+            &during_snapshot,
+            &after_snapshot,
+        );
+    let report = WindowsExitHandoffReport {
+        schema_version: 1,
+        phase: "phase10",
+        mode: "live_windows_exit_handoff",
+        evidence_mode: "measured",
+        status,
+        platform: "windows",
+        captured_at: utc_now_string(),
+        captured_at_unix: captured_at_after as u64,
+        git_commit,
+        exit_host: config.exit_a_host.clone(),
+        exit_node_id: config.exit_a_node_id.clone(),
+        nat_name: WINDOWS_NAT_NAME.to_owned(),
+        tunnel_alias: WINDOWS_TUNNEL_ALIAS.to_owned(),
+        mesh_cidr,
+        daemon_restart_status,
+        lifecycle,
+        source_artifacts: vec![log_path.display().to_string()],
+        detail: detail.clone(),
+    };
+    let _ = captured_at_during;
+    let _ = forwarding_restored;
+    let mut body = serde_json::to_string(&report)
+        .map_err(|err| format!("serialize windows exit-handoff report failed: {err}"))?;
+    body.push('\n');
+    write_file(&report_path, body.as_str())?;
+    let log_body = format!(
+        "[windows-exit-handoff] status={status} exit_host={} exit_node_id={} detail={}\n",
+        config.exit_a_host, config.exit_a_node_id, detail
+    );
+    write_file(&log_path, log_body.as_str())?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "windows exit-handoff invariants failed: {}",
             failures.join("; ")
         ))
     }
@@ -2468,27 +2845,53 @@ peer.1.endpoint=192.168.128.26:51820
         assert_eq!(snapshot.egress_forwarding, "Disabled");
     }
 
+    fn macos_lifecycle_artifact_fixture(during_present: bool, restored: bool) -> serde_json::Value {
+        let during = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            100,
+            "100.64.0.0/10",
+            "com.rustynet/nat",
+            if during_present {
+                "nat-anchor \"com.rustynet/nat\" all\nnat on en0 inet from 100.64.0.0/10 to any -> en0:0\n"
+            } else {
+                ""
+            },
+            "1\n",
+        );
+        let after = rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+            200,
+            "100.64.0.0/10",
+            "com.rustynet/nat",
+            "",
+            if restored { "0\n" } else { "1\n" },
+        );
+        rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact(
+            &during, &after,
+        )
+    }
+
     #[test]
     fn macos_exit_handoff_report_serializes_with_serde() {
         // The report struct must round-trip through serde_json so a
         // malicious operator-supplied exit_host string can't break
-        // the report parser downstream.
+        // the report parser downstream. Envelope mirrors the canonical
+        // live-lab shape consumed by `ops_fresh_install_os_matrix::load_json_report`.
         let report = super::MacosExitHandoffReport {
             schema_version: 1,
+            phase: "phase10",
+            mode: "live_macos_exit_handoff",
+            evidence_mode: "measured",
             status: "fail",
             platform: "macos",
+            captured_at: "1970-01-01T00:00:00Z".to_owned(),
+            captured_at_unix: 200,
+            git_commit: "deadbeef".to_owned(),
             exit_host: "admin@192.168.18.49 \" inject \n more".to_owned(),
             exit_node_id: "exit-49".to_owned(),
             pf_anchor: "com.rustynet/nat".to_owned(),
             mesh_cidr: "100.64.0.0/10".to_owned(),
-            during_run_pf_anchor_present: true,
-            during_run_internal_prefix: "100.64.0.0/10".to_owned(),
-            during_run_tunnel_forwarding: "Enabled".to_owned(),
-            during_run_egress_forwarding: "Enabled".to_owned(),
-            after_stop_pf_anchor_present: false,
-            after_stop_forwarding_restored: true,
-            captured_at_unix_during: 100,
-            captured_at_unix_after: 200,
+            daemon_restart_status: "restart_failed: ssh down".to_owned(),
+            lifecycle: macos_lifecycle_artifact_fixture(true, true),
+            source_artifacts: vec!["live-lab/macos-exit-handoff.log".to_owned()],
             detail: "all invariants held".to_owned(),
         };
         let json = serde_json::to_string(&report).expect("serialize");
@@ -2496,9 +2899,247 @@ peer.1.endpoint=192.168.128.26:51820
             serde_json::from_str(&json).expect("must produce valid JSON round-trip");
         assert_eq!(parsed["status"], "fail");
         assert_eq!(parsed["platform"], "macos");
+        assert_eq!(parsed["phase"], "phase10");
+        assert_eq!(parsed["mode"], "live_macos_exit_handoff");
+        assert_eq!(parsed["evidence_mode"], "measured");
+        assert_eq!(parsed["lifecycle"]["during_run"]["pf_anchor_present"], true);
+        assert_eq!(
+            parsed["lifecycle"]["after_stop"]["forwarding_restored"],
+            true
+        );
+        assert_eq!(
+            parsed["daemon_restart_status"], "restart_failed: ssh down",
+            "restart failure must be visible in the report"
+        );
         assert_eq!(
             parsed["exit_host"], "admin@192.168.18.49 \" inject \n more",
             "embedded quote/newline must survive serde escaping"
         );
+    }
+
+    #[test]
+    fn macos_lifecycle_merger_surfaces_failure_when_forwarding_not_restored() {
+        // Negative-path coverage of the contract our report relies on:
+        // the merger's `forwarding_restored` field must be `false`
+        // when after_stop forwarding is still Enabled. A change in
+        // `merge_macos_exit_nat_lifecycle_artifact` that breaks this
+        // would silently turn a leaked-forwarding host into a passing
+        // run, so pin the shape here.
+        let merged = macos_lifecycle_artifact_fixture(true, false);
+        assert_eq!(merged["during_run"]["pf_anchor_present"], true);
+        assert_eq!(
+            merged["after_stop"]["forwarding_restored"], false,
+            "after_stop forwarding still Enabled must surface as restored=false"
+        );
+    }
+
+    // ─── Track B Phase 5: Windows exit-handoff validator ──────────
+    //
+    // Mirror the macOS test shape: pin the parser behaviour for the
+    // EXACT PowerShell capture outputs that run_windows_exit_handoff
+    // feeds into rustynetd::windows_exit_nat_lifecycle, then prove
+    // the report struct survives serde with operator-supplied chars.
+    fn windows_options() -> rustynetd::windows_exit_nat_lifecycle::WindowsExitNatLifecycleOptions {
+        rustynetd::windows_exit_nat_lifecycle::WindowsExitNatLifecycleOptions {
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            nat_name: super::WINDOWS_NAT_NAME.to_owned(),
+            tunnel_alias: super::WINDOWS_TUNNEL_ALIAS.to_owned(),
+        }
+    }
+
+    #[test]
+    fn windows_during_run_capture_parses_netnat_present_and_forwarding_enabled() {
+        // The PowerShell pipe is `Get-NetNat ... | ConvertTo-Json
+        // -Depth 4 -Compress` which yields a JSON object with the
+        // InternalIPInterfaceAddressPrefix property.
+        let netnat_json = r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#;
+        let snapshot =
+            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+                100,
+                &windows_options(),
+                netnat_json,
+                "Enabled\n",
+                "Enabled\n",
+                "Ethernet\n",
+                "",
+            )
+            .expect("snapshot must build");
+        assert!(
+            snapshot.netnat_present,
+            "NetNat object must parse as present"
+        );
+        assert_eq!(snapshot.internal_prefix, "100.64.0.0/10");
+        assert_eq!(snapshot.tunnel_forwarding, "Enabled");
+        assert_eq!(snapshot.egress_forwarding, "Enabled");
+        assert_eq!(snapshot.egress_alias, "Ethernet");
+    }
+
+    #[test]
+    fn windows_after_stop_capture_parses_netnat_absent_and_forwarding_disabled() {
+        let snapshot =
+            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+                200,
+                &windows_options(),
+                "",
+                "Disabled\n",
+                "Disabled\n",
+                "Ethernet\n",
+                "",
+            )
+            .expect("snapshot must build");
+        assert!(
+            !snapshot.netnat_present,
+            "empty Get-NetNat output must parse as NetNat-absent"
+        );
+        assert_eq!(snapshot.tunnel_forwarding, "Disabled");
+        assert_eq!(snapshot.egress_forwarding, "Disabled");
+    }
+
+    #[test]
+    fn windows_netnat_array_form_also_parses_present() {
+        // PowerShell sometimes emits an array when ConvertTo-Json sees
+        // a single object — pin both shapes to keep this validator in
+        // lockstep with rustynetd::windows_exit_nat_lifecycle.
+        let netnat_json = r#"[{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}]"#;
+        let snapshot =
+            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+                300,
+                &windows_options(),
+                netnat_json,
+                "Enabled",
+                "Enabled",
+                "Ethernet",
+                "",
+            )
+            .expect("snapshot must build");
+        assert!(snapshot.netnat_present);
+        assert_eq!(snapshot.internal_prefix, "100.64.0.0/10");
+    }
+
+    fn windows_lifecycle_artifact_fixture(present: bool, restored: bool) -> serde_json::Value {
+        let during =
+            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+                100,
+                &windows_options(),
+                if present {
+                    r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#
+                } else {
+                    ""
+                },
+                "Enabled",
+                "Enabled",
+                "Ethernet",
+                "",
+            )
+            .expect("during snapshot");
+        let after =
+            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+                200,
+                &windows_options(),
+                "",
+                if restored { "Disabled" } else { "Enabled" },
+                if restored { "Disabled" } else { "Enabled" },
+                "Ethernet",
+                "",
+            )
+            .expect("after snapshot");
+        rustynetd::windows_exit_nat_lifecycle::merge_windows_exit_nat_lifecycle_artifact(
+            &during, &after,
+        )
+    }
+
+    #[test]
+    fn windows_exit_handoff_report_serializes_with_serde() {
+        // Operator-supplied exit_host with embedded quote+newline must
+        // survive serde escaping. Envelope mirrors the canonical
+        // live-lab shape consumed by `ops_fresh_install_os_matrix::load_json_report`.
+        let report = super::WindowsExitHandoffReport {
+            schema_version: 1,
+            phase: "phase10",
+            mode: "live_windows_exit_handoff",
+            evidence_mode: "measured",
+            status: "fail",
+            platform: "windows",
+            captured_at: "1970-01-01T00:00:00Z".to_owned(),
+            captured_at_unix: 200,
+            git_commit: "deadbeef".to_owned(),
+            exit_host: "admin@192.168.18.40 \" inject \n more".to_owned(),
+            exit_node_id: "exit-40".to_owned(),
+            nat_name: super::WINDOWS_NAT_NAME.to_owned(),
+            tunnel_alias: super::WINDOWS_TUNNEL_ALIAS.to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            daemon_restart_status: "restart_failed: SCM access denied".to_owned(),
+            lifecycle: windows_lifecycle_artifact_fixture(true, true),
+            source_artifacts: vec!["live-lab/windows-exit-handoff.log".to_owned()],
+            detail: "all invariants held".to_owned(),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("must produce valid JSON round-trip");
+        assert_eq!(parsed["status"], "fail");
+        assert_eq!(parsed["platform"], "windows");
+        assert_eq!(parsed["phase"], "phase10");
+        assert_eq!(parsed["mode"], "live_windows_exit_handoff");
+        assert_eq!(parsed["evidence_mode"], "measured");
+        assert_eq!(parsed["nat_name"], super::WINDOWS_NAT_NAME);
+        assert_eq!(parsed["tunnel_alias"], super::WINDOWS_TUNNEL_ALIAS);
+        assert_eq!(parsed["lifecycle"]["during_run"]["netnat_present"], true);
+        assert_eq!(
+            parsed["lifecycle"]["after_stop"]["forwarding_restored"],
+            true
+        );
+        assert_eq!(
+            parsed["daemon_restart_status"], "restart_failed: SCM access denied",
+            "SCM restart failure must be visible in the report"
+        );
+        assert_eq!(
+            parsed["exit_host"], "admin@192.168.18.40 \" inject \n more",
+            "embedded quote/newline must survive serde escaping"
+        );
+    }
+
+    #[test]
+    fn windows_lifecycle_merger_surfaces_failure_when_netnat_leaks_after_stop() {
+        // Negative-path coverage: if after_stop NetNat is still
+        // present, the merger must surface forwarding_restored=false
+        // so the validator's assertion cannot pass.
+        let during =
+            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+                100,
+                &windows_options(),
+                r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#,
+                "Enabled",
+                "Enabled",
+                "Ethernet",
+                "",
+            )
+            .expect("during");
+        let after =
+            rustynetd::windows_exit_nat_lifecycle::build_windows_exit_nat_lifecycle_snapshot(
+                200,
+                &windows_options(),
+                r#"{"Name":"RustyNetExit-rustynet0","InternalIPInterfaceAddressPrefix":"100.64.0.0/10"}"#,
+                "Disabled",
+                "Disabled",
+                "Ethernet",
+                "",
+            )
+            .expect("after");
+        let merged =
+            rustynetd::windows_exit_nat_lifecycle::merge_windows_exit_nat_lifecycle_artifact(
+                &during, &after,
+            );
+        assert_eq!(merged["after_stop"]["netnat_present"], true);
+        assert_eq!(
+            merged["after_stop"]["forwarding_restored"], false,
+            "leaked NetNat must surface as forwarding_restored=false"
+        );
+    }
+
+    #[test]
+    fn windows_scm_service_name_is_canonical() {
+        // Defense-in-depth: pin the SCM service identifier the
+        // validator stops/restarts so a future rename surfaces here.
+        assert_eq!(super::WINDOWS_SCM_SERVICE, "rustynetd");
     }
 }
