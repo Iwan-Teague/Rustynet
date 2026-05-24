@@ -54,6 +54,7 @@ phase checklists that finished (Phase 1, 2, 3, 5) have moved to
 - [TestCoverageImprovementPlan_2026-05-24.md](./TestCoverageImprovementPlan_2026-05-24.md) — owning ledger for the test-coverage track; prioritized P0/P1/P2 workstreams (roles.rs zero-coverage, signed-state/crypto/dns-zone negative tests, sysinfo parse/IO split, dataplane default-deny truth tables, gossip anti-replay persistence) plus tooling levers (llvm-cov ratchet, proptest, expanded fuzzing, broadened coverage-gate floors)
 - [SerializationFormatHardeningPlan_2026-03-25.md](./SerializationFormatHardeningPlan_2026-03-25.md)
 - [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md)
+- [StartShOperatorUxRustMigrationPlan_2026-05-24.md](./StartShOperatorUxRustMigrationPlan_2026-05-24.md) — implementation guide for migrating the remaining `start.sh` logic (operator UX, config management, role policy, validators, arg parsing, egress detection, dependency bootstrap) into a new `rustynet-operator` Rust crate; continues ShellToRustMigrationPlan (privileged/secret flows already migrated) and closes the last two direct privileged shell ops (config chmod, binary install); motivated by cross-platform (Windows) support and security
 - [UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md](./UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md)
 - [UdpHolePunchingHP2IngestionPlan_2026-03-07.md](./UdpHolePunchingHP2IngestionPlan_2026-03-07.md)
 - [UdpHolePunchingImplementationBlueprint_2026-03-07.md](./UdpHolePunchingImplementationBlueprint_2026-03-07.md)
