@@ -1032,6 +1032,46 @@ pub fn verify_sudo(identity: &Path, known_hosts: &Path, target: &str) -> Result<
     }
 }
 
+/// Minimal passwordless-sudo preflight WITHOUT the Linux-PAM
+/// hostname-in-/etc/hosts check. macOS does not maintain hostnames in
+/// /etc/hosts (HostName lives in scutil), so `verify_sudo` rejects
+/// healthy mac hosts spuriously. Use this from macOS live-lab paths.
+pub fn verify_passwordless_sudo(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+) -> Result<(), String> {
+    let verify_cmd = "if sudo -n -k true >/dev/null 2>&1; then :; else printf 'passwordless sudo (sudo -n) is required for live lab automation\\n'; printf 'user: %s\\n' \"$(id -un)\"; printf 'groups: %s\\n' \"$(id -Gn)\"; exit 1; fi";
+    let status = ssh_status(identity, known_hosts, target, verify_cmd)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "passwordless sudo verification failed for {target}"
+        ))
+    }
+}
+
+/// Windows admin preflight: probes the remote PowerShell session to
+/// confirm the SSH user is in the BUILTIN\Administrators group. Live
+/// lab Windows hosts run OpenSSH server as the user; without admin
+/// rights, NetNat/SCM commands return access-denied opaquely.
+pub fn verify_windows_admin(
+    identity: &Path,
+    known_hosts: &Path,
+    target: &str,
+) -> Result<(), String> {
+    let probe = "powershell -NoProfile -Command \"if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) { 'admin' } else { 'not_admin'; exit 1 }\"";
+    let output = capture_remote_stdout(identity, known_hosts, target, probe)?;
+    if output.trim().eq_ignore_ascii_case("admin") {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows live-lab target {target} SSH session is not in BUILTIN\\Administrators; NetNat + SCM commands will fail"
+        ))
+    }
+}
+
 pub fn capture_root(
     identity: &Path,
     known_hosts: &Path,
