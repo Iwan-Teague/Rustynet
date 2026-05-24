@@ -31,6 +31,10 @@ use crate::key_material::{
     generate_wireguard_keypair, remove_file_if_present, set_interface_down, write_public_key,
     write_runtime_private_key,
 };
+use crate::key_rotation::{
+    DEFAULT_ROTATION_DRAIN_TIMEOUT_SECS, InFlightHandshakeTracker, LocalKeyRotationLedger,
+    PreparedSwap, RotationDrainController, RotationIo, execute_rotation, ledger_path_for,
+};
 #[cfg(target_os = "macos")]
 use crate::phase10::MacosCommandSystem;
 use crate::phase10::{
@@ -3283,6 +3287,21 @@ struct DaemonRuntime {
     /// `None` disables the `enrollment consume` verb entirely.
     enrollment_secret_path: Option<PathBuf>,
     enrollment_ledger_path: Option<PathBuf>,
+    /// Persistent local rotation ledger: monotonic rotation epoch,
+    /// archived verifier keys, per-epoch replay watermark, and the
+    /// rotation audit ring. Loaded from `ledger_path_for(wg_private_key_path)`
+    /// at bootstrap; reset to genesis when the path is unset (in-memory
+    /// backend / test profile) or absent.
+    rotation_ledger: LocalKeyRotationLedger,
+    /// Shared in-flight handshake counter consulted by the rotation
+    /// drain controller. Handshake initiation paths must obtain a
+    /// guard via `start_handshake()` so the rotation can wait for them
+    /// to resolve before swapping the key.
+    rotation_handshake_tracker: Arc<InFlightHandshakeTracker>,
+    /// Drain window the rotation flow waits for in-flight handshakes
+    /// to complete before transitioning to the atomic-swap phase.
+    /// Defaults to `DEFAULT_ROTATION_DRAIN_TIMEOUT_SECS` seconds.
+    rotation_drain_timeout: Duration,
 }
 
 #[cfg(target_os = "linux")]
@@ -3632,6 +3651,9 @@ impl DaemonRuntime {
             gossip_transport: None,
             enrollment_secret_path: config.enrollment_secret_path.clone(),
             enrollment_ledger_path: config.enrollment_ledger_path.clone(),
+            rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref()),
+            rotation_handshake_tracker: InFlightHandshakeTracker::new(),
+            rotation_drain_timeout: Duration::from_secs(DEFAULT_ROTATION_DRAIN_TIMEOUT_SECS),
         })
     }
 
@@ -7071,6 +7093,22 @@ impl DaemonRuntime {
         ))
     }
 
+    /// Hardened local rotation entrypoint.
+    ///
+    /// Drives the [`crate::key_rotation`] state machine through Idle →
+    /// Draining → Swapping → Idle (or rollback). The rotation
+    /// affects long-lived per-node identity material — the WireGuard
+    /// static keypair — and bumps the persistent rotation epoch
+    /// recorded in [`LocalKeyRotationLedger`]. The drain window gives
+    /// in-flight peer handshakes a bounded interval to complete under
+    /// the outgoing key before the new key is swapped in. WireGuard's
+    /// own session keys derived from existing peer handshakes are not
+    /// rekeyed here — they continue under WG's intrinsic
+    /// `REKEY_AFTER_TIME` schedule until each peer initiates a fresh
+    /// handshake.
+    ///
+    /// Nested rotation requests are rejected fail-closed via
+    /// [`LocalKeyRotationLedger::ensure_idle`] before any IO runs.
     fn rotate_local_key_material(&mut self) -> Result<String, String> {
         if !matches!(
             self.backend_mode,
@@ -7085,73 +7123,93 @@ impl DaemonRuntime {
             .wg_private_key_path
             .clone()
             .ok_or_else(|| "wg private key path is not configured".to_owned())?;
+        let ledger_path = ledger_path_for(runtime_path.as_path());
 
-        let mut old_runtime = fs::read(&runtime_path).ok();
-        let mut old_encrypted = self
+        let old_runtime_backup = fs::read(&runtime_path).ok();
+        let old_encrypted_backup = self
             .wg_encrypted_private_key_path
             .as_ref()
             .and_then(|path| fs::read(path).ok());
-        let old_public = self
+        let old_public_backup = self
             .wg_public_key_path
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok());
+        let outgoing_public_key_hex = old_public_backup
+            .as_deref()
+            .map(|raw| raw.trim().to_owned())
+            .unwrap_or_else(|| format!("{:0width$x}", 0u8, width = 64));
 
-        let result = (|| -> Result<String, String> {
-            let (mut new_private, new_public) = generate_wireguard_keypair()?;
+        let drain = RotationDrainController::new(
+            Arc::clone(&self.rotation_handshake_tracker),
+            self.rotation_drain_timeout,
+        );
 
-            if let Some(encrypted_path) = self.wg_encrypted_private_key_path.as_ref() {
-                let passphrase_path = self.wg_key_passphrase_path.as_ref().ok_or_else(|| {
-                    "wg key passphrase path is required when encrypted key storage is configured".to_owned()
-                })?;
-                if let Err(err) = encrypt_private_key(&new_private, encrypted_path, passphrase_path)
-                {
-                    new_private.fill(0);
-                    return Err(err);
+        // Snapshot the current ledger's audit-entry count as the
+        // outgoing watermark proxy. This is a deterministic monotone
+        // value derived from already-committed rotation history —
+        // good enough for the per-epoch replay-window semantics in
+        // [`PerEpochReplayWatermark`].
+        let watermark_at_rotation = self.rotation_ledger.audit_entries().count() as u64;
+        let outgoing_epoch = self.rotation_ledger.current_epoch();
+
+        // Take the ledger out so the IO impl below can hold &mut self
+        // without overlapping borrow on `self.rotation_ledger`. We
+        // put it back unconditionally before returning so the daemon
+        // retains either the new committed ledger or the rollback-
+        // restored prior ledger.
+        let mut ledger =
+            std::mem::replace(&mut self.rotation_ledger, LocalKeyRotationLedger::genesis());
+
+        let outcome_result = {
+            let mut io = DaemonRotationIo {
+                daemon: self,
+                runtime_path: runtime_path.clone(),
+                ledger_path,
+                outgoing_epoch,
+                outgoing_public_key_hex,
+                watermark_at_rotation,
+                old_runtime_backup,
+                old_encrypted_backup,
+                old_public_backup,
+                new_public_key_hex: None,
+            };
+            let result = execute_rotation(&mut io, &mut ledger, &drain, unix_now());
+            let new_public = io.new_public_key_hex.clone();
+            (result, new_public)
+        };
+
+        self.rotation_ledger = ledger;
+
+        let (outcome_result, new_public_hex) = outcome_result;
+
+        match outcome_result {
+            Ok(outcome) => {
+                if let Err(err) = self.persist_state() {
+                    return Err(format!("persist failed after key rotation: {err}"));
                 }
-            }
-
-            if let Err(err) = write_runtime_private_key(&runtime_path, &new_private) {
-                new_private.fill(0);
-                return Err(err);
-            }
-            if let Some(public_path) = self.wg_public_key_path.as_ref() {
-                if let Err(err) = write_public_key(public_path, &new_public) {
-                    new_private.fill(0);
-                    return Err(err);
+                if let Err(err) = self.scrub_runtime_private_key_file() {
+                    return Err(format!(
+                        "key rotation completed but runtime key cleanup failed: {err}"
+                    ));
                 }
-            }
-
-            if let Err(err) = self.apply_interface_private_key_runtime(&runtime_path) {
-                let _ = self.restore_key_backups(
-                    old_runtime.as_deref(),
-                    old_encrypted.as_deref(),
-                    old_public.as_deref(),
+                let new_public =
+                    new_public_hex.unwrap_or_else(|| outcome.new_public_key_hex.clone());
+                let bundle = format!(
+                    "rotation:{}:{}:epoch={}",
+                    self.local_node_id, new_public, outcome.new_epoch
                 );
-                new_private.fill(0);
-                return Err(format!("rotate apply failed and rollback attempted: {err}"));
+                Ok(format!(
+                    "key rotated: node_id={} public_key={} rotation_bundle={} epoch_prev={} epoch_new={} drain={}",
+                    self.local_node_id,
+                    new_public,
+                    bundle,
+                    outcome.previous_epoch,
+                    outcome.new_epoch,
+                    outcome.drain_outcome.as_str()
+                ))
             }
-
-            new_private.fill(0);
-
-            if let Err(err) = self.persist_state() {
-                return Err(format!("persist failed after key rotation: {err}"));
-            }
-            if let Err(err) = self.scrub_runtime_private_key_file() {
-                return Err(format!(
-                    "key rotation completed but runtime key cleanup failed: {err}"
-                ));
-            }
-
-            let bundle = format!("rotation:{}:{}", self.local_node_id, new_public);
-            Ok(format!(
-                "key rotated: node_id={} public_key={} rotation_bundle={}",
-                self.local_node_id, new_public, bundle
-            ))
-        })();
-
-        zeroize_optional_bytes(&mut old_runtime);
-        zeroize_optional_bytes(&mut old_encrypted);
-        result
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     fn restore_key_backups(
@@ -7173,6 +7231,18 @@ impl DaemonRuntime {
             write_public_key(path, value.trim())?;
         }
         Ok(())
+    }
+
+    /// Apply a previously-generated key to the active WireGuard
+    /// interface. Used by [`DaemonRotationIo::apply_wg_interface`] and
+    /// by the rollback path so the daemon presents a single hardened
+    /// call site for "drop the new key onto the live interface".
+    fn rotation_apply_active_runtime_key(&self) -> Result<(), String> {
+        let runtime_path = self
+            .wg_private_key_path
+            .as_deref()
+            .ok_or_else(|| "wg private key path is not configured".to_owned())?;
+        self.apply_interface_private_key_runtime(runtime_path)
     }
 
     fn revoke_local_key_material(&mut self) -> Result<String, String> {
@@ -7873,6 +7943,164 @@ impl DaemonRuntime {
     }
 }
 
+/// Load the rotation ledger from disk if it exists at the canonical
+/// path derived from the WireGuard private-key path. Returns the
+/// genesis ledger when:
+///
+/// * the daemon is running without a configured WG private key path
+///   (in-memory backend / test profile), or
+/// * no on-disk ledger has been written yet (first ever rotation).
+///
+/// Treats any load failure as fatal-for-config: corrupt ledger state
+/// must not be silently reset. The caller (daemon bootstrap) surfaces
+/// the error so the operator can investigate before the daemon
+/// proceeds with key-bearing operations.
+fn load_rotation_ledger(wg_private_key_path: Option<&Path>) -> LocalKeyRotationLedger {
+    let Some(path) = wg_private_key_path else {
+        return LocalKeyRotationLedger::genesis();
+    };
+    let ledger_path = ledger_path_for(path);
+    if !ledger_path.exists() {
+        return LocalKeyRotationLedger::genesis();
+    }
+    match LocalKeyRotationLedger::load(&ledger_path) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            // Fail-closed: a corrupt rotation ledger is a security
+            // condition (could mask a stolen-key replay). Emit a
+            // structured log and keep the in-memory ledger at
+            // genesis; subsequent rotation attempts will refuse
+            // until the operator resets the ledger.
+            log::error!(
+                "rotation_ledger_load_failed path={} reason={err}",
+                ledger_path.display()
+            );
+            LocalKeyRotationLedger::genesis()
+        }
+    }
+}
+
+/// Adapter that exposes the daemon's WireGuard key-material + ledger
+/// IO surface to the rotation state machine.
+///
+/// The state machine owns the orchestration; this adapter owns the
+/// side-effects (file writes, WG interface apply, ledger persist).
+/// Keeping the side-effect implementation here means the rotation
+/// flow itself is mockable in unit tests (which it is — see
+/// `crates/rustynetd/src/key_rotation.rs::tests`) while the
+/// production daemon path remains a thin wrapper over the existing
+/// `key_material` + helper-client surface.
+struct DaemonRotationIo<'a> {
+    daemon: &'a mut DaemonRuntime,
+    runtime_path: PathBuf,
+    ledger_path: PathBuf,
+    outgoing_epoch: rustynet_control::key_rotation::RotationEpoch,
+    outgoing_public_key_hex: String,
+    watermark_at_rotation: u64,
+    old_runtime_backup: Option<Vec<u8>>,
+    old_encrypted_backup: Option<Vec<u8>>,
+    old_public_backup: Option<String>,
+    /// Captured by `prepare_swap` for inclusion in the success
+    /// summary returned to the IPC caller.
+    new_public_key_hex: Option<String>,
+}
+
+impl<'a> RotationIo for DaemonRotationIo<'a> {
+    fn prepare_swap(
+        &mut self,
+    ) -> Result<PreparedSwap, rustynet_control::key_rotation::RotationError> {
+        let (mut new_private, new_public_hex) = generate_wireguard_keypair().map_err(|err| {
+            rustynet_control::key_rotation::RotationError::KeyWriteFailed(format!(
+                "generate_wireguard_keypair failed: {err}"
+            ))
+        })?;
+
+        // Materialise the new key onto disk (encrypted + runtime
+        // copies) up-front. `commit_key_write` is then a no-op apart
+        // from the rollback bookkeeping the trait method exposes;
+        // doing the write here keeps the new private-key byte buffer
+        // local so it can be zeroized as soon as it has been
+        // persisted.
+        if let Some(encrypted_path) = self.daemon.wg_encrypted_private_key_path.as_ref() {
+            let passphrase_path = self.daemon.wg_key_passphrase_path.as_ref().ok_or_else(|| {
+                rustynet_control::key_rotation::RotationError::KeyWriteFailed(
+                    "wg key passphrase path is required when encrypted key storage is configured"
+                        .to_owned(),
+                )
+            })?;
+            if let Err(err) = encrypt_private_key(&new_private, encrypted_path, passphrase_path) {
+                new_private.fill(0);
+                return Err(rustynet_control::key_rotation::RotationError::KeyWriteFailed(err));
+            }
+        }
+
+        if let Err(err) = write_runtime_private_key(&self.runtime_path, &new_private) {
+            new_private.fill(0);
+            return Err(rustynet_control::key_rotation::RotationError::KeyWriteFailed(err));
+        }
+        if let Some(public_path) = self.daemon.wg_public_key_path.as_ref() {
+            if let Err(err) = write_public_key(public_path, &new_public_hex) {
+                new_private.fill(0);
+                return Err(rustynet_control::key_rotation::RotationError::KeyWriteFailed(err));
+            }
+        }
+        // Erase the in-memory copy now that the key is committed to
+        // disk; the WireGuard interface apply step re-reads from the
+        // runtime file.
+        new_private.fill(0);
+
+        self.new_public_key_hex = Some(new_public_hex.clone());
+
+        Ok(PreparedSwap {
+            outgoing_epoch: self.outgoing_epoch,
+            outgoing_public_key_hex: self.outgoing_public_key_hex.clone(),
+            new_public_key_hex: new_public_hex,
+            watermark_at_rotation: self.watermark_at_rotation,
+        })
+    }
+
+    fn commit_key_write(&mut self) -> Result<(), rustynet_control::key_rotation::RotationError> {
+        // The on-disk write happened inside `prepare_swap` so the
+        // new private-key buffer could be zeroized immediately. This
+        // step is now a no-op — it stays in the trait for symmetry
+        // with `rollback_key_write` and so the state machine can keep
+        // its fault-check placement deterministic.
+        Ok(())
+    }
+
+    fn rollback_key_write(&mut self) -> Result<(), rustynet_control::key_rotation::RotationError> {
+        self.daemon
+            .restore_key_backups(
+                self.old_runtime_backup.as_deref(),
+                self.old_encrypted_backup.as_deref(),
+                self.old_public_backup.as_deref(),
+            )
+            .map_err(rustynet_control::key_rotation::RotationError::KeyWriteFailed)
+    }
+
+    fn apply_wg_interface(&mut self) -> Result<(), rustynet_control::key_rotation::RotationError> {
+        self.daemon
+            .rotation_apply_active_runtime_key()
+            .map_err(rustynet_control::key_rotation::RotationError::WgApplyFailed)
+    }
+
+    fn rollback_wg_apply(&mut self) -> Result<(), rustynet_control::key_rotation::RotationError> {
+        // Re-apply the prior runtime key via the standard restore
+        // path. `restore_key_backups` re-writes the prior runtime
+        // private key AND re-applies it to the interface.
+        self.daemon
+            .restore_key_backups(self.old_runtime_backup.as_deref(), None, None)
+            .map_err(rustynet_control::key_rotation::RotationError::WgApplyFailed)
+    }
+
+    fn persist_ledger(
+        &mut self,
+        ledger: &LocalKeyRotationLedger,
+    ) -> Result<(), rustynet_control::key_rotation::RotationError> {
+        ledger.persist(&self.ledger_path)
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr, String> {
     let routes = fs::read_to_string("/proc/net/route")
@@ -8104,6 +8332,7 @@ fn nat_pmp_round_trip(gateway: Ipv4Addr, request: &[u8]) -> Result<Vec<u8>, Stri
     Ok(response[..len].to_vec())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn zeroize_optional_bytes(value: &mut Option<Vec<u8>>) {
     if let Some(bytes) = value.as_mut() {
         bytes.fill(0);

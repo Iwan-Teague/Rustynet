@@ -998,6 +998,93 @@ fn verify_membership_signatures(
     Ok(())
 }
 
+/// Bundle tagged with the rotation epoch under which it was signed.
+///
+/// `EpochTaggedBundle` is the explicit replay-watermark wrapper that the
+/// daemon uses to bind a peer-issued payload (membership update,
+/// gossip-derived state delta, etc.) to the signing key generation that
+/// produced it. The `epoch_tag` is the [`crate::key_rotation::RotationEpoch`]
+/// value that was current on the signing node when the payload was
+/// signed; the watermark is the monotonically-increasing
+/// per-epoch sequence number for that payload.
+///
+/// Verification consults both the [`crate::key_rotation::VerifierArchive`]
+/// (for epoch-correct verifier-key lookup) and the
+/// [`crate::key_rotation::PerEpochReplayWatermark`] (for "this bundle is
+/// not past the rotation freeze point" enforcement).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochTaggedBundle {
+    pub epoch_tag: crate::key_rotation::RotationEpoch,
+    pub update_watermark: u64,
+    pub payload: Vec<u8>,
+    pub signature_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochTaggedBundleError {
+    Membership(MembershipError),
+    Rotation(crate::key_rotation::RotationError),
+}
+
+impl fmt::Display for EpochTaggedBundleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EpochTaggedBundleError::Membership(err) => write!(f, "{err}"),
+            EpochTaggedBundleError::Rotation(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for EpochTaggedBundleError {}
+
+impl From<MembershipError> for EpochTaggedBundleError {
+    fn from(err: MembershipError) -> Self {
+        EpochTaggedBundleError::Membership(err)
+    }
+}
+
+impl From<crate::key_rotation::RotationError> for EpochTaggedBundleError {
+    fn from(err: crate::key_rotation::RotationError) -> Self {
+        EpochTaggedBundleError::Rotation(err)
+    }
+}
+
+/// Verify an [`EpochTaggedBundle`] against an archived verifier key
+/// indexed by the bundle's epoch tag, then enforce the per-epoch
+/// rotation-watermark policy.
+///
+/// The verifier archive lookup MUST come from a previously-committed
+/// rotation record so a stolen old-key-signed bundle cannot resurrect a
+/// long-discarded epoch. The per-epoch watermark MUST be consulted
+/// before signature verification short-circuits success: a bundle that
+/// passes signature verification but violates the rotation-watermark
+/// policy is a security-context violation and is reported as
+/// [`crate::key_rotation::RotationError::WatermarkPastRotationPoint`].
+pub fn verify_epoch_tagged_bundle(
+    bundle: &EpochTaggedBundle,
+    archive: &crate::key_rotation::VerifierArchive,
+    watermark: &crate::key_rotation::PerEpochReplayWatermark,
+) -> Result<(), EpochTaggedBundleError> {
+    watermark.validate_bundle(bundle.epoch_tag, bundle.update_watermark)?;
+    let archived = archive
+        .lookup(bundle.epoch_tag)
+        .ok_or(EpochTaggedBundleError::Rotation(
+            crate::key_rotation::RotationError::UnknownEpoch {
+                epoch: bundle.epoch_tag,
+            },
+        ))?;
+    let verifying_key_bytes = decode_hex_to_fixed::<32>(&archived.public_key_hex)
+        .map_err(EpochTaggedBundleError::Membership)?;
+    let verifying_key = VerifyingKey::from_bytes(&verifying_key_bytes)
+        .map_err(|_| EpochTaggedBundleError::Membership(MembershipError::SignatureInvalid))?;
+    let signature_bytes = decode_hex_to_fixed::<64>(&bundle.signature_hex)
+        .map_err(EpochTaggedBundleError::Membership)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(bundle.payload.as_slice(), &signature)
+        .map_err(|_| EpochTaggedBundleError::Membership(MembershipError::SignatureInvalid))
+}
+
 fn reduce_membership_state(
     state: &MembershipState,
     operation: &MembershipOperation,
@@ -2287,5 +2374,131 @@ mod tests {
         std::fs::write(&log, tampered).expect("tampered log should write");
         let bad = load_membership_log(&log);
         assert!(bad.is_err());
+    }
+}
+
+#[cfg(test)]
+mod epoch_tagged_bundle_tests {
+    use super::verify_epoch_tagged_bundle;
+    use super::{EpochTaggedBundle, EpochTaggedBundleError, MembershipError, hex_encode};
+    use crate::key_rotation::{
+        ArchivedVerifier, PerEpochReplayWatermark, RotationEpoch, RotationError, VerifierArchive,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signed_bundle_under(
+        signing: &SigningKey,
+        epoch: RotationEpoch,
+        watermark: u64,
+        payload: &[u8],
+    ) -> EpochTaggedBundle {
+        let signature = signing.sign(payload);
+        EpochTaggedBundle {
+            epoch_tag: epoch,
+            update_watermark: watermark,
+            payload: payload.to_vec(),
+            signature_hex: hex_encode(&signature.to_bytes()),
+        }
+    }
+
+    fn archive_with(
+        epoch: RotationEpoch,
+        signing: &SigningKey,
+        watermark_at_rotation: u64,
+    ) -> VerifierArchive {
+        let mut archive = VerifierArchive::new();
+        archive
+            .record(ArchivedVerifier {
+                epoch,
+                public_key_hex: hex_encode(signing.verifying_key().as_bytes()),
+                archived_at_unix: 0,
+                watermark_at_rotation,
+            })
+            .expect("archive insert");
+        archive
+    }
+
+    #[test]
+    fn pre_rotation_bundle_verifies_against_archived_verifier_within_watermark() {
+        let outgoing = SigningKey::from_bytes(&[7u8; 32]);
+        let archive = archive_with(RotationEpoch(1), &outgoing, 50);
+        let mut watermark = PerEpochReplayWatermark::new(RotationEpoch(1));
+        watermark.advance_to(RotationEpoch(2)).expect("advance");
+        watermark
+            .freeze_outgoing(RotationEpoch(1), 50)
+            .expect("freeze outgoing");
+        let bundle = signed_bundle_under(&outgoing, RotationEpoch(1), 25, b"hello-1");
+        verify_epoch_tagged_bundle(&bundle, &archive, &watermark)
+            .expect("pre-rotation bundle within watermark must verify");
+    }
+
+    #[test]
+    fn post_rotation_bundle_signed_by_new_key_verifies() {
+        let incoming = SigningKey::from_bytes(&[8u8; 32]);
+        let mut archive = VerifierArchive::new();
+        archive
+            .record(ArchivedVerifier {
+                epoch: RotationEpoch(2),
+                public_key_hex: hex_encode(incoming.verifying_key().as_bytes()),
+                archived_at_unix: 0,
+                watermark_at_rotation: 0,
+            })
+            .expect("archive insert");
+        let watermark = PerEpochReplayWatermark::new(RotationEpoch(2));
+        let bundle = signed_bundle_under(&incoming, RotationEpoch(2), 10, b"hello-2");
+        verify_epoch_tagged_bundle(&bundle, &archive, &watermark)
+            .expect("post-rotation bundle must verify");
+    }
+
+    #[test]
+    fn replayed_old_epoch_bundle_with_advanced_watermark_rejected_as_signature_invalid() {
+        let outgoing = SigningKey::from_bytes(&[7u8; 32]);
+        let archive = archive_with(RotationEpoch(1), &outgoing, 50);
+        let mut watermark = PerEpochReplayWatermark::new(RotationEpoch(1));
+        watermark.advance_to(RotationEpoch(2)).expect("advance");
+        watermark
+            .freeze_outgoing(RotationEpoch(1), 50)
+            .expect("freeze outgoing");
+        let bundle = signed_bundle_under(&outgoing, RotationEpoch(1), 75, b"stale");
+        let err = verify_epoch_tagged_bundle(&bundle, &archive, &watermark)
+            .expect_err("bundle past the freeze point must fail closed");
+        assert!(matches!(
+            err,
+            EpochTaggedBundleError::Rotation(RotationError::WatermarkPastRotationPoint { .. })
+        ));
+    }
+
+    #[test]
+    fn bundle_with_unknown_epoch_tag_rejected() {
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let archive = VerifierArchive::new();
+        let watermark = PerEpochReplayWatermark::new(RotationEpoch(0));
+        let bundle = signed_bundle_under(&signing, RotationEpoch(99), 0, b"nope");
+        let err = verify_epoch_tagged_bundle(&bundle, &archive, &watermark)
+            .expect_err("unknown epoch tag must fail closed");
+        assert!(matches!(
+            err,
+            EpochTaggedBundleError::Rotation(RotationError::UnknownEpoch { .. })
+        ));
+    }
+
+    #[test]
+    fn bundle_with_tampered_signature_rejected_as_signature_invalid() {
+        let outgoing = SigningKey::from_bytes(&[7u8; 32]);
+        let archive = archive_with(RotationEpoch(1), &outgoing, 100);
+        let mut watermark = PerEpochReplayWatermark::new(RotationEpoch(1));
+        watermark.advance_to(RotationEpoch(2)).expect("advance");
+        watermark
+            .freeze_outgoing(RotationEpoch(1), 100)
+            .expect("freeze outgoing");
+        let mut bundle = signed_bundle_under(&outgoing, RotationEpoch(1), 25, b"payload");
+        // flip one byte of the signature
+        bundle.signature_hex.replace_range(0..2, "ff");
+        let err = verify_epoch_tagged_bundle(&bundle, &archive, &watermark)
+            .expect_err("tampered signature must fail closed");
+        assert!(matches!(
+            err,
+            EpochTaggedBundleError::Membership(MembershipError::SignatureInvalid)
+        ));
     }
 }
