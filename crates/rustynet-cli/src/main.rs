@@ -14445,8 +14445,29 @@ fn daemon_socket_path() -> PathBuf {
         .map_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH), PathBuf::from)
 }
 
+/// Track B Phase 18 — root-managed shared-runtime socket
+/// allowlist used by `validate_control_socket_security`. The Linux
+/// install adapter puts the daemon socket under `/run/rustynet`;
+/// the macOS install adapter
+/// (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`)
+/// puts it under `/private/var/run/rustynet`. Both are root-owned,
+/// group-rustynetd parent directories that the daemon (running as
+/// rustynetd) writes its socket into. Without this allowlist, the
+/// macOS CLI rejected its own daemon socket with "parent
+/// directory has insecure permissions: mode 770" even though the
+/// daemon was healthy.
+fn is_root_managed_shared_runtime_socket_path(path: &Path) -> bool {
+    if path.starts_with("/run/rustynet") {
+        return true;
+    }
+    if cfg!(target_os = "macos") && path.starts_with("/private/var/run/rustynet") {
+        return true;
+    }
+    false
+}
+
 fn rustynetd_service_uid_for_socket(path: &Path) -> Option<u32> {
-    if !path.starts_with("/run/rustynet") {
+    if !is_root_managed_shared_runtime_socket_path(path) {
         return None;
     }
     User::from_name("rustynetd")
@@ -14456,7 +14477,7 @@ fn rustynetd_service_uid_for_socket(path: &Path) -> Option<u32> {
 }
 
 fn rustynetd_service_gid_for_socket(path: &Path) -> Option<u32> {
-    if !path.starts_with("/run/rustynet") {
+    if !is_root_managed_shared_runtime_socket_path(path) {
         return None;
     }
     Group::from_name("rustynetd")
@@ -18788,6 +18809,57 @@ fn execute_config_subcommand(command: ConfigSubCommand) -> Result<String, String
                 None => serialized.clone(),
             };
             Ok(cli_human_or_json(json, payload, human))
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase18_socket_allowlist_tests {
+    use super::is_root_managed_shared_runtime_socket_path;
+    use std::path::Path;
+
+    #[test]
+    fn linux_run_rustynet_path_is_allowlisted() {
+        // Linux install adapter puts the daemon socket under
+        // /run/rustynet/rustynetd.sock. Mode 0o770 owner root:rustynetd
+        // must be accepted as a root-managed shared-runtime socket.
+        assert!(is_root_managed_shared_runtime_socket_path(Path::new(
+            "/run/rustynet/rustynetd.sock"
+        )));
+    }
+
+    #[test]
+    fn macos_private_var_run_path_is_allowlisted_only_on_macos() {
+        // Track B Phase 18 — macOS install adapter puts the daemon
+        // socket under /private/var/run/rustynet/rustynetd.sock with
+        // mode 0o770. Before Phase 18 the CLI rejected it as
+        // "insecure permissions: mode 770" because the allowlist
+        // was Linux-only.
+        let macos_path = Path::new("/private/var/run/rustynet/rustynetd.sock");
+        if cfg!(target_os = "macos") {
+            assert!(
+                is_root_managed_shared_runtime_socket_path(macos_path),
+                "macOS daemon socket path must be allowlisted on macOS targets"
+            );
+        } else {
+            assert!(
+                !is_root_managed_shared_runtime_socket_path(macos_path),
+                "macOS-specific path must NOT be allowlisted on non-macOS targets"
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrary_user_path_is_never_allowlisted() {
+        for path in [
+            "/tmp/rustynetd.sock",
+            "/Users/attacker/rustynetd.sock",
+            "/var/tmp/rustynetd.sock",
+        ] {
+            assert!(
+                !is_root_managed_shared_runtime_socket_path(Path::new(path)),
+                "attacker-controlled path must NEVER be allowlisted: {path}"
+            );
         }
     }
 }
