@@ -1,0 +1,70 @@
+==============================================================================
+Phase 25 - Orchestrator-side invocation reconstruction (NO live execution)
+==============================================================================
+
+The Phase 23 orchestrator invokes (live_linux_lab_orchestrator.sh:2862-2901):
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+        -File 'C:\Windows\Tempn_bootstrap_windows.ps1' \
+        -NodeId '<node_id>' \
+        -NetworkId '<NETWORK_ID>' \
+        -NodeRole '<role>' \
+        -SshAllowCidrs '<SSH_ALLOW_CIDRS>' \
+        -SourceArchive 'C:\Windows\Tempustynet_src.tar.gz' \
+        -BuildDir 'C:\Windows\Tempn_build' \
+        -ServiceName 'RustyNet'
+
+It calls live_lab_ssh "$target" "$invoke_cmd" which becomes:
+
+    ssh -i ~/.ssh/rustynet_lab_ed25519 -o ... -- windows@192.168.65.8 \
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'C:\Windows\Temp\rn_bootstrap_windows.ps1' \
+         -NodeId 'windows-client-1' ..."
+
+This is PowerShell-over-SSH directly (no cmd.exe wrapper). Per the
+Phase 23 reviewer (commit 4a7af92 review), PowerShell-over-SSH fails
+with 'Thread failed to start' on memory-pressured Windows hosts; the
+workaround documented by the reviewer is to invoke via:
+
+    cmd.exe /c "powershell.exe -EncodedCommand <b64-utf16le>"
+
+The Phase 23 orchestrator does NOT apply that workaround. The wrapper
+script is correct but the orchestrator-side invocation does not match
+the reviewer's documented compatibility pattern.
+
+------------------------------------------------------------------------------
+Probe: SSH transport itself fails on this VM
+------------------------------------------------------------------------------
+
+$ scp -i ~/.ssh/rustynet_lab_ed25519 ./test windows@192.168.65.8:C:/Windows/Temp/probe.txt
+scp: Connection closed
+
+$ ssh -i ~/.ssh/rustynet_lab_ed25519 windows@192.168.65.8 'hostname'
+
+$ ssh -i ~/.ssh/rustynet_lab_ed25519 windows@192.168.65.8 'echo HELLO'
+Exception of type 'System.OutOfMemoryException' was thrown.
+Thread failed to start.
+
+------------------------------------------------------------------------------
+Inferred root cause
+------------------------------------------------------------------------------
+Windows OpenSSH server uses PowerShell as the default ssh login shell
+on Windows 10 (HKLM:\SOFTWARE\OpenSSH\DefaultShell). Every SSH
+session bootstraps a PowerShell host before running the command, and
+PowerShell host startup loads System.Management.Automation assembly.
+With the guest paging file exhausted, the assembly load aborts with
+HRESULT 0x800705AF before the command body ever executes.
+
+The orchestrator's Windows arm thus cannot transmit anything to this
+VM in its current state - this is a guest-OS-level resource problem,
+not a Phase 23/26/27 code defect.
+
+Operator action required:
+  1) Open the windows-utm-1 guest console (UTM).
+  2) If the guest is logged in: open Task Manager, kill rustynetd.exe
+     if it is consuming significant RAM; otherwise sign in and check
+     System / Advanced / Performance / Advanced / Virtual memory and
+     resize the paging file to 4GB+ (Windows default 'System managed'
+     is too small for a 4GB-RAM lab guest under sustained load).
+  3) Restart the guest.
+  4) Re-run Phase 25 validation from this evidence directory.
+
