@@ -239,7 +239,13 @@ function Ensure-RustyNetRuntimeLayout {
             (Join-Path $StateRoot 'keys'),
             (Join-Path $StateRoot 'membership'),
             (Join-Path $StateRoot 'secrets'),
-            (Join-Path $StateRoot 'secrets\key-custody')
+            (Join-Path $StateRoot 'secrets\key-custody'),
+            # Per-invocation credential workspace for membership-mutation
+            # ops verbs. SYSTEM/Administrators-only DACL inherited from
+            # the parent state root and re-validated by the W4 runtime
+            # ACL gate at use time. Mirrors the Linux/macOS
+            # `credentials-workspace` directories.
+            (Join-Path $StateRoot 'credentials-workspace')
         )) {
         Ensure-Directory -Path $path
     }
@@ -880,6 +886,7 @@ $preServiceAdministratorsName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-32-5
 $preServiceLocalSystemName = Get-LocalizedAccountNameFromSid -Sid 'S-1-5-18'
 foreach ($preServiceDirectory in @(
         (Join-Path $StateRoot 'keys'),
+        (Join-Path $StateRoot 'credentials-workspace'),
         (Join-Path $StateRoot 'secrets'),
         (Join-Path $StateRoot 'secrets\key-custody')
     )) {
@@ -1034,6 +1041,7 @@ if ($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file) {
                 (Join-Path $StateRoot 'trust'),
                 (Join-Path $StateRoot 'keys'),
                 (Join-Path $StateRoot 'membership'),
+                (Join-Path $StateRoot 'credentials-workspace'),
                 (Join-Path $StateRoot 'secrets'),
                 (Join-Path $StateRoot 'secrets\key-custody')
             )) {
@@ -1206,6 +1214,7 @@ $report = [ordered]@{
     config_present = Test-Path -LiteralPath $configPath
     log_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'logs')
     trust_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'trust')
+    credentials_workspace_present = Test-Path -LiteralPath (Join-Path $StateRoot 'credentials-workspace')
     secrets_root_present = Test-Path -LiteralPath (Join-Path $StateRoot 'secrets')
     service_sid_configured = $serviceSidConfigured
     runtime_acl_applied = $runtimeAclApplied

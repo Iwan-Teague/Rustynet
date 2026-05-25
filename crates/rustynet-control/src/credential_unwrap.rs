@@ -124,6 +124,19 @@ pub trait CredentialUnwrapBackend: Send + Sync {
 /// Default Linux directory where reviewed systemd-creds blobs live.
 pub const LINUX_DEFAULT_CREDENTIAL_DIR: &str = "/etc/rustynet/credentials";
 
+/// Path to the Linux `systemd-creds` CLI. Hard-coded to the
+/// distro-shipped absolute path so PATH manipulation cannot redirect
+/// to a Trojan helper. Matches the macOS `MACOS_SECURITY_BIN`
+/// convention.
+///
+/// Reviewed Linux installs ship `systemd-creds` at `/usr/bin/systemd-creds`
+/// (Debian, Ubuntu, Fedora, RHEL). The path is pinned absolute so that
+/// even if the daemon's effective `$PATH` carries a writable directory
+/// ahead of `/usr/bin`, the backend still invokes the OS-shipped binary
+/// and not an attacker-controlled shim.
+#[cfg(target_os = "linux")]
+pub const LINUX_SYSTEMD_CREDS_BIN: &str = "/usr/bin/systemd-creds";
+
 /// Linux backend that decrypts a systemd-creds blob via
 /// `systemd-creds decrypt --name=<service> <blob_path> -`.
 ///
@@ -201,7 +214,17 @@ impl CredentialUnwrapBackend for LinuxSystemdCredsBackend {
                 blob_path.display()
             ));
         }
-        run_helper_and_capture("systemd-creds", &argv, timeout)
+        // Fail closed if the reviewed absolute helper path is missing.
+        // PATH-based discovery is forbidden here (CWE-426): an attacker
+        // who controls a writable directory earlier in $PATH could
+        // otherwise substitute their own `systemd-creds` and read the
+        // plaintext passphrase.
+        if !std::path::Path::new(LINUX_SYSTEMD_CREDS_BIN).is_file() {
+            return Err(format!(
+                "linux-systemd-creds: required helper missing at {LINUX_SYSTEMD_CREDS_BIN}",
+            ));
+        }
+        run_helper_and_capture(LINUX_SYSTEMD_CREDS_BIN, &argv, timeout)
     }
 }
 
@@ -347,10 +370,17 @@ impl CredentialUnwrapBackend for WindowsDpapiBackend {
         "windows-dpapi"
     }
 
+    /// Honour the `timeout` contract from the trait docstring by
+    /// running the in-process DPAPI unprotect on a worker thread and
+    /// joining via a bounded `recv_timeout`. On timeout the worker
+    /// continues until the syscall returns but the result is dropped
+    /// in the channel, which runs `Zeroizing::drop` on the plaintext
+    /// before the bytes escape; the caller sees a precise timeout
+    /// error.
     fn unwrap_credential(
         &self,
         descriptor: &CredentialDescriptor,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<Zeroizing<Vec<u8>>, String> {
         let blob_path = self.blob_path(descriptor)?;
         if !blob_path.is_file() {
@@ -359,31 +389,65 @@ impl CredentialUnwrapBackend for WindowsDpapiBackend {
                 blob_path.display()
             ));
         }
-        let raw = std::fs::read(&blob_path)
-            .map_err(|err| format!("windows-dpapi: read {} failed: {err}", blob_path.display()))?;
-        let protected_zeroizing = Zeroizing::new(raw);
-        let protected = strip_dpapi_envelope(protected_zeroizing.as_slice(), &blob_path)?;
-        let plaintext = rustynet_windows_native::dpapi_unprotect(protected).map_err(|err| {
-            format!(
-                "windows-dpapi: unprotect {} failed: {err}",
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Zeroizing<Vec<u8>>, String>>();
+        let worker_blob_path = blob_path.clone();
+        // Detach the worker; we never join it. If the syscall outlives
+        // our `recv_timeout` budget the result lands in the channel,
+        // the receiving end drops on scope exit, and `Zeroizing::drop`
+        // wipes the plaintext before it can leak.
+        let _ = std::thread::Builder::new()
+            .name("windows-dpapi-unwrap".to_owned())
+            .spawn(move || {
+                let result = unwrap_dpapi_blob(&worker_blob_path);
+                // Ignore send error: receiver may have timed out and
+                // dropped the channel. The result `Zeroizing` then
+                // drops here, wiping any plaintext that was produced.
+                let _ = tx.send(result);
+            })
+            .map_err(|err| format!("windows-dpapi: failed to spawn worker thread: {err}"))?;
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "windows-dpapi: unwrap of {} exceeded {timeout:?} timeout",
                 blob_path.display()
-            )
-        })?;
-        drop(protected_zeroizing);
-        if plaintext.is_empty() {
-            return Err(format!(
-                "windows-dpapi: unwrap produced empty plaintext for {}",
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+                "windows-dpapi: worker thread exited without delivering a result for {}",
                 blob_path.display()
-            ));
+            )),
         }
-        // Trim trailing newline (if any) so callers see exactly the
-        // passphrase bytes that were sealed.
-        let mut zeroizing = Zeroizing::new(plaintext);
-        if zeroizing.last() == Some(&b'\n') {
-            zeroizing.pop();
-        }
-        Ok(zeroizing)
     }
+}
+
+/// In-process DPAPI unwrap. Factored out of the trait impl so the
+/// worker thread that honours the timeout contract can call it
+/// without re-implementing the envelope-strip + newline-trim path.
+#[cfg(target_os = "windows")]
+fn unwrap_dpapi_blob(blob_path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    let raw = std::fs::read(blob_path)
+        .map_err(|err| format!("windows-dpapi: read {} failed: {err}", blob_path.display()))?;
+    let protected_zeroizing = Zeroizing::new(raw);
+    let protected = strip_dpapi_envelope(protected_zeroizing.as_slice(), blob_path)?;
+    let plaintext = rustynet_windows_native::dpapi_unprotect(protected).map_err(|err| {
+        format!(
+            "windows-dpapi: unprotect {} failed: {err}",
+            blob_path.display()
+        )
+    })?;
+    drop(protected_zeroizing);
+    if plaintext.is_empty() {
+        return Err(format!(
+            "windows-dpapi: unwrap produced empty plaintext for {}",
+            blob_path.display()
+        ));
+    }
+    // Trim trailing newline (if any) so callers see exactly the
+    // passphrase bytes that were sealed.
+    let mut zeroizing = Zeroizing::new(plaintext);
+    if zeroizing.last() == Some(&b'\n') {
+        zeroizing.pop();
+    }
+    Ok(zeroizing)
 }
 
 /// Verify the reviewed DPAPI envelope (matches the WireGuard passphrase
@@ -611,6 +675,43 @@ mod tests {
         assert_eq!(descriptor.service, "signing_key_passphrase");
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn source_pins_windows_dpapi_backend_contract_on_non_windows_hosts() {
+        let source = include_str!("credential_unwrap.rs");
+        let implementation = source
+            .split("// ─── Tests")
+            .next()
+            .expect("implementation section must precede tests");
+        for expected in [
+            "pub struct WindowsDpapiBackend",
+            "WINDOWS_DEFAULT_SECRET_DIR",
+            "signing_key_passphrase.dpapi",
+            "rustynet_windows_native::dpapi_unprotect",
+            "strip_dpapi_envelope",
+            "RNYDPAPI",
+            "recv_timeout(timeout)",
+        ] {
+            assert!(
+                implementation.contains(expected),
+                "Windows DPAPI backend contract missing source marker: {expected}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_systemd_creds_path_is_absolute_and_canonical() {
+        // Pin the reviewed Linux helper path so a future refactor
+        // cannot silently revert to PATH-based lookup (CWE-426).
+        // Matches `MACOS_SECURITY_BIN` pattern.
+        assert_eq!(LINUX_SYSTEMD_CREDS_BIN, "/usr/bin/systemd-creds");
+        assert!(
+            LINUX_SYSTEMD_CREDS_BIN.starts_with('/'),
+            "linux systemd-creds helper path must be absolute, got {LINUX_SYSTEMD_CREDS_BIN}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_backend_argv_uses_decrypt_name_pair() {
@@ -695,6 +796,24 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_backend_fails_closed_when_keychain_item_missing() {
+        // Pinned against the reviewed `/usr/bin/security` behaviour:
+        //   $ /usr/bin/security find-generic-password \
+        //       -a __nonexistent_test_account__ \
+        //       -s __nonexistent_test_service__ \
+        //       /Library/Keychains/System.keychain ; echo $?
+        //   security: SecKeychainSearchCopyNext: The specified item
+        //   could not be found in the keychain.
+        //   44
+        //
+        // Exit 44 is `errSecItemNotFound`. The substring matches the
+        // canonical Security framework error text. Pinning both
+        // signals keeps the assertion meaningful even if Apple
+        // reworks the error wording (we keep failing on the exit
+        // code) or changes the exit code (we keep failing on the
+        // text). The previous loose-substring assertion accepted
+        // the literal "security" (the program name appears in every
+        // error message) and would silently pass on an unrelated
+        // failure mode.
         let backend = MacosKeychainBackend::new();
         let descriptor = CredentialDescriptor {
             account: "membership-owner-signing-key-test-missing".to_owned(),
@@ -703,9 +822,12 @@ mod tests {
         let err = backend
             .unwrap_credential(&descriptor, Duration::from_secs(2))
             .expect_err("missing keychain item must fail closed");
+        let exit_code_pinned = err.contains("status 44");
+        let canonical_text_pinned = err.contains("could not be found in the keychain");
         assert!(
-            err.contains("security") || err.contains("could not be found"),
-            "unexpected error shape: {err}"
+            exit_code_pinned && canonical_text_pinned,
+            "expected fail-closed error to carry both exit-code 44 and canonical \
+             \"could not be found in the keychain\" text, got: {err}"
         );
     }
 

@@ -267,7 +267,25 @@ Already covered by Phase 23's Windows arm in the wrapper, but Phase 25 is the fo
 
 #### Phase 27 — Windows `ops e2e-membership-set-capabilities` (DPAPI completion)
 
+**Status (2026-05-25)**: code-complete on `codex/windows-dpapi-phase27`; live Windows proof still pending.
+
 Lands the Windows backend from Phase 22 if not already completed there.
+
+**Implemented**:
+- `rustynet-control::credential_unwrap::WindowsDpapiBackend` unwraps reviewed `RNYDPAPI` blobs through DPAPI, enforces descriptor validation, trims helper newline shape, returns `Zeroizing<Vec<u8>>`, and honours the timeout contract through a bounded worker-thread receive.
+- `rustynet ops e2e-membership-set-capabilities` now uses platform credential backends and stages plaintext only under a reviewed per-invocation credential workspace, not `/tmp`.
+- Windows e2e bootstrap provisions `C:\ProgramData\RustyNet\secrets\signing_key_passphrase.dpapi` so the ops verb has a canonical LocalMachine DPAPI blob to unwrap.
+- Windows install bootstrap creates and ACL-repairs `C:\ProgramData\RustyNet\credentials-workspace`, and reports its presence.
+- Canonical Windows credential paths are exposed in `crates/rustynetd/src/windows_paths.rs`.
+
+**Local proof**:
+- `cargo fmt --all -- --check`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase27-target cargo test -p rustynet-control credential_unwrap --all-features`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase27-target cargo test -p rustynet-cli membership_workspace --all-features`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase27-target cargo test -p rustynet-cli windows_install --all-features`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase27-target cargo test -p rustynetd windows_runtime_startup_acl_roots --all-features`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase27-target cargo clippy -p rustynet-control -p rustynet-cli -p rustynetd --all-targets --all-features -- -D warnings`
+- `git diff --check`
 
 ### Round 5 (serial: Phase 28 — biggest, most invasive)
 
