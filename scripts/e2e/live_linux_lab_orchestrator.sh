@@ -2670,6 +2670,37 @@ bootstrap_host_worker() {
   local target="$2"
   local node_id="$3"
   local role="$4"
+  local platform
+  platform="$(node_platform_for_label "${label}")" || return 1
+  case "${platform}" in
+    linux)
+      bootstrap_host_worker_linux "${label}" "${target}" "${node_id}" "${role}"
+      ;;
+    macos)
+      bootstrap_host_worker_macos "${label}" "${target}" "${node_id}" "${role}"
+      ;;
+    windows)
+      bootstrap_host_worker_windows "${label}" "${target}" "${node_id}" "${role}"
+      ;;
+    *)
+      printf 'bootstrap_host_worker: unsupported platform %q for label %q\n' \
+        "${platform}" "${label}" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Linux bootstrap worker — preserves the pre-Phase-23 behaviour
+# verbatim so the existing A2 (5-node Debian) profile remains
+# bit-identical. The only change vs. the historical inline body is the
+# function name; the orchestrator still scp's the inline-generated
+# `rn_bootstrap.sh`, the env file, and the source tarball, then asserts
+# Linux-specific install paths.
+bootstrap_host_worker_linux() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
   local env_path
   local attempt max_attempts=12 sleep_secs=10
   ssh_wait_for_host "$target" || return 1
@@ -2685,7 +2716,7 @@ EOF_ENV
   if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
     printf 'RUSTYNET_BACKEND=%s\n' "${RUSTYNET_BACKEND}" >> "$env_path"
   fi
-  printf '[bootstrap] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
+  printf '[bootstrap] %s %s (%s %s) platform=linux\n' "$label" "$target" "$node_id" "$role"
   for attempt in $(seq 1 "$max_attempts"); do
     if live_lab_scp_to "$STATE_DIR/rn_bootstrap.sh" "$target" "/tmp/rn_bootstrap.sh" &&
       live_lab_scp_to "$env_path" "$target" "/tmp/rn_bootstrap.env" &&
@@ -2693,6 +2724,110 @@ EOF_ENV
       live_lab_ssh "$target" "chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh /tmp/rn_bootstrap.env" &&
       live_lab_wait_for_daemon_socket "$target" &&
       live_lab_run_root "$target" "root test -x /usr/local/bin/rustynet && root test -x /usr/local/bin/rustynetd && root test -f /var/lib/rustynet/keys/wireguard.pub && root getent group rustynetd >/dev/null 2>&1"
+    then
+      return 0
+    fi
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+  return 1
+}
+
+# macOS bootstrap worker (Phase 23) — scp the orchestrator-side wrapper
+# (`scripts/e2e/rn_bootstrap_macos.sh`) plus the source archive, then
+# invoke the wrapper on the target host. The wrapper derives the per-node
+# utun interface name (FNV-1a, same constants as the Rust adapter in
+# crates/rustynet-cli/.../macos_install.rs), extracts the source into
+# `/tmp/rn_build`, runs `Bootstrap-RustyNetMacos.sh`, and polls for the
+# daemon Unix socket. Fail-closed: each attempt aborts on first error;
+# we retry up to 3 times to absorb transient sudo/SSH flakes.
+bootstrap_host_worker_macos() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
+  local wrapper_local="$ROOT_DIR/scripts/e2e/rn_bootstrap_macos.sh"
+  local remote_wrapper="/tmp/rn_bootstrap_macos.sh"
+  local remote_archive="/tmp/rustynet_src.tar.gz"
+  local remote_env="/tmp/rn_macos_bootstrap.env"
+  local remote_build_dir="/tmp/rn_build"
+  local attempt max_attempts=3 sleep_secs=10
+  local invoke_cmd
+  if [[ ! -f "$wrapper_local" ]]; then
+    printf 'bootstrap_host_worker_macos: wrapper missing at %s\n' "$wrapper_local" >&2
+    return 1
+  fi
+  ssh_wait_for_host "$target" || return 1
+  live_lab_push_sudo_password "$target"
+  printf '[bootstrap] %s %s (%s %s) platform=macos\n' "$label" "$target" "$node_id" "$role"
+  invoke_cmd="sudo -n chmod 700 '${remote_wrapper}' && sudo -n bash '${remote_wrapper}'"
+  invoke_cmd+=" --node-id '${node_id}'"
+  invoke_cmd+=" --network-id '${NETWORK_ID}'"
+  invoke_cmd+=" --node-role '${role}'"
+  invoke_cmd+=" --ssh-allow-cidrs '${SSH_ALLOW_CIDRS}'"
+  invoke_cmd+=" --source-archive '${remote_archive}'"
+  invoke_cmd+=" --build-dir '${remote_build_dir}'"
+  invoke_cmd+=" --env-file '${remote_env}'"
+  for attempt in $(seq 1 "$max_attempts"); do
+    if live_lab_scp_to "$wrapper_local" "$target" "$remote_wrapper" &&
+      live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "$remote_archive" &&
+      live_lab_ssh "$target" "$invoke_cmd" &&
+      live_lab_wait_for_daemon_socket "$target" "/private/var/run/rustynet/rustynetd.sock" &&
+      live_lab_run_root "$target" "root test -x /usr/local/bin/rustynet && root test -x /usr/local/bin/rustynetd && root test -f /usr/local/var/rustynet/keys/wireguard.pub && root test -f /usr/local/var/rustynet/keys/enrollment.secret"
+    then
+      return 0
+    fi
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      sleep "$sleep_secs"
+    fi
+  done
+  return 1
+}
+
+# Windows bootstrap worker (Phase 23) — scp the orchestrator-side
+# PowerShell wrapper (`scripts/e2e/rn_bootstrap_windows.ps1`) plus the
+# source archive, then invoke the wrapper on the target host. The wrapper
+# extracts the source into `C:\Windows\Temp\rn_build`, runs
+# `Bootstrap-RustyNetWindows.ps1 -Phase build-release / install-release`
+# (which builds + registers the SCM service), then waits for the
+# `RustyNet` service to reach Running. Fail-closed: each attempt aborts
+# on first error; we retry up to 3 times. PowerShell is invoked via
+# `powershell.exe -NoProfile -ExecutionPolicy Bypass`, which is the
+# only reviewed path (Windows lab guests do not currently ship pwsh).
+bootstrap_host_worker_windows() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
+  local role="$4"
+  local wrapper_local="$ROOT_DIR/scripts/e2e/rn_bootstrap_windows.ps1"
+  local remote_wrapper='C:\Windows\Temp\rn_bootstrap_windows.ps1'
+  local remote_archive='C:\Windows\Temp\rustynet_src.tar.gz'
+  local remote_build_dir='C:\Windows\Temp\rn_build'
+  local service_name='RustyNet'
+  local attempt max_attempts=3 sleep_secs=10
+  local invoke_cmd
+  if [[ ! -f "$wrapper_local" ]]; then
+    printf 'bootstrap_host_worker_windows: wrapper missing at %s\n' "$wrapper_local" >&2
+    return 1
+  fi
+  ssh_wait_for_host "$target" || return 1
+  printf '[bootstrap] %s %s (%s %s) platform=windows\n' "$label" "$target" "$node_id" "$role"
+  # argv-only PowerShell invocation. Each orchestrator-controlled value
+  # rides in via a named parameter (-NodeId, -NetworkId, ...); the
+  # wrapper validates each one before any side-effect.
+  invoke_cmd="powershell.exe -NoProfile -ExecutionPolicy Bypass -File '${remote_wrapper}'"
+  invoke_cmd+=" -NodeId '${node_id}'"
+  invoke_cmd+=" -NetworkId '${NETWORK_ID}'"
+  invoke_cmd+=" -NodeRole '${role}'"
+  invoke_cmd+=" -SshAllowCidrs '${SSH_ALLOW_CIDRS}'"
+  invoke_cmd+=" -SourceArchive '${remote_archive}'"
+  invoke_cmd+=" -BuildDir '${remote_build_dir}'"
+  invoke_cmd+=" -ServiceName '${service_name}'"
+  for attempt in $(seq 1 "$max_attempts"); do
+    if live_lab_scp_to "$wrapper_local" "$target" "$remote_wrapper" &&
+      live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "$remote_archive" &&
+      live_lab_ssh "$target" "$invoke_cmd"
     then
       return 0
     fi

@@ -27,6 +27,17 @@ static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh");
 static INSTALL_SERVICE_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Install-RustyNetMacosService.sh");
+// Phase 23 orchestrator-side wrappers (per-OS dispatch from
+// `live_linux_lab_orchestrator.sh::bootstrap_host_worker`). Compiled
+// in for tests only so the FNV-1a parity guard and the input-validation
+// pins below stay enforced; the wrappers themselves run on the target
+// host (orchestrator scp's them from `scripts/e2e/`).
+#[cfg(test)]
+static MACOS_BOOTSTRAP_WRAPPER: &str =
+    include_str!("../../../../../../scripts/e2e/rn_bootstrap_macos.sh");
+#[cfg(test)]
+static WINDOWS_BOOTSTRAP_WRAPPER: &str =
+    include_str!("../../../../../../scripts/e2e/rn_bootstrap_windows.ps1");
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -1073,6 +1084,221 @@ mod tests {
             INSTALL_SERVICE_SCRIPT
                 .contains("Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in)"),
             "install script must keep the audited-omission header intact"
+        );
+    }
+
+    // ── Phase 23: cross-OS orchestrator bootstrap wrapper parity ────────────
+
+    /// The bash wrapper (rn_bootstrap_macos.sh) and the Rust adapter MUST
+    /// derive the same utun interface name for a given node_id. A drift
+    /// would mean the bootstrap-time plist names one interface and the
+    /// enforce-runtime plist names another, breaking WireGuard bringup.
+    /// This test runs the Rust implementation against the known-good
+    /// values pinned in the bash wrapper's `assert_known_utun_index`
+    /// guard so a refactor of either side trips the same canary.
+    #[test]
+    fn phase23_macos_wrapper_utun_parity_matches_rust_impl() {
+        // Pins from rn_bootstrap_macos.sh's `assert_known_utun_index` calls.
+        let known_inputs_expected_indices: &[(&str, u16)] = &[
+            ("macos-client-1", 3912),
+            ("exit-1", 2369),
+            ("client-1", 3466),
+        ];
+        for (node_id, expected_index) in known_inputs_expected_indices {
+            let rust_index = utun_index_for_node_id(node_id);
+            assert_eq!(
+                rust_index, *expected_index,
+                "Rust utun_index_for_node_id({node_id:?}) = {rust_index}, expected {expected_index} \
+                 — bash wrapper's assert_known_utun_index pin and Rust impl have drifted"
+            );
+        }
+    }
+
+    /// The bash wrapper's `fnv1a_utun_index` must use the same FNV-1a
+    /// 32-bit constants as the Rust implementation. This test pins the
+    /// offset basis (2166136261) and prime (16777619) in the wrapper so
+    /// a refactor cannot silently swap them.
+    #[test]
+    fn phase23_macos_wrapper_uses_canonical_fnv1a_constants() {
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("2166136261"),
+            "rn_bootstrap_macos.sh must embed the FNV-1a 32-bit offset basis (2166136261)"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("16777619"),
+            "rn_bootstrap_macos.sh must embed the FNV-1a 32-bit prime (16777619)"
+        );
+        // utun range guard: (hash % 4086) + 10 → [10, 4095].
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("(hash % 4086) + 10"),
+            "rn_bootstrap_macos.sh must reproduce the (hash % 4086) + 10 utun-range guard"
+        );
+        // The Rust impl wraps multiplication and masks with the 32-bit
+        // wrap. The bash impl must explicitly mask too because bash uses
+        // 64-bit integers (without masking, the values diverge after a
+        // few iterations).
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("& 0xFFFFFFFF"),
+            "rn_bootstrap_macos.sh must mask the FNV-1a state to 32 bits each iteration"
+        );
+    }
+
+    /// The bash wrapper must pin its known-input parity assertions so
+    /// any divergence (in either the bash hash or the Rust hash) fails
+    /// before the macOS host gets a bogus WG_INTERFACE.
+    #[test]
+    fn phase23_macos_wrapper_pins_known_utun_assertions() {
+        for needle in [
+            "assert_known_utun_index \"macos-client-1\" \"3912\"",
+            "assert_known_utun_index \"exit-1\"         \"2369\"",
+            "assert_known_utun_index \"client-1\"       \"3466\"",
+        ] {
+            assert!(
+                MACOS_BOOTSTRAP_WRAPPER.contains(needle),
+                "rn_bootstrap_macos.sh must pin the known-input parity assertion: {needle}"
+            );
+        }
+    }
+
+    /// The bash wrapper must validate every CLI input with a strict
+    /// allowlist before reaching any side-effect (sudo, tar, bootstrap
+    /// invocation). This pins the validators so a future refactor
+    /// cannot silently drop them.
+    #[test]
+    fn phase23_macos_wrapper_validates_inputs_fail_closed() {
+        for needle in [
+            "validate_identifier \"--node-id\" \"$NODE_ID\"",
+            "validate_identifier \"--network-id\" \"$NETWORK_ID\"",
+            "validate_node_role \"$NODE_ROLE\"",
+            "validate_ssh_allow_cidrs \"$SSH_ALLOW_CIDRS\"",
+            "validate_path_argument \"--source-archive\" \"$SOURCE_ARCHIVE_PATH\"",
+        ] {
+            assert!(
+                MACOS_BOOTSTRAP_WRAPPER.contains(needle),
+                "rn_bootstrap_macos.sh must call validator: {needle}"
+            );
+        }
+    }
+
+    /// The bash wrapper must invoke the reviewed bootstrap script via
+    /// `sudo -n bash <absolute-path> <env-file>` — argv-only exec, no
+    /// shell construction of operator-controlled values.
+    #[test]
+    fn phase23_macos_wrapper_invokes_bootstrap_argv_only() {
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER
+                .contains("sudo -n bash \"$BOOTSTRAP_SCRIPT\" \"$ENV_FILE_PATH\""),
+            "rn_bootstrap_macos.sh must invoke the reviewed bootstrap via argv-only sudo bash"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains(
+                "BOOTSTRAP_SCRIPT=\"$BUILD_DIR/scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh\""
+            ),
+            "rn_bootstrap_macos.sh must point at the canonical bootstrap script path"
+        );
+    }
+
+    /// The bash wrapper must poll for the daemon Unix socket before
+    /// returning so the next orchestrator stage (collect_pubkeys) does
+    /// not race with launchctl bootstrap. This mirrors the Rust
+    /// adapter's wait_for_macos_daemon_socket.
+    #[test]
+    fn phase23_macos_wrapper_waits_for_daemon_socket() {
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("/private/var/run/rustynet/rustynetd.sock"),
+            "rn_bootstrap_macos.sh must probe the macOS daemon socket path"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("sudo -n test -S"),
+            "rn_bootstrap_macos.sh must probe the socket via `sudo -n test -S` (Unix socket test)"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("for attempt in $(seq 1 40)"),
+            "rn_bootstrap_macos.sh must poll 40 iterations × 1 s (matches wait_for_macos_daemon_socket)"
+        );
+    }
+
+    /// The Windows wrapper must apply the same strict input validation
+    /// posture (Set-StrictMode + ErrorActionPreference Stop + named-arg
+    /// validators) as the macOS wrapper.
+    #[test]
+    fn phase23_windows_wrapper_fails_closed() {
+        for needle in [
+            "Set-StrictMode -Version Latest",
+            "$ErrorActionPreference = 'Stop'",
+            "Assert-Identifier -Label '-NodeId' -Value $NodeId",
+            "Assert-Identifier -Label '-NetworkId' -Value $NetworkId",
+            "Assert-NodeRole -Value $NodeRole",
+            "Assert-SshAllowCidrs -Value $SshAllowCidrs",
+            "Assert-AbsolutePath -Label '-SourceArchive'",
+            "Assert-ServiceName -Label '-ServiceName'",
+        ] {
+            assert!(
+                WINDOWS_BOOTSTRAP_WRAPPER.contains(needle),
+                "rn_bootstrap_windows.ps1 must include: {needle}"
+            );
+        }
+    }
+
+    /// Per CLAUDE.md / project style: PowerShell scripts must use
+    /// `$null -eq <var>` (not `<var> -eq $null`) to avoid silent
+    /// breakage under StrictMode when $var is unset.
+    #[test]
+    fn phase23_windows_wrapper_uses_null_lhs_comparisons() {
+        // No `-eq $null` (rhs form) — the linter pattern that flags
+        // bugs under StrictMode.
+        assert!(
+            !WINDOWS_BOOTSTRAP_WRAPPER.contains("-eq $null"),
+            "rn_bootstrap_windows.ps1 must use `$null -eq <var>` (lhs form), \
+             not `<var> -eq $null` (rhs form)"
+        );
+        // At least one positive use of the lhs form to confirm the
+        // pattern is in active use, not just absent because there are
+        // no null checks.
+        assert!(
+            WINDOWS_BOOTSTRAP_WRAPPER.contains("$null -eq"),
+            "rn_bootstrap_windows.ps1 must contain at least one `$null -eq <var>` check"
+        );
+    }
+
+    /// The Windows wrapper must invoke the reviewed bootstrap via
+    /// PowerShell named-arg surface (no string concatenation of
+    /// operator values into the command line).
+    #[test]
+    fn phase23_windows_wrapper_invokes_bootstrap_named_args() {
+        for needle in [
+            "& $bootstrapScript",
+            "-Phase $phase",
+            "-SourceMode archive",
+            "-RustyNetRoot $rustyNetRoot",
+            "-InstallRoot $installRoot",
+            "-StateRoot $stateRoot",
+            "-ServiceName $ServiceName",
+            "& $installHelper",
+            "-NodeId $NodeId",
+        ] {
+            assert!(
+                WINDOWS_BOOTSTRAP_WRAPPER.contains(needle),
+                "rn_bootstrap_windows.ps1 must invoke the reviewed bootstrap via named arg: {needle}"
+            );
+        }
+    }
+
+    /// The Windows wrapper must poll for the service to reach Running
+    /// before returning (analog of the macOS daemon-socket wait).
+    #[test]
+    fn phase23_windows_wrapper_waits_for_service_running() {
+        assert!(
+            WINDOWS_BOOTSTRAP_WRAPPER.contains("Get-Service -Name $ServiceName"),
+            "rn_bootstrap_windows.ps1 must probe service status via Get-Service"
+        );
+        assert!(
+            WINDOWS_BOOTSTRAP_WRAPPER.contains("$svc.Status -eq 'Running'"),
+            "rn_bootstrap_windows.ps1 must wait for Status = Running"
+        );
+        assert!(
+            WINDOWS_BOOTSTRAP_WRAPPER.contains("ServiceReadyTimeoutSecs"),
+            "rn_bootstrap_windows.ps1 must accept a configurable timeout"
         );
     }
 }
