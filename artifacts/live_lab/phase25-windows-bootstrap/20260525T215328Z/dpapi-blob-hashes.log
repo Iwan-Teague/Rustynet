@@ -1,0 +1,39 @@
+==============================================================================
+Phase 25 - Step 4 DPAPI blob SHA256 distinctness (BLOCKED by guest OOM)
+==============================================================================
+
+Phase 27 fold-in (commit 6f46a90) BLOCKER 1 fix requires that the two
+DPAPI blobs hold INDEPENDENTLY-generated 48-byte passphrases:
+
+    C:\ProgramData\RustyNet\secrets\signing_key_passphrase.dpapi
+    C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi
+
+Step 4 acceptance criterion (per Phase 25 prompt):
+    Verify they have DIFFERENT SHA256 hashes.
+
+Intended query:
+    $ ssh windows@192.168.65.8 'powershell.exe -NoProfile -Command \"
+        @{
+          signing = (Get-FileHash -Path \"C:\\ProgramData\\RustyNet\\secrets\\signing_key_passphrase.dpapi\" -Algorithm SHA256).Hash
+          wireguard = (Get-FileHash -Path \"C:\\ProgramData\\RustyNet\\secrets\\wireguard.passphrase.dpapi\" -Algorithm SHA256).Hash
+        } | ConvertTo-Json
+    \"'
+
+Could NOT be executed: guest is OOMed (see preflight.log [G],
+orchestrator-invocation.log probes). Get-FileHash requires loading
+Microsoft.PowerShell.Utility which hits the paging-file-too-small
+condition.
+
+Code-level evidence the fix is in place
+---------------------------------------
+The fix lives in crates/rustynet-cli/src/windows_install.rs - the
+Phase 27 fold-in commit 6f46a90 ('Phase 27 reviewer fold-in - DPAPI
+key separation') replaced the single-RNG path with two independent
+[System.Security.Cryptography.RandomNumberGenerator]::Create()
+instances (\$wgRng + \$signingRng). The corresponding unit test
+'e2e_bootstrap_uses_distinct_wg_and_signing_passphrases' pins this
+behaviour in CI. So distinctness IS guaranteed by construction at
+bootstrap time; live verification is blocked solely by the VM state.
+
+After the guest is restored, the operator should re-run the intended
+query above to capture observational proof.

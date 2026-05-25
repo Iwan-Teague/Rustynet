@@ -1,0 +1,33 @@
+==============================================================================
+Phase 25 - Step 4 service-status capture (BLOCKED by guest OOM)
+==============================================================================
+
+Intended query:
+    powershell.exe -NoProfile -Command "Get-Service RustyNet |
+        Format-List Name,Status,StartType"
+
+Earliest observation (during the brief pre-OOM window):
+    Status    : Running
+    StartType : Automatic
+    (Name field rendered empty due to PowerShell module autoload starting
+    to fail; see preflight.log [E])
+
+This single observation confirms the RustyNet Windows service IS already
+installed and running on windows-client-1 from a prior bootstrap. The
+Phase 23/26/27 baseline therefore exists on disk, but verification of
+the current install layout (Step 4 directory structure) and re-running
+the Phase 23 orchestrator's bootstrap_host_worker_windows path are both
+blocked by guest OOM.
+
+Subsequent retries (after the VM degraded):
+    $ powershell.exe -NoProfile -EncodedCommand <base64 of "(Get-Service -Name RustyNet -ErrorAction SilentlyContinue).Status">
+    Thread failed to start.
+
+    $ ssh windows@192.168.65.8 'hostname'
+    The shell cannot be started. A failure occurred during initialization:
+    Exception of type 'System.OutOfMemoryException' was thrown.
+
+VM state at evidence-capture time: guest paging file exhausted; every
+SSH login crashes the default PowerShell host before the command body
+runs. See orchestrator-invocation.log for the inferred root cause and
+operator remediation steps.
