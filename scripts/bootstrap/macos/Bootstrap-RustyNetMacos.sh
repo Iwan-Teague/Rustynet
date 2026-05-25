@@ -18,6 +18,10 @@
 #   NETWORK_ID        — mesh network identifier
 #   SSH_ALLOW_CIDRS   — comma-separated CIDRs allowed through SSH fail-open rule
 #   SOURCE_ARCHIVE    — path to the source tarball on this host
+#   WG_INTERFACE      — utun<N> (default utun9; orchestrator passes the
+#                       node-derived value via macos_install.rs's
+#                       utun_name_for_node_id helper so the first plist
+#                       install already targets the correct device)
 #
 # Design:
 #   - Idempotent: safe to re-run; each phase skips if already satisfied.
@@ -607,6 +611,16 @@ install_launchd_service() {
   # orchestrator's collect_pubkeys stage hangs and aborts.  Use 86400 s here
   # to match what enforce_daemon already sets, so the very first invocation
   # also stays within the freshness window.
+  # WG_INTERFACE is the per-node utun device name derived from NODE_ID by
+  # the Rust orchestrator (utun_name_for_node_id in macos_install.rs). Fall
+  # back to utun9 so a manual operator-run install (without the env var)
+  # still produces a usable plist; the install-script regex validation
+  # (^utun[0-9]+$) rejects anything malformed before plist rendering.
+  local wg_interface="${WG_INTERFACE:-utun9}"
+  if [[ ! "${wg_interface}" =~ ^utun[0-9]+$ ]]; then
+    echo "[bootstrap] WG_INTERFACE='${wg_interface}' must match ^utun[0-9]+\$" >&2
+    exit 2
+  fi
   bash "${install_script}" \
     --rustynetd-bin "${RUSTYNETD_BIN}" \
     --state-root "${STATE_ROOT}" \
@@ -618,6 +632,7 @@ install_launchd_service() {
     --brew-prefix "${BREW_PREFIX:-/opt/homebrew}" \
     --auto-tunnel-enforce "false" \
     --trust-max-age-secs 86400 \
+    --wg-interface "${wg_interface}" \
     --fail-closed-ssh-allow "${ssh_allow_flag}" \
     --fail-closed-ssh-allow-cidrs "${SSH_ALLOW_CIDRS:-}"
 }
