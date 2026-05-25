@@ -27,6 +27,10 @@ serde_json = "1"
 log = "0.4"
 rand.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+rustynet-tun = { path = "../../third_party/rustynet-tun" }
+
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.3", default-features = false }
 
@@ -39,5 +43,11 @@ test-harness = ["rustynet-backend-wireguard/test-harness"]
 [dev-dependencies]
 tempfile = "3"
 
-[lints]
-workspace = true
+[lints.rust]
+# Downgrade workspace `unsafe_code = "forbid"` to `deny` so the scoped
+# `#[allow(unsafe_code)]` on `macos_utun_helper_unsafe` can take effect.
+# That module is the only place in rustynetd permitted to use unsafe; it
+# contains the SCM_RIGHTS fd-passing primitives for the macOS utun
+# privileged-helper path. All other modules in the crate still individually
+# pin `#![forbid(unsafe_code)]` at the top of their files.
+unsafe_code = "deny"

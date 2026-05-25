@@ -420,14 +420,20 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
                 continue;
             }
 
-            // Peek first 4 bytes to dispatch RNUF (utun open) vs RNHF (command).
-            let mut peek_buf = [0u8; 4];
-            let peeked = stream.peek(&mut peek_buf).unwrap_or(0);
-
+            // On macOS, peek first 4 bytes to dispatch RNUF (utun open) vs
+            // RNHF (command). On other Unixes there is no utun helper so
+            // the peek + dispatch is unconditional RNHF and we skip the peek.
+            // The peek uses libc::recv with MSG_PEEK (in
+            // macos_utun_helper_unsafe) because UnixStream::peek is still
+            // nightly-only (unix_socket_peek).
             #[cfg(target_os = "macos")]
-            if peeked >= 4 && &peek_buf == crate::macos_utun_helper::RNUF_MAGIC {
-                let _ = crate::macos_utun_helper_server::handle_utun_open_request(stream);
-                continue;
+            {
+                let peek_buf = crate::macos_utun_helper_unsafe::peek_first_4_bytes(&stream)
+                    .unwrap_or([0u8; 4]);
+                if peek_buf == crate::macos_utun_helper::RNUF_MAGIC {
+                    let _ = crate::macos_utun_helper_server::handle_utun_open_request(stream);
+                    continue;
+                }
             }
 
             let response = match read_request(&mut stream) {

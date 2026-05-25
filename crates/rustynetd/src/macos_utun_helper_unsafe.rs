@@ -9,7 +9,8 @@
 //! - [`open_utun_and_send_fd`] — server: open utun device, send fd via SCM_RIGHTS
 //! - [`send_error_response`]   — server: send 1-byte error status + message
 
-use std::os::fd::{OwnedFd, RawFd};
+use std::io;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -22,10 +23,8 @@ pub(crate) fn send_rnuf_and_recv_fd(
     interface_name: &str,
     timeout: Duration,
 ) -> Result<OwnedFd, String> {
-    use std::io::Write;
-
-    let stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("utun helper connect failed: {e}"))?;
+    let stream =
+        UnixStream::connect(socket_path).map_err(|e| format!("utun helper connect failed: {e}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| format!("utun helper set_read_timeout failed: {e}"))?;
@@ -134,8 +133,7 @@ pub(crate) fn open_utun_and_send_fd(
 fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
-    let cmsg_space =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
     let mut cmsg_buf = vec![0u8; cmsg_space];
 
     let mut dummy: u8 = 0;
@@ -143,7 +141,7 @@ fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
         iov_base: (&mut dummy) as *mut u8 as *mut libc::c_void,
         iov_len: 1,
     };
-    let mut msghdr = libc::msghdr {
+    let msghdr = libc::msghdr {
         msg_name: std::ptr::null_mut(),
         msg_namelen: 0,
         msg_iov: &mut iov,
@@ -157,8 +155,7 @@ fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
         let cmsg = libc::CMSG_FIRSTHDR(&msghdr);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len =
-            libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as libc::socklen_t;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as libc::socklen_t;
         let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
         std::ptr::write_unaligned(data, fd);
 
@@ -171,6 +168,37 @@ fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Peek the first 4 bytes of a Unix stream without consuming them.
+///
+/// Uses `libc::recv` with `MSG_PEEK` because `UnixStream::peek` is unstable
+/// (`unix_socket_peek`). Returns the number of bytes peeked (0 if peer closed
+/// before sending 4 bytes). Used by the privileged-helper accept loop to
+/// dispatch RNUF (macOS utun fd-passing) vs RNHF (general command) frames
+/// without disturbing the byte stream that the downstream handler will read.
+pub(crate) fn peek_first_4_bytes(stream: &UnixStream) -> io::Result<[u8; 4]> {
+    use std::os::fd::AsRawFd;
+    let mut buf = [0u8; 4];
+    let nbytes = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+            libc::MSG_PEEK,
+        )
+    };
+    if nbytes < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (nbytes as usize) < buf.len() {
+        // Pad with zeros if fewer than 4 bytes were peekable — caller checks
+        // against known 4-byte magics, so partial peek will never match.
+        for byte in &mut buf[nbytes as usize..] {
+            *byte = 0;
+        }
+    }
+    Ok(buf)
 }
 
 /// Server: send a 1-byte error indicator followed by the error message text.
