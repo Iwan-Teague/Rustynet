@@ -11,6 +11,17 @@ pub const DEFAULT_WINDOWS_MEMBERSHIP_ROOT: &str = r"C:\ProgramData\RustyNet\memb
 pub const DEFAULT_WINDOWS_KEYS_ROOT: &str = r"C:\ProgramData\RustyNet\keys";
 pub const DEFAULT_WINDOWS_SECRET_ROOT: &str = r"C:\ProgramData\RustyNet\secrets";
 pub const DEFAULT_WINDOWS_KEY_CUSTODY_ROOT: &str = r"C:\ProgramData\RustyNet\secrets\key-custody";
+/// Per-invocation membership-mutation credential workspace root.
+///
+/// The `ops e2e-membership-...` verbs create a per-call subdirectory
+/// here, materialise the membership signing-key passphrase plaintext
+/// into a 0600 / SYSTEM-Administrators-only tempfile under that
+/// subdirectory, then shred + remove the tree once the mutation
+/// completes. The reviewed parent ACL is SYSTEM/Administrators-only,
+/// validated at daemon start by the W4 runtime ACL gate and
+/// re-validated by the verb at use time.
+pub const DEFAULT_WINDOWS_CREDENTIALS_WORKSPACE_ROOT: &str =
+    r"C:\ProgramData\RustyNet\credentials-workspace";
 pub const DEFAULT_WINDOWS_STATE_PATH: &str = r"C:\ProgramData\RustyNet\rustynetd.state";
 pub const DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\rustynetd.trust";
@@ -54,6 +65,8 @@ pub const DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH: &str =
     r"C:\ProgramData\RustyNet\keys\wireguard.key.enc";
 pub const DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH: &str =
     r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi";
+pub const DEFAULT_WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH: &str =
+    r"C:\ProgramData\RustyNet\secrets\signing_key_passphrase.dpapi";
 pub const DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH: &str = r"C:\ProgramData\RustyNet\keys\wireguard.pub";
 
 const LINUX_RUNTIME_ROOTS: [&str; 4] = [
@@ -255,6 +268,10 @@ const WINDOWS_RUNTIME_STARTUP_ACL_ROOTS: &[(&str, &str)] = &[
     (DEFAULT_WINDOWS_KEYS_ROOT, "keys root"),
     (DEFAULT_WINDOWS_SECRET_ROOT, "secret root"),
     (DEFAULT_WINDOWS_KEY_CUSTODY_ROOT, "key-custody root"),
+    (
+        DEFAULT_WINDOWS_CREDENTIALS_WORKSPACE_ROOT,
+        "credentials workspace root",
+    ),
 ];
 
 pub(crate) fn evaluate_windows_runtime_acl_sddl(
@@ -402,6 +419,7 @@ fn is_reviewed_runtime_path(normalized: &str) -> bool {
         || under_reviewed_root(lowered.as_str(), DEFAULT_WINDOWS_MEMBERSHIP_ROOT)
         || under_reviewed_root(lowered.as_str(), DEFAULT_WINDOWS_KEYS_ROOT)
         || under_reviewed_root(lowered.as_str(), DEFAULT_WINDOWS_SECRET_ROOT)
+        || under_reviewed_root(lowered.as_str(), DEFAULT_WINDOWS_CREDENTIALS_WORKSPACE_ROOT)
 }
 
 fn under_reviewed_root(lowered: &str, root: &str) -> bool {
@@ -750,6 +768,7 @@ mod tests {
             DEFAULT_WINDOWS_KEYS_ROOT,
             DEFAULT_WINDOWS_SECRET_ROOT,
             DEFAULT_WINDOWS_KEY_CUSTODY_ROOT,
+            DEFAULT_WINDOWS_CREDENTIALS_WORKSPACE_ROOT,
         ] {
             assert!(
                 paths.contains(&required),
@@ -1025,7 +1044,7 @@ mod tests {
     /// silent removal of a root (e.g. dropping `key-custody root` by
     /// accident) trips a named failure.
     #[test]
-    fn windows_runtime_startup_acl_roots_snapshot_pinned_at_eight_entries() {
+    fn windows_runtime_startup_acl_roots_snapshot_pinned_at_nine_entries() {
         let paths: Vec<&str> = WINDOWS_RUNTIME_STARTUP_ACL_ROOTS
             .iter()
             .map(|(p, _)| *p)
@@ -1039,6 +1058,7 @@ mod tests {
             DEFAULT_WINDOWS_KEYS_ROOT,
             DEFAULT_WINDOWS_SECRET_ROOT,
             DEFAULT_WINDOWS_KEY_CUSTODY_ROOT,
+            DEFAULT_WINDOWS_CREDENTIALS_WORKSPACE_ROOT,
         ];
         assert_eq!(
             paths, expected,
