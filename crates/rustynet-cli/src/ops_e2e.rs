@@ -349,6 +349,22 @@ pub fn execute_ops_e2e_bootstrap_host(
         &[],
         "creating runtime directory failed",
     )?;
+    // Per-invocation credential workspace root. Root-owned 0700 so
+    // membership-mutation verbs (`ops e2e-membership-...`) can stage
+    // a plaintext-passphrase tempfile under an ACL-fenced parent
+    // instead of `/tmp` (which is mode 1777 sticky-writable and
+    // exposed to symlink-TOCTOU attacks; CWE-367).
+    run_status(
+        "install",
+        &[
+            "-d",
+            "-m",
+            "0700",
+            "/var/lib/rustynet/credentials-workspace",
+        ],
+        &[],
+        "creating credentials workspace directory failed",
+    )?;
 
     let passphrase_path = format!(
         "/tmp/rustynet-passphrase.{}.{}",
@@ -895,6 +911,16 @@ pub fn execute_ops_e2e_bootstrap_macos(
         &[],
         "creating macOS config directory failed",
     )?;
+    // Per-invocation credential workspace root (see Linux comment
+    // above). Eliminates the `/tmp` TOCTOU window on macOS by
+    // hosting the plaintext-passphrase tempfile under the same 0700
+    // root that already fences the membership snapshot.
+    run_status(
+        "install",
+        &["-d", "-m", "0700", MACOS_CREDENTIALS_WORKSPACE_DIR],
+        &[],
+        "creating macOS credentials workspace directory failed",
+    )?;
 
     let snapshot = format!("{MACOS_MEMBERSHIP_DIR}/membership.snapshot");
     let log = format!("{MACOS_MEMBERSHIP_DIR}/membership.log");
@@ -1392,12 +1418,45 @@ struct MembershipMutationPaths {
     log: PathBuf,
     watermark: PathBuf,
     owner_signing_key: PathBuf,
-    /// Secure parent for the per-invocation passphrase tempfile. The
-    /// caller creates the per-invocation workspace as a 0700 (Unix) /
-    /// SYSTEM-Administrators-ACLed (Windows) child of this directory
-    /// and removes the entire tree once the mutation is done.
+    /// Secure parent for the per-invocation passphrase workspace.
+    ///
+    /// MUST be a root-owned 0700 (Unix) / SYSTEM-Administrators-only
+    /// (Windows) directory created at install time so that:
+    /// - `/tmp` (mode 1777 sticky-writable) cannot be a parent on any
+    ///   reviewed platform (closes the symlink/TOCTOU window where an
+    ///   attacker pre-creates the workspace as a symlink and the
+    ///   chmod-after-create follows it; CWE-367).
+    /// - The eventual passphrase tempfile inherits a reviewed access
+    ///   fence even before our own 0600 chmod runs.
+    ///
+    /// On Linux this is `/var/lib/rustynet/credentials-workspace`
+    /// (sibling to the existing state roots). On macOS it is
+    /// `/usr/local/var/rustynet/credentials-workspace`. On Windows it
+    /// is `C:\ProgramData\RustyNet\credentials-workspace`, which the
+    /// W4 verifier validates as SYSTEM/Administrators-only.
     secure_workspace_parent: PathBuf,
 }
+
+/// Linux per-invocation credential workspace parent. Root-owned 0700
+/// directory pre-created by the install adapter. Eliminates the
+/// `/tmp` (mode 1777) TOCTOU window (CWE-367) the previous
+/// implementation was exposed to.
+#[cfg(target_os = "linux")]
+const LINUX_CREDENTIALS_WORKSPACE_DIR: &str = "/var/lib/rustynet/credentials-workspace";
+
+/// macOS per-invocation credential workspace parent. Lives under the
+/// reviewed state root (`/usr/local/var/rustynet`) which the macOS
+/// install adapter already maintains as 0700 root:rustynetd.
+#[cfg(target_os = "macos")]
+const MACOS_CREDENTIALS_WORKSPACE_DIR: &str = "/usr/local/var/rustynet/credentials-workspace";
+
+/// Windows per-invocation credential workspace parent. SYSTEM/
+/// Administrators-only DACL inherited from
+/// `C:\ProgramData\RustyNet\`, validated post-creation by the W4
+/// runtime ACL gate.
+#[cfg(target_os = "windows")]
+const WINDOWS_CREDENTIALS_WORKSPACE_DIR: &str =
+    rustynetd::windows_paths::DEFAULT_WINDOWS_CREDENTIALS_WORKSPACE_ROOT;
 
 impl MembershipMutationPaths {
     fn for_current_platform() -> Self {
@@ -1408,7 +1467,7 @@ impl MembershipMutationPaths {
                 log: PathBuf::from("/var/lib/rustynet/membership.log"),
                 watermark: PathBuf::from("/var/lib/rustynet/membership.watermark"),
                 owner_signing_key: PathBuf::from("/etc/rustynet/membership.owner.key"),
-                secure_workspace_parent: PathBuf::from("/tmp"),
+                secure_workspace_parent: PathBuf::from(LINUX_CREDENTIALS_WORKSPACE_DIR),
             }
         }
         #[cfg(target_os = "macos")]
@@ -1422,7 +1481,7 @@ impl MembershipMutationPaths {
                 // the macOS install adapter; placing the workspace inside
                 // the reviewed state root keeps the plaintext-passphrase
                 // tempfile under the same access fence as the snapshot.
-                secure_workspace_parent: PathBuf::from(MACOS_STATE_ROOT),
+                secure_workspace_parent: PathBuf::from(MACOS_CREDENTIALS_WORKSPACE_DIR),
             }
         }
         #[cfg(target_os = "windows")]
@@ -1438,14 +1497,14 @@ impl MembershipMutationPaths {
                 owner_signing_key: PathBuf::from(
                     rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
                 ),
-                // C:\ProgramData\RustyNet\secrets carries the canonical
-                // SYSTEM/Administrators-only ACL; placing the per-
-                // invocation passphrase tempfile here keeps the
-                // plaintext inside the same access fence as the DPAPI
-                // blob it was unwrapped from.
-                secure_workspace_parent: PathBuf::from(
-                    rustynetd::windows_paths::DEFAULT_WINDOWS_SECRET_ROOT,
-                ),
+                // C:\ProgramData\RustyNet\credentials-workspace carries
+                // the canonical SYSTEM/Administrators-only ACL inherited
+                // from \ProgramData\RustyNet\. The per-invocation
+                // workspace lives under here and is validated post-
+                // creation by the W4 runtime ACL gate so even a future
+                // non-inheriting `D:P` ACL on `\secrets\` cannot leave a
+                // child workspace with a default DACL.
+                secure_workspace_parent: PathBuf::from(WINDOWS_CREDENTIALS_WORKSPACE_DIR),
             }
         }
     }
@@ -1467,10 +1526,13 @@ impl MembershipMutationPaths {
 /// Returns the populated workspace + passphrase file path. The caller
 /// must call `secure_remove_file` on the passphrase path and
 /// `fs::remove_dir_all` on the workspace once the mutation completes
-/// (success or failure). The workspace is created with 0700 mode
-/// (Unix) or under the SYSTEM/Administrators-ACLed `\secrets\` root
-/// (Windows) so plaintext material cannot be read by other local
-/// identities during the brief window between unwrap and shred.
+/// (success or failure). The workspace is created atomically with
+/// 0700 mode (Unix) — see `create_membership_workspace_dir_atomic`
+/// for the reviewed TOCTOU-safe creation contract — or under the
+/// SYSTEM/Administrators-ACLed credentials-workspace root (Windows,
+/// then re-validated by the W4 runtime ACL gate) so plaintext
+/// material cannot be read by other local identities during the
+/// brief window between unwrap and shred.
 fn stage_membership_signing_passphrase(
     paths: &MembershipMutationPaths,
 ) -> Result<(PathBuf, PathBuf), String> {
@@ -1478,14 +1540,25 @@ fn stage_membership_signing_passphrase(
         CredentialUnwrapBackend, membership_signing_key_passphrase_descriptor,
     };
 
-    let work_dir = paths.secure_workspace_parent.join(format!(
-        "rustynet-membership-update.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    fs::create_dir_all(&work_dir)
-        .map_err(|err| format!("failed creating {}: {err}", work_dir.display()))?;
-    set_unix_mode(work_dir.as_path(), 0o700)?;
+    // The parent workspace root MUST exist (pre-created by the
+    // platform install adapter) and be a real directory — refuse to
+    // mutate state if the install path is wrong. Refusing here is a
+    // fail-closed default that matches the daemon's startup ACL gates.
+    let parent_metadata = fs::symlink_metadata(&paths.secure_workspace_parent).map_err(|err| {
+        format!(
+            "credential workspace parent missing or unreadable ({}): {err}; \
+             run the platform install adapter so the parent is provisioned with the reviewed ACL",
+            paths.secure_workspace_parent.display()
+        )
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(format!(
+            "credential workspace parent must be a real directory, not a symlink or file: {}",
+            paths.secure_workspace_parent.display()
+        ));
+    }
+
+    let work_dir = create_membership_workspace_dir_atomic(paths.secure_workspace_parent.as_path())?;
 
     let passphrase_path = work_dir.join("signing-key.passphrase");
     let descriptor = membership_signing_key_passphrase_descriptor();
@@ -1573,6 +1646,104 @@ fn stage_membership_signing_passphrase(
     set_unix_mode(passphrase_path.as_path(), 0o600)?;
 
     Ok((work_dir, passphrase_path))
+}
+
+/// Track B Phase 22 follow-up — atomically create the per-invocation
+/// credential workspace directory under `parent` with 0700 mode (Unix)
+/// or default SYSTEM/Administrators inheritance (Windows), then
+/// validate the resulting ACL fail-closed on Windows.
+///
+/// The created directory always wins the create-vs-replace race because:
+/// - Unix path uses `DirBuilder::mode(0o700).create(...)` — backed by
+///   `mkdir(2)` with the 0700 mode applied at creation time. If the
+///   leaf path already exists (regular file, directory, OR symlink
+///   pointing anywhere), `create` returns `AlreadyExists` and we
+///   retry with a fresh random suffix. This eliminates the previous
+///   `create_dir_all` + post-chmod TOCTOU window (CWE-367) where an
+///   attacker could pre-create the target as a symlink to a
+///   directory they wanted to chmod 0700.
+/// - Windows path uses `fs::create_dir` (`CreateDirectoryW`) which is
+///   also atomic-create-or-fail. The new directory inherits its DACL
+///   from `parent` (always SYSTEM/Administrators-only under the
+///   reviewed install layout), and we re-validate with the W4 runtime
+///   ACL gate after creation so any drift in the parent's
+///   non-inheriting `D:P` ACL is caught fail-closed.
+fn create_membership_workspace_dir_atomic(parent: &Path) -> Result<PathBuf, String> {
+    const MAX_ATTEMPTS: u32 = 32;
+    for _attempt in 0..MAX_ATTEMPTS {
+        let candidate = parent.join(format!(
+            "rustynet-membership-update.{}.{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let create_result = create_owner_only_dir_atomic(candidate.as_path());
+        match create_result {
+            Ok(()) => {
+                // On Windows the directory inherits its DACL from the
+                // reviewed credentials-workspace root, but a future
+                // non-inheriting `D:P` ACL on the parent could leave
+                // the child with a default DACL that includes
+                // WRITE_DAC for non-SYSTEM users. Re-validate the W4
+                // runtime ACL contract before returning so a drifted
+                // parent fails closed at use time.
+                #[cfg(target_os = "windows")]
+                {
+                    if let Err(err) = rustynetd::windows_paths::validate_windows_runtime_acl(
+                        candidate.as_path(),
+                        "membership credentials workspace",
+                    ) {
+                        let _ = fs::remove_dir_all(candidate.as_path());
+                        return Err(format!(
+                            "membership credentials workspace ACL validation failed; \
+                             the parent {} may have lost the reviewed \
+                             SYSTEM/Administrators-only DACL: {err}",
+                            parent.display()
+                        ));
+                    }
+                }
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "creating membership credentials workspace {} failed: {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "unable to allocate a free membership credentials workspace under {} after {MAX_ATTEMPTS} attempts",
+        parent.display()
+    ))
+}
+
+/// Atomic, owner-only directory creation that fails on collision.
+///
+/// On Unix this calls `mkdir(2)` via `DirBuilder` with mode 0o700
+/// applied at creation. Because the kernel rejects `mkdir` on any
+/// existing leaf (regular file, directory, or dangling symlink), a
+/// successful return guarantees the new inode is the one we just
+/// created with the desired mode — no separate chmod is needed.
+///
+/// On Windows this calls `CreateDirectoryW` via `fs::create_dir`,
+/// which is also atomic-create-or-fail and inherits the parent ACL.
+fn create_owner_only_dir_atomic(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.recursive(false);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: CreateDirectoryW is atomic-create-or-fail and
+        // inherits the parent's DACL by default. Post-creation
+        // validation runs in the caller.
+        fs::create_dir(path)
+    }
 }
 
 pub fn execute_ops_e2e_membership_set_capabilities(
@@ -6584,6 +6755,43 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
     #[test]
     fn e2e_backend_mode_value_parser_returns_none_for_empty() {
         assert_eq!(super::parse_e2e_backend_mode_value("").unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn membership_workspace_create_is_atomic_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().expect("tempdir");
+        let work_dir = super::create_membership_workspace_dir_atomic(parent.path())
+            .expect("workspace should be created");
+        assert!(
+            work_dir.starts_with(parent.path()),
+            "workspace must stay under reviewed parent"
+        );
+        let mode = std::fs::symlink_metadata(&work_dir)
+            .expect("workspace metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "workspace must be created mode 0700");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_dir_atomic_rejects_existing_symlink_leaf() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let attacker_target = tempfile::tempdir().expect("target");
+        let symlink_leaf = parent.path().join("rustynet-membership-update.symlink");
+        std::os::unix::fs::symlink(attacker_target.path(), &symlink_leaf).expect("symlink");
+
+        let err = super::create_owner_only_dir_atomic(&symlink_leaf)
+            .expect_err("mkdir must fail on existing symlink leaf");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "atomic mkdir must not follow or chmod attacker-controlled symlink"
+        );
     }
 
     #[cfg(not(windows))]
