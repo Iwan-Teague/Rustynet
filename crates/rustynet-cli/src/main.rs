@@ -88,6 +88,11 @@ use rustynetd::key_material::{
     initialize_encrypted_key_material, migrate_existing_private_key_material,
     read_passphrase_file_explicit, remove_file_if_present, store_passphrase_in_os_secure_store,
 };
+#[cfg(windows)]
+use rustynetd::windows_ipc::{
+    DEFAULT_WINDOWS_DAEMON_PIPE_PATH, WindowsLocalIpcRole, call_windows_daemon_control_raw,
+    validate_windows_pipe_path,
+};
 use serde_json::{Value, json};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -14440,9 +14445,18 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
     }
 }
 
+#[cfg(not(windows))]
 fn daemon_socket_path() -> PathBuf {
     std::env::var("RUSTYNET_DAEMON_SOCKET")
         .map_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH), PathBuf::from)
+}
+
+#[cfg(windows)]
+fn daemon_socket_path() -> PathBuf {
+    std::env::var("RUSTYNET_DAEMON_SOCKET").map_or_else(
+        |_| PathBuf::from(DEFAULT_WINDOWS_DAEMON_PIPE_PATH),
+        PathBuf::from,
+    )
 }
 
 /// Track B Phase 18 — root-managed shared-runtime socket
@@ -14486,6 +14500,7 @@ fn rustynetd_service_gid_for_socket(path: &Path) -> Option<u32> {
         .map(|group| group.gid.as_raw())
 }
 
+#[cfg(not(windows))]
 fn validate_control_socket_security(path: &Path, label: &str) -> Result<(), String> {
     let expected_uid = Uid::effective().as_raw();
     let mut allowed_owner_uids = vec![expected_uid, 0];
@@ -14506,10 +14521,17 @@ fn validate_control_socket_security(path: &Path, label: &str) -> Result<(), Stri
     validate_owner_only_socket(path, label, &allowed_owner_uids, &allowed_owner_uids)
 }
 
+#[cfg(windows)]
+fn validate_control_socket_security(path: &Path, label: &str) -> Result<(), String> {
+    validate_windows_pipe_path(path, WindowsLocalIpcRole::DaemonControl)
+        .map_err(|err| format!("{label} named-pipe path failed validation: {err}"))
+}
+
 fn send_command(command: IpcCommand) -> Result<IpcResponse, String> {
     send_command_with_socket(command, daemon_socket_path())
 }
 
+#[cfg(not(windows))]
 fn send_command_with_socket(
     command: IpcCommand,
     socket_path: PathBuf,
@@ -14528,6 +14550,20 @@ fn send_command_with_socket(
         .read_line(&mut line)
         .map_err(|err| format!("read failed: {err}"))?;
 
+    Ok(IpcResponse::from_wire(&line))
+}
+
+#[cfg(windows)]
+fn send_command_with_socket(
+    command: IpcCommand,
+    socket_path: PathBuf,
+) -> Result<IpcResponse, String> {
+    validate_control_socket_security(socket_path.as_path(), "daemon socket")?;
+    let line = call_windows_daemon_control_raw(
+        socket_path.as_path(),
+        command.as_wire(),
+        Duration::from_secs(5),
+    )?;
     Ok(IpcResponse::from_wire(&line))
 }
 

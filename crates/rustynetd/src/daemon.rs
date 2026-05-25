@@ -75,7 +75,7 @@ use crate::windows_backend_gate::{
 #[cfg(windows)]
 use crate::windows_ipc::{
     DEFAULT_WINDOWS_DAEMON_PIPE_PATH, MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES,
-    WindowsLocalIpcRole, build_named_pipe_security_sddl, validate_windows_pipe_path,
+    WindowsLocalIpcRole, serve_windows_daemon_control_request_once, validate_windows_pipe_path,
 };
 #[cfg(windows)]
 use crate::windows_paths::{
@@ -152,8 +152,6 @@ use rustynet_policy::{
     ContextualAccessRequest, ContextualPolicyRule, ContextualPolicySet, Decision,
     MembershipDirectory, MembershipStatus, Protocol, RuleAction, TrafficContext,
 };
-#[cfg(windows)]
-use rustynet_windows_native::serve_named_pipe_one_message;
 use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "macos")]
@@ -8762,7 +8760,8 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // an mpsc channel so DaemonRuntime stays single-threaded.
         let (cmd_tx, cmd_rx) = mpsc::channel::<(Vec<u8>, mpsc::SyncSender<Vec<u8>>)>();
         let pipe_path_str = config.socket_path.to_string_lossy().to_string();
-        let control_sddl = build_named_pipe_security_sddl(WindowsLocalIpcRole::DaemonControl, None);
+        let service_sid =
+            rustynet_windows_native::lookup_account_sid_string(r"NT SERVICE\RustyNet").ok();
 
         std::thread::Builder::new()
             .name("rustynetd-control-pipe".to_string())
@@ -8770,11 +8769,16 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                 loop {
                     let (resp_tx, resp_rx) = mpsc::sync_channel::<Vec<u8>>(1);
                     let cmd_tx_clone = cmd_tx.clone();
-                    if let Err(err) = serve_named_pipe_one_message(
-                        pipe_path_str.as_str(),
-                        control_sddl.as_str(),
-                        MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES,
+                    if let Err(err) = serve_windows_daemon_control_request_once(
+                        Path::new(pipe_path_str.as_str()),
+                        service_sid.as_deref(),
                         |request_bytes| {
+                            if request_bytes.len() > MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES {
+                                return Err(format!(
+                                    "daemon control request exceeds maximum size ({} > {MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES} bytes)",
+                                    request_bytes.len()
+                                ));
+                            }
                             cmd_tx_clone.send((request_bytes, resp_tx)).map_err(|e| {
                                 format!("control pipe cmd channel send failed: {e}")
                             })?;

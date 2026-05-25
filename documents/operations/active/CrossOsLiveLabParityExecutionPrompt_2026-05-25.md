@@ -235,6 +235,8 @@ Already covered by Phase 23's Windows arm in the wrapper, but Phase 25 is the fo
 
 #### Phase 26 — Windows daemon named-pipe + parent allowlist
 
+**Status (2026-05-25)**: code-complete on `codex/windows-named-pipe-acl`; live Windows proof still pending.
+
 **Problem**: Windows daemon socket is a named pipe `\\.\pipe\rustynet`, not a Unix socket. Track B Phase 18 added the macOS allowlist; Windows needs analogous allowlist + named-pipe security descriptor validation.
 
 **Fix**: add Windows-specific socket validator that checks the named-pipe ACL via `windows-rs` (or `winapi`) — must require `BUILTIN\Administrators` full control, `rustynetd` service account read/write, deny everyone else.
@@ -247,6 +249,21 @@ Already covered by Phase 23's Windows arm in the wrapper, but Phase 25 is the fo
 **Acceptance criteria**:
 - Windows CLI can introspect the daemon (`rustynet status` returns the canonical line).
 - Unit tests pin the named-pipe ACL contract.
+
+**Implemented**:
+- Native named-pipe ACL inspection and authorized server path in `crates/rustynet-windows-native/src/lib.rs`.
+- Shared Windows IPC policy and ACL report producer in `crates/rustynetd/src/windows_ipc.rs`.
+- `rustynetd windows-named-pipe-acls-check` fail-closed validator in `crates/rustynetd/src/main.rs`.
+- Windows CLI daemon control path now validates the named-pipe path and uses the local named-pipe transport in `crates/rustynet-cli/src/main.rs`.
+- Live-lab stage `validate_windows_named_pipe_acls` added in `crates/rustynet-cli/src/vm_lab/mod.rs`.
+- Bootstrap verifier now records named-pipe ACL validation status in `scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1`.
+
+**Local proof**:
+- `cargo fmt --all -- --check`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase26-target cargo test -p rustynetd windows_ipc --all-features`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase26-target cargo test -p rustynetd windows_named_pipe --all-features`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase26-target cargo test -p rustynet-cli windows_named_pipe --all-features`
+- `CARGO_TARGET_DIR=/private/tmp/rustynet-phase26-target cargo clippy -p rustynetd -p rustynet-cli -p rustynet-windows-native --all-targets --all-features -- -D warnings`
 
 #### Phase 27 — Windows `ops e2e-membership-set-capabilities` (DPAPI completion)
 
