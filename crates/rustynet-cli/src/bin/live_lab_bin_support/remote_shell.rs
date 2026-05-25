@@ -548,29 +548,7 @@ impl RemoteShellHost for WindowsShellHost {
     ) -> Result<(), RemoteShellError> {
         validate_remote_path(remote_path)?;
         validate_mode_octal(mode_octal)?;
-        let b64 = encode_base64_standard(bytes);
-        // `[Convert]::FromBase64String` requires a String literal, so
-        // we embed the base64 payload as a here-string. Base64 only
-        // contains [A-Za-z0-9+/=] — none of which need PowerShell
-        // escaping inside a single-quoted string. The icacls step
-        // tightens the ACL after the bytes are written; the order is
-        // "create file, then tighten ACL" because Windows ACLs are
-        // applied via icacls and require the file to exist. The
-        // `[IO.File]::WriteAllBytes` call inherits the parent
-        // directory's ACL (typically root-only inside the live-lab
-        // RustyNet ProgramData tree), so even before icacls runs the
-        // file is not world-readable.
-        let acl_script = windows_mode_to_acl_script(remote_path, mode_octal);
-        let script = format!(
-            "$ErrorActionPreference='Stop'; $path = '{path}'; \
-             $parent = Split-Path -Parent $path; \
-             if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ \
-               New-Item -ItemType Directory -Force -Path $parent | Out-Null; \
-             }}; \
-             [System.IO.File]::WriteAllBytes($path, [Convert]::FromBase64String('{b64}')); \
-             {acl_script}",
-            path = powershell_single_quote_escape(remote_path),
-        );
+        let script = windows_write_file_script(remote_path, bytes, mode_octal);
         let _ = windows_run_powershell(
             &self.identity,
             &self.known_hosts,
@@ -699,46 +677,7 @@ impl RemoteShellHost for WindowsShellHost {
             u32::try_from(timeout.as_millis()).map_err(|_| RemoteShellError::InvalidInput {
                 message: format!("tcp timeout {timeout:?} exceeds 32-bit milliseconds"),
             })?;
-        // Pure-PowerShell TCP client: connect with an explicit
-        // ReceiveTimeout / SendTimeout so a hung peer cannot block
-        // forever. The response is base64-encoded server-side so
-        // binary payloads survive PowerShell's pipeline.
-        let script = format!(
-            "$ErrorActionPreference='Stop'; \
-             $client = New-Object System.Net.Sockets.TcpClient; \
-             $client.ReceiveTimeout = {timeout_ms}; \
-             $client.SendTimeout = {timeout_ms}; \
-             try {{ \
-               $iar = $client.BeginConnect('{host}', {port}, $null, $null); \
-               if (-not $iar.AsyncWaitHandle.WaitOne({timeout_ms}, $false)) {{ \
-                 throw 'tcp connect timed out'; \
-               }}; \
-               $client.EndConnect($iar); \
-               $stream = $client.GetStream(); \
-               $payload = [Convert]::FromBase64String('{payload_b64}'); \
-               if ($payload.Length -gt 0) {{ $stream.Write($payload, 0, $payload.Length); }}; \
-               $stream.Flush(); \
-               $buffer = New-Object byte[] 4096; \
-               $ms = New-Object System.IO.MemoryStream; \
-               $deadline = [DateTime]::UtcNow.AddMilliseconds({timeout_ms}); \
-               while ([DateTime]::UtcNow -lt $deadline) {{ \
-                 if ($client.Available -gt 0) {{ \
-                   $read = $stream.Read($buffer, 0, $buffer.Length); \
-                   if ($read -le 0) {{ break; }}; \
-                   $ms.Write($buffer, 0, $read); \
-                 }} elseif ($ms.Length -gt 0) {{ \
-                   break; \
-                 }} else {{ \
-                   Start-Sleep -Milliseconds 50; \
-                 }}; \
-               }}; \
-               $bytes = $ms.ToArray(); \
-               [Console]::Out.Write([Convert]::ToBase64String($bytes)); \
-             }} finally {{ \
-               $client.Close(); \
-             }}",
-            host = powershell_single_quote_escape(host),
-        );
+        let script = windows_tcp_send_recv_script(host, port, &payload_b64, timeout_ms);
         let output = windows_run_powershell(
             &self.identity,
             &self.known_hosts,
@@ -947,6 +886,119 @@ fn windows_run_powershell(
     })
 }
 
+/// Build the PowerShell body that drives the Windows `write_file`
+/// primitive. Extracted from [`WindowsShellHost::write_file`] so a
+/// unit test can assert the atomic-create-with-restrictive-ACL
+/// ordering without needing a remote PowerShell to actually execute
+/// it.
+///
+/// The script's hardened contract (mirrors POSIX `umask 077; install
+/// -m`):
+///
+///   1. Create an empty tmpfile in the target's parent dir.
+///   2. Tighten the tmpfile's ACL BEFORE any secret bytes are
+///      written. The first `WriteAllBytes` happens only after the
+///      DACL is canonical, so a concurrent observer that opens the
+///      tmpfile during the race window sees an empty file it has no
+///      read access to.
+///   3. `WriteAllBytes` the payload into the already-ACL'd tmpfile.
+///   4. `Move-Item` the tmpfile onto the final path. NTFS rename
+///      preserves the source DACL on the destination, so the target
+///      inherits the SYSTEM+Administrators-only ACL we just
+///      installed.
+///   5. Verify the post-move DACL matches the requested mode. If
+///      verification fails the file is deleted and the script
+///      throws fail-closed.
+///
+/// This keeps the invariant: between the moment any byte of the
+/// final path exists and the moment its DACL is locked down, NO
+/// secret bytes can have been written.
+pub(crate) fn windows_write_file_script(remote_path: &str, bytes: &[u8], mode: u16) -> String {
+    let b64 = encode_base64_standard(bytes);
+    let acl_script = windows_mode_to_acl_script_for_tmpfile(mode);
+    let post_move_verify = windows_post_move_acl_verify_script(mode);
+    format!(
+        "$ErrorActionPreference='Stop'; $path = '{path}'; \
+         $parent = Split-Path -Parent $path; \
+         if ($parent -and -not (Test-Path -LiteralPath $parent)) {{ \
+           New-Item -ItemType Directory -Force -Path $parent | Out-Null; \
+         }}; \
+         $tmpName = [System.IO.Path]::GetRandomFileName(); \
+         $tmp = if ($parent) {{ Join-Path -Path $parent -ChildPath ($tmpName + '.partial') }} \
+                else {{ $tmpName + '.partial' }}; \
+         try {{ \
+           $null = New-Item -ItemType File -Path $tmp -Force; \
+           {acl_script}; \
+           [System.IO.File]::WriteAllBytes($tmp, [Convert]::FromBase64String('{b64}')); \
+           Move-Item -LiteralPath $tmp -Destination $path -Force; \
+           {post_move_verify}; \
+         }} catch {{ \
+           if (Test-Path -LiteralPath $tmp) {{ \
+             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; \
+           }}; \
+           throw; \
+         }}",
+        path = powershell_single_quote_escape(remote_path),
+    )
+}
+
+/// Build the PowerShell body that drives the Windows TCP send/recv
+/// primitive. Extracted from [`WindowsShellHost::tcp_send_recv`] so a
+/// unit test can assert the script structure without needing a remote
+/// PowerShell to actually execute it.
+///
+/// The read loop MUST be timeout-based, not first-segment-arrival-
+/// based: keep reading until either the peer closes (Read returns 0)
+/// or the caller's deadline fires. This matches POSIX `nc -w <secs>`.
+pub(crate) fn windows_tcp_send_recv_script(
+    host: &str,
+    port: u16,
+    payload_b64: &str,
+    timeout_ms: u32,
+) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         $client = New-Object System.Net.Sockets.TcpClient; \
+         $client.ReceiveTimeout = {timeout_ms}; \
+         $client.SendTimeout = {timeout_ms}; \
+         try {{ \
+           $iar = $client.BeginConnect('{host}', {port}, $null, $null); \
+           if (-not $iar.AsyncWaitHandle.WaitOne({timeout_ms}, $false)) {{ \
+             throw 'tcp connect timed out'; \
+           }}; \
+           $client.EndConnect($iar); \
+           $stream = $client.GetStream(); \
+           $payload = [Convert]::FromBase64String('{payload_b64}'); \
+           if ($payload.Length -gt 0) {{ $stream.Write($payload, 0, $payload.Length); }}; \
+           $stream.Flush(); \
+           $buffer = New-Object byte[] 4096; \
+           $ms = New-Object System.IO.MemoryStream; \
+           $deadline = [DateTime]::UtcNow.AddMilliseconds({timeout_ms}); \
+           while ([DateTime]::UtcNow -lt $deadline) {{ \
+             $remainingMs = [int]([Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)); \
+             if ($remainingMs -le 0) {{ break; }}; \
+             $readAr = $stream.BeginRead($buffer, 0, $buffer.Length, $null, $null); \
+             if (-not $readAr.AsyncWaitHandle.WaitOne($remainingMs, $false)) {{ \
+               try {{ $stream.Close(); }} catch {{}}; \
+               break; \
+             }}; \
+             try {{ \
+               $read = $stream.EndRead($readAr); \
+             }} catch {{ \
+               break; \
+             }}; \
+             if ($read -le 0) {{ break; }}; \
+             $ms.Write($buffer, 0, $read); \
+           }}; \
+           $bytes = $ms.ToArray(); \
+           [Console]::Out.Write([Convert]::ToBase64String($bytes)); \
+         }} finally {{ \
+           $client.Close(); \
+         }}",
+        host = powershell_single_quote_escape(host),
+    )
+}
+
 fn windows_mode_to_acl_script(remote_path: &str, mode: u16) -> String {
     let quoted = powershell_single_quote_escape(remote_path);
     match mode {
@@ -970,6 +1022,70 @@ fn windows_mode_to_acl_script(remote_path: &str, mode: u16) -> String {
             )
         }
         _ => format!("Write-Error 'mode {mode:o} not in cross-platform allow-list'; exit 1"),
+    }
+}
+
+/// Tmpfile-targeted variant of [`windows_mode_to_acl_script`]. The
+/// `write_file` PowerShell body holds the tmpfile path in a
+/// `$tmp` variable rather than a baked-in string literal so the
+/// random suffix is constructed remote-side. Emitting `& icacls $tmp`
+/// (no surrounding single quotes) lets PowerShell expand the variable
+/// before invoking icacls.
+///
+/// The DACL shape matches the path-literal variant exactly so the
+/// post-move file inherits the same SDDL contract.
+pub(crate) fn windows_mode_to_acl_script_for_tmpfile(mode: u16) -> String {
+    match mode {
+        0o600 | 0o700 => {
+            "& icacls $tmp /inheritance:r /grant:r 'SYSTEM:(F)' /grant:r 'Administrators:(F)' | Out-Null".to_owned()
+        }
+        0o644 | 0o755 => {
+            "& icacls $tmp /inheritance:r /grant:r 'SYSTEM:(F)' /grant:r 'Administrators:(F)' /grant:r 'BUILTIN\\Users:(R)' | Out-Null".to_owned()
+        }
+        _ => format!("Write-Error 'mode {mode:o} not in cross-platform allow-list'; exit 1"),
+    }
+}
+
+/// Post-move DACL verification snippet. Reads the SDDL from the final
+/// `$path` and confirms it matches the expected shape for the
+/// requested mode. On drift the file is removed and the script
+/// throws, so a caller never sees a "success" return when the
+/// post-rename ACL diverges from the requested mode.
+///
+/// The regex matches the SDDL DACL produced by `icacls /inheritance:r
+/// /grant:r 'SYSTEM:(F)' /grant:r 'Administrators:(F)' [...]'`:
+///   * Owner-only (0o600 / 0o700) — `D:PAI(A;;FA;;;SY)(A;;FA;;;BA)` or
+///     the no-AI variant. `WD` (Everyone) and `BU` (BUILTIN\Users) MUST
+///     NOT appear.
+///   * World-readable (0o644 / 0o755) — same as above plus
+///     `(A;;...;;;BU)` MAY appear. `WD` MUST NOT.
+pub(crate) fn windows_post_move_acl_verify_script(mode: u16) -> String {
+    match mode {
+        0o600 | 0o700 => {
+            "$verifyAcl = (Get-Acl -LiteralPath $path).Sddl; \
+             if ($verifyAcl -match ';WD\\)' -or $verifyAcl -match ';BU\\)') { \
+               Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue; \
+               throw 'rustynet-write-file: post-move ACL drift on owner-only mode (Users or Everyone present)'; \
+             }; \
+             if (-not ($verifyAcl -match ';FA;;;SY\\)') -or -not ($verifyAcl -match ';FA;;;BA\\)')) { \
+               Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue; \
+               throw 'rustynet-write-file: post-move ACL drift on owner-only mode (SYSTEM or Administrators missing)'; \
+             }".to_owned()
+        }
+        0o644 | 0o755 => {
+            "$verifyAcl = (Get-Acl -LiteralPath $path).Sddl; \
+             if ($verifyAcl -match ';WD\\)') { \
+               Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue; \
+               throw 'rustynet-write-file: post-move ACL drift on world-readable mode (Everyone present)'; \
+             }; \
+             if (-not ($verifyAcl -match ';FA;;;SY\\)') -or -not ($verifyAcl -match ';FA;;;BA\\)')) { \
+               Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue; \
+               throw 'rustynet-write-file: post-move ACL drift on world-readable mode (SYSTEM or Administrators missing)'; \
+             }".to_owned()
+        }
+        _ => format!(
+            "Write-Error 'mode {mode:o} not in cross-platform allow-list for post-move verify'; exit 1"
+        ),
     }
 }
 

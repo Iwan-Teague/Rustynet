@@ -419,11 +419,28 @@ fn parse_windows_stat_maps_users_or_everyone_to_world_readable_mode() {
 }
 
 #[test]
-fn parse_windows_stat_defaults_group_to_owner_when_group_missing() {
+fn parse_windows_stat_passes_through_empty_group_value() {
+    // Envelope has a `GROUP:` line with no value (whitespace-trimmed
+    // to empty). The parser treats this as a present-but-empty value
+    // and propagates the empty string verbatim — the
+    // owner-fallback branch only fires when the GROUP line is
+    // absent entirely (see the next test).
     let envelope = "SIZE:7\nOWNER:S-1-5-18\nGROUP:\nSDDL:O:SYG:SYD:(A;;FA;;;SY)\n";
     let stat = parse_windows_stat(envelope).expect("parse");
     assert_eq!(stat.owner_uid_or_sid, "S-1-5-18");
     assert_eq!(stat.group_gid_or_sid, "");
+}
+
+#[test]
+fn parse_windows_stat_defaults_group_to_owner_when_group_line_missing() {
+    // No `GROUP:` line in the envelope at all — exercises the
+    // `group.unwrap_or_else(|| owner.clone())` branch in
+    // `parse_windows_stat`. Without this test the owner-fallback
+    // code path has zero coverage.
+    let envelope = "SIZE:7\nOWNER:S-1-5-18\nSDDL:O:SYG:SYD:(A;;FA;;;SY)\n";
+    let stat = parse_windows_stat(envelope).expect("parse");
+    assert_eq!(stat.owner_uid_or_sid, "S-1-5-18");
+    assert_eq!(stat.group_gid_or_sid, "S-1-5-18");
 }
 
 #[test]
@@ -642,4 +659,214 @@ fn windows_mode_to_acl_script_escapes_embedded_apostrophe_in_path() {
     // quotes around the path literal stay balanced inside the
     // PowerShell script body.
     assert!(script.contains("it''s_fine"));
+}
+
+// ── Windows write_file: ACL-before-bytes contract (HIGH-1 fold-in) ───────────
+
+#[test]
+fn windows_write_file_script_applies_acl_before_writing_payload_bytes() {
+    // The hardened contract is "tighten DACL on the tmpfile BEFORE
+    // any secret bytes are written, then atomic-rename onto the
+    // final path". Verify the script body orders the operations
+    // correctly: icacls on $tmp must precede WriteAllBytes on $tmp.
+    let script = windows_write_file_script(
+        "C:\\ProgramData\\RustyNet\\secrets\\anchor.dpapi",
+        b"secret-bytes-payload",
+        0o600,
+    );
+    let acl_at = script
+        .find("icacls $tmp /inheritance:r")
+        .expect("icacls $tmp call must appear in script");
+    let write_at = script
+        .find("[System.IO.File]::WriteAllBytes($tmp")
+        .expect("WriteAllBytes on $tmp must appear in script");
+    assert!(
+        acl_at < write_at,
+        "icacls must run BEFORE WriteAllBytes so secret bytes never land in a world-readable tmpfile (acl_at={acl_at}, write_at={write_at})",
+    );
+}
+
+#[test]
+fn windows_write_file_script_atomically_renames_tmpfile_onto_target() {
+    // After the tmpfile is ACL'd and filled, Move-Item replaces the
+    // final path atomically. Asserting the script contains the
+    // Move-Item step locks in the rename-onto-target step of the
+    // contract.
+    let script = windows_write_file_script(
+        "C:\\ProgramData\\RustyNet\\trust\\membership.owner.key.pub",
+        b"public-key-bytes",
+        0o644,
+    );
+    assert!(
+        script.contains("Move-Item -LiteralPath $tmp -Destination $path -Force"),
+        "tmpfile must be atomic-renamed onto the final path"
+    );
+    let write_at = script
+        .find("[System.IO.File]::WriteAllBytes($tmp")
+        .expect("WriteAllBytes must precede Move-Item");
+    let move_at = script
+        .find("Move-Item -LiteralPath $tmp -Destination $path -Force")
+        .expect("Move-Item must appear");
+    assert!(
+        write_at < move_at,
+        "bytes must land in the ACL'd tmpfile before the rename"
+    );
+}
+
+#[test]
+fn windows_write_file_script_verifies_post_move_acl_for_owner_only_mode() {
+    // The post-move DACL verifier runs Get-Acl on the final path and
+    // throws if the DACL drifted from the owner-only shape. The
+    // verifier MUST run after the Move-Item — otherwise it inspects
+    // the tmpfile's DACL, not the renamed target's, and a hostile
+    // rename could move a different ACL onto $path.
+    let script = windows_write_file_script(
+        "C:\\ProgramData\\RustyNet\\secrets\\token.dpapi",
+        b"x",
+        0o600,
+    );
+    let move_at = script
+        .find("Move-Item -LiteralPath $tmp -Destination $path -Force")
+        .expect("Move-Item must appear");
+    let verify_at = script
+        .find("$verifyAcl = (Get-Acl -LiteralPath $path).Sddl")
+        .expect("post-move ACL verify must appear");
+    assert!(
+        move_at < verify_at,
+        "post-move ACL verify must run AFTER Move-Item so it inspects the final path's DACL"
+    );
+    assert!(
+        script.contains("post-move ACL drift on owner-only mode"),
+        "owner-only verify must emit the canonical drift message"
+    );
+    assert!(
+        script.contains("Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue"),
+        "ACL drift recovery must remove the offending file fail-closed"
+    );
+}
+
+#[test]
+fn windows_write_file_script_cleans_up_tmpfile_on_exception() {
+    // The script's catch arm removes the tmpfile if any step throws.
+    // Without this, a partial write (or an ACL verify drift) would
+    // leave a partial file with potentially incorrect DACL on disk.
+    let script = windows_write_file_script("C:\\ProgramData\\RustyNet\\file", b"x", 0o600);
+    assert!(
+        script.contains("Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue"),
+        "tmpfile cleanup must appear in the catch handler"
+    );
+    assert!(
+        script.contains("throw"),
+        "catch handler must re-throw to surface the failure to the caller"
+    );
+}
+
+#[test]
+fn windows_write_file_script_creates_parent_directory_if_missing() {
+    // The script ensures the parent dir exists before staging the
+    // tmpfile — otherwise the very first New-Item call against a
+    // path under a non-existent parent would fail with an opaque
+    // "Could not find a part of the path" error.
+    let script = windows_write_file_script("C:\\ProgramData\\RustyNet\\subdir\\file", b"x", 0o600);
+    assert!(
+        script.contains("New-Item -ItemType Directory -Force -Path $parent"),
+        "script must ensure parent dir exists before staging tmpfile"
+    );
+}
+
+#[test]
+fn windows_write_file_script_rejects_disallowed_mode_via_acl_helper() {
+    // Modes outside the cross-platform allow-list make the ACL
+    // helpers emit a `Write-Error` stanza. The validate_mode_octal
+    // wall already rejects them in the calling impl, but if the
+    // raw helpers are wired anywhere else (e.g. from a future
+    // substage), the script-level guard is the last fail-closed line.
+    let bad = windows_write_file_script("C:\\ProgramData\\RustyNet\\f", b"x", 0o777);
+    assert!(
+        bad.contains("not in cross-platform allow-list"),
+        "disallowed mode must trip the script-level guard"
+    );
+}
+
+#[test]
+fn windows_post_move_acl_verify_script_world_readable_rejects_everyone_sid() {
+    // World-readable modes allow BUILTIN\\Users but NEVER allow
+    // Everyone (WD). The verify script's regex MUST reject any DACL
+    // that grants Everyone an ACE, even on a 0o644 target.
+    let verify = windows_post_move_acl_verify_script(0o644);
+    assert!(verify.contains(";WD\\)"), "WD (Everyone) check must appear");
+    assert!(
+        verify.contains("post-move ACL drift on world-readable mode (Everyone present)"),
+        "Everyone-rejection message must appear"
+    );
+    // The verifier still requires SYSTEM and Administrators on
+    // world-readable mode — those entries provide the privileged
+    // admin path even when the file is widely readable.
+    assert!(verify.contains(";FA;;;SY\\)"));
+    assert!(verify.contains(";FA;;;BA\\)"));
+}
+
+// ── Windows TCP read loop: timeout-based, not first-segment-based (MED-3) ────
+
+#[test]
+fn windows_tcp_send_recv_script_loop_is_timeout_based_not_first_segment_based() {
+    // The hardened read-loop contract: keep reading until either
+    // the peer half-closes (Read returns 0) or the caller's deadline
+    // fires. The legacy implementation exited on first idle poll
+    // once any byte had arrived (`elseif ($ms.Length -gt 0) { break; }`),
+    // which truncated multi-segment responses with >50ms inter-
+    // segment gaps. Verify the script body does NOT contain that
+    // first-segment-exit shape.
+    let script = windows_tcp_send_recv_script("127.0.0.1", 51822, "AAAA", 30_000);
+    assert!(
+        !script.contains("elseif ($ms.Length -gt 0) { break; }"),
+        "first-segment-arrival exit MUST NOT appear in the read loop"
+    );
+    assert!(
+        !script.contains("$client.Available -gt 0"),
+        "Available-poll loop is the truncating shape; new loop blocks on BeginRead instead"
+    );
+    // The new loop drives BeginRead with the remaining-deadline
+    // WaitHandle so each iteration waits up to the remaining timeout
+    // for data and only exits on EOF or deadline.
+    assert!(
+        script.contains("BeginRead"),
+        "loop must use BeginRead so each iteration blocks on the remaining timeout"
+    );
+    assert!(
+        script.contains("WaitOne($remainingMs"),
+        "BeginRead must be awaited with the remaining-deadline timeout, not a fixed sleep"
+    );
+    assert!(
+        script.contains("if ($read -le 0) {"),
+        "loop must exit on peer half-close (Read returns 0)"
+    );
+}
+
+#[test]
+fn windows_tcp_send_recv_script_uses_deadline_not_fixed_sleep() {
+    // The loop's deadline anchor is a UtcNow timestamp + the
+    // operator's timeout. Each iteration recomputes the remaining
+    // millis so we never block past the deadline even if the peer
+    // sends a slow trickle of bytes.
+    let script = windows_tcp_send_recv_script("127.0.0.1", 51822, "", 5_000);
+    assert!(script.contains("[DateTime]::UtcNow.AddMilliseconds(5000)"));
+    assert!(script.contains("$remainingMs"));
+    // The truncating sleep loop should be gone — Start-Sleep was
+    // the polling delay between Available checks in the old impl.
+    assert!(
+        !script.contains("Start-Sleep -Milliseconds 50"),
+        "old polling delay must be removed; loop now blocks on BeginRead+WaitHandle"
+    );
+}
+
+#[test]
+fn windows_tcp_send_recv_script_aborts_connect_on_deadline() {
+    // The connect path uses BeginConnect + AsyncWaitHandle.WaitOne
+    // with the caller's timeout, so a hung peer never blocks forever
+    // even if SO_RCVTIMEO is somehow ignored.
+    let script = windows_tcp_send_recv_script("203.0.113.1", 8443, "", 1_500);
+    assert!(script.contains("BeginConnect"));
+    assert!(script.contains("WaitOne(1500"));
+    assert!(script.contains("tcp connect timed out"));
 }

@@ -59,6 +59,31 @@ if rustup target list --installed 2>/dev/null | grep -q 'x86_64-pc-windows-gnu';
 
     # Core Windows-supported crates.
     # rustynet-cli is excluded: it uses nix / std::os::unix and is Unix-only by design.
+    #
+    # Phase 28 fold-in (MED-1) coverage gap, deferred fix:
+    #   The WindowsShellHost backend in
+    #   crates/rustynet-cli/src/bin/live_lab_bin_support/remote_shell.rs
+    #   IS Windows-runtime code but is never cross-compiled by this
+    #   gate. The wrapping `rustynet-cli` crate pulls in `nix` and
+    #   `std::os::unix` so `cargo check -p rustynet-cli --target
+    #   *-windows-*` cannot succeed. Extending coverage to the
+    #   submodule requires either:
+    #     (a) extracting `live_lab_bin_support` into a no-`nix`
+    #         sub-crate (`rustynet-live-lab-support`) that depends
+    #         only on portable std + base64, and re-exporting from
+    #         the bins, or
+    #     (b) gating the Unix-only helpers in `mod.rs` behind
+    #         `#[cfg(unix)]` so the bare `remote_shell` submodule
+    #         can compile alone on Windows.
+    #   Both are intentionally out of scope for the Phase 28 review
+    #   fold-in to avoid a crate restructure inside a security fix.
+    #   The Windows backend's runtime behaviour is still gated by the
+    #   `pub(crate)` script-builder unit tests
+    #   (`windows_write_file_script_*`, `windows_tcp_send_recv_script_*`,
+    #   `windows_mode_to_acl_script_*`) which run on the host arch
+    #   and verify the PowerShell body the remote will actually
+    #   execute. A future task should land option (a) or (b) so the
+    #   PowerShell-bearing module participates in this gate.
     for CRATE in \
       rustynet-backend-api \
       rustynet-backend-stub \
