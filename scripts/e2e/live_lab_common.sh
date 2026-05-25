@@ -42,7 +42,7 @@ live_lab_init() {
     exit 1
   fi
 
-  for cmd in ssh scp ssh-keygen awk sed openssl xxd mktemp chmod tr; do
+  for cmd in ssh scp ssh-keygen awk sed openssl xxd mktemp chmod tr iconv base64; do
     live_lab_require_command "$cmd"
   done
 
@@ -1081,6 +1081,114 @@ live_lab_ssh_via_ssh() {
   "${ssh_args[@]}"
 }
 
+# Encode a PowerShell payload as UTF-16LE + base64, suitable for
+# powershell.exe -EncodedCommand. Pure-stdout — emits the base64 token
+# on success, or returns non-zero with an explanatory message on stderr
+# on encoding failure / NUL byte detection. Bash strings cannot natively
+# contain NUL bytes (printf '%s' truncates at the first NUL), but the
+# explicit NUL check below remains as defense in depth in case the
+# caller forwards a payload constructed with $'\x00' literals or other
+# embedding tricks; we then fail closed rather than silently encoding a
+# truncated payload.
+live_lab_encode_powershell_b64() {
+  local ps_command="$1"
+  if [[ -z "$ps_command" ]]; then
+    echo "live_lab_encode_powershell_b64: empty PowerShell command not permitted" >&2
+    return 1
+  fi
+  # NUL byte detection. Compare the raw payload byte count to the
+  # NUL-stripped byte count; any mismatch means the payload smuggled at
+  # least one 0x00 byte. Done via wc -c under LC_ALL=C to count raw
+  # bytes irrespective of locale, since `grep` on macOS BSD lacks
+  # portable NUL matching and `grep -P` is not in the required-command
+  # set.
+  local _raw_byte_count _stripped_byte_count
+  _raw_byte_count="$(LC_ALL=C printf '%s' "$ps_command" | LC_ALL=C wc -c | tr -d '[:space:]')"
+  _stripped_byte_count="$(LC_ALL=C printf '%s' "$ps_command" | LC_ALL=C tr -d '\0' | LC_ALL=C wc -c | tr -d '[:space:]')"
+  if [[ "$_raw_byte_count" != "$_stripped_byte_count" ]]; then
+    echo "live_lab_encode_powershell_b64: NUL byte in payload not permitted" >&2
+    return 1
+  fi
+  local b64
+  if ! b64="$(printf '%s' "$ps_command" | iconv -f UTF-8 -t UTF-16LE 2>/dev/null | base64 | tr -d '\n')"; then
+    echo "live_lab_encode_powershell_b64: iconv UTF-16LE / base64 encoding failed" >&2
+    return 1
+  fi
+  if [[ -z "$b64" ]]; then
+    echo "live_lab_encode_powershell_b64: encoder produced empty output" >&2
+    return 1
+  fi
+  # Base64 alphabet sanity. Reject anything outside [A-Za-z0-9+/=].
+  if [[ ! "$b64" =~ ^[A-Za-z0-9+/=]+$ ]]; then
+    echo "live_lab_encode_powershell_b64: encoder produced non-base64 output" >&2
+    return 1
+  fi
+  printf '%s' "$b64"
+}
+
+# Invoke a PowerShell payload on a Windows host over SSH, wrapping the
+# payload in `cmd.exe /c "powershell.exe -EncodedCommand <b64-utf16le>"`
+# so PowerShell launch routes through CMD instead of OpenSSH's
+# default-shell PowerShell path. This avoids HRESULT 0x800705AF
+# (paging file too small), OutOfMemoryException, and StackOverflowException
+# thread-create failures on memory-pressured Windows guests (Phase 23
+# reviewer finding, Phase 25 lab validation against windows@192.168.65.8).
+#
+# UTM-mapped Windows targets continue to use the UTM exec transport
+# (utmctl exec invokes the in-guest agent directly and is not affected
+# by the SSH thread-create failure mode); only the raw-SSH path needs
+# the cmd.exe wrap.
+#
+# Args:
+#   $1: ssh user@host (e.g., "windows@192.168.65.8")
+#   $2: PowerShell command string (will be UTF-16LE encoded then base64'd)
+#   $3: optional ssh timeout seconds (forwarded for parity with live_lab_ssh)
+#
+# argv-only: the SSH invocation passes a single fully-formed remote
+# command string ("cmd.exe /c \"powershell.exe ... -EncodedCommand <b64>\"")
+# as the ssh remote-command argument. The base64 token is restricted to
+# the base64 alphabet by live_lab_encode_powershell_b64 so it cannot
+# inject shell metacharacters into the cmd.exe arg parse.
+live_lab_ssh_windows() {
+  local target="$1"
+  local ps_command="$2"
+  local timeout="${3:-10800}"
+  if [[ -z "$target" || -z "$ps_command" ]]; then
+    echo "live_lab_ssh_windows: target and ps_command must be non-empty" >&2
+    return 1
+  fi
+  local b64 remote_command
+  b64="$(live_lab_encode_powershell_b64 "$ps_command")" || return 1
+  # cmd.exe /c argument is wrapped in double quotes so the inner
+  # `powershell.exe -EncodedCommand <b64>` reaches cmd.exe as a single
+  # /c command line. The base64 token is alphanumeric + `+/=` only,
+  # so it cannot break out of the quoted region.
+  remote_command="cmd.exe /c \"powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${b64}\""
+  if live_lab_target_uses_utm_transport "$target"; then
+    if live_lab_utm_exec "$target" "$ps_command" "$timeout"; then
+      return 0
+    fi
+    printf 'UTM exec failed for %s; falling back to SSH (windows)\n' "$target" >&2
+  fi
+  live_lab_ssh_via_ssh "$target" "$remote_command" "$timeout"
+}
+
+# stdin-friendly variant: the PowerShell payload is read from stdin.
+# Useful for multi-line script bodies the caller produces with a
+# heredoc or by reading a local file. Equivalent fail-closed semantics
+# to live_lab_ssh_windows.
+live_lab_ssh_windows_stdin() {
+  local target="$1"
+  local timeout="${2:-10800}"
+  if [[ -z "$target" ]]; then
+    echo "live_lab_ssh_windows_stdin: target must be non-empty" >&2
+    return 1
+  fi
+  local ps_command
+  ps_command="$(cat)"
+  live_lab_ssh_windows "$target" "$ps_command" "$timeout"
+}
+
 live_lab_scp_to_via_ssh() {
   local src="$1"
   local target="$2"
@@ -1576,8 +1684,14 @@ live_lab_collect_pubkey_hex() {
     if rustynet_platform_uses_unix_shell "$platform"; then
       pub_b64="$(live_lab_capture_root "$target" "root cat '${wg_pub_path}' | tr -d '[:space:]'")"
     else
-      # Windows SSH: shell is PowerShell; read via Get-Content.
-      pub_b64="$(live_lab_capture_root "$target" "powershell.exe -NoProfile -Command \"(Get-Content -Path '${wg_pub_path}' -Raw).Trim()\"")"
+      # Windows SSH: route through cmd.exe /c "powershell.exe -EncodedCommand <b64>"
+      # so PowerShell launch survives memory-pressured Windows guests
+      # (Phase 23 reviewer finding, Phase 25 lab validation). The
+      # payload reads the public-key file and trims any trailing
+      # whitespace before printing the single-line base64 token.
+      pub_b64="$(live_lab_ssh_windows "$target" "(Get-Content -Path '${wg_pub_path}' -Raw).Trim()")" || return 1
+      pub_b64="${pub_b64//$'\r'/}"
+      pub_b64="${pub_b64//$'\n'/}"
     fi
   fi
   local pub_hex
