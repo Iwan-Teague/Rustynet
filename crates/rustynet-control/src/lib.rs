@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod credential_unwrap;
 pub mod enrollment;
 pub mod ga;
 pub mod key_rotation;

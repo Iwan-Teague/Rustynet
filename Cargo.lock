@@ -910,8 +910,10 @@ dependencies = [
  "rustynet-crypto",
  "rustynet-dns-zone",
  "rustynet-policy",
+ "rustynet-windows-native",
  "sha2",
  "subtle",
+ "tempfile",
  "zeroize",
 ]
 
