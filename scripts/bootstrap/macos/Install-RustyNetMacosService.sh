@@ -42,10 +42,15 @@ NETWORK_ID=""
 # deployed, matching the Linux e2e-enforce-host pattern.
 AUTO_TUNNEL_ENFORCE="false"
 # trust_max_age_secs: macOS has no periodic trust-evidence refresh timer (unlike
-# Linux which uses rustynetd-trust-refresh.service).  Bootstrap-phase and initial
-# invocations should use a short value; enforce_runtime should pass 86400 so the
-# once-issued lab evidence stays valid for the duration of the run.
-TRUST_MAX_AGE_SECS=""
+# Linux which uses rustynetd-trust-refresh.service). The daemon's hardcoded 300 s
+# default trips "trust evidence is stale" on the very first launch when the
+# bootstrap-time `rustynet trust issue` ran several minutes before launchctl
+# bootstrap finally invokes the daemon. Default to 86400 s here so any caller
+# that omits the flag — including a re-install via the orchestrator's enforce
+# stage if the env var is dropped — still gets a freshness window long enough
+# to survive lab-typical install latencies. enforce-time callers may still
+# override with a smaller value if they re-issue the evidence at the same time.
+TRUST_MAX_AGE_SECS="86400"
 AUTO_TUNNEL_MAX_AGE_SECS=""
 TRAVERSAL_MAX_AGE_SECS=""
 DNS_ZONE_MAX_AGE_SECS=""
@@ -382,13 +387,108 @@ PLIST
 chown root:wheel "${PLIST_DST}"
 chmod 0644 "${PLIST_DST}"
 
-# ── Load the service ──────────────────────────────────────────────────────────
-# Unload first if already registered (idempotent re-install).
+# ── Privileged helper plist ──────────────────────────────────────────────────
+#
+# The privileged helper is the macOS counterpart of Linux's
+# rustynetd-privileged-helper.service. It runs as root, hosts the SCM_RIGHTS
+# utun fd-passing socket (used by Phase 19), and recreates the runtime socket
+# parent directory (/private/var/run/rustynet) on every boot. macOS garbage-
+# collects /private/var/run between reboots, so without a root-privileged
+# RunAtLoad daemon to recreate it the rustynetd user has no permission to
+# mkdir there and the unprivileged daemon's parent-dir create fails with
+# EACCES. Installing the helper plist here gives macOS the same
+# Requires=rustynetd-privileged-helper.service semantics that systemd
+# provides implicitly on Linux.
+#
+# Allowed uid/gid pull from the rustynetd account this install just created
+# (or that already existed from an earlier install). Resolving them at
+# install time (via dscl) instead of hardcoding 500 avoids drift if a
+# subsequent install runs on a host where a different unrelated account
+# already occupies uid 500.
+HELPER_PLIST_DST="$(dirname "${PLIST_DST}")/com.rustynet.privileged-helper.plist"
+RUSTYNETD_UID="$(dscl . -read /Users/rustynetd UniqueID 2>/dev/null | awk '{print $2}')"
+RUSTYNETD_GID="$(dscl . -read /Groups/rustynetd PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+if [[ -z "${RUSTYNETD_UID}" || -z "${RUSTYNETD_GID}" ]]; then
+  echo "error: cannot resolve rustynetd uid/gid; ensure_rustynetd_user must run first" >&2
+  exit 1
+fi
+if [[ ! "${RUSTYNETD_UID}" =~ ^[0-9]+$ ]] || [[ ! "${RUSTYNETD_GID}" =~ ^[0-9]+$ ]]; then
+  echo "error: rustynetd uid/gid not integer (uid='${RUSTYNETD_UID}' gid='${RUSTYNETD_GID}')" >&2
+  exit 1
+fi
+
+cat > "${HELPER_PLIST_DST}" <<HELPER_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.privileged-helper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${RUSTYNETD_BIN}</string>
+        <string>privileged-helper</string>
+        <string>--socket</string>
+        <string>${PRIVILEGED_HELPER_SOCKET}</string>
+        <string>--allowed-uid</string>
+        <string>${RUSTYNETD_UID}</string>
+        <string>--allowed-gid</string>
+        <string>${RUSTYNETD_GID}</string>
+        <string>--timeout-ms</string>
+        <string>30000</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>AbandonProcessGroup</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/rustynetd-helper.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/rustynetd-helper-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${DAEMON_PATH}</string>
+    </dict>
+</dict>
+</plist>
+HELPER_PLIST
+chown root:wheel "${HELPER_PLIST_DST}"
+chmod 0644 "${HELPER_PLIST_DST}"
+
+# ── Load the services ────────────────────────────────────────────────────────
+# Helper must come up BEFORE the daemon so the runtime socket parent
+# directory and the privileged-helper socket both exist when the daemon
+# tries to bind. Unload first for idempotent re-install.
 if launchctl print system/com.rustynet.daemon >/dev/null 2>&1; then
   launchctl bootout system/com.rustynet.daemon || true
   sleep 1
 fi
+if launchctl print system/com.rustynet.privileged-helper >/dev/null 2>&1; then
+  launchctl bootout system/com.rustynet.privileged-helper || true
+  sleep 1
+fi
+
+launchctl bootstrap system "${HELPER_PLIST_DST}"
+# Wait up to 10 s for the helper socket to materialise. The daemon will
+# refuse to start if the helper socket parent dir is missing, so we cannot
+# race past this step.
+for attempt in $(seq 1 20); do
+  if [[ -S "${PRIVILEGED_HELPER_SOCKET}" ]]; then
+    break
+  fi
+  sleep 0.5
+done
+if [[ ! -S "${PRIVILEGED_HELPER_SOCKET}" ]]; then
+  echo "error: privileged helper socket ${PRIVILEGED_HELPER_SOCKET} did not appear within 10 s of launchctl bootstrap" >&2
+  exit 1
+fi
 
 launchctl bootstrap system "${PLIST_DST}"
 
+echo "[install-service] com.rustynet.privileged-helper loaded via launchctl bootstrap (socket=${PRIVILEGED_HELPER_SOCKET})"
 echo "[install-service] com.rustynet.daemon loaded via launchctl bootstrap (brew-prefix=${BREW_PREFIX})"

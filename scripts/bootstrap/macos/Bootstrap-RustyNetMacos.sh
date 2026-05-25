@@ -420,8 +420,15 @@ clear_residual_state() {
   if networksetup -listallhardwareports 2>/dev/null | grep -q rustynet; then
     ifconfig rustynet0 down 2>/dev/null || true
   fi
+  # Boot out daemon first (depends on helper socket); helper second so its
+  # SCM_RIGHTS socket survives until the daemon has detached. Matches the
+  # systemd Requires=rustynetd-privileged-helper.service teardown order.
   if launchctl print system/com.rustynet.daemon &>/dev/null 2>&1; then
     launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+    sleep 1
+  fi
+  if launchctl print system/com.rustynet.privileged-helper &>/dev/null 2>&1; then
+    launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
     sleep 1
   fi
 }
@@ -497,28 +504,115 @@ install_binaries() {
 }
 
 # ── WireGuard key generation ──────────────────────────────────────────────────
+#
+# Mirrors the Linux key-custody pipeline so the macOS daemon's runtime
+# key material is identical in shape to systemd hosts:
+#   - ${KEYS_DIR}/wireguard.key       — plaintext runtime key (mode 0600)
+#   - ${KEYS_DIR}/wireguard.key.enc   — passphrase-encrypted blob (mode 0600)
+#   - ${KEYS_DIR}/wireguard.pub       — public key (mode 0640)
+#   - ${KEYS_DIR}/wireguard.passphrase — passphrase credential (mode 0600)
+#
+# The plaintext path is what the daemon's `--wg-private-key` plist arg
+# references. The encrypted blob + passphrase are what the daemon decrypts
+# at every startup (see `prepare_runtime_wireguard_key_material` in
+# crates/rustynetd/src/daemon.rs); the result is rewritten to the plaintext
+# path because the macOS userspace-shared backend re-reads the runtime
+# key on boringtun worker recovery (`retains_runtime_key_at_rest` is true
+# and the daemon never scrubs the file).
+#
+# After `key init` we push the passphrase into the macOS keychain via
+# `rustynetd key store-passphrase`. The launchd plist exports
+# `RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT`, so at runtime
+# `read_passphrase_file` resolves the passphrase from Security framework
+# instead of disk; the on-disk passphrase file remains only as the
+# bootstrap-time material for `key init` and to satisfy the launchd plist
+# file-path argument.
+#
+# Fail-closed: no fallback. If `key init` returns non-zero the install must
+# stop here rather than silently leaving plaintext key bytes at
+# `wireguard.key.enc` (the prior `|| cp` branch did exactly that, which
+# Phase 19+20 live-val surfaced as a daemon "decrypt encrypted key failed"
+# loop on first start).
 generate_wireguard_keys() {
-  if [[ -f "${KEYS_DIR}/wireguard.pub" ]]; then
-    echo "[bootstrap] WireGuard keys already present; skipping key generation"
+  local runtime_key="${KEYS_DIR}/wireguard.key"
+  local encrypted_key="${KEYS_DIR}/wireguard.key.enc"
+  local public_key="${KEYS_DIR}/wireguard.pub"
+  local passphrase_file="${KEYS_DIR}/wireguard.passphrase"
+
+  if [[ -f "${public_key}" && -f "${runtime_key}" && -f "${encrypted_key}" \
+        && -f "${passphrase_file}" ]]; then
+    echo "[bootstrap] WireGuard key material already present; skipping generation"
     return 0
   fi
-  local tmp_priv
-  tmp_priv="$(mktemp)"
-  chmod 600 "${tmp_priv}"
-  wg genkey > "${tmp_priv}"
-  wg pubkey < "${tmp_priv}" > "${KEYS_DIR}/wireguard.pub"
-  # Encrypt using rustynetd key-custody; plain copy as fallback.
-  "${RUSTYNETD_BIN}" key init \
-    --wg-private-key "${tmp_priv}" \
-    --wg-encrypted-private-key "${KEYS_DIR}/wireguard.key.enc" 2>/dev/null \
-    || cp "${tmp_priv}" "${KEYS_DIR}/wireguard.key.enc"
-  rm -f "${tmp_priv}"
-  chmod 600 "${KEYS_DIR}/wireguard.key.enc"
-  chmod 640 "${KEYS_DIR}/wireguard.pub"
-  chown rustynetd:rustynetd \
-    "${KEYS_DIR}/wireguard.key.enc" \
-    "${KEYS_DIR}/wireguard.pub"
-  echo "[bootstrap] WireGuard keys generated"
+
+  # Atomic passphrase write: chmod the tmpfile BEFORE writing entropy so the
+  # secret bytes never appear under the default umask (0644) even briefly.
+  # Same protocol as provision_enrollment_secret above.
+  local passphrase_tmp=""
+  # shellcheck disable=SC2064
+  trap 'rm -f "${passphrase_tmp}"' EXIT
+  passphrase_tmp="$(mktemp "${KEYS_DIR}/wireguard.passphrase.tmp.XXXXXX")"
+  if [[ -z "${passphrase_tmp}" || ! -f "${passphrase_tmp}" ]]; then
+    echo "[bootstrap] failed to create wireguard.passphrase tmpfile under ${KEYS_DIR}" >&2
+    exit 1
+  fi
+  chmod 0600 "${passphrase_tmp}"
+  # 32 raw bytes -> 64 hex chars (>= 16-char minimum enforced by parse_passphrase_bytes).
+  od -A n -t x1 -N 32 /dev/urandom | tr -d ' \n' > "${passphrase_tmp}"
+  local passphrase_size
+  passphrase_size="$(wc -c < "${passphrase_tmp}" | tr -d ' ')"
+  if [[ "${passphrase_size}" -ne 64 ]]; then
+    echo "[bootstrap] wireguard passphrase generation produced ${passphrase_size} bytes; expected 64" >&2
+    exit 1
+  fi
+  chown rustynetd:rustynetd "${passphrase_tmp}"
+  mv "${passphrase_tmp}" "${passphrase_file}"
+  trap - EXIT
+
+  # `rustynetd key init` reads `--passphrase-file` via the explicit
+  # (non-keychain) reader on macOS — see read_passphrase_file_explicit in
+  # crates/rustynetd/src/key_material.rs — so this works even before the
+  # passphrase is in the keychain.
+  #
+  # `--force` is required so a re-run after a partial install (e.g. crash
+  # between `mv` of the passphrase file and the first key-init invocation)
+  # cleanly overwrites the stale material.
+  #
+  # Run as rustynetd so files are written with the right owner; the
+  # runtime/public/encrypted files are written mode 0600 owner-rustynetd by
+  # initialize_encrypted_key_material's write_atomic helper, which uses the
+  # effective UID of the running process.
+  if ! sudo -u rustynetd "${RUSTYNETD_BIN}" key init \
+      --runtime-private-key "${runtime_key}" \
+      --encrypted-private-key "${encrypted_key}" \
+      --public-key "${public_key}" \
+      --passphrase-file "${passphrase_file}" \
+      --force; then
+    echo "[bootstrap] rustynetd key init failed; refusing to leave plaintext key in encrypted slot" >&2
+    exit 1
+  fi
+
+  # Push the passphrase into the macOS keychain so the daemon resolves it
+  # via Security framework at runtime (per
+  # RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT in the launchd plist). The
+  # keychain account is per-node so concurrent tenants on the same host
+  # cannot cross-read each other's passphrase.
+  local keychain_account="wg-passphrase-${NODE_ID}"
+  if ! sudo -u rustynetd "${RUSTYNETD_BIN}" key store-passphrase \
+      --passphrase-file "${passphrase_file}" \
+      --keychain-account "${keychain_account}"; then
+    echo "[bootstrap] rustynetd key store-passphrase failed; daemon cannot resolve passphrase from keychain" >&2
+    exit 1
+  fi
+
+  # Final ownership/perms tightening — defence in depth against any race
+  # between key init's atomic write and a concurrent process.
+  chown rustynetd:rustynetd "${runtime_key}" "${encrypted_key}" "${public_key}" "${passphrase_file}"
+  chmod 0600 "${runtime_key}" "${encrypted_key}" "${passphrase_file}"
+  chmod 0640 "${public_key}"
+
+  echo "[bootstrap] WireGuard keys generated (runtime=${runtime_key} encrypted=${encrypted_key} public=${public_key})"
+  echo "[bootstrap] WireGuard passphrase stored in macOS keychain (account=${keychain_account})"
 }
 
 # ── Trust evidence seeding ───────────────────────────────────────────────────
