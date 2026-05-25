@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::uninlined_format_args)]
+// Track B Phase 28 transition: this bin still calls the deprecated
+// `live_lab_bin_support::capture_root` shim. Phase 29 rewrites the
+// substages on top of the new `RemoteShellHost` trait. Allow the
+// deprecation lint until then so `-D warnings` stays green.
+#![allow(deprecated)]
 
 //! Track B Phase 6 — real Linux relay-service-lifecycle live validator.
 //!

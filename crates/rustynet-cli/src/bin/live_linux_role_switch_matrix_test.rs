@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// Track B Phase 28 transition: still calls the deprecated
+// `capture_root` shim. Phase 29 rewrites on the new
+// `RemoteShellHost` trait. Allow until then so `-D warnings` passes.
+#![allow(deprecated)]
 
 mod live_lab_bin_support;
 

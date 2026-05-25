@@ -1,9 +1,30 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
+// Track B Phase 28 — `capture_root` (and the `run_root`/`retry_root`
+// pair built on top of it) are POSIX-only. Phase 28 marks
+// `capture_root` `#[deprecated]` to drive consumer migration to the
+// new [`RemoteShellHost`] trait, but this module is the transition
+// shim — it still calls the deprecated helper internally so existing
+// substages keep running until Phase 29 rewrites them. Allow the
+// deprecation lint here so the shim does not break `-D warnings`.
+#![allow(deprecated)]
 
 #[path = "../../env_file.rs"]
 #[allow(dead_code)]
 mod env_file;
+
+mod remote_shell;
+
+// Each bin compiles `mod live_lab_bin_support` separately, so a
+// `pub use` of the trait surface is flagged "unused" in every bin
+// that hasn't migrated to the trait yet. Phase 29 starts the
+// migration; until then the allow keeps `-D warnings` green without
+// hiding the actual public API.
+#[allow(unused_imports)]
+pub use remote_shell::{
+    LinuxShellHost, MacosShellHost, MockShellHost, RemoteExitStatus, RemoteShellError,
+    RemoteShellHost, RemoteStat, WindowsShellHost, new_remote_shell_host,
+};
 
 use std::env;
 use std::ffi::OsString;
@@ -1072,6 +1093,16 @@ pub fn verify_windows_admin(
     }
 }
 
+/// POSIX-only sudo-wrapped capture. Track B Phase 28 introduced the
+/// [`RemoteShellHost`] trait as the cross-platform replacement;
+/// Phase 29 rewrites the in-tree call sites. This shim stays
+/// functional during the transition so existing Linux/macOS substages
+/// keep working — the deprecation marker is the audit signal that
+/// new code MUST use [`RemoteShellHost::run_argv`] instead.
+#[deprecated(
+    since = "0.1.0",
+    note = "POSIX-only; use RemoteShellHost::run_argv via the Phase 28 trait (Phase 29 rewrites in-tree call sites)"
+)]
 pub fn capture_root(
     identity: &Path,
     known_hosts: &Path,
