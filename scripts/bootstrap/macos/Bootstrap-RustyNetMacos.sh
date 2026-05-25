@@ -329,8 +329,38 @@ ensure_rustynetd_user() {
 setup_directories() {
   install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}"
   install -d -m 0700 -o rustynetd -g rustynetd "${KEYS_DIR}"
+  install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/membership"
+  install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/secrets"
+  install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}/trust"
   install -d -m 0750 -o root      -g rustynetd "${CONFIG_ROOT}"
   install -d -m 0750 -o rustynetd -g rustynetd "${LOG_DIR}"
+}
+
+# ── Enrollment secret provisioning ───────────────────────────────────────────
+# Generates a 32-byte random enrollment HMAC secret for the daemon.
+# The file is raw binary (not hex or base64) — exactly what load_secret()
+# expects in rustynetd/src/enrollment_token.rs.
+# Idempotent: if the file already exists it is left untouched.
+# Fail-closed: if generation or the permission/ownership steps fail, the
+# script exits immediately via set -euo pipefail.
+provision_enrollment_secret() {
+  local secret_path="${KEYS_DIR}/enrollment.secret"
+  if [ ! -f "${secret_path}" ]; then
+    # Generate 32 raw binary bytes via openssl (available on all macOS versions).
+    openssl rand -out "${secret_path}" 32
+    chmod 0600 "${secret_path}"
+    chown rustynetd:rustynetd "${secret_path}"
+    echo "[bootstrap] enrollment.secret generated at ${secret_path}"
+  else
+    echo "[bootstrap] enrollment.secret already present; skipping generation"
+  fi
+  # Hard verify: the file must exist and must be exactly 32 bytes.
+  local size
+  size="$(wc -c < "${secret_path}" | tr -d ' ')"
+  if [ "${size}" -ne 32 ]; then
+    echo "[bootstrap] enrollment.secret size mismatch: expected 32 bytes, got ${size}" >&2
+    exit 1
+  fi
 }
 
 # ── Clear residual state ──────────────────────────────────────────────────────
@@ -552,6 +582,7 @@ if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   ensure_rustynetd_user
   setup_directories
   generate_wireguard_keys
+  provision_enrollment_secret
   seed_trust_evidence
   install_launchd_service
 else
@@ -562,6 +593,7 @@ else
   build_rustynet
   install_binaries
   generate_wireguard_keys
+  provision_enrollment_secret
   seed_trust_evidence
   install_launchd_service
 fi

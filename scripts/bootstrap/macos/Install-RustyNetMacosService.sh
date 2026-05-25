@@ -20,6 +20,7 @@
 #     --auto-tunnel-max-age-secs <secs>      (default: empty, uses daemon default 300 s)
 #     --traversal-max-age-secs <secs>        (default: empty, uses daemon default)
 #     --dns-zone-max-age-secs <secs>         (default: empty, uses daemon default)
+#     --wg-interface <utunN>                 (default: utun9; must match ^utun[0-9]+$)
 #     --fail-closed-ssh-allow <true|false>   (default: false)
 #     --fail-closed-ssh-allow-cidrs <cidr>   (default: empty; only used when --fail-closed-ssh-allow true)
 
@@ -50,6 +51,10 @@ TRAVERSAL_MAX_AGE_SECS=""
 DNS_ZONE_MAX_AGE_SECS=""
 FAIL_CLOSED_SSH_ALLOW="false"
 FAIL_CLOSED_SSH_ALLOW_CIDRS=""
+# utun interface name for WireGuard. Defaults to utun9 (safe fallback that avoids
+# utun0-8 used by macOS system interfaces). Callers should always pass an explicit
+# value derived from the node_id (see utun_name_for_node_id in macos_install.rs).
+WG_INTERFACE="utun9"
 # Auto-detect brew prefix; caller may override via --brew-prefix.
 if [[ -x "/opt/homebrew/bin/brew" ]]; then
   BREW_PREFIX="/opt/homebrew"
@@ -72,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --auto-tunnel-max-age-secs)    AUTO_TUNNEL_MAX_AGE_SECS="$2";    shift 2 ;;
     --traversal-max-age-secs)      TRAVERSAL_MAX_AGE_SECS="$2";      shift 2 ;;
     --dns-zone-max-age-secs)       DNS_ZONE_MAX_AGE_SECS="$2";       shift 2 ;;
+    --wg-interface)                WG_INTERFACE="$2";                shift 2 ;;
     --fail-closed-ssh-allow)       FAIL_CLOSED_SSH_ALLOW="$2";       shift 2 ;;
     --fail-closed-ssh-allow-cidrs) FAIL_CLOSED_SSH_ALLOW_CIDRS="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -80,6 +86,13 @@ done
 
 if [[ -z "${NODE_ID}" || -z "${NODE_ROLE}" ]]; then
   echo "error: --node-id and --node-role are required" >&2
+  exit 2
+fi
+
+# Validate --wg-interface: must be utun followed by one or more digits.
+# Fail closed — an invalid or missing value must never silently end up in the plist.
+if [[ ! "${WG_INTERFACE}" =~ ^utun[0-9]+$ ]]; then
+  echo "error: --wg-interface '${WG_INTERFACE}' must match ^utun[0-9]+$" >&2
   exit 2
 fi
 
@@ -235,6 +248,10 @@ cat > "${PLIST_DST}" <<PLIST
         <string>--trust-watermark</string>
         <string>${STATE_ROOT}/trust/rustynetd.trust.watermark</string>
 ${TRUST_MAX_AGE_PLIST_FRAGMENT}
+        <string>--enrollment-secret</string>
+        <string>${STATE_ROOT}/keys/enrollment.secret</string>
+        <string>--enrollment-ledger</string>
+        <string>${STATE_ROOT}/keys/rustynetd.enrollment.ledger</string>
         <string>--membership-snapshot</string>
         <string>${STATE_ROOT}/membership/membership.snapshot</string>
         <string>--membership-log</string>
@@ -269,6 +286,8 @@ ${DNS_ZONE_MAX_AGE_PLIST_FRAGMENT}
 ${WG_ENCRYPTED_KEY_PLIST_FRAGMENT}
         <string>--wg-public-key</string>
         <string>${STATE_ROOT}/keys/wireguard.pub</string>
+        <string>--wg-interface</string>
+        <string>${WG_INTERFACE}</string>
         <string>--backend</string>
         <string>macos-wireguard-userspace-shared</string>
         <string>--socket</string>
