@@ -56,6 +56,7 @@ use rustynetd::windows_dns_failclosed::{
     build_windows_dns_failclosed_report, collect_windows_dns_failclosed_snapshot,
     evaluate_nrpt_ipv6_sibling_coverage, evaluate_router_advertisement_suppression,
 };
+use rustynetd::windows_ipc::collect_windows_named_pipe_acl_report;
 use rustynetd::windows_key_custody::collect_windows_key_custody_snapshot;
 use rustynetd::windows_mesh_status::{
     WindowsMeshStatusOptions, collect_windows_mesh_status_report,
@@ -157,6 +158,9 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "windows-runtime-acls-check" => {
                 run_windows_runtime_acls_check_command(rest)
+            }
+            [cmd, rest @ ..] if cmd == "windows-named-pipe-acls-check" => {
+                run_windows_named_pipe_acls_check_command(rest)
             }
             [cmd, rest @ ..] if cmd == "windows-registry-acls-check" => {
                 run_windows_registry_acls_check_command(rest)
@@ -561,6 +565,52 @@ fn run_windows_runtime_acls_check_command(args: &[String]) -> Result<(), String>
     if fail_on_drift && !report.overall_ok {
         return Err(
             "windows-runtime-acls-check reported drift on at least one reviewed runtime root"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn run_windows_named_pipe_acls_check_command(args: &[String]) -> Result<(), String> {
+    let mut fail_on_drift = true;
+    let mut service_sid: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args.get(index).map(String::as_str) {
+            Some("--no-fail-on-drift") => {
+                fail_on_drift = false;
+                index += 1;
+            }
+            Some("--service-sid") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "windows-named-pipe-acls-check --service-sid requires a value".to_owned()
+                })?;
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err(
+                        "windows-named-pipe-acls-check --service-sid must be non-empty printable text"
+                            .to_owned(),
+                    );
+                }
+                service_sid = Some(value.clone());
+                index += 2;
+            }
+            Some(flag) => {
+                return Err(format!(
+                    "unknown windows-named-pipe-acls-check argument: {flag}"
+                ));
+            }
+            None => break,
+        }
+    }
+    let report = collect_windows_named_pipe_acl_report(service_sid.as_deref());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("serialize named-pipe-acls report failed: {err}"))?
+    );
+    if fail_on_drift && !report.overall_ok {
+        return Err(
+            "windows-named-pipe-acls-check reported drift on at least one reviewed named pipe"
                 .to_owned(),
         );
     }
@@ -3164,6 +3214,7 @@ fn help_text() -> String {
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-runtime-acls-check [--no-fail-on-drift]",
+        "  rustynetd windows-named-pipe-acls-check [--service-sid <sid>] [--no-fail-on-drift]",
         "  rustynetd windows-registry-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-runtime-acls-check [--no-fail-on-drift]",
         "  rustynetd linux-mesh-status-check [--state-path <path>] [--expected-peer-id <id>]... [--max-age-seconds <secs>] [--no-fail-on-drift]",
@@ -3270,8 +3321,8 @@ mod tests {
         run_windows_backend_readiness_check_command, run_windows_dns_failclosed_check_command,
         run_windows_exit_nat_lifecycle_snapshot_command, run_windows_key_custody_check_command,
         run_windows_killswitch_assert_command, run_windows_mesh_status_check_command,
-        run_windows_registry_acls_check_command, run_windows_runtime_acls_check_command,
-        run_windows_service_hardening_check_command,
+        run_windows_named_pipe_acls_check_command, run_windows_registry_acls_check_command,
+        run_windows_runtime_acls_check_command, run_windows_service_hardening_check_command,
     };
     use rustynetd::daemon::{
         DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_BUNDLE_PATH,
@@ -3309,6 +3360,13 @@ mod tests {
     }
 
     #[test]
+    fn help_text_advertises_windows_named_pipe_acls_check_subcommand() {
+        let help = help_text();
+        assert!(help.contains("windows-named-pipe-acls-check"));
+        assert!(help.contains("--service-sid <sid>"));
+    }
+
+    #[test]
     fn run_windows_runtime_acls_check_command_rejects_unknown_flags() {
         let err = run_windows_runtime_acls_check_command(&["--bogus".to_owned()])
             .expect_err("unknown flag must be rejected");
@@ -3316,6 +3374,21 @@ mod tests {
             err.contains("unknown windows-runtime-acls-check argument"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn run_windows_named_pipe_acls_check_command_rejects_unknown_flags() {
+        let err = run_windows_named_pipe_acls_check_command(&["--bogus".to_owned()])
+            .expect_err("unknown flag must be rejected");
+        assert!(err.contains("unknown windows-named-pipe-acls-check argument"));
+    }
+
+    #[test]
+    fn run_windows_named_pipe_acls_check_command_rejects_empty_service_sid() {
+        let err =
+            run_windows_named_pipe_acls_check_command(&["--service-sid".to_owned(), "".to_owned()])
+                .expect_err("empty service SID must be rejected");
+        assert!(err.contains("--service-sid must be non-empty printable text"));
     }
 
     #[test]
