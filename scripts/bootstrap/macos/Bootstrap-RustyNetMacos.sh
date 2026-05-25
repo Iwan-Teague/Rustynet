@@ -64,7 +64,25 @@ BREW_PREFIX=""
 # ── Privilege separation ───────────────────────────────────────────────────────
 # Homebrew and the Rust toolchain refuse to run as root. When invoked via
 # `sudo bash`, $SUDO_USER holds the original unprivileged user.
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || whoami)}"
+#
+# Phase 24 follow-up (Gap E): the orchestrator wrapper rn_bootstrap_macos.sh
+# already runs us under `sudo -n bash`, so we are launched with SUDO_USER
+# pointing at the wrapper's effective user. When the wrapper itself was
+# already invoked via sudo (the orchestrator's `live_lab_run_root` pattern),
+# SUDO_USER inside this script is `root` rather than the human/desktop
+# account that owns Homebrew. Falling back blindly to `${SUDO_USER:-...}`
+# would then make as_user run brew as root, which Homebrew refuses
+# ("Running Homebrew as root is extremely dangerous"). Prefer logname
+# (which tracks the original login session uid) and only fall back to
+# SUDO_USER when logname is unavailable AND SUDO_USER is not root.
+REAL_USER="$(logname 2>/dev/null || true)"
+if [[ -z "${REAL_USER}" || "${REAL_USER}" == "root" ]]; then
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    REAL_USER="${SUDO_USER}"
+  else
+    REAL_USER="$(whoami)"
+  fi
+fi
 REAL_HOME="$(eval echo "~${REAL_USER}")"
 
 # Run a command as the real (non-root) user with the current PATH exported.
@@ -196,7 +214,15 @@ ensure_homebrew() {
 install_brew_packages() {
   local pkg
   # Note: Homebrew renamed the formula from rustup-init to rustup (keg-only).
-  for pkg in wireguard-go wireguard-tools rustup; do
+  #
+  # Phase 24 follow-up (Gap D): coreutils provides `gtimeout`, which we
+  # symlink into /usr/local/bin/timeout below so the orchestrator's
+  # `timeout 15 sudo -n -k true` preflight (Linux-style, see
+  # scripts/e2e/live_lab_common.sh::live_lab_verify_sudo) resolves to a
+  # working `timeout` binary on stock macOS (which ships only BSD `time`,
+  # no GNU `timeout`). Without this the orchestrator's prime_remote_access
+  # stage fails for the aux/macos label with rc=127.
+  for pkg in wireguard-go wireguard-tools rustup coreutils; do
     if as_user "${BREW_PREFIX}/bin/brew" list --formula "${pkg}" &>/dev/null 2>&1; then
       echo "[prereqs] ${pkg}: already installed"
     else
@@ -215,6 +241,21 @@ install_brew_packages() {
       ln -sf "${wg_go_bin}" /usr/local/bin/wireguard-go
     else
       echo "[prereqs] wireguard-go not found after brew install" >&2
+      exit 1
+    fi
+  fi
+
+  # Phase 24 follow-up (Gap D): expose GNU timeout at /usr/local/bin/timeout
+  # so the orchestrator's preflight finds it on ssh non-login shells (whose
+  # PATH does NOT include /opt/homebrew/bin even when /etc/paths lists it).
+  if [[ ! -e /usr/local/bin/timeout ]]; then
+    local gtimeout_bin="${BREW_PREFIX}/bin/gtimeout"
+    if [[ -x "${gtimeout_bin}" ]]; then
+      echo "[prereqs] Symlinking gtimeout to /usr/local/bin/timeout for orchestrator PATH"
+      mkdir -p /usr/local/bin
+      ln -sf "${gtimeout_bin}" /usr/local/bin/timeout
+    else
+      echo "[prereqs] gtimeout not found after brew install coreutils" >&2
       exit 1
     fi
   fi
@@ -582,7 +623,15 @@ generate_wireguard_keys() {
   # runtime/public/encrypted files are written mode 0600 owner-rustynetd by
   # initialize_encrypted_key_material's write_atomic helper, which uses the
   # effective UID of the running process.
-  if ! sudo -u rustynetd "${RUSTYNETD_BIN}" key init \
+  # Phase 24 follow-up (Gap F): rustynetd's resolve_wireguard_binary_path()
+  # defaults to /usr/bin/wg, which does not exist on macOS. Homebrew installs
+  # wg at ${BREW_PREFIX}/bin/wg (the launchd plist already exports
+  # RUSTYNET_WG_BINARY_PATH for the daemon's runtime invocations). For the
+  # bootstrap-time `key init` call we must export the same path explicitly,
+  # since `sudo -u rustynetd ${RUSTYNETD_BIN}` would otherwise inherit the
+  # rustynetd-user env (which is empty for the dscl-created service account).
+  if ! sudo -u rustynetd RUSTYNET_WG_BINARY_PATH="${BREW_PREFIX}/bin/wg" \
+      "${RUSTYNETD_BIN}" key init \
       --runtime-private-key "${runtime_key}" \
       --encrypted-private-key "${encrypted_key}" \
       --public-key "${public_key}" \
@@ -742,6 +791,21 @@ if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   # Binary already installed — skip prereqs, build, and binary install.
   # Only run the steps needed to keep the service config current.
   echo "[bootstrap] SKIP_BUILD=1: skipping prereqs and build phases"
+  # Phase 24 follow-up (Gap G): generate_wireguard_keys and the install
+  # script both reference ${BREW_PREFIX}; without setup_bootstrap_path the
+  # variable is empty and `${BREW_PREFIX}/bin/wg` collapses to `/bin/wg`,
+  # which does not exist on macOS. Resolve BREW_PREFIX here so the SKIP_BUILD
+  # path runs with the same brew_prefix the full-install path would.
+  for _bp in /opt/homebrew /usr/local; do
+    if [[ -x "${_bp}/bin/brew" ]]; then
+      BREW_PREFIX="${_bp}"
+      break
+    fi
+  done
+  if [[ -z "${BREW_PREFIX}" ]]; then
+    echo "[bootstrap] SKIP_BUILD=1: brew not found at /opt/homebrew or /usr/local" >&2
+    exit 1
+  fi
   ensure_rustynetd_user
   setup_directories
   generate_wireguard_keys

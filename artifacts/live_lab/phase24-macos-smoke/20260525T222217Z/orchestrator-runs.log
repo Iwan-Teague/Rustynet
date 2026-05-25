@@ -1,0 +1,487 @@
+run started: 2026-05-25 23:28:05 IST (utc: 2026-05-25T22:28:05Z)
+[stage:preflight] START verify local prerequisites
+[stage:preflight] PASS
+[stage:prepare_source_archive] START package local source tree for remote install
+source mode: local working tree
+[stage:prepare_source_archive] PASS
+[stage:verify_ssh_reachability] START verify all selected nodes are reachable via ssh
+[parallel:verify_ssh_reachability] exit debian@192.168.65.3 rc=0
+----- verify_ssh_reachability/exit (exit-1 admin) BEGIN -----
+[ssh-reachable] exit debian@192.168.65.3
+
+----- verify_ssh_reachability/exit END -----
+[parallel:verify_ssh_reachability] client debian@192.168.65.4 rc=0
+----- verify_ssh_reachability/client (client-1 client) BEGIN -----
+[ssh-reachable] client debian@192.168.65.4
+
+----- verify_ssh_reachability/client END -----
+[parallel:verify_ssh_reachability] entry debian@192.168.65.5 rc=0
+----- verify_ssh_reachability/entry (client-2 client) BEGIN -----
+[ssh-reachable] entry debian@192.168.65.5
+
+----- verify_ssh_reachability/entry END -----
+[parallel:verify_ssh_reachability] aux mac@192.168.64.18 rc=0
+----- verify_ssh_reachability/aux (client-3 client) BEGIN -----
+[ssh-reachable] aux mac@192.168.64.18
+
+----- verify_ssh_reachability/aux END -----
+[parallel:verify_ssh_reachability] extra debian@192.168.65.6 rc=0
+----- verify_ssh_reachability/extra (client-4 client) BEGIN -----
+[ssh-reachable] extra debian@192.168.65.6
+
+----- verify_ssh_reachability/extra END -----
+[parallel:verify_ssh_reachability] fifth_client debian@192.168.65.7 rc=0
+----- verify_ssh_reachability/fifth_client (client-5 client) BEGIN -----
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- verify_ssh_reachability/fifth_client END -----
+[stage:verify_ssh_reachability] PASS
+[stage:prime_remote_access] START push sudo credentials to all targets
+[serial:prime_remote_access] exit debian@192.168.65.3 rc=0
+----- prime_remote_access/exit (exit-1 admin) BEGIN -----
+[prime-remote] exit debian@192.168.65.3
+[ssh-reachable] exit debian@192.168.65.3
+
+----- prime_remote_access/exit END -----
+[serial:prime_remote_access] client debian@192.168.65.4 rc=0
+----- prime_remote_access/client (client-1 client) BEGIN -----
+[prime-remote] client debian@192.168.65.4
+[ssh-reachable] client debian@192.168.65.4
+
+----- prime_remote_access/client END -----
+[serial:prime_remote_access] entry debian@192.168.65.5 rc=0
+----- prime_remote_access/entry (client-2 client) BEGIN -----
+[prime-remote] entry debian@192.168.65.5
+[ssh-reachable] entry debian@192.168.65.5
+
+----- prime_remote_access/entry END -----
+[serial:prime_remote_access] aux mac@192.168.64.18 rc=1
+----- prime_remote_access/aux (client-3 client) BEGIN -----
+[prime-remote] aux mac@192.168.64.18
+[ssh-reachable] aux mac@192.168.64.18
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+passwordless sudo (sudo -n) is required for live lab automation
+user: mac
+groups: staff everyone localaccounts _appserverusr admin _appserveradm com.apple.sharepoint.group.1 _appstore _lpadmin _lpoperator _developer _analyticsusers com.apple.access_ftp com.apple.access_screensharing com.apple.access_ssh com.apple.access_remote_ae
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+passwordless sudo (sudo -n) is required for live lab automation
+user: mac
+groups: staff everyone localaccounts _appserverusr admin _appserveradm com.apple.sharepoint.group.1 _appstore _lpadmin _lpoperator _developer _analyticsusers com.apple.access_ftp com.apple.access_screensharing com.apple.access_ssh com.apple.access_remote_ae
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+passwordless sudo (sudo -n) is required for live lab automation
+user: mac
+groups: staff everyone localaccounts _appserverusr admin _appserveradm com.apple.sharepoint.group.1 _appstore _lpadmin _lpoperator _developer _analyticsusers com.apple.access_ftp com.apple.access_screensharing com.apple.access_ssh com.apple.access_remote_ae
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+passwordless sudo (sudo -n) is required for live lab automation
+user: mac
+groups: staff everyone localaccounts _appserverusr admin _appserveradm com.apple.sharepoint.group.1 _appstore _lpadmin _lpoperator _developer _analyticsusers com.apple.access_ftp com.apple.access_screensharing com.apple.access_ssh com.apple.access_remote_ae
+
+----- prime_remote_access/aux END -----
+[serial:prime_remote_access] extra debian@192.168.65.6 rc=0
+----- prime_remote_access/extra (client-4 client) BEGIN -----
+[prime-remote] extra debian@192.168.65.6
+[ssh-reachable] extra debian@192.168.65.6
+
+----- prime_remote_access/extra END -----
+[serial:prime_remote_access] fifth_client debian@192.168.65.7 rc=0
+----- prime_remote_access/fifth_client (client-5 client) BEGIN -----
+[prime-remote] fifth_client debian@192.168.65.7
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- prime_remote_access/fifth_client END -----
+[stage:prime_remote_access] FAIL rc=1
+[stage:prime_remote_access] failure digest: artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/failure_digest.md
+run started: 2026-05-25 23:46:12 IST (utc: 2026-05-25T22:46:12Z)
+[stage:preflight] START verify local prerequisites
+[stage:preflight] PASS
+[stage:prepare_source_archive] START package local source tree for remote install
+source mode: local working tree
+[stage:prepare_source_archive] PASS
+[stage:verify_ssh_reachability] START verify all selected nodes are reachable via ssh
+[parallel:verify_ssh_reachability] exit debian@192.168.65.3 rc=0
+----- verify_ssh_reachability/exit (exit-1 admin) BEGIN -----
+[ssh-reachable] exit debian@192.168.65.3
+
+----- verify_ssh_reachability/exit END -----
+[parallel:verify_ssh_reachability] client debian@192.168.65.4 rc=0
+----- verify_ssh_reachability/client (client-1 client) BEGIN -----
+[ssh-reachable] client debian@192.168.65.4
+
+----- verify_ssh_reachability/client END -----
+[parallel:verify_ssh_reachability] entry debian@192.168.65.5 rc=0
+----- verify_ssh_reachability/entry (client-2 client) BEGIN -----
+[ssh-reachable] entry debian@192.168.65.5
+
+----- verify_ssh_reachability/entry END -----
+[parallel:verify_ssh_reachability] aux mac@192.168.64.18 rc=0
+----- verify_ssh_reachability/aux (client-3 client) BEGIN -----
+[ssh-reachable] aux mac@192.168.64.18
+
+----- verify_ssh_reachability/aux END -----
+[parallel:verify_ssh_reachability] extra debian@192.168.65.6 rc=0
+----- verify_ssh_reachability/extra (client-4 client) BEGIN -----
+[ssh-reachable] extra debian@192.168.65.6
+
+----- verify_ssh_reachability/extra END -----
+[parallel:verify_ssh_reachability] fifth_client debian@192.168.65.7 rc=0
+----- verify_ssh_reachability/fifth_client (client-5 client) BEGIN -----
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- verify_ssh_reachability/fifth_client END -----
+[stage:verify_ssh_reachability] PASS
+[stage:prime_remote_access] START push sudo credentials to all targets
+[serial:prime_remote_access] exit debian@192.168.65.3 rc=0
+----- prime_remote_access/exit (exit-1 admin) BEGIN -----
+[prime-remote] exit debian@192.168.65.3
+[ssh-reachable] exit debian@192.168.65.3
+
+----- prime_remote_access/exit END -----
+[serial:prime_remote_access] client debian@192.168.65.4 rc=0
+----- prime_remote_access/client (client-1 client) BEGIN -----
+[prime-remote] client debian@192.168.65.4
+[ssh-reachable] client debian@192.168.65.4
+
+----- prime_remote_access/client END -----
+[serial:prime_remote_access] entry debian@192.168.65.5 rc=0
+----- prime_remote_access/entry (client-2 client) BEGIN -----
+[prime-remote] entry debian@192.168.65.5
+[ssh-reachable] entry debian@192.168.65.5
+
+----- prime_remote_access/entry END -----
+[serial:prime_remote_access] aux mac@192.168.64.18 rc=0
+----- prime_remote_access/aux (client-3 client) BEGIN -----
+[prime-remote] aux mac@192.168.64.18
+[ssh-reachable] aux mac@192.168.64.18
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+
+----- prime_remote_access/aux END -----
+[serial:prime_remote_access] extra debian@192.168.65.6 rc=0
+----- prime_remote_access/extra (client-4 client) BEGIN -----
+[prime-remote] extra debian@192.168.65.6
+[ssh-reachable] extra debian@192.168.65.6
+
+----- prime_remote_access/extra END -----
+[serial:prime_remote_access] fifth_client debian@192.168.65.7 rc=0
+----- prime_remote_access/fifth_client (client-5 client) BEGIN -----
+[prime-remote] fifth_client debian@192.168.65.7
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- prime_remote_access/fifth_client END -----
+[stage:prime_remote_access] PASS
+[stage:cleanup_hosts] START remove prior RustyNet state from targets
+[serial:cleanup_hosts] exit debian@192.168.65.3 rc=0
+----- cleanup_hosts/exit (exit-1 admin) BEGIN -----
+[cleanup] exit debian@192.168.65.3 platform=linux
+
+----- cleanup_hosts/exit END -----
+[serial:cleanup_hosts] client debian@192.168.65.4 rc=0
+----- cleanup_hosts/client (client-1 client) BEGIN -----
+[cleanup] client debian@192.168.65.4 platform=linux
+
+----- cleanup_hosts/client END -----
+[serial:cleanup_hosts] entry debian@192.168.65.5 rc=0
+----- cleanup_hosts/entry (client-2 client) BEGIN -----
+[cleanup] entry debian@192.168.65.5 platform=linux
+
+----- cleanup_hosts/entry END -----
+[serial:cleanup_hosts] aux mac@192.168.64.18 rc=0
+----- cleanup_hosts/aux (client-3 client) BEGIN -----
+[cleanup] aux mac@192.168.64.18 platform=macos
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+Error: Virtual machine not found.
+UTM exec failed for mac@192.168.64.18; falling back to SSH
+
+----- cleanup_hosts/aux END -----
+[serial:cleanup_hosts] extra debian@192.168.65.6 rc=0
+----- cleanup_hosts/extra (client-4 client) BEGIN -----
+[cleanup] extra debian@192.168.65.6 platform=linux
+
+----- cleanup_hosts/extra END -----
+[serial:cleanup_hosts] fifth_client debian@192.168.65.7 rc=0
+----- cleanup_hosts/fifth_client (client-5 client) BEGIN -----
+[cleanup] fifth_client debian@192.168.65.7 platform=linux
+
+----- cleanup_hosts/fifth_client END -----
+[stage:cleanup_hosts] PASS
+[stage:bootstrap_hosts] START fresh install and bootstrap RustyNet on all targets
+scripts/e2e/live_linux_lab_orchestrator.sh: line 1650: 49665 Killed: 9               ( set -euo pipefail; "$@" ) 2>&1
+     49666                       | tee -a "$log_path"
+[stage:bootstrap_hosts] FAIL rc=137
+[stage:bootstrap_hosts] failure digest: artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/failure_digest.md
+run started: 2026-05-25 23:55:54 IST (utc: 2026-05-25T22:55:54Z)
+[stage:preflight] START verify local prerequisites
+[stage:preflight] PASS
+[stage:prepare_source_archive] START package local source tree for remote install
+source mode: local working tree
+[stage:prepare_source_archive] PASS
+[stage:verify_ssh_reachability] START verify all selected nodes are reachable via ssh
+[parallel:verify_ssh_reachability] exit debian@192.168.65.3 rc=0
+----- verify_ssh_reachability/exit (exit-1 admin) BEGIN -----
+[ssh-reachable] exit debian@192.168.65.3
+
+----- verify_ssh_reachability/exit END -----
+[parallel:verify_ssh_reachability] client debian@192.168.65.4 rc=0
+----- verify_ssh_reachability/client (client-1 client) BEGIN -----
+[ssh-reachable] client debian@192.168.65.4
+
+----- verify_ssh_reachability/client END -----
+[parallel:verify_ssh_reachability] entry debian@192.168.65.5 rc=0
+----- verify_ssh_reachability/entry (client-2 client) BEGIN -----
+[ssh-reachable] entry debian@192.168.65.5
+
+----- verify_ssh_reachability/entry END -----
+[parallel:verify_ssh_reachability] aux mac@192.168.64.18 rc=0
+----- verify_ssh_reachability/aux (client-3 client) BEGIN -----
+[ssh-reachable] aux mac@192.168.64.18
+
+----- verify_ssh_reachability/aux END -----
+[parallel:verify_ssh_reachability] extra debian@192.168.65.6 rc=0
+----- verify_ssh_reachability/extra (client-4 client) BEGIN -----
+[ssh-reachable] extra debian@192.168.65.6
+
+----- verify_ssh_reachability/extra END -----
+[parallel:verify_ssh_reachability] fifth_client debian@192.168.65.7 rc=0
+----- verify_ssh_reachability/fifth_client (client-5 client) BEGIN -----
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- verify_ssh_reachability/fifth_client END -----
+[stage:verify_ssh_reachability] PASS
+[stage:prime_remote_access] START push sudo credentials to all targets
+[serial:prime_remote_access] exit debian@192.168.65.3 rc=0
+----- prime_remote_access/exit (exit-1 admin) BEGIN -----
+[prime-remote] exit debian@192.168.65.3
+[ssh-reachable] exit debian@192.168.65.3
+
+----- prime_remote_access/exit END -----
+[serial:prime_remote_access] client debian@192.168.65.4 rc=0
+----- prime_remote_access/client (client-1 client) BEGIN -----
+[prime-remote] client debian@192.168.65.4
+[ssh-reachable] client debian@192.168.65.4
+
+----- prime_remote_access/client END -----
+[serial:prime_remote_access] entry debian@192.168.65.5 rc=0
+----- prime_remote_access/entry (client-2 client) BEGIN -----
+[prime-remote] entry debian@192.168.65.5
+[ssh-reachable] entry debian@192.168.65.5
+
+----- prime_remote_access/entry END -----
+[serial:prime_remote_access] aux mac@192.168.64.18 rc=0
+----- prime_remote_access/aux (client-3 client) BEGIN -----
+[prime-remote] aux mac@192.168.64.18
+[ssh-reachable] aux mac@192.168.64.18
+
+----- prime_remote_access/aux END -----
+[serial:prime_remote_access] extra debian@192.168.65.6 rc=0
+----- prime_remote_access/extra (client-4 client) BEGIN -----
+[prime-remote] extra debian@192.168.65.6
+[ssh-reachable] extra debian@192.168.65.6
+
+----- prime_remote_access/extra END -----
+[serial:prime_remote_access] fifth_client debian@192.168.65.7 rc=0
+----- prime_remote_access/fifth_client (client-5 client) BEGIN -----
+[prime-remote] fifth_client debian@192.168.65.7
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- prime_remote_access/fifth_client END -----
+[stage:prime_remote_access] PASS
+[stage:cleanup_hosts] START remove prior RustyNet state from targets
+[serial:cleanup_hosts] exit debian@192.168.65.3 rc=1
+----- cleanup_hosts/exit (exit-1 admin) BEGIN -----
+[cleanup] exit debian@192.168.65.3 platform=linux
+rm: cannot remove '/tmp/rn_source.tar.gz': Operation not permitted
+
+----- cleanup_hosts/exit END -----
+[serial:cleanup_hosts] client debian@192.168.65.4 rc=1
+----- cleanup_hosts/client (client-1 client) BEGIN -----
+[cleanup] client debian@192.168.65.4 platform=linux
+rm: cannot remove '/tmp/rn_source.tar.gz': Operation not permitted
+
+----- cleanup_hosts/client END -----
+[serial:cleanup_hosts] entry debian@192.168.65.5 rc=0
+----- cleanup_hosts/entry (client-2 client) BEGIN -----
+[cleanup] entry debian@192.168.65.5 platform=linux
+
+----- cleanup_hosts/entry END -----
+[serial:cleanup_hosts] aux mac@192.168.64.18 rc=0
+----- cleanup_hosts/aux (client-3 client) BEGIN -----
+[cleanup] aux mac@192.168.64.18 platform=macos
+
+----- cleanup_hosts/aux END -----
+[serial:cleanup_hosts] extra debian@192.168.65.6 rc=0
+----- cleanup_hosts/extra (client-4 client) BEGIN -----
+[cleanup] extra debian@192.168.65.6 platform=linux
+
+----- cleanup_hosts/extra END -----
+[serial:cleanup_hosts] fifth_client debian@192.168.65.7 rc=0
+----- cleanup_hosts/fifth_client (client-5 client) BEGIN -----
+[cleanup] fifth_client debian@192.168.65.7 platform=linux
+
+----- cleanup_hosts/fifth_client END -----
+[stage:cleanup_hosts] FAIL rc=1
+[stage:cleanup_hosts] failure digest: artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/failure_digest.md
+run started: 2026-05-26 00:05:08 IST (utc: 2026-05-25T23:05:08Z)
+[stage:preflight] START verify local prerequisites
+[stage:preflight] PASS
+[stage:prepare_source_archive] START package local source tree for remote install
+source mode: local working tree
+[stage:prepare_source_archive] PASS
+[stage:verify_ssh_reachability] START verify all selected nodes are reachable via ssh
+[parallel:verify_ssh_reachability] exit debian@192.168.65.3 rc=0
+----- verify_ssh_reachability/exit (exit-1 admin) BEGIN -----
+[ssh-reachable] exit debian@192.168.65.3
+
+----- verify_ssh_reachability/exit END -----
+[parallel:verify_ssh_reachability] client debian@192.168.65.4 rc=0
+----- verify_ssh_reachability/client (client-1 client) BEGIN -----
+[ssh-reachable] client debian@192.168.65.4
+
+----- verify_ssh_reachability/client END -----
+[parallel:verify_ssh_reachability] entry debian@192.168.65.5 rc=0
+----- verify_ssh_reachability/entry (client-2 client) BEGIN -----
+[ssh-reachable] entry debian@192.168.65.5
+
+----- verify_ssh_reachability/entry END -----
+[parallel:verify_ssh_reachability] aux mac@192.168.64.18 rc=0
+----- verify_ssh_reachability/aux (client-3 client) BEGIN -----
+[ssh-reachable] aux mac@192.168.64.18
+
+----- verify_ssh_reachability/aux END -----
+[parallel:verify_ssh_reachability] extra debian@192.168.65.6 rc=0
+----- verify_ssh_reachability/extra (client-4 client) BEGIN -----
+[ssh-reachable] extra debian@192.168.65.6
+
+----- verify_ssh_reachability/extra END -----
+[parallel:verify_ssh_reachability] fifth_client debian@192.168.65.7 rc=0
+----- verify_ssh_reachability/fifth_client (client-5 client) BEGIN -----
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- verify_ssh_reachability/fifth_client END -----
+[stage:verify_ssh_reachability] PASS
+[stage:prime_remote_access] START push sudo credentials to all targets
+[serial:prime_remote_access] exit debian@192.168.65.3 rc=0
+----- prime_remote_access/exit (exit-1 admin) BEGIN -----
+[prime-remote] exit debian@192.168.65.3
+[ssh-reachable] exit debian@192.168.65.3
+
+----- prime_remote_access/exit END -----
+[serial:prime_remote_access] client debian@192.168.65.4 rc=0
+----- prime_remote_access/client (client-1 client) BEGIN -----
+[prime-remote] client debian@192.168.65.4
+[ssh-reachable] client debian@192.168.65.4
+
+----- prime_remote_access/client END -----
+[serial:prime_remote_access] entry debian@192.168.65.5 rc=0
+----- prime_remote_access/entry (client-2 client) BEGIN -----
+[prime-remote] entry debian@192.168.65.5
+[ssh-reachable] entry debian@192.168.65.5
+
+----- prime_remote_access/entry END -----
+[serial:prime_remote_access] aux mac@192.168.64.18 rc=0
+----- prime_remote_access/aux (client-3 client) BEGIN -----
+[prime-remote] aux mac@192.168.64.18
+[ssh-reachable] aux mac@192.168.64.18
+
+----- prime_remote_access/aux END -----
+[serial:prime_remote_access] extra debian@192.168.65.6 rc=0
+----- prime_remote_access/extra (client-4 client) BEGIN -----
+[prime-remote] extra debian@192.168.65.6
+[ssh-reachable] extra debian@192.168.65.6
+
+----- prime_remote_access/extra END -----
+[serial:prime_remote_access] fifth_client debian@192.168.65.7 rc=0
+----- prime_remote_access/fifth_client (client-5 client) BEGIN -----
+[prime-remote] fifth_client debian@192.168.65.7
+[ssh-reachable] fifth_client debian@192.168.65.7
+
+----- prime_remote_access/fifth_client END -----
+[stage:prime_remote_access] PASS
+[stage:cleanup_hosts] START remove prior RustyNet state from targets
+[serial:cleanup_hosts] exit debian@192.168.65.3 rc=0
+----- cleanup_hosts/exit (exit-1 admin) BEGIN -----
+[cleanup] exit debian@192.168.65.3 platform=linux
+
+----- cleanup_hosts/exit END -----
+[serial:cleanup_hosts] client debian@192.168.65.4 rc=0
+----- cleanup_hosts/client (client-1 client) BEGIN -----
+[cleanup] client debian@192.168.65.4 platform=linux
+
+----- cleanup_hosts/client END -----
+[serial:cleanup_hosts] entry debian@192.168.65.5 rc=0
+----- cleanup_hosts/entry (client-2 client) BEGIN -----
+[cleanup] entry debian@192.168.65.5 platform=linux
+
+----- cleanup_hosts/entry END -----
+[serial:cleanup_hosts] aux mac@192.168.64.18 rc=0
+----- cleanup_hosts/aux (client-3 client) BEGIN -----
+[cleanup] aux mac@192.168.64.18 platform=macos
+
+----- cleanup_hosts/aux END -----
+[serial:cleanup_hosts] extra debian@192.168.65.6 rc=0
+----- cleanup_hosts/extra (client-4 client) BEGIN -----
+[cleanup] extra debian@192.168.65.6 platform=linux
+
+----- cleanup_hosts/extra END -----
+[serial:cleanup_hosts] fifth_client debian@192.168.65.7 rc=0
+----- cleanup_hosts/fifth_client (client-5 client) BEGIN -----
+[cleanup] fifth_client debian@192.168.65.7 platform=linux
+
+----- cleanup_hosts/fifth_client END -----
+[stage:cleanup_hosts] PASS
+[stage:bootstrap_hosts] START fresh install and bootstrap RustyNet on all targets
