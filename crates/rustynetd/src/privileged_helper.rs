@@ -420,6 +420,16 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
                 continue;
             }
 
+            // Peek first 4 bytes to dispatch RNUF (utun open) vs RNHF (command).
+            let mut peek_buf = [0u8; 4];
+            let peeked = stream.peek(&mut peek_buf).unwrap_or(0);
+
+            #[cfg(target_os = "macos")]
+            if peeked >= 4 && &peek_buf == crate::macos_utun_helper::RNUF_MAGIC {
+                let _ = crate::macos_utun_helper_server::handle_utun_open_request(stream);
+                continue;
+            }
+
             let response = match read_request(&mut stream) {
                 Ok(request) => handle_request_with_timeout(request, config.io_timeout),
                 Err(err) => HelperResponse::error(err),

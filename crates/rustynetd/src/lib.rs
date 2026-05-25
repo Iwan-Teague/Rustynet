@@ -35,6 +35,12 @@ pub mod macos_key_custody;
 pub mod macos_mesh_status;
 pub mod macos_runtime_acls;
 pub mod macos_service_hardening;
+#[cfg(target_os = "macos")]
+pub mod macos_utun_helper;
+#[cfg(target_os = "macos")]
+pub mod macos_utun_helper_server;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_utun_helper_unsafe;
 pub mod perf;
 pub mod phase10;
 pub mod platform;

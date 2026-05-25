@@ -216,11 +216,42 @@ pub(crate) trait MacosTunLifecycle: fmt::Debug + Send + Sync {
     fn cleanup(&mut self, interface_name: &str) -> Result<(), BackendError>;
 }
 
-#[derive(Debug, Default)]
 pub(crate) struct DirectMacosTunLifecycle {
     runner: LinuxCommandRunner,
     default_route: Option<MacosDefaultRoute>,
     endpoint_bypass_hosts: BTreeSet<IpAddr>,
+    #[cfg(target_os = "macos")]
+    utun_opener: Option<crate::MacosUtunOpenerFn>,
+}
+
+impl fmt::Debug for DirectMacosTunLifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectMacosTunLifecycle")
+            .field("default_route", &self.default_route)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DirectMacosTunLifecycle {
+    fn default() -> Self {
+        Self {
+            runner: LinuxCommandRunner,
+            default_route: None,
+            endpoint_bypass_hosts: BTreeSet::new(),
+            #[cfg(target_os = "macos")]
+            utun_opener: None,
+        }
+    }
+}
+
+impl DirectMacosTunLifecycle {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_utun_opener(opener: crate::MacosUtunOpenerFn) -> Self {
+        Self {
+            utun_opener: Some(opener),
+            ..Self::default()
+        }
+    }
 }
 
 impl MacosTunLifecycle for DirectMacosTunLifecycle {
@@ -231,6 +262,9 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
     ) -> Result<MacosTunDevice, BackendError> {
         validate_macos_utun_name(interface_name)?;
         let local = ParsedLocalCidr::parse(&context.local_cidr)?;
+        #[cfg(target_os = "macos")]
+        let device = open_utun_device(interface_name, self.utun_opener.as_deref())?;
+        #[cfg(not(target_os = "macos"))]
         let device = SyncDevice::open(interface_name).map_err(|err| {
             BackendError::internal(format!(
                 "macos userspace-shared utun open failed for {interface_name}: {err}"
@@ -880,6 +914,34 @@ impl ParsedLocalCidr {
             address,
             prefix_len,
         })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_utun_device(
+    interface_name: &str,
+    opener_fn: Option<&(dyn Fn(&str) -> Result<std::os::fd::OwnedFd, String> + Send + Sync)>,
+) -> Result<SyncDevice, BackendError> {
+    match opener_fn {
+        None => SyncDevice::open(interface_name).map_err(|err| {
+            BackendError::internal(format!(
+                "macos userspace-shared utun open failed for {interface_name}: {err}"
+            ))
+        }),
+        Some(open_fn) => {
+            use std::os::fd::IntoRawFd;
+            let owned_fd = open_fn(interface_name).map_err(|err| {
+                BackendError::internal(format!(
+                    "macos userspace-shared utun privileged-helper open failed for {interface_name}: {err}"
+                ))
+            })?;
+            let raw_fd = owned_fd.into_raw_fd();
+            SyncDevice::from_raw_fd(raw_fd).map_err(|err| {
+                BackendError::internal(format!(
+                    "macos userspace-shared utun fd wrap failed for {interface_name}: {err}"
+                ))
+            })
+        }
     }
 }
 

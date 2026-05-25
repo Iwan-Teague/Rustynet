@@ -127,7 +127,9 @@ use rustynet_backend_wireguard::{
     DEFAULT_WINDOWS_WIREGUARD_EXE_PATH, WindowsWireguardBackend,
 };
 #[cfg(target_os = "macos")]
-use rustynet_backend_wireguard::{MacosUserspaceSharedBackend, MacosWireguardBackend};
+use rustynet_backend_wireguard::{
+    MacosUserspaceSharedBackend, MacosUtunOpenerFn, MacosWireguardBackend,
+};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
 use rustynet_control::membership::{
@@ -2613,12 +2615,37 @@ impl DaemonBackend {
                     }
                     #[cfg(not(test))]
                     {
-                        let backend = MacosUserspaceSharedBackend::new(
-                            config.wg_interface.clone(),
-                            private_key.to_string_lossy().to_string(),
-                            config.wg_listen_port,
-                        )
-                        .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+                        let backend =
+                            if let Some(ref helper_path) =
+                                config.privileged_helper_socket_path
+                            {
+                                let socket_path = helper_path.clone();
+                                let timeout = std::time::Duration::from_millis(
+                                    config.privileged_helper_timeout_ms.get(),
+                                );
+                                let opener: MacosUtunOpenerFn =
+                                    Box::new(move |iface: &str| {
+                                        crate::macos_utun_helper::send_utun_open_request(
+                                            &socket_path,
+                                            iface,
+                                            timeout,
+                                        )
+                                    });
+                                MacosUserspaceSharedBackend::new_with_helper(
+                                    config.wg_interface.clone(),
+                                    private_key.to_string_lossy().to_string(),
+                                    config.wg_listen_port,
+                                    opener,
+                                )
+                                .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?
+                            } else {
+                                MacosUserspaceSharedBackend::new(
+                                    config.wg_interface.clone(),
+                                    private_key.to_string_lossy().to_string(),
+                                    config.wg_listen_port,
+                                )
+                                .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?
+                            };
                         Ok(Self::MacosUserspaceShared(backend))
                     }
                 }

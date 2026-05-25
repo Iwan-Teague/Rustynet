@@ -222,13 +222,40 @@ mod imp {
             }
             Ok((result as usize).saturating_sub(UTUN_HEADER_LEN))
         }
+
+        pub fn from_raw_fd(fd: RawFd) -> io::Result<Self> {
+            if fd < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "utun fd must be non-negative",
+                ));
+            }
+            Ok(Self { fd })
+        }
     }
 
     impl Drop for SyncDevice {
         fn drop(&mut self) {
-            unsafe {
-                libc::close(self.fd);
+            if self.fd >= 0 {
+                unsafe {
+                    libc::close(self.fd);
+                }
+                self.fd = -1;
             }
+        }
+    }
+
+    impl std::os::fd::IntoRawFd for SyncDevice {
+        fn into_raw_fd(self) -> RawFd {
+            let fd = self.fd;
+            std::mem::forget(self);
+            fd
+        }
+    }
+
+    impl std::os::fd::AsRawFd for SyncDevice {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
         }
     }
 
