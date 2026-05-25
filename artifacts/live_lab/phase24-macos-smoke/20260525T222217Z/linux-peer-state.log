@@ -1,0 +1,61 @@
+=== Linux peer state — all 5 Debian VMs show membership_active_nodes=6 (including macos-client-1) ===
+Run: 2026-05-25T23:25:53Z
+Profile: profiles/live_lab/generated_vm_lab_20260525T222217Z_phase24_macos_smoke.env
+
+--- debian@192.168.65.3 ---
+node_id=exit-1
+node_role=admin
+state=DataplaneApplied
+managed_peer_endpoints=none
+reconcile_failures=0
+last_reconcile_error=none
+path_live_proven=false
+membership_epoch=6
+membership_active_nodes=6
+
+--- debian@192.168.65.4 ---
+node_id=client-1
+node_role=client
+state=DataplaneApplied
+managed_peer_endpoints=none
+reconcile_failures=0
+last_reconcile_error=none
+path_live_proven=false
+membership_epoch=6
+membership_active_nodes=6
+
+--- debian@192.168.65.5 ---
+node_id=client-2
+node_role=client
+state=DataplaneApplied
+managed_peer_endpoints=none
+reconcile_failures=0
+last_reconcile_error=none
+path_live_proven=false
+membership_epoch=6
+membership_active_nodes=6
+
+--- debian@192.168.65.6 ---
+node_id=client-4
+node_role=client
+state=DataplaneApplied
+managed_peer_endpoints=none
+reconcile_failures=0
+last_reconcile_error=none
+path_live_proven=false
+membership_epoch=6
+membership_active_nodes=6
+
+--- debian@192.168.65.7 ---
+node_id=client-5
+node_role=client
+state=DataplaneApplied
+managed_peer_endpoints=none
+reconcile_failures=0
+last_reconcile_error=none
+path_live_proven=false
+membership_epoch=6
+membership_active_nodes=6
+
+=== Membership listing on exit-1 ===
+membership status: network_id=rn-live-lab-20260525T230508Z epoch=6 quorum_threshold=1 active_nodes=client-1,client-2,client-4,client-5,exit-1,macos-client-1 state_root=d65c242a2b832a15f177701f03941fc53d49dc5e46351573e2d8353f56a21db5
