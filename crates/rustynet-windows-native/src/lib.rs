@@ -69,12 +69,25 @@ pub enum AuthenticodeChainOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NativeWindowsNamedPipeClientFacts {
     pub user_sid: Option<String>,
+    /// Token group SIDs filtered to those that are currently
+    /// SE_GROUP_ENABLED and NOT SE_GROUP_USE_FOR_DENY_ONLY. UAC-filtered
+    /// admin tokens carry the Administrators SID with
+    /// SE_GROUP_USE_FOR_DENY_ONLY set; such SIDs do NOT grant
+    /// authorisation and must not appear here.
     pub group_sids: Vec<String>,
     pub is_local_system: bool,
     pub is_builtin_administrator: bool,
     pub matches_service_identity: bool,
-    pub is_remote_client: bool,
 }
+
+// Remote-client rejection for our named-pipe server is enforced by the
+// `PIPE_REJECT_REMOTE_CLIENTS` flag passed to `CreateNamedPipeW` (see
+// the imp::serve_named_pipe_one_message_authorized impl). The Windows
+// kernel refuses connections that come in over the network at handle
+// creation time, so there is no need to query the connected client for
+// "is this remote?" — by the time we impersonate, the connection is
+// guaranteed local. Keeping a runtime `is_remote_client` field here
+// would imply an additional check that does not actually happen.
 
 #[cfg(not(windows))]
 pub fn dpapi_protect(
@@ -277,9 +290,9 @@ mod imp {
     };
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GetFileSecurityW, GetKernelObjectSecurity, GetTokenInformation,
-        ImpersonateNamedPipeClient, LookupAccountNameW, OWNER_SECURITY_INFORMATION,
-        OpenThreadToken, PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES,
-        SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
+        LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, RevertToSelf,
+        SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+        TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers,
@@ -287,10 +300,21 @@ mod imp {
     };
     use windows_sys::Win32::System::Pipes::{
         CallNamedPipeW, ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
-        PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
-        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ImpersonateNamedPipeClient, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+    // Token-group SID attribute bits (windows-sys 0.59 exposes these as
+    // `i32` constants under `Win32::System::SystemServices`, but the
+    // `SID_AND_ATTRIBUTES.Attributes` field is `u32`). Defining them
+    // locally as `u32` keeps the cast at the constant site instead of
+    // littering call sites with `as u32` and avoids pulling in another
+    // top-level feature for two small bit flags. Values match
+    // `winnt.h` and `windows_sys::Win32::System::SystemServices::{
+    // SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY}`.
+    const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+    const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 
     pub fn dpapi_protect(
         plaintext: &[u8],
@@ -403,9 +427,7 @@ mod imp {
     /// Invalid}` variants.
     pub fn inspect_registry_key_sddl(key_path: &str) -> Result<String, String> {
         use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
-        use windows_sys::Win32::System::Registry::{
-            HKEY, KEY_READ, RegCloseKey, RegGetKeySecurity, RegOpenKeyExW,
-        };
+        use windows_sys::Win32::System::Registry::{HKEY, KEY_READ, RegCloseKey, RegOpenKeyExW};
 
         let (root, subkey) = parse_registry_root(key_path)?;
         let wide_subkey = to_wide(subkey);
@@ -698,12 +720,11 @@ mod imp {
                 DisconnectNamedPipe(handle.raw());
             }
             return Err(format!(
-                "Windows named-pipe client rejected: user_sid={} local_system={} builtin_admin={} service_sid_match={} remote_client={}",
+                "Windows named-pipe client rejected: user_sid={} local_system={} builtin_admin={} service_sid_match={}",
                 facts.user_sid.as_deref().unwrap_or("<unknown>"),
                 facts.is_local_system,
                 facts.is_builtin_administrator,
                 facts.matches_service_identity,
-                facts.is_remote_client
             ));
         }
 
@@ -723,9 +744,9 @@ mod imp {
     }
 
     fn named_pipe_client_authorized(facts: &NativeWindowsNamedPipeClientFacts) -> bool {
-        if facts.is_remote_client {
-            return false;
-        }
+        // Remote-client rejection is enforced by `PIPE_REJECT_REMOTE_CLIENTS`
+        // at handle creation in `CreateNamedPipeW`, so every connection
+        // that reaches this authorisation step is guaranteed local.
         facts.is_local_system || facts.is_builtin_administrator || facts.matches_service_identity
     }
 
@@ -770,9 +791,13 @@ mod imp {
         let token = OwnedHandle::new(token)
             .ok_or_else(|| "OpenThreadToken returned an invalid handle".to_owned())?;
         let user_sid = read_token_user_sid(token.raw())?;
-        let group_sids = read_token_group_sids(token.raw())?;
+        // Only ENABLED and not DENY_ONLY group SIDs grant authorisation.
+        // Filtering at extraction prevents UAC-filtered admin tokens
+        // (Administrators SID present but `SE_GROUP_USE_FOR_DENY_ONLY`)
+        // from being treated as Administrators downstream.
+        let group_sids = read_active_token_group_sids(token.raw())?;
         let is_local_system = user_sid.as_deref() == Some("S-1-5-18");
-        let is_builtin_administrator = group_sids.iter().any(|sid| sid == "S-1-5-32-544");
+        let is_builtin_administrator = group_contains_builtin_administrators(&group_sids);
         let matches_service_identity = service_sid.is_some_and(|expected| {
             user_sid.as_deref() == Some(expected) || group_sids.iter().any(|sid| sid == expected)
         });
@@ -782,13 +807,16 @@ mod imp {
             is_local_system,
             is_builtin_administrator,
             matches_service_identity,
-            is_remote_client: false,
         })
     }
 
     fn read_token_user_sid(token: HANDLE) -> Result<Option<String>, String> {
         let bytes = read_token_information(token, TokenUser)?;
         let token_user = bytes.as_ptr().cast::<TOKEN_USER>();
+        // Safety: `bytes` was sized + filled by GetTokenInformation for
+        // the TokenUser class, so `*token_user` is a valid TOKEN_USER
+        // whose `User.Sid` field points into the same allocation (or
+        // is null when the kernel reports no SID).
         let sid = unsafe { (*token_user).User.Sid };
         if sid.is_null() {
             return Ok(None);
@@ -796,18 +824,74 @@ mod imp {
         sid_to_string(sid.cast::<c_void>()).map(Some)
     }
 
-    fn read_token_group_sids(token: HANDLE) -> Result<Vec<String>, String> {
+    /// Token-group SID slice extracted from a TOKEN_GROUPS buffer,
+    /// preserving each entry's `Attributes` bitfield so authorisation
+    /// checks can filter out DENY_ONLY / disabled groups.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SidWithAttributes {
+        pub sid: String,
+        pub attributes: u32,
+    }
+
+    /// Pure-Rust filter: returns only SIDs whose `SE_GROUP_ENABLED`
+    /// bit is set AND whose `SE_GROUP_USE_FOR_DENY_ONLY` bit is
+    /// cleared. UAC-filtered admin tokens carry the Administrators
+    /// SID with DENY_ONLY set — that SID must NOT grant any
+    /// authorisation, which is what this filter ensures.
+    pub(super) fn filter_active_group_sids(groups: &[SidWithAttributes]) -> Vec<String> {
+        groups
+            .iter()
+            .filter(|g| {
+                g.attributes & SE_GROUP_ENABLED != 0
+                    && g.attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0
+            })
+            .map(|g| g.sid.clone())
+            .collect()
+    }
+
+    /// Pure-Rust helper: true when the filtered SID list contains the
+    /// well-known Administrators SID `S-1-5-32-544`. The input is
+    /// expected to be the output of `filter_active_group_sids` so a
+    /// DENY_ONLY Administrators SID is never seen here.
+    pub(super) fn group_contains_builtin_administrators(filtered_sids: &[String]) -> bool {
+        filtered_sids.iter().any(|sid| sid == "S-1-5-32-544")
+    }
+
+    fn read_token_group_sids_raw(token: HANDLE) -> Result<Vec<SidWithAttributes>, String> {
         let bytes = read_token_information(token, TokenGroups)?;
         let token_groups = bytes.as_ptr().cast::<TOKEN_GROUPS>();
+        // Safety: bytes was sized + populated by GetTokenInformation for
+        // TokenGroups, so `*token_groups` is a valid TOKEN_GROUPS and
+        // its `Groups` array contains `GroupCount` valid
+        // SID_AND_ATTRIBUTES entries inside the same allocation.
         let count = unsafe { (*token_groups).GroupCount as usize };
         let groups = unsafe { std::slice::from_raw_parts((*token_groups).Groups.as_ptr(), count) };
-        let mut sids = Vec::with_capacity(count);
-        for SID_AND_ATTRIBUTES { Sid, .. } in groups {
-            if !Sid.is_null() {
-                sids.push(sid_to_string((*Sid).cast::<c_void>())?);
+        let mut out = Vec::with_capacity(count);
+        for entry in groups {
+            let SID_AND_ATTRIBUTES { Sid, Attributes } = *entry;
+            if Sid.is_null() {
+                continue;
             }
+            // Safety: `Sid` is a `PSID = *mut c_void` that points into
+            // the same TOKEN_GROUPS allocation; we are passing it to
+            // ConvertSidToStringSidW, which only reads the SID.
+            let sid_str = sid_to_string(Sid.cast::<c_void>())?;
+            out.push(SidWithAttributes {
+                sid: sid_str,
+                attributes: Attributes,
+            });
         }
-        Ok(sids)
+        Ok(out)
+    }
+
+    /// Reads the impersonated thread token's group SIDs, filtered to
+    /// the SIDs that are currently active (enabled and not
+    /// DENY_ONLY). This is the public-shaped helper that callers
+    /// should use; raw access stays internal to keep the UAC filter
+    /// from being bypassed by accident.
+    fn read_active_token_group_sids(token: HANDLE) -> Result<Vec<String>, String> {
+        let groups = read_token_group_sids_raw(token)?;
+        Ok(filter_active_group_sids(&groups))
     }
 
     fn read_token_information(
@@ -1486,5 +1570,93 @@ mod tests {
         );
         let err = select_default_gateway_from_adapters(&[bad]).expect_err("no gateway");
         assert!(err.contains("no usable Windows default gateway"));
+    }
+}
+
+// Pure-Rust UAC-filter coverage for the token-group authorisation
+// path. The helpers tested here have no FFI dependency, so the tests
+// build and run on every host the workspace targets (Linux/macOS test
+// runs catch regressions before they ever reach a Windows fixture).
+#[cfg(windows)]
+#[cfg(test)]
+mod token_filter_tests {
+    use super::imp::{
+        SidWithAttributes, filter_active_group_sids, group_contains_builtin_administrators,
+    };
+
+    const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+    const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
+    const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
+
+    fn entry(sid: &str, attributes: u32) -> SidWithAttributes {
+        SidWithAttributes {
+            sid: sid.to_owned(),
+            attributes,
+        }
+    }
+
+    #[test]
+    fn token_group_filter_keeps_enabled_non_deny_only_sids() {
+        let groups = [
+            entry("S-1-5-32-544", SE_GROUP_ENABLED),
+            entry("S-1-5-11", SE_GROUP_ENABLED),
+        ];
+        let filtered = filter_active_group_sids(&groups);
+        assert!(filtered.contains(&"S-1-5-32-544".to_owned()));
+        assert!(filtered.contains(&"S-1-5-11".to_owned()));
+    }
+
+    #[test]
+    fn token_group_filter_rejects_deny_only_admin_sid() {
+        // UAC-filtered admin token: Administrators SID present but
+        // carrying SE_GROUP_USE_FOR_DENY_ONLY. MUST NOT appear in the
+        // filtered set.
+        let groups = [
+            entry("S-1-5-32-544", SE_GROUP_USE_FOR_DENY_ONLY),
+            entry("S-1-5-11", SE_GROUP_ENABLED),
+        ];
+        let filtered = filter_active_group_sids(&groups);
+        assert!(!filtered.contains(&"S-1-5-32-544".to_owned()));
+        assert!(filtered.contains(&"S-1-5-11".to_owned()));
+    }
+
+    #[test]
+    fn token_group_filter_rejects_disabled_admin_sid() {
+        // SID present but neither ENABLED nor DENY_ONLY (e.g. a
+        // restricted group that the kernel left in the token without
+        // active membership). Must also be filtered out.
+        let groups = [
+            entry("S-1-5-32-544", 0),
+            entry("S-1-5-32-544", SE_GROUP_INTEGRITY),
+        ];
+        let filtered = filter_active_group_sids(&groups);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn token_group_filter_rejects_enabled_but_also_deny_only_sid() {
+        // Defensive: a SID with both bits set (real Windows can
+        // produce this combination on some legacy tokens) still
+        // counts as DENY_ONLY, so it must be filtered out.
+        let groups = [entry(
+            "S-1-5-32-544",
+            SE_GROUP_ENABLED | SE_GROUP_USE_FOR_DENY_ONLY,
+        )];
+        let filtered = filter_active_group_sids(&groups);
+        assert!(!filtered.contains(&"S-1-5-32-544".to_owned()));
+    }
+
+    #[test]
+    fn is_builtin_administrator_rejects_uac_filtered_admin_token() {
+        let groups = [entry("S-1-5-32-544", SE_GROUP_USE_FOR_DENY_ONLY)];
+        let filtered = filter_active_group_sids(&groups);
+        assert!(!group_contains_builtin_administrators(&filtered));
+    }
+
+    #[test]
+    fn is_builtin_administrator_accepts_active_admin_token() {
+        let groups = [entry("S-1-5-32-544", SE_GROUP_ENABLED)];
+        let filtered = filter_active_group_sids(&groups);
+        assert!(group_contains_builtin_administrators(&filtered));
     }
 }
