@@ -237,7 +237,7 @@ Already covered by Phase 23's Windows arm in the wrapper, but Phase 25 is the fo
 
 **Status (2026-05-25)**: code-complete on `codex/windows-named-pipe-acl`; live Windows proof still pending.
 
-**Problem**: Windows daemon socket is a named pipe `\\.\pipe\rustynet`, not a Unix socket. Track B Phase 18 added the macOS allowlist; Windows needs analogous allowlist + named-pipe security descriptor validation.
+**Problem**: Windows daemon socket is a named pipe under the reviewed `\\.\pipe\RustyNet\` sub-namespace (canonical leaf `\\.\pipe\RustyNet\rustynetd`, privileged-helper leaf `\\.\pipe\RustyNet\rustynetd-privileged`), not a Unix socket. Track B Phase 18 added the macOS allowlist; Windows needs analogous allowlist + named-pipe security descriptor validation. Pinned by `DEFAULT_WINDOWS_DAEMON_PIPE_PATH` / `DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH` in `crates/rustynetd/src/windows_ipc.rs` and the `canonical_pipe_paths_pin_rustynet_namespace` test in the same file.
 
 **Fix**: add Windows-specific socket validator that checks the named-pipe ACL via `windows-rs` (or `winapi`) — must require `BUILTIN\Administrators` full control, `rustynetd` service account read/write, deny everyone else.
 

@@ -43,15 +43,24 @@ pub struct WindowsNamedPipeSecurityPolicy {
     pub allow_local_system: bool,
     pub allow_builtin_administrators: bool,
     pub allow_service_identity: bool,
-    pub deny_remote_clients: bool,
 }
+
+// Remote-client rejection is enforced by the server-side
+// `PIPE_REJECT_REMOTE_CLIENTS` flag passed to `CreateNamedPipeW`
+// inside `rustynet-windows-native::serve_named_pipe_one_message_authorized`.
+// The Windows kernel refuses remote connections at handle creation, so
+// no runtime allowlist flag is needed here. The dropped fields
+// (`WindowsNamedPipeClientFacts::is_remote_client` and
+// `WindowsNamedPipeSecurityPolicy::deny_remote_clients`) misled
+// readers into believing there was a second runtime check; there
+// never was, and adding one would duplicate the kernel-enforced
+// rejection without strengthening it.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WindowsNamedPipeClientFacts {
     pub is_local_system: bool,
     pub is_builtin_administrator: bool,
     pub matches_service_identity: bool,
-    pub is_remote_client: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,13 +107,11 @@ pub fn default_security_policy(role: WindowsLocalIpcRole) -> WindowsNamedPipeSec
             allow_local_system: true,
             allow_builtin_administrators: true,
             allow_service_identity: true,
-            deny_remote_clients: true,
         },
         WindowsLocalIpcRole::PrivilegedHelper => WindowsNamedPipeSecurityPolicy {
             allow_local_system: true,
             allow_builtin_administrators: true,
             allow_service_identity: true,
-            deny_remote_clients: true,
         },
     }
 }
@@ -113,9 +120,9 @@ pub fn is_client_authorized(
     policy: &WindowsNamedPipeSecurityPolicy,
     facts: WindowsNamedPipeClientFacts,
 ) -> bool {
-    if policy.deny_remote_clients && facts.is_remote_client {
-        return false;
-    }
+    // Remote-client rejection happens at handle creation via
+    // `PIPE_REJECT_REMOTE_CLIENTS`. By the time a connected-client
+    // facts struct exists, the connection is already local.
     if policy.allow_service_identity && facts.matches_service_identity {
         return true;
     }
@@ -353,8 +360,32 @@ fn collect_named_pipe_acl_entry(
     }
 }
 
+/// Detect the "named pipe does not exist" error shape that
+/// `inspect_named_pipe_sddl` produces when the pipe handle has not
+/// been created yet (typical at install time before the daemon has
+/// started). Match the literal Windows error code with word
+/// boundaries so a substring like "Windows error 2" does NOT also
+/// match "Windows error 20" (ERROR_BAD_ENVIRONMENT) or "Windows
+/// error 32" (ERROR_SHARING_VIOLATION).
 fn named_pipe_missing_error(reason: &str) -> bool {
-    reason.contains("Windows error 2") || reason.contains("not found")
+    // Tokenised match against the canonical "Windows error <code>"
+    // shape that `rustynet_windows_native` errors use. The error
+    // code is always the last token on its segment of the string,
+    // so we scan whitespace-separated tokens once and only accept
+    // an exact "2" alongside a literal "error" predecessor.
+    let tokens: Vec<&str> = reason
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+    for window in tokens.windows(2) {
+        if window[0].eq_ignore_ascii_case("error") && window[1] == "2" {
+            return true;
+        }
+    }
+    // Symbolic form (in case a future error string includes the
+    // Windows constant name directly) and the long-form English
+    // text also count as "missing".
+    reason.contains("ERROR_FILE_NOT_FOUND") || reason.contains("not found")
 }
 
 fn parse_sddl_field<'a>(sddl: &'a str, marker: &str) -> Option<&'a str> {
@@ -657,15 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn default_security_policy_denies_remote_and_unknown_clients() {
+    fn default_security_policy_denies_unknown_clients() {
+        // Note: remote-client rejection is enforced by the
+        // PIPE_REJECT_REMOTE_CLIENTS server-side flag in
+        // CreateNamedPipeW (see `rustynet-windows-native`), so the
+        // policy struct itself only has to deny "client matches none
+        // of the allow rules".
         let policy = default_security_policy(WindowsLocalIpcRole::PrivilegedHelper);
-        assert!(!is_client_authorized(
-            &policy,
-            WindowsNamedPipeClientFacts {
-                is_remote_client: true,
-                ..WindowsNamedPipeClientFacts::default()
-            },
-        ));
         assert!(!is_client_authorized(
             &policy,
             WindowsNamedPipeClientFacts::default(),
@@ -823,5 +852,50 @@ mod tests {
             reason.contains("implemented"),
             "blocker reason should acknowledge implemented status: {reason}"
         );
+    }
+
+    #[test]
+    fn canonical_pipe_paths_pin_rustynet_namespace() {
+        // M2 — pin the canonical pipe path constants so the doc
+        // and the code can never drift again without test failure.
+        // Phase 26 reviewer caught a drift where docs said
+        // `\\.\pipe\rustynet` but code used `\\.\pipe\RustyNet\rustynetd`;
+        // the code path is the correct security-hardened form
+        // (namespaced sub-pipe), so the doc has been updated to match.
+        assert_eq!(
+            DEFAULT_WINDOWS_DAEMON_PIPE_PATH,
+            r"\\.\pipe\RustyNet\rustynetd"
+        );
+        assert_eq!(
+            DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH,
+            r"\\.\pipe\RustyNet\rustynetd-privileged"
+        );
+    }
+
+    #[test]
+    fn named_pipe_missing_error_matches_only_error_code_two() {
+        // Positive cases: real Win32 errors from
+        // `rustynet-windows-native::inspect_named_pipe_sddl` use the
+        // shape "...failed with Windows error N".
+        assert!(super::named_pipe_missing_error(
+            "GetNamedSecurityInfoW failed for named pipe \\\\.\\pipe\\rustynetd with Windows error 2"
+        ));
+        assert!(super::named_pipe_missing_error("ERROR_FILE_NOT_FOUND"));
+        assert!(super::named_pipe_missing_error("pipe handle not found"));
+
+        // Negative cases: substring "Windows error 2" used to match
+        // any 2-prefixed code. These MUST now be rejected.
+        assert!(!super::named_pipe_missing_error(
+            "GetNamedSecurityInfoW failed with Windows error 20"
+        ));
+        assert!(!super::named_pipe_missing_error(
+            "GetNamedSecurityInfoW failed with Windows error 32"
+        ));
+        assert!(!super::named_pipe_missing_error(
+            "GetNamedSecurityInfoW failed with Windows error 234"
+        ));
+        assert!(!super::named_pipe_missing_error(
+            "GetNamedSecurityInfoW failed with Windows error 1234"
+        ));
     }
 }
