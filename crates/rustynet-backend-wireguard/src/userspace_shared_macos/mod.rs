@@ -61,6 +61,22 @@ impl MacosUserspaceSharedBackend {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn new_with_helper(
+        interface_name: impl Into<String>,
+        private_key_path: impl Into<String>,
+        listen_port: u16,
+        utun_opener: crate::MacosUtunOpenerFn,
+    ) -> Result<Self, BackendError> {
+        Self::new_with_tun_lifecycle(
+            interface_name,
+            private_key_path,
+            listen_port,
+            Box::new(tun::DirectMacosTunLifecycle::with_utun_opener(utun_opener)),
+            false,
+        )
+    }
+
     #[cfg(any(test, feature = "test-harness"))]
     #[doc(hidden)]
     pub fn new_for_test(
