@@ -223,6 +223,55 @@ if [[ -f "${STATE_ROOT}/keys/wireguard.passphrase" ]]; then
         <string>${STATE_ROOT}/keys/wireguard.passphrase</string>"
 fi
 
+# ── Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in) ──────────
+#
+# Linux systemd unit (scripts/systemd/rustynetd.service) passes a superset of
+# daemon flags. For each flag the Linux unit passes that this macOS plist
+# does NOT, the decision is documented below. An accidental omission set
+# would silently fall back to daemon defaults which may differ from the
+# Linux-validated configuration; the explicit audit closes that gap.
+#
+# Flags ADDED to the plist below to match systemd-unit semantics:
+#   --gossip-watermark
+#       systemd value: /var/lib/rustynet/rustynetd.gossip.watermark
+#       daemon default: None (gossip runs in-memory only)
+#       reason: D2.5 requires the gossip-sequence + seen-source ledger to
+#       survive daemon restarts. Without an explicit spool path the
+#       daemon loses replay protection across restarts on macOS.
+#       macOS spool: ${STATE_ROOT}/membership/rustynetd.gossip.watermark
+#
+# Flags INTENTIONALLY OMITTED because the daemon default already matches
+# the Linux-validated value on macOS:
+#   --anchor-bundle-pull-addr        default: 127.0.0.1:51822 (loopback) — matches systemd
+#   --anchor-bundle-pull-token-path  default: None (no token enforced) — matches systemd empty
+#   --anchor-bundle-pull-allow-lan   default: false — matches systemd
+#   --wg-listen-port                 default: 51820 — matches systemd
+#   --egress-interface               default: "auto" — matches systemd
+#   --auto-port-forward-exit         default: false — matches systemd
+#   --auto-port-forward-lease-secs   default: 1200 — matches systemd
+#   --privileged-helper-timeout-ms   default: 2000 — matches systemd
+#   --reconcile-interval-ms          default: 1000 — matches systemd
+#   --max-reconcile-failures         default: 5 — matches systemd
+#   --dns-zone-name                  default: "rustynet" — matches systemd
+#   --dns-resolver-bind-addr         default: 127.0.0.1:53535 — matches systemd
+#   --traversal-stun-servers         default: empty Vec — matches systemd empty
+#   --traversal-stun-gather-timeout-ms default: 2000 — matches systemd
+#
+# Flag INTENTIONALLY OMITTED because it is platform-specific to Linux:
+#   --dataplane-mode
+#       systemd value: hybrid-native
+#       daemon default: Shell
+#       reason: dataplane_mode is consumed only by the Linux dataplane
+#       branch (daemon.rs maps DaemonDataplaneMode → LinuxDataplaneMode).
+#       The macOS backend takes a different code path that does not
+#       reference this field, so passing or omitting it has no effect.
+
+# Build the gossip-watermark plist fragment. Always present; spool lives
+# under the membership dir so it shares the same rustynetd:rustynetd 0700
+# ownership setup by Bootstrap-RustyNetMacos.sh setup_directories.
+GOSSIP_WATERMARK_PLIST_FRAGMENT="        <string>--gossip-watermark</string>
+        <string>${STATE_ROOT}/membership/rustynetd.gossip.watermark</string>"
+
 # ── Write plist ───────────────────────────────────────────────────────────────
 cat > "${PLIST_DST}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -258,6 +307,7 @@ ${TRUST_MAX_AGE_PLIST_FRAGMENT}
         <string>${STATE_ROOT}/membership/membership.log</string>
         <string>--membership-watermark</string>
         <string>${STATE_ROOT}/membership/membership.watermark</string>
+${GOSSIP_WATERMARK_PLIST_FRAGMENT}
         <string>--auto-tunnel-enforce</string>
         <string>${AUTO_TUNNEL_ENFORCE}</string>
         <string>--auto-tunnel-bundle</string>

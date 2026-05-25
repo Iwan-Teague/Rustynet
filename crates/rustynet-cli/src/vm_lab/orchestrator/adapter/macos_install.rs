@@ -704,8 +704,127 @@ mod tests {
             "bootstrap script must set mode 0600 on enrollment.secret"
         );
         assert!(
-            BOOTSTRAP_SCRIPT.contains("if [ ! -f") || BOOTSTRAP_SCRIPT.contains("if [[ ! -f"),
-            "enrollment.secret provisioning must be idempotent (generate-if-missing)"
+            BOOTSTRAP_SCRIPT.contains("if [ -f \"${secret_path}\" ]"),
+            "enrollment.secret provisioning must be idempotent (skip-if-present)"
+        );
+    }
+
+    /// HIGH 1 + 2 reviewer fold-in (Phase 21 follow-up).
+    ///
+    /// Pins the atomic tmpfile+rename pattern for `enrollment.secret`:
+    ///   - generation writes to a tmpfile inside `${KEYS_DIR}` (same fs →
+    ///     atomic rename),
+    ///   - the tmpfile is `chmod 0600`'d BEFORE any secret bytes land in
+    ///     it (chmod-first eliminates the race with default umask),
+    ///   - the script verifies the tmpfile is exactly 32 bytes before
+    ///     promoting it via `mv` (partial-write trap),
+    ///   - an `EXIT` trap removes the tmpfile if any pre-rename step
+    ///     fails so a re-run is always a clean fresh write.
+    #[test]
+    fn bootstrap_enrollment_secret_uses_atomic_tmpfile_rename() {
+        // Must mktemp inside ${KEYS_DIR} so the final mv is an atomic
+        // intra-filesystem rename, not a cross-device copy.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("mktemp \"${KEYS_DIR}/enrollment.secret.tmp.XXXXXX\""),
+            "bootstrap must mktemp the enrollment secret tmpfile inside ${{KEYS_DIR}}"
+        );
+        // EXIT trap so a SIGTERM/SIGHUP/abort path does not leak a partial tmpfile.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("trap 'rm -f \"${tmp}\"' EXIT"),
+            "bootstrap must install an EXIT trap to clean up the enrollment secret tmpfile"
+        );
+        // Atomic rename into the final secret path.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("mv \"${tmp}\" \"${secret_path}\""),
+            "bootstrap must promote the tmpfile via atomic mv"
+        );
+    }
+
+    /// HIGH 1 reviewer fold-in (Phase 21 follow-up).
+    ///
+    /// The `chmod 0600` MUST happen BEFORE `openssl rand` writes any
+    /// secret bytes into the tmpfile. The previous non-atomic pattern
+    /// (`openssl rand -out … && chmod 0600 …`) left the file at the
+    /// process umask mode for a brief window. Without this ordering
+    /// pin, a refactor could silently regress.
+    #[test]
+    fn bootstrap_enrollment_secret_chmod_precedes_openssl_write() {
+        let chmod_idx = BOOTSTRAP_SCRIPT
+            .find("chmod 0600 \"${tmp}\"")
+            .expect("bootstrap must chmod the tmpfile 0600");
+        let openssl_idx = BOOTSTRAP_SCRIPT
+            .find("openssl rand -out \"${tmp}\" 32")
+            .expect("bootstrap must write 32 random bytes to the tmpfile");
+        assert!(
+            chmod_idx < openssl_idx,
+            "chmod 0600 must run BEFORE openssl rand writes the secret (chmod-first \
+             prevents the race window where the file exists at umask perms)"
+        );
+    }
+
+    /// HIGH 2 reviewer fold-in (Phase 21 follow-up).
+    ///
+    /// The 32-byte size verification must run against the TMPFILE before
+    /// promotion, not against the final secret path after promotion. The
+    /// old pattern verified after `openssl rand` wrote directly to the
+    /// final path; a truncated openssl output (signal-killed, disk full)
+    /// would leave a partial secret at the canonical path. Next bootstrap
+    /// saw the file as present and skipped regeneration, then size-check
+    /// exited 1 → install stuck.
+    #[test]
+    fn bootstrap_enrollment_secret_size_check_targets_tmpfile_before_rename() {
+        // The size check must reference $tmp (pre-rename), and must
+        // appear BEFORE the `mv "${tmp}" "${secret_path}"` line.
+        let size_check_idx = BOOTSTRAP_SCRIPT
+            .find("size=\"$(wc -c < \"${tmp}\" | tr -d ' ')\"")
+            .expect("bootstrap must size-check the tmpfile before rename");
+        let rename_idx = BOOTSTRAP_SCRIPT
+            .find("mv \"${tmp}\" \"${secret_path}\"")
+            .expect("bootstrap must promote the tmpfile via mv");
+        assert!(
+            size_check_idx < rename_idx,
+            "size verification must target the tmpfile and run BEFORE the rename, \
+             so a truncated openssl output never reaches the canonical secret path"
+        );
+        // The pre-existing secret path also has its own size guard, so a
+        // partial file left behind by a hostile pre-Phase-21 install is
+        // also detected at the next bootstrap (rather than silently
+        // skipped).
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("existing enrollment.secret has invalid size"),
+            "bootstrap must hard-fail when an existing enrollment.secret is wrong size"
+        );
+    }
+
+    /// HIGH 3 reviewer fold-in (Phase 21 follow-up).
+    ///
+    /// `seed_trust_evidence` previously called
+    ///   `install -d -m 0755 -o root -g rustynetd "${trust_dir}"`
+    /// which rewrote the directory perms set by `setup_directories`
+    /// (`install -d -m 0700 -o rustynetd -g rustynetd`). The result
+    /// was a world-traversable trust dir. The fix must use the same
+    /// 0700 rustynetd:rustynetd perms in both call sites.
+    #[test]
+    fn bootstrap_trust_dir_perms_are_consistent_700_rustynetd() {
+        // setup_directories — unchanged baseline.
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("install -d -m 0700 -o rustynetd -g rustynetd \"${STATE_ROOT}/trust\""),
+            "setup_directories must create the trust dir as 0700 rustynetd:rustynetd"
+        );
+        // seed_trust_evidence — fixed to match.
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("install -d -m 0700 -o rustynetd -g rustynetd \"${trust_dir}\""),
+            "seed_trust_evidence must reaffirm 0700 rustynetd:rustynetd on the trust dir"
+        );
+        // Negative: the old 0755 root:rustynetd line must not reappear.
+        assert!(
+            !BOOTSTRAP_SCRIPT
+                .contains("install -d -m 0755 -o root      -g rustynetd \"${trust_dir}\"")
+                && !BOOTSTRAP_SCRIPT
+                    .contains("install -d -m 0755 -o root -g rustynetd \"${trust_dir}\""),
+            "seed_trust_evidence must not regress to 0755 root:rustynetd on the trust dir"
         );
     }
 
@@ -739,6 +858,72 @@ mod tests {
         assert!(
             BOOTSTRAP_SCRIPT.contains("chmod 0600") || BOOTSTRAP_SCRIPT.contains("chmod 600"),
             "bootstrap must set 0600 mode on secret files"
+        );
+    }
+
+    /// HIGH 4 reviewer fold-in (Phase 21 follow-up).
+    ///
+    /// The macOS plist's ProgramArguments must be a deliberate, audited
+    /// match to the Linux systemd-unit ExecStart flag set. For each
+    /// flag the Linux unit passes that the macOS plist omits, the
+    /// install script must either pass the flag explicitly or carry a
+    /// comment block declaring the omission intentional + safe.
+    ///
+    /// This test pins the audited add list (currently
+    /// `--gossip-watermark`, required for D2.5 gossip-state persistence
+    /// across daemon restarts) and pins the audited intentional-omission
+    /// comment block so a refactor cannot silently drop the audit.
+    #[test]
+    fn install_service_script_carries_audited_linux_parity_flag_set() {
+        // Added flags (Linux passes, macOS plist now also passes).
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("--gossip-watermark"),
+            "plist must pass --gossip-watermark (D2.5 gossip-state spool); \
+             omitting it makes the daemon run gossip purely in-memory and \
+             loses replay protection across restarts"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("${STATE_ROOT}/membership/rustynetd.gossip.watermark"),
+            "gossip-watermark spool must live under the membership/ dir so it \
+             inherits the 0700 rustynetd:rustynetd perms from setup_directories"
+        );
+
+        // Audited intentional-omission comment block — pins each omitted
+        // flag by name so a refactor that drops the comment fails the test.
+        // For each name below the comment must explain WHY the daemon
+        // default is correct on macOS for the lab.
+        let omitted_flags = [
+            "--anchor-bundle-pull-addr",
+            "--anchor-bundle-pull-token-path",
+            "--anchor-bundle-pull-allow-lan",
+            "--wg-listen-port",
+            "--egress-interface",
+            "--auto-port-forward-exit",
+            "--auto-port-forward-lease-secs",
+            "--privileged-helper-timeout-ms",
+            "--reconcile-interval-ms",
+            "--max-reconcile-failures",
+            "--dns-zone-name",
+            "--dns-resolver-bind-addr",
+            "--traversal-stun-servers",
+            "--traversal-stun-gather-timeout-ms",
+            "--dataplane-mode",
+        ];
+        for flag in omitted_flags {
+            assert!(
+                INSTALL_SERVICE_SCRIPT.contains(flag),
+                "install script must name {flag} in the audited omission comment \
+                 block so its absence from the plist is a deliberate, documented \
+                 choice rather than an accidental drop"
+            );
+        }
+
+        // Pin the audit-block header so the comment stays a single coherent
+        // block and is not split across the file by a refactor.
+        assert!(
+            INSTALL_SERVICE_SCRIPT
+                .contains("Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in)"),
+            "install script must keep the audited-omission header intact"
         );
     }
 }

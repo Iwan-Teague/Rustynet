@@ -340,27 +340,75 @@ setup_directories() {
 # Generates a 32-byte random enrollment HMAC secret for the daemon.
 # The file is raw binary (not hex or base64) — exactly what load_secret()
 # expects in rustynetd/src/enrollment_token.rs.
-# Idempotent: if the file already exists it is left untouched.
+# Idempotent: if the file already exists at the canonical path it is left
+# untouched.
 # Fail-closed: if generation or the permission/ownership steps fail, the
 # script exits immediately via set -euo pipefail.
+#
+# Atomic write protocol (HIGH 1 + 2 reviewer fold-in):
+#   1. Create unique tmpfile inside the keys/ directory (same filesystem as
+#      the final secret path, so the final mv is an atomic rename, not a
+#      cross-device copy).
+#   2. chmod 0600 the tmpfile BEFORE writing any secret bytes into it —
+#      this closes the brief race window in which `openssl rand -out`
+#      would otherwise create the file under the process umask (typically
+#      0022 → mode 0644) and only later have chmod tighten it.
+#   3. Write exactly 32 bytes of entropy into the tmpfile via openssl rand.
+#   4. Verify the tmpfile is exactly 32 bytes before promoting it. This
+#      catches truncated/short writes from a signal-killed openssl. The
+#      previous non-atomic pattern left a partial enrollment.secret on
+#      disk; the next bootstrap saw `if [ -f ]` as true, skipped
+#      regeneration, then size-checked and exited 1 → install stuck
+#      until an operator deleted the partial file by hand.
+#   5. chown to rustynetd:rustynetd, then atomic mv into the final path.
+#   6. EXIT trap removes the tmpfile if any step before the rename
+#      failed, so a re-run is always a clean fresh write.
 provision_enrollment_secret() {
   local secret_path="${KEYS_DIR}/enrollment.secret"
-  if [ ! -f "${secret_path}" ]; then
-    # Generate 32 raw binary bytes via openssl (available on all macOS versions).
-    openssl rand -out "${secret_path}" 32
-    chmod 0600 "${secret_path}"
-    chown rustynetd:rustynetd "${secret_path}"
-    echo "[bootstrap] enrollment.secret generated at ${secret_path}"
-  else
-    echo "[bootstrap] enrollment.secret already present; skipping generation"
+  if [ -f "${secret_path}" ]; then
+    # Hard verify the existing file is exactly 32 bytes before declaring
+    # it good. A pre-existing zero-byte or truncated secret is a fail-
+    # closed condition — the daemon would reject the HMAC key and the
+    # install would silently regress.
+    local existing_size
+    existing_size="$(wc -c < "${secret_path}" | tr -d ' ')"
+    if [ "${existing_size}" -ne 32 ]; then
+      echo "[bootstrap] existing enrollment.secret has invalid size ${existing_size} (expected 32); refusing to overwrite — delete it manually and re-run" >&2
+      exit 1
+    fi
+    echo "[bootstrap] enrollment.secret already present (32 bytes); skipping generation"
+    return 0
   fi
-  # Hard verify: the file must exist and must be exactly 32 bytes.
-  local size
-  size="$(wc -c < "${secret_path}" | tr -d ' ')"
-  if [ "${size}" -ne 32 ]; then
-    echo "[bootstrap] enrollment.secret size mismatch: expected 32 bytes, got ${size}" >&2
+
+  local tmp=""
+  # EXIT trap covers SIGTERM, SIGHUP, hard `exit` paths, and the
+  # set -e abort case. If the rename below succeeds, $tmp will no
+  # longer name an existing file and `rm -f` is a no-op.
+  # shellcheck disable=SC2064
+  trap 'rm -f "${tmp}"' EXIT
+  tmp="$(mktemp "${KEYS_DIR}/enrollment.secret.tmp.XXXXXX")"
+  if [ -z "${tmp}" ] || [ ! -f "${tmp}" ]; then
+    echo "[bootstrap] failed to create enrollment.secret tmpfile under ${KEYS_DIR}" >&2
     exit 1
   fi
+  # chmod-first: lock the tmpfile down BEFORE any secret material lands in it.
+  chmod 0600 "${tmp}"
+  # Write exactly 32 raw binary bytes via openssl (available on all macOS versions).
+  openssl rand -out "${tmp}" 32
+  # Defend against truncated openssl output (signal-killed, disk full, etc.).
+  local size
+  size="$(wc -c < "${tmp}" | tr -d ' ')"
+  if [ "${size}" -ne 32 ]; then
+    echo "[bootstrap] openssl wrote ${size} bytes to tmpfile; expected 32" >&2
+    exit 1
+  fi
+  chown rustynetd:rustynetd "${tmp}"
+  # Atomic rename within the same filesystem. The final secret path
+  # only ever appears with full contents + correct mode + correct owner.
+  mv "${tmp}" "${secret_path}"
+  # Disarm the trap; the tmpfile name no longer exists.
+  trap - EXIT
+  echo "[bootstrap] enrollment.secret generated at ${secret_path}"
 }
 
 # ── Clear residual state ──────────────────────────────────────────────────────
@@ -486,7 +534,13 @@ seed_trust_evidence() {
     return 0
   fi
 
-  install -d -m 0755 -o root -g rustynetd "${trust_dir}"
+  # HIGH 3 reviewer fold-in: match setup_directories perms exactly
+  # (0700 owner rustynetd:rustynetd). Earlier code used 0755 root:rustynetd
+  # which left the trust directory world-traversable. Files inside
+  # (signing_key, trust_evidence, verifier_key) are individually chowned
+  # below to root:rustynetd; rustynetd traverses through the dir because
+  # the dir itself is rustynetd-owned.
+  install -d -m 0700 -o rustynetd -g rustynetd "${trust_dir}"
 
   passphrase_file="$(mktemp)"
   chmod 600 "${passphrase_file}"
