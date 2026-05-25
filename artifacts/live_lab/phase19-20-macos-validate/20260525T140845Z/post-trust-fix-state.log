@@ -1,0 +1,19 @@
+====LAUNCHCTL====
+-	65	com.rustynet.daemon
+19433	0	com.rustynet.privileged-helper
+====LATEST ERRORS====
+  hint: configuration validation failed; check the path/schema named above
+rustynetd startup failed [config_error (65)]: invalid config: trust preflight failed: trust evidence is stale
+  hint: configuration validation failed; check the path/schema named above
+rustynetd startup failed [config_error (65)]: invalid config: trust preflight failed: trust evidence is stale
+  hint: configuration validation failed; check the path/schema named above
+rustynetd startup failed [config_error (65)]: invalid config: trust preflight failed: trust evidence is stale
+  hint: configuration validation failed; check the path/schema named above
+rustynetd startup failed [config_error (65)]: invalid config: trust preflight failed: trust evidence is stale
+  hint: configuration validation failed; check the path/schema named above
+rustynetd startup failed [config_error (65)]: invalid config: trust preflight failed: trust evidence is stale
+  hint: configuration validation failed; check the path/schema named above
+rustynetd startup failed [config_error (65)]: invalid config: dataplane preflight failed: i/o failed: inspect privileged helper socket failed (/private/var/run/rustynet/rustynetd-privileged.sock): No such file or directory (os error 2)
+  hint: configuration validation failed; check the path/schema named above
+rustynetd startup failed [config_error (65)]: invalid config: dataplane preflight failed: i/o failed: inspect privileged helper socket failed (/private/var/run/rustynet/rustynetd-privileged.sock): No such file or directory (os error 2)
+  hint: configuration validation failed; check the path/schema named above

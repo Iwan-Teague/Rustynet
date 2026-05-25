@@ -1,0 +1,44 @@
+====RUNNING HELPER====
+system/com.rustynet.privileged-helper = {
+	active count = 1
+	path = /Library/LaunchDaemons/com.rustynet.privileged-helper.plist
+	type = LaunchDaemon
+	state = running
+
+	program = /usr/local/bin/rustynetd
+	arguments = {
+		/usr/local/bin/rustynetd
+		privileged-helper
+		--socket
+		/private/var/run/rustynet/rustynetd-privileged.sock
+		--allowed-uid
+		500
+		--allowed-gid
+		500
+		--timeout-ms
+		30000
+	}
+
+	stdout path = /usr/local/var/log/rustynet/rustynetd-helper.log
+	stderr path = /usr/local/var/log/rustynet/rustynetd-helper-error.log
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		PATH => /opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+		XPC_SERVICE_NAME => com.rustynet.privileged-helper
+	}
+
+	domain = system
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 19433
+	immediate reason = speculative
+	forks = 33119
+	execs = 1
+====SOCKET LISTING====
+ls: /private/var/run/rustynet/: No such file or directory
+ls: /var/run/rustynet/: No such file or directory
