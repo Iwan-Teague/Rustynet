@@ -9512,6 +9512,7 @@ fn run_windows_orchestration_stages_with_options(
     let custody_log_path = logs_dir.join("validate_windows_key_custody.log");
     let authenticode_log_path = logs_dir.join("validate_windows_authenticode.log");
     let dns_failclosed_log_path = logs_dir.join("validate_windows_dns_failclosed.log");
+    let named_pipe_acls_log_path = logs_dir.join("validate_windows_named_pipe_acls.log");
     let capture_exit_evidence_log_path =
         logs_dir.join("capture_windows_exit_evidence_artifacts.log");
     let pull_exit_evidence_log_path = logs_dir.join("pull_windows_exit_evidence_artifacts.log");
@@ -9789,6 +9790,72 @@ fn run_windows_orchestration_stages_with_options(
 
     let acls_passed = acls_outcome.status == VmLabStageStatus::Pass;
 
+    let named_pipe_acls_outcome = if dry_run {
+        stage_outcome(
+            "validate_windows_named_pipe_acls",
+            VmLabStageStatus::Skipped,
+            format!("dry-run: would verify Windows named-pipe ACLs on {windows_alias}"),
+            vec![],
+        )
+    } else if !bootstrap_passed {
+        stage_outcome(
+            "validate_windows_named_pipe_acls",
+            VmLabStageStatus::Skipped,
+            format!("skipped: bootstrap_windows_host did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !validate_passed {
+        stage_outcome(
+            "validate_windows_named_pipe_acls",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_client_install did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !acls_passed {
+        stage_outcome(
+            "validate_windows_named_pipe_acls",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else {
+        let result = run_validate_windows_named_pipe_acls_stage(
+            windows_alias,
+            inventory_path,
+            ssh_identity_file,
+            known_hosts_path,
+        );
+        match result {
+            Ok((summary, raw_report)) => {
+                let _ = std::fs::write(&named_pipe_acls_log_path, raw_report.as_str());
+                stage_outcome(
+                    "validate_windows_named_pipe_acls",
+                    VmLabStageStatus::Pass,
+                    summary,
+                    vec![named_pipe_acls_log_path.clone()],
+                )
+            }
+            Err((reason, raw_report)) => {
+                let log_body = if raw_report.is_empty() {
+                    reason.clone()
+                } else {
+                    format!("{reason}\n--- raw report ---\n{raw_report}")
+                };
+                let _ = std::fs::write(&named_pipe_acls_log_path, log_body.as_str());
+                stage_outcome(
+                    "validate_windows_named_pipe_acls",
+                    VmLabStageStatus::Fail,
+                    format!(
+                        "Windows named-pipe ACL validation failed for {windows_alias}: {reason}"
+                    ),
+                    vec![named_pipe_acls_log_path.clone()],
+                )
+            }
+        }
+    };
+
+    let named_pipe_acls_passed = named_pipe_acls_outcome.status == VmLabStageStatus::Pass;
+
     // Stage 4: validate_windows_service_hardening
     // Dispatches `rustynetd windows-service-hardening-check --no-fail-on-drift`
     // on the live Windows guest, parses the typed JSON report, and fails the
@@ -9821,6 +9888,13 @@ fn run_windows_orchestration_stages_with_options(
             "validate_windows_service_hardening",
             VmLabStageStatus::Skipped,
             format!("skipped: validate_windows_runtime_acls did not pass for {windows_alias}"),
+            vec![],
+        )
+    } else if !named_pipe_acls_passed {
+        stage_outcome(
+            "validate_windows_service_hardening",
+            VmLabStageStatus::Skipped,
+            format!("skipped: validate_windows_named_pipe_acls did not pass for {windows_alias}"),
             vec![],
         )
     } else {
@@ -11062,6 +11136,7 @@ fn run_windows_orchestration_stages_with_options(
         bootstrap_outcome,
         validate_outcome,
         acls_outcome,
+        named_pipe_acls_outcome,
         hardening_outcome,
         custody_outcome,
         authenticode_outcome,
@@ -11935,6 +12010,116 @@ fn evaluate_windows_runtime_acls_report(
     let inspected_count = report.roots.len();
     Ok(format!(
         "Windows runtime ACLs verified on {windows_alias}: {inspected_count} reviewed roots passed"
+    ))
+}
+
+fn run_validate_windows_named_pipe_acls_stage(
+    windows_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<(String, String), (String, String)> {
+    let targets = resolve_remote_targets(inventory_path, &[windows_alias.to_owned()], false, &[])
+        .map_err(|err| (err, String::new()))?;
+    let target = targets.into_iter().next().ok_or_else(|| {
+        (
+            format!("no target resolved for alias {windows_alias}"),
+            String::new(),
+        )
+    })?;
+    if target.platform_profile.platform != VmGuestPlatform::Windows {
+        return Err((
+            format!(
+                "alias {windows_alias} resolved to non-Windows platform: {}",
+                target.platform_profile.platform.as_str()
+            ),
+            String::new(),
+        ));
+    }
+    let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
+    let script = build_windows_security_check_invocation("windows-named-pipe-acls-check", &[])
+        .map_err(|err| (err, String::new()))?;
+    let invocation = build_ssh_powershell_encoded_invocation(script.as_str())
+        .map_err(|err| (err, String::new()))?;
+    let raw_output = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        invocation.as_str(),
+        timeout,
+    )
+    .map_err(|err| {
+        (
+            format!("remote dispatch of windows-named-pipe-acls-check failed: {err}"),
+            String::new(),
+        )
+    })?;
+    let raw_trimmed = raw_output.trim().to_owned();
+    evaluate_windows_named_pipe_acls_report(windows_alias, raw_trimmed.as_str())
+        .map(|summary| (summary, raw_trimmed.clone()))
+        .map_err(|reason| (reason, raw_trimmed))
+}
+
+fn evaluate_windows_named_pipe_acls_report(
+    windows_alias: &str,
+    raw_json: &str,
+) -> Result<String, String> {
+    let report: rustynetd::windows_ipc::WindowsNamedPipeAclReport = serde_json::from_str(raw_json)
+        .map_err(|err| format!("parse windows-named-pipe-acls-check JSON output failed: {err}"))?;
+    if report.schema_version != 1 {
+        return Err(format!(
+            "windows-named-pipe-acls-check returned unsupported schema_version={}",
+            report.schema_version
+        ));
+    }
+    if report.pipes.is_empty() {
+        return Err(
+            "windows-named-pipe-acls-check returned an empty pipe list; expected reviewed daemon pipe set"
+                .to_owned(),
+        );
+    }
+    if !report.overall_ok {
+        let drifted = report
+            .pipes
+            .iter()
+            .filter_map(|entry| match &entry.status {
+                rustynetd::windows_ipc::WindowsNamedPipeAclStatus::Ok { .. } => None,
+                rustynetd::windows_ipc::WindowsNamedPipeAclStatus::Missing { reason } => {
+                    Some(format!("{} missing: {reason}", entry.label))
+                }
+                rustynetd::windows_ipc::WindowsNamedPipeAclStatus::Drifted { reason, .. } => {
+                    Some(format!("{} drifted: {reason}", entry.label))
+                }
+                rustynetd::windows_ipc::WindowsNamedPipeAclStatus::Unobserved { reason } => {
+                    Some(format!("{} unobserved: {reason}", entry.label))
+                }
+            })
+            .collect::<Vec<_>>();
+        let drifted_summary = if drifted.is_empty() {
+            "report set overall_ok=false but every per-pipe entry is Ok; output is inconsistent"
+                .to_owned()
+        } else {
+            drifted.join("; ")
+        };
+        return Err(format!(
+            "Windows named-pipe ACL drift detected: {drifted_summary}"
+        ));
+    }
+    if report.pipes.iter().any(|entry| {
+        !matches!(
+            entry.status,
+            rustynetd::windows_ipc::WindowsNamedPipeAclStatus::Ok { .. }
+        )
+    }) {
+        return Err(
+            "report set overall_ok=true but at least one per-pipe entry is not Ok; output is inconsistent"
+                .to_owned(),
+        );
+    }
+    let inspected_count = report.pipes.len();
+    Ok(format!(
+        "Windows named-pipe ACLs verified on {windows_alias}: {inspected_count} reviewed pipes passed"
     ))
 }
 
@@ -30394,6 +30579,87 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         );
     }
 
+    #[test]
+    fn evaluate_windows_named_pipe_acls_report_accepts_all_ok_payload() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "pipes": [
+                {
+                    "label": "daemon control pipe",
+                    "path": "\\\\.\\pipe\\RustyNet\\rustynetd",
+                    "role": "daemon control pipe",
+                    "status": {
+                        "status": "ok",
+                        "acl_sddl": "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)"
+                    }
+                },
+                {
+                    "label": "privileged helper pipe",
+                    "path": "\\\\.\\pipe\\RustyNet\\rustynetd-privileged",
+                    "role": "privileged helper pipe",
+                    "status": {
+                        "status": "ok",
+                        "acl_sddl": "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)"
+                    }
+                }
+            ]
+        });
+        let summary = super::evaluate_windows_named_pipe_acls_report(
+            "windows-utm-1",
+            json.to_string().as_str(),
+        )
+        .expect("all-ok payload must validate");
+        assert!(
+            summary.contains("windows-utm-1") && summary.contains("2 reviewed pipes passed"),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_named_pipe_acls_report_rejects_drifted_pipe() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": false,
+            "pipes": [
+                {
+                    "label": "daemon control pipe",
+                    "path": "\\\\.\\pipe\\RustyNet\\rustynetd",
+                    "role": "daemon control pipe",
+                    "status": {
+                        "status": "drifted",
+                        "reason": "daemon control pipe ACL grants a broader-than-reviewed Windows principal (WD)",
+                        "acl_sddl": "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)"
+                    }
+                }
+            ]
+        });
+        let err = super::evaluate_windows_named_pipe_acls_report(
+            "windows-utm-1",
+            json.to_string().as_str(),
+        )
+        .expect_err("drifted pipe must fail");
+        assert!(
+            err.contains("daemon control pipe drifted") && err.contains("broader-than-reviewed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_windows_named_pipe_acls_report_rejects_schema_mismatch() {
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "overall_ok": true,
+            "pipes": []
+        });
+        let err = super::evaluate_windows_named_pipe_acls_report(
+            "windows-utm-1",
+            json.to_string().as_str(),
+        )
+        .expect_err("schema mismatch must fail");
+        assert!(err.contains("schema_version=2"), "unexpected error: {err}");
+    }
+
     fn reviewed_service_hardening_payload() -> serde_json::Value {
         serde_json::json!({
             "schema_version": 1,
@@ -33423,6 +33689,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .map(|s| s["stage"].as_str().unwrap())
             .collect();
         assert!(stage_names.contains(&"validate_windows_runtime_acls"));
+        assert!(stage_names.contains(&"validate_windows_named_pipe_acls"));
         assert!(stage_names.contains(&"validate_windows_service_hardening"));
         assert!(stage_names.contains(&"validate_windows_key_custody"));
         assert!(stage_names.contains(&"validate_windows_authenticode"));
