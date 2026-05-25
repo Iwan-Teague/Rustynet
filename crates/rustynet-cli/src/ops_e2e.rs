@@ -1376,6 +1376,205 @@ pub fn execute_ops_e2e_membership_add(
     ))
 }
 
+/// Track B Phase 22 — cross-platform paths the
+/// `ops e2e-membership-set-capabilities` verb consumes.
+///
+/// Resolves to the canonical install layout per host OS:
+/// - Linux: `/var/lib/rustynet/membership.{snapshot,log,watermark}` +
+///   `/etc/rustynet/membership.owner.key`
+/// - macOS: `/usr/local/var/rustynet/membership/membership.{snapshot,
+///   log,watermark}` + `/usr/local/etc/rustynet/membership.owner.key`
+/// - Windows: `C:\ProgramData\RustyNet\membership\membership.{snapshot,
+///   log,watermark}` + `\membership.owner.key`
+#[derive(Debug, Clone)]
+struct MembershipMutationPaths {
+    snapshot: PathBuf,
+    log: PathBuf,
+    watermark: PathBuf,
+    owner_signing_key: PathBuf,
+    /// Secure parent for the per-invocation passphrase tempfile. The
+    /// caller creates the per-invocation workspace as a 0700 (Unix) /
+    /// SYSTEM-Administrators-ACLed (Windows) child of this directory
+    /// and removes the entire tree once the mutation is done.
+    secure_workspace_parent: PathBuf,
+}
+
+impl MembershipMutationPaths {
+    fn for_current_platform() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                snapshot: PathBuf::from("/var/lib/rustynet/membership.snapshot"),
+                log: PathBuf::from("/var/lib/rustynet/membership.log"),
+                watermark: PathBuf::from("/var/lib/rustynet/membership.watermark"),
+                owner_signing_key: PathBuf::from("/etc/rustynet/membership.owner.key"),
+                secure_workspace_parent: PathBuf::from("/tmp"),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                snapshot: PathBuf::from("/usr/local/var/rustynet/membership/membership.snapshot"),
+                log: PathBuf::from("/usr/local/var/rustynet/membership/membership.log"),
+                watermark: PathBuf::from("/usr/local/var/rustynet/membership/membership.watermark"),
+                owner_signing_key: PathBuf::from(MACOS_OWNER_SIGNING_KEY_PATH),
+                // /usr/local/var/rustynet is already 0700 root:rustynetd via
+                // the macOS install adapter; placing the workspace inside
+                // the reviewed state root keeps the plaintext-passphrase
+                // tempfile under the same access fence as the snapshot.
+                secure_workspace_parent: PathBuf::from(MACOS_STATE_ROOT),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self {
+                snapshot: PathBuf::from(
+                    rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH,
+                ),
+                log: PathBuf::from(rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH),
+                watermark: PathBuf::from(
+                    rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH,
+                ),
+                owner_signing_key: PathBuf::from(
+                    rustynetd::windows_paths::DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+                ),
+                // C:\ProgramData\RustyNet\secrets carries the canonical
+                // SYSTEM/Administrators-only ACL; placing the per-
+                // invocation passphrase tempfile here keeps the
+                // plaintext inside the same access fence as the DPAPI
+                // blob it was unwrapped from.
+                secure_workspace_parent: PathBuf::from(
+                    rustynetd::windows_paths::DEFAULT_WINDOWS_SECRET_ROOT,
+                ),
+            }
+        }
+    }
+
+    fn state_paths_for_chown(&self) -> Vec<String> {
+        vec![
+            self.snapshot.display().to_string(),
+            self.log.display().to_string(),
+            self.watermark.display().to_string(),
+        ]
+    }
+}
+
+/// Track B Phase 22 — create a per-invocation 0700 workspace, unwrap the
+/// membership signing-key passphrase via the platform credential
+/// backend, and write the plaintext to a 0600 tempfile inside the
+/// workspace.
+///
+/// Returns the populated workspace + passphrase file path. The caller
+/// must call `secure_remove_file` on the passphrase path and
+/// `fs::remove_dir_all` on the workspace once the mutation completes
+/// (success or failure). The workspace is created with 0700 mode
+/// (Unix) or under the SYSTEM/Administrators-ACLed `\secrets\` root
+/// (Windows) so plaintext material cannot be read by other local
+/// identities during the brief window between unwrap and shred.
+fn stage_membership_signing_passphrase(
+    paths: &MembershipMutationPaths,
+) -> Result<(PathBuf, PathBuf), String> {
+    use rustynet_control::credential_unwrap::{
+        CredentialUnwrapBackend, membership_signing_key_passphrase_descriptor,
+    };
+
+    let work_dir = paths.secure_workspace_parent.join(format!(
+        "rustynet-membership-update.{}.{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::create_dir_all(&work_dir)
+        .map_err(|err| format!("failed creating {}: {err}", work_dir.display()))?;
+    set_unix_mode(work_dir.as_path(), 0o700)?;
+
+    let passphrase_path = work_dir.join("signing-key.passphrase");
+    let descriptor = membership_signing_key_passphrase_descriptor();
+
+    #[cfg(target_os = "linux")]
+    let backend: Box<dyn CredentialUnwrapBackend> =
+        Box::new(rustynet_control::credential_unwrap::LinuxSystemdCredsBackend::new());
+    #[cfg(target_os = "macos")]
+    let backend: Box<dyn CredentialUnwrapBackend> =
+        Box::new(rustynet_control::credential_unwrap::MacosKeychainBackend::new());
+    #[cfg(target_os = "windows")]
+    let backend: Box<dyn CredentialUnwrapBackend> =
+        Box::new(rustynet_control::credential_unwrap::WindowsDpapiBackend::new());
+
+    let unwrap_result = backend
+        .unwrap_credential(&descriptor, Duration::from_secs(30))
+        .map_err(|err| {
+            format!(
+                "membership signing-key passphrase unwrap via {} failed: {err}",
+                backend.name()
+            )
+        });
+    let plaintext = match unwrap_result {
+        Ok(value) => value,
+        Err(err) => {
+            // Clean up the empty workspace so we never leave stale dirs
+            // behind on a failed unwrap.
+            let _ = fs::remove_dir_all(&work_dir);
+            return Err(err);
+        }
+    };
+    if plaintext.is_empty() {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(format!(
+            "membership signing-key passphrase unwrap via {} produced empty plaintext",
+            backend.name()
+        ));
+    }
+
+    // Write plaintext to a fresh 0600 file inside the 0700 workspace.
+    // create_new + O_EXCL ensures an attacker cannot pre-create the path
+    // with a symlink. On Windows create_new still atomically fails if
+    // the target already exists.
+    let write_result = (|| -> Result<(), String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&passphrase_path).map_err(|err| {
+            format!(
+                "create passphrase tempfile failed ({}): {err}",
+                passphrase_path.display()
+            )
+        })?;
+        file.write_all(plaintext.as_slice()).map_err(|err| {
+            format!(
+                "write passphrase tempfile failed ({}): {err}",
+                passphrase_path.display()
+            )
+        })?;
+        if !plaintext.ends_with(b"\n") {
+            file.write_all(b"\n").map_err(|err| {
+                format!(
+                    "append trailing newline to passphrase tempfile failed ({}): {err}",
+                    passphrase_path.display()
+                )
+            })?;
+        }
+        file.sync_all().map_err(|err| {
+            format!(
+                "sync passphrase tempfile failed ({}): {err}",
+                passphrase_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        secure_remove_file(passphrase_path.as_path());
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(err);
+    }
+    set_unix_mode(passphrase_path.as_path(), 0o600)?;
+
+    Ok((work_dir, passphrase_path))
+}
+
 pub fn execute_ops_e2e_membership_set_capabilities(
     node_id: String,
     capabilities: String,
@@ -1389,36 +1588,20 @@ pub fn execute_ops_e2e_membership_set_capabilities(
             .map_err(|err| err.to_string())?,
     );
 
-    let passphrase_path = format!(
-        "/tmp/rustynet-membership-passphrase.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    );
-    let work_dir = PathBuf::from(format!(
-        "/tmp/rustynet-membership-update.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    fs::create_dir_all(work_dir.as_path())
-        .map_err(|err| format!("failed creating {}: {err}", work_dir.display()))?;
-    set_unix_mode(work_dir.as_path(), 0o700)?;
+    let paths = MembershipMutationPaths::for_current_platform();
+    let (work_dir, passphrase_path) = stage_membership_signing_passphrase(&paths)?;
     let record_path = work_dir.join("set-capabilities.record");
     let signed_path = work_dir.join("set-capabilities.signed");
 
+    let snapshot_str = paths.snapshot.display().to_string();
+    let log_str = paths.log.display().to_string();
+    let owner_key_str = paths.owner_signing_key.display().to_string();
+    let passphrase_str = passphrase_path.display().to_string();
+    let state_paths = paths.state_paths_for_chown();
+    let state_path_refs = state_paths.iter().map(String::as_str).collect::<Vec<_>>();
+
     let result = (|| -> Result<(), String> {
-        run_status(
-            "systemd-creds",
-            &[
-                "decrypt",
-                "--name=signing_key_passphrase",
-                "/etc/rustynet/credentials/signing_key_passphrase.cred",
-                passphrase_path.as_str(),
-            ],
-            &[],
-            "decrypting signing passphrase credential failed",
-        )?;
-        set_unix_mode(Path::new(passphrase_path.as_str()), 0o600)?;
-        set_membership_state_permissions_local(ROOT_OWNER_GROUP)?;
+        set_membership_state_permissions_for(state_path_refs.as_slice(), ROOT_OWNER_GROUP)?;
 
         run_status(
             "rustynet",
@@ -1432,9 +1615,9 @@ pub fn execute_ops_e2e_membership_set_capabilities(
                 "--output",
                 record_path.to_string_lossy().as_ref(),
                 "--snapshot",
-                "/var/lib/rustynet/membership.snapshot",
+                snapshot_str.as_str(),
                 "--log",
-                "/var/lib/rustynet/membership.log",
+                log_str.as_str(),
             ],
             &[],
             "membership propose-set-capabilities failed",
@@ -1449,9 +1632,9 @@ pub fn execute_ops_e2e_membership_set_capabilities(
                 "--approver-id",
                 owner_approver_id.as_str(),
                 "--signing-key",
-                "/etc/rustynet/membership.owner.key",
+                owner_key_str.as_str(),
                 "--signing-key-passphrase-file",
-                passphrase_path.as_str(),
+                passphrase_str.as_str(),
                 "--output",
                 signed_path.to_string_lossy().as_ref(),
             ],
@@ -1466,9 +1649,9 @@ pub fn execute_ops_e2e_membership_set_capabilities(
                 "--signed-update",
                 signed_path.to_string_lossy().as_ref(),
                 "--snapshot",
-                "/var/lib/rustynet/membership.snapshot",
+                snapshot_str.as_str(),
                 "--log",
-                "/var/lib/rustynet/membership.log",
+                log_str.as_str(),
             ],
             &[],
             "membership apply-update failed",
@@ -1476,8 +1659,11 @@ pub fn execute_ops_e2e_membership_set_capabilities(
         emit_anchor_bundle_pull_capability_audit(capabilities.as_str())?;
         Ok(())
     })();
-    let restore_result = set_membership_state_permissions_local(MEMBERSHIP_STATE_OWNER_GROUP);
-    secure_remove_file(Path::new(passphrase_path.as_str()));
+    let restore_result = set_membership_state_permissions_for(
+        state_path_refs.as_slice(),
+        MEMBERSHIP_STATE_OWNER_GROUP,
+    );
+    secure_remove_file(passphrase_path.as_path());
     let _ = fs::remove_dir_all(work_dir);
     match (result, restore_result) {
         (Ok(()), Ok(())) => {}
@@ -5579,39 +5765,66 @@ fn normalize_membership_permissions(
 }
 
 fn set_membership_state_permissions_local(owner_group: &str) -> Result<(), String> {
-    let existing_paths = MEMBERSHIP_STATE_PATHS
-        .iter()
-        .copied()
-        .filter(|path| Path::new(path).exists())
-        .collect::<Vec<_>>();
-    if existing_paths.is_empty() {
+    set_membership_state_permissions_for(MEMBERSHIP_STATE_PATHS.as_slice(), owner_group)
+}
+
+/// Track B Phase 22 — generalised over the platform's membership-state paths.
+///
+/// Used by both the Linux-only legacy path (membership add) and the
+/// cross-platform Phase 22 rewrite of `e2e-membership-set-capabilities`.
+/// Linux + macOS: chown the snapshot/log/watermark to `<owner_group>` and
+/// reset mode to 0600 so the running daemon can take ownership back via
+/// the daemon-group fixture once the mutation is applied. On Windows the
+/// CLI is running as Administrator and the existing NTFS ACLs on the
+/// reviewed membership-root grant SYSTEM + Administrators write access,
+/// so an explicit chown step is a no-op (the existing daemon ACL stays
+/// authoritative).
+fn set_membership_state_permissions_for(paths: &[&str], owner_group: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // On Windows the CLI runs as Administrator; the canonical
+        // membership-root NTFS ACL (provisioned by the install script)
+        // already grants SYSTEM and Administrators full control. There
+        // is no chown/chmod analogue to perform here.
+        let _ = (paths, owner_group);
         return Ok(());
     }
+    #[cfg(not(windows))]
+    {
+        let existing_paths = paths
+            .iter()
+            .copied()
+            .filter(|path| Path::new(path).exists())
+            .collect::<Vec<_>>();
+        if existing_paths.is_empty() {
+            return Ok(());
+        }
 
-    let output = Command::new("chown")
-        .arg(owner_group)
-        .args(existing_paths.iter().copied())
-        .output()
-        .map_err(|err| format!("membership state chown spawn failed: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = match (stdout.is_empty(), stderr.is_empty()) {
-            (true, true) => "no stdout/stderr output".to_owned(),
-            (true, false) => format!("stderr={stderr}"),
-            (false, true) => format!("stdout={stdout}"),
-            (false, false) => format!("stdout={stdout}; stderr={stderr}"),
-        };
-        return Err(format!(
-            "membership state chown failed: status={} {detail}",
-            output.status.code().unwrap_or(-1)
-        ));
-    }
+        let output = Command::new("chown")
+            .arg(owner_group)
+            .args(existing_paths.iter().copied())
+            .output()
+            .map_err(|err| format!("membership state chown spawn failed: {err}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let detail = match (stdout.is_empty(), stderr.is_empty()) {
+                (true, true) => "no stdout/stderr output".to_owned(),
+                (true, false) => format!("stderr={stderr}"),
+                (false, true) => format!("stdout={stdout}"),
+                (false, false) => format!("stdout={stdout}; stderr={stderr}"),
+            };
+            return Err(format!(
+                "membership state chown failed: status={} {detail}",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
 
-    for path in existing_paths {
-        set_unix_mode(Path::new(path), 0o600)?;
+        for path in existing_paths {
+            set_unix_mode(Path::new(path), 0o600)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn remote_stat_mode(
