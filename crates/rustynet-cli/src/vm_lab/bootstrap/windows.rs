@@ -290,20 +290,27 @@ fn build_windows_service_host_smoke_invocation(
     }
 }
 
-fn build_windows_verify_invocation(context: &BootstrapPhaseContext<'_>) -> WindowsHelperScriptSpec {
+fn build_windows_verify_invocation(
+    context: &BootstrapPhaseContext<'_>,
+    require_live_path: bool,
+) -> WindowsHelperScriptSpec {
+    let mut args = vec![
+        "-RustyNetRoot".to_owned(),
+        context.workdir.to_owned(),
+        "-InstallRoot".to_owned(),
+        WINDOWS_INSTALL_ROOT.to_owned(),
+        "-StateRoot".to_owned(),
+        WINDOWS_STATE_ROOT.to_owned(),
+        "-ServiceName".to_owned(),
+        WINDOWS_SERVICE_NAME.to_owned(),
+    ];
+    if require_live_path {
+        args.push("-RequireLivePath".to_owned());
+    }
     WindowsHelperScriptSpec {
         helper_file_name: WINDOWS_VERIFY_HELPER_FILE,
         remote_file_name: WINDOWS_VERIFY_HELPER_FILE,
-        args: vec![
-            "-RustyNetRoot".to_owned(),
-            context.workdir.to_owned(),
-            "-InstallRoot".to_owned(),
-            WINDOWS_INSTALL_ROOT.to_owned(),
-            "-StateRoot".to_owned(),
-            WINDOWS_STATE_ROOT.to_owned(),
-            "-ServiceName".to_owned(),
-            WINDOWS_SERVICE_NAME.to_owned(),
-        ],
+        args,
     }
 }
 
@@ -462,6 +469,16 @@ fn parse_windows_runtime_report_output(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.chars().take(160).collect::<String>());
+    let require_live_path = parsed
+        .get("require_live_path")
+        .and_then(|value| value.as_bool());
+    let path_live_proven = parsed
+        .get("path_live_proven")
+        .and_then(|value| value.as_bool());
+    let path_latest_live_handshake_unix = parsed
+        .get("path_latest_live_handshake_unix")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty());
     let notes = parsed
         .get("notes")
         .and_then(|value| value.as_array())
@@ -494,6 +511,17 @@ fn parse_windows_runtime_report_output(
     }
     if let Some(runtime_probe_excerpt) = runtime_probe_excerpt {
         details.push(format!("runtime_probe_excerpt={runtime_probe_excerpt}"));
+    }
+    if let Some(require_live_path) = require_live_path {
+        details.push(format!("require_live_path={require_live_path}"));
+    }
+    if let Some(path_live_proven) = path_live_proven {
+        details.push(format!("path_live_proven={path_live_proven}"));
+    }
+    if let Some(path_latest_live_handshake_unix) = path_latest_live_handshake_unix {
+        details.push(format!(
+            "path_latest_live_handshake_unix={path_latest_live_handshake_unix}"
+        ));
     }
     if let Some(notes) = notes {
         details.push(format!("notes={notes}"));
@@ -768,6 +796,16 @@ pub(crate) struct WindowsVerifyReportView {
     pub service_present: bool,
     #[serde(default)]
     pub service_status: String,
+    #[serde(default)]
+    pub require_live_path: bool,
+    #[serde(default)]
+    pub daemon_status_probe_status: String,
+    #[serde(default)]
+    pub daemon_netcheck_probe_status: String,
+    #[serde(default)]
+    pub path_live_proven: bool,
+    #[serde(default)]
+    pub path_latest_live_handshake_unix: String,
     #[serde(default)]
     pub failure_step: String,
     #[serde(default)]
@@ -1557,7 +1595,7 @@ impl WindowsBootstrapProvider {
                 let output = self.capture_helper_output(
                     target,
                     context,
-                    build_windows_verify_invocation(context),
+                    build_windows_verify_invocation(context, false),
                     "Windows verify helper after restart-runtime",
                 )?;
                 parse_windows_runtime_report_output(
@@ -1567,7 +1605,7 @@ impl WindowsBootstrapProvider {
                 )
             }
             BootstrapPhase::VerifyRuntime => {
-                let invocation = build_windows_verify_invocation(context);
+                let invocation = build_windows_verify_invocation(context, true);
                 if local_utm_result_file_supported_for_phase(BootstrapPhase::VerifyRuntime, target)
                 {
                     self.run_helper_via_local_utm_result_file(
@@ -1722,6 +1760,37 @@ mod tests {
     }
 
     #[test]
+    fn windows_verify_invocation_requires_live_path_only_for_final_verify() {
+        let context = sample_context(None);
+        let layout_only = build_windows_verify_invocation(&context, false);
+        assert_eq!(layout_only.helper_file_name, WINDOWS_VERIFY_HELPER_FILE);
+        assert_eq!(layout_only.remote_file_name, WINDOWS_VERIFY_HELPER_FILE);
+        assert!(!layout_only.args.iter().any(|arg| arg == "-RequireLivePath"));
+
+        let final_verify = build_windows_verify_invocation(&context, true);
+        assert_eq!(final_verify.helper_file_name, WINDOWS_VERIFY_HELPER_FILE);
+        assert_eq!(final_verify.remote_file_name, WINDOWS_VERIFY_HELPER_FILE);
+        assert!(
+            final_verify
+                .args
+                .iter()
+                .any(|arg| arg == "-RequireLivePath")
+        );
+    }
+
+    #[test]
+    fn windows_verify_helper_daemon_probes_are_bounded_and_allowlisted() {
+        let helper = include_str!(
+            "../../../../../scripts/bootstrap/windows/Verify-RustyNetWindowsBootstrap.ps1"
+        );
+        assert!(helper.contains("function Invoke-DaemonControlCommand"));
+        assert!(helper.contains("$Command -notin @('status', 'netcheck')"));
+        assert!(helper.contains("-ArgumentList @($Command)"));
+        assert!(helper.contains("$process.WaitForExit($TimeoutSeconds * 1000)"));
+        assert!(helper.contains("Stop-Process -Id $process.Id -Force"));
+    }
+
+    #[test]
     fn windows_verify_output_parser_rejects_missing_service() {
         let err = parse_windows_runtime_report_output(
             r#"{
@@ -1758,6 +1827,31 @@ mod tests {
         assert!(err.contains("status=blocked"));
         assert!(err.contains("reason=windows-runtime-backend-explicitly-unsupported"));
         assert!(err.contains("backend_label=windows-unsupported"));
+    }
+
+    #[test]
+    fn windows_runtime_report_parser_surfaces_live_path_blocker() {
+        let err = parse_windows_runtime_report_output(
+            r#"{
+                "status": "fail",
+                "reason": "windows-path-live-not-proven",
+                "service_status": "Running",
+                "backend_label": "windows-wireguard-nt",
+                "require_live_path": true,
+                "path_live_proven": false,
+                "path_latest_live_handshake_unix": "0",
+                "notes": ["path-live-not-proven"]
+            }"#,
+            "Windows verify helper",
+            "windows-utm-1",
+        )
+        .expect_err("RequireLivePath without live proof must fail closed");
+        assert!(err.contains("status=fail"));
+        assert!(err.contains("reason=windows-path-live-not-proven"));
+        assert!(err.contains("require_live_path=true"));
+        assert!(err.contains("path_live_proven=false"));
+        assert!(err.contains("path_latest_live_handshake_unix=0"));
+        assert!(err.contains("path-live-not-proven"));
     }
 
     #[test]
@@ -2108,6 +2202,11 @@ mod tests {
           "service_verified": true,
           "service_present": true,
           "service_status": "Running",
+          "require_live_path": true,
+          "daemon_status_probe_status": "pass",
+          "daemon_netcheck_probe_status": "pass",
+          "path_live_proven": true,
+          "path_latest_live_handshake_unix": "1710000000",
           "failure_step": "",
           "notes": []
         }"#;
@@ -2116,6 +2215,11 @@ mod tests {
         assert_eq!(view.status, "pass");
         assert!(view.runtime_supported);
         assert!(view.service_verified);
+        assert!(view.require_live_path);
+        assert_eq!(view.daemon_status_probe_status, "pass");
+        assert_eq!(view.daemon_netcheck_probe_status, "pass");
+        assert!(view.path_live_proven);
+        assert_eq!(view.path_latest_live_handshake_unix, "1710000000");
     }
 
     #[test]
