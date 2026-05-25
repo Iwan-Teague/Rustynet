@@ -285,6 +285,41 @@ function Invoke-WindowsRuntimeBoundaryCheck {
     }
 }
 
+function Invoke-WindowsNamedPipeAclCheck {
+    param([Parameter(Mandatory = $true)][string]$DaemonPath)
+    if (-not (Test-Path -LiteralPath $DaemonPath)) {
+        return $null
+    }
+    $output = (& $DaemonPath windows-named-pipe-acls-check 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        return [ordered]@{
+            status = 'fail'
+            reason = $output.Trim()
+        }
+    }
+    try {
+        $parsed = $output | ConvertFrom-Json -ErrorAction Stop
+        if (-not [bool]$parsed.overall_ok) {
+            return [ordered]@{
+                status = 'fail'
+                reason = 'named-pipe-acl-drift'
+                report = $parsed
+            }
+        }
+        return [ordered]@{
+            status = 'pass'
+            report = $parsed
+        }
+    }
+    catch {
+        return [ordered]@{
+            status = 'fail'
+            reason = ('invalid-named-pipe-acl-json: ' + $_.Exception.Message)
+            raw = $output.Trim()
+        }
+    }
+}
+
 function Get-ReviewedBackendState {
     param([Parameter(Mandatory = $true)][string]$ConfigPath)
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
@@ -390,6 +425,13 @@ $script:VerifyRuntimeSignals = $runtimeSignals
 $runtimeFlagsPresent = [bool]($runtimeSignals.has_windows_service -and $runtimeSignals.has_env_file)
 $script:VerifyFailureStep = 'runtime-boundary-check'
 $runtimeBoundary = Invoke-WindowsRuntimeBoundaryCheck -DaemonPath $daemonInstallPath -StateRoot $StateRoot
+$script:VerifyFailureStep = 'named-pipe-acl-check'
+$namedPipeAcl = if ($serviceRuntime.status -eq 'Running') {
+    Invoke-WindowsNamedPipeAclCheck -DaemonPath $daemonInstallPath
+}
+else {
+    $null
+}
 
 $script:VerifyFailureStep = 'review-backend-state'
 $backendState = Get-ReviewedBackendState -ConfigPath $configPath
@@ -398,6 +440,7 @@ $serviceImagePathUsesEnvFile = Test-ImagePathContainsToken -ImagePath $serviceIm
 $serviceEnvFilePinned = Test-ImagePathContainsToken -ImagePath $serviceImagePath -Token $configPath
 $serviceSidConfigured = [bool]($serviceSidType -match 'UNRESTRICTED')
 $runtimeBoundaryPassed = [bool]($runtimeBoundary -and $runtimeBoundary.status -eq 'pass')
+$namedPipeAclPassed = [bool]($namedPipeAcl -and $namedPipeAcl.status -eq 'pass')
 
 $checks = [ordered]@{
     git_present = Test-CommandPresent -Name 'git.exe'
@@ -441,6 +484,8 @@ $checks = [ordered]@{
     service_sid_configured = $serviceSidConfigured
     runtime_boundary_status = if ($runtimeBoundary) { [string]$runtimeBoundary.status } else { 'not-run' }
     runtime_boundary_validated = $runtimeBoundaryPassed
+    named_pipe_acl_status = if ($namedPipeAcl) { [string]$namedPipeAcl.status } else { 'not-run' }
+    named_pipe_acl_validated = $namedPipeAclPassed
 }
 
 $notes = @()
@@ -494,6 +539,9 @@ if (-not $checks.service_sid_configured) {
 }
 if (-not $checks.runtime_boundary_validated) {
     $notes += 'runtime-boundary-check-failed'
+}
+if (-not $checks.named_pipe_acl_validated) {
+    $notes += 'named-pipe-acl-check-failed'
 }
 if (-not $checks.backend_label) {
     $notes += 'backend-label-missing'
@@ -554,6 +602,14 @@ elseif ($checks.backend_reason) {
 elseif (-not $checks.service_running) {
     $reason = 'windows-service-not-running'
 }
+elseif (-not $checks.named_pipe_acl_validated) {
+    if ($namedPipeAcl -and $namedPipeAcl.reason) {
+        $reason = 'windows-named-pipe-acl-check-failed'
+    }
+    else {
+        $reason = 'windows-named-pipe-acl-check-not-run'
+    }
+}
 else {
     $status = 'pass'
     $runtimeSupported = $true
@@ -607,6 +663,9 @@ $report = [ordered]@{
     runtime_boundary_status = $checks.runtime_boundary_status
     runtime_boundary_validated = $checks.runtime_boundary_validated
     runtime_boundary = $runtimeBoundary
+    named_pipe_acl_status = $checks.named_pipe_acl_status
+    named_pipe_acl_validated = $checks.named_pipe_acl_validated
+    named_pipe_acl = $namedPipeAcl
     failure_step = $script:VerifyFailureStep
     runtime_signals = $runtimeSignals
     notes = $notes

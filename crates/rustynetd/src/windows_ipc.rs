@@ -1,5 +1,5 @@
 use crate::windows_paths::{is_linux_runtime_root_text, validate_windows_runtime_file_path};
-use rustynet_windows_native::{call_named_pipe, serve_named_pipe_one_message};
+use rustynet_windows_native::{call_named_pipe, serve_named_pipe_one_message_authorized};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
@@ -9,6 +9,8 @@ pub const DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH: &str =
     r"\\.\pipe\RustyNet\rustynetd-privileged";
 pub const WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION: u16 = 1;
 const MAX_WINDOWS_PRIVILEGED_MESSAGE_BYTES: usize = 16 * 1024;
+const WINDOWS_NAMED_PIPE_ACL_SCHEMA_VERSION: u8 = 1;
+const FORBIDDEN_PIPE_SDDL_PRINCIPALS: &[&str] = &["WD", "AU", "BU", "NU", "AN"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsLocalIpcRole {
@@ -50,6 +52,30 @@ pub struct WindowsNamedPipeClientFacts {
     pub is_builtin_administrator: bool,
     pub matches_service_identity: bool,
     pub is_remote_client: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowsNamedPipeAclReport {
+    pub schema_version: u8,
+    pub overall_ok: bool,
+    pub pipes: Vec<WindowsNamedPipeAclEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowsNamedPipeAclEntry {
+    pub label: String,
+    pub path: String,
+    pub role: String,
+    pub status: WindowsNamedPipeAclStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WindowsNamedPipeAclStatus {
+    Ok { acl_sddl: String },
+    Missing { reason: String },
+    Drifted { reason: String, acl_sddl: String },
+    Unobserved { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +217,172 @@ pub fn build_named_pipe_security_sddl(
     format!("O:SYG:SYD:P{}", aces.join(""))
 }
 
+pub fn evaluate_named_pipe_security_sddl(
+    label: &str,
+    sddl: &str,
+    expected_service_sid: Option<&str>,
+) -> Result<(), String> {
+    if sddl.trim().is_empty() {
+        return Err(format!("{label} ACL SDDL is empty"));
+    }
+    if !sddl.contains("D:") {
+        return Err(format!(
+            "{label} ACL must expose a Windows DACL in SDDL form"
+        ));
+    }
+    if !sddl.contains("D:P") {
+        return Err(format!(
+            "{label} ACL must use a protected DACL with inheritance disabled"
+        ));
+    }
+    let owner = parse_sddl_field(sddl, "O:")
+        .ok_or_else(|| format!("{label} ACL must expose an owner entry in SDDL form"))?;
+    if owner != "SY" {
+        return Err(format!(
+            "{label} ACL owner must be LocalSystem; found {owner}"
+        ));
+    }
+    let group = parse_sddl_field(sddl, "G:")
+        .ok_or_else(|| format!("{label} ACL must expose a group entry in SDDL form"))?;
+    if group != "SY" {
+        return Err(format!(
+            "{label} ACL group must be LocalSystem; found {group}"
+        ));
+    }
+    let allow_principals = allow_ace_principals(sddl);
+    if !allow_principals.contains(&"SY") {
+        return Err(format!("{label} ACL must grant LocalSystem access"));
+    }
+    if !allow_principals.contains(&"BA") {
+        return Err(format!(
+            "{label} ACL must grant Builtin Administrators access"
+        ));
+    }
+    if let Some(service_sid) = expected_service_sid
+        && !allow_principals.contains(&service_sid)
+    {
+        return Err(format!(
+            "{label} ACL must grant configured RustyNet service SID access"
+        ));
+    }
+    for forbidden in FORBIDDEN_PIPE_SDDL_PRINCIPALS {
+        if allow_principals
+            .iter()
+            .any(|principal| principal == forbidden)
+        {
+            return Err(format!(
+                "{label} ACL grants a broader-than-reviewed Windows principal ({forbidden})"
+            ));
+        }
+    }
+    for principal in allow_principals {
+        let allowed = principal == "SY"
+            || principal == "BA"
+            || expected_service_sid.is_some_and(|service_sid| principal == service_sid);
+        if !allowed {
+            return Err(format!(
+                "{label} ACL grants unreviewed Windows principal ({principal})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn collect_windows_named_pipe_acl_report(
+    expected_service_sid: Option<&str>,
+) -> WindowsNamedPipeAclReport {
+    let specs = [
+        (
+            "daemon control pipe",
+            DEFAULT_WINDOWS_DAEMON_PIPE_PATH,
+            WindowsLocalIpcRole::DaemonControl,
+        ),
+        (
+            "privileged helper pipe",
+            DEFAULT_WINDOWS_PRIVILEGED_HELPER_PIPE_PATH,
+            WindowsLocalIpcRole::PrivilegedHelper,
+        ),
+    ];
+    let pipes = specs
+        .into_iter()
+        .map(|(label, path, role)| {
+            collect_named_pipe_acl_entry(label, path, role, expected_service_sid)
+        })
+        .collect::<Vec<_>>();
+    let overall_ok = pipes
+        .iter()
+        .all(|entry| matches!(entry.status, WindowsNamedPipeAclStatus::Ok { .. }));
+    WindowsNamedPipeAclReport {
+        schema_version: WINDOWS_NAMED_PIPE_ACL_SCHEMA_VERSION,
+        overall_ok,
+        pipes,
+    }
+}
+
+fn collect_named_pipe_acl_entry(
+    label: &str,
+    path: &str,
+    role: WindowsLocalIpcRole,
+    expected_service_sid: Option<&str>,
+) -> WindowsNamedPipeAclEntry {
+    let status = match validate_windows_pipe_path(Path::new(path), role) {
+        Err(reason) => WindowsNamedPipeAclStatus::Drifted {
+            reason,
+            acl_sddl: String::new(),
+        },
+        Ok(()) => match rustynet_windows_native::inspect_named_pipe_sddl(path) {
+            Ok(acl_sddl) => match evaluate_named_pipe_security_sddl(
+                label,
+                acl_sddl.as_str(),
+                expected_service_sid,
+            ) {
+                Ok(()) => WindowsNamedPipeAclStatus::Ok { acl_sddl },
+                Err(reason) => WindowsNamedPipeAclStatus::Drifted { reason, acl_sddl },
+            },
+            Err(reason) if named_pipe_missing_error(reason.as_str()) => {
+                WindowsNamedPipeAclStatus::Missing { reason }
+            }
+            Err(reason) => WindowsNamedPipeAclStatus::Unobserved { reason },
+        },
+    };
+    WindowsNamedPipeAclEntry {
+        label: label.to_owned(),
+        path: path.to_owned(),
+        role: role.label().to_owned(),
+        status,
+    }
+}
+
+fn named_pipe_missing_error(reason: &str) -> bool {
+    reason.contains("Windows error 2") || reason.contains("not found")
+}
+
+fn parse_sddl_field<'a>(sddl: &'a str, marker: &str) -> Option<&'a str> {
+    let start = sddl.find(marker)? + marker.len();
+    let tail = &sddl[start..];
+    let end = ["O:", "G:", "D:", "S:"]
+        .into_iter()
+        .filter_map(|next_marker| tail.find(next_marker))
+        .filter(|idx| *idx > 0)
+        .min()
+        .unwrap_or(tail.len());
+    Some(&tail[..end])
+}
+
+fn allow_ace_principals(sddl: &str) -> Vec<&str> {
+    let mut principals = Vec::new();
+    for segment in sddl.split('(').skip(1) {
+        let Some(ace) = segment.split(')').next() else {
+            continue;
+        };
+        let fields = ace.split(';').collect::<Vec<_>>();
+        if fields.len() >= 6 && fields[0] == "A" {
+            principals.push(fields[5]);
+        }
+    }
+    principals
+}
+
 pub fn validate_windows_privileged_request(
     request: &WindowsPrivilegedRequest,
 ) -> Result<(), String> {
@@ -273,10 +465,11 @@ where
 {
     validate_windows_pipe_path(pipe_path, role)?;
     let sddl = build_named_pipe_security_sddl(role, service_sid);
-    serve_named_pipe_one_message(
+    serve_named_pipe_one_message_authorized(
         pipe_path.to_string_lossy().as_ref(),
         sddl.as_str(),
         MAX_WINDOWS_PRIVILEGED_MESSAGE_BYTES,
+        service_sid,
         |bytes| {
             let request = decode_windows_privileged_request(&bytes)?;
             let response = handler(request)?;
@@ -350,10 +543,11 @@ where
 {
     validate_windows_pipe_path(pipe_path, WindowsLocalIpcRole::DaemonControl)?;
     let sddl = build_named_pipe_security_sddl(WindowsLocalIpcRole::DaemonControl, service_sid);
-    serve_named_pipe_one_message(
+    serve_named_pipe_one_message_authorized(
         pipe_path.to_string_lossy().as_ref(),
         sddl.as_str(),
         MAX_WINDOWS_DAEMON_CONTROL_MESSAGE_BYTES,
+        service_sid,
         handler,
     )
 }
@@ -516,6 +710,63 @@ mod tests {
         assert!(sddl.contains("(A;;GA;;;SY)"));
         assert!(sddl.contains("(A;;GA;;;BA)"));
         assert!(sddl.starts_with("O:SYG:SYD:P"));
+    }
+
+    #[test]
+    fn evaluate_named_pipe_security_sddl_accepts_canonical_acl() {
+        evaluate_named_pipe_security_sddl(
+            "daemon pipe",
+            "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)",
+            None,
+        )
+        .expect("canonical pipe ACL must validate");
+    }
+
+    #[test]
+    fn evaluate_named_pipe_security_sddl_accepts_service_sid_acl() {
+        evaluate_named_pipe_security_sddl(
+            "daemon pipe",
+            "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-80-123)",
+            Some("S-1-5-80-123"),
+        )
+        .expect("service SID pipe ACL must validate");
+    }
+
+    #[test]
+    fn evaluate_named_pipe_security_sddl_rejects_broad_principals() {
+        for principal in ["WD", "AU", "BU", "NU", "AN"] {
+            let sddl = format!("O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{principal})");
+            let err = evaluate_named_pipe_security_sddl("daemon pipe", sddl.as_str(), None)
+                .expect_err("broad principal must fail");
+            assert!(err.contains("broader-than-reviewed"));
+        }
+    }
+
+    #[test]
+    fn evaluate_named_pipe_security_sddl_rejects_missing_protected_dacl() {
+        let err = evaluate_named_pipe_security_sddl(
+            "daemon pipe",
+            "O:SYG:SYD:(A;;GA;;;SY)(A;;GA;;;BA)",
+            None,
+        )
+        .expect_err("inherited DACL must fail");
+        assert!(err.contains("protected DACL"));
+    }
+
+    #[test]
+    fn evaluate_named_pipe_security_sddl_rejects_wrong_owner_or_missing_grants() {
+        let wrong_owner = evaluate_named_pipe_security_sddl(
+            "daemon pipe",
+            "O:BAG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)",
+            None,
+        )
+        .expect_err("wrong owner must fail");
+        assert!(wrong_owner.contains("owner must be LocalSystem"));
+
+        let missing_admin =
+            evaluate_named_pipe_security_sddl("daemon pipe", "O:SYG:SYD:P(A;;GA;;;SY)", None)
+                .expect_err("missing BA must fail");
+        assert!(missing_admin.contains("Builtin Administrators"));
     }
 
     #[test]

@@ -66,6 +66,16 @@ pub enum AuthenticodeChainOutcome {
     Untrusted { reason: String, hresult: i64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NativeWindowsNamedPipeClientFacts {
+    pub user_sid: Option<String>,
+    pub group_sids: Vec<String>,
+    pub is_local_system: bool,
+    pub is_builtin_administrator: bool,
+    pub matches_service_identity: bool,
+    pub is_remote_client: bool,
+}
+
 #[cfg(not(windows))]
 pub fn dpapi_protect(
     _plaintext: &[u8],
@@ -141,10 +151,29 @@ pub fn lookup_account_sid_string(_account_name: &str) -> Result<String, String> 
 }
 
 #[cfg(not(windows))]
+pub fn inspect_named_pipe_sddl(_path: &str) -> Result<String, String> {
+    Err("Windows named-pipe ACL inspection is only available on Windows hosts".to_owned())
+}
+
+#[cfg(not(windows))]
 pub fn serve_named_pipe_one_message<F>(
     _path: &str,
     _security_sddl: &str,
     _max_message_bytes: usize,
+    _handler: F,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<u8>) -> Result<Vec<u8>, String>,
+{
+    Err("Windows named pipes are only available on Windows hosts".to_owned())
+}
+
+#[cfg(not(windows))]
+pub fn serve_named_pipe_one_message_authorized<F>(
+    _path: &str,
+    _security_sddl: &str,
+    _max_message_bytes: usize,
+    _service_sid: Option<&str>,
     _handler: F,
 ) -> Result<(), String>
 where
@@ -216,7 +245,9 @@ fn gateway_is_usable_for_port_mapping(gateway: IpAddr) -> bool {
 
 #[cfg(windows)]
 mod imp {
-    use super::{WindowsDpapiScope, WindowsNetworkAdapterSnapshot};
+    use super::{
+        NativeWindowsNamedPipeClientFacts, WindowsDpapiScope, WindowsNetworkAdapterSnapshot,
+    };
     use std::ffi::{CStr, c_void};
     use std::mem::size_of;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -237,15 +268,18 @@ mod imp {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
         CryptProtectData, CryptUnprotectData,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetFileSecurityW, GetKernelObjectSecurity, LookupAccountNameW,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        DACL_SECURITY_INFORMATION, GetFileSecurityW, GetKernelObjectSecurity, GetTokenInformation,
+        ImpersonateNamedPipeClient, LookupAccountNameW, OWNER_SECURITY_INFORMATION,
+        OpenThreadToken, PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES,
+        SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers,
@@ -256,6 +290,7 @@ mod imp {
         PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE,
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
 
     pub fn dpapi_protect(
         plaintext: &[u8],
@@ -557,10 +592,64 @@ mod imp {
         sid_to_string(sid.as_mut_ptr().cast::<c_void>())
     }
 
+    pub fn inspect_named_pipe_sddl(path: &str) -> Result<String, String> {
+        let wide_path = to_wide(path);
+        let mut owner = null_mut();
+        let mut group = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != NO_ERROR {
+            return Err(format!(
+                "GetNamedSecurityInfoW failed for named pipe {path} with Windows error {status}"
+            ));
+        }
+        if descriptor.is_null() {
+            return Err(format!(
+                "GetNamedSecurityInfoW returned a null security descriptor for named pipe {path}"
+            ));
+        }
+        let result = security_descriptor_to_sddl(descriptor);
+        unsafe {
+            LocalFree(descriptor.cast::<c_void>());
+        }
+        result
+    }
+
     pub fn serve_named_pipe_one_message<F>(
         path: &str,
         security_sddl: &str,
         max_message_bytes: usize,
+        handler: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(Vec<u8>) -> Result<Vec<u8>, String>,
+    {
+        serve_named_pipe_one_message_authorized(
+            path,
+            security_sddl,
+            max_message_bytes,
+            None,
+            handler,
+        )
+    }
+
+    pub fn serve_named_pipe_one_message_authorized<F>(
+        path: &str,
+        security_sddl: &str,
+        max_message_bytes: usize,
+        service_sid: Option<&str>,
         handler: F,
     ) -> Result<(), String>
     where
@@ -603,6 +692,21 @@ mod imp {
             }
         }
 
+        let facts = connected_client_facts(handle.raw(), service_sid)?;
+        if !named_pipe_client_authorized(&facts) {
+            unsafe {
+                DisconnectNamedPipe(handle.raw());
+            }
+            return Err(format!(
+                "Windows named-pipe client rejected: user_sid={} local_system={} builtin_admin={} service_sid_match={} remote_client={}",
+                facts.user_sid.as_deref().unwrap_or("<unknown>"),
+                facts.is_local_system,
+                facts.is_builtin_administrator,
+                facts.matches_service_identity,
+                facts.is_remote_client
+            ));
+        }
+
         let request = read_pipe_message(handle.raw(), max_message_bytes)?;
         let response = handler(request)?;
         if response.len() > max_message_bytes {
@@ -616,6 +720,128 @@ mod imp {
             DisconnectNamedPipe(handle.raw());
         }
         Ok(())
+    }
+
+    fn named_pipe_client_authorized(facts: &NativeWindowsNamedPipeClientFacts) -> bool {
+        if facts.is_remote_client {
+            return false;
+        }
+        facts.is_local_system || facts.is_builtin_administrator || facts.matches_service_identity
+    }
+
+    fn connected_client_facts(
+        pipe_handle: HANDLE,
+        service_sid: Option<&str>,
+    ) -> Result<NativeWindowsNamedPipeClientFacts, String> {
+        let ok = unsafe { ImpersonateNamedPipeClient(pipe_handle) };
+        if ok == 0 {
+            return Err(format!(
+                "ImpersonateNamedPipeClient failed with Windows error {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        let guard = ImpersonationGuard;
+        let result = inspect_impersonated_thread_token(service_sid);
+        drop(guard);
+        result
+    }
+
+    struct ImpersonationGuard;
+
+    impl Drop for ImpersonationGuard {
+        fn drop(&mut self) {
+            unsafe {
+                RevertToSelf();
+            }
+        }
+    }
+
+    fn inspect_impersonated_thread_token(
+        service_sid: Option<&str>,
+    ) -> Result<NativeWindowsNamedPipeClientFacts, String> {
+        let mut token = null_mut();
+        let ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+        if ok == 0 {
+            return Err(format!(
+                "OpenThreadToken after named-pipe impersonation failed with Windows error {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        let token = OwnedHandle::new(token)
+            .ok_or_else(|| "OpenThreadToken returned an invalid handle".to_owned())?;
+        let user_sid = read_token_user_sid(token.raw())?;
+        let group_sids = read_token_group_sids(token.raw())?;
+        let is_local_system = user_sid.as_deref() == Some("S-1-5-18");
+        let is_builtin_administrator = group_sids.iter().any(|sid| sid == "S-1-5-32-544");
+        let matches_service_identity = service_sid.is_some_and(|expected| {
+            user_sid.as_deref() == Some(expected) || group_sids.iter().any(|sid| sid == expected)
+        });
+        Ok(NativeWindowsNamedPipeClientFacts {
+            user_sid,
+            group_sids,
+            is_local_system,
+            is_builtin_administrator,
+            matches_service_identity,
+            is_remote_client: false,
+        })
+    }
+
+    fn read_token_user_sid(token: HANDLE) -> Result<Option<String>, String> {
+        let bytes = read_token_information(token, TokenUser)?;
+        let token_user = bytes.as_ptr().cast::<TOKEN_USER>();
+        let sid = unsafe { (*token_user).User.Sid };
+        if sid.is_null() {
+            return Ok(None);
+        }
+        sid_to_string(sid.cast::<c_void>()).map(Some)
+    }
+
+    fn read_token_group_sids(token: HANDLE) -> Result<Vec<String>, String> {
+        let bytes = read_token_information(token, TokenGroups)?;
+        let token_groups = bytes.as_ptr().cast::<TOKEN_GROUPS>();
+        let count = unsafe { (*token_groups).GroupCount as usize };
+        let groups = unsafe { std::slice::from_raw_parts((*token_groups).Groups.as_ptr(), count) };
+        let mut sids = Vec::with_capacity(count);
+        for SID_AND_ATTRIBUTES { Sid, .. } in groups {
+            if !Sid.is_null() {
+                sids.push(sid_to_string((*Sid).cast::<c_void>())?);
+            }
+        }
+        Ok(sids)
+    }
+
+    fn read_token_information(
+        token: HANDLE,
+        class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+    ) -> Result<Vec<u8>, String> {
+        let mut needed = 0u32;
+        let first = unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut needed) };
+        if first != 0 {
+            return Err("GetTokenInformation unexpectedly succeeded with no buffer".to_owned());
+        }
+        let err = unsafe { GetLastError() };
+        if err != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+            return Err(format!(
+                "GetTokenInformation sizing failed with Windows error {err}"
+            ));
+        }
+        let mut bytes = vec![0u8; needed as usize];
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                bytes.as_mut_ptr().cast::<c_void>(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "GetTokenInformation failed with Windows error {}",
+                unsafe { GetLastError() }
+            ));
+        }
+        Ok(bytes)
     }
 
     pub fn call_named_pipe(
@@ -1173,8 +1399,9 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{
     call_named_pipe, dpapi_protect, dpapi_unprotect, extract_signer_thumbprint_sha256,
-    get_adapters_addresses, inspect_file_sddl, inspect_registry_key_sddl,
-    lookup_account_sid_string, serve_named_pipe_one_message, verify_authenticode_chain,
+    get_adapters_addresses, inspect_file_sddl, inspect_named_pipe_sddl, inspect_registry_key_sddl,
+    lookup_account_sid_string, serve_named_pipe_one_message,
+    serve_named_pipe_one_message_authorized, verify_authenticode_chain,
 };
 
 #[cfg(test)]
