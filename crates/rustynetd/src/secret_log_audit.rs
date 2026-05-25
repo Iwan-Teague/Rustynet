@@ -1152,37 +1152,37 @@ const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, u32, &str)] = &[
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        2890,
+        2892,
         "nonce counter zero-check on relay fleet request u64 input (not secret material)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3044,
+        3046,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3049,
+        3051,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3182,
+        3184,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        3185,
+        3187,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        4210,
+        4214,
         "all-zero sentinel rejection on coordination session_id byte array (per-byte zero check, not a secret compare)",
     ),
     (
         "crates/rustynet-control/src/lib.rs",
-        4215,
+        4219,
         "all-zero sentinel rejection on coordination nonce byte array (per-byte zero check, not a secret compare)",
     ),
     (
