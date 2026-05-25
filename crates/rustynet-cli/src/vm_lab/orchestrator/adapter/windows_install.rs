@@ -28,6 +28,10 @@ pub const WINDOWS_MEMBERSHIP_SNAPSHOT_PATH: &str =
 // Paths written by the e2e bootstrap sequence.
 pub const WINDOWS_WG_PASSPHRASE_PATH: &str =
     r"C:\ProgramData\RustyNet\secrets\wireguard.passphrase.dpapi";
+pub const WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH: &str =
+    r"C:\ProgramData\RustyNet\secrets\signing_key_passphrase.dpapi";
+pub const WINDOWS_CREDENTIALS_WORKSPACE_DIR: &str =
+    r"C:\ProgramData\RustyNet\credentials-workspace";
 const WINDOWS_MEMBERSHIP_LOG_PATH: &str = r"C:\ProgramData\RustyNet\membership\membership.log";
 const WINDOWS_MEMBERSHIP_WATERMARK_PATH: &str =
     r"C:\ProgramData\RustyNet\membership\membership.watermark";
@@ -658,6 +662,8 @@ fn run_windows_e2e_bootstrap(
 
     // ── 2. WireGuard key init + membership init + service start ─────────────
     let passphrase_q = ps_quote(WINDOWS_WG_PASSPHRASE_PATH)?;
+    let membership_passphrase_q = ps_quote(WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH)?;
+    let credentials_workspace_q = ps_quote(WINDOWS_CREDENTIALS_WORKSPACE_DIR)?;
     let rustynetd_q = ps_quote(WINDOWS_RUSTYNETD_PATH)?;
     let wg_binary_q = ps_quote(WINDOWS_WG_BINARY_PATH)?;
     let node_id_q = ps_quote(&node_id)?;
@@ -686,6 +692,7 @@ fn run_windows_e2e_bootstrap(
          $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
          {bootstrap_acl_repair}; \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
+         New-Item -ItemType Directory -Force -Path {credentials_workspace_q} | Out-Null; \
          [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
          $keyInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key init --passphrase-file {passphrase_q} --force }}; \
          if ($keyInit.ExitCode -ne 0) {{ throw ('rustynetd key init failed: ' + $keyInit.Output) }}; \
@@ -699,6 +706,9 @@ fn run_windows_e2e_bootstrap(
              --network-id {network_id_q} \
              --force }}; \
          if ($mbInit.ExitCode -ne 0) {{ throw ('rustynetd membership init failed: ' + $mbInit.Output) }}; \
+         [System.IO.File]::WriteAllText({membership_passphrase_q}, $pp); \
+         $msp = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key store-passphrase --passphrase-file {membership_passphrase_q} }}; \
+         if ($msp.ExitCode -ne 0) {{ throw ('rustynetd membership signing passphrase store failed: ' + $msp.Output) }}; \
          $ksp = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q} }}; \
          if ($ksp.ExitCode -ne 0) {{ throw ('rustynetd key store-passphrase failed: ' + $ksp.Output) }}; \
          $acl = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} windows-runtime-acls-check }}; \
@@ -938,6 +948,44 @@ mod tests {
         assert!(
             INSTALL_SERVICE_SCRIPT.contains("(Join-Path $StateRoot 'secrets\\key-custody')"),
             "pre-service ACL repair must cover key custody blobs"
+        );
+    }
+
+    #[test]
+    fn install_service_script_provisions_membership_credentials_workspace() {
+        assert!(
+            WINDOWS_CREDENTIALS_WORKSPACE_DIR.ends_with(r"credentials-workspace"),
+            "credentials workspace path must be canonical: {WINDOWS_CREDENTIALS_WORKSPACE_DIR}"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("(Join-Path $StateRoot 'credentials-workspace')"),
+            "install helper must create and ACL-repair the membership credential workspace"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("credentials_workspace_present"),
+            "install report must expose credentials workspace presence"
+        );
+    }
+
+    #[test]
+    fn e2e_bootstrap_provisions_windows_membership_signing_passphrase_blob() {
+        assert!(
+            WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH
+                .ends_with(r"secrets\signing_key_passphrase.dpapi"),
+            "membership signing passphrase must use the reviewed DPAPI blob name: {WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH}"
+        );
+        let source = include_str!("windows_install.rs");
+        assert!(
+            source.contains("WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH"),
+            "Windows e2e bootstrap must carry the membership signing passphrase path"
+        );
+        assert!(
+            source.contains("membership_passphrase_q"),
+            "Windows e2e bootstrap must quote the membership signing passphrase path"
+        );
+        assert!(
+            source.contains("key store-passphrase --passphrase-file {membership_passphrase_q}"),
+            "Windows e2e bootstrap must DPAPI-protect the membership signing passphrase blob"
         );
     }
 
