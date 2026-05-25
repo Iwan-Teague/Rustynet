@@ -4728,7 +4728,7 @@ fn resolve_setup_live_lab_selection(
             require_five_node: false,
         })?;
         let profile = load_live_lab_profile(profile_path)?;
-        ensure_live_lab_profile_linux_only(&profile, "vm-lab-setup-live-lab")?;
+        ensure_live_lab_profile_desktop_orchestrator_supported(&profile, "vm-lab-setup-live-lab")?;
         return Ok(LiveLabSetupSelection {
             profile_path: profile_path.to_path_buf(),
             profile_generated: false,
@@ -4809,7 +4809,7 @@ fn resolve_setup_live_lab_selection(
         require_five_node: false,
     })?;
     let profile = load_live_lab_profile(profile_path.as_path())?;
-    ensure_live_lab_profile_linux_only(&profile, "vm-lab-setup-live-lab")?;
+    ensure_live_lab_profile_desktop_orchestrator_supported(&profile, "vm-lab-setup-live-lab")?;
     Ok(LiveLabSetupSelection {
         profile_path,
         profile_generated: true,
@@ -6083,28 +6083,19 @@ fn daemon_probe_for(platform: VmGuestPlatform) -> Box<dyn DaemonProbe> {
 /// Per-target Rust orchestrator that selects between two execution
 /// strategies based on the target platform set:
 ///
-/// 1. **Pure-Linux node set** — delegates to the wrapped
+/// 1. **Linux-core desktop node set** — delegates to the wrapped
 ///    `LinuxBashOrchestrator`. Parity with the existing bash impl is
-///    *identity* in this mode: the live-lab is run by literally
+///    *identity* for pure-Linux mode: the live-lab is run by literally
 ///    invoking `scripts/e2e/live_linux_lab_orchestrator.sh`, exactly
 ///    as it has been since the repository's first live-lab landed.
-///    No new dispatch code runs, no behavioral surface drifts; the
-///    plan §6.1 + §9 rollback contract — "for pure-Linux node sets,
-///    [`RustOrchestrator`] must produce byte-identical (or
-///    behaviorally equivalent) reports to the bash impl. No silent
-///    divergence." — is satisfied by construction.
+///    Phase 31 also allows Linux+macOS+Windows desktop sidecars through
+///    this wrapper because the script now carries per-platform metadata
+///    and sidecar dispatch.
 ///
-/// 2. **Heterogeneous node set (any non-Linux target)** — rejects up-
-///    front with a roadmap blocker citing W4.1. The Linux-only gate
-///    `ensure_live_lab_profile_linux_only` at the existing
-///    `execute_ops_vm_lab_run_live_lab` entry point enforces the same
-///    contract today; `RustOrchestrator` mirrors it so any caller
-///    that bypasses the entry-point function and reaches for the
-///    trait directly still fails closed. When W4.1 lands the per-
-///    stage capability gating + the per-target adapter dispatch
-///    (using the W3.2 `RuntimePaths` / `ServiceManager` /
-///    `RemoteExec` / `DaemonProbe` traits), this branch becomes the
-///    real heterogeneous execution path.
+/// 2. **Unsupported topology** — pure non-Linux, mobile, or otherwise
+///    unsupported platform sets reject before execution. This keeps the
+///    mixed-OS unlock fail-closed: the current stage graph still needs a
+///    Linux core host.
 ///
 /// `RustOrchestrator::new(linux_bash, target_platforms)` consumes a
 /// pre-built `LinuxBashOrchestrator` and the resolved per-target
@@ -6126,17 +6117,23 @@ impl RustOrchestrator {
         }
     }
 
-    /// True when every captured target platform is `Linux` (or the
-    /// platform set is empty — empty defaults to Linux today since
-    /// the bash orchestrator's profile gating already enforces a
-    /// 5×Linux topology).
+    /// True when the captured target set can be driven by the current
+    /// bash-backed mixed-OS wrapper: all-Linux or Linux plus supported
+    /// desktop sidecars. A Linux core remains mandatory because the
+    /// current stage graph still anchors exit/client/relay roles there.
     #[allow(dead_code)]
-    fn is_pure_linux(&self) -> bool {
+    fn is_supported_desktop_topology(&self) -> bool {
         self.target_platforms.is_empty()
             || self
                 .target_platforms
                 .iter()
-                .all(|p| matches!(p, VmGuestPlatform::Linux))
+                .any(|p| matches!(p, VmGuestPlatform::Linux))
+                && self.target_platforms.iter().all(|p| {
+                    matches!(
+                        p,
+                        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+                    )
+                })
     }
 
     /// Names of any non-Linux platforms in the captured set. Used to
@@ -6159,23 +6156,20 @@ impl RustOrchestrator {
 
 impl StageOrchestrator for RustOrchestrator {
     fn execute_live_lab(&self, inputs: &LiveLabRunInputs) -> Result<LiveLabRunReport, String> {
-        if self.is_pure_linux() {
+        if self.is_supported_desktop_topology() {
             // Parity proof for pure-Linux: delegate to the wrapped
             // bash orchestrator. Behavior is identity — same script,
             // same flag set, same TSV-on-disk contract. No new code
-            // runs in this branch beyond the dispatch decision
-            // itself.
+            // runs in this branch beyond the dispatch decision itself.
+            // Phase 31 extends that same path to mixed desktop
+            // topologies because the bash wrapper now carries
+            // per-platform metadata and sidecar stage dispatch.
             return self.linux_bash.execute_live_lab(inputs);
         }
 
-        // Heterogeneous set: refuse to execute today. The orchestrator
-        // entry point's `ensure_live_lab_profile_linux_only` already
-        // rejects this case at the profile boundary; this is the
-        // belt-and-braces equivalent at the trait boundary so a
-        // caller who bypasses the entry point and reaches for the
-        // trait directly still fails closed. W4.1 wires per-stage
-        // capability gating + per-target adapter dispatch and turns
-        // this branch into the real heterogeneous execution path.
+        // Unsupported topology: refuse before execution. This protects
+        // callers that bypass the profile boundary and reach the trait
+        // directly with pure-non-Linux or mobile target sets.
         //
         // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14 wires the
         // capability evaluator at this boundary through the umbrella
@@ -6214,12 +6208,10 @@ impl StageOrchestrator for RustOrchestrator {
         });
         let capability_record = outcome.failure_context().record.clone();
         Err(format!(
-            "RustOrchestrator refuses heterogeneous live-lab execution today: \
-             non-Linux platforms in target set [{}]. {}. Until per-stage \
-             capability gating (W4.1, see OS-agnostic delta plan §6.2 / §7 W4.1) \
-             wires per-target adapter dispatch, use the LinuxBashOrchestrator \
-             path for pure-Linux runs and the existing Windows sidecar for \
-             Windows peers.",
+            "RustOrchestrator refuses unsupported live-lab topology: \
+             non-Linux platforms in target set [{}]. {}. Current supported \
+             topology is Linux core plus desktop sidecars (macOS/Windows); \
+             mobile and pure-non-Linux profiles fail closed.",
             blockers.join(", "),
             capability::render_capability_summary(&capability_record),
         ))
@@ -6230,7 +6222,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
     ensure_local_regular_file_path(config.profile_path.as_path(), "live-lab profile")?;
     ensure_local_regular_file_path(config.script_path.as_path(), "live-lab script")?;
     let profile = load_live_lab_profile(config.profile_path.as_path())?;
-    ensure_live_lab_profile_linux_only(&profile, "vm-lab-run-live-lab")?;
+    ensure_live_lab_profile_desktop_orchestrator_supported(&profile, "vm-lab-run-live-lab")?;
     if let Some(value) = config.source_mode.as_deref() {
         ensure_no_control_chars("source mode", value)?;
     }
@@ -15471,7 +15463,10 @@ pub fn execute_ops_vm_lab_validate_live_lab_profile(
     }
 
     ensure_live_lab_profile_platform_metadata(&profile)?;
-    ensure_live_lab_profile_linux_only(&profile, "vm-lab-validate-live-lab-profile")?;
+    ensure_live_lab_profile_desktop_orchestrator_supported(
+        &profile,
+        "vm-lab-validate-live-lab-profile",
+    )?;
 
     let targets = profile.configured_targets()?;
     let mut lines = vec![
@@ -15499,7 +15494,10 @@ pub fn execute_ops_vm_lab_diagnose_live_lab_failure(
 ) -> Result<String, String> {
     let report_dir = resolve_absolute_path(config.report_dir.as_path())?;
     let profile = load_live_lab_profile(config.profile_path.as_path())?;
-    ensure_live_lab_profile_linux_only(&profile, "vm-lab-diagnose-live-lab-failure")?;
+    ensure_live_lab_profile_desktop_orchestrator_supported(
+        &profile,
+        "vm-lab-diagnose-live-lab-failure",
+    )?;
     let summary = summarize_live_lab_report(report_dir.as_path(), false, 1)?;
     let stage = if let Some(stage) = config.stage.as_deref() {
         stage.to_owned()
@@ -17059,6 +17057,7 @@ fn ensure_live_lab_profile_capabilities(
     ))
 }
 
+#[allow(dead_code)]
 fn ensure_live_lab_profile_linux_only(
     profile: &LiveLabProfile,
     command_name: &str,
@@ -17075,6 +17074,97 @@ fn ensure_live_lab_profile_linux_only(
         LIVE_LAB_LINUX_ONLY_REQUIRED_CAPABILITIES,
         command_name,
     )
+}
+
+fn ensure_live_lab_profile_desktop_orchestrator_supported(
+    profile: &LiveLabProfile,
+    command_name: &str,
+) -> Result<(), String> {
+    let targets = configured_live_lab_target_platform_profiles(profile)?;
+    if targets.is_empty() {
+        return Err(format!(
+            "{command_name} requires at least one configured live-lab target"
+        ));
+    }
+
+    let has_linux = targets
+        .iter()
+        .any(|(_, _, target)| target.platform == VmGuestPlatform::Linux);
+    if !has_linux {
+        return Err(format!(
+            "{command_name} requires at least one Linux target for the current mixed-OS live-lab orchestrator core stages"
+        ));
+    }
+
+    let mut blocked = Vec::new();
+    for (role, target, profile) in targets {
+        let reason = match profile.platform {
+            VmGuestPlatform::Linux => {
+                if profile.remote_shell != VmRemoteShell::Posix
+                    || profile.guest_exec_mode != VmGuestExecMode::LinuxBash
+                    || profile.service_manager != VmServiceManager::Systemd
+                {
+                    Some(format!(
+                        "linux target must use posix/linux_bash/systemd profile; got remote_shell={} guest_exec_mode={} service_manager={}",
+                        profile.remote_shell.as_str(),
+                        profile.guest_exec_mode.as_str(),
+                        profile.service_manager.as_str()
+                    ))
+                } else {
+                    None
+                }
+            }
+            VmGuestPlatform::Macos => {
+                if profile.remote_shell != VmRemoteShell::Posix
+                    || profile.guest_exec_mode != VmGuestExecMode::MacosPosix
+                    || profile.service_manager != VmServiceManager::Launchd
+                {
+                    Some(format!(
+                        "macOS target must use posix/macos_posix/launchd profile; got remote_shell={} guest_exec_mode={} service_manager={}",
+                        profile.remote_shell.as_str(),
+                        profile.guest_exec_mode.as_str(),
+                        profile.service_manager.as_str()
+                    ))
+                } else {
+                    None
+                }
+            }
+            VmGuestPlatform::Windows => {
+                if profile.remote_shell != VmRemoteShell::Powershell
+                    || profile.guest_exec_mode != VmGuestExecMode::WindowsPowershell
+                    || profile.service_manager != VmServiceManager::WindowsService
+                {
+                    Some(format!(
+                        "Windows target must use powershell/windows_powershell/windows_service profile; got remote_shell={} guest_exec_mode={} service_manager={}",
+                        profile.remote_shell.as_str(),
+                        profile.guest_exec_mode.as_str(),
+                        profile.service_manager.as_str()
+                    ))
+                } else {
+                    None
+                }
+            }
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => Some(format!(
+                "{} targets are not supported by the desktop mixed-OS live-lab orchestrator",
+                profile.platform.as_str()
+            )),
+        };
+        if let Some(reason) = reason {
+            blocked.push(format!(
+                "role={role} target={target} platform={} reason={reason}",
+                profile.platform.as_str()
+            ));
+        }
+    }
+
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{command_name} rejected unsupported live-lab target profile(s): {}",
+            blocked.join("; ")
+        ))
+    }
 }
 
 fn load_live_lab_profile(path: &Path) -> Result<LiveLabProfile, String> {
@@ -29035,35 +29125,67 @@ REPO_REF=\"HEAD\"\n",
     }
 
     #[test]
-    fn validate_live_lab_profile_rejects_non_linux_stage_targets() {
+    fn validate_live_lab_profile_accepts_phase31_mixed_desktop_targets() {
         let profile_path = write_temp_live_lab_profile(
-            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"debian@client-host\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
+            "EXIT_TARGET=\"debian@exit-host\"\nCLIENT_TARGET=\"debian@client-host\"\nENTRY_TARGET=\"debian@relay-host\"\nAUX_TARGET=\"macos@aux-host\"\nEXTRA_TARGET=\"Administrator@windows-extra\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"linux\"\nEXIT_REMOTE_SHELL=\"posix\"\nEXIT_GUEST_EXEC_MODE=\"linux_bash\"\nEXIT_SERVICE_MANAGER=\"systemd\"\nCLIENT_PLATFORM=\"linux\"\nCLIENT_REMOTE_SHELL=\"posix\"\nCLIENT_GUEST_EXEC_MODE=\"linux_bash\"\nCLIENT_SERVICE_MANAGER=\"systemd\"\nENTRY_PLATFORM=\"linux\"\nENTRY_REMOTE_SHELL=\"posix\"\nENTRY_GUEST_EXEC_MODE=\"linux_bash\"\nENTRY_SERVICE_MANAGER=\"systemd\"\nAUX_PLATFORM=\"macos\"\nAUX_REMOTE_SHELL=\"posix\"\nAUX_GUEST_EXEC_MODE=\"macos_posix\"\nAUX_SERVICE_MANAGER=\"launchd\"\nEXTRA_PLATFORM=\"windows\"\nEXTRA_REMOTE_SHELL=\"powershell\"\nEXTRA_GUEST_EXEC_MODE=\"windows_powershell\"\nEXTRA_SERVICE_MANAGER=\"windows_service\"\n",
         );
 
-        let err = execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
-            profile_path: profile_path.clone(),
-            expected_backend: None,
-            expected_source_mode: None,
-            require_five_node: false,
-        })
-        .expect_err("non-linux live-lab targets must fail closed");
-
-        // W4.1 capability gate format: rejection enumerates the
-        // missing capability labels for each blocked target. A
-        // Windows target lacks the Linux kernel/userspace caps
-        // (`linux-bash-guest-exec`, `nftables-filtering`,
-        // `systemd-resolved-dns`) that the bash orchestrator's
-        // existing stage list still requires.
-        assert!(err.contains("requires capabilities"));
-        assert!(err.contains("blocked targets"));
-        assert!(err.contains("missing="));
-        assert!(
-            err.contains("linux-bash-guest-exec")
-                || err.contains("nftables-filtering")
-                || err.contains("systemd-resolved-dns")
-        );
+        let summary =
+            execute_ops_vm_lab_validate_live_lab_profile(VmLabValidateLiveLabProfileConfig {
+                profile_path: profile_path.clone(),
+                expected_backend: None,
+                expected_source_mode: None,
+                require_five_node: true,
+            })
+            .expect("Phase 31 mixed desktop profile must validate");
+        assert!(summary.contains("target.aux=macos@aux-host"));
+        assert!(summary.contains("target.extra=Administrator@windows-extra"));
 
         cleanup_temp_path(profile_path.as_path());
+    }
+
+    #[test]
+    fn phase31_mixed_os_profile_matches_desktop_topology_contract() {
+        let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../profiles/live_lab/phase31_mixed_os_five_node.env");
+        let profile = load_live_lab_profile(profile_path.as_path())
+            .expect("Phase 31 mixed-OS profile should parse");
+
+        super::ensure_live_lab_profile_platform_metadata(&profile)
+            .expect("Phase 31 profile should include platform metadata");
+        super::ensure_live_lab_profile_desktop_orchestrator_supported(
+            &profile,
+            "phase31-profile-test",
+        )
+        .expect("Phase 31 profile should be accepted by the desktop mixed-OS gate");
+
+        let targets = profile
+            .configured_targets()
+            .expect("Phase 31 profile targets should resolve");
+        assert_eq!(targets.len(), 5);
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.role == "entry" && target.target == "debian@192.168.65.6")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.role == "aux" && target.target == "mac@192.168.64.18")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.role == "extra" && target.target == "windows@192.168.65.8")
+        );
+        assert_eq!(
+            profile.optional("EXTRA_REMOTE_SHELL").as_deref(),
+            Some("powershell")
+        );
+        assert_eq!(
+            profile.optional("EXTRA_GUEST_EXEC_MODE").as_deref(),
+            Some("windows_powershell")
+        );
     }
 
     #[test]
@@ -29685,10 +29807,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         });
 
         let err = result.expect_err("windows profile must be blocked before shell invocation");
-        // W4.1 capability gate format.
-        assert!(err.contains("requires capabilities"));
-        assert!(err.contains("blocked targets"));
-        assert!(err.contains("missing="));
+        assert!(err.contains("requires at least one Linux target"));
         assert!(
             !marker_path.exists(),
             "shell helper should not have executed"
@@ -29770,10 +29889,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
 
         let err =
             result.expect_err("windows profile must be blocked before setup shell invocation");
-        // W4.1 capability gate format.
-        assert!(err.contains("requires capabilities"));
-        assert!(err.contains("blocked targets"));
-        assert!(err.contains("missing="));
+        assert!(err.contains("requires at least one Linux target"));
         assert!(
             !marker_path.exists(),
             "shell helper should not have executed"
@@ -29788,7 +29904,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     #[test]
     fn execute_ops_vm_lab_diagnose_live_lab_failure_rejects_windows_profile_before_diagnostics() {
         let profile_path = write_temp_live_lab_profile(
-            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"debian@client-host\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
+            "EXIT_TARGET=\"Administrator@windows-exit\"\nCLIENT_TARGET=\"Administrator@windows-client\"\nSSH_IDENTITY_FILE=\"$IDENTITY_FILE\"\nEXIT_PLATFORM=\"windows\"\nEXIT_REMOTE_SHELL=\"powershell\"\nEXIT_GUEST_EXEC_MODE=\"windows_powershell\"\nEXIT_SERVICE_MANAGER=\"windows_service\"\nEXIT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\nCLIENT_PLATFORM=\"windows\"\nCLIENT_REMOTE_SHELL=\"powershell\"\nCLIENT_GUEST_EXEC_MODE=\"windows_powershell\"\nCLIENT_SERVICE_MANAGER=\"windows_service\"\nCLIENT_RUSTYNET_SRC_DIR=\"C:\\\\Rustynet\"\n",
         );
         let inventory_path = write_temp_inventory(
             r#"{
@@ -29812,10 +29928,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         )
         .expect_err("windows live-lab diagnostics must fail closed before collection starts");
 
-        // W4.1 capability gate format.
-        assert!(err.contains("requires capabilities"));
-        assert!(err.contains("blocked targets"));
-        assert!(err.contains("missing="));
+        assert!(err.contains("requires at least one Linux target"));
         assert!(
             !output_dir.exists(),
             "diagnostics output should not be created before the Linux-only guard passes"
@@ -33410,7 +33523,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     fn rust_orchestrator_pure_linux_path_is_pure_linux() {
         let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
         let rust = super::RustOrchestrator::new(bash, vec![super::VmGuestPlatform::Linux; 5]);
-        assert!(rust.is_pure_linux());
+        assert!(rust.is_supported_desktop_topology());
         assert_eq!(rust.non_linux_platforms(), Vec::<&'static str>::new());
     }
 
@@ -33421,11 +33534,11 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         // Linux-bash path rather than refusing.
         let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
         let rust = super::RustOrchestrator::new(bash, vec![]);
-        assert!(rust.is_pure_linux());
+        assert!(rust.is_supported_desktop_topology());
     }
 
     #[test]
-    fn rust_orchestrator_heterogeneous_set_is_not_pure_linux() {
+    fn rust_orchestrator_heterogeneous_desktop_set_is_supported() {
         let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
         let rust = super::RustOrchestrator::new(
             bash,
@@ -33435,7 +33548,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
                 super::VmGuestPlatform::Windows,
             ],
         );
-        assert!(!rust.is_pure_linux());
+        assert!(rust.is_supported_desktop_topology());
         let non_linux = rust.non_linux_platforms();
         assert_eq!(non_linux, vec!["windows"]);
     }
@@ -33459,37 +33572,30 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
-    fn rust_orchestrator_heterogeneous_execution_rejects_with_w4_blocker() {
+    fn rust_orchestrator_mobile_mixed_execution_rejects_with_capability_blocker() {
         let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
         let rust = super::RustOrchestrator::new(
             bash,
-            vec![
-                super::VmGuestPlatform::Linux,
-                super::VmGuestPlatform::Windows,
-            ],
+            vec![super::VmGuestPlatform::Linux, super::VmGuestPlatform::Ios],
         );
         let inputs = rust_orchestrator_inputs();
         let err = rust
             .execute_live_lab(&inputs)
-            .expect_err("heterogeneous execution must reject today");
+            .expect_err("mobile mixed execution must reject");
         assert!(
-            err.contains("heterogeneous live-lab execution"),
-            "blocker must mention heterogeneous: {err}"
+            err.contains("non-Linux platforms in target set [ios]"),
+            "blocker must name ios: {err}"
         );
         assert!(
-            err.contains("W4.1"),
-            "blocker must cite W4.1 roadmap: {err}"
-        );
-        assert!(
-            err.contains("windows"),
-            "blocker must name the offending platform: {err}"
+            err.contains("reason_code=target-platform-unsupported"),
+            "blocker must surface target-platform-unsupported: {err}"
         );
     }
 
     #[test]
-    fn rust_orchestrator_heterogeneous_execution_blocker_includes_capability_record() {
+    fn rust_orchestrator_mobile_blocker_includes_capability_record() {
         // Slice 2 of VmLabCapabilityReportingPlan_2026-04-14: the
-        // heterogeneous reject must carry a stable capability `reason_code`
+        // mobile reject must carry a stable capability `reason_code`
         // and `status` so downstream tooling can grep on the capability
         // vocabulary rather than the free-form W4.1 prose.
         let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
@@ -33497,13 +33603,13 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             bash,
             vec![
                 super::VmGuestPlatform::Linux,
-                super::VmGuestPlatform::Windows,
+                super::VmGuestPlatform::Android,
             ],
         );
         let inputs = rust_orchestrator_inputs();
         let err = rust
             .execute_live_lab(&inputs)
-            .expect_err("heterogeneous execution must reject today");
+            .expect_err("mobile execution must reject");
         assert!(
             err.contains("scope=RunLiveLab"),
             "blocker must surface the RunLiveLab capability scope: {err}"
@@ -33513,8 +33619,8 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             "blocker must surface Unsupported status: {err}"
         );
         assert!(
-            err.contains("reason_code=topology-mismatch"),
-            "blocker must surface the topology-mismatch reason code: {err}"
+            err.contains("reason_code=target-platform-unsupported"),
+            "blocker must surface the target-platform-unsupported reason code: {err}"
         );
     }
 
@@ -33534,7 +33640,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         // The wrapper holds the bash orchestrator privately, so we
         // assert via the public route: pure-linux dispatch is
         // identity-by-delegation.
-        assert!(rust.is_pure_linux());
+        assert!(rust.is_supported_desktop_topology());
         // Sanity: the expected args are the same as the bash impl
         // would emit on its own — the parity contract.
         assert!(
@@ -33586,25 +33692,36 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
     }
 
     #[test]
-    fn rust_orchestrator_mixed_topology_reject_uses_topology_mismatch_reason_code() {
-        // Mixed Linux+Windows must surface topology-mismatch, not
-        // linux-shell-orchestrator-only.
-        let bash = super::LinuxBashOrchestrator::new(PathBuf::from("/x/orch.sh"));
+    fn rust_orchestrator_mixed_desktop_topology_delegates_to_bash_wrapper() {
+        let marker = std::env::temp_dir().join(format!(
+            "rustynet-rust-orchestrator-mixed-{}.marker",
+            super::unique_suffix()
+        ));
+        let script = write_temp_executable(
+            format!(
+                "#!/bin/sh\nprintf 'mixed-desktop\\n' > {}\nexit 0\n",
+                marker.display()
+            )
+            .as_str(),
+        );
+        let bash = super::LinuxBashOrchestrator::new(script.clone());
         let rust = super::RustOrchestrator::new(
             bash,
             vec![
                 super::VmGuestPlatform::Linux,
                 super::VmGuestPlatform::Linux,
                 super::VmGuestPlatform::Windows,
+                super::VmGuestPlatform::Macos,
             ],
         );
-        let err = rust
+        let report = rust
             .execute_live_lab(&rust_orchestrator_inputs())
-            .expect_err("mixed topology must reject today");
-        assert!(
-            err.contains("reason_code=topology-mismatch"),
-            "mixed topology must surface topology-mismatch: {err}"
-        );
+            .expect("mixed desktop topology should delegate to bash wrapper");
+        assert!(report.success);
+        assert_eq!(report.exit_status_code, Some(0));
+        assert!(marker.exists());
+        cleanup_temp_path(script.as_path());
+        cleanup_temp_path(marker.as_path());
     }
 
     #[test]

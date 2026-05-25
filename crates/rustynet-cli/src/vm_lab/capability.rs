@@ -195,21 +195,16 @@ fn evaluate_setup_or_run(
     mixed_platform_topology: bool,
 ) -> (VmLabCapabilityStatus, &'static str, String) {
     match platform {
-        VmLabPlatform::Linux => {
+        VmLabPlatform::Linux => (
+            VmLabCapabilityStatus::Supported,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
             if mixed_platform_topology {
-                (
-                    VmLabCapabilityStatus::Unsupported,
-                    reason_code::TOPOLOGY_MISMATCH,
-                    "the current live-lab wrapper path is Linux-shell based and cannot satisfy the selected mixed-platform topology".to_owned(),
-                )
+                "supported as the Linux core of the current mixed-OS live-lab wrapper path"
+                    .to_owned()
             } else {
-                (
-                    VmLabCapabilityStatus::Supported,
-                    reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-                    "supported through the current Linux shell orchestrator path".to_owned(),
-                )
-            }
-        }
+                "supported through the current Linux shell orchestrator path".to_owned()
+            },
+        ),
         VmLabPlatform::Windows => (
             VmLabCapabilityStatus::Unsupported,
             reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
@@ -568,12 +563,12 @@ pub enum VmLabTopologyValidation {
 /// 2. Any mobile platform (`Ios` or `Android`) in the topology is rejected
 ///    with `target-platform-unsupported`. Mobile is not part of the current
 ///    wrapper surface.
-/// 3. For composite/run/setup scopes that do not currently accept mixed
-///    platforms (`SetupLiveLab`, `RunLiveLab`, `OrchestrateLiveLab`,
-///    `RepoSync`, `Suite`), a mix that contains any non-Linux target is
-///    rejected with `topology-mismatch` when more than one platform family
-///    is present, or with `linux-shell-orchestrator-only` when the single
-///    family is a non-Linux platform.
+/// 3. For composite/run/setup scopes (`SetupLiveLab`, `RunLiveLab`,
+///    `OrchestrateLiveLab`, `RepoSync`, `Suite`), pure non-Linux desktop
+///    topologies are rejected with `linux-shell-orchestrator-only` because
+///    the current wrapper still needs a Linux core host. Mixed desktop
+///    topologies are accepted so Phase 31's Linux+macOS+Windows profile can
+///    run through the platform-aware sidecar stages.
 /// 4. Otherwise the topology is `Ok` for the requested scope.
 ///
 /// The `scope` argument decides which scope label the rejection record
@@ -618,28 +613,16 @@ pub fn validate_vm_lab_target_topology(
             | VmLabCapabilityScope::RepoSync
             | VmLabCapabilityScope::Suite
     );
-    if scope_requires_pure_linux {
-        if distinct.len() > 1 {
-            return VmLabTopologyValidation::Rejected(VmLabCapabilityRecord {
-                scope,
-                status: VmLabCapabilityStatus::Unsupported,
-                reason_code: reason_code::TOPOLOGY_MISMATCH,
-                message:
-                    "the current live-lab wrapper path requires a pure-Linux topology; mixed-platform targets are not supported yet".to_owned(),
-            });
-        }
-        // distinct.len() == 1 here
-        if distinct[0] != VmLabPlatform::Linux {
-            return VmLabTopologyValidation::Rejected(VmLabCapabilityRecord {
-                scope,
-                status: VmLabCapabilityStatus::Unsupported,
-                reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
-                message: format!(
-                    "the current live-lab wrapper path is Linux-shell based and does not yet execute the top-level flow on {} targets",
-                    distinct[0].as_label(),
-                ),
-            });
-        }
+    if scope_requires_pure_linux && !distinct.contains(&VmLabPlatform::Linux) {
+        return VmLabTopologyValidation::Rejected(VmLabCapabilityRecord {
+            scope,
+            status: VmLabCapabilityStatus::Unsupported,
+            reason_code: reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY,
+            message: format!(
+                "the current live-lab wrapper path is Linux-shell based and does not yet execute the top-level flow on {} targets",
+                distinct[0].as_label(),
+            ),
+        });
     }
     VmLabTopologyValidation::Ok
 }
@@ -1244,9 +1227,9 @@ impl VmLabCapabilityPrecondition {
 ///
 /// `primary_platform` is the platform attached to the capability context
 /// (e.g. the bootstrap target platform or the wrapper's selected
-/// platform). When topology contains multiple distinct families the
-/// topology validator will already have rejected, so `primary_platform`
-/// only matters in the single-family case.
+/// platform). For Phase 31 mixed desktop topologies it remains the Linux
+/// core platform; the topology validator rejects pure non-Linux and mobile
+/// mixes before execution.
 pub fn validate_vm_lab_capability_preconditions(
     command: &str,
     primary_platform: VmLabPlatform,
@@ -1370,8 +1353,12 @@ mod tests {
         let mut ctx = ctx_linux(VmLabCapabilityScope::SetupLiveLab);
         ctx.mixed_platform_topology = true;
         let record = evaluate_vm_lab_capability(ctx);
-        assert_eq!(record.status, VmLabCapabilityStatus::Unsupported);
-        assert_eq!(record.reason_code, reason_code::TOPOLOGY_MISMATCH);
+        assert_eq!(record.status, VmLabCapabilityStatus::Supported);
+        assert_eq!(
+            record.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+        assert!(record.message.contains("mixed-OS"));
     }
 
     #[test]
@@ -2015,16 +2002,11 @@ mod tests {
             super::super::VmGuestPlatform::Windows,
         ];
         let mix = normalize_vm_lab_platform_mix(&guests);
-        // The mix carries two distinct desktop families on a pure-Linux-
-        // required scope, so the validator should reject with
-        // topology-mismatch.
+        // Phase 31 permits a Linux-core mixed desktop topology. The
+        // normalized mix should feed the topology validator directly
+        // without an extra translation or compatibility shim.
         let result = validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &mix);
-        match result {
-            VmLabTopologyValidation::Rejected(rec) => {
-                assert_eq!(rec.reason_code, reason_code::TOPOLOGY_MISMATCH);
-            }
-            VmLabTopologyValidation::Ok => panic!("expected topology-mismatch rejection"),
-        }
+        assert_eq!(result, VmLabTopologyValidation::Ok);
     }
 
     #[test]
@@ -2106,16 +2088,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_topology_mixed_linux_and_windows_is_rejected_with_topology_mismatch() {
+    fn validate_topology_mixed_linux_and_windows_is_supported() {
         let platforms = vec![
             VmLabPlatform::Linux,
             VmLabPlatform::Linux,
             VmLabPlatform::Windows,
         ];
-        assert_rejected(
+        assert_eq!(
             validate_vm_lab_target_topology(VmLabCapabilityScope::SetupLiveLab, &platforms),
-            VmLabCapabilityStatus::Unsupported,
-            reason_code::TOPOLOGY_MISMATCH,
+            VmLabTopologyValidation::Ok,
         );
     }
 
@@ -2653,12 +2634,13 @@ mod tests {
     }
 
     #[test]
-    fn report_capabilities_returns_linux_setup_mixed_topology_topology_mismatch() {
+    fn report_capabilities_returns_linux_setup_mixed_topology_supported() {
         let mut config = linux_setup_config();
         config.mixed_platform_topology = true;
         let out = execute_ops_vm_lab_report_capabilities(config).unwrap();
-        assert!(out.starts_with("scope=SetupLiveLab status=Unsupported"));
-        assert!(out.contains("reason_code=topology-mismatch"));
+        assert!(out.starts_with("scope=SetupLiveLab status=Supported"));
+        assert!(out.contains("reason_code=linux-shell-orchestrator-only"));
+        assert!(out.contains("mixed-OS"));
     }
 
     #[test]
@@ -2867,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn preconditions_mixed_topology_returns_blocked_with_topology_mismatch_record() {
+    fn preconditions_mixed_desktop_topology_returns_supported_linux_core_record() {
         let outcome = validate_vm_lab_capability_preconditions(
             "vm-lab-setup-live-lab",
             VmLabPlatform::Linux,
@@ -2880,10 +2862,15 @@ mod tests {
             ],
         )
         .expect("known command must parse");
-        assert!(outcome.is_blocked());
+        assert!(!outcome.is_blocked());
         let bundle = outcome.failure_context();
         assert!(bundle.context.mixed_platform_topology);
-        assert_eq!(bundle.record.reason_code, reason_code::TOPOLOGY_MISMATCH);
+        assert_eq!(bundle.record.status, VmLabCapabilityStatus::Supported);
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+        assert!(bundle.record.message.contains("mixed-OS"));
     }
 
     #[test]
@@ -3088,8 +3075,13 @@ mod tests {
         )
         .unwrap();
         assert!(bundle.context.mixed_platform_topology);
-        assert!(bundle.is_blocker());
-        assert_eq!(bundle.record.reason_code, reason_code::TOPOLOGY_MISMATCH);
+        assert!(!bundle.is_blocker());
+        assert_eq!(bundle.record.status, VmLabCapabilityStatus::Supported);
+        assert_eq!(
+            bundle.record.reason_code,
+            reason_code::LINUX_SHELL_ORCHESTRATOR_ONLY
+        );
+        assert!(bundle.record.message.contains("mixed-OS"));
     }
 
     #[test]
@@ -3205,14 +3197,15 @@ mod tests {
     }
 
     #[test]
-    fn render_failure_block_mixed_topology_flag_shown_as_true_when_set() {
+    fn render_failure_block_mixed_topology_flag_shown_as_supported_linux_core() {
         let mut ctx = ctx_linux(VmLabCapabilityScope::SetupLiveLab);
         ctx.mixed_platform_topology = true;
         let bundle = VmLabCapabilityFailureContext::new("vm-lab-setup-live-lab", ctx);
         let rendered = render_vm_lab_capability_failure_block(&bundle);
         assert!(rendered.contains("mixed_platform_topology: true"));
-        // Mixed topology + Linux scope must surface topology-mismatch.
-        assert!(rendered.contains("reason_code: topology-mismatch"));
+        assert!(rendered.contains("status: Supported"));
+        assert!(rendered.contains("reason_code: linux-shell-orchestrator-only"));
+        assert!(rendered.contains("mixed-OS"));
     }
 
     // ----- validate_vm_lab_report_dir_fresh -----
