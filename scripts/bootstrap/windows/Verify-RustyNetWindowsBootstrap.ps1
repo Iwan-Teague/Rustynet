@@ -3,6 +3,7 @@ param(
     [string]$InstallRoot = 'C:\Program Files\RustyNet',
     [string]$StateRoot = 'C:\ProgramData\RustyNet',
     [string]$ServiceName = 'RustyNet',
+    [switch]$RequireLivePath,
     [string]$OutputPath = ''
 )
 
@@ -59,6 +60,9 @@ function New-FailClosedVerifyReport {
         service_present = $false
         service_running = $false
         service_status = 'missing'
+        require_live_path = [bool]$RequireLivePath
+        path_live_proven = $false
+        path_latest_live_handshake_unix = ''
         failure_step = $script:VerifyFailureStep
         runtime_signals = $script:VerifyRuntimeSignals
         notes = @('verify-helper-trap')
@@ -320,6 +324,114 @@ function Invoke-WindowsNamedPipeAclCheck {
     }
 }
 
+function Invoke-DaemonControlCommand {
+    param(
+        [string]$CliPath,
+        [Parameter(Mandatory = $true)][string]$Command,
+        [int]$TimeoutSeconds = 15
+    )
+    if ($Command -notin @('status', 'netcheck')) {
+        throw ('unsupported daemon control command: {0}' -f $Command)
+    }
+    if ([string]::IsNullOrWhiteSpace($CliPath)) {
+        return [ordered]@{
+            status = 'not-run'
+            exit_code = $null
+            output = ''
+            reason = 'cli-missing'
+        }
+    }
+    if (-not (Test-Path -LiteralPath $CliPath)) {
+        return [ordered]@{
+            status = 'not-run'
+            exit_code = $null
+            output = ''
+            reason = 'cli-missing'
+        }
+    }
+    $probeRoot = Join-Path $env:TEMP ('rustynet-daemon-probe-' + [guid]::NewGuid().ToString('N'))
+    $stdoutPath = Join-Path $probeRoot 'stdout.txt'
+    $stderrPath = Join-Path $probeRoot 'stderr.txt'
+    New-Item -ItemType Directory -Force -Path $probeRoot | Out-Null
+    try {
+        $process = Start-Process `
+            -FilePath $CliPath `
+            -ArgumentList @($Command) `
+            -NoNewWindow `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            return [ordered]@{
+                status = 'fail'
+                exit_code = $null
+                output = ''
+                reason = ('command-timed-out: ' + $Command)
+            }
+        }
+        $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -Raw -LiteralPath $stdoutPath } else { '' }
+        $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -Raw -LiteralPath $stderrPath } else { '' }
+        $output = (($stdout, $stderr) -join "`n").Trim()
+        $exitCode = $process.ExitCode
+        if ($exitCode -ne 0) {
+            return [ordered]@{
+                status = 'fail'
+                exit_code = $exitCode
+                output = $output
+                reason = ('command-failed: ' + $Command)
+            }
+        }
+        return [ordered]@{
+            status = 'pass'
+            exit_code = $exitCode
+            output = $output
+            reason = ''
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-InlineStatusField {
+    param(
+        [string]$Text,
+        [Parameter(Mandatory = $true)][string]$FieldName
+    )
+    if (-not $Text) {
+        return ''
+    }
+    $escapedName = [regex]::Escape($FieldName)
+    $match = [regex]::Match($Text, "(^|\s)$escapedName=([^\s]+)")
+    if ($match.Success) {
+        return [string]$match.Groups[2].Value
+    }
+    return ''
+}
+
+function Get-LivePathEvidence {
+    param(
+        [Parameter(Mandatory = $true)]$StatusProbe,
+        [Parameter(Mandatory = $true)]$NetcheckProbe
+    )
+    $statusText = if ($StatusProbe) { [string]$StatusProbe.output } else { '' }
+    $netcheckText = if ($NetcheckProbe) { [string]$NetcheckProbe.output } else { '' }
+    $pathLiveRaw = Get-InlineStatusField -Text $netcheckText -FieldName 'path_live_proven'
+    if (-not $pathLiveRaw) {
+        $pathLiveRaw = Get-InlineStatusField -Text $statusText -FieldName 'path_live_proven'
+    }
+    $handshake = Get-InlineStatusField -Text $netcheckText -FieldName 'path_latest_live_handshake_unix'
+    if (-not $handshake) {
+        $handshake = Get-InlineStatusField -Text $statusText -FieldName 'path_latest_live_handshake_unix'
+    }
+    return [ordered]@{
+        path_live_proven = [bool]($pathLiveRaw -eq 'true')
+        path_live_proven_raw = $pathLiveRaw
+        path_latest_live_handshake_unix = $handshake
+    }
+}
+
 function Get-ReviewedBackendState {
     param([Parameter(Mandatory = $true)][string]$ConfigPath)
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
@@ -441,6 +553,20 @@ $serviceEnvFilePinned = Test-ImagePathContainsToken -ImagePath $serviceImagePath
 $serviceSidConfigured = [bool]($serviceSidType -match 'UNRESTRICTED')
 $runtimeBoundaryPassed = [bool]($runtimeBoundary -and $runtimeBoundary.status -eq 'pass')
 $namedPipeAclPassed = [bool]($namedPipeAcl -and $namedPipeAcl.status -eq 'pass')
+$script:VerifyFailureStep = 'daemon-live-path-probe'
+$daemonStatusProbe = if ($serviceRuntime.status -eq 'Running') {
+    Invoke-DaemonControlCommand -CliPath $cliInstallPath -Command 'status'
+}
+else {
+    [ordered]@{ status = 'not-run'; exit_code = $null; output = ''; reason = 'service-not-running' }
+}
+$daemonNetcheckProbe = if ($serviceRuntime.status -eq 'Running') {
+    Invoke-DaemonControlCommand -CliPath $cliInstallPath -Command 'netcheck'
+}
+else {
+    [ordered]@{ status = 'not-run'; exit_code = $null; output = ''; reason = 'service-not-running' }
+}
+$livePathEvidence = Get-LivePathEvidence -StatusProbe $daemonStatusProbe -NetcheckProbe $daemonNetcheckProbe
 
 $checks = [ordered]@{
     git_present = Test-CommandPresent -Name 'git.exe'
@@ -486,6 +612,12 @@ $checks = [ordered]@{
     runtime_boundary_validated = $runtimeBoundaryPassed
     named_pipe_acl_status = if ($namedPipeAcl) { [string]$namedPipeAcl.status } else { 'not-run' }
     named_pipe_acl_validated = $namedPipeAclPassed
+    require_live_path = [bool]$RequireLivePath
+    daemon_status_probe_status = [string]$daemonStatusProbe.status
+    daemon_netcheck_probe_status = [string]$daemonNetcheckProbe.status
+    path_live_proven = [bool]$livePathEvidence.path_live_proven
+    path_live_proven_raw = [string]$livePathEvidence.path_live_proven_raw
+    path_latest_live_handshake_unix = [string]$livePathEvidence.path_latest_live_handshake_unix
 }
 
 $notes = @()
@@ -545,6 +677,9 @@ if (-not $checks.named_pipe_acl_validated) {
 }
 if (-not $checks.backend_label) {
     $notes += 'backend-label-missing'
+}
+if ($checks.require_live_path -and -not $checks.path_live_proven) {
+    $notes += 'path-live-not-proven'
 }
 
 $status = 'fail'
@@ -610,6 +745,9 @@ elseif (-not $checks.named_pipe_acl_validated) {
         $reason = 'windows-named-pipe-acl-check-not-run'
     }
 }
+elseif ($checks.require_live_path -and -not $checks.path_live_proven) {
+    $reason = 'windows-path-live-not-proven'
+}
 else {
     $status = 'pass'
     $runtimeSupported = $true
@@ -623,6 +761,7 @@ $report = [ordered]@{
     rustynet_root = $RustyNetRoot
     install_root = $InstallRoot
     state_root = $StateRoot
+    service_name = $ServiceName
     status = $status
     runtime_supported = $runtimeSupported
     service_verified = $serviceVerified
@@ -666,6 +805,14 @@ $report = [ordered]@{
     named_pipe_acl_status = $checks.named_pipe_acl_status
     named_pipe_acl_validated = $checks.named_pipe_acl_validated
     named_pipe_acl = $namedPipeAcl
+    require_live_path = $checks.require_live_path
+    daemon_status_probe_status = $checks.daemon_status_probe_status
+    daemon_netcheck_probe_status = $checks.daemon_netcheck_probe_status
+    daemon_status_probe = $daemonStatusProbe
+    daemon_netcheck_probe = $daemonNetcheckProbe
+    path_live_proven = $checks.path_live_proven
+    path_live_proven_raw = $checks.path_live_proven_raw
+    path_latest_live_handshake_unix = $checks.path_latest_live_handshake_unix
     failure_step = $script:VerifyFailureStep
     runtime_signals = $runtimeSignals
     notes = $notes
