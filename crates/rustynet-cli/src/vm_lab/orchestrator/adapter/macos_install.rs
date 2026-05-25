@@ -21,8 +21,7 @@ pub const MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH: &str =
     "/usr/local/var/rustynet/membership/membership.owner.key.pub";
 pub const MACOS_MEMBERSHIP_SNAPSHOT_PATH: &str =
     "/usr/local/var/rustynet/membership/membership.snapshot";
-pub const MACOS_ENROLLMENT_SECRET_PATH: &str =
-    "/usr/local/var/rustynet/keys/enrollment.secret";
+pub const MACOS_ENROLLMENT_SECRET_PATH: &str = "/usr/local/var/rustynet/keys/enrollment.secret";
 
 static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh");
@@ -733,7 +732,8 @@ mod tests {
     #[test]
     fn bootstrap_script_sets_correct_ownership_and_mode_for_secrets() {
         assert!(
-            BOOTSTRAP_SCRIPT.contains("chown rustynetd") || BOOTSTRAP_SCRIPT.contains("chown -R rustynetd"),
+            BOOTSTRAP_SCRIPT.contains("chown rustynetd")
+                || BOOTSTRAP_SCRIPT.contains("chown -R rustynetd"),
             "bootstrap must set rustynetd ownership"
         );
         assert!(
