@@ -660,9 +660,17 @@ mod tests {
         };
         assert!(descriptor.validate().is_ok());
 
+        // Pin the production-canonical macOS descriptor pair so the
+        // validator never tightens to reject the descriptor the
+        // membership-mutation ops verbs actually use.
+        // Phase 27 reviewer fold-in (MED 2): the previous fixture
+        // used `net.rustynet.signing-key-passphrase`, a service name
+        // no production code path ever generates (the canonical
+        // service is `signing_key_passphrase`, set by
+        // `membership_signing_key_passphrase_descriptor`).
         let descriptor = CredentialDescriptor {
-            account: "exit-1-owner".to_owned(),
-            service: "net.rustynet.signing-key-passphrase".to_owned(),
+            account: "membership-owner-signing-key".to_owned(),
+            service: "signing_key_passphrase".to_owned(),
         };
         assert!(descriptor.validate().is_ok());
     }
@@ -764,17 +772,21 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_backend_argv_pins_system_keychain() {
+        // Phase 27 reviewer fold-in (MED 2): the previous fixture
+        // exercised `net.rustynet.signing-key-passphrase`, a service
+        // name no production code path ever generates. Pin the
+        // production descriptor from
+        // `membership_signing_key_passphrase_descriptor` so the test
+        // exercises the exact argv the membership-mutation ops verbs
+        // build at runtime.
         let backend = MacosKeychainBackend::new();
-        let descriptor = CredentialDescriptor {
-            account: "membership-owner-signing-key".to_owned(),
-            service: "net.rustynet.signing-key-passphrase".to_owned(),
-        };
+        let descriptor = membership_signing_key_passphrase_descriptor();
         let argv = backend.build_argv(&descriptor).expect("argv builds");
         assert_eq!(argv[0], "find-generic-password");
         assert_eq!(argv[1], "-a");
         assert_eq!(argv[2], "membership-owner-signing-key");
         assert_eq!(argv[3], "-s");
-        assert_eq!(argv[4], "net.rustynet.signing-key-passphrase");
+        assert_eq!(argv[4], "signing_key_passphrase");
         assert_eq!(argv[5], "-w");
         assert_eq!(argv[6], MACOS_SYSTEM_KEYCHAIN_PATH);
     }
@@ -814,10 +826,17 @@ mod tests {
         // the literal "security" (the program name appears in every
         // error message) and would silently pass on an unrelated
         // failure mode.
+        // Phase 27 reviewer fold-in (MED 2): the previous fixture
+        // used `net.rustynet.signing-key-passphrase-test-missing`, a
+        // service name disconnected from the production descriptor.
+        // Use the production service name with a known-bad account
+        // suffix so the negative test exercises the exact descriptor
+        // shape the membership-mutation ops verbs build at runtime
+        // (`signing_key_passphrase`).
         let backend = MacosKeychainBackend::new();
         let descriptor = CredentialDescriptor {
             account: "membership-owner-signing-key-test-missing".to_owned(),
-            service: "net.rustynet.signing-key-passphrase-test-missing".to_owned(),
+            service: "signing_key_passphrase".to_owned(),
         };
         let err = backend
             .unwrap_credential(&descriptor, Duration::from_secs(2))

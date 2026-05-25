@@ -33,11 +33,6 @@ const MEMBERSHIP_STATE_GROUP: &str = "rustynetd";
 const MEMBERSHIP_STATE_MODE: &str = "0600";
 const MEMBERSHIP_STATE_OWNER_GROUP: &str = "rustynetd:rustynetd";
 const ROOT_OWNER_GROUP: &str = "root:root";
-const MEMBERSHIP_STATE_PATHS: [&str; 3] = [
-    "/var/lib/rustynet/membership.snapshot",
-    "/var/lib/rustynet/membership.log",
-    "/var/lib/rustynet/membership.watermark",
-];
 
 fn fill_os_random_bytes(bytes: &mut [u8], label: &str) -> Result<(), String> {
     OsRng
@@ -366,11 +361,20 @@ pub fn execute_ops_e2e_bootstrap_host(
         "creating credentials workspace directory failed",
     )?;
 
-    let passphrase_path = format!(
-        "/tmp/rustynet-passphrase.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    );
+    // Phase 27 reviewer fold-in (HIGH 2 — CWE-367):
+    // Migrate the bootstrap passphrase tempfile from `/tmp` (mode 1777)
+    // to the reviewed credentials-workspace root under
+    // `/var/lib/rustynet/credentials-workspace`. The workspace dir is
+    // created by `install -d -m 0700` immediately above so an attacker
+    // cannot race the parent. `create_membership_workspace_dir_atomic`
+    // applies the 0700 mode at creation via mkdir(2) and rejects any
+    // pre-existing leaf — eliminating the TOCTOU window that allowed a
+    // symlink to be followed by the post-chmod.
+    let bootstrap_work_dir = create_membership_workspace_dir_atomic(Path::new(
+        "/var/lib/rustynet/credentials-workspace",
+    ))?;
+    let passphrase_pathbuf = bootstrap_work_dir.join("bootstrap.passphrase");
+    let passphrase_path = passphrase_pathbuf.display().to_string();
     let bootstrap_result = (|| -> Result<(), String> {
         let mut passphrase_bytes = [0u8; 48];
         fill_os_random_bytes(&mut passphrase_bytes, "bootstrap passphrase")?;
@@ -380,9 +384,33 @@ pub fn execute_ops_e2e_bootstrap_host(
                 .map_err(|err| format!("formatting bootstrap passphrase failed: {err}"))?;
         }
         passphrase_hex.push('\n');
-        fs::write(passphrase_path.as_str(), passphrase_hex.as_bytes())
-            .map_err(|err| format!("writing bootstrap passphrase failed: {err}"))?;
-        set_unix_mode(Path::new(passphrase_path.as_str()), 0o600)?;
+        // Atomic-create with O_EXCL + 0600 so the file inherits the
+        // intended access fence at creation time. The workspace dir is
+        // already 0700 root, so even the brief window before this
+        // syscall returns is fenced against unprivileged readers.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            let mut file = options.open(passphrase_pathbuf.as_path()).map_err(|err| {
+                format!(
+                    "create bootstrap passphrase tempfile failed ({}): {err}",
+                    passphrase_pathbuf.display()
+                )
+            })?;
+            file.write_all(passphrase_hex.as_bytes()).map_err(|err| {
+                format!(
+                    "write bootstrap passphrase tempfile failed ({}): {err}",
+                    passphrase_pathbuf.display()
+                )
+            })?;
+            file.sync_all().map_err(|err| {
+                format!(
+                    "sync bootstrap passphrase tempfile failed ({}): {err}",
+                    passphrase_pathbuf.display()
+                )
+            })?;
+        }
         passphrase_hex.zeroize();
         passphrase_bytes.zeroize();
 
@@ -603,7 +631,8 @@ pub fn execute_ops_e2e_bootstrap_host(
         )?;
         Ok(())
     })();
-    secure_remove_file(Path::new(passphrase_path.as_str()));
+    secure_remove_file(passphrase_pathbuf.as_path());
+    let _ = fs::remove_dir_all(bootstrap_work_dir);
     bootstrap_result?;
 
     Ok(format!(
@@ -951,9 +980,106 @@ pub fn execute_ops_e2e_bootstrap_macos(
         "rustynetd membership init failed during macOS e2e bootstrap",
     )?;
 
+    // Phase 27 reviewer fold-in (MED 1): provision the
+    // `signing_key_passphrase` System.keychain item so the
+    // membership-mutation ops verbs (`set_capabilities`, `add`,
+    // ...) can unwrap the owner-signing-key passphrase via
+    // `MacosKeychainBackend`. Without this step the unwrap path
+    // would fail at runtime — the production descriptor (account=
+    // `membership-owner-signing-key`, service=`signing_key_passphrase`)
+    // had no provisioning code path until now.
+    //
+    // Read the passphrase plaintext from the caller-staged file, then
+    // hand it to `/usr/bin/security add-generic-password` via argv.
+    // The plaintext is held in a `Zeroizing<Vec<u8>>` while the helper
+    // runs and is wiped on drop. argv-only exec keeps the helper-exec
+    // contract; the brief `-w` argv exposure window is bounded by the
+    // single security(8) invocation and visible only to other root
+    // processes on the host (the macOS process namespace restricts
+    // argv readability to same-uid callers). System.keychain is
+    // selected explicitly so the item survives across user sessions
+    // and is reachable by the launchd-managed daemon at startup.
+    provision_macos_membership_signing_keychain_item(passphrase_file.as_path())?;
+
     Ok(format!(
         "macOS membership genesis initialized: node_id={node_id}, network_id={network_id}, snapshot={snapshot}"
     ))
+}
+
+/// Phase 27 reviewer fold-in (MED 1) — provision the canonical
+/// macOS System.keychain item for the membership-owner signing-key
+/// passphrase.
+///
+/// Idempotent: deletes any pre-existing item with the same
+/// account/service tuple (ignoring "item not found" errors), then
+/// adds the fresh secret. The service/account pair MUST match the
+/// canonical descriptor in
+/// `rustynet_control::credential_unwrap::membership_signing_key_passphrase_descriptor`:
+///   - service = "signing_key_passphrase"
+///   - account = "membership-owner-signing-key"
+#[cfg(target_os = "macos")]
+fn provision_macos_membership_signing_keychain_item(passphrase_file: &Path) -> Result<(), String> {
+    use zeroize::Zeroizing;
+
+    const SECURITY_BIN: &str = "/usr/bin/security";
+    const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
+    const KEYCHAIN_SERVICE: &str = "signing_key_passphrase";
+    const KEYCHAIN_ACCOUNT: &str = "membership-owner-signing-key";
+
+    let mut raw =
+        fs::read(passphrase_file).map_err(|err| format!("read passphrase file failed: {err}"))?;
+    if raw.len() > 4096 {
+        raw.zeroize();
+        return Err("membership signing passphrase exceeds 4 KiB cap".to_owned());
+    }
+    // Strip a trailing newline if present; the keychain item must
+    // round-trip exactly the bytes the daemon expects.
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    let plaintext = Zeroizing::new(raw);
+    if plaintext.is_empty() {
+        return Err("membership signing passphrase file is empty".to_owned());
+    }
+    let plaintext_str = std::str::from_utf8(plaintext.as_slice())
+        .map_err(|err| format!("membership signing passphrase is not valid utf-8: {err}"))?;
+    if plaintext_str.contains('\0') {
+        return Err("membership signing passphrase contains NUL byte".to_owned());
+    }
+
+    // Idempotent delete-then-add. `delete-generic-password` returns
+    // non-zero when the item is absent; ignore that failure mode
+    // explicitly. argv-only exec — no shell construction.
+    run_allow_failure(
+        SECURITY_BIN,
+        &[
+            "delete-generic-password",
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-s",
+            KEYCHAIN_SERVICE,
+            SYSTEM_KEYCHAIN,
+        ],
+        &[],
+    );
+
+    run_status(
+        SECURITY_BIN,
+        &[
+            "add-generic-password",
+            "-a",
+            KEYCHAIN_ACCOUNT,
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-w",
+            plaintext_str,
+            SYSTEM_KEYCHAIN,
+        ],
+        &[],
+        "provisioning macOS System.keychain signing_key_passphrase item failed",
+    )?;
+
+    Ok(())
 }
 
 /// Track B Step 7 (B1.2) — Windows genesis driver.
@@ -1293,36 +1419,36 @@ pub fn execute_ops_e2e_membership_add(
     );
     ensure_hex_32("client-pubkey-hex", client_pubkey_hex.as_str())?;
 
-    let passphrase_path = format!(
-        "/tmp/rustynet-membership-passphrase.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    );
-    let work_dir = PathBuf::from(format!(
-        "/tmp/rustynet-membership-update.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    fs::create_dir_all(work_dir.as_path())
-        .map_err(|err| format!("failed creating {}: {err}", work_dir.display()))?;
-    set_unix_mode(work_dir.as_path(), 0o700)?;
+    // Phase 27 reviewer fold-in (BLOCKER 2 — CWE-367):
+    // The previous implementation staged the signing passphrase tempfile
+    // and the per-invocation record/signed workspace under `/tmp` (mode
+    // 1777 sticky-writable) with a `fs::create_dir_all` + post-chmod
+    // pattern. That left a symlink-TOCTOU window where a hostile local
+    // user could pre-create the workspace path as a symlink and have
+    // the post-chmod follow it. Mirror the `set_capabilities` hardened
+    // path so:
+    //   - The per-invocation workspace lives under the reviewed
+    //     `credentials-workspace` root (root:rustynetd 0700 on Linux,
+    //     SY/BA-only DACL on Windows).
+    //   - The workspace dir is created atomically via mkdir(2) with
+    //     mode 0700 (rejects any pre-existing leaf, symlink or not).
+    //   - The passphrase tempfile is unwrapped via the platform
+    //     credential backend (systemd-creds / Keychain / DPAPI) and
+    //     written with O_EXCL + 0o600.
+    let paths = MembershipMutationPaths::for_current_platform();
+    let (work_dir, passphrase_path) = stage_membership_signing_passphrase(&paths)?;
     let record_path = work_dir.join("add.record");
     let signed_path = work_dir.join("add.signed");
 
+    let snapshot_str = paths.snapshot.display().to_string();
+    let log_str = paths.log.display().to_string();
+    let owner_key_str = paths.owner_signing_key.display().to_string();
+    let passphrase_str = passphrase_path.display().to_string();
+    let state_paths = paths.state_paths_for_chown();
+    let state_path_refs = state_paths.iter().map(String::as_str).collect::<Vec<_>>();
+
     let result = (|| -> Result<(), String> {
-        run_status(
-            "systemd-creds",
-            &[
-                "decrypt",
-                "--name=signing_key_passphrase",
-                "/etc/rustynet/credentials/signing_key_passphrase.cred",
-                passphrase_path.as_str(),
-            ],
-            &[],
-            "decrypting signing passphrase credential failed",
-        )?;
-        set_unix_mode(Path::new(passphrase_path.as_str()), 0o600)?;
-        set_membership_state_permissions_local(ROOT_OWNER_GROUP)?;
+        set_membership_state_permissions_for(state_path_refs.as_slice(), ROOT_OWNER_GROUP)?;
 
         run_status(
             "rustynet",
@@ -1340,9 +1466,9 @@ pub fn execute_ops_e2e_membership_add(
                 "--capabilities",
                 capabilities.as_str(),
                 "--snapshot",
-                "/var/lib/rustynet/membership.snapshot",
+                snapshot_str.as_str(),
                 "--log",
-                "/var/lib/rustynet/membership.log",
+                log_str.as_str(),
             ],
             &[],
             "membership propose-add failed",
@@ -1357,9 +1483,9 @@ pub fn execute_ops_e2e_membership_add(
                 "--approver-id",
                 owner_approver_id.as_str(),
                 "--signing-key",
-                "/etc/rustynet/membership.owner.key",
+                owner_key_str.as_str(),
                 "--signing-key-passphrase-file",
-                passphrase_path.as_str(),
+                passphrase_str.as_str(),
                 "--output",
                 signed_path.to_string_lossy().as_ref(),
             ],
@@ -1374,17 +1500,20 @@ pub fn execute_ops_e2e_membership_add(
                 "--signed-update",
                 signed_path.to_string_lossy().as_ref(),
                 "--snapshot",
-                "/var/lib/rustynet/membership.snapshot",
+                snapshot_str.as_str(),
                 "--log",
-                "/var/lib/rustynet/membership.log",
+                log_str.as_str(),
             ],
             &[],
             "membership apply-update failed",
         )?;
         Ok(())
     })();
-    let restore_result = set_membership_state_permissions_local(MEMBERSHIP_STATE_OWNER_GROUP);
-    secure_remove_file(Path::new(passphrase_path.as_str()));
+    let restore_result = set_membership_state_permissions_for(
+        state_path_refs.as_slice(),
+        MEMBERSHIP_STATE_OWNER_GROUP,
+    );
+    secure_remove_file(passphrase_path.as_path());
     let _ = fs::remove_dir_all(work_dir);
     match (result, restore_result) {
         (Ok(()), Ok(())) => {}
@@ -1975,25 +2104,16 @@ pub fn execute_ops_e2e_issue_assignments(
     let assignment_exit_path_text = assignment_exit_path.display().to_string();
     let assignment_client_path_text = assignment_client_path.display().to_string();
 
-    let passphrase_path = format!(
-        "/tmp/rustynet-assignment-passphrase.{}.{}",
-        std::process::id(),
-        unique_suffix()
-    );
+    // Phase 27 reviewer fold-in (HIGH 2 — CWE-367):
+    // Migrate this code path from `/tmp` to the reviewed
+    // `credentials-workspace` root. `materialize_signing_passphrase_workspace`
+    // wraps `create_membership_workspace_dir_atomic` (TOCTOU-safe mkdir(2)
+    // with mode 0700 applied at creation) plus an O_EXCL+0o600 plaintext
+    // tempfile inside the workspace.
+    let (work_dir, passphrase_pathbuf) =
+        materialize_signing_passphrase_workspace("two-node-assignment")?;
+    let passphrase_path = passphrase_pathbuf.display().to_string();
     let result = (|| -> Result<(), String> {
-        run_status(
-            "systemd-creds",
-            &[
-                "decrypt",
-                "--name=signing_key_passphrase",
-                "/etc/rustynet/credentials/signing_key_passphrase.cred",
-                passphrase_path.as_str(),
-            ],
-            &[],
-            "decrypting assignment signing passphrase failed",
-        )?;
-        set_unix_mode(Path::new(passphrase_path.as_str()), 0o600)?;
-
         if !Path::new("/etc/rustynet/assignment.signing.secret").is_file() {
             run_status(
                 "rustynet",
@@ -2075,7 +2195,7 @@ pub fn execute_ops_e2e_issue_assignments(
 
         let signing_secret = crate::load_assignment_signing_secret(
             Path::new("/etc/rustynet/assignment.signing.secret"),
-            Path::new(passphrase_path.as_str()),
+            passphrase_pathbuf.as_path(),
         )?;
         let traversal_artifacts = issue_two_node_traversal_artifacts(
             signing_secret.as_slice(),
@@ -2113,7 +2233,8 @@ pub fn execute_ops_e2e_issue_assignments(
         }
         Ok(())
     })();
-    secure_remove_file(Path::new(passphrase_path.as_str()));
+    secure_remove_file(passphrase_pathbuf.as_path());
+    let _ = fs::remove_dir_all(work_dir);
     result?;
 
     Ok(format!(
@@ -2224,7 +2345,7 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     }
 
     let verifier_key_output = config.issue_dir.join("rn-assignment.pub");
-    let passphrase_path = materialize_signing_passphrase_temp("rustynet-assignment-passphrase")?;
+    let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("assignment")?;
     let result = (|| -> Result<(), String> {
         ensure_regular_file(
             Path::new("/etc/rustynet/assignment.signing.secret"),
@@ -2232,7 +2353,7 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
         )?;
         let signing_secret = crate::load_assignment_signing_secret(
             Path::new("/etc/rustynet/assignment.signing.secret"),
-            Path::new(passphrase_path.as_str()),
+            passphrase_path.as_path(),
         )?;
         let (verifier_key_hex, bundles) = issue_assignment_bundle_artifacts(
             signing_secret.as_slice(),
@@ -2273,7 +2394,8 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
         }
         Ok(())
     })();
-    secure_remove_file(Path::new(passphrase_path.as_str()));
+    secure_remove_file(passphrase_path.as_path());
+    let _ = fs::remove_dir_all(work_dir);
     result?;
 
     Ok(format!(
@@ -2333,7 +2455,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
     prepare_clean_issue_dir(config.issue_dir.as_path(), "traversal issue dir")?;
 
     let verifier_key_output = config.issue_dir.join("rn-traversal.pub");
-    let passphrase_path = materialize_signing_passphrase_temp("rustynet-traversal-passphrase")?;
+    let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("traversal")?;
     let result = (|| -> Result<(), String> {
         ensure_regular_file(
             Path::new("/etc/rustynet/assignment.signing.secret"),
@@ -2341,7 +2463,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
         )?;
         let signing_secret = crate::load_assignment_signing_secret(
             Path::new("/etc/rustynet/assignment.signing.secret"),
-            Path::new(passphrase_path.as_str()),
+            passphrase_path.as_path(),
         )?;
         let traversal_artifacts = issue_traversal_bundle_artifacts(
             signing_secret.as_slice(),
@@ -2404,7 +2526,8 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
         }
         Ok(())
     })();
-    secure_remove_file(Path::new(passphrase_path.as_str()));
+    secure_remove_file(passphrase_path.as_path());
+    let _ = fs::remove_dir_all(work_dir);
     result?;
 
     Ok(format!(
@@ -2469,7 +2592,7 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
     prepare_clean_issue_dir(config.issue_dir.as_path(), "dns zone issue dir")?;
 
     let verifier_key_output = config.issue_dir.join("rn-dns-zone.pub");
-    let passphrase_path = materialize_signing_passphrase_temp("rustynet-dns-zone-passphrase")?;
+    let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("dns-zone")?;
     let result = (|| -> Result<(), String> {
         ensure_regular_file(
             Path::new("/etc/rustynet/membership.owner.key"),
@@ -2477,7 +2600,7 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
         )?;
         let signing_secret = crate::load_assignment_signing_secret(
             Path::new("/etc/rustynet/membership.owner.key"),
-            Path::new(passphrase_path.as_str()),
+            passphrase_path.as_path(),
         )?;
         let (verifier_key_hex, bundles) = issue_dns_zone_bundle_artifacts(
             signing_secret.as_slice(),
@@ -2511,7 +2634,8 @@ pub fn execute_ops_e2e_issue_dns_zone_bundles_from_env(
         set_unix_mode(verifier_key_output.as_path(), 0o600)?;
         Ok(())
     })();
-    secure_remove_file(Path::new(passphrase_path.as_str()));
+    secure_remove_file(passphrase_path.as_path());
+    let _ = fs::remove_dir_all(work_dir);
     result?;
 
     Ok(format!(
@@ -4501,21 +4625,87 @@ fn prepare_clean_issue_dir(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn materialize_signing_passphrase_temp(prefix: &str) -> Result<String, String> {
-    let output_path = format!("/tmp/{prefix}.{}.{}", std::process::id(), unique_suffix());
-    run_status(
+/// Phase 27 reviewer fold-in (HIGH 2 — CWE-367):
+///
+/// The previous implementation decrypted `signing_key_passphrase` into a
+/// `/tmp` (mode 1777 sticky-writable) file. A local user could pre-create
+/// the leaf path as a symlink and race the post-decrypt permission set.
+/// The same pattern was repeated by `execute_ops_e2e_membership_add`,
+/// `execute_ops_e2e_issue_assignments`, and the bundle-issuance verbs
+/// (`execute_ops_e2e_issue_assignment_bundles_from_env`,
+/// `execute_ops_e2e_issue_traversal_bundles_from_env`,
+/// `execute_ops_e2e_issue_dns_zone_bundles_from_env`). All callers now
+/// go through this helper (BLOCKER 2 / HIGH 2).
+///
+/// The hardened path:
+///   - Resolves the reviewed credentials-workspace root for the host OS
+///     via `MembershipMutationPaths::for_current_platform()` (root:0700
+///     on Linux, root:0700 under /usr/local/var/rustynet on macOS,
+///     SYSTEM/Administrators-only ACL on Windows).
+///   - Creates a fresh per-invocation workspace dir atomically via
+///     `create_membership_workspace_dir_atomic` (mkdir(2) with mode 0700
+///     applied at creation; rejects pre-existing leaves including
+///     symlinks).
+///   - Decrypts the systemd-creds credential into a 0600 file inside
+///     the workspace.
+///   - Returns `(workspace_dir, passphrase_path)` so the caller can
+///     shred both on success and failure (mirrors
+///     `stage_membership_signing_passphrase` for the membership
+///     mutations).
+///
+/// The `prefix` argument is retained for the tempfile leaf so log
+/// messages stay descriptive ("assignment", "traversal", "dns-zone").
+fn materialize_signing_passphrase_workspace(prefix: &str) -> Result<(PathBuf, PathBuf), String> {
+    let paths = MembershipMutationPaths::for_current_platform();
+
+    // Fail closed if the platform install adapter has not provisioned
+    // the workspace parent. The Linux install path now creates it via
+    // both `ops install-systemd` and the e2e bootstrap; macOS via
+    // `execute_ops_e2e_bootstrap_macos`; Windows via the canonical ACL
+    // repair fragment and Install-RustyNetWindowsService.ps1.
+    let parent_metadata = fs::symlink_metadata(&paths.secure_workspace_parent).map_err(|err| {
+        format!(
+            "credential workspace parent missing or unreadable ({}): {err}; \
+             run `rustynet ops install-systemd` (Linux) or the platform install adapter \
+             so the parent is provisioned with the reviewed ACL",
+            paths.secure_workspace_parent.display()
+        )
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(format!(
+            "credential workspace parent must be a real directory, not a symlink or file: {}",
+            paths.secure_workspace_parent.display()
+        ));
+    }
+
+    let work_dir = create_membership_workspace_dir_atomic(paths.secure_workspace_parent.as_path())?;
+    let passphrase_path = work_dir.join(format!("{prefix}.passphrase"));
+
+    let decrypt_result = run_status(
         "systemd-creds",
         &[
             "decrypt",
             "--name=signing_key_passphrase",
             "/etc/rustynet/credentials/signing_key_passphrase.cred",
-            output_path.as_str(),
+            passphrase_path.to_string_lossy().as_ref(),
         ],
         &[],
         "decrypting signing passphrase credential failed",
-    )?;
-    set_unix_mode(Path::new(output_path.as_str()), 0o600)?;
-    Ok(output_path)
+    );
+    if let Err(err) = decrypt_result {
+        // Clean up the empty workspace so we never leave stale dirs
+        // behind on a failed unwrap.
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(err);
+    }
+
+    if let Err(err) = set_unix_mode(passphrase_path.as_path(), 0o600) {
+        secure_remove_file(passphrase_path.as_path());
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(err);
+    }
+
+    Ok((work_dir, passphrase_path))
 }
 
 fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
@@ -5933,10 +6123,6 @@ fn normalize_membership_permissions(
         &[],
     )?;
     Ok(())
-}
-
-fn set_membership_state_permissions_local(owner_group: &str) -> Result<(), String> {
-    set_membership_state_permissions_for(MEMBERSHIP_STATE_PATHS.as_slice(), owner_group)
 }
 
 /// Track B Phase 22 — generalised over the platform's membership-state paths.

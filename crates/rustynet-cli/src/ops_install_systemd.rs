@@ -100,6 +100,22 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         daemon_uid,
         daemon_gid,
     )?;
+    // Phase 27 reviewer fold-in (MED 3): the canonical install flow
+    // (`ops install-systemd`) used by operator-driven deployments
+    // never provisioned `/var/lib/rustynet/credentials-workspace`.
+    // Only the e2e bootstrap verb (`ops e2e-bootstrap-host`) did.
+    // Membership-mutation ops verbs (`ops e2e-membership-*`) fail
+    // closed with "credential workspace parent missing" until the
+    // workspace exists, so non-e2e installs could not run the
+    // mutation verbs. The workspace lives at root:rustynetd 0700
+    // (same fence as `/var/lib/rustynet`); ops verbs run as root and
+    // create per-invocation 0700 subdirs via mkdir(2) atomically.
+    ensure_directory_with_owner_mode(
+        Path::new("/var/lib/rustynet/credentials-workspace"),
+        0o700,
+        Uid::from_raw(0),
+        daemon_gid,
+    )?;
     install_file(
         sources.service.as_path(),
         Path::new(SERVICE_DST),
@@ -2556,6 +2572,29 @@ mod tests {
         render_assignment_refresh_env_contents, resolve_selected_exit_node_id,
         systemctl_state_retryable, wait_for_unix_socket,
     };
+
+    /// Phase 27 reviewer fold-in (MED 3): the canonical install flow
+    /// (`ops install-systemd`) must provision the
+    /// credentials-workspace root that the membership-mutation ops
+    /// verbs depend on. Without this provisioning step, non-e2e
+    /// installs cannot run the mutation verbs (they fail closed with
+    /// "credential workspace parent missing").
+    #[test]
+    fn install_systemd_source_pins_credentials_workspace_provisioning() {
+        let source = include_str!("ops_install_systemd.rs");
+        // The source-grep tests in this module follow the same
+        // pin-against-the-source pattern used elsewhere. The
+        // credentials-workspace dir provisioning lives in
+        // `execute_ops_install_systemd` (private fn) — pin the
+        // literal path so a future refactor cannot silently drop it
+        // and reintroduce the non-e2e gap.
+        assert!(
+            source.contains("/var/lib/rustynet/credentials-workspace"),
+            "ops install-systemd must create /var/lib/rustynet/credentials-workspace \
+             so the membership-mutation ops verbs (ops e2e-membership-...) work on \
+             non-e2e installs (Phase 27 MED 3)"
+        );
+    }
 
     #[test]
     fn parse_install_bool_accepts_expected_variants() {
