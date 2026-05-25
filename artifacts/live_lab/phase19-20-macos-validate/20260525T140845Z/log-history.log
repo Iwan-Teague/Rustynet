@@ -1,0 +1,121 @@
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+  hint: unclassified failure; check the error message above
+rustynetd: restrict_recoverable: membership snapshot is missing
+rustynetd startup failed [generic_failure (1)]: i/o error: Read-only file system (os error 30)
+---PRIOR PLIST ENV---
+    <string>com.rustynet.daemon</string>
+    <key>ProgramArguments</key>
+--
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+--
+        <string>/usr/local/var/rustynet/rustynetd.state</string>
+        <string>--trust-evidence</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.trust</string>
+        <string>--trust-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/trust-evidence.pub</string>
+        <string>--trust-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.trust.watermark</string>
+        <string>--trust-max-age-secs</string>
+--
+        <string>/usr/local/var/rustynet/membership/membership.snapshot</string>
+        <string>--membership-log</string>
+        <string>/usr/local/var/rustynet/membership/membership.log</string>
+        <string>--membership-watermark</string>
+        <string>/usr/local/var/rustynet/membership/membership.watermark</string>
+        <string>--auto-tunnel-enforce</string>
+--
+        <string>/usr/local/var/rustynet/trust/rustynetd.assignment</string>
+        <string>--auto-tunnel-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/assignment.pub</string>
+        <string>--auto-tunnel-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.assignment.watermark</string>
+
+--
+        <string>/usr/local/var/rustynet/trust/rustynetd.traversal</string>
+        <string>--traversal-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/traversal.pub</string>
+        <string>--traversal-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.traversal.watermark</string>
+
+--
+        <string>/usr/local/var/rustynet/trust/rustynetd.dns-zone</string>
+        <string>--dns-zone-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/dns-zone.pub</string>
+        <string>--dns-zone-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark</string>
+
+--
+        <string>/usr/local/var/rustynet/keys/wireguard.key</string>
+
+--
+        <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
+        <string>--backend</string>
+--
+        <string>/private/var/run/rustynet/rustynetd.sock</string>
+        <string>--privileged-helper-socket</string>
+        <string>/private/var/run/rustynet/rustynetd-privileged.sock</string>
+        <string>--fail-closed-ssh-allow</string>
+--
+    <string>rustynetd</string>
+    <key>GroupName</key>
+    <string>rustynetd</string>
+    <key>RunAtLoad</key>
+--
+    <string>/usr/local/var/log/rustynet/rustynetd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/rustynet/rustynetd-error.log</string>
+    <key>EnvironmentVariables</key>
+--
+        <key>RUSTYNET_NODE_ROLE</key>
+        <string>client</string>
+        <key>RUSTYNET_NETWORK_ID</key>
+        <string>rustynet</string>
+        <key>RUSTYNET_WG_BINARY_PATH</key>
+        <string>/opt/homebrew/bin/wg</string>

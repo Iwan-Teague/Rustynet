@@ -1,0 +1,34 @@
+Expected utun interface derivation for macos-client-1
+======================================================
+
+Reference implementation: crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs
+  fn utun_index_for_node_id(node_id: &str) -> u16
+  fn utun_name_for_node_id(node_id: &str) -> String
+
+Algorithm:
+  1. FNV-1a 32-bit hash of node_id UTF-8 bytes
+     offset = 2166136261 (0x811c9dc5)
+     prime  = 16777619   (0x01000193)
+  2. index = hash % 4086 + 10   (avoids reserved utun0-9)
+  3. name  = format!("utun{}", index)
+
+Python verifier:
+  def fnv(s):
+    h = 2166136261
+    for b in s.encode():
+      h ^= b
+      h = (h * 16777619) & 0xFFFFFFFF
+    return h
+  print(fnv("macos-client-1") % 4086 + 10)
+
+Result for "macos-client-1": 3912 → utun3912
+
+Plist verification (from this run):
+  <string>--wg-interface</string>
+  <string>utun3912</string>
+
+Phase 20 acceptance criterion satisfied:
+  * Plist contains utun3912 (NOT default utun9, NOT rustynet0).
+  * Value derived deterministically from node_id by the Rust orchestrator
+    (utun_name_for_node_id), passed via the install script's --wg-interface
+    flag, and rendered into the launchd ProgramArguments array.

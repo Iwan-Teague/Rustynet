@@ -1,0 +1,7 @@
+        <string>--node-id</string>
+        <string>macos-client-1</string>
+        <string>--node-role</string>
+        <string>blind_exit</string>
+--
+        <string>--wg-interface</string>
+        <string>utun3912</string>

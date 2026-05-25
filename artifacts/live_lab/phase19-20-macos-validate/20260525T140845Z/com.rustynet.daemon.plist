@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+        <string>--node-id</string>
+        <string>macos-client-1</string>
+        <string>--node-role</string>
+        <string>blind_exit</string>
+        <string>--state</string>
+        <string>/usr/local/var/rustynet/rustynetd.state</string>
+        <string>--trust-evidence</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.trust</string>
+        <string>--trust-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/trust-evidence.pub</string>
+        <string>--trust-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.trust.watermark</string>
+
+        <string>--enrollment-secret</string>
+        <string>/usr/local/var/rustynet/keys/enrollment.secret</string>
+        <string>--enrollment-ledger</string>
+        <string>/usr/local/var/rustynet/keys/rustynetd.enrollment.ledger</string>
+        <string>--membership-snapshot</string>
+        <string>/usr/local/var/rustynet/membership/membership.snapshot</string>
+        <string>--membership-log</string>
+        <string>/usr/local/var/rustynet/membership/membership.log</string>
+        <string>--membership-watermark</string>
+        <string>/usr/local/var/rustynet/membership/membership.watermark</string>
+        <string>--gossip-watermark</string>
+        <string>/usr/local/var/rustynet/membership/rustynetd.gossip.watermark</string>
+        <string>--auto-tunnel-enforce</string>
+        <string>false</string>
+        <string>--auto-tunnel-bundle</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.assignment</string>
+        <string>--auto-tunnel-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/assignment.pub</string>
+        <string>--auto-tunnel-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.assignment.watermark</string>
+
+        <string>--traversal-bundle</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.traversal</string>
+        <string>--traversal-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/traversal.pub</string>
+        <string>--traversal-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.traversal.watermark</string>
+
+        <string>--dns-zone-bundle</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.dns-zone</string>
+        <string>--dns-zone-verifier-key</string>
+        <string>/usr/local/var/rustynet/trust/dns-zone.pub</string>
+        <string>--dns-zone-watermark</string>
+        <string>/usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark</string>
+
+        <string>--wg-private-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.key</string>
+
+        <string>--wg-public-key</string>
+        <string>/usr/local/var/rustynet/keys/wireguard.pub</string>
+        <string>--wg-interface</string>
+        <string>utun3912</string>
+        <string>--backend</string>
+        <string>macos-wireguard-userspace-shared</string>
+        <string>--socket</string>
+        <string>/private/var/run/rustynet/rustynetd.sock</string>
+        <string>--privileged-helper-socket</string>
+        <string>/private/var/run/rustynet/rustynetd-privileged.sock</string>
+
+    </array>
+    <key>UserName</key>
+    <string>rustynetd</string>
+    <key>GroupName</key>
+    <string>rustynetd</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>AbandonProcessGroup</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/rustynet/rustynetd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/rustynet/rustynetd-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>RUSTYNET_NODE_ROLE</key>
+        <string>blind_exit</string>
+        <key>RUSTYNET_NETWORK_ID</key>
+        <string>rustynet-lab</string>
+        <key>RUSTYNET_WG_BINARY_PATH</key>
+        <string>/opt/homebrew/bin/wg</string>
+
+    </dict>
+</dict>
+</plist>
