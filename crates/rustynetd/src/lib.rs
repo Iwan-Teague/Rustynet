@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod daemon;
 pub mod dataplane;
@@ -40,6 +40,7 @@ pub mod macos_utun_helper;
 #[cfg(target_os = "macos")]
 pub mod macos_utun_helper_server;
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 pub(crate) mod macos_utun_helper_unsafe;
 pub mod perf;
 pub mod phase10;

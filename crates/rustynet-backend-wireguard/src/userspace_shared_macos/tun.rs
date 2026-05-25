@@ -918,9 +918,12 @@ impl ParsedLocalCidr {
 }
 
 #[cfg(target_os = "macos")]
+type MacosUtunOpener = dyn Fn(&str) -> Result<std::os::fd::OwnedFd, String> + Send + Sync;
+
+#[cfg(target_os = "macos")]
 fn open_utun_device(
     interface_name: &str,
-    opener_fn: Option<&(dyn Fn(&str) -> Result<std::os::fd::OwnedFd, String> + Send + Sync)>,
+    opener_fn: Option<&MacosUtunOpener>,
 ) -> Result<SyncDevice, BackendError> {
     match opener_fn {
         None => SyncDevice::open(interface_name).map_err(|err| {

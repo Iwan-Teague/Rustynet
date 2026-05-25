@@ -48,9 +48,9 @@ pub fn validate_utun_interface_name(interface_name: &str) -> Result<(), String> 
             interface_name, MAX_IFACE_NAME_LEN
         ));
     }
-    let suffix = interface_name.strip_prefix("utun").ok_or_else(|| {
-        format!("interface name '{}' must start with 'utun'", interface_name)
-    })?;
+    let suffix = interface_name
+        .strip_prefix("utun")
+        .ok_or_else(|| format!("interface name '{}' must start with 'utun'", interface_name))?;
     if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
             "interface name '{}' must be 'utun' followed by one or more digits",
@@ -86,7 +86,7 @@ mod tests {
         assert!(validate_utun_interface_name("utunX").is_err());
         assert!(validate_utun_interface_name("utun 0").is_err());
         assert!(validate_utun_interface_name("utun0\n").is_err());
-        assert!(validate_utun_interface_name("utun12345678901").is_err());
+        assert!(validate_utun_interface_name("utun123456789012").is_err());
         assert!(validate_utun_interface_name("tun0").is_err());
         assert!(validate_utun_interface_name("rustynet0").is_err());
     }

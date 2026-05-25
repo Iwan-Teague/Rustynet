@@ -118,6 +118,8 @@ use rustynet_backend_api::{
 use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 #[cfg(target_os = "linux")]
 use rustynet_backend_wireguard::LinuxWireguardBackend;
+#[cfg(all(target_os = "macos", not(test)))]
+use rustynet_backend_wireguard::MacosUtunOpenerFn;
 #[cfg(test)]
 use rustynet_backend_wireguard::RecordedAuthoritativeTransportOperation;
 use rustynet_backend_wireguard::WireguardBackend;
@@ -127,9 +129,7 @@ use rustynet_backend_wireguard::{
     DEFAULT_WINDOWS_WIREGUARD_EXE_PATH, WindowsWireguardBackend,
 };
 #[cfg(target_os = "macos")]
-use rustynet_backend_wireguard::{
-    MacosUserspaceSharedBackend, MacosUtunOpenerFn, MacosWireguardBackend,
-};
+use rustynet_backend_wireguard::{MacosUserspaceSharedBackend, MacosWireguardBackend};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner};
 use rustynet_control::membership::{
@@ -2616,21 +2616,18 @@ impl DaemonBackend {
                     #[cfg(not(test))]
                     {
                         let backend =
-                            if let Some(ref helper_path) =
-                                config.privileged_helper_socket_path
-                            {
+                            if let Some(ref helper_path) = config.privileged_helper_socket_path {
                                 let socket_path = helper_path.clone();
                                 let timeout = std::time::Duration::from_millis(
                                     config.privileged_helper_timeout_ms.get(),
                                 );
-                                let opener: MacosUtunOpenerFn =
-                                    Box::new(move |iface: &str| {
-                                        crate::macos_utun_helper::send_utun_open_request(
-                                            &socket_path,
-                                            iface,
-                                            timeout,
-                                        )
-                                    });
+                                let opener: MacosUtunOpenerFn = Box::new(move |iface: &str| {
+                                    crate::macos_utun_helper::send_utun_open_request(
+                                        &socket_path,
+                                        iface,
+                                        timeout,
+                                    )
+                                });
                                 MacosUserspaceSharedBackend::new_with_helper(
                                     config.wg_interface.clone(),
                                     private_key.to_string_lossy().to_string(),
