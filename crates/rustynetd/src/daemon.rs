@@ -13651,7 +13651,30 @@ fn is_root_managed_shared_runtime_parent(
         && (owner_gid == expected_gid || owner_gid == 0)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Track B Phase 18 — macOS allowlist. The macOS install adapter
+/// (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`)
+/// creates `/private/var/run/rustynet` with mode 0o770 owned by
+/// root and group `rustynetd` so the daemon (which runs as
+/// rustynetd) can write its socket inside. Without this allowlist,
+/// the CLI's parent-directory security preflight rejected the
+/// directory as `insecure permissions: mode 770` and refused to
+/// connect — even when the daemon was healthy. Mirrors the Linux
+/// `/run/rustynet` allowlist semantics exactly.
+#[cfg(target_os = "macos")]
+fn is_root_managed_shared_runtime_parent(
+    parent: &Path,
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    expected_gid: u32,
+) -> bool {
+    parent == Path::new("/private/var/run/rustynet")
+        && owner_uid == 0
+        && mode == 0o770
+        && (owner_gid == expected_gid || owner_gid == 0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn is_root_managed_shared_runtime_parent(
     _parent: &Path,
     _mode: u32,
