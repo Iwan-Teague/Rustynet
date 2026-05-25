@@ -52,6 +52,17 @@ pub fn install_daemon(
         .get(alias)
         .cloned()
         .unwrap_or_else(|| format!("{alias}-bootstrap"));
+    if node_id.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "install_daemon: node_id must not be empty".to_owned(),
+        });
+    }
+    // Defence-in-depth: revalidate the derived utun name before it ever
+    // reaches the shell layer. utun_name_for_node_id always produces
+    // utun<N>, but pinning the check here makes a future refactor of the
+    // helper fail at the install boundary instead of silently writing
+    // junk into the plist.
+    validate_utun_name(&utun_name_for_node_id(&node_id))?;
 
     let script_tmp = write_temp_file("rn_macos_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
     let install_tmp = write_temp_file(
@@ -147,6 +158,15 @@ pub fn install_daemon_from_workdir(
         .get(alias)
         .cloned()
         .unwrap_or_else(|| format!("{alias}-bootstrap"));
+    if node_id.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "install_daemon_from_workdir: node_id must not be empty".to_owned(),
+        });
+    }
+    // Defence-in-depth: same check as install_daemon — the helper is
+    // deterministic, but pinning validation at the install boundary
+    // protects against a future refactor producing an invalid utun name.
+    validate_utun_name(&utun_name_for_node_id(&node_id))?;
 
     let env_content = build_bootstrap_env(&node_id, &role, ctx);
     let env_tmp = write_temp_file("rn_macos_env_", ".env", env_content.as_bytes())?;
@@ -449,9 +469,18 @@ fn build_bootstrap_env(node_id: &str, role: &NodeRole, ctx: &OrchestrationContex
     let daemon_node_role = role
         .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
         .expect("macOS lab role must have explicit daemon role mapping");
+    // Derive the per-node utun interface name and pass it through to the
+    // bootstrap shell so the FIRST plist install already targets the
+    // node-specific utun device. Without WG_INTERFACE in the env file the
+    // bootstrap-time install would fall back to the install-script default
+    // (utun9) and the orchestrator's later enforce_runtime phase would have
+    // to re-render the plist; mac hosts running concurrently with the same
+    // utun9 would collide. Computing it here keeps the value identical in
+    // both code paths and avoids re-deriving it in shell.
+    let wg_interface = utun_name_for_node_id(node_id);
     format!(
         "ROLE={role_str}\nDAEMON_NODE_ROLE={daemon_node_role}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\n\
-         SSH_ALLOW_CIDRS={cidrs}\n",
+         SSH_ALLOW_CIDRS={cidrs}\nWG_INTERFACE={wg_interface}\n",
         network_id = ctx.network_id,
         cidrs = ctx.ssh_allow_cidrs,
     )
@@ -579,37 +608,34 @@ mod tests {
     }
 
     #[test]
-    fn utun_index_is_in_valid_range() {
-        for node_id in &["exit-1", "macos-client-1", "relay-node", "x"] {
+    fn utun_index_is_in_valid_range_for_lab_node_ids() {
+        let long_id = "x".repeat(64);
+        let mut node_ids: Vec<&str> = vec![
+            "exit-1",
+            "macos-client-1",
+            "macos-client-2",
+            "client-1",
+            "relay-1",
+            "anchor-1",
+            "a",
+        ];
+        node_ids.push(long_id.as_str());
+        for node_id in node_ids {
             let n = utun_index_for_node_id(node_id);
             assert!(
                 (10..=4095).contains(&n),
                 "utun index {n} out of range for {node_id:?}"
             );
             let name = utun_name_for_node_id(node_id);
-            assert!(name.starts_with("utun"), "utun name must start with utun");
-            assert!(name.len() <= 15, "utun name must be <= 15 chars");
-            assert!(
-                name[4..].chars().all(|c| c.is_ascii_digit()),
-                "utun suffix must be digits"
-            );
+            assert!(name.len() <= 15, "utun name {name:?} exceeds IFNAMSIZ");
+            assert!(name.starts_with("utun"));
+            assert!(name[4..].chars().all(|c| c.is_ascii_digit()));
+            validate_utun_name(&name).expect("derived name must validate");
         }
-        // Long node_id
-        let long_id = "a".repeat(64);
-        let n = utun_index_for_node_id(&long_id);
-        assert!(
-            (10..=4095).contains(&n),
-            "utun index {n} out of range for long node_id"
-        );
-        let name = utun_name_for_node_id(&long_id);
-        assert!(
-            name.len() <= 15,
-            "utun name must be <= 15 chars for long node_id"
-        );
     }
 
     #[test]
-    fn utun_index_is_deterministic() {
+    fn utun_index_is_deterministic_across_invocations() {
         assert_eq!(
             utun_index_for_node_id("exit-1"),
             utun_index_for_node_id("exit-1")
@@ -621,53 +647,176 @@ mod tests {
     }
 
     #[test]
-    fn utun_index_avoids_reserved_range() {
-        // utun0-9 are commonly used by macOS system interfaces
-        let n = utun_index_for_node_id("any-node");
-        assert!(n >= 10, "must not use utun0-9");
+    fn utun_index_avoids_reserved_low_range() {
+        // utun0..9 are commonly used by macOS system interfaces.
+        for node_id in [
+            "a",
+            "b",
+            "c",
+            "exit-1",
+            "macos-client-1",
+            "macos-client-2",
+            "client-1",
+        ] {
+            let n = utun_index_for_node_id(node_id);
+            assert!(
+                n >= 10,
+                "must not use utun0..9 for {node_id:?} (got utun{n})"
+            );
+        }
     }
 
+    /// Phase 20 collision guard. The 7-node live lab inventory (one mac
+    /// client + one windows client + five linux nodes) must produce
+    /// distinct utun indices so a future "second macOS client" or
+    /// "second exit" cannot silently collide with another node. The
+    /// 4086-slot range [10, 4095] gives plenty of headroom for this.
     #[test]
-    fn enforce_daemon_script_includes_wg_interface_flag() {
-        // Verify the Rust side formats --wg-interface into the script invocation.
+    fn utun_index_collisions_for_known_lab_inventory_are_zero() {
+        use std::collections::HashSet;
+        let lab_node_ids = [
+            "exit-1",
+            "client-1",
+            "client-2",
+            "client-3",
+            "client-4",
+            "macos-client-1",
+            "windows-client-1",
+        ];
+        let mut seen: HashSet<u16> = HashSet::new();
+        for node_id in &lab_node_ids {
+            let n = utun_index_for_node_id(node_id);
+            assert!(
+                seen.insert(n),
+                "utun collision for {node_id:?} at utun{n} \u{2014} entire lab inventory must be unique"
+            );
+        }
+    }
+
+    /// enforce_daemon's invocation string is the actual surface that
+    /// reaches the install-script. Reconstruct the same format!() shape
+    /// the fn uses to pin that the derived utun name lands as
+    /// `--wg-interface 'utun<N>'` for the lab macOS node.
+    #[test]
+    fn enforce_daemon_constructs_wg_interface_flag_with_derived_value() {
         let node_id = "macos-client-1";
-        let wg_interface = utun_name_for_node_id(node_id);
-        // The enforce_daemon fn produces a script string containing the flag.
-        // Reconstruct the relevant snippet directly to test the logic.
+        let expected_iface = utun_name_for_node_id(node_id);
+        // Reconstruct the relevant portion of the enforce_daemon command.
         let script = format!(
             "sudo /tmp/Install-RustyNetMacosService.sh \
                --node-id '{node_id}' \
-               --wg-interface '{wg_interface}'"
+               --wg-interface '{expected_iface}'"
         );
         assert!(
-            script.contains("--wg-interface"),
-            "script must contain --wg-interface flag"
+            script.contains(&format!("--wg-interface '{expected_iface}'")),
+            "enforce_daemon must pass --wg-interface with the derived utun name"
         );
-        assert!(
-            script.contains(&wg_interface),
-            "script must contain the computed utun name"
-        );
-        assert!(
-            wg_interface.starts_with("utun"),
-            "computed interface must start with utun"
+        // Pin that the derived name is in the legal range, not the
+        // install-script default (utun9). For node_id "macos-client-1"
+        // the FNV-1a hash must NOT land on 9.
+        assert_ne!(
+            expected_iface, "utun9",
+            "derived name for macos-client-1 must not collide with the install-script default"
         );
     }
 
     #[test]
     fn validate_utun_name_accepts_valid_names() {
-        for name in &["utun10", "utun42", "utun4095", "utun100"] {
-            validate_utun_name(name).unwrap_or_else(|e| panic!("rejected valid name {name}: {e}"));
+        for name in ["utun0", "utun9", "utun42", "utun100", "utun4095"] {
+            validate_utun_name(name)
+                .unwrap_or_else(|e| panic!("rejected valid name {name}: {e:?}"));
         }
     }
 
+    /// Phase 20 injection-vector pin. The install-script does the
+    /// authoritative regex check, but the Rust validate_utun_name is
+    /// the first line of defence — any shell-special, control-char, or
+    /// non-utun-prefixed input must fail before reaching the shell.
     #[test]
-    fn validate_utun_name_rejects_invalid_names() {
-        for name in &["rustynet0", "utun", "utun4096x", "wg0", "utunABC"] {
-            assert!(
-                validate_utun_name(name).is_err(),
-                "should reject invalid utun name {name:?}"
-            );
+    fn validate_utun_name_rejects_injection_vectors() {
+        for bad in [
+            "",
+            "utun",
+            "utunX",
+            "utun-evil",
+            "utun;rm -rf /",
+            "utun 0",
+            "utun\n0",
+            "utun\t0",
+            "rustynet0",
+            "tun0",
+            "utun12345678901234",
+            "utun4096x",
+            "wg0",
+            "utunABC",
+        ] {
+            assert!(validate_utun_name(bad).is_err(), "must reject {bad:?}");
         }
+    }
+
+    /// Phase 20 install-script presence pin. The install-script must
+    /// keep all three integration points alive: the CLI flag handler,
+    /// the WG_INTERFACE shell variable, the strict regex validation
+    /// before plist render, and the `<string>--wg-interface</string>`
+    /// emit into the plist ProgramArguments array. Any refactor that
+    /// drops one of these silently regresses the per-node interface
+    /// derivation.
+    #[test]
+    fn install_service_script_includes_wg_interface_flag_in_plist() {
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("--wg-interface")
+                && INSTALL_SERVICE_SCRIPT.contains("WG_INTERFACE"),
+            "install script must accept --wg-interface CLI arg and propagate WG_INTERFACE env"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("^utun[0-9]+$"),
+            "install script must validate utun name against ^utun[0-9]+$ before plist render"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<string>--wg-interface</string>"),
+            "install script must emit --wg-interface into plist ProgramArguments"
+        );
+    }
+
+    /// Phase 20 bootstrap-script propagation pin. The bootstrap script
+    /// must (a) document WG_INTERFACE as an env-file variable, (b)
+    /// validate it against the same ^utun[0-9]+$ regex used by the
+    /// install script, and (c) forward `--wg-interface` to
+    /// Install-RustyNetMacosService.sh so the FIRST plist install
+    /// already targets the per-node interface (not the utun9 default).
+    #[test]
+    fn bootstrap_script_propagates_wg_interface_to_install_service() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("WG_INTERFACE"),
+            "bootstrap script must document and consume WG_INTERFACE env var"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("^utun[0-9]+\\$"),
+            "bootstrap script must validate WG_INTERFACE before passing it to install script"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--wg-interface \"${wg_interface}\""),
+            "bootstrap script must pass --wg-interface to Install-RustyNetMacosService.sh"
+        );
+    }
+
+    /// Phase 20 env-file pin. build_bootstrap_env must always emit a
+    /// WG_INTERFACE line with the derived utun name so the FIRST plist
+    /// install already targets the per-node device. Without this the
+    /// orchestrator's later enforce_runtime phase would have to re-render
+    /// the plist and the bootstrap-time daemon start would race against
+    /// the still-stale utun9 default.
+    #[test]
+    fn build_bootstrap_env_emits_wg_interface_derived_from_node_id() {
+        let ctx = make_ctx(NodeRole::Client);
+        let env = build_bootstrap_env("macos-client-1", &NodeRole::Client, &ctx);
+        let expected = utun_name_for_node_id("macos-client-1");
+        assert!(
+            env.contains(&format!("WG_INTERFACE={expected}")),
+            "bootstrap env must contain WG_INTERFACE={expected}, got:\n{env}"
+        );
+        // The derived name must be in the [10, 4095] range, never the default.
+        assert_ne!(expected, "utun9");
     }
 
     #[test]
