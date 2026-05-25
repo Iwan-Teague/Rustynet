@@ -2655,10 +2655,74 @@ stage_cleanup_hosts() {
 cleanup_host_worker() {
   local label="$1"
   local target="$2"
-  printf '[cleanup] %s %s\n' "$label" "$target"
+  local platform
+  platform="$(node_platform_for_label "${label}")" || return 1
+  printf '[cleanup] %s %s platform=%s\n' "$label" "$target" "$platform"
   ssh_wait_for_host "$target" 120 5 || return 1
-  live_lab_scp_to "$STATE_DIR/rn_cleanup.sh" "$target" "/tmp/rn_cleanup.sh"
-  live_lab_ssh "$target" "chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh"
+  case "${platform}" in
+    linux)
+      live_lab_scp_to "$STATE_DIR/rn_cleanup.sh" "$target" "/tmp/rn_cleanup.sh"
+      live_lab_ssh "$target" "chmod 700 /tmp/rn_cleanup.sh && bash /tmp/rn_cleanup.sh"
+      ;;
+    macos)
+      cleanup_host_worker_macos "$target"
+      ;;
+    windows)
+      cleanup_host_worker_windows "$target"
+      ;;
+    *)
+      printf 'cleanup_host_worker: unsupported platform %q for label %q\n' \
+        "${platform}" "${label}" >&2
+      return 1
+      ;;
+  esac
+}
+
+# macOS cleanup — mirrors the Linux rn_cleanup.sh shape but uses launchctl
+# + /usr/local/var/rustynet paths. Idempotent: every step is best-effort
+# and exits 0 even when the resource was already absent.
+cleanup_host_worker_macos() {
+  local target="$1"
+  live_lab_push_sudo_password "$target"
+  # Heredoc payload is constant; no orchestrator-controlled value is
+  # interpolated, so there is no shell-injection surface.
+  live_lab_ssh "$target" 'sudo -n bash -s' <<'MACOS_CLEANUP'
+set -euo pipefail
+launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
+pkill -9 rustynetd 2>/dev/null || true
+sleep 1
+rm -f /Library/LaunchDaemons/com.rustynet.daemon.plist \
+      /Library/LaunchDaemons/com.rustynet.privileged-helper.plist
+rm -rf /usr/local/var/rustynet /usr/local/etc/rustynet \
+       /usr/local/var/log/rustynet /private/var/run/rustynet
+# Best-effort interface cleanup — utun devices are torn down when the
+# daemon exits, but ifconfig down is safe if any orphan remains.
+for utun in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun[0-9]'); do
+  ifconfig "${utun}" down 2>/dev/null || true
+done
+exit 0
+MACOS_CLEANUP
+}
+
+# Windows cleanup — best-effort SCM service teardown + state-root removal.
+# Idempotent. Used by Phase 24's mixed-OS bring-up so Windows can join a
+# fresh fleet alongside the Linux + macOS hosts without leaving stale
+# membership/trust files behind.
+cleanup_host_worker_windows() {
+  local target="$1"
+  # Powershell heredoc-equivalent via `ssh ... powershell -Command`. The
+  # script payload is constant (no orchestrator-controlled interpolation).
+  live_lab_ssh "$target" 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+$ErrorActionPreference = ''Continue'';
+sc.exe stop RustyNet 2>&1 | Out-Null;
+sc.exe delete RustyNet 2>&1 | Out-Null;
+sc.exe stop RustyNetPrivilegedHelper 2>&1 | Out-Null;
+sc.exe delete RustyNetPrivilegedHelper 2>&1 | Out-Null;
+Get-Process -Name rustynetd -ErrorAction SilentlyContinue | Stop-Process -Force;
+Remove-Item -LiteralPath ''C:\ProgramData\RustyNet'' -Recurse -Force -ErrorAction SilentlyContinue;
+exit 0
+"'
 }
 
 stage_bootstrap_hosts() {
@@ -2858,10 +2922,11 @@ collect_pubkey_worker() {
   local target="$2"
   local node_id="$3"
   local pub_hex
-  local stage_dir result_path
+  local stage_dir result_path platform
   stage_dir="$(parallel_stage_dir collect_pubkeys)"
   result_path="${stage_dir}/pubkey-${label}.tsv"
-  if ! pub_hex="$(live_lab_collect_pubkey_hex "$target")"; then
+  platform="$(node_platform_for_label "${label}")" || return 1
+  if ! pub_hex="$(live_lab_collect_pubkey_hex "$target" "$platform")"; then
     return 1
   fi
   if [[ -z "$pub_hex" ]]; then
@@ -2954,10 +3019,39 @@ stage_distribute_membership_state() {
 distribute_membership_worker() {
   local label="$1"
   local target="$2"
-  printf '[membership-distribute] %s %s\n' "$label" "$target"
+  local platform
+  platform="$(node_platform_for_label "${label}")" || return 1
+  printf '[membership-distribute] %s %s platform=%s\n' "$label" "$target" "$platform"
   live_lab_scp_to "$STATE_DIR/membership.snapshot" "$target" "/tmp/rn-membership.snapshot"
   live_lab_scp_to "$STATE_DIR/membership.log" "$target" "/tmp/rn-membership.log"
-  live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
+  local snapshot_path log_path watermark_path state_root
+  snapshot_path="$(rustynet_membership_snapshot_path "$platform")"
+  log_path="$(rustynet_membership_log_path "$platform")"
+  watermark_path="$(rustynet_membership_watermark_path "$platform")"
+  state_root="$(rustynet_state_root "$platform")"
+  case "$platform" in
+    macos)
+      local membership_dir
+      membership_dir="$(dirname "$snapshot_path")"
+      live_lab_run_root "$target" "
+set -euo pipefail
+root mkdir -p '${membership_dir}'
+root chown rustynetd:rustynetd '${state_root}' '${membership_dir}'
+root chmod 700 '${state_root}' '${membership_dir}'
+root install -m 0600 /tmp/rn-membership.snapshot '${snapshot_path}'
+root install -m 0600 /tmp/rn-membership.log '${log_path}'
+root chown rustynetd:rustynetd '${snapshot_path}' '${log_path}'
+root rm -f '${watermark_path}' /tmp/rn-membership.snapshot /tmp/rn-membership.log
+"
+      ;;
+    windows)
+      printf 'distribute_membership_worker: windows path not yet wired in this stage\n' >&2
+      return 1
+      ;;
+    *)
+      live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
+      ;;
+  esac
 }
 
 stage_issue_and_distribute_assignments() {
@@ -2980,25 +3074,26 @@ stage_issue_and_distribute_assignments() {
 }
 
 distribute_assignment_worker() {
-  local _label="$1"
+  local label="$1"
   local target="$2"
   local node_id="$3"
-  local bundle_local refresh_env exit_target exit_node_id
+  local bundle_local refresh_env exit_target exit_node_id platform
   # shellcheck disable=SC1090
   source "$ONEHOP_STATE_ENV"
   exit_target="$EXIT_TARGET"
   exit_node_id="$(node_id_for_label exit)"
   bundle_local="$STATE_DIR/assignment-${node_id}.bundle"
   refresh_env="$STATE_DIR/assignment-refresh-${node_id}.env"
-  printf '[assignment-distribute] %s %s\n' "$node_id" "$target"
+  platform="$(node_platform_for_label "${label}")" || return 1
+  printf '[assignment-distribute] %s %s platform=%s\n' "$node_id" "$target" "$platform"
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
-  live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local"
+  live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local" "$platform"
   if [[ "$node_id" == "$exit_node_id" ]]; then
     live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC"
   else
     live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$NODES_SPEC" "$ALLOW_SPEC" "$exit_node_id"
   fi
-  live_lab_install_assignment_refresh_env "$target" "$refresh_env"
+  live_lab_install_assignment_refresh_env "$target" "$refresh_env" "$platform"
 }
 
 issue_and_distribute_traversal_snapshot() {
@@ -3048,34 +3143,63 @@ stage_issue_and_distribute_dns_zone() {
 }
 
 distribute_traversal_worker() {
-  local _label="$1"
+  local label="$1"
   local target="$2"
   local node_id="$3"
-  local bundle_local exit_target
+  local bundle_local exit_target platform
   # shellcheck disable=SC1090
   source "$ONEHOP_STATE_ENV"
   exit_target="$EXIT_TARGET"
   bundle_local="$STATE_DIR/traversal-${node_id}.bundle"
-  printf '[traversal-distribute] %s %s\n' "$node_id" "$target"
-  live_lab_ensure_rustynetd_group "$target" || return 1
+  platform="$(node_platform_for_label "${label}")" || return 1
+  printf '[traversal-distribute] %s %s platform=%s\n' "$node_id" "$target" "$platform"
+  live_lab_ensure_rustynetd_group "$target" "$platform" || return 1
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/traversal-issue/rn-traversal-${node_id}.traversal" "$bundle_local" || return 1
   live_lab_scp_to "$STATE_DIR/traversal.pub" "$target" "/tmp/rn-traversal.pub"
   live_lab_scp_to "$bundle_local" "$target" "/tmp/rn-traversal.bundle"
-  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+  local traversal_pub_path bundle_path watermark_path config_dir state_root
+  traversal_pub_path="$(rustynet_traversal_pub_path "$platform")"
+  bundle_path="$(rustynet_traversal_bundle_path "$platform")"
+  watermark_path="$(rustynet_traversal_watermark_path "$platform")"
+  config_dir="$(rustynet_config_dir "$platform")"
+  state_root="$(rustynet_state_root "$platform")"
+  case "$platform" in
+    macos)
+      live_lab_run_root "$target" "
+set -euo pipefail
+root mkdir -p '${state_root}/trust' '${config_dir}'
+root chown -R rustynetd:rustynetd '${state_root}/trust'
+root chmod 700 '${state_root}/trust'
+root install -m 0644 /tmp/rn-traversal.pub '${traversal_pub_path}'
+root chown root:rustynetd '${traversal_pub_path}'
+root install -m 0640 /tmp/rn-traversal.bundle '${bundle_path}'
+root chown root:rustynetd '${bundle_path}'
+root rm -f '${watermark_path}' /tmp/rn-traversal.pub /tmp/rn-traversal.bundle
+"
+      ;;
+    windows)
+      printf 'distribute_traversal_worker: windows path not yet wired in this stage\n' >&2
+      return 1
+      ;;
+    *)
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+      ;;
+  esac
 }
 
 distribute_dns_zone_worker() {
-  local _label="$1"
+  local label="$1"
   local target="$2"
   local node_id="$3"
-  local bundle_local exit_target
+  local bundle_local exit_target platform
   # shellcheck disable=SC1090
   source "$ONEHOP_STATE_ENV"
   exit_target="$EXIT_TARGET"
   bundle_local="$STATE_DIR/dns-zone-${node_id}.bundle"
-  printf '[dns-zone-distribute] %s %s\n' "$node_id" "$target"
+  platform="$(node_platform_for_label "${label}")" || return 1
+  printf '[dns-zone-distribute] %s %s platform=%s\n' "$node_id" "$target" "$platform"
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/dns-zone-issue/rn-dns-zone-${node_id}.dns-zone" "$bundle_local" || return 1
-  live_lab_install_dns_zone_bundle "$target" "$STATE_DIR/dns-zone.pub" "$bundle_local"
+  live_lab_install_dns_zone_bundle "$target" "$STATE_DIR/dns-zone.pub" "$bundle_local" "$platform"
 }
 
 stage_enforce_baseline_runtime() {
@@ -3108,9 +3232,108 @@ enforce_runtime_worker() {
   local target="$2"
   local node_id="$3"
   local role="$4"
-  printf '[runtime-enforce] %s %s (%s %s)\n' "$label" "$target" "$node_id" "$role"
-  live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
-  live_lab_wait_for_daemon_socket "$target"
+  local platform
+  platform="$(node_platform_for_label "${label}")" || return 1
+  printf '[runtime-enforce] %s %s (%s %s) platform=%s\n' "$label" "$target" "$node_id" "$role" "$platform"
+  case "$platform" in
+    linux)
+      live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
+      ;;
+    macos)
+      enforce_runtime_worker_macos "$target" "$role" "$node_id"
+      ;;
+    windows)
+      # Windows enforce relies on the orchestrator-side
+      # Install-RustyNetWindowsService.ps1 plus DPAPI provisioning. The
+      # bootstrap stage already ran the canonical install; on enforce we
+      # only need to flip the SCM service to "auto-tunnel enforce on" via
+      # `rustynet ops install-windows-service` if needed.
+      live_lab_enforce_host "$target" "$role" "$node_id" "$SSH_ALLOW_CIDRS" "$(live_lab_remote_src_dir "$target")"
+      ;;
+    *)
+      printf 'enforce_runtime_worker: unsupported platform %q for label %q\n' \
+        "${platform}" "${label}" >&2
+      return 1
+      ;;
+  esac
+  local daemon_socket
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
+}
+
+# macOS enforce — re-run Install-RustyNetMacosService.sh with
+# --auto-tunnel-enforce true after the orchestrator has distributed the
+# signed assignment / traversal / dns-zone bundles. The script is already
+# on the host from bootstrap_host_worker_macos (we re-scp it just in case
+# the lab tmp dir was wiped). Mirrors Linux's `e2e-enforce-host` flip from
+# `auto_tunnel_enforce=false` (bootstrap) to `true` (enforce).
+enforce_runtime_worker_macos() {
+  local target="$1"
+  local role="$2"
+  local node_id="$3"
+  local local_install_script="$ROOT_DIR/scripts/bootstrap/macos/Install-RustyNetMacosService.sh"
+  local remote_install_script="/tmp/Install-RustyNetMacosService.sh"
+  local wg_interface daemon_node_role
+  if [[ ! -f "$local_install_script" ]]; then
+    printf 'enforce_runtime_worker_macos: install script missing locally at %s\n' \
+      "$local_install_script" >&2
+    return 1
+  fi
+  daemon_node_role="$(macos_daemon_node_role_for_orchestrator_role "$role")" || return 1
+  wg_interface="$(macos_wg_interface_for_node_id "$node_id")" || return 1
+  live_lab_push_sudo_password "$target" || return 1
+  live_lab_scp_to "$local_install_script" "$target" "$remote_install_script" || return 1
+  local cmd
+  cmd="sudo -n bash '${remote_install_script}'"
+  cmd+=" --node-id '${node_id}'"
+  cmd+=" --node-role '${daemon_node_role}'"
+  cmd+=" --network-id '${NETWORK_ID}'"
+  cmd+=" --auto-tunnel-enforce true"
+  cmd+=" --trust-max-age-secs 86400"
+  cmd+=" --wg-interface '${wg_interface}'"
+  if [[ -n "${SSH_ALLOW_CIDRS:-}" ]]; then
+    cmd+=" --fail-closed-ssh-allow true"
+    cmd+=" --fail-closed-ssh-allow-cidrs '${SSH_ALLOW_CIDRS}'"
+  fi
+  live_lab_ssh "$target" "$cmd" || return 1
+}
+
+# Mirror NodeRole::daemon_node_role_for_platform(Macos) in
+# crates/rustynet-cli/src/vm_lab/orchestrator/role.rs so the bash
+# enforce path always passes a DAEMON_NODE_ROLE that the install
+# script accepts. The bootstrap-time bash wrapper
+# (`scripts/e2e/rn_bootstrap_macos.sh::daemon_node_role_for_macos`)
+# uses the identical mapping; keep them in sync.
+macos_daemon_node_role_for_orchestrator_role() {
+  case "$1" in
+    exit) printf 'blind_exit' ;;
+    client|entry|aux|extra|fifth_client) printf 'client' ;;
+    admin) printf 'admin' ;;
+    *) printf 'enforce_runtime_worker_macos: cannot map role %q to a macOS daemon role\n' \
+         "$1" >&2; return 1 ;;
+  esac
+}
+
+# Mirror utun_name_for_node_id in
+# crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs
+# (also pinned in scripts/e2e/rn_bootstrap_macos.sh::fnv1a_utun_name).
+# Keeping the FNV-1a 32-bit derivation in three places is deliberate:
+# Rust adapter, bootstrap-time bash wrapper, enforce-time bash wrapper.
+# All three must produce the same utun name for a given node_id so the
+# launchd plist install (bootstrap), the orchestrator's Rust enforce
+# path (when invoked from a non-Mac control plane), and this enforce
+# wrapper agree on the interface name.
+macos_wg_interface_for_node_id() {
+  local s="$1"
+  local hash=2166136261
+  local i len byte
+  len="${#s}"
+  for (( i = 0; i < len; i++ )); do
+    printf -v byte '%d' "'${s:i:1}"
+    hash=$(( hash ^ byte ))
+    hash=$(( (hash * 16777619) & 0xFFFFFFFF ))
+  done
+  printf 'utun%s' $(( (hash % 4086) + 10 ))
 }
 
 refresh_runtime_state_worker() {
@@ -3118,9 +3341,12 @@ refresh_runtime_state_worker() {
   local target="$2"
   local node_id="$3"
   local _role="$4"
-  printf '[runtime-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
-  live_lab_run_root "$target" "root rustynet ops force-local-assignment-refresh-now"
-  live_lab_wait_for_daemon_socket "$target"
+  local platform daemon_socket
+  platform="$(node_platform_for_label "${label}")" || return 1
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  printf '[runtime-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
+  live_lab_run_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops force-local-assignment-refresh-now"
+  live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
 }
 
 refresh_trust_evidence_worker() {
@@ -3128,9 +3354,12 @@ refresh_trust_evidence_worker() {
   local target="$2"
   local node_id="$3"
   local _role="$4"
-  printf '[trust-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
-  live_lab_wait_for_daemon_socket "$target"
-  live_lab_retry_root "$target" "root rustynet ops refresh-signed-trust" 5 2
+  local platform daemon_socket
+  platform="$(node_platform_for_label "${label}")" || return 1
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  printf '[trust-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
+  live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
+  live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops refresh-signed-trust" 5 2
 }
 
 refresh_runtime_state_all_nodes() {
@@ -3347,9 +3576,12 @@ refresh_signed_state_worker() {
   local target="$2"
   local node_id="$3"
   local _role="$4"
-  printf '[signed-state-refresh] %s %s (%s)\n' "$label" "$target" "$node_id"
-  live_lab_wait_for_daemon_socket "$target"
-  live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh" 5 2
+  local platform daemon_socket
+  platform="$(node_platform_for_label "${label}")" || return 1
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  printf '[signed-state-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
+  live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
+  live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet state refresh" 5 2
 }
 
 refresh_signed_state_all_nodes() {

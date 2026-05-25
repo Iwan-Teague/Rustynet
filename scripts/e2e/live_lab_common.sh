@@ -1382,6 +1382,7 @@ rustynet_config_dir() {
   local platform="${1:-linux}"
   case "$platform" in
     windows) printf '%s' 'C:\ProgramData\RustyNet\config' ;;
+    macos)   printf '%s' '/usr/local/etc/rustynet' ;;
     *)       printf '%s' '/etc/rustynet' ;;
   esac
 }
@@ -1391,7 +1392,118 @@ rustynet_daemon_socket() {
   local platform="${1:-linux}"
   case "$platform" in
     windows) printf '%s' '\\.\pipe\RustyNet\rustynetd' ;;
+    macos)   printf '%s' '/private/var/run/rustynet/rustynetd.sock' ;;
     *)       printf '%s' '/run/rustynet/rustynetd.sock' ;;
+  esac
+}
+
+# Returns the persistent state root for rustynetd on the given platform.
+rustynet_state_root() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet' ;;
+    *)       printf '%s' '/var/lib/rustynet' ;;
+  esac
+}
+
+# Returns the membership snapshot path for the given platform.
+rustynet_membership_snapshot_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\membership\membership.snapshot' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/membership/membership.snapshot' ;;
+    *)       printf '%s' '/var/lib/rustynet/membership.snapshot' ;;
+  esac
+}
+
+# Returns the membership log path for the given platform.
+rustynet_membership_log_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\membership\membership.log' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/membership/membership.log' ;;
+    *)       printf '%s' '/var/lib/rustynet/membership.log' ;;
+  esac
+}
+
+# Returns the membership watermark path for the given platform.
+rustynet_membership_watermark_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\membership\membership.watermark' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/membership/membership.watermark' ;;
+    *)       printf '%s' '/var/lib/rustynet/membership.watermark' ;;
+  esac
+}
+
+# Returns the DNS zone bundle path for the given platform.
+rustynet_dns_zone_bundle_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.dns-zone' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.dns-zone' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.dns-zone' ;;
+  esac
+}
+
+# Returns the DNS zone watermark path for the given platform.
+rustynet_dns_zone_watermark_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.dns-zone.watermark' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.dns-zone.watermark' ;;
+  esac
+}
+
+# Returns the DNS zone verifier key path for the given platform.
+rustynet_dns_zone_pub_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\dns-zone.pub' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/dns-zone.pub' ;;
+    *)       printf '%s' '/etc/rustynet/dns-zone.pub' ;;
+  esac
+}
+
+# Returns the traversal bundle path for the given platform.
+rustynet_traversal_bundle_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.traversal' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.traversal' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.traversal' ;;
+  esac
+}
+
+# Returns the traversal watermark path for the given platform.
+rustynet_traversal_watermark_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.traversal.watermark' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.traversal.watermark' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.traversal.watermark' ;;
+  esac
+}
+
+# Returns the traversal verifier key path for the given platform.
+rustynet_traversal_pub_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\traversal.pub' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/traversal.pub' ;;
+    *)       printf '%s' '/etc/rustynet/traversal.pub' ;;
+  esac
+}
+
+# Returns the assignment refresh env file path for the given platform.
+rustynet_assignment_refresh_env_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\config\assignment-refresh.env' ;;
+    macos)   printf '%s' '/usr/local/etc/rustynet/assignment-refresh.env' ;;
+    *)       printf '%s' '/etc/rustynet/assignment-refresh.env' ;;
   esac
 }
 
@@ -1400,6 +1512,7 @@ rustynet_wg_pub_key_path() {
   local platform="${1:-linux}"
   case "$platform" in
     windows) printf '%s' 'C:\ProgramData\RustyNet\keys\wireguard.pub' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/keys/wireguard.pub' ;;
     *)       printf '%s' '/var/lib/rustynet/keys/wireguard.pub' ;;
   esac
 }
@@ -1409,6 +1522,7 @@ rustynet_assignment_bundle_path() {
   local platform="${1:-linux}"
   case "$platform" in
     windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.assignment' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.assignment' ;;
     *)       printf '%s' '/var/lib/rustynet/rustynetd.assignment' ;;
   esac
 }
@@ -1418,6 +1532,7 @@ rustynet_assignment_watermark_path() {
   local platform="${1:-linux}"
   case "$platform" in
     windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.assignment.watermark' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.assignment.watermark' ;;
     *)       printf '%s' '/var/lib/rustynet/rustynetd.assignment.watermark' ;;
   esac
 }
@@ -1427,6 +1542,7 @@ rustynet_assignment_pub_path() {
   local platform="${1:-linux}"
   case "$platform" in
     windows) printf '%s' 'C:\ProgramData\RustyNet\trust\assignment.pub' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/assignment.pub' ;;
     *)       printf '%s' '/etc/rustynet/assignment.pub' ;;
   esac
 }
@@ -1529,32 +1645,140 @@ live_lab_install_assignment_bundle() {
   local target="$1"
   local assignment_pub_local="$2"
   local assignment_bundle_local="$3"
-  live_lab_ensure_rustynetd_group "$target" || return 1
-  live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub" || return 1
-  live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle" || return 1
-  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle" || return 1
+  local platform="${4:-linux}"
+  live_lab_ensure_rustynetd_group "$target" "$platform" || return 1
+  local assignment_pub_path bundle_path watermark_path config_dir state_root
+  assignment_pub_path="$(rustynet_assignment_pub_path "$platform")"
+  bundle_path="$(rustynet_assignment_bundle_path "$platform")"
+  watermark_path="$(rustynet_assignment_watermark_path "$platform")"
+  config_dir="$(rustynet_config_dir "$platform")"
+  state_root="$(rustynet_state_root "$platform")"
+  case "$platform" in
+    macos)
+      live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub" || return 1
+      live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle" || return 1
+      # macOS trust artifacts live under ${state_root}/trust (owner rustynetd:rustynetd 0700).
+      # install(1) on macOS does not accept the GNU -o/-g flags; use chown after install.
+      live_lab_run_root "$target" "
+set -euo pipefail
+root mkdir -p '${state_root}/trust' '${config_dir}'
+root chown -R rustynetd:rustynetd '${state_root}/trust'
+root chmod 700 '${state_root}/trust'
+root install -m 0644 /tmp/rn-assignment.pub '${assignment_pub_path}'
+root chown root:rustynetd '${assignment_pub_path}'
+root install -m 0640 /tmp/rn-assignment.bundle '${bundle_path}'
+root chown root:rustynetd '${bundle_path}'
+root rm -f '${watermark_path}' /tmp/rn-assignment.pub /tmp/rn-assignment.bundle
+" || return 1
+      ;;
+    windows)
+      printf 'live_lab_install_assignment_bundle: windows not yet supported in this helper\n' >&2
+      return 1
+      ;;
+    *)
+      live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub" || return 1
+      live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle" || return 1
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle" || return 1
+      ;;
+  esac
 }
 
 live_lab_install_assignment_refresh_env() {
   local target="$1"
   local env_local="$2"
-  live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env" || return 1
-  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
+  local platform="${3:-linux}"
+  local refresh_path config_dir
+  refresh_path="$(rustynet_assignment_refresh_env_path "$platform")"
+  config_dir="$(rustynet_config_dir "$platform")"
+  case "$platform" in
+    macos)
+      live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env" || return 1
+      live_lab_run_root "$target" "
+set -euo pipefail
+root mkdir -p '${config_dir}'
+root chown root:rustynetd '${config_dir}'
+root chmod 750 '${config_dir}'
+root install -m 0600 /tmp/rn-assignment-refresh.env '${refresh_path}'
+root chown root:wheel '${refresh_path}'
+root rm -f /tmp/rn-assignment-refresh.env
+" || return 1
+      ;;
+    windows)
+      printf 'live_lab_install_assignment_refresh_env: windows not yet supported in this helper\n' >&2
+      return 1
+      ;;
+    *)
+      live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env" || return 1
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
+      ;;
+  esac
 }
 
 live_lab_install_dns_zone_bundle() {
   local target="$1"
   local dns_zone_pub_local="$2"
   local dns_zone_bundle_local="$3"
-  live_lab_ensure_rustynetd_group "$target" || return 1
-  live_lab_scp_to "$dns_zone_pub_local" "$target" "/tmp/rn-dns-zone.pub" || return 1
-  live_lab_scp_to "$dns_zone_bundle_local" "$target" "/tmp/rn-dns-zone.bundle" || return 1
-  live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" || return 1
+  local platform="${4:-linux}"
+  live_lab_ensure_rustynetd_group "$target" "$platform" || return 1
+  local dns_zone_pub_path bundle_path watermark_path config_dir state_root
+  dns_zone_pub_path="$(rustynet_dns_zone_pub_path "$platform")"
+  bundle_path="$(rustynet_dns_zone_bundle_path "$platform")"
+  watermark_path="$(rustynet_dns_zone_watermark_path "$platform")"
+  config_dir="$(rustynet_config_dir "$platform")"
+  state_root="$(rustynet_state_root "$platform")"
+  case "$platform" in
+    macos)
+      live_lab_scp_to "$dns_zone_pub_local" "$target" "/tmp/rn-dns-zone.pub" || return 1
+      live_lab_scp_to "$dns_zone_bundle_local" "$target" "/tmp/rn-dns-zone.bundle" || return 1
+      live_lab_run_root "$target" "
+set -euo pipefail
+root mkdir -p '${state_root}/trust' '${config_dir}'
+root chown -R rustynetd:rustynetd '${state_root}/trust'
+root chmod 700 '${state_root}/trust'
+root install -m 0644 /tmp/rn-dns-zone.pub '${dns_zone_pub_path}'
+root chown root:rustynetd '${dns_zone_pub_path}'
+root install -m 0640 /tmp/rn-dns-zone.bundle '${bundle_path}'
+root chown root:rustynetd '${bundle_path}'
+root rm -f '${watermark_path}' /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle
+" || return 1
+      ;;
+    windows)
+      printf 'live_lab_install_dns_zone_bundle: windows not yet supported in this helper\n' >&2
+      return 1
+      ;;
+    *)
+      live_lab_scp_to "$dns_zone_pub_local" "$target" "/tmp/rn-dns-zone.pub" || return 1
+      live_lab_scp_to "$dns_zone_bundle_local" "$target" "/tmp/rn-dns-zone.bundle" || return 1
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" || return 1
+      ;;
+  esac
 }
 
 live_lab_ensure_rustynetd_group() {
   local target="$1"
-  live_lab_run_root "$target" "if ! root getent group rustynetd >/dev/null 2>&1; then root groupadd --system rustynetd; fi" || return 1
+  local platform="${2:-linux}"
+  case "$platform" in
+    macos)
+      # On macOS the rustynetd group is created via dscl by
+      # Bootstrap-RustyNetMacos.sh::ensure_rustynetd_user. If it is not
+      # present here the install must hard-fail rather than synthesize a
+      # group from the orchestrator.
+      live_lab_run_root "$target" "
+set -euo pipefail
+if ! dscl . -read /Groups/rustynetd >/dev/null 2>&1; then
+  echo 'rustynetd group missing on macOS target; bootstrap_host_worker_macos must have run first' >&2
+  exit 1
+fi
+" || return 1
+      ;;
+    windows)
+      printf 'live_lab_ensure_rustynetd_group: windows not yet supported in this helper\n' >&2
+      return 1
+      ;;
+    *)
+      live_lab_run_root "$target" "if ! root getent group rustynetd >/dev/null 2>&1; then root groupadd --system rustynetd; fi" || return 1
+      ;;
+  esac
 }
 
 live_lab_issue_assignment_bundles_from_env() {
