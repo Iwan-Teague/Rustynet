@@ -20,11 +20,28 @@ mod remote_shell;
 // that hasn't migrated to the trait yet. Phase 29 starts the
 // migration; until then the allow keeps `-D warnings` green without
 // hiding the actual public API.
+//
+// Production surface — substages may construct the real per-OS
+// backends or dispatch via `new_remote_shell_host`. The mock backend
+// is intentionally NOT exported here; see `testing` below.
 #[allow(unused_imports)]
 pub use remote_shell::{
-    LinuxShellHost, MacosShellHost, MockShellHost, RemoteExitStatus, RemoteShellError,
-    RemoteShellHost, RemoteStat, WindowsShellHost, new_remote_shell_host,
+    LinuxShellHost, MacosShellHost, RemoteExitStatus, RemoteShellError, RemoteShellHost,
+    RemoteStat, WindowsShellHost, new_remote_shell_host,
 };
+
+/// Test-only surface for the live-lab support module. `MockShellHost`
+/// is an in-process backend with no real transport — exposing it
+/// alongside the production backends would let a substage accidentally
+/// pass a mock where a real backend is required, defeating the
+/// fail-closed cross-platform contract. Callers that need the mock
+/// (the trait's own contract tests, future bin-level unit tests, etc.)
+/// must reach for it explicitly via
+/// `live_lab_bin_support::testing::MockShellHost`.
+pub mod testing {
+    #[allow(unused_imports)]
+    pub use super::remote_shell::{MockRunInvocation, MockShellHost, MockTcpInvocation};
+}
 
 use std::env;
 use std::ffi::OsString;
