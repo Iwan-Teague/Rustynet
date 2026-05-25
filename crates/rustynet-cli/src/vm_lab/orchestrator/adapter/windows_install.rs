@@ -512,6 +512,31 @@ fn windows_bootstrap_acl_repair_fragment() -> Result<String, AdapterError> {
 }
 
 fn windows_bootstrap_native_helper_fragment() -> String {
+    // Bootstrap helper fragment: defines reusable PowerShell functions
+    // consumed by the e2e bootstrap script.
+    //
+    // - `Invoke-RustyNetBootstrapNative` runs a native command and
+    //   captures its exit code + combined stdout/stderr.
+    // - `New-RustyNetDpapiEnvelope` produces the reviewed `RNYDPAPI`
+    //   envelope (magic + version + reserved + BE u32 length +
+    //   protected) so PowerShell-side DPAPI ciphertexts decode against
+    //   `decode_windows_dpapi_passphrase_blob`. Used by the Phase 27
+    //   reviewer fold-in so the canonical `.dpapi` paths never see
+    //   plaintext bytes on disk.
+    // - `Write-RustyNetDpapiBlobAtomic` writes the envelope to a
+    //   `.tmp` sibling and `Move-Item`s it onto the final path (atomic
+    //   on NTFS). Forces a `Remove-Item -Force` first so an existing
+    //   plaintext blob from a previous run cannot leave deleted-block
+    //   journal entries that the new envelope appears to "amend".
+    // - `Remove-RustyNetPlaintextTempFile` overwrites the file with
+    //   zeros then deletes it, the closest NTFS-side equivalent of
+    //   `shred` for the per-key plaintext tempfiles. The reviewed
+    //   `credentials-workspace` parent has the same SY/BA-only DACL
+    //   as `secrets\`, so the tempfile inherits that fence even
+    //   before deletion.
+    // - `Clear-RustyNetSensitiveString` zeroes a `[string]` variable
+    //   so the in-process passphrase plaintext is overwritten when
+    //   the bootstrap script exits.
     "function Invoke-RustyNetBootstrapNative { \
          param([Parameter(Mandatory = $true)][scriptblock]$Command); \
          $oldErrorActionPreference = $ErrorActionPreference; \
@@ -524,6 +549,65 @@ fn windows_bootstrap_native_helper_fragment() -> String {
          }; \
          if ($null -eq $exitCode) { $exitCode = 0 }; \
          [pscustomobject]@{ ExitCode = $exitCode; Output = $output } \
+     }; \
+     function New-RustyNetDpapiEnvelope { \
+         param([Parameter(Mandatory = $true)][byte[]]$ProtectedBytes); \
+         if ($ProtectedBytes.Length -gt 4294967295) { throw 'protected blob exceeds u32 length' }; \
+         $magic = [byte[]]@(0x52,0x4E,0x59,0x44,0x50,0x41,0x50,0x49); \
+         $header = New-Object byte[] 14; \
+         [Array]::Copy($magic, 0, $header, 0, 8); \
+         $header[8] = 0x01; \
+         $header[9] = 0x00; \
+         $len = [uint32]$ProtectedBytes.Length; \
+         $header[10] = [byte](($len -shr 24) -band 0xff); \
+         $header[11] = [byte](($len -shr 16) -band 0xff); \
+         $header[12] = [byte](($len -shr 8) -band 0xff); \
+         $header[13] = [byte]($len -band 0xff); \
+         $envelope = New-Object byte[] ($header.Length + $ProtectedBytes.Length); \
+         [Array]::Copy($header, 0, $envelope, 0, $header.Length); \
+         [Array]::Copy($ProtectedBytes, 0, $envelope, $header.Length, $ProtectedBytes.Length); \
+         return ,$envelope \
+     }; \
+     function Write-RustyNetDpapiBlobAtomic { \
+         param( \
+             [Parameter(Mandatory = $true)][string]$Path, \
+             [Parameter(Mandatory = $true)][byte[]]$Bytes \
+         ); \
+         $parent = Split-Path -Parent $Path; \
+         if (-not (Test-Path -LiteralPath $parent -PathType Container)) { \
+             throw ('DPAPI blob parent directory missing: ' + $parent) \
+         }; \
+         $leaf = Split-Path -Leaf $Path; \
+         $tmpName = '.' + $leaf + '.' + [System.Diagnostics.Process]::GetCurrentProcess().Id + '.' + [System.Guid]::NewGuid().ToString('N') + '.tmp'; \
+         $tmpPath = Join-Path $parent $tmpName; \
+         if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force }; \
+         [System.IO.File]::WriteAllBytes($tmpPath, $Bytes); \
+         if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }; \
+         Move-Item -LiteralPath $tmpPath -Destination $Path -Force \
+     }; \
+     function Remove-RustyNetPlaintextTempFile { \
+         param([Parameter(Mandatory = $true)][string]$Path); \
+         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }; \
+         try { \
+             $len = (Get-Item -LiteralPath $Path -Force).Length; \
+             if ($len -gt 0) { \
+                 $zeros = New-Object byte[] $len; \
+                 [System.IO.File]::WriteAllBytes($Path, $zeros); \
+                 [Array]::Clear($zeros, 0, $zeros.Length) \
+             } \
+         } catch {}; \
+         try { Remove-Item -LiteralPath $Path -Force } catch {} \
+     }; \
+     function Clear-RustyNetSensitiveString { \
+         param([Parameter(Mandatory = $true)][string]$Name); \
+         try { \
+             $val = Get-Variable -Name $Name -Scope 1 -ValueOnly -ErrorAction Stop; \
+             if ($val -is [string] -and $val.Length -gt 0) { \
+                 $arr = $val.ToCharArray(); \
+                 [Array]::Clear($arr, 0, $arr.Length); \
+                 Set-Variable -Name $Name -Value '' -Scope 1 \
+             } \
+         } catch {} \
      }"
     .to_owned()
 }
@@ -681,36 +765,100 @@ fn run_windows_e2e_bootstrap(
     // DistributeDnsZone stages that run AFTER this bootstrap stage.
     // EnforceBaselineRuntime calls start_daemon after all verifier keys are in
     // place.
+    //
+    // ── Phase 27 reviewer fold-in (BLOCKER 1 + HIGH 1) ─────────────────────
+    //
+    // BLOCKER 1 (key separation, §3.4): the previous implementation used a
+    // single `$pp` to encrypt BOTH the WireGuard private key AND the
+    // membership owner-signing key. Compromise of either DPAPI envelope
+    // would yield the plaintext for the other. We now generate two
+    // statistically independent 48-byte hex passphrases from separate
+    // RNGCryptoServiceProvider instances and never reuse plaintext
+    // across the WG and signing paths.
+    //
+    // HIGH 1 (NTFS deleted-block recovery): the previous implementation
+    // wrote plaintext to `wireguard.passphrase.dpapi` and
+    // `signing_key_passphrase.dpapi` and then atomically renamed the
+    // DPAPI-protected blob over the same path. The plaintext bytes
+    // remained recoverable in NTFS journal entries indexed by the
+    // `.dpapi`-named path. We now:
+    //   1. Stage plaintext only to per-key tempfiles under
+    //      `C:\ProgramData\RustyNet\credentials-workspace\` (SY/BA-only
+    //      ACL inherited from `\ProgramData\RustyNet\`).
+    //   2. Run `key init` / `membership init` against those tempfiles
+    //      so the daemon can derive the KDFs from plaintext.
+    //   3. Call `[System.Security.Cryptography.ProtectedData]::Protect`
+    //      in-process on the plaintext bytes (LocalMachine scope).
+    //   4. Wrap the protected bytes in the reviewed `RNYDPAPI` envelope
+    //      (magic + version + reserved + BE u32 length + protected) so
+    //      `decode_windows_dpapi_passphrase_blob` accepts it.
+    //   5. Write the envelope directly to the canonical `.dpapi` path
+    //      via `[System.IO.File]::WriteAllBytes` — the `.dpapi` path
+    //      never sees plaintext bytes on disk.
+    //   6. Overwrite the plaintext tempfile with zeros and delete it.
+    //   7. Disable PSReadLine / transcripts during the bootstrap script
+    //      so the plaintext never lands in a profile history file.
     let bootstrap_script = format!(
         "$ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
+         try {{ if (Get-Module -Name PSReadLine) {{ Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction SilentlyContinue }} }} catch {{}}; \
          {native_helper}; \
          $env:RUSTYNET_WG_BINARY_PATH = {wg_binary_q}; \
-         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create(); \
-         $bytes = New-Object byte[] 48; \
-         $rng.GetBytes($bytes); \
-         $pp = -join ($bytes | ForEach-Object {{ $_.ToString('x2') }}); \
          {bootstrap_acl_repair}; \
          New-Item -ItemType Directory -Force -Path (Split-Path {passphrase_q}) | Out-Null; \
+         New-Item -ItemType Directory -Force -Path (Split-Path {membership_passphrase_q}) | Out-Null; \
          New-Item -ItemType Directory -Force -Path {credentials_workspace_q} | Out-Null; \
-         [System.IO.File]::WriteAllText({passphrase_q}, $pp); \
-         $keyInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key init --passphrase-file {passphrase_q} --force }}; \
-         if ($keyInit.ExitCode -ne 0) {{ throw ('rustynetd key init failed: ' + $keyInit.Output) }}; \
-         $mbInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} membership init \
-             --snapshot {membership_snapshot_q} \
-             --log {membership_log_q} \
-             --watermark {membership_watermark_q} \
-             --owner-signing-key {membership_owner_key_q} \
-             --owner-signing-key-passphrase-file {passphrase_q} \
-             --node-id {node_id_q} \
-             --network-id {network_id_q} \
-             --force }}; \
-         if ($mbInit.ExitCode -ne 0) {{ throw ('rustynetd membership init failed: ' + $mbInit.Output) }}; \
-         [System.IO.File]::WriteAllText({membership_passphrase_q}, $pp); \
-         $msp = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key store-passphrase --passphrase-file {membership_passphrase_q} }}; \
-         if ($msp.ExitCode -ne 0) {{ throw ('rustynetd membership signing passphrase store failed: ' + $msp.Output) }}; \
-         $ksp = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key store-passphrase --passphrase-file {passphrase_q} }}; \
-         if ($ksp.ExitCode -ne 0) {{ throw ('rustynetd key store-passphrase failed: ' + $ksp.Output) }}; \
+         $wgRng = [System.Security.Cryptography.RandomNumberGenerator]::Create(); \
+         $wgBytes = New-Object byte[] 24; \
+         $wgRng.GetBytes($wgBytes); \
+         $wgPp = -join ($wgBytes | ForEach-Object {{ $_.ToString('x2') }}); \
+         $wgRng.Dispose(); \
+         [Array]::Clear($wgBytes, 0, $wgBytes.Length); \
+         $signingRng = [System.Security.Cryptography.RandomNumberGenerator]::Create(); \
+         $signingBytes = New-Object byte[] 24; \
+         $signingRng.GetBytes($signingBytes); \
+         $signingPp = -join ($signingBytes | ForEach-Object {{ $_.ToString('x2') }}); \
+         $signingRng.Dispose(); \
+         [Array]::Clear($signingBytes, 0, $signingBytes.Length); \
+         if ($wgPp -eq $signingPp) {{ throw 'fail-closed: WG + signing passphrases collided (RNG bug)' }}; \
+         $wgPlaintextPath = Join-Path {credentials_workspace_q} ('wg-init.' + [System.Diagnostics.Process]::GetCurrentProcess().Id + '.' + [System.Guid]::NewGuid().ToString('N') + '.tmp'); \
+         $signingPlaintextPath = Join-Path {credentials_workspace_q} ('signing-init.' + [System.Diagnostics.Process]::GetCurrentProcess().Id + '.' + [System.Guid]::NewGuid().ToString('N') + '.tmp'); \
+         try {{ \
+             $utf8NoBom = New-Object System.Text.UTF8Encoding $false; \
+             [System.IO.File]::WriteAllText($wgPlaintextPath, $wgPp, $utf8NoBom); \
+             [System.IO.File]::WriteAllText($signingPlaintextPath, $signingPp, $utf8NoBom); \
+             $keyInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key init --passphrase-file $wgPlaintextPath --force }}; \
+             if ($keyInit.ExitCode -ne 0) {{ throw ('rustynetd key init failed: ' + $keyInit.Output) }}; \
+             $mbInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} membership init \
+                 --snapshot {membership_snapshot_q} \
+                 --log {membership_log_q} \
+                 --watermark {membership_watermark_q} \
+                 --owner-signing-key {membership_owner_key_q} \
+                 --owner-signing-key-passphrase-file $signingPlaintextPath \
+                 --node-id {node_id_q} \
+                 --network-id {network_id_q} \
+                 --force }}; \
+             if ($mbInit.ExitCode -ne 0) {{ throw ('rustynetd membership init failed: ' + $mbInit.Output) }}; \
+             $wgPlain = [System.Text.Encoding]::UTF8.GetBytes($wgPp); \
+             $signingPlain = [System.Text.Encoding]::UTF8.GetBytes($signingPp); \
+             $wgProtected = [System.Security.Cryptography.ProtectedData]::Protect($wgPlain, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine); \
+             $signingProtected = [System.Security.Cryptography.ProtectedData]::Protect($signingPlain, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine); \
+             [Array]::Clear($wgPlain, 0, $wgPlain.Length); \
+             [Array]::Clear($signingPlain, 0, $signingPlain.Length); \
+             $wgEnvelope = New-RustyNetDpapiEnvelope -ProtectedBytes $wgProtected; \
+             $signingEnvelope = New-RustyNetDpapiEnvelope -ProtectedBytes $signingProtected; \
+             [Array]::Clear($wgProtected, 0, $wgProtected.Length); \
+             [Array]::Clear($signingProtected, 0, $signingProtected.Length); \
+             Write-RustyNetDpapiBlobAtomic -Path {passphrase_q} -Bytes $wgEnvelope; \
+             Write-RustyNetDpapiBlobAtomic -Path {membership_passphrase_q} -Bytes $signingEnvelope; \
+             [Array]::Clear($wgEnvelope, 0, $wgEnvelope.Length); \
+             [Array]::Clear($signingEnvelope, 0, $signingEnvelope.Length); \
+         }} finally {{ \
+             try {{ Clear-RustyNetSensitiveString -Name 'wgPp' }} catch {{}}; \
+             try {{ Clear-RustyNetSensitiveString -Name 'signingPp' }} catch {{}}; \
+             Remove-RustyNetPlaintextTempFile -Path $wgPlaintextPath; \
+             Remove-RustyNetPlaintextTempFile -Path $signingPlaintextPath; \
+         }}; \
          $acl = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} windows-runtime-acls-check }}; \
          if ($acl.ExitCode -ne 0) {{ throw ('runtime ACL check failed (startup would fail): ' + $acl.Output) }}",
     );
@@ -967,6 +1115,19 @@ mod tests {
         );
     }
 
+    /// Returns the implementation slice of `windows_install.rs` — the
+    /// source above the `#[cfg(test)] mod tests` marker. The
+    /// source-pin tests below must check the implementation, not the
+    /// test fixtures themselves; a naive `include_str!` would match
+    /// patterns referenced in the test assertions (false-positive on
+    /// the `assert!(!source.contains(...))` invariants).
+    fn windows_install_impl_source() -> &'static str {
+        let full = include_str!("windows_install.rs");
+        full.split("#[cfg(test)]")
+            .next()
+            .expect("implementation slice must precede tests")
+    }
+
     #[test]
     fn e2e_bootstrap_provisions_windows_membership_signing_passphrase_blob() {
         assert!(
@@ -974,7 +1135,7 @@ mod tests {
                 .ends_with(r"secrets\signing_key_passphrase.dpapi"),
             "membership signing passphrase must use the reviewed DPAPI blob name: {WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH}"
         );
-        let source = include_str!("windows_install.rs");
+        let source = windows_install_impl_source();
         assert!(
             source.contains("WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH"),
             "Windows e2e bootstrap must carry the membership signing passphrase path"
@@ -983,9 +1144,92 @@ mod tests {
             source.contains("membership_passphrase_q"),
             "Windows e2e bootstrap must quote the membership signing passphrase path"
         );
+        // Phase 27 reviewer fold-in (HIGH 1): the canonical
+        // `.dpapi` paths must never see plaintext bytes on disk.
+        // PowerShell now pre-encrypts the passphrase via DPAPI and
+        // writes only the reviewed `RNYDPAPI` envelope to the
+        // canonical path. Pin both the helper that builds the
+        // envelope and the atomic-write helper that lands it on the
+        // membership-signing path.
         assert!(
-            source.contains("key store-passphrase --passphrase-file {membership_passphrase_q}"),
-            "Windows e2e bootstrap must DPAPI-protect the membership signing passphrase blob"
+            source.contains("Write-RustyNetDpapiBlobAtomic -Path {membership_passphrase_q}"),
+            "Windows e2e bootstrap must write the membership signing DPAPI envelope atomically to the canonical path"
+        );
+        assert!(
+            source.contains("New-RustyNetDpapiEnvelope"),
+            "Windows e2e bootstrap must wrap the DPAPI protected bytes in the reviewed RNYDPAPI envelope"
+        );
+        assert!(
+            !source.contains("[System.IO.File]::WriteAllText({membership_passphrase_q}"),
+            "Windows e2e bootstrap must NOT write plaintext to the membership signing .dpapi path (HIGH 1)"
+        );
+        assert!(
+            !source.contains("[System.IO.File]::WriteAllText({passphrase_q}"),
+            "Windows e2e bootstrap must NOT write plaintext to the WG .dpapi path (HIGH 1)"
+        );
+    }
+
+    /// Phase 27 reviewer fold-in (BLOCKER 1, §3.4 key separation):
+    /// the WG and signing passphrases MUST be derived from independent
+    /// RNG instances and MUST never share plaintext source material.
+    /// Pin the source-level invariants so a future refactor cannot
+    /// silently revert to a shared `$pp`.
+    #[test]
+    fn e2e_bootstrap_uses_distinct_wg_and_signing_passphrases() {
+        let source = windows_install_impl_source();
+        assert!(
+            source.contains(
+                "$wgRng = [System.Security.Cryptography.RandomNumberGenerator]::Create()"
+            ),
+            "Windows e2e bootstrap must instantiate a dedicated RNG for the WG passphrase"
+        );
+        assert!(
+            source.contains(
+                "$signingRng = [System.Security.Cryptography.RandomNumberGenerator]::Create()"
+            ),
+            "Windows e2e bootstrap must instantiate a dedicated RNG for the membership signing passphrase"
+        );
+        assert!(
+            source.contains("if ($wgPp -eq $signingPp)"),
+            "Windows e2e bootstrap must fail closed if the WG and signing passphrases collide"
+        );
+        assert!(
+            !source.contains("$pp = -join"),
+            "Windows e2e bootstrap must NOT reuse a single $pp for WG + signing (BLOCKER 1)"
+        );
+    }
+
+    /// Phase 27 reviewer fold-in (HIGH 1, NTFS deleted-block recovery):
+    /// pin the helper-fragment invariants so the canonical `.dpapi`
+    /// paths only ever receive DPAPI-protected bytes wrapped in the
+    /// reviewed `RNYDPAPI` envelope.
+    #[test]
+    fn bootstrap_native_helper_defines_dpapi_envelope_and_shred() {
+        let script = windows_bootstrap_native_helper_fragment();
+
+        assert!(
+            script.contains("function New-RustyNetDpapiEnvelope"),
+            "bootstrap helper must define the RNYDPAPI envelope builder"
+        );
+        assert!(
+            script.contains("function Write-RustyNetDpapiBlobAtomic"),
+            "bootstrap helper must define an atomic blob writer"
+        );
+        assert!(
+            script.contains("function Remove-RustyNetPlaintextTempFile"),
+            "bootstrap helper must define the plaintext-shred routine"
+        );
+        assert!(
+            script.contains("0x52,0x4E,0x59,0x44,0x50,0x41,0x50,0x49"),
+            "RNYDPAPI envelope must embed the reviewed 8-byte magic (matches decode_windows_dpapi_passphrase_blob)"
+        );
+        // The Protect invocation itself lives at the call-site
+        // (`run_windows_e2e_bootstrap`), pinned via the source-grep
+        // test `e2e_bootstrap_provisions_windows_membership_signing_passphrase_blob`.
+        let source = windows_install_impl_source();
+        assert!(
+            source.contains("[System.Security.Cryptography.ProtectedData]::Protect"),
+            "bootstrap script must invoke ProtectedData::Protect on the in-memory plaintext (HIGH 1)"
         );
     }
 
@@ -1159,8 +1403,11 @@ mod tests {
     fn windows_e2e_bootstrap_timeout_covers_key_and_membership_budget() {
         // Bootstrap does NOT start the service; the service is deferred to
         // EnforceBaselineRuntime (after verifier keys are distributed).
-        // The timeout only needs to cover: key init, membership init,
-        // key store-passphrase, and runtime-acls-check.
+        // The timeout only needs to cover: key init, membership init, the
+        // PowerShell-side DPAPI protect + atomic envelope write for both
+        // the WG and signing passphrases (Phase 27 reviewer fold-in: the
+        // previous `key store-passphrase` invocations were replaced with
+        // in-PowerShell `ProtectedData::Protect`), and runtime-acls-check.
         assert!(
             WINDOWS_E2E_BOOTSTRAP_TIMEOUT.as_secs() > 120,
             "bootstrap timeout must leave budget for key init, membership init, and ACL checks"
