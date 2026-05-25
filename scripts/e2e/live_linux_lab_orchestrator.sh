@@ -2709,20 +2709,24 @@ MACOS_CLEANUP
 # Idempotent. Used by Phase 24's mixed-OS bring-up so Windows can join a
 # fresh fleet alongside the Linux + macOS hosts without leaving stale
 # membership/trust files behind.
+#
+# PowerShell is invoked via live_lab_ssh_windows, which wraps the
+# payload in `cmd.exe /c "powershell.exe -EncodedCommand <b64>"` so
+# launch survives memory-pressured Windows guests (Phase 23 reviewer
+# finding, Phase 25 lab validation against windows@192.168.65.8). The
+# script payload is constant (no orchestrator-controlled interpolation).
 cleanup_host_worker_windows() {
   local target="$1"
-  # Powershell heredoc-equivalent via `ssh ... powershell -Command`. The
-  # script payload is constant (no orchestrator-controlled interpolation).
-  live_lab_ssh "$target" 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-$ErrorActionPreference = ''Continue'';
-sc.exe stop RustyNet 2>&1 | Out-Null;
-sc.exe delete RustyNet 2>&1 | Out-Null;
-sc.exe stop RustyNetPrivilegedHelper 2>&1 | Out-Null;
-sc.exe delete RustyNetPrivilegedHelper 2>&1 | Out-Null;
-Get-Process -Name rustynetd -ErrorAction SilentlyContinue | Stop-Process -Force;
-Remove-Item -LiteralPath ''C:\ProgramData\RustyNet'' -Recurse -Force -ErrorAction SilentlyContinue;
-exit 0
-"'
+  local ps_payload
+  ps_payload=$'$ErrorActionPreference = \'Continue\';\n'
+  ps_payload+=$'sc.exe stop RustyNet 2>&1 | Out-Null;\n'
+  ps_payload+=$'sc.exe delete RustyNet 2>&1 | Out-Null;\n'
+  ps_payload+=$'sc.exe stop RustyNetPrivilegedHelper 2>&1 | Out-Null;\n'
+  ps_payload+=$'sc.exe delete RustyNetPrivilegedHelper 2>&1 | Out-Null;\n'
+  ps_payload+=$'Get-Process -Name rustynetd -ErrorAction SilentlyContinue | Stop-Process -Force;\n'
+  ps_payload+=$'Remove-Item -LiteralPath \'C:\\ProgramData\\RustyNet\' -Recurse -Force -ErrorAction SilentlyContinue;\n'
+  ps_payload+=$'exit 0\n'
+  live_lab_ssh_windows "$target" "$ps_payload"
 }
 
 stage_bootstrap_hosts() {
@@ -2856,9 +2860,15 @@ bootstrap_host_worker_macos() {
 # `Bootstrap-RustyNetWindows.ps1 -Phase build-release / install-release`
 # (which builds + registers the SCM service), then waits for the
 # `RustyNet` service to reach Running. Fail-closed: each attempt aborts
-# on first error; we retry up to 3 times. PowerShell is invoked via
-# `powershell.exe -NoProfile -ExecutionPolicy Bypass`, which is the
-# only reviewed path (Windows lab guests do not currently ship pwsh).
+# on first error; we retry up to 3 times.
+#
+# PowerShell is invoked via live_lab_ssh_windows, which wraps the
+# payload in `cmd.exe /c "powershell.exe -EncodedCommand <b64>"` so
+# launch survives memory-pressured Windows guests (Phase 23 reviewer
+# finding, Phase 25 lab validation against windows@192.168.65.8 — the
+# raw `ssh ... powershell.exe ...` path failed with HRESULT 0x800705AF
+# / OutOfMemoryException / StackOverflowException thread-create errors
+# on guests with constrained paging-file budgets).
 bootstrap_host_worker_windows() {
   local label="$1"
   local target="$2"
@@ -2879,8 +2889,12 @@ bootstrap_host_worker_windows() {
   printf '[bootstrap] %s %s (%s %s) platform=windows\n' "$label" "$target" "$node_id" "$role"
   # argv-only PowerShell invocation. Each orchestrator-controlled value
   # rides in via a named parameter (-NodeId, -NetworkId, ...); the
-  # wrapper validates each one before any side-effect.
-  invoke_cmd="powershell.exe -NoProfile -ExecutionPolicy Bypass -File '${remote_wrapper}'"
+  # wrapper validates each one before any side-effect. The PowerShell
+  # payload below is the script body that the cmd.exe-wrapped
+  # `powershell.exe -EncodedCommand` runs on the guest. `& '<path>' -A`
+  # invokes the wrapper script via the call operator with named params
+  # so the wrapper's own param-validation is the security boundary.
+  invoke_cmd="& '${remote_wrapper}'"
   invoke_cmd+=" -NodeId '${node_id}'"
   invoke_cmd+=" -NetworkId '${NETWORK_ID}'"
   invoke_cmd+=" -NodeRole '${role}'"
@@ -2888,10 +2902,11 @@ bootstrap_host_worker_windows() {
   invoke_cmd+=" -SourceArchive '${remote_archive}'"
   invoke_cmd+=" -BuildDir '${remote_build_dir}'"
   invoke_cmd+=" -ServiceName '${service_name}'"
+  invoke_cmd+=$'\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n'
   for attempt in $(seq 1 "$max_attempts"); do
     if live_lab_scp_to "$wrapper_local" "$target" "$remote_wrapper" &&
       live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "$remote_archive" &&
-      live_lab_ssh "$target" "$invoke_cmd"
+      live_lab_ssh_windows "$target" "$invoke_cmd"
     then
       return 0
     fi
