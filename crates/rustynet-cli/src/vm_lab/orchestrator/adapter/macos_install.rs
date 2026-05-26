@@ -850,6 +850,66 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_signed_state_body_dispatches_per_platform() {
+        assert!(
+            LIVE_LAB_COMMON.contains("daemon_socket=\"$(rustynet_daemon_socket \"$platform\")\"")
+                && LIVE_LAB_COMMON.contains(
+                    "assignment_bundle=\"$(rustynet_assignment_bundle_path \"$platform\")\""
+                ),
+            "signed-state body must derive daemon socket and assignment bundle path from platform"
+        );
+        assert!(
+            !LIVE_LAB_COMMON.contains(
+                "rustynet assignment verify --bundle /var/lib/rustynet/rustynetd.assignment"
+            ),
+            "signed-state body must not hard-code Linux assignment bundle path"
+        );
+        assert!(
+            LIVE_LAB_COMMON.contains("rustynet_trust_evidence_path \"$platform\"")
+                && LIVE_LAB_COMMON.contains("rustynet_trust_verifier_key_path \"$platform\"")
+                && LIVE_LAB_COMMON.contains("rustynet_trust_watermark_path \"$platform\""),
+            "signed-state body must resolve trust evidence / verifier / watermark via platform helpers"
+        );
+    }
+
+    #[test]
+    fn live_lab_dns_zone_body_dispatches_per_platform() {
+        assert!(
+            LIVE_LAB_COMMON
+                .contains("dns_zone_bundle=\"$(rustynet_dns_zone_bundle_path \"$platform\")\"")
+                && LIVE_LAB_COMMON
+                    .contains("dns_zone_pub=\"$(rustynet_dns_zone_pub_path \"$platform\")\""),
+            "DNS zone body must derive bundle and verifier paths from platform"
+        );
+        assert!(
+            !LIVE_LAB_COMMON.contains(
+                "rustynet dns zone verify --bundle /var/lib/rustynet/rustynetd.dns-zone --verifier-key /etc/rustynet/dns-zone.pub"
+            ),
+            "DNS zone body must not hard-code Linux paths"
+        );
+    }
+
+    #[test]
+    fn live_lab_trust_path_helpers_cover_all_platforms() {
+        for needle in [
+            "rustynet_trust_evidence_path() {",
+            "'/usr/local/var/rustynet/trust/rustynetd.trust'",
+            "'/var/lib/rustynet/rustynetd.trust'",
+            "rustynet_trust_verifier_key_path() {",
+            "'/usr/local/var/rustynet/trust/trust-evidence.pub'",
+            "'/etc/rustynet/trust-evidence.pub'",
+            "rustynet_trust_watermark_path() {",
+            "'/usr/local/var/rustynet/trust/rustynetd.trust.watermark'",
+            "'/var/lib/rustynet/rustynetd.trust.watermark'",
+        ] {
+            assert!(
+                LIVE_LAB_COMMON.contains(needle),
+                "common helper missing trust-path needle: {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),

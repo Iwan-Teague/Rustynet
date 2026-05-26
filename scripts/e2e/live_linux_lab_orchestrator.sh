@@ -4155,9 +4155,9 @@ validate_runtime_worker() {
   # refresh cycle instead of burning it here.
   snapshot="$(live_lab_wait_for_node_convergence "$target" "$node_id" "$role" "$expected_membership_nodes" "$exit_node_id" "$runtime_attempts" "$runtime_sleep_secs" "$platform")"
   wait_rc=$?
-  signed_state_snapshot="$(live_lab_wait_for_signed_state_convergence "$target" "$node_id" "$role" "$zone_name" "${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}" "${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}" "$signed_state_attempts" "$signed_state_sleep_secs")"
+  signed_state_snapshot="$(live_lab_wait_for_signed_state_convergence "$target" "$node_id" "$role" "$zone_name" "${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}" "${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}" "$signed_state_attempts" "$signed_state_sleep_secs" "$platform")"
   signed_state_rc=$?
-  dns_zone_snapshot="$(live_lab_wait_for_dns_zone_convergence "$target" "$node_id" "$zone_name" "$dns_zone_attempts" "$dns_zone_sleep_secs")"
+  dns_zone_snapshot="$(live_lab_wait_for_dns_zone_convergence "$target" "$node_id" "$zone_name" "$dns_zone_attempts" "$dns_zone_sleep_secs" "$platform")"
   dns_zone_rc=$?
   route_policy="$(live_lab_collect_route_policy "$target" "1.1.1.1" "$expected_next_hop" 2>&1)"
   route_policy_rc=$?
@@ -5472,10 +5472,11 @@ live_lab_wait_for_signed_state_convergence() {
   local max_clock_skew_secs="${6:-${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}}"
   local attempts="${7:-20}"
   local sleep_secs="${8:-3}"
+  local platform="${9:-linux}"
   local attempt snapshot
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" "$zone_name" "$max_age_secs" "$max_clock_skew_secs")" || snapshot=""
+    snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" "$zone_name" "$max_age_secs" "$max_clock_skew_secs" "$platform")" || snapshot=""
     if [[ -n "$snapshot" ]] && live_lab_assert_signed_state_health \
       "$snapshot" \
       "$node_id" \
@@ -5488,7 +5489,7 @@ live_lab_wait_for_signed_state_convergence() {
     fi
   done
 
-  snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" "$zone_name" "$max_age_secs" "$max_clock_skew_secs")" || snapshot=""
+  snapshot="$(live_lab_collect_signed_state_snapshot "$target" "$node_id" "$role" "$zone_name" "$max_age_secs" "$max_clock_skew_secs" "$platform")" || snapshot=""
   printf '%s' "$snapshot"
   return 1
 }
@@ -5558,10 +5559,11 @@ live_lab_wait_for_dns_zone_convergence() {
   local zone_name="${3:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
   local attempts="${4:-20}"
   local sleep_secs="${5:-3}"
+  local platform="${6:-linux}"
   local attempt snapshot
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" "$zone_name")" || snapshot=""
+    snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" "$zone_name" "$platform")" || snapshot=""
     if [[ -n "$snapshot" ]] && live_lab_assert_dns_zone_health \
       "$snapshot" \
       "$node_id" \
@@ -5574,7 +5576,7 @@ live_lab_wait_for_dns_zone_convergence() {
     fi
   done
 
-  snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" "$zone_name")" || snapshot=""
+  snapshot="$(live_lab_collect_dns_zone_snapshot "$target" "$node_id" "$zone_name" "$platform")" || snapshot=""
   printf '%s' "$snapshot"
   return 1
 }
