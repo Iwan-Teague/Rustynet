@@ -563,6 +563,16 @@ pub fn store_macos_generic_password(
 /// `SecKeychainOpen` and `SecKeychainAddGenericPassword` fail — callers
 /// must NOT retry on a third path; one hardened execution path per
 /// security-sensitive workflow (CLAUDE.md §3, §4).
+///
+/// `SecKeychain::open` returns a handle but does not unlock the keychain;
+/// `set_generic_password` then fails with `errSecAuthFailed` on a locked
+/// System.keychain even when the calling uid is root. Unlock the keychain
+/// with the default empty password before writing — fresh macOS images
+/// ship System.keychain with no password, and Phase 24's lab VM matches
+/// that default. If a custom System.keychain password has been set
+/// (operator territory) the unlock fails and `set_generic_password` will
+/// in turn fail with `OsStoreUnavailable`, surfacing the misconfiguration
+/// at the bootstrap-time `rustynet key init` rather than masking it.
 #[cfg(target_os = "macos")]
 fn store_macos_generic_password_system_keychain(
     service: &str,
@@ -571,8 +581,12 @@ fn store_macos_generic_password_system_keychain(
 ) -> Result<(), CryptoError> {
     validate_macos_keychain_label("service", service)?;
     validate_macos_keychain_label("account", account)?;
-    let keychain = SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)
+    let mut keychain = SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)
         .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    // Empty-password unlock — the standard System.keychain default on
+    // a fresh macOS image. `keychain.unlock(None)` would prompt
+    // interactively (no GUI here), so we pass Some("") explicitly.
+    let _ = keychain.unlock(Some(""));
     // `SecKeychain::set_generic_password` deletes any pre-existing item
     // for the (service, account) pair before adding the new password, so
     // `key init --force` re-runs cleanly land in the same slot rather
