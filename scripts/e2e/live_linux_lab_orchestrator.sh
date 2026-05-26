@@ -2688,8 +2688,6 @@ cleanup_host_worker_macos() {
   # Payload is constant; no orchestrator-controlled value is interpolated.
   # Do not use ssh stdin here: live_lab_ssh_via_ssh intentionally passes -n.
   cleanup_cmd="$(cat <<'MACOS_CLEANUP'
-chown root:wheel /private/tmp
-chmod 1777 /private/tmp
 launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
 launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
 pkill -9 rustynetd 2>/dev/null || true
@@ -2811,7 +2809,7 @@ EOF_ENV
 # invoke the wrapper on the target host. The wrapper derives the per-node
 # utun interface name (FNV-1a, same constants as the Rust adapter in
 # crates/rustynet-cli/.../macos_install.rs), extracts the source into
-# `/tmp/rn_build`, runs `Bootstrap-RustyNetMacos.sh`, and polls for the
+# `/private/var/tmp/rn_build`, runs `Bootstrap-RustyNetMacos.sh`, and polls for the
 # daemon Unix socket. Fail-closed: each attempt aborts on first error;
 # we retry up to 3 times to absorb transient sudo/SSH flakes.
 bootstrap_host_worker_macos() {
@@ -2820,10 +2818,11 @@ bootstrap_host_worker_macos() {
   local node_id="$3"
   local role="$4"
   local wrapper_local="$ROOT_DIR/scripts/e2e/rn_bootstrap_macos.sh"
-  local remote_wrapper="/tmp/rn_bootstrap_macos.sh"
-  local remote_archive="/tmp/rustynet_src.tar.gz"
-  local remote_env="/tmp/rn_macos_bootstrap.env"
-  local remote_build_dir="/tmp/rn_build"
+  local remote_tmp="/private/var/tmp"
+  local remote_wrapper="${remote_tmp}/rn_bootstrap_macos.sh"
+  local remote_archive="${remote_tmp}/rustynet_src.tar.gz"
+  local remote_env="${remote_tmp}/rn_macos_bootstrap.env"
+  local remote_build_dir="${remote_tmp}/rn_build"
   local attempt max_attempts=3 sleep_secs=10
   local invoke_cmd
   if [[ ! -f "$wrapper_local" ]]; then
