@@ -2613,34 +2613,48 @@ impl DaemonBackend {
                     }
                     #[cfg(not(test))]
                     {
-                        let backend =
-                            if let Some(ref helper_path) = config.privileged_helper_socket_path {
-                                let socket_path = helper_path.clone();
-                                let timeout = std::time::Duration::from_millis(
-                                    config.privileged_helper_timeout_ms.get(),
-                                );
-                                let opener: MacosUtunOpenerFn = Box::new(move |iface: &str| {
-                                    crate::macos_utun_helper::send_utun_open_request(
-                                        &socket_path,
-                                        iface,
-                                        timeout,
-                                    )
-                                });
-                                MacosUserspaceSharedBackend::new_with_helper(
-                                    config.wg_interface.clone(),
-                                    private_key.to_string_lossy().to_string(),
-                                    config.wg_listen_port,
-                                    opener,
+                        let backend = if let Some(ref helper_path) =
+                            config.privileged_helper_socket_path
+                        {
+                            let socket_path = helper_path.clone();
+                            let timeout = std::time::Duration::from_millis(
+                                config.privileged_helper_timeout_ms.get(),
+                            );
+                            let opener: MacosUtunOpenerFn = Box::new(move |iface: &str| {
+                                crate::macos_utun_helper::send_utun_open_request(
+                                    &socket_path,
+                                    iface,
+                                    timeout,
                                 )
-                                .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?
-                            } else {
-                                MacosUserspaceSharedBackend::new(
-                                    config.wg_interface.clone(),
-                                    private_key.to_string_lossy().to_string(),
-                                    config.wg_listen_port,
-                                )
-                                .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?
-                            };
+                            });
+                            // Route the macOS backend's ifconfig / route
+                            // invocations through the privileged helper
+                            // (the daemon runs as User=rustynetd; the
+                            // SIOCAIFADDR / SIOCDIFADDR ioctls and `route`
+                            // require root). Mirrors the Linux flow that
+                            // wraps `PrivilegedCommandClient` in
+                            // `PrivilegedHelperWireguardRunner`.
+                            let helper_client = PrivilegedCommandClient::new(
+                                helper_path.clone(),
+                                Duration::from_millis(config.privileged_helper_timeout_ms.get()),
+                            )
+                            .map_err(DaemonError::InvalidConfig)?;
+                            MacosUserspaceSharedBackend::new_with_helper_runner(
+                                config.wg_interface.clone(),
+                                private_key.to_string_lossy().to_string(),
+                                config.wg_listen_port,
+                                PrivilegedHelperWireguardRunner::new(helper_client),
+                                opener,
+                            )
+                            .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?
+                        } else {
+                            MacosUserspaceSharedBackend::new(
+                                config.wg_interface.clone(),
+                                private_key.to_string_lossy().to_string(),
+                                config.wg_listen_port,
+                            )
+                            .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?
+                        };
                         Ok(Self::MacosUserspaceShared(backend))
                     }
                 }
