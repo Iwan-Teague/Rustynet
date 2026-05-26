@@ -3184,8 +3184,15 @@ distribute_traversal_worker() {
   printf '[traversal-distribute] %s %s platform=%s\n' "$node_id" "$target" "$platform"
   live_lab_ensure_rustynetd_group "$target" "$platform" || return 1
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/traversal-issue/rn-traversal-${node_id}.traversal" "$bundle_local" || return 1
-  live_lab_scp_to "$STATE_DIR/traversal.pub" "$target" "/tmp/rn-traversal.pub"
-  live_lab_scp_to "$bundle_local" "$target" "/tmp/rn-traversal.bundle"
+  local staging_dir remote_pub remote_bundle
+  staging_dir="/tmp"
+  if [[ "$platform" == "macos" ]]; then
+    staging_dir="/private/var/tmp"
+  fi
+  remote_pub="${staging_dir}/rn-traversal.pub"
+  remote_bundle="${staging_dir}/rn-traversal.bundle"
+  live_lab_scp_to "$STATE_DIR/traversal.pub" "$target" "$remote_pub"
+  live_lab_scp_to "$bundle_local" "$target" "$remote_bundle"
   local traversal_pub_path bundle_path watermark_path config_dir state_root
   traversal_pub_path="$(rustynet_traversal_pub_path "$platform")"
   bundle_path="$(rustynet_traversal_bundle_path "$platform")"
@@ -3199,11 +3206,11 @@ set -euo pipefail
 root mkdir -p '${state_root}/trust' '${config_dir}'
 root chown -R rustynetd:rustynetd '${state_root}/trust'
 root chmod 700 '${state_root}/trust'
-root install -m 0644 /tmp/rn-traversal.pub '${traversal_pub_path}'
+root install -m 0644 '${remote_pub}' '${traversal_pub_path}'
 root chown root:rustynetd '${traversal_pub_path}'
-root install -m 0640 /tmp/rn-traversal.bundle '${bundle_path}'
+root install -m 0640 '${remote_bundle}' '${bundle_path}'
 root chown root:rustynetd '${bundle_path}'
-root rm -f '${watermark_path}' /tmp/rn-traversal.pub /tmp/rn-traversal.bundle
+root rm -f '${watermark_path}' '${remote_pub}' '${remote_bundle}'
 "
       ;;
     windows)
@@ -3211,7 +3218,7 @@ root rm -f '${watermark_path}' /tmp/rn-traversal.pub /tmp/rn-traversal.bundle
       return 1
       ;;
     *)
-      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root '${remote_pub}' /etc/rustynet/traversal.pub && root install -m 0640 -o root -g rustynetd '${remote_bundle}' /var/lib/rustynet/rustynetd.traversal && root rm -f /var/lib/rustynet/rustynetd.traversal.watermark '${remote_pub}' '${remote_bundle}'"
       ;;
   esac
 }

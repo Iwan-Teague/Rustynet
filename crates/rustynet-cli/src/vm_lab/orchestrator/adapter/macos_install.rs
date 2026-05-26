@@ -41,6 +41,8 @@ static WINDOWS_BOOTSTRAP_WRAPPER: &str =
 #[cfg(test)]
 static LIVE_LINUX_LAB_ORCHESTRATOR: &str =
     include_str!("../../../../../../scripts/e2e/live_linux_lab_orchestrator.sh");
+#[cfg(test)]
+static LIVE_LAB_COMMON: &str = include_str!("../../../../../../scripts/e2e/live_lab_common.sh");
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -654,6 +656,48 @@ mod tests {
             !LIVE_LINUX_LAB_ORCHESTRATOR
                 .contains("root install -m 0600 /tmp/rn-membership.snapshot '${snapshot_path}'"),
             "macOS membership distribution must not hard-code /tmp"
+        );
+    }
+
+    #[test]
+    fn live_lab_macos_signed_artifact_distribution_uses_writable_staging() {
+        for needle in [
+            "remote_pub=\"${staging_dir}/rn-assignment.pub\"",
+            "remote_bundle=\"${staging_dir}/rn-assignment.bundle\"",
+            "remote_env=\"${staging_dir}/rn-assignment-refresh.env\"",
+            "remote_pub=\"${staging_dir}/rn-dns-zone.pub\"",
+            "remote_bundle=\"${staging_dir}/rn-dns-zone.bundle\"",
+        ] {
+            assert!(
+                LIVE_LAB_COMMON.contains(needle),
+                "common helper missing {needle}"
+            );
+        }
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("remote_pub=\"${staging_dir}/rn-traversal.pub\""),
+            "traversal pub staging path must be platform-derived"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("remote_bundle=\"${staging_dir}/rn-traversal.bundle\""),
+            "traversal bundle staging path must be platform-derived"
+        );
+        assert!(
+            !LIVE_LAB_COMMON.contains(
+                "scp_to \"$assignment_pub_local\" \"$target\" \"/tmp/rn-assignment.pub\""
+            ),
+            "assignment install must not hard-code /tmp for macOS"
+        );
+        assert!(
+            !LIVE_LAB_COMMON
+                .contains("scp_to \"$env_local\" \"$target\" \"/tmp/rn-assignment-refresh.env\""),
+            "assignment refresh install must not hard-code /tmp for macOS"
+        );
+        assert!(
+            !LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "scp_to \"$STATE_DIR/traversal.pub\" \"$target\" \"/tmp/rn-traversal.pub\""
+            ),
+            "traversal install must not hard-code /tmp for macOS"
         );
     }
 
