@@ -2304,26 +2304,30 @@ impl MacosCommandSystem {
         let mut rules = String::new();
         rules.push_str("set block-policy drop\n");
         if !strict_fail_closed {
-            rules.push_str("pass out quick inet on lo0 all keep state\n");
+            // pf grammar: `[action] [direction] [quick] [on <iface>] [<af>] [proto <p>] …`.
+            // The address family token (`inet`/`inet6`) MUST come after
+            // `on <iface>`, not before. macOS pfctl rejects the reversed form
+            // with `syntax error` (verified against Phase 24 lab macOS 26.5).
+            rules.push_str("pass out quick on lo0 inet all keep state\n");
             if self.dns_protected {
                 rules.push_str(&format!(
-                    "pass out quick inet proto udp on {} to any port 53 keep state\n",
+                    "pass out quick on {} inet proto udp to any port 53 keep state\n",
                     self.interface_name
                 ));
                 rules.push_str(&format!(
-                    "pass out quick inet proto tcp on {} to any port 53 keep state\n",
+                    "pass out quick on {} inet proto tcp to any port 53 keep state\n",
                     self.interface_name
                 ));
                 rules.push_str("block drop out quick inet proto udp to any port 53\n");
                 rules.push_str("block drop out quick inet proto tcp to any port 53\n");
             }
             rules.push_str(&format!(
-                "pass out quick inet on {} all keep state\n",
+                "pass out quick on {} inet all keep state\n",
                 self.interface_name
             ));
             if self.allow_egress_interface {
                 rules.push_str(&format!(
-                    "pass out quick inet on {} all keep state\n",
+                    "pass out quick on {} inet all keep state\n",
                     self.egress_interface
                 ));
             }
@@ -2348,10 +2352,13 @@ impl MacosCommandSystem {
             }
         }
         for endpoint in &self.traversal_bootstrap_allow_endpoints {
+            // Address family (`inet`/`inet6`) must come after `on <iface>`
+            // per the macOS pf grammar — see strict_fail_closed=false block
+            // above for the same constraint.
             rules.push_str(&format!(
-                "pass out quick {} proto udp on {} to {} port {} keep state\n",
-                pf_family_for_ip(endpoint.ip()),
+                "pass out quick on {} {} proto udp to {} port {} keep state\n",
                 self.egress_interface,
+                pf_family_for_ip(endpoint.ip()),
                 endpoint.ip(),
                 endpoint.port()
             ));
@@ -10155,8 +10162,8 @@ mod tests {
         let rules = system
             .render_pf_rules(false)
             .expect("rule render should succeed");
-        assert!(rules.contains("pass out quick inet proto udp on utun9 to any port 53 keep state"));
-        assert!(rules.contains("pass out quick inet proto tcp on utun9 to any port 53 keep state"));
+        assert!(rules.contains("pass out quick on utun9 inet proto udp to any port 53 keep state"));
+        assert!(rules.contains("pass out quick on utun9 inet proto tcp to any port 53 keep state"));
         assert!(rules.contains("block drop out quick inet proto udp to any port 53"));
         assert!(rules.contains("block drop out quick inet proto tcp to any port 53"));
     }
@@ -10176,13 +10183,13 @@ mod tests {
         assert_eq!(
             rules,
             "set block-policy drop\n\
-             pass out quick inet on lo0 all keep state\n\
-             pass out quick inet proto udp on utun9 to any port 53 keep state\n\
-             pass out quick inet proto tcp on utun9 to any port 53 keep state\n\
+             pass out quick on lo0 inet all keep state\n\
+             pass out quick on utun9 inet proto udp to any port 53 keep state\n\
+             pass out quick on utun9 inet proto tcp to any port 53 keep state\n\
              block drop out quick inet proto udp to any port 53\n\
              block drop out quick inet proto tcp to any port 53\n\
-             pass out quick inet on utun9 all keep state\n\
-             pass out quick inet on en0 all keep state\n\
+             pass out quick on utun9 inet all keep state\n\
+             pass out quick on en0 inet all keep state\n\
              block drop out quick inet6 all\n\
              block drop out quick all\n"
         );
@@ -10195,8 +10202,8 @@ mod tests {
         let rules = system
             .render_pf_rules(false)
             .expect("rule render should succeed");
-        assert!(!rules.contains("proto udp on utun9 to any port 53"));
-        assert!(!rules.contains("proto tcp on utun9 to any port 53"));
+        assert!(!rules.contains("on utun9 inet proto udp to any port 53"));
+        assert!(!rules.contains("on utun9 inet proto tcp to any port 53"));
         assert!(!rules.contains("block drop out quick inet proto udp to any port 53"));
         assert!(!rules.contains("block drop out quick inet proto tcp to any port 53"));
     }
@@ -10226,9 +10233,9 @@ mod tests {
         assert_eq!(
             rules,
             "set block-policy drop\n\
-             pass out quick inet on lo0 all keep state\n\
-             pass out quick inet on utun9 all keep state\n\
-             pass out quick inet on en0 all keep state\n\
+             pass out quick on lo0 inet all keep state\n\
+             pass out quick on utun9 inet all keep state\n\
+             pass out quick on en0 inet all keep state\n\
              block drop out quick all\n"
         );
     }
@@ -10246,9 +10253,9 @@ mod tests {
             .render_pf_rules(false)
             .expect("blind_exit rule render should succeed");
 
-        assert!(rules.contains("pass out quick inet on rustynet0 all keep state"));
-        assert!(rules.contains("pass out quick inet on en0 from 100.64.0.0/10 to any keep state"));
-        assert!(!rules.contains("pass out quick inet on en0 all keep state"));
+        assert!(rules.contains("pass out quick on rustynet0 inet all keep state"));
+        assert!(rules.contains("pass out quick on en0 inet from 100.64.0.0/10 to any keep state"));
+        assert!(!rules.contains("pass out quick on en0 inet all keep state"));
         assert!(rules.contains("block drop out quick inet6 all"));
         assert!(rules.ends_with("block drop out quick all\n"));
     }
@@ -10331,7 +10338,7 @@ mod tests {
             .expect("rule render should succeed");
         assert!(
             rules.contains(
-                "pass out quick inet proto udp on en0 to 203.0.113.10 port 3478 keep state"
+                "pass out quick on en0 inet proto udp to 203.0.113.10 port 3478 keep state"
             )
         );
         assert!(rules.contains("block drop out quick all"));
