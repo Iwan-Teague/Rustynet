@@ -2259,6 +2259,15 @@ elif command -v route >/dev/null 2>&1; then
   done <<< "\$route_get_output"
 fi
 actual_next_hop="unresolved"
+# macOS route -n get for a route whose nexthop is a P2P/tunnel interface
+# emits gateway in the form 'index: <ifindex> <device>' rather than an IP
+# address. After whitespace stripping that becomes 'index:<N><device>'.
+# Treat this case as a direct-link route to the device so the next-hop
+# canonical form matches the orchestrator's expected 'direct:<dev>'.
+if [[ "\$actual_via" =~ ^index:[0-9]+([A-Za-z][A-Za-z0-9]*)\$ ]]; then
+  actual_route_device="\${BASH_REMATCH[1]}"
+  actual_via=""
+fi
 if [[ -n "\$actual_via" ]]; then
   actual_next_hop="\$actual_via"
 elif [[ -n "\$actual_route_device" && "\$route_get_rc" -eq 0 ]]; then
