@@ -18,6 +18,8 @@ use rustynet_windows_native::{
     WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
 };
 #[cfg(target_os = "macos")]
+use security_framework::os::macos::keychain::SecKeychain;
+#[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -500,16 +502,84 @@ fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
     Ok(value)
 }
 
+/// Absolute path to the macOS System keychain.
+///
+/// Service-account / launchd-managed callers (`rustynetd`) have no
+/// user-session default keychain, so any `SecItem`/`set_generic_password`
+/// call that targets the default keychain fails with
+/// `errSecNoDefaultKeychain` (-25307). The System keychain is the
+/// hardened fallback the daemon reads from at startup; the load-side
+/// already targets it via the `security` CLI. Mirroring that target
+/// here closes Gap H surfaced in Phase 24 live validation.
+#[cfg(target_os = "macos")]
+pub const MACOS_SYSTEM_KEYCHAIN_PATH: &str = "/Library/Keychains/System.keychain";
+
+/// Strict allow-list for the keychain `service` and `account` labels we
+/// hand to `SecKeychain::set_generic_password`. The safe Rust API does
+/// not interpolate shell metacharacters, but defense-in-depth still
+/// rejects whitespace, control bytes, NUL, and over-long values that
+/// could confuse Keychain Services. CWE-20 / SecurityMinimumBar §3.7.
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_macos_keychain_label(field: &str, value: &str) -> Result<(), CryptoError> {
+    let _ = field;
+    if value.is_empty() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    if value.len() > 128 {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    if !value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '+' | '@')
+    }) {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 pub fn store_macos_generic_password(
     service: &str,
     account: &str,
     secret: &[u8],
 ) -> Result<(), CryptoError> {
-    if service.trim().is_empty() || account.trim().is_empty() {
-        return Err(CryptoError::OsStoreUnavailable);
+    validate_macos_keychain_label("service", service)?;
+    validate_macos_keychain_label("account", account)?;
+    // Default keychain first. Works for an interactive operator/CLI run from
+    // a login shell — the user-session keychain is the canonical place for
+    // per-user secrets.
+    if set_generic_password(service, account, secret).is_ok() {
+        return Ok(());
     }
-    set_generic_password(service, account, secret).map_err(|_| CryptoError::OsStoreUnavailable)
+    // Fallback: target the System keychain explicitly. Required for the
+    // launchd-managed daemon and for any other context that lacks a
+    // reachable default keychain (e.g. `sudo -u rustynetd ... key init`).
+    // Mirrors the load-side fallback in `load_macos_generic_password`.
+    store_macos_generic_password_system_keychain(service, account, secret)
+}
+
+/// Targets the macOS System keychain via the legacy `SecKeychain` API.
+/// Used as the fail-closed fallback when the default keychain is
+/// unreachable. Returns `Err(OsStoreUnavailable)` if both
+/// `SecKeychainOpen` and `SecKeychainAddGenericPassword` fail — callers
+/// must NOT retry on a third path; one hardened execution path per
+/// security-sensitive workflow (CLAUDE.md §3, §4).
+#[cfg(target_os = "macos")]
+fn store_macos_generic_password_system_keychain(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Result<(), CryptoError> {
+    validate_macos_keychain_label("service", service)?;
+    validate_macos_keychain_label("account", account)?;
+    let keychain = SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    // `SecKeychain::set_generic_password` deletes any pre-existing item
+    // for the (service, account) pair before adding the new password, so
+    // `key init --force` re-runs cleanly land in the same slot rather
+    // than colliding on `errSecDuplicateItem`.
+    keychain
+        .set_generic_password(service, account, secret)
+        .map_err(|_| CryptoError::OsStoreUnavailable)
 }
 
 #[cfg(target_os = "macos")]
@@ -1684,6 +1754,202 @@ mod tests {
             provider.verify_attestation(payload, &mauled).err(),
             Some(CryptoError::AttestationVerificationFailed),
             "verify_strict must reject the non-canonical (mauled) signature"
+        );
+    }
+
+    // ─── macOS Keychain System.keychain fallback (Gap H) ───────────────
+    //
+    // The store-side System.keychain fallback closes Phase 24 Gap H:
+    // `PlatformOsSecureStore::store_key` on macOS previously hard-failed
+    // when `set_generic_password` returned `errSecNoDefaultKeychain`
+    // (the launchd-managed `rustynetd` service account has no
+    // user-session default keychain). The load side already targets
+    // `/Library/Keychains/System.keychain` via the `security` CLI; the
+    // store side now mirrors that target via `SecKeychain::set_generic_password`.
+    //
+    // Source-pin tests below guard the contract without requiring a
+    // live macOS host: they read this very source file and assert the
+    // System.keychain path, the safe-Rust API call, and the strict
+    // input validators are present. Live behaviour is exercised by
+    // the Phase 24+ macOS bring-up smoke (`rustynetd key init` under
+    // sudo, then `security find-generic-password ... /Library/Keychains/System.keychain`).
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validate_macos_keychain_label_rejects_injection_vectors() {
+        use super::validate_macos_keychain_label;
+        // Empty.
+        assert!(validate_macos_keychain_label("account", "").is_err());
+        // Whitespace, control bytes, NUL, newline, semicolon, backtick — all
+        // illegal under the strict allow-list. The label-allow-list is
+        // narrower than what Keychain Services itself accepts so that any
+        // future shell or `security` CLI re-introduction (e.g. for the
+        // current load-side fallback) cannot be tricked by an attacker
+        // controlling the label.
+        for bad in [
+            " account",
+            "account ",
+            "acc\tount",
+            "acc\nount",
+            "acc\0unt",
+            "acc;rm",
+            "acc$0",
+            "acc`id`",
+            "acc'or'1",
+            "acc\"or\"1",
+            "acc\\x",
+            "acc|sh",
+            "acc&bg",
+            "acc*glob",
+            "acc?glob",
+            "acc(",
+        ] {
+            assert!(
+                validate_macos_keychain_label("account", bad).is_err(),
+                "label {bad:?} must be rejected"
+            );
+        }
+        // Over-length: 129 chars exceeds the 128-cap.
+        let too_long: String = "a".repeat(129);
+        assert!(validate_macos_keychain_label("account", &too_long).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validate_macos_keychain_label_accepts_canonical_descriptors() {
+        use super::validate_macos_keychain_label;
+        // Canonical service/account pairs the daemon and ops verbs hand to
+        // the keychain backend. Pinning these so a tightening of the
+        // allow-list cannot silently break the bootstrap.
+        for good in [
+            // WireGuard key custody (key_material.rs).
+            "rustynet.wg-private-deadbeef01234567",
+            "rustynet",
+            // WireGuard passphrase service (key_material.rs:43).
+            "net.rustynet.wg-key-passphrase",
+            "wg-passphrase-node-001",
+            // Membership-owner signing-key passphrase (ops_e2e.rs:1026).
+            "signing_key_passphrase",
+            "membership-owner-signing-key",
+            // Anchor enrollment HMAC secret (SecurityMinimumBar §6.C/4).
+            "rustynet.anchor_enrollment_secret",
+        ] {
+            assert!(
+                validate_macos_keychain_label("test", good).is_ok(),
+                "label {good:?} must be accepted"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_macos_generic_password_rejects_invalid_labels_fail_closed() {
+        use super::store_macos_generic_password;
+        // Per CLAUDE.md §3 / §4: validation MUST be enforced before any
+        // keychain mutation. An injection-shaped label must never reach
+        // the keychain — assert the bad-label arm returns
+        // `OsStoreUnavailable` rather than spawning a process or
+        // touching the keychain.
+        let result = store_macos_generic_password("svc;rm -rf /", "acct", b"secret");
+        assert_eq!(result.err(), Some(CryptoError::OsStoreUnavailable));
+        let result = store_macos_generic_password("svc", "acct\0name", b"secret");
+        assert_eq!(result.err(), Some(CryptoError::OsStoreUnavailable));
+        let result = store_macos_generic_password("", "acct", b"secret");
+        assert_eq!(result.err(), Some(CryptoError::OsStoreUnavailable));
+        let result = store_macos_generic_password("svc", "", b"secret");
+        assert_eq!(result.err(), Some(CryptoError::OsStoreUnavailable));
+    }
+
+    /// Pin: the store-side System.keychain fallback path is wired through
+    /// the safe Rust `SecKeychain::set_generic_password` API, NOT through
+    /// the `security` CLI. The previous CLI-based attempt was rejected
+    /// because the macOS `security` CLI cannot accept the password on
+    /// stdin when targeting a non-default keychain (the password must
+    /// appear in argv, briefly visible to other same-uid processes via
+    /// `ps`). The safe Rust API holds the plaintext only in our process
+    /// address space.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_macos_generic_password_does_not_spawn_security_cli() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+
+        // Slice the exact body of `store_macos_generic_password_system_keychain`.
+        // We end at the first top-level `\n}\n` after the signature so the
+        // pin does not pick up the load-side helper (which DOES call the
+        // `security` CLI as the read-only fallback). Source-pin tests
+        // must scope to the function under test, not the entire file.
+        let start = body
+            .find("fn store_macos_generic_password_system_keychain(")
+            .expect("System.keychain store helper must remain present");
+        let rel_end = body[start..]
+            .find("\n}\n")
+            .expect("System.keychain store helper must have a closing brace");
+        let window = &body[start..start + rel_end + 3];
+
+        assert!(
+            window.contains("SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)"),
+            "store helper must open the System keychain via the safe Rust API"
+        );
+        assert!(
+            window.contains(".set_generic_password(service, account, secret)"),
+            "store helper must call the safe Rust set_generic_password"
+        );
+        // No process spawn in the store-side helper — the password must
+        // not transit a child process argv where `ps` could observe it.
+        assert!(
+            !window.contains("Command::new"),
+            "store helper must NOT spawn /usr/bin/security (would leak password into argv)"
+        );
+        assert!(
+            !window.contains("/usr/bin/security"),
+            "store helper must NOT reference the security CLI"
+        );
+    }
+
+    /// Pin: the System.keychain path is declared once, exported as
+    /// `pub const`, and matches the reviewed path used by
+    /// `MacosKeychainBackend::unwrap_credential` in `rustynet-control`.
+    /// A drift between the two paths would split the trust-anchor for
+    /// macOS key custody — load and store MUST target the same keychain
+    /// file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_keychain_path_constant_matches_reviewed_location() {
+        use super::MACOS_SYSTEM_KEYCHAIN_PATH;
+        assert_eq!(
+            MACOS_SYSTEM_KEYCHAIN_PATH, "/Library/Keychains/System.keychain",
+            "macOS System keychain path must remain the reviewed location"
+        );
+    }
+
+    /// Pin: `store_macos_generic_password` tries the default keychain
+    /// first, then falls back to System.keychain — symmetric with the
+    /// load-side fallback in `load_macos_generic_password`. A future
+    /// refactor that removed the fallback would re-open Gap H.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_macos_generic_password_has_system_keychain_fallback() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+
+        let start = body
+            .find("pub fn store_macos_generic_password(")
+            .expect("store_macos_generic_password must remain present");
+        let next_fn = body[start..]
+            .find("\n#[cfg")
+            .expect("store_macos_generic_password must be followed by another macOS-gated item");
+        let window = &body[start..start + next_fn];
+
+        assert!(
+            window.contains("set_generic_password(service, account, secret)"),
+            "default-keychain attempt must remain wired via security_framework"
+        );
+        assert!(
+            window.contains("store_macos_generic_password_system_keychain("),
+            "fallback to System.keychain must be wired (Gap H)"
         );
     }
 }

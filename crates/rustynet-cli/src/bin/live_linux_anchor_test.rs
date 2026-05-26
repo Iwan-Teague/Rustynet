@@ -1724,6 +1724,14 @@ fn remote_join(platform: AnchorPlatform, dir: &str, leaf: &str) -> String {
 /// `Remove-Item -Recurse -Force`. Errors are intentionally
 /// dropped — the substages already returned their primary result
 /// and a noisy cleanup error would mask the real signal.
+///
+/// Phase 29 follow-up (LOW 2 fold-in): the Windows branch now also
+/// stops and removes the `rustynet-anchor-inflight` PowerShell job
+/// emitted by `start_inflight_bundle_pull`. Without the explicit
+/// `Stop-Job` + `Remove-Job` step, a hung job persists until the
+/// host PowerShell exits — which on a long-running orchestrator run
+/// leaks one PowerShell job per substage iteration. The cleanup is
+/// best-effort and silently noops if no job by that name exists.
 fn cleanup_remote_dir(shell: &dyn RemoteShellHost, config: &Config, dir: &str) {
     if !is_safe_remote_dir(config.platform, dir) {
         return;
@@ -1733,10 +1741,7 @@ fn cleanup_remote_dir(shell: &dyn RemoteShellHost, config: &Config, dir: &str) {
             let _ = shell.run_argv(&["rm", "-rf", "--", dir], &[], &[]);
         }
         AnchorPlatform::Windows => {
-            let script = format!(
-                "$ErrorActionPreference='SilentlyContinue'; Remove-Item -LiteralPath '{}' -Recurse -Force",
-                ps_quote_str(dir)
-            );
+            let script = windows_cleanup_remote_dir_script(dir);
             let _ = shell.run_argv(
                 &[
                     "powershell",
@@ -1750,6 +1755,27 @@ fn cleanup_remote_dir(shell: &dyn RemoteShellHost, config: &Config, dir: &str) {
             );
         }
     }
+}
+
+/// Build the PowerShell body that drives the Windows `cleanup_remote_dir`
+/// primitive. Extracted so a unit test can pin the `Stop-Job` step
+/// without needing a remote PowerShell to actually execute it.
+///
+/// The script's contract:
+///   1. Stop + remove the named `rustynet-anchor-inflight` job, if
+///      present, to bound the LOW-2 leak window.
+///   2. Remove the scratch dir recursively. SilentlyContinue so a
+///      missing dir does not propagate an error code (the cleanup
+///      runs best-effort after the substage's primary result).
+fn windows_cleanup_remote_dir_script(dir: &str) -> String {
+    format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Get-Job -Name 'rustynet-anchor-inflight' -ErrorAction SilentlyContinue | \
+         Stop-Job -PassThru -ErrorAction SilentlyContinue | \
+         Remove-Job -Force -ErrorAction SilentlyContinue; \
+         Remove-Item -LiteralPath '{quoted}' -Recurse -Force",
+        quoted = ps_quote_str(dir),
+    )
 }
 
 /// Defence-in-depth check before invoking `rm -rf`: refuse to
@@ -1881,28 +1907,12 @@ fn unwrap_signing_passphrase_to_remote_tmp(
             // skipped — we write inline from PowerShell so the
             // plaintext never leaves the remote host. The work_dir
             // creation is handled by the script itself.
-            let script = format!(
-                "$ErrorActionPreference='Stop'; \
-                 $work = '{work}'; \
-                 if (-not (Test-Path -LiteralPath $work)) {{ New-Item -ItemType Directory -Force -Path $work | Out-Null }}; \
-                 $blob = [System.IO.File]::ReadAllBytes('{cred}'); \
-                 if ($blob.Length -lt 14) {{ Write-Error 'RNYDPAPI envelope too short'; exit 1 }}; \
-                 $magic = [System.Text.Encoding]::ASCII.GetBytes('RNYDPAPI'); \
-                 for ($i = 0; $i -lt 8; $i++) {{ if ($blob[$i] -ne $magic[$i]) {{ Write-Error 'RNYDPAPI magic missing'; exit 1 }} }}; \
-                 if ($blob[8] -ne 1) {{ Write-Error 'RNYDPAPI unsupported version'; exit 1 }}; \
-                 $declared = ([int]$blob[10] -shl 24) -bor ([int]$blob[11] -shl 16) -bor ([int]$blob[12] -shl 8) -bor [int]$blob[13]; \
-                 $actual = $blob.Length - 14; \
-                 if ($actual -ne $declared) {{ Write-Error 'RNYDPAPI length mismatch'; exit 1 }}; \
-                 $inner = New-Object byte[] $actual; \
-                 [Array]::Copy($blob, 14, $inner, 0, $actual); \
-                 Add-Type -AssemblyName System.Security; \
-                 $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($inner, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine); \
-                 [System.IO.File]::WriteAllBytes('{out}', $plain); \
-                 & icacls '{out}' /inheritance:r /grant:r 'SYSTEM:(F)' /grant:r 'Administrators:(F)' | Out-Null",
-                work = ps_quote_str(work_dir),
-                cred = ps_quote_str(cred_path),
-                out = ps_quote_str(passphrase_path),
-            );
+            //
+            // Phase 29 follow-up (MED 1 fold-in): the script
+            // ordering is now ACL-first — see
+            // `windows_dpapi_unwrap_script` for the canonical
+            // contract + the unit test that pins it.
+            let script = windows_dpapi_unwrap_script(work_dir, cred_path, passphrase_path);
             let status = shell
                 .run_argv(
                     &[
@@ -1926,6 +1936,85 @@ fn unwrap_signing_passphrase_to_remote_tmp(
         }
     }
     Ok(())
+}
+
+/// Build the PowerShell body that drives the Windows DPAPI unwrap
+/// step in `unwrap_signing_passphrase_to_remote_tmp`. Extracted so a
+/// unit test can pin the ACL-first ordering without needing a remote
+/// PowerShell to actually execute the script.
+///
+/// The script's hardened contract (mirrors POSIX
+/// `chmod 700 <work_dir>` ahead of the secret write, and the
+/// `windows_write_file_script` ACL-first pattern in
+/// `live_lab_bin_support/remote_shell.rs`):
+///
+///   1. Create the work dir (no-op if already present).
+///   2. Tighten the DIRECTORY ACL via icacls
+///      (`/inheritance:r` + grant SYSTEM/Administrators full
+///      control). This happens BEFORE any plaintext is written so a
+///      concurrent observer that opens a freshly-created file inside
+///      the dir during the race window inherits the locked-down ACL.
+///   3. Verify the directory's SDDL is canonical (no Everyone /
+///      BUILTIN\Users ACE; SYSTEM + Administrators full control
+///      present). Fail-closed on drift.
+///   4. Read + validate the RNYDPAPI envelope, then
+///      ProtectedData.Unprotect the inner CryptProtectData payload.
+///   5. WriteAllBytes the plaintext into the already-ACL'd dir.
+///   6. Re-tighten the FILE ACL (defense-in-depth — the file
+///      already inherits from the locked-down dir, but an explicit
+///      grant matches the POSIX `chmod 600 <passphrase_path>` step
+///      after `chmod 700 <work_dir>`).
+///   7. Verify the file's SDDL is canonical. On drift the file is
+///      removed and the script throws fail-closed.
+///
+/// Invariant the test pins: between the moment the dir exists and
+/// the moment its DACL is locked down, NO secret bytes can have been
+/// written to disk. Specifically, the `icacls $work` call must
+/// appear in the script text *before* the first `WriteAllBytes`.
+fn windows_dpapi_unwrap_script(work_dir: &str, cred_path: &str, passphrase_path: &str) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         $work = '{work}'; \
+         if (-not (Test-Path -LiteralPath $work)) {{ New-Item -ItemType Directory -Force -Path $work | Out-Null }}; \
+         & icacls $work /inheritance:r /grant:r 'SYSTEM:(F)' /grant:r 'Administrators:(F)' | Out-Null; \
+         $dirAcl = (Get-Acl -LiteralPath $work).Sddl; \
+         if ($dirAcl -match ';WD\\)' -or $dirAcl -match ';BU\\)') {{ \
+           Write-Error 'rustynet-anchor-dpapi: work-dir ACL drift (Users or Everyone present) before secret write'; \
+           exit 1; \
+         }}; \
+         if (-not ($dirAcl -match ';FA;;;SY\\)') -or -not ($dirAcl -match ';FA;;;BA\\)')) {{ \
+           Write-Error 'rustynet-anchor-dpapi: work-dir ACL drift (SYSTEM or Administrators missing) before secret write'; \
+           exit 1; \
+         }}; \
+         $blob = [System.IO.File]::ReadAllBytes('{cred}'); \
+         if ($blob.Length -lt 14) {{ Write-Error 'RNYDPAPI envelope too short'; exit 1 }}; \
+         $magic = [System.Text.Encoding]::ASCII.GetBytes('RNYDPAPI'); \
+         for ($i = 0; $i -lt 8; $i++) {{ if ($blob[$i] -ne $magic[$i]) {{ Write-Error 'RNYDPAPI magic missing'; exit 1 }} }}; \
+         if ($blob[8] -ne 1) {{ Write-Error 'RNYDPAPI unsupported version'; exit 1 }}; \
+         $declared = ([int]$blob[10] -shl 24) -bor ([int]$blob[11] -shl 16) -bor ([int]$blob[12] -shl 8) -bor [int]$blob[13]; \
+         $actual = $blob.Length - 14; \
+         if ($actual -ne $declared) {{ Write-Error 'RNYDPAPI length mismatch'; exit 1 }}; \
+         $inner = New-Object byte[] $actual; \
+         [Array]::Copy($blob, 14, $inner, 0, $actual); \
+         Add-Type -AssemblyName System.Security; \
+         $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($inner, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine); \
+         [System.IO.File]::WriteAllBytes('{out}', $plain); \
+         & icacls '{out}' /inheritance:r /grant:r 'SYSTEM:(F)' /grant:r 'Administrators:(F)' | Out-Null; \
+         $fileAcl = (Get-Acl -LiteralPath '{out}').Sddl; \
+         if ($fileAcl -match ';WD\\)' -or $fileAcl -match ';BU\\)') {{ \
+           Remove-Item -LiteralPath '{out}' -Force -ErrorAction SilentlyContinue; \
+           Write-Error 'rustynet-anchor-dpapi: passphrase file ACL drift after write (Users or Everyone present)'; \
+           exit 1; \
+         }}; \
+         if (-not ($fileAcl -match ';FA;;;SY\\)') -or -not ($fileAcl -match ';FA;;;BA\\)')) {{ \
+           Remove-Item -LiteralPath '{out}' -Force -ErrorAction SilentlyContinue; \
+           Write-Error 'rustynet-anchor-dpapi: passphrase file ACL drift after write (SYSTEM or Administrators missing)'; \
+           exit 1; \
+         }}",
+        work = ps_quote_str(work_dir),
+        cred = ps_quote_str(cred_path),
+        out = ps_quote_str(passphrase_path),
+    )
 }
 
 /// Pre-create a remote scratch directory with the conventional
@@ -3681,5 +3770,191 @@ mod tests {
         shell.program_run_response(&["echo", "hi"], ok_response(b"hi\n"));
         let out = super::run_argv_capture_stdout(&shell, &["echo", "hi"]).expect("success ok");
         assert_eq!(out, "hi\n");
+    }
+
+    // ─── Phase 29 follow-up: MED 1 (Windows DPAPI tempdir ACL pre-tighten) ───
+
+    /// Pins the ACL-first invariant: the icacls call that tightens
+    /// the work-dir DACL MUST appear in the script text before the
+    /// first `WriteAllBytes` (which is the secret write). The
+    /// inverse ordering — what Phase 29 originally shipped — left a
+    /// race window where a concurrent reader could open the
+    /// freshly-written passphrase file under the inherited
+    /// (possibly permissive) `C:\Windows\Temp` ACL.
+    #[test]
+    fn windows_dpapi_unwrap_script_pins_acl_before_secret_write() {
+        let script = super::windows_dpapi_unwrap_script(
+            r"C:\Windows\Temp\rustynet-anchor-enrollment-1-2",
+            r"C:\ProgramData\RustyNet\credentials\signing_key_passphrase.cred",
+            r"C:\Windows\Temp\rustynet-anchor-enrollment-1-2\signing.passphrase",
+        );
+        let icacls_dir = script
+            .find("& icacls $work")
+            .expect("script tightens the work-dir ACL via icacls $work");
+        let write_all_bytes = script
+            .find("WriteAllBytes(")
+            .expect("script writes plaintext via WriteAllBytes");
+        assert!(
+            icacls_dir < write_all_bytes,
+            "icacls on work-dir ({icacls_dir}) must precede WriteAllBytes ({write_all_bytes}); ACL-first ordering broken"
+        );
+    }
+
+    /// Pins the post-write directory-ACL verification step. Without
+    /// the verify step a future regression that swaps the icacls
+    /// call for an ineffective grant (e.g. typo in SID) would
+    /// silently regress: the script would exit 0 even though the
+    /// work dir is still permissive. The verify step's Get-Acl +
+    /// SDDL match makes the regression fail loudly.
+    #[test]
+    fn windows_dpapi_unwrap_script_verifies_dir_acl_before_secret_write() {
+        let script = super::windows_dpapi_unwrap_script(
+            r"C:\Windows\Temp\rustynet-anchor-enrollment-1-2",
+            r"C:\ProgramData\RustyNet\credentials\signing_key_passphrase.cred",
+            r"C:\Windows\Temp\rustynet-anchor-enrollment-1-2\signing.passphrase",
+        );
+        let get_dir_acl = script
+            .find("$dirAcl = (Get-Acl -LiteralPath $work).Sddl")
+            .expect("script reads the work-dir SDDL");
+        let write_all_bytes = script
+            .find("WriteAllBytes(")
+            .expect("script writes plaintext via WriteAllBytes");
+        assert!(
+            get_dir_acl < write_all_bytes,
+            "Get-Acl verify on work-dir ({get_dir_acl}) must precede WriteAllBytes ({write_all_bytes})"
+        );
+        assert!(
+            script
+                .contains("rustynet-anchor-dpapi: work-dir ACL drift (Users or Everyone present) before secret write"),
+            "script must fail-closed if work-dir DACL leaks Users/Everyone"
+        );
+        assert!(
+            script.contains(
+                "rustynet-anchor-dpapi: work-dir ACL drift (SYSTEM or Administrators missing) before secret write"
+            ),
+            "script must fail-closed if SYSTEM/Administrators ACE is missing"
+        );
+    }
+
+    /// Pins the post-write file-ACL verification step + fail-closed
+    /// secret removal on drift. Mirrors the
+    /// `windows_post_move_acl_verify_script` pattern in
+    /// `live_lab_bin_support/remote_shell.rs`.
+    #[test]
+    fn windows_dpapi_unwrap_script_verifies_file_acl_after_secret_write() {
+        let script = super::windows_dpapi_unwrap_script(
+            r"C:\Windows\Temp\rustynet-anchor-enrollment-1-2",
+            r"C:\ProgramData\RustyNet\credentials\signing_key_passphrase.cred",
+            r"C:\Windows\Temp\rustynet-anchor-enrollment-1-2\signing.passphrase",
+        );
+        let write_all_bytes = script
+            .find("WriteAllBytes(")
+            .expect("script writes plaintext");
+        let icacls_file = script
+            .rfind("& icacls '")
+            .expect("script tightens file ACL");
+        let get_file_acl = script
+            .find("$fileAcl = (Get-Acl -LiteralPath '")
+            .expect("script reads file SDDL after write");
+        assert!(
+            write_all_bytes < icacls_file,
+            "file icacls must run after the write (defense-in-depth)"
+        );
+        assert!(
+            icacls_file < get_file_acl,
+            "file ACL verify must run after the file icacls"
+        );
+        assert!(
+            script.contains("Remove-Item -LiteralPath '")
+                && script.contains(
+                    "rustynet-anchor-dpapi: passphrase file ACL drift after write (Users or Everyone present)"
+                ),
+            "drift must trigger secret-file removal + fail-closed throw"
+        );
+    }
+
+    // ─── Phase 29 follow-up: LOW 2 (Start-Job cleanup) ───
+
+    /// Pins the LOW-2 fold-in: `cleanup_remote_dir` on Windows MUST
+    /// stop + remove the `rustynet-anchor-inflight` PowerShell job
+    /// before removing the scratch dir. Without this step a hung
+    /// job (e.g. listener accepts then never replies, so
+    /// `$client.Available -gt 0` polls forever) persists until the
+    /// host PowerShell process exits.
+    #[test]
+    fn windows_cleanup_remote_dir_script_stops_inflight_job_before_removing_dir() {
+        let script = super::windows_cleanup_remote_dir_script(
+            r"C:\Windows\Temp\rustynet-anchor-inflight-1-2",
+        );
+        let get_job = script
+            .find("Get-Job -Name 'rustynet-anchor-inflight'")
+            .expect("script must reference the named Start-Job");
+        let stop_job = script.find("Stop-Job").expect("script must call Stop-Job");
+        let remove_job = script
+            .find("Remove-Job")
+            .expect("script must call Remove-Job");
+        let remove_item = script
+            .find("Remove-Item -LiteralPath '")
+            .expect("script must remove the scratch dir");
+        assert!(
+            get_job < stop_job,
+            "Get-Job ({get_job}) must precede Stop-Job ({stop_job})"
+        );
+        assert!(
+            stop_job < remove_job,
+            "Stop-Job ({stop_job}) must precede Remove-Job ({remove_job})"
+        );
+        assert!(
+            remove_job < remove_item,
+            "Remove-Job ({remove_job}) must precede Remove-Item ({remove_item}) so a hung job is cleaned up before the dir is gone"
+        );
+        // Silent-continue everywhere so cleanup never masks a real
+        // substage failure.
+        assert!(
+            script.contains("$ErrorActionPreference='SilentlyContinue'"),
+            "script must run best-effort (SilentlyContinue)"
+        );
+        assert!(
+            script.contains("-ErrorAction SilentlyContinue"),
+            "Get/Stop/Remove-Job calls must also tolerate missing job"
+        );
+    }
+
+    /// End-to-end mock check: when cleanup_remote_dir is invoked
+    /// against a Windows config it must dispatch a single
+    /// PowerShell invocation whose script body contains the
+    /// Stop-Job step.
+    #[test]
+    fn cleanup_remote_dir_dispatches_stop_job_on_windows() {
+        let shell = MockShellHost::new();
+        let cfg = mock_config_for_test(super::AnchorPlatform::Windows);
+        let dir = r"C:\Windows\Temp\rustynet-anchor-inflight-windows-1";
+        // Pre-program ANY powershell invocation as success — the
+        // recorded argv is asserted below.
+        let expected_script = super::windows_cleanup_remote_dir_script(dir);
+        shell.program_run_response(
+            &[
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                expected_script.as_str(),
+            ],
+            ok_response(b""),
+        );
+        super::cleanup_remote_dir(&shell, &cfg, dir);
+        let log = shell.run_log();
+        assert_eq!(log.len(), 1, "single powershell dispatch expected");
+        assert_eq!(log[0].argv[0], "powershell");
+        assert!(
+            log[0].argv[4].contains("Get-Job -Name 'rustynet-anchor-inflight'"),
+            "argv must reference the named Start-Job: {:?}",
+            log[0].argv[4]
+        );
+        assert!(
+            log[0].argv[4].contains("Stop-Job"),
+            "argv must include Stop-Job: {:?}",
+            log[0].argv[4]
+        );
     }
 }
