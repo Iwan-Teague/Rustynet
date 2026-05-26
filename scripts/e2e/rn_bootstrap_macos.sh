@@ -19,7 +19,7 @@
 #   4. Writes the bootstrap env file consumed by
 #      `Bootstrap-RustyNetMacos.sh` (and forwards `DAEMON_NODE_ROLE` +
 #      `SSH_ALLOW_CIDRS` so the launchd plist install picks them up).
-#   5. Extracts the source archive into `/tmp/rn_build`.
+#   5. Extracts the source archive into `/private/var/tmp/rn_build`.
 #   6. Invokes the reviewed bootstrap script with `sudo`.
 #   7. Polls for the daemon Unix socket to appear (40 s × 1 s).
 #
@@ -38,9 +38,9 @@ NODE_ID=""
 NETWORK_ID=""
 NODE_ROLE=""
 SSH_ALLOW_CIDRS=""
-SOURCE_ARCHIVE_PATH="/tmp/rustynet_src.tar.gz"
-BUILD_DIR="/tmp/rn_build"
-ENV_FILE_PATH="/tmp/rn_macos_bootstrap.env"
+SOURCE_ARCHIVE_PATH="/private/var/tmp/rustynet_src.tar.gz"
+BUILD_DIR="/private/var/tmp/rn_build"
+ENV_FILE_PATH="/private/var/tmp/rn_macos_bootstrap.env"
 
 usage() {
   cat >&2 <<'USAGE'

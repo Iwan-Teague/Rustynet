@@ -56,7 +56,7 @@ readonly LOG_DIR="/usr/local/var/log/rustynet"
 readonly LAUNCHDAEMON_DIR="/Library/LaunchDaemons"
 readonly PLIST_PATH="${LAUNCHDAEMON_DIR}/com.rustynet.daemon.plist"
 readonly PLIST_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly BUILD_DIR="/tmp/rustynet-build-$$"
+readonly BUILD_DIR="/private/var/tmp/rustynet-build-$$"
 
 # On Apple Silicon brew lives at /opt/homebrew; on Intel at /usr/local.
 BREW_PREFIX=""
