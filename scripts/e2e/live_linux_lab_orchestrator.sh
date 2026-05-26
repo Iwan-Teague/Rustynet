@@ -2688,6 +2688,8 @@ cleanup_host_worker_macos() {
   # interpolated, so there is no shell-injection surface.
   live_lab_ssh "$target" 'sudo -n bash -s' <<'MACOS_CLEANUP'
 set -euo pipefail
+chown root:wheel /private/tmp
+chmod 1777 /private/tmp
 launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
 launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
 pkill -9 rustynetd 2>/dev/null || true
