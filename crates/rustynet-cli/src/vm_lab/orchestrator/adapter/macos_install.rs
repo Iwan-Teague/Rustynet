@@ -612,6 +612,10 @@ mod tests {
             "macOS passphrase provisioning must run as root so System.keychain writes succeed"
         );
         assert!(
+            BOOTSTRAP_SCRIPT.contains("chown root:wheel \"${passphrase_tmp}\""),
+            "bootstrap passphrase must be root-owned while root reads it for secure-store provisioning"
+        );
+        assert!(
             BOOTSTRAP_SCRIPT.contains("chown rustynetd:rustynetd \"${runtime_key}\" \"${encrypted_key}\" \"${public_key}\" \"${passphrase_file}\""),
             "root-created key files must be handed back to the daemon service account"
         );
