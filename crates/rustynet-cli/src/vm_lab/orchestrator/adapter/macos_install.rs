@@ -566,6 +566,26 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_script_refuses_root_homebrew_fallback() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("resolve_non_root_bootstrap_user"),
+            "bootstrap script must centralize non-root Homebrew user resolution"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("RUSTYNET_MACOS_BOOTSTRAP_USER"),
+            "bootstrap script must allow an explicit non-root override for headless SSH bootstrap"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("Refusing to run Homebrew/Rust toolchain as root"),
+            "bootstrap script must fail closed instead of running Homebrew as root"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("REAL_USER=\"$(whoami)\""),
+            "bootstrap script must not fall back to root when invoked by root over SSH"
+        );
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),
