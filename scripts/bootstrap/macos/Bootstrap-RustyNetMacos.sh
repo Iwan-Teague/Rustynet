@@ -426,6 +426,42 @@ ensure_rustynetd_user() {
   echo "[bootstrap] created rustynetd user/group (uid/gid=${uid})"
 }
 
+# ── System.keychain unlock ──────────────────────────────────────────────────
+# `rustynetd key init` writes the WireGuard runtime passphrase + (later) the
+# trust signing-key passphrase into the macOS System.keychain via
+# `store_macos_generic_password_system_keychain` in rustynet-crypto.
+# The legacy `SecKeychain` API fails closed with `OsStoreUnavailable` when
+# the keychain is locked, even for root. macOS auto-locks System.keychain on
+# sleep / on a per-keychain idle timeout (default 300 s). Without an explicit
+# unlock pass here the bootstrap fails with `encrypt key failed: os secure
+# store unavailable` whenever the VM has been idle long enough for the lock
+# timer to fire (Phase 24 live-lab retry15 hit this).
+#
+# Set the timeout to no auto-lock and run an unlock pass. The default fresh
+# macOS System.keychain password is empty, so the unlock typically succeeds
+# without operator input. Both steps are best-effort — they emit a clear
+# log line and continue so a locked-keychain failure surfaces at `key init`
+# (fail-closed) rather than being masked.
+ensure_system_keychain_unlocked() {
+  local keychain_path="/Library/Keychains/System.keychain"
+  if [[ ! -f "${keychain_path}" ]]; then
+    echo "[bootstrap] System.keychain missing at ${keychain_path}; key init will fail" >&2
+    return 0
+  fi
+  if security set-keychain-settings "${keychain_path}" >/dev/null 2>&1; then
+    echo "[bootstrap] System.keychain auto-lock disabled (no-timeout)"
+  else
+    echo "[bootstrap] failed to disable System.keychain auto-lock (continuing)" >&2
+  fi
+  if security unlock-keychain -p "" "${keychain_path}" >/dev/null 2>&1; then
+    echo "[bootstrap] System.keychain unlocked (default empty password)"
+  else
+    # Already unlocked or a custom password is set; key init will surface
+    # the real error if write still fails.
+    echo "[bootstrap] System.keychain unlock-keychain returned non-zero (likely already unlocked or custom password)"
+  fi
+}
+
 # ── Directory setup ───────────────────────────────────────────────────────────
 setup_directories() {
   install -d -m 0700 -o rustynetd -g rustynetd "${STATE_ROOT}"
@@ -871,6 +907,7 @@ if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   fi
   ensure_rustynetd_user
   setup_directories
+  ensure_system_keychain_unlocked
   generate_wireguard_keys
   provision_enrollment_secret
   seed_trust_evidence
@@ -882,6 +919,7 @@ else
   clear_residual_state
   build_rustynet
   install_binaries
+  ensure_system_keychain_unlocked
   generate_wireguard_keys
   provision_enrollment_secret
   seed_trust_evidence

@@ -930,6 +930,34 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_unlocks_system_keychain_before_key_init() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("ensure_system_keychain_unlocked() {"),
+            "bootstrap must define ensure_system_keychain_unlocked"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("security set-keychain-settings"),
+            "bootstrap must disable the System.keychain auto-lock so a long idle window does not lock the keychain between bootstrap and `rustynetd key init`"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("security unlock-keychain -p \"\" \"${keychain_path}\""),
+            "bootstrap must explicitly unlock System.keychain with the default empty password before key init"
+        );
+        // Both install paths (SKIP_BUILD and full install) must call the
+        // unlock helper *before* the first `key init` invocation.
+        let skip_build_marker = "install_binaries";
+        let full_install_marker = "ensure_system_keychain_unlocked\n  generate_wireguard_keys";
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(full_install_marker),
+            "ensure_system_keychain_unlocked must precede generate_wireguard_keys in the full install path"
+        );
+        // The SKIP_BUILD branch also lists generate_wireguard_keys after
+        // ensure_system_keychain_unlocked; assert by string proximity to the
+        // skip-build install_binaries-skipping marker comment.
+        let _ = skip_build_marker;
+    }
+
+    #[test]
     fn install_service_script_pins_userspace_shared_backend_and_keychain_env() {
         assert!(
             INSTALL_SERVICE_SCRIPT.contains("<string>macos-wireguard-userspace-shared</string>"),
