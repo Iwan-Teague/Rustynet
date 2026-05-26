@@ -2687,19 +2687,19 @@ cleanup_host_worker_macos() {
   live_lab_push_sudo_password "$target"
   # Payload is constant; no orchestrator-controlled value is interpolated.
   # Do not use ssh stdin here: live_lab_ssh_via_ssh intentionally passes -n.
-  cleanup_cmd="$(cat <<'MACOS_CLEANUP'
-launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
-launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
-pkill -9 rustynetd 2>/dev/null || true
+cleanup_cmd="$(cat <<'MACOS_CLEANUP'
+root launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+root launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
+root pkill -9 rustynetd 2>/dev/null || true
 sleep 1
-rm -f /Library/LaunchDaemons/com.rustynet.daemon.plist \
+root rm -f /Library/LaunchDaemons/com.rustynet.daemon.plist \
       /Library/LaunchDaemons/com.rustynet.privileged-helper.plist
-rm -rf /usr/local/var/rustynet /usr/local/etc/rustynet \
+root rm -rf /usr/local/var/rustynet /usr/local/etc/rustynet \
        /usr/local/var/log/rustynet /private/var/run/rustynet
 # Best-effort interface cleanup — utun devices are torn down when the
 # daemon exits, but ifconfig down is safe if any orphan remains.
 for utun in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun[0-9]'); do
-  ifconfig "${utun}" down 2>/dev/null || true
+  root ifconfig "${utun}" down 2>/dev/null || true
 done
 exit 0
 MACOS_CLEANUP
