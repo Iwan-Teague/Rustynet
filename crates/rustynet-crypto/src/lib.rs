@@ -631,11 +631,30 @@ fn store_macos_generic_password_system_keychain_via_security_cli(
     // For the single-tenant lab / service-account install layout this is
     // the canonical pattern; revisit if/when the host hosts multiple
     // tenants that must not share keychain item access.
+    //
+    // Delete-then-add (rather than `-U` update): `add-generic-password -U`
+    // updates the password slot but keeps the existing ACL. If a previous
+    // bootstrap stored the item with a more restrictive ACL (e.g. before
+    // this -A flag landed, or via a different code-signing identity), -U
+    // alone leaves that ACL intact and the daemon's load path still fails
+    // with errSecAuthFailed. Delete-first forces a fresh ACL on every store.
+    let _ = std::process::Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-a",
+            account,
+            "-s",
+            service,
+            "/Library/Keychains/System.keychain",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     let status = std::process::Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
             "-A",
-            "-U",
             "-a",
             account,
             "-s",
