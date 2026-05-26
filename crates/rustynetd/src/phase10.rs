@@ -2414,7 +2414,13 @@ impl MacosCommandSystem {
                 }
                 _ => {}
             }
-            normalized.contains("port 53") || normalized.contains("port = domain")
+            // Accept both rendered (`port 53`) and pfctl-normalized (`port = 53`)
+            // forms. macOS pfctl rewrites `port 53` to `port = 53` and `port domain`
+            // to `port = domain` when dumping the live ruleset via `-s rules`.
+            normalized.contains("port 53")
+                || normalized.contains("port = 53")
+                || normalized.contains("port domain")
+                || normalized.contains("port = domain")
         })
     }
 
@@ -10360,6 +10366,38 @@ mod tests {
             "udp",
             None,
         ));
+    }
+
+    #[test]
+    fn macos_dns_rule_parser_accepts_pfctl_normalized_live_output() {
+        // macOS pfctl rewrites `port 53` → `port = 53` and inserts `from any`
+        // when dumping the live ruleset via `pfctl -a <anchor> -s rules`.
+        // assert_killswitch parses that exact output, so the matcher must
+        // accept the rewritten form.
+        let rules = "pass out quick on utun9 inet proto udp from any to any port = 53 keep state\n\
+                     pass out quick on utun9 inet proto tcp from any to any port = 53 keep state\n\
+                     block drop out quick inet proto udp from any to any port = 53\n\
+                     block drop out quick inet proto tcp from any to any port = 53\n";
+        for proto in ["udp", "tcp"] {
+            assert!(
+                MacosCommandSystem::ruleset_contains_dns_rule(
+                    rules,
+                    "pass out quick",
+                    proto,
+                    Some("utun9"),
+                ),
+                "pass-out rule should match for proto={proto}"
+            );
+            assert!(
+                MacosCommandSystem::ruleset_contains_dns_rule(
+                    rules,
+                    "block drop out quick",
+                    proto,
+                    None,
+                ),
+                "block rule should match for proto={proto}"
+            );
+        }
     }
 
     // ── A3: Hysteresis tests ───────────────────────────────────────────────

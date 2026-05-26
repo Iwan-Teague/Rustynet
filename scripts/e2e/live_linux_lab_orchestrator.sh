@@ -2711,6 +2711,13 @@ root rm -rf /usr/local/var/rustynet /usr/local/etc/rustynet \
 for utun in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun[0-9]'); do
   root ifconfig "${utun}" down 2>/dev/null || true
 done
+# Restore the default route. A prior dataplane apply may have torn down
+# the default route during fail-closed rollback (privileged helper
+# disconnect mid-cleanup), leaving the host unable to detect the egress
+# interface on the next daemon start. Re-binding DHCP on en0 reinstalls
+# the default route published by the configd DHCP lease.
+root ipconfig set en0 DHCP 2>/dev/null || true
+sleep 2
 exit 0
 MACOS_CLEANUP
 )"
