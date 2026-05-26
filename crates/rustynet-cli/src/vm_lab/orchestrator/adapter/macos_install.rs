@@ -586,6 +586,22 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_script_skips_coreutils_when_timeout_exists() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("timeout: already available; skipping coreutils install"),
+            "bootstrap must not fetch coreutils when a working timeout binary is already present"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("Installing coreutils for gtimeout"),
+            "bootstrap still needs a fail-closed coreutils install path when timeout is absent"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("wireguard-go wireguard-tools rustup coreutils"),
+            "coreutils must not be part of the unconditional Homebrew formula install loop"
+        );
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),

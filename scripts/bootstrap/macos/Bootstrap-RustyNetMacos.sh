@@ -269,7 +269,7 @@ install_brew_packages() {
   # working `timeout` binary on stock macOS (which ships only BSD `time`,
   # no GNU `timeout`). Without this the orchestrator's prime_remote_access
   # stage fails for the aux/macos label with rc=127.
-  for pkg in wireguard-go wireguard-tools rustup coreutils; do
+  for pkg in wireguard-go wireguard-tools rustup; do
     if as_user "${BREW_PREFIX}/bin/brew" list --formula "${pkg}" &>/dev/null 2>&1; then
       echo "[prereqs] ${pkg}: already installed"
     else
@@ -277,6 +277,15 @@ install_brew_packages() {
       as_user "${BREW_PREFIX}/bin/brew" install "${pkg}"
     fi
   done
+
+  if command -v timeout &>/dev/null || [[ -x /usr/local/bin/timeout ]]; then
+    echo "[prereqs] timeout: already available; skipping coreutils install"
+  elif as_user "${BREW_PREFIX}/bin/brew" list --formula coreutils &>/dev/null 2>&1; then
+    echo "[prereqs] coreutils: already installed"
+  else
+    echo "[prereqs] Installing coreutils for gtimeout..."
+    as_user "${BREW_PREFIX}/bin/brew" install coreutils
+  fi
 
   # wireguard-go must be reachable from the daemon's restricted PATH
   # (/usr/local/bin is always in launchd's default PATH).
