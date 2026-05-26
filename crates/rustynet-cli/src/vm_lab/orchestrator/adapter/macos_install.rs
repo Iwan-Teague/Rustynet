@@ -737,11 +737,23 @@ mod tests {
     }
 
     #[test]
-    fn live_lab_refresh_trust_skips_non_linux_until_signer_key_provisioned() {
+    fn live_lab_refresh_trust_resolves_macos_paths_via_env() {
         assert!(
             LIVE_LINUX_LAB_ORCHESTRATOR
-                .contains("[trust-refresh] %s skipped on %s (signer key path Linux-only today)"),
-            "non-Linux trust refresh must be an explicit no-op until the verb is platform-aware"
+                .contains("RUSTYNET_TRUST_SIGNER_KEY='/usr/local/etc/rustynet/trust-evidence.key'"),
+            "macOS trust refresh must pin signer key path to the macOS canonical location"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "RUSTYNET_TRUST_EVIDENCE='/usr/local/var/rustynet/trust/rustynetd.trust'"
+            ),
+            "macOS trust refresh must pin trust evidence path to the macOS canonical location"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "[trust-refresh] %s skipped on windows (DPAPI signer-key unwrap pending)"
+            ),
+            "Windows trust refresh stays an explicit no-op until DPAPI unwrap lands"
         );
         assert!(
             LIVE_LINUX_LAB_ORCHESTRATOR.contains("rustynet ops refresh-signed-trust"),
