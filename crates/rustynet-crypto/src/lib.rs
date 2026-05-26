@@ -619,9 +619,22 @@ fn store_macos_generic_password_system_keychain_via_security_cli(
         return Err(CryptoError::OsStoreUnavailable);
     }
     let secret_str = std::str::from_utf8(secret).map_err(|_| CryptoError::OsStoreUnavailable)?;
+    // `-A` allows any application on the same host to read the item without
+    // an additional ACL prompt. Required because the daemon
+    // (`/usr/local/bin/rustynetd`, uid 500) reads the item via a *different*
+    // process from the one that stored it (`/usr/bin/security`, here run as
+    // root by the bootstrap), and the default System.keychain ACL would
+    // bind read access to the storing app's code-signing identity. The
+    // alternative `-T <app>` flag is per-app — not appropriate here because
+    // load_macos_generic_password's CLI fallback also goes through
+    // `/usr/bin/security`, so a one-app ACL would block our own loader.
+    // For the single-tenant lab / service-account install layout this is
+    // the canonical pattern; revisit if/when the host hosts multiple
+    // tenants that must not share keychain item access.
     let status = std::process::Command::new("/usr/bin/security")
         .args([
             "add-generic-password",
+            "-A",
             "-U",
             "-a",
             account,
