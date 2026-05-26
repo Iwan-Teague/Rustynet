@@ -1767,10 +1767,17 @@ live_lab_install_assignment_bundle() {
   watermark_path="$(rustynet_assignment_watermark_path "$platform")"
   config_dir="$(rustynet_config_dir "$platform")"
   state_root="$(rustynet_state_root "$platform")"
+  local staging_dir remote_pub remote_bundle
+  staging_dir="/tmp"
+  if [[ "$platform" == "macos" ]]; then
+    staging_dir="/private/var/tmp"
+  fi
+  remote_pub="${staging_dir}/rn-assignment.pub"
+  remote_bundle="${staging_dir}/rn-assignment.bundle"
   case "$platform" in
     macos)
-      live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub" || return 1
-      live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle" || return 1
+      live_lab_scp_to "$assignment_pub_local" "$target" "$remote_pub" || return 1
+      live_lab_scp_to "$assignment_bundle_local" "$target" "$remote_bundle" || return 1
       # macOS trust artifacts live under ${state_root}/trust (owner rustynetd:rustynetd 0700).
       # install(1) on macOS does not accept the GNU -o/-g flags; use chown after install.
       live_lab_run_root "$target" "
@@ -1778,11 +1785,11 @@ set -euo pipefail
 root mkdir -p '${state_root}/trust' '${config_dir}'
 root chown -R rustynetd:rustynetd '${state_root}/trust'
 root chmod 700 '${state_root}/trust'
-root install -m 0644 /tmp/rn-assignment.pub '${assignment_pub_path}'
+root install -m 0644 '${remote_pub}' '${assignment_pub_path}'
 root chown root:rustynetd '${assignment_pub_path}'
-root install -m 0640 /tmp/rn-assignment.bundle '${bundle_path}'
+root install -m 0640 '${remote_bundle}' '${bundle_path}'
 root chown root:rustynetd '${bundle_path}'
-root rm -f '${watermark_path}' /tmp/rn-assignment.pub /tmp/rn-assignment.bundle
+root rm -f '${watermark_path}' '${remote_pub}' '${remote_bundle}'
 " || return 1
       ;;
     windows)
@@ -1790,9 +1797,9 @@ root rm -f '${watermark_path}' /tmp/rn-assignment.pub /tmp/rn-assignment.bundle
       return 1
       ;;
     *)
-      live_lab_scp_to "$assignment_pub_local" "$target" "/tmp/rn-assignment.pub" || return 1
-      live_lab_scp_to "$assignment_bundle_local" "$target" "/tmp/rn-assignment.bundle" || return 1
-      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-assignment.pub /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-assignment.bundle /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle" || return 1
+      live_lab_scp_to "$assignment_pub_local" "$target" "$remote_pub" || return 1
+      live_lab_scp_to "$assignment_bundle_local" "$target" "$remote_bundle" || return 1
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root '${remote_pub}' /etc/rustynet/assignment.pub && root install -m 0640 -o root -g rustynetd '${remote_bundle}' /var/lib/rustynet/rustynetd.assignment && root rm -f /var/lib/rustynet/rustynetd.assignment.watermark '${remote_pub}' '${remote_bundle}'" || return 1
       ;;
   esac
 }
@@ -1804,17 +1811,23 @@ live_lab_install_assignment_refresh_env() {
   local refresh_path config_dir
   refresh_path="$(rustynet_assignment_refresh_env_path "$platform")"
   config_dir="$(rustynet_config_dir "$platform")"
+  local staging_dir remote_env
+  staging_dir="/tmp"
+  if [[ "$platform" == "macos" ]]; then
+    staging_dir="/private/var/tmp"
+  fi
+  remote_env="${staging_dir}/rn-assignment-refresh.env"
   case "$platform" in
     macos)
-      live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env" || return 1
+      live_lab_scp_to "$env_local" "$target" "$remote_env" || return 1
       live_lab_run_root "$target" "
 set -euo pipefail
 root mkdir -p '${config_dir}'
 root chown root:rustynetd '${config_dir}'
 root chmod 750 '${config_dir}'
-root install -m 0600 /tmp/rn-assignment-refresh.env '${refresh_path}'
+root install -m 0600 '${remote_env}' '${refresh_path}'
 root chown root:wheel '${refresh_path}'
-root rm -f /tmp/rn-assignment-refresh.env
+root rm -f '${remote_env}'
 " || return 1
       ;;
     windows)
@@ -1822,8 +1835,8 @@ root rm -f /tmp/rn-assignment-refresh.env
       return 1
       ;;
     *)
-      live_lab_scp_to "$env_local" "$target" "/tmp/rn-assignment-refresh.env" || return 1
-      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -m 0600 -o root -g root /tmp/rn-assignment-refresh.env /etc/rustynet/assignment-refresh.env && root rm -f /tmp/rn-assignment-refresh.env" || return 1
+      live_lab_scp_to "$env_local" "$target" "$remote_env" || return 1
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -m 0600 -o root -g root '${remote_env}' /etc/rustynet/assignment-refresh.env && root rm -f '${remote_env}'" || return 1
       ;;
   esac
 }
@@ -1840,20 +1853,27 @@ live_lab_install_dns_zone_bundle() {
   watermark_path="$(rustynet_dns_zone_watermark_path "$platform")"
   config_dir="$(rustynet_config_dir "$platform")"
   state_root="$(rustynet_state_root "$platform")"
+  local staging_dir remote_pub remote_bundle
+  staging_dir="/tmp"
+  if [[ "$platform" == "macos" ]]; then
+    staging_dir="/private/var/tmp"
+  fi
+  remote_pub="${staging_dir}/rn-dns-zone.pub"
+  remote_bundle="${staging_dir}/rn-dns-zone.bundle"
   case "$platform" in
     macos)
-      live_lab_scp_to "$dns_zone_pub_local" "$target" "/tmp/rn-dns-zone.pub" || return 1
-      live_lab_scp_to "$dns_zone_bundle_local" "$target" "/tmp/rn-dns-zone.bundle" || return 1
+      live_lab_scp_to "$dns_zone_pub_local" "$target" "$remote_pub" || return 1
+      live_lab_scp_to "$dns_zone_bundle_local" "$target" "$remote_bundle" || return 1
       live_lab_run_root "$target" "
 set -euo pipefail
 root mkdir -p '${state_root}/trust' '${config_dir}'
 root chown -R rustynetd:rustynetd '${state_root}/trust'
 root chmod 700 '${state_root}/trust'
-root install -m 0644 /tmp/rn-dns-zone.pub '${dns_zone_pub_path}'
+root install -m 0644 '${remote_pub}' '${dns_zone_pub_path}'
 root chown root:rustynetd '${dns_zone_pub_path}'
-root install -m 0640 /tmp/rn-dns-zone.bundle '${bundle_path}'
+root install -m 0640 '${remote_bundle}' '${bundle_path}'
 root chown root:rustynetd '${bundle_path}'
-root rm -f '${watermark_path}' /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle
+root rm -f '${watermark_path}' '${remote_pub}' '${remote_bundle}'
 " || return 1
       ;;
     windows)
@@ -1861,9 +1881,9 @@ root rm -f '${watermark_path}' /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle
       return 1
       ;;
     *)
-      live_lab_scp_to "$dns_zone_pub_local" "$target" "/tmp/rn-dns-zone.pub" || return 1
-      live_lab_scp_to "$dns_zone_bundle_local" "$target" "/tmp/rn-dns-zone.bundle" || return 1
-      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle" || return 1
+      live_lab_scp_to "$dns_zone_pub_local" "$target" "$remote_pub" || return 1
+      live_lab_scp_to "$dns_zone_bundle_local" "$target" "$remote_bundle" || return 1
+      live_lab_run_root "$target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && root install -m 0644 -o root -g root '${remote_pub}' /etc/rustynet/dns-zone.pub && root install -m 0640 -o root -g rustynetd '${remote_bundle}' /var/lib/rustynet/rustynetd.dns-zone && root rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark '${remote_pub}' '${remote_bundle}'" || return 1
       ;;
   esac
 }
