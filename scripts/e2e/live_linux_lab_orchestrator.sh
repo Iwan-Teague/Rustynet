@@ -4183,7 +4183,7 @@ refresh_runtime_state_for_validation_worker() {
   local target="$2"
   local _node_id="$3"
   local role="$4"
-  local exit_node_id
+  local exit_node_id platform env_path daemon_socket
 
   if [[ "$role" == "client" ]]; then
     exit_node_id="$(node_id_for_label exit)"
@@ -4191,13 +4191,16 @@ refresh_runtime_state_for_validation_worker() {
       printf 'missing exit node id for client validation refresh\n' >&2
       return 1
     }
-    printf '[runtime-refresh-role-coupling] %s %s (exit=%s)\n' "$label" "$target" "$exit_node_id"
+    platform="$(node_platform_for_label "${label}")" || return 1
+    env_path="$(rustynet_config_dir "$platform")/assignment-refresh.env"
+    daemon_socket="$(rustynet_daemon_socket "$platform")"
+    printf '[runtime-refresh-role-coupling] %s %s (exit=%s) platform=%s\n' "$label" "$target" "$exit_node_id" "$platform"
     # Baseline validation performs the authoritative route assertion itself.
     # Skip the helper's internal route wait here so we do not spend the short
     # signed-state window on a second convergence loop before collecting the
     # final validation snapshots.
-    live_lab_apply_role_coupling "$target" "client" "$exit_node_id" "false" "/etc/rustynet/assignment-refresh.env" "true" || return 1
-    live_lab_wait_for_daemon_socket "$target"
+    live_lab_apply_role_coupling "$target" "client" "$exit_node_id" "false" "$env_path" "true" "$platform" || return 1
+    live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
     return 0
   fi
 
