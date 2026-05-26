@@ -675,18 +675,19 @@ generate_wireguard_keys() {
   # between `mv` of the passphrase file and the first key-init invocation)
   # cleanly overwrites the stale material.
   #
-  # Run as rustynetd so files are written with the right owner; the
-  # runtime/public/encrypted files are written mode 0600 owner-rustynetd by
-  # initialize_encrypted_key_material's write_atomic helper, which uses the
-  # effective UID of the running process.
+  # Run the key-init custody write as root, then chown the material back to
+  # rustynetd below. The macOS service account can read System.keychain items
+  # but cannot create them ("Write permissions error"), so running this command
+  # as rustynetd fails closed at PlatformOsSecureStore before any usable daemon
+  # key material exists. Root is the single privileged bootstrap writer; the
+  # daemon remains the runtime reader through Security.framework/System.keychain.
   # Phase 24 follow-up (Gap F): rustynetd's resolve_wireguard_binary_path()
   # defaults to /usr/bin/wg, which does not exist on macOS. Homebrew installs
   # wg at ${BREW_PREFIX}/bin/wg (the launchd plist already exports
   # RUSTYNET_WG_BINARY_PATH for the daemon's runtime invocations). For the
-  # bootstrap-time `key init` call we must export the same path explicitly,
-  # since `sudo -u rustynetd ${RUSTYNETD_BIN}` would otherwise inherit the
-  # rustynetd-user env (which is empty for the dscl-created service account).
-  if ! sudo -u rustynetd RUSTYNET_WG_BINARY_PATH="${BREW_PREFIX}/bin/wg" \
+  # bootstrap-time `key init` call we must export the same path explicitly;
+  # sudo scrubs the caller environment unless the variable is passed in argv.
+  if ! sudo RUSTYNET_WG_BINARY_PATH="${BREW_PREFIX}/bin/wg" \
       "${RUSTYNETD_BIN}" key init \
       --runtime-private-key "${runtime_key}" \
       --encrypted-private-key "${encrypted_key}" \
@@ -701,9 +702,11 @@ generate_wireguard_keys() {
   # via Security framework at runtime (per
   # RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT in the launchd plist). The
   # keychain account is per-node so concurrent tenants on the same host
-  # cannot cross-read each other's passphrase.
+  # cannot cross-read each other's passphrase. This write also runs as root
+  # because the service account is intentionally not allowed to create
+  # System.keychain items.
   local keychain_account="wg-passphrase-${NODE_ID}"
-  if ! sudo -u rustynetd "${RUSTYNETD_BIN}" key store-passphrase \
+  if ! sudo "${RUSTYNETD_BIN}" key store-passphrase \
       --passphrase-file "${passphrase_file}" \
       --keychain-account "${keychain_account}"; then
     echo "[bootstrap] rustynetd key store-passphrase failed; daemon cannot resolve passphrase from keychain" >&2

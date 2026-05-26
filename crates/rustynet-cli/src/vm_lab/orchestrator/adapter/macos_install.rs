@@ -602,6 +602,32 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_script_uses_root_for_system_keychain_writes_only() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("sudo RUSTYNET_WG_BINARY_PATH=\"${BREW_PREFIX}/bin/wg\""),
+            "macOS key init must run as root so System.keychain writes succeed"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("sudo \"${RUSTYNETD_BIN}\" key store-passphrase"),
+            "macOS passphrase provisioning must run as root so System.keychain writes succeed"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("chown rustynetd:rustynetd \"${runtime_key}\" \"${encrypted_key}\" \"${public_key}\" \"${passphrase_file}\""),
+            "root-created key files must be handed back to the daemon service account"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT
+                .contains("sudo -u rustynetd RUSTYNET_WG_BINARY_PATH=\"${BREW_PREFIX}/bin/wg\""),
+            "key init must not run as rustynetd; that account cannot write System.keychain"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT
+                .contains("sudo -u rustynetd \"${RUSTYNETD_BIN}\" key store-passphrase"),
+            "passphrase keychain provisioning must not run as rustynetd"
+        );
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),
