@@ -778,6 +778,78 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_assert_runtime_spec_dispatches_macos_route_assertions() {
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "expected_route_device=\"$(macos_wg_interface_for_node_id \"$node_id\")\""
+            ),
+            "macOS client route device assertion must derive from FNV-1a(node_id), not hard-code rustynet0"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "expected_next_hop=\"direct:$(macos_wg_interface_for_node_id \"$node_id\")\""
+            ),
+            "validate_runtime_worker must derive macOS expected_next_hop from FNV-1a(node_id)"
+        );
+        // Linux assertion must remain unchanged for backwards compatibility.
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "assert_text_contains \"$route_check\" \"$route_label\" \"actual_route_device=rustynet0\""
+            ),
+            "Linux client route device assertion must keep the existing rustynet0 pin"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "assert_text_contains \"$route_check\" \"$route_label\" \"actual_route_table=51820\""
+            ),
+            "Linux client route table assertion must keep the existing 51820 pin"
+        );
+    }
+
+    #[test]
+    fn live_lab_route_policy_body_dispatches_per_command() {
+        assert!(
+            LIVE_LAB_COMMON.contains("if command -v ip >/dev/null 2>&1; then"),
+            "route policy body must detect Linux via `command -v ip`"
+        );
+        assert!(
+            LIVE_LAB_COMMON.contains("elif command -v route >/dev/null 2>&1; then"),
+            "route policy body must fall through to macOS / BSD `route` command"
+        );
+        assert!(
+            LIVE_LAB_COMMON.contains("route -n get"),
+            "macOS route policy body must use `route -n get` to query the route table"
+        );
+        assert!(
+            LIVE_LAB_COMMON.contains("route_platform=\"macos\""),
+            "platform classification must be carried through the snapshot wire format"
+        );
+    }
+
+    #[test]
+    fn live_lab_secret_hygiene_body_dispatches_per_platform() {
+        assert!(
+            LIVE_LAB_COMMON.contains("state_root=\"$(rustynet_state_root \"$platform\")\""),
+            "secret hygiene body must resolve state_root via the platform helper"
+        );
+        assert!(
+            LIVE_LAB_COMMON.contains("daemon_socket=\"$(rustynet_daemon_socket \"$platform\")\""),
+            "secret hygiene body must probe the platform-aware daemon socket path"
+        );
+    }
+
+    #[test]
+    fn live_lab_status_snapshot_body_accepts_platform() {
+        assert!(
+            LIVE_LAB_COMMON.contains("live_lab_status_snapshot_body() {")
+                && LIVE_LAB_COMMON.contains("local platform=\"${1:-linux}\"")
+                && LIVE_LAB_COMMON
+                    .contains("daemon_socket=\"$(rustynet_daemon_socket \"$platform\")\""),
+            "live_lab_status_snapshot_body must accept platform and resolve socket per-platform"
+        );
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),
