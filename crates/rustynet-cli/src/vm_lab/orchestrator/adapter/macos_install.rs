@@ -827,6 +827,19 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_route_policy_body_normalizes_macos_tunnel_gateway_index() {
+        // macOS route -n get returns gateway as 'index: <ifindex> <device>' when
+        // the next-hop is a P2P/tunnel interface. After whitespace stripping
+        // that becomes 'index:<N><device>'. The body must rewrite this to
+        // direct:<device> so the orchestrator's expected_next_hop assertion
+        // (direct:utunN) matches the actual route.
+        assert!(
+            LIVE_LAB_COMMON.contains(r#"^index:[0-9]+([A-Za-z][A-Za-z0-9]*)\$"#),
+            "route policy body must rewrite index:<N><device> gateways to direct:<device>"
+        );
+    }
+
+    #[test]
     fn live_lab_secret_hygiene_body_dispatches_per_platform() {
         assert!(
             LIVE_LAB_COMMON.contains("state_root=\"$(rustynet_state_root \"$platform\")\""),
