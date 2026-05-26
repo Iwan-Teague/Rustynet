@@ -3044,8 +3044,15 @@ distribute_membership_worker() {
   local platform
   platform="$(node_platform_for_label "${label}")" || return 1
   printf '[membership-distribute] %s %s platform=%s\n' "$label" "$target" "$platform"
-  live_lab_scp_to "$STATE_DIR/membership.snapshot" "$target" "/tmp/rn-membership.snapshot"
-  live_lab_scp_to "$STATE_DIR/membership.log" "$target" "/tmp/rn-membership.log"
+  local staging_dir remote_snapshot remote_log
+  staging_dir="/tmp"
+  if [[ "$platform" == "macos" ]]; then
+    staging_dir="/private/var/tmp"
+  fi
+  remote_snapshot="${staging_dir}/rn-membership.snapshot"
+  remote_log="${staging_dir}/rn-membership.log"
+  live_lab_scp_to "$STATE_DIR/membership.snapshot" "$target" "$remote_snapshot"
+  live_lab_scp_to "$STATE_DIR/membership.log" "$target" "$remote_log"
   local snapshot_path log_path watermark_path state_root
   snapshot_path="$(rustynet_membership_snapshot_path "$platform")"
   log_path="$(rustynet_membership_log_path "$platform")"
@@ -3060,10 +3067,10 @@ set -euo pipefail
 root mkdir -p '${membership_dir}'
 root chown rustynetd:rustynetd '${state_root}' '${membership_dir}'
 root chmod 700 '${state_root}' '${membership_dir}'
-root install -m 0600 /tmp/rn-membership.snapshot '${snapshot_path}'
-root install -m 0600 /tmp/rn-membership.log '${log_path}'
+root install -m 0600 '${remote_snapshot}' '${snapshot_path}'
+root install -m 0600 '${remote_log}' '${log_path}'
 root chown rustynetd:rustynetd '${snapshot_path}' '${log_path}'
-root rm -f '${watermark_path}' /tmp/rn-membership.snapshot /tmp/rn-membership.log
+root rm -f '${watermark_path}' '${remote_snapshot}' '${remote_log}'
 "
       ;;
     windows)
@@ -3071,7 +3078,7 @@ root rm -f '${watermark_path}' /tmp/rn-membership.snapshot /tmp/rn-membership.lo
       return 1
       ;;
     *)
-      live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.snapshot /var/lib/rustynet/membership.snapshot && root install -m 0600 -o rustynetd -g rustynetd /tmp/rn-membership.log /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark /tmp/rn-membership.snapshot /tmp/rn-membership.log"
+      live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o rustynetd -g rustynetd '${remote_snapshot}' /var/lib/rustynet/membership.snapshot && root install -m 0600 -o rustynetd -g rustynetd '${remote_log}' /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark '${remote_snapshot}' '${remote_log}'"
       ;;
   esac
 }
