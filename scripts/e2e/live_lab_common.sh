@@ -2360,8 +2360,13 @@ printf 'systemd_resolved_service=%s\n' "\$systemd_resolved_service"
 printf 'managed_dns_service=%s\n' "\$managed_dns_service"
 printf 'resolvectl_available=%s\n' "\$resolvectl_available"
 printf 'probe_count=%s\n' "\${#probe_names[@]}"
-for index in "\${!probe_names[@]}"; do
-  printf 'probe_%s=%s\n' "\$index" "\${probe_names[\$index]}"
+# Iterate via a counter rather than \${!probe_names[@]} so the body
+# stays valid under zsh (the default login shell on macOS) — zsh
+# rejects bash's array-indices indirection with "bad substitution".
+probe_index=0
+for probe in "\${probe_names[@]}"; do
+  printf 'probe_%s=%s\n' "\$probe_index" "\$probe"
+  probe_index=\$((probe_index + 1))
 done
 printf 'resolv_conf_begin\n'
 if root test -f /etc/resolv.conf; then

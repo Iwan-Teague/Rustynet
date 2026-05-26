@@ -2698,6 +2698,13 @@ cleanup_host_worker_macos() {
   # Payload is constant; no orchestrator-controlled value is interpolated.
   # Do not use ssh stdin here: live_lab_ssh_via_ssh intentionally passes -n.
 cleanup_cmd="$(cat <<'MACOS_CLEANUP'
+# Restore /private/tmp to its standard root:wheel 1777 sticky-writable
+# contract before anything else. A previous run that ended in fail-closed
+# rollback can leave it as root:rustynetd 0770, which then blocks the
+# SSH user zsh from creating here-doc temp files during validation, and
+# blocks scp from staging install scripts under /tmp.
+root chown root:wheel /private/tmp
+root chmod 1777 /private/tmp
 root launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
 root launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
 root pkill -9 rustynetd 2>/dev/null || true
