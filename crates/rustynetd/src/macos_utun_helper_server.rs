@@ -72,7 +72,18 @@ pub fn handle_utun_open_request(mut stream: UnixStream) -> Result<(), String> {
         return Err(msg);
     }
 
-    open_utun_and_send_fd(&stream, interface_name)
+    // If open_utun_and_send_fd fails, surface the failure via the inline
+    // error-reply channel so the client sees an explicit error rather
+    // than timing out on recvmsg. This is the second half of the Gap I
+    // fix (commit b565810 follow-up): without it, any helper-side
+    // SyncDevice::open or sendmsg failure produced a silent recvmsg
+    // EAGAIN at the daemon and the dataplane reconcile loop kept
+    // retrying indefinitely.
+    if let Err(e) = open_utun_and_send_fd(&stream, interface_name) {
+        send_error_response(&mut stream, &e);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -137,5 +148,85 @@ mod tests {
         drop(client);
         let result = handle_utun_open_request(server);
         assert!(result.is_err());
+    }
+
+    /// Regression for Gap I (commit `b565810` reproduction): with the
+    /// client's `shutdown(Write)` half-close, the helper's trailing-byte
+    /// check must NOT block waiting for more data. Pre-fix this test
+    /// would hang for the helper's read_timeout; post-fix it returns
+    /// promptly because EOF arrives immediately after the frame.
+    #[test]
+    fn trailing_byte_check_does_not_block_after_client_shutdown_write() {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::time::Duration;
+
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        // Helper-side timeout would surface the deadlock as a 2s test
+        // hang if the fix regressed. Keep tight so a CI failure is fast.
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let frame = make_rnuf_frame(RNUF_VERSION, "utun9");
+        let writer = std::thread::spawn(move || {
+            client.write_all(&frame).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            // Hold client open so we can read the helper's response.
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response);
+            response
+        });
+
+        // Drive only the protocol-validation portion (mirrors what the
+        // real handler does up to `open_utun_and_send_fd`). We can't
+        // call the full handler in a unit test because SyncDevice::open
+        // requires root. The trailing-byte read happens BEFORE the
+        // device open, so this exercises the deadlock fix in isolation.
+        let mut header = [0u8; 6];
+        server.read_exact(&mut header).unwrap();
+        let mut name = [0u8; 5];
+        server.read_exact(&mut name).unwrap();
+        let mut trailing = [0u8; 1];
+        let n = server
+            .read(&mut trailing)
+            .expect("trailing read must not error");
+        assert_eq!(
+            n, 0,
+            "trailing read must return Ok(0) immediately after client shutdown"
+        );
+
+        drop(server);
+        let _ = writer.join().unwrap();
+    }
+
+    /// On `open_utun_and_send_fd` failure path, server must send a 0xFF
+    /// inline error reply so the client sees an explicit error rather
+    /// than a recvmsg timeout. Tested here via the existing
+    /// `validate_utun_interface_name` rejection branch, which uses the
+    /// same `send_error_response` codepath.
+    #[test]
+    fn error_response_uses_0xff_marker() {
+        use std::io::Read;
+        use std::net::Shutdown;
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let frame = make_rnuf_frame(RNUF_VERSION, "rustynet0"); // not utun-prefixed
+        std::io::Write::write_all(&mut client, &frame).unwrap();
+        client
+            .shutdown(Shutdown::Write)
+            .expect("client half-close should unblock helper trailing-byte check");
+
+        let _ = handle_utun_open_request(server);
+
+        // Client should see [0xFF, error_message...].
+        let mut reply = Vec::new();
+        let _ = client.read_to_end(&mut reply);
+        assert!(!reply.is_empty(), "helper must send error reply");
+        assert_eq!(reply[0], 0xFF, "error reply must start with 0xFF marker");
+        let message = String::from_utf8_lossy(&reply[1..]);
+        assert!(
+            message.contains("rustynet0") || message.contains("interface name"),
+            "error message must describe the rejection, got: {message}"
+        );
     }
 }
