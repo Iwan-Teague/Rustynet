@@ -2552,6 +2552,7 @@ prime_remote_access() {
 
 stage_verify_ssh_reachability() {
   local force_ssh_for_reachability=0
+  local saved_force_ssh="${LIVE_LAB_FORCE_SSH_TRANSPORT:-}"
   if live_lab_has_utm_transport && live_lab_can_use_ssh_transport; then
     export LIVE_LAB_FORCE_SSH_TRANSPORT=1
     force_ssh_for_reachability=1
@@ -2559,7 +2560,16 @@ stage_verify_ssh_reachability() {
   run_parallel_node_stage verify_ssh_reachability ssh_reachability_worker
   local rc=$?
   if (( force_ssh_for_reachability )); then
-    unset LIVE_LAB_FORCE_SSH_TRANSPORT
+    # Restore the operator-provided FORCE_SSH setting; previously this
+    # unconditionally unset the var, which clobbered an outer
+    # `LIVE_LAB_FORCE_SSH_TRANSPORT=1` passed at script-invocation time
+    # and re-enabled UTM transport for downstream stages even when the
+    # operator had explicitly disabled it (retry12 hit this; see task #8).
+    if [[ -n "$saved_force_ssh" ]]; then
+      export LIVE_LAB_FORCE_SSH_TRANSPORT="$saved_force_ssh"
+    else
+      unset LIVE_LAB_FORCE_SSH_TRANSPORT
+    fi
   fi
   return "$rc"
 }
