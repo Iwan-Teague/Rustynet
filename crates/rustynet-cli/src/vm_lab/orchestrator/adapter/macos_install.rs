@@ -762,6 +762,22 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_role_coupling_validation_passes_platform() {
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "live_lab_apply_role_coupling \"$target\" \"client\" \"$exit_node_id\" \"false\" \"$env_path\" \"true\" \"$platform\""
+            ),
+            "validation role coupling must pass platform so non-Linux uses canonical assignment-refresh.env path"
+        );
+        assert!(
+            !LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "live_lab_apply_role_coupling \"$target\" \"client\" \"$exit_node_id\" \"false\" \"/etc/rustynet/assignment-refresh.env\" \"true\""
+            ),
+            "validation role coupling must not hard-code Linux assignment-refresh.env path"
+        );
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),
