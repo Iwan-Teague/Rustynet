@@ -2829,6 +2829,10 @@ bootstrap_host_worker_macos() {
   ssh_wait_for_host "$target" || return 1
   live_lab_push_sudo_password "$target"
   printf '[bootstrap] %s %s (%s %s) platform=macos\n' "$label" "$target" "$node_id" "$role"
+  if ! live_lab_run_root "$target" "root rm -f '${remote_wrapper}' '${remote_archive}' '${remote_env}'"; then
+    printf '[bootstrap] failed to clear stale macOS bootstrap files on %s\n' "$target" >&2
+    return 1
+  fi
   invoke_cmd="sudo -n chmod 700 '${remote_wrapper}' && sudo -n bash '${remote_wrapper}'"
   invoke_cmd+=" --node-id '${node_id}'"
   invoke_cmd+=" --network-id '${NETWORK_ID}'"
