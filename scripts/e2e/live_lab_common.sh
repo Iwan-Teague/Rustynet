@@ -2046,9 +2046,12 @@ live_lab_shell_quote() {
 }
 
 live_lab_status_snapshot_body() {
-  cat <<'EOF'
+  local platform="${1:-linux}"
+  local daemon_socket
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  cat <<EOF
 printf '__RNLAB_STATUS_BEGIN__\n'
-root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status || true
+root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet status || true
 printf '__RNLAB_STATUS_END__\n'
 EOF
 }
@@ -2153,27 +2156,60 @@ live_lab_route_policy_body() {
   local quoted_destination quoted_expected
   quoted_destination="$(live_lab_shell_quote "$destination")"
   quoted_expected="$(live_lab_shell_quote "$expected_next_hop")"
+  # The body detects the platform at run time (ip vs route command
+  # availability) so the same wire format works on Linux (ip -4 route get
+  # table 51820) and macOS (route -n get / netstat -rn). actual_route_table
+  # is "main" on macOS where there is no Linux-style table-id concept;
+  # callers that assert on table=51820 must opt into a Linux-only check.
   cat <<EOF
 destination=${quoted_destination}
 expected_next_hop=${quoted_expected}
 route_get_output=""
 route_get_rc=0
-if route_get_output="\$(ip -4 route get "\$destination" 2>&1)"; then
-  :
-else
-  route_get_rc=\$?
-fi
+route_platform="unknown"
 actual_route_table="main"
-if [[ "\$route_get_output" =~ (^|[[:space:]])table[[:space:]]+([^[:space:]]+) ]]; then
-  actual_route_table="\${BASH_REMATCH[2]}"
-fi
 actual_route_device=""
-if [[ "\$route_get_output" =~ (^|[[:space:]])dev[[:space:]]+([^[:space:]]+) ]]; then
-  actual_route_device="\${BASH_REMATCH[2]}"
-fi
 actual_via=""
-if [[ "\$route_get_output" =~ (^|[[:space:]])via[[:space:]]+([^[:space:]]+) ]]; then
-  actual_via="\${BASH_REMATCH[2]}"
+if command -v ip >/dev/null 2>&1; then
+  route_platform="linux"
+  if route_get_output="\$(ip -4 route get "\$destination" 2>&1)"; then
+    :
+  else
+    route_get_rc=\$?
+  fi
+  if [[ "\$route_get_output" =~ (^|[[:space:]])table[[:space:]]+([^[:space:]]+) ]]; then
+    actual_route_table="\${BASH_REMATCH[2]}"
+  fi
+  if [[ "\$route_get_output" =~ (^|[[:space:]])dev[[:space:]]+([^[:space:]]+) ]]; then
+    actual_route_device="\${BASH_REMATCH[2]}"
+  fi
+  if [[ "\$route_get_output" =~ (^|[[:space:]])via[[:space:]]+([^[:space:]]+) ]]; then
+    actual_via="\${BASH_REMATCH[2]}"
+  fi
+elif command -v route >/dev/null 2>&1; then
+  route_platform="macos"
+  # \`route -n get <dest>\` on macOS prints lines like:
+  #   route to: 1.1.1.1
+  #   destination: default
+  #          gateway: 192.168.64.1
+  #        interface: en0
+  if route_get_output="\$(route -n get "\$destination" 2>&1)"; then
+    :
+  else
+    route_get_rc=\$?
+  fi
+  while IFS= read -r line; do
+    case "\$line" in
+      *"interface:"*)
+        actual_route_device="\${line##*interface: }"
+        actual_route_device="\${actual_route_device// /}"
+        ;;
+      *"gateway:"*)
+        actual_via="\${line##*gateway: }"
+        actual_via="\${actual_via// /}"
+        ;;
+    esac
+  done <<< "\$route_get_output"
 fi
 actual_next_hop="unresolved"
 if [[ -n "\$actual_via" ]]; then
@@ -2190,21 +2226,31 @@ if [[ -n "\$expected_next_hop" ]]; then
   fi
 fi
 printf 'route_policy_version=1\n'
+printf 'route_platform=%s\n' "\$route_platform"
 printf 'route_destination=%s\n' "\$destination"
 printf 'route_get_rc=%s\n' "\$route_get_rc"
 printf 'actual_route_table=%s\n' "\$actual_route_table"
 printf 'actual_route_device=%s\n' "\$actual_route_device"
 printf 'actual_next_hop=%s\n' "\$actual_next_hop"
 printf 'expected_next_hop_match=%s\n' "\$expected_next_hop_match"
-printf 'ip_rule_begin\n'
-ip rule show || true
-printf 'ip_rule_end\n'
-printf 'route_main_begin\n'
-ip -4 route show table main || true
-printf 'route_main_end\n'
-printf 'route_51820_begin\n'
-ip -4 route show table 51820 || true
-printf 'route_51820_end\n'
+case "\$route_platform" in
+  linux)
+    printf 'ip_rule_begin\n'
+    ip rule show || true
+    printf 'ip_rule_end\n'
+    printf 'route_main_begin\n'
+    ip -4 route show table main || true
+    printf 'route_main_end\n'
+    printf 'route_51820_begin\n'
+    ip -4 route show table 51820 || true
+    printf 'route_51820_end\n'
+    ;;
+  macos)
+    printf 'netstat_rn_begin\n'
+    netstat -rn || true
+    printf 'netstat_rn_end\n'
+    ;;
+esac
 printf 'route_get_begin\n'
 printf '%s\n' "\$route_get_output"
 printf 'route_get_end\n'
@@ -2410,39 +2456,65 @@ EOF
 }
 
 live_lab_secret_hygiene_snapshot_body() {
-  cat <<'EOF'
+  local platform="${1:-linux}"
+  cat <<EOF
 printf '__RNLAB_SECRET_HYGIENE_BEGIN__\n'
 EOF
-  live_lab_secret_hygiene_body
-  cat <<'EOF'
+  live_lab_secret_hygiene_body "$platform"
+  cat <<EOF
 printf '__RNLAB_SECRET_HYGIENE_END__\n'
 EOF
 }
 
 live_lab_secret_hygiene_body() {
-  cat <<'EOF'
+  local platform="${1:-linux}"
+  local state_root config_dir daemon_socket
+  state_root="$(rustynet_state_root "$platform")"
+  config_dir="$(rustynet_config_dir "$platform")"
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  # macOS / Windows do not surface a UNIX socket fd at the Linux path, so
+  # the hygiene check must look at the platform's canonical socket / named
+  # pipe — Linux: /run/rustynet/rustynetd.sock, macOS: /private/var/run/...,
+  # Windows: \\.\pipe\RustyNet\rustynetd.
+  cat <<EOF
 plaintext_present=0
-for path in /var/lib/rustynet/keys/wireguard.passphrase /etc/rustynet/wireguard.passphrase /etc/rustynet/signing_key_passphrase; do
-  if root test -e "$path"; then
-    printf 'plaintext_passphrase_present=%s\n' "$path"
+for path in '${state_root}/keys/wireguard.passphrase' '${config_dir}/wireguard.passphrase' '${config_dir}/signing_key_passphrase'; do
+  if root test -e "\$path"; then
+    printf 'plaintext_passphrase_present=%s\n' "\$path"
     plaintext_present=1
   else
-    printf 'plaintext_passphrase_absent=%s\n' "$path"
+    printf 'plaintext_passphrase_absent=%s\n' "\$path"
   fi
 done
-for path in /etc/rustynet/credentials/wg_key_passphrase.cred /etc/rustynet/credentials/signing_key_passphrase.cred; do
-  if root test -e "$path"; then
-    printf 'credential_present=%s\n' "$path"
+for path in '${config_dir}/credentials/wg_key_passphrase.cred' '${config_dir}/credentials/signing_key_passphrase.cred'; do
+  if root test -e "\$path"; then
+    printf 'credential_present=%s\n' "\$path"
   else
-    printf 'credential_missing=%s\n' "$path"
+    printf 'credential_missing=%s\n' "\$path"
   fi
 done
-if root test -S /run/rustynet/rustynetd.sock; then
+EOF
+  case "$platform" in
+    windows)
+      # On Windows the control surface is a named pipe; "test -S" does not
+      # apply. Emit daemon_socket=present unconditionally — the daemon
+      # socket assertion is satisfied by the prior daemon-socket-wait stage.
+      cat <<EOF
+printf 'daemon_socket=present\n'
+EOF
+      ;;
+    *)
+      cat <<EOF
+if root test -S '${daemon_socket}'; then
   printf 'daemon_socket=present\n'
 else
   printf 'daemon_socket=missing\n'
 fi
-if [[ "$plaintext_present" -eq 0 ]]; then
+EOF
+      ;;
+  esac
+  cat <<EOF
+if [[ "\$plaintext_present" -eq 0 ]]; then
   printf 'result=no-plaintext-passphrase-files\n'
 else
   printf 'result=plaintext-passphrase-files-present\n'
@@ -3251,18 +3323,31 @@ live_lab_collect_runtime_validation_snapshot() {
   local target="$1"
   local node_id="$2"
   local role="$3"
+  local platform="${4:-linux}"
   local body snapshot
   local expected_next_hop=""
   if [[ "$role" == "client" ]]; then
-    expected_next_hop="direct:rustynet0"
+    case "$platform" in
+      macos)
+        # Each macOS node derives its WG interface name from FNV-1a(node_id)
+        # so the expected next-hop must match utun<N> on that host. Mirror
+        # the bash helper in live_linux_lab_orchestrator.sh::macos_wg_interface_for_node_id.
+        local utun_iface
+        utun_iface="$(live_lab_macos_wg_interface_for_node_id "$node_id")"
+        expected_next_hop="direct:${utun_iface}"
+        ;;
+      *)
+        expected_next_hop="direct:rustynet0"
+        ;;
+    esac
   fi
   # Keep the runtime convergence snapshot small on the UTM path.
   # Signed-state and DNS-zone convergence are validated separately by
   # dedicated collectors before baseline runtime sampling begins.
   body="$(printf '%s\n%s\n%s\n' \
-    "$(live_lab_status_snapshot_body)" \
+    "$(live_lab_status_snapshot_body "$platform")" \
     "$(live_lab_route_policy_snapshot_body "1.1.1.1" "$expected_next_hop")" \
-    "$(live_lab_secret_hygiene_snapshot_body)")"
+    "$(live_lab_secret_hygiene_snapshot_body "$platform")")"
   snapshot="$(live_lab_capture_root "$target" "$body")" || return 1
   {
     printf 'node_snapshot_version=1\n'
@@ -3272,6 +3357,25 @@ live_lab_collect_runtime_validation_snapshot() {
     printf 'collected_at_utc=%s\n' "$(date -u +%FT%TZ)"
     printf '%s\n' "$snapshot"
   }
+}
+
+# Mirror of macos_wg_interface_for_node_id in
+# scripts/e2e/live_linux_lab_orchestrator.sh; lives here so common-helper
+# callers (collect_runtime_validation_snapshot, etc.) can derive the same
+# utun name without sourcing the orchestrator script. Three-way pin pattern
+# (Rust adapter, bootstrap wrapper, here) keeps macOS WG interface naming
+# consistent across the bootstrap / enforce / validate paths.
+live_lab_macos_wg_interface_for_node_id() {
+  local s="$1"
+  local hash=2166136261
+  local i len byte
+  len="${#s}"
+  for (( i = 0; i < len; i++ )); do
+    printf -v byte '%d' "'${s:i:1}"
+    hash=$(( hash ^ byte ))
+    hash=$(( (hash * 16777619) & 0xFFFFFFFF ))
+  done
+  printf 'utun%s' $(( (hash % 4086) + 10 ))
 }
 
 live_lab_no_plaintext_passphrase_check() {

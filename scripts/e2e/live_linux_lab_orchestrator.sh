@@ -3541,8 +3541,10 @@ live_lab_collect_baseline_runtime_cluster_snapshot() {
     printf 'baseline_cluster_collected_at_utc=%s\n' "$(date -u +%FT%TZ)"
     while IFS=$'\t' read -r label target node_id role; do
       [[ -n "$target" ]] || continue
+      local cluster_platform
+      cluster_platform="$(node_platform_for_label "${label}")" || cluster_platform="linux"
       set +e
-      snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role" 2>&1)"
+      snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role" "$cluster_platform" 2>&1)"
       capture_rc=$?
       set -e
       ready=0
@@ -3552,7 +3554,8 @@ live_lab_collect_baseline_runtime_cluster_snapshot() {
         "$target" \
         "$role" \
         "$expected_membership_nodes" \
-        "$exit_node_id" >/dev/null 2>&1; then
+        "$exit_node_id" \
+        "$cluster_platform" >/dev/null 2>&1; then
         ready=1
       else
         overall_status="fail"
@@ -3823,6 +3826,7 @@ live_lab_runtime_snapshot_ready() {
   local role="$4"
   local expected_membership_nodes="$5"
   local exit_node_id="$6"
+  local platform="${7:-linux}"
   local status state restricted_safe_mode bootstrap_error last_reconcile_error
 
   status="$(snapshot_section_text "$snapshot" "RNLAB_STATUS")"
@@ -3844,7 +3848,8 @@ live_lab_runtime_snapshot_ready() {
     "$target" \
     "$role" \
     "$expected_membership_nodes" \
-    "$exit_node_id"
+    "$exit_node_id" \
+    "$platform"
 }
 
 live_lab_wait_for_node_convergence() {
@@ -3855,17 +3860,19 @@ live_lab_wait_for_node_convergence() {
   local exit_node_id="$5"
   local attempts="${6:-60}"
   local sleep_secs="${7:-10}"
+  local platform="${8:-linux}"
   local attempt snapshot
 
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role")" || snapshot=""
+    snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role" "$platform")" || snapshot=""
     if [[ -n "$snapshot" ]] && live_lab_runtime_snapshot_ready \
       "$snapshot" \
       "$node_id" \
       "$target" \
       "$role" \
       "$expected_membership_nodes" \
-      "$exit_node_id" >/dev/null 2>&1; then
+      "$exit_node_id" \
+      "$platform" >/dev/null 2>&1; then
       printf '%s' "$snapshot"
       return 0
     fi
@@ -3874,14 +3881,15 @@ live_lab_wait_for_node_convergence() {
     fi
   done
 
-  snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role")" || snapshot=""
+  snapshot="$(live_lab_collect_runtime_validation_snapshot "$target" "$node_id" "$role" "$platform")" || snapshot=""
   if [[ -n "$snapshot" ]] && live_lab_runtime_snapshot_ready \
     "$snapshot" \
     "$node_id" \
     "$target" \
     "$role" \
     "$expected_membership_nodes" \
-    "$exit_node_id" >/dev/null 2>&1; then
+    "$exit_node_id" \
+    "$platform" >/dev/null 2>&1; then
     printf '%s' "$snapshot"
     return 0
   fi
@@ -4117,7 +4125,7 @@ validate_runtime_worker() {
   local expected_membership_nodes exit_node_id snapshot wait_rc
   local route_policy route_policy_rc dns_snapshot dns_snapshot_rc expected_next_hop
   local signed_state_snapshot signed_state_rc dns_zone_snapshot dns_zone_rc
-  local zone_name
+  local zone_name platform
   local runtime_attempts=8
   local runtime_sleep_secs=1
   local signed_state_attempts=5
@@ -4128,16 +4136,24 @@ validate_runtime_worker() {
   expected_membership_nodes="$(node_count)"
   exit_node_id="$(node_id_for_label exit)"
   zone_name="${RUSTYNET_DNS_ZONE_NAME:-rustynet}"
+  platform="$(node_platform_for_label "${_label}")" || return 1
   expected_next_hop=""
   if [[ "$role" == "client" ]]; then
-    expected_next_hop="direct:rustynet0"
+    case "$platform" in
+      macos)
+        expected_next_hop="direct:$(macos_wg_interface_for_node_id "$node_id")"
+        ;;
+      *)
+        expected_next_hop="direct:rustynet0"
+        ;;
+    esac
   fi
   set +e
   # Stage-level route-matrix convergence already waited for the cluster to
   # settle before this worker runs. Keep the per-node wait short so we capture
   # the fresh runtime and signed-state window immediately after the final
   # refresh cycle instead of burning it here.
-  snapshot="$(live_lab_wait_for_node_convergence "$target" "$node_id" "$role" "$expected_membership_nodes" "$exit_node_id" "$runtime_attempts" "$runtime_sleep_secs")"
+  snapshot="$(live_lab_wait_for_node_convergence "$target" "$node_id" "$role" "$expected_membership_nodes" "$exit_node_id" "$runtime_attempts" "$runtime_sleep_secs" "$platform")"
   wait_rc=$?
   signed_state_snapshot="$(live_lab_wait_for_signed_state_convergence "$target" "$node_id" "$role" "$zone_name" "${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}" "${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}" "$signed_state_attempts" "$signed_state_sleep_secs")"
   signed_state_rc=$?
@@ -4170,7 +4186,8 @@ validate_runtime_worker() {
     "$target" \
     "$role" \
     "$expected_membership_nodes" \
-    "$exit_node_id"
+    "$exit_node_id" \
+    "$platform"
   # Keep the convergence helper return code in the worker artifacts for
   # forensics, but fail only on the explicit runtime, signed-state, DNS-zone,
   # route-policy, and secret-hygiene assertions above. The helper can time out
@@ -5666,8 +5683,9 @@ live_lab_assert_runtime_spec() {
   local role="$4"
   local expected_membership_nodes="$5"
   local exit_node_id="$6"
+  local platform="${7:-linux}"
   local status route_check secret_hygiene
-  local status_label route_label hygiene_label
+  local status_label route_label hygiene_label expected_route_device
 
   status_label="baseline status (${node_id})"
   route_label="route check (${node_id})"
@@ -5696,8 +5714,19 @@ live_lab_assert_runtime_spec() {
 
   if [[ "$role" == "client" ]]; then
     assert_text_contains "$status" "$status_label" "exit_node=${exit_node_id}"
-    assert_text_contains "$route_check" "$route_label" "actual_route_device=rustynet0"
-    assert_text_contains "$route_check" "$route_label" "actual_route_table=51820"
+    case "$platform" in
+      macos)
+        expected_route_device="$(macos_wg_interface_for_node_id "$node_id")"
+        # macOS has no Linux-style route table id (51820); platform-aware
+        # body emits actual_route_table=main and the next-hop assertion
+        # carries the burden of the route correctness check.
+        assert_text_contains "$route_check" "$route_label" "actual_route_device=${expected_route_device}"
+        ;;
+      *)
+        assert_text_contains "$route_check" "$route_label" "actual_route_device=rustynet0"
+        assert_text_contains "$route_check" "$route_label" "actual_route_table=51820"
+        ;;
+    esac
     assert_text_contains "$route_check" "$route_label" "expected_next_hop_match=pass"
   fi
 }
