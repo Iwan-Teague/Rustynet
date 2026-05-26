@@ -75,15 +75,62 @@ BREW_PREFIX=""
 # ("Running Homebrew as root is extremely dangerous"). Prefer logname
 # (which tracks the original login session uid) and only fall back to
 # SUDO_USER when logname is unavailable AND SUDO_USER is not root.
-REAL_USER="$(logname 2>/dev/null || true)"
-if [[ -z "${REAL_USER}" || "${REAL_USER}" == "root" ]]; then
-  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-    REAL_USER="${SUDO_USER}"
-  else
-    REAL_USER="$(whoami)"
+resolve_non_root_bootstrap_user() {
+  local candidate=""
+  local prefix owner
+  for candidate in "${RUSTYNET_MACOS_BOOTSTRAP_USER:-}" \
+                   "$(logname 2>/dev/null || true)" \
+                   "${SUDO_USER:-}"; do
+    if [[ -n "${candidate}" && "${candidate}" != "root" ]] &&
+       id -u "${candidate}" >/dev/null 2>&1; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  for prefix in /opt/homebrew /usr/local; do
+    if [[ -x "${prefix}/bin/brew" ]]; then
+      owner="$(stat -f '%Su' "${prefix}" 2>/dev/null || true)"
+      if [[ -n "${owner}" && "${owner}" != "root" ]] &&
+         id -u "${owner}" >/dev/null 2>&1; then
+        printf '%s\n' "${owner}"
+        return 0
+      fi
+      owner="$(stat -f '%Su' "${prefix}/bin/brew" 2>/dev/null || true)"
+      if [[ -n "${owner}" && "${owner}" != "root" ]] &&
+         id -u "${owner}" >/dev/null 2>&1; then
+        printf '%s\n' "${owner}"
+        return 0
+      fi
+    fi
+  done
+
+  owner="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+  if [[ -n "${owner}" && "${owner}" != "root" ]] &&
+     id -u "${owner}" >/dev/null 2>&1; then
+    printf '%s\n' "${owner}"
+    return 0
   fi
+
+  return 1
+}
+
+REAL_USER="$(resolve_non_root_bootstrap_user)" || {
+  cat >&2 <<'EOF'
+[bootstrap] could not resolve a non-root macOS bootstrap user.
+[bootstrap] Refusing to run Homebrew/Rust toolchain as root.
+[bootstrap] Re-run from an admin user session or set RUSTYNET_MACOS_BOOTSTRAP_USER to a valid non-root account.
+EOF
+  exit 1
+}
+REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+if [[ -z "${REAL_HOME}" || ! -d "${REAL_HOME}" ]]; then
+  REAL_HOME="$(eval echo "~${REAL_USER}")"
 fi
-REAL_HOME="$(eval echo "~${REAL_USER}")"
+if [[ -z "${REAL_HOME}" || ! -d "${REAL_HOME}" ]]; then
+  echo "[bootstrap] could not resolve home directory for ${REAL_USER}" >&2
+  exit 1
+fi
 
 # Run a command as the real (non-root) user with the current PATH exported.
 as_user() {
