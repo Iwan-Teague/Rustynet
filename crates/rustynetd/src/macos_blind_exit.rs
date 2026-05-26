@@ -81,12 +81,16 @@ pub fn build_macos_blind_exit_pf_rules(config: &MacosBlindExitPfConfig) -> Resul
     }
 
     if config.dns_protected {
+        // pf grammar: `[action] [direction] [quick] [on <iface>] [<af>] [proto <p>] ...`
+        // The address family token (inet / inet6) MUST come after `on <iface>`.
+        // macOS pfctl rejects `inet on <iface>` with `syntax error`
+        // (verified against Phase 24 lab macOS 26.5).
         rules.push_str(&format!(
-            "pass out quick inet proto udp on {} to any port 53 keep state\n",
+            "pass out quick on {} inet proto udp to any port 53 keep state\n",
             config.tunnel_interface
         ));
         rules.push_str(&format!(
-            "pass out quick inet proto tcp on {} to any port 53 keep state\n",
+            "pass out quick on {} inet proto tcp to any port 53 keep state\n",
             config.tunnel_interface
         ));
         rules.push_str("block drop out quick inet proto udp to any port 53\n");
@@ -94,22 +98,22 @@ pub fn build_macos_blind_exit_pf_rules(config: &MacosBlindExitPfConfig) -> Resul
     }
 
     rules.push_str(&format!(
-        "pass out quick inet on {} all keep state\n",
+        "pass out quick on {} inet all keep state\n",
         config.tunnel_interface
     ));
     if config.ipv6_tunnel_allowed {
         rules.push_str(&format!(
-            "pass out quick inet6 on {} all keep state\n",
+            "pass out quick on {} inet6 all keep state\n",
             config.tunnel_interface
         ));
     }
     rules.push_str(&format!(
-        "pass in quick {} on {} from {} to any keep state\n",
-        mesh_family, config.tunnel_interface, config.mesh_cidr
+        "pass in quick on {} {} from {} to any keep state\n",
+        config.tunnel_interface, mesh_family, config.mesh_cidr
     ));
     rules.push_str(&format!(
-        "pass out quick {} on {} from {} to any keep state\n",
-        mesh_family, config.egress_interface, config.mesh_cidr
+        "pass out quick on {} {} from {} to any keep state\n",
+        config.egress_interface, mesh_family, config.mesh_cidr
     ));
     if !config.ipv6_tunnel_allowed {
         rules.push_str("block drop out quick inet6 all\n");
@@ -150,7 +154,7 @@ pub fn evaluate_macos_blind_exit_pf_rules(
     }
 
     let tunnel_v4 = format!(
-        "pass out quick inet on {} all keep state",
+        "pass out quick on {} inet all keep state",
         config.tunnel_interface
     );
     if !normalized.iter().any(|line| line == &tunnel_v4) {
@@ -161,7 +165,7 @@ pub fn evaluate_macos_blind_exit_pf_rules(
     }
     if config.ipv6_tunnel_allowed {
         let tunnel_v6 = format!(
-            "pass out quick inet6 on {} all keep state",
+            "pass out quick on {} inet6 all keep state",
             config.tunnel_interface
         );
         if !normalized.iter().any(|line| line == &tunnel_v6) {
@@ -173,8 +177,8 @@ pub fn evaluate_macos_blind_exit_pf_rules(
     }
 
     let mesh_in = format!(
-        "pass in quick {} on {} from {} to any keep state",
-        mesh_family, config.tunnel_interface, config.mesh_cidr
+        "pass in quick on {} {} from {} to any keep state",
+        config.tunnel_interface, mesh_family, config.mesh_cidr
     );
     if !normalized.iter().any(|line| line == &mesh_in) {
         reasons.push(format!(
@@ -184,8 +188,8 @@ pub fn evaluate_macos_blind_exit_pf_rules(
     }
 
     let mesh_out = format!(
-        "pass out quick {} on {} from {} to any keep state",
-        mesh_family, config.egress_interface, config.mesh_cidr
+        "pass out quick on {} {} from {} to any keep state",
+        config.egress_interface, mesh_family, config.mesh_cidr
     );
     if !normalized.iter().any(|line| line == &mesh_out) {
         reasons.push(format!(
@@ -209,8 +213,8 @@ pub fn evaluate_macos_blind_exit_pf_rules(
     if config.dns_protected {
         for proto in ["udp", "tcp"] {
             let pass = format!(
-                "pass out quick inet proto {} on {} to any port 53 keep state",
-                proto, config.tunnel_interface
+                "pass out quick on {} inet proto {} to any port 53 keep state",
+                config.tunnel_interface, proto
             );
             let block = format!("block drop out quick inet proto {} to any port 53", proto);
             if !normalized.iter().any(|line| line == &pass) {
@@ -341,14 +345,14 @@ mod tests {
     fn builder_emits_reviewed_final_hop_rules() {
         let rules = build_macos_blind_exit_pf_rules(&config()).unwrap();
         assert!(rules.contains("set block-policy drop\n"));
-        assert!(rules.contains("pass out quick inet on rustynet0 all keep state\n"));
-        assert!(rules.contains("pass out quick inet6 on rustynet0 all keep state\n"));
+        assert!(rules.contains("pass out quick on rustynet0 inet all keep state\n"));
+        assert!(rules.contains("pass out quick on rustynet0 inet6 all keep state\n"));
         assert!(
             rules
-                .contains("pass in quick inet on rustynet0 from 100.64.0.0/10 to any keep state\n")
+                .contains("pass in quick on rustynet0 inet from 100.64.0.0/10 to any keep state\n")
         );
         assert!(
-            rules.contains("pass out quick inet on en0 from 100.64.0.0/10 to any keep state\n")
+            rules.contains("pass out quick on en0 inet from 100.64.0.0/10 to any keep state\n")
         );
         assert!(rules.ends_with("block drop out quick all\n"));
         assert!(evaluate_macos_blind_exit_pf_rules(&rules, &config()).is_empty());
@@ -357,7 +361,7 @@ mod tests {
     #[test]
     fn evaluator_rejects_unreviewed_cleartext_egress() {
         let mut rules = build_macos_blind_exit_pf_rules(&config()).unwrap();
-        rules.push_str("pass out quick inet on en0 all keep state\n");
+        rules.push_str("pass out quick on en0 inet all keep state\n");
         let reasons = evaluate_macos_blind_exit_pf_rules(&rules, &config());
         assert!(
             reasons
@@ -370,7 +374,7 @@ mod tests {
     fn evaluator_rejects_pf_route_bypass_primitives() {
         let mut rules = build_macos_blind_exit_pf_rules(&config()).unwrap();
         rules
-            .push_str("pass out quick route-to (en1 192.0.2.1) inet on rustynet0 all keep state\n");
+            .push_str("pass out quick route-to (en1 192.0.2.1) on rustynet0 inet all keep state\n");
         let reasons = evaluate_macos_blind_exit_pf_rules(&rules, &config());
         assert!(
             reasons
@@ -388,7 +392,7 @@ mod tests {
         assert!(reasons.is_empty(), "{reasons:?}");
         assert!(
             rules
-                .contains("pass out quick inet proto udp on rustynet0 to any port 53 keep state\n")
+                .contains("pass out quick on rustynet0 inet proto udp to any port 53 keep state\n")
         );
         assert!(rules.contains("block drop out quick inet proto tcp to any port 53\n"));
     }
