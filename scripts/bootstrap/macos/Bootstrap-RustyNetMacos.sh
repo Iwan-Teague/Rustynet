@@ -662,7 +662,11 @@ generate_wireguard_keys() {
     echo "[bootstrap] wireguard passphrase generation produced ${passphrase_size} bytes; expected 64" >&2
     exit 1
   fi
-  chown rustynetd:rustynetd "${passphrase_tmp}"
+  # Keep the bootstrap passphrase root-owned until the privileged `key init`
+  # and `key store-passphrase` calls finish. The daemon's Unix secret-file
+  # guard requires the file owner to match the effective reader UID; root is
+  # the reader during these two System.keychain provisioning steps.
+  chown root:wheel "${passphrase_tmp}"
   mv "${passphrase_tmp}" "${passphrase_file}"
   trap - EXIT
 
