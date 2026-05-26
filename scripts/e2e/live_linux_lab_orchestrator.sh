@@ -3303,12 +3303,16 @@ enforce_runtime_worker() {
 # on the host from bootstrap_host_worker_macos (we re-scp it just in case
 # the lab tmp dir was wiped). Mirrors Linux's `e2e-enforce-host` flip from
 # `auto_tunnel_enforce=false` (bootstrap) to `true` (enforce).
+#
+# Stage the script under /private/var/tmp (matching bootstrap_host_worker_macos);
+# /private/tmp is policy-locked on the live mac VM, so scp to /tmp fails closed
+# with "Permission denied".
 enforce_runtime_worker_macos() {
   local target="$1"
   local role="$2"
   local node_id="$3"
   local local_install_script="$ROOT_DIR/scripts/bootstrap/macos/Install-RustyNetMacosService.sh"
-  local remote_install_script="/tmp/Install-RustyNetMacosService.sh"
+  local remote_install_script="/private/var/tmp/Install-RustyNetMacosService.sh"
   local wg_interface daemon_node_role
   if [[ ! -f "$local_install_script" ]]; then
     printf 'enforce_runtime_worker_macos: install script missing locally at %s\n' \
@@ -3318,6 +3322,11 @@ enforce_runtime_worker_macos() {
   daemon_node_role="$(macos_daemon_node_role_for_orchestrator_role "$role")" || return 1
   wg_interface="$(macos_wg_interface_for_node_id "$node_id")" || return 1
   live_lab_push_sudo_password "$target" || return 1
+  if ! live_lab_run_root "$target" "root rm -f '${remote_install_script}'"; then
+    printf 'enforce_runtime_worker_macos: failed to clear stale install script on %s\n' \
+      "$target" >&2
+    return 1
+  fi
   live_lab_scp_to "$local_install_script" "$target" "$remote_install_script" || return 1
   local cmd
   cmd="sudo -n bash '${remote_install_script}'"
