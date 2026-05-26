@@ -3428,12 +3428,25 @@ refresh_trust_evidence_worker() {
   local label="$1"
   local target="$2"
   local node_id="$3"
-  local _role="$4"
+  local role="$4"
   local platform daemon_socket
   platform="$(node_platform_for_label "${label}")" || return 1
   daemon_socket="$(rustynet_daemon_socket "$platform")"
-  printf '[trust-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
+  printf '[trust-refresh] %s %s (%s %s) platform=%s\n' "$label" "$target" "$node_id" "$role" "$platform"
   live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
+  # refresh-signed-trust mints a fresh signed trust record using the local
+  # signing key (admin / blind_exit roles only — bootstrap discards the
+  # signing-key passphrase on client nodes). Non-issuing roles just consume
+  # the published evidence via the daemon bounce in refresh_runtime_state_worker.
+  case "$role" in
+    admin|blind_exit)
+      ;;
+    *)
+      printf '[trust-refresh] %s skipped: role %q does not mint signed trust evidence\n' \
+        "$label" "$role"
+      return 0
+      ;;
+  esac
   case "$platform" in
     linux)
       live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops refresh-signed-trust" 5 2
@@ -4222,11 +4235,33 @@ refresh_runtime_state_for_validation_worker() {
     env_path="$(rustynet_config_dir "$platform")/assignment-refresh.env"
     daemon_socket="$(rustynet_daemon_socket "$platform")"
     printf '[runtime-refresh-role-coupling] %s %s (exit=%s) platform=%s\n' "$label" "$target" "$exit_node_id" "$platform"
-    # Baseline validation performs the authoritative route assertion itself.
-    # Skip the helper's internal route wait here so we do not spend the short
-    # signed-state window on a second convergence loop before collecting the
-    # final validation snapshots.
-    live_lab_apply_role_coupling "$target" "client" "$exit_node_id" "false" "$env_path" "true" "$platform" || return 1
+    case "$platform" in
+      linux)
+        # Baseline validation performs the authoritative route assertion itself.
+        # Skip the helper's internal route wait here so we do not spend the short
+        # signed-state window on a second convergence loop before collecting the
+        # final validation snapshots.
+        live_lab_apply_role_coupling "$target" "client" "$exit_node_id" "false" "$env_path" "true" "$platform" || return 1
+        ;;
+      macos|windows)
+        # `rustynet ops apply-role-coupling` is Linux-only (systemctl /
+        # set_assignment_refresh_exit_node path). The macOS / Windows
+        # assignment-refresh.env was already written by
+        # live_lab_install_assignment_refresh_env with the orchestrator-
+        # chosen exit-node-id baked in, so the daemon picks the right
+        # exit on its next reconcile. Bouncing the daemon (refresh
+        # state worker) is what role-coupling does on Linux beyond the
+        # env rewrite; skip the verb and call the platform-aware
+        # refresh worker directly so the macOS / Windows daemon sees the
+        # latest signed state.
+        refresh_runtime_state_worker "$label" "$target" "$_node_id" "$role" || return 1
+        ;;
+      *)
+        printf 'refresh_runtime_state_for_validation_worker: unsupported platform %q for label %q\n' \
+          "${platform}" "${label}" >&2
+        return 1
+        ;;
+    esac
     live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
     return 0
   fi
