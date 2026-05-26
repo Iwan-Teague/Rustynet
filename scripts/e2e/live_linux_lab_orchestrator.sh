@@ -3390,7 +3390,27 @@ refresh_runtime_state_worker() {
   platform="$(node_platform_for_label "${label}")" || return 1
   daemon_socket="$(rustynet_daemon_socket "$platform")"
   printf '[runtime-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
-  live_lab_run_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops force-local-assignment-refresh-now"
+  case "$platform" in
+    linux)
+      live_lab_run_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops force-local-assignment-refresh-now"
+      ;;
+    macos)
+      # macOS has no systemd; `rustynet ops force-local-assignment-refresh-now`
+      # is Linux-only today. For Phase 24 client nodes the meaningful work is
+      # bouncing the daemon so it re-reads the signed bundles the orchestrator
+      # just distributed. Privileged-helper bounces best-effort (KeepAlive=true
+      # re-launches it).
+      live_lab_run_root "$target" "root launchctl kickstart -k system/com.rustynet.privileged-helper 2>/dev/null || true; root launchctl kickstart -k system/com.rustynet.daemon" || return 1
+      ;;
+    windows)
+      live_lab_ssh_windows "$target" "Restart-Service -Name RustyNet -Force" || return 1
+      ;;
+    *)
+      printf 'refresh_runtime_state_worker: unsupported platform %q for label %q\n' \
+        "${platform}" "${label}" >&2
+      return 1
+      ;;
+  esac
   live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
 }
 
@@ -3404,7 +3424,27 @@ refresh_trust_evidence_worker() {
   daemon_socket="$(rustynet_daemon_socket "$platform")"
   printf '[trust-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
   live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
-  live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops refresh-signed-trust" 5 2
+  case "$platform" in
+    linux)
+      live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops refresh-signed-trust" 5 2
+      ;;
+    macos|windows)
+      # `rustynet ops refresh-signed-trust` defaults to Linux paths
+      # (/etc/rustynet/trust-evidence.key) and the macOS / Windows bootstrap
+      # does not provision an equivalent signing key. The non-Linux host
+      # already consumed the latest signed trust evidence via the daemon
+      # bounce in refresh_runtime_state_worker; skipping here is the
+      # safe no-op until the Rust verb gains platform-aware path resolution
+      # and macOS / Windows trust-key provisioning.
+      printf '[trust-refresh] %s skipped on %s (signer key path Linux-only today)\n' \
+        "$label" "$platform"
+      ;;
+    *)
+      printf 'refresh_trust_evidence_worker: unsupported platform %q for label %q\n' \
+        "${platform}" "${label}" >&2
+      return 1
+      ;;
+  esac
 }
 
 refresh_runtime_state_all_nodes() {

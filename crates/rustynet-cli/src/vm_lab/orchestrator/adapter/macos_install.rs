@@ -717,6 +717,39 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_refresh_runtime_state_dispatches_per_platform() {
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "root launchctl kickstart -k system/com.rustynet.privileged-helper 2>/dev/null || true; root launchctl kickstart -k system/com.rustynet.daemon"
+            ),
+            "macOS runtime refresh must bounce daemon via launchctl kickstart"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "live_lab_ssh_windows \"$target\" \"Restart-Service -Name RustyNet -Force\""
+            ),
+            "Windows runtime refresh must restart RustyNet service via PowerShell"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("rustynet ops force-local-assignment-refresh-now"),
+            "Linux runtime refresh must keep the existing systemd-aware path"
+        );
+    }
+
+    #[test]
+    fn live_lab_refresh_trust_skips_non_linux_until_signer_key_provisioned() {
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("[trust-refresh] %s skipped on %s (signer key path Linux-only today)"),
+            "non-Linux trust refresh must be an explicit no-op until the verb is platform-aware"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("rustynet ops refresh-signed-trust"),
+            "Linux trust refresh must keep the existing signed-trust verb"
+        );
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),
