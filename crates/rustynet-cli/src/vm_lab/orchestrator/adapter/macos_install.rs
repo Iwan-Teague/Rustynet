@@ -38,6 +38,9 @@ static MACOS_BOOTSTRAP_WRAPPER: &str =
 #[cfg(test)]
 static WINDOWS_BOOTSTRAP_WRAPPER: &str =
     include_str!("../../../../../../scripts/e2e/rn_bootstrap_windows.ps1");
+#[cfg(test)]
+static LIVE_LINUX_LAB_ORCHESTRATOR: &str =
+    include_str!("../../../../../../scripts/e2e/live_linux_lab_orchestrator.sh");
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -628,6 +631,29 @@ mod tests {
             !BOOTSTRAP_SCRIPT
                 .contains("sudo -u rustynetd \"${RUSTYNETD_BIN}\" key store-passphrase"),
             "passphrase keychain provisioning must not run as rustynetd"
+        );
+    }
+
+    #[test]
+    fn live_lab_membership_distribution_uses_macos_writable_staging() {
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains("staging_dir=\"/private/var/tmp\""),
+            "macOS membership distribution must not stage files under locked-down /tmp"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("remote_snapshot=\"${staging_dir}/rn-membership.snapshot\""),
+            "membership snapshot staging path must be platform-derived"
+        );
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("root install -m 0600 '${remote_snapshot}' '${snapshot_path}'"),
+            "macOS membership install must consume the platform-specific staging path"
+        );
+        assert!(
+            !LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("root install -m 0600 /tmp/rn-membership.snapshot '${snapshot_path}'"),
+            "macOS membership distribution must not hard-code /tmp"
         );
     }
 
