@@ -3428,16 +3428,22 @@ refresh_trust_evidence_worker() {
     linux)
       live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops refresh-signed-trust" 5 2
       ;;
-    macos|windows)
-      # `rustynet ops refresh-signed-trust` defaults to Linux paths
-      # (/etc/rustynet/trust-evidence.key) and the macOS / Windows bootstrap
-      # does not provision an equivalent signing key. The non-Linux host
-      # already consumed the latest signed trust evidence via the daemon
-      # bounce in refresh_runtime_state_worker; skipping here is the
-      # safe no-op until the Rust verb gains platform-aware path resolution
-      # and macOS / Windows trust-key provisioning.
-      printf '[trust-refresh] %s skipped on %s (signer key path Linux-only today)\n' \
-        "$label" "$platform"
+    macos)
+      # macOS bootstrap provisions the trust signing key under the macOS
+      # state root (/usr/local/etc/rustynet/trust-evidence.key) and the
+      # signed trust record under /usr/local/var/rustynet/trust/. The Rust
+      # ops verb still defaults to Linux paths; pass the macOS canonicals
+      # via env so refresh-signed-trust resolves to the right files.
+      live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' RUSTYNET_TRUST_SIGNER_KEY='/usr/local/etc/rustynet/trust-evidence.key' RUSTYNET_TRUST_EVIDENCE='/usr/local/var/rustynet/trust/rustynetd.trust' rustynet ops refresh-signed-trust" 5 2
+      ;;
+    windows)
+      # Windows install layout places trust material under
+      # C:\ProgramData\RustyNet\trust\. Windows refresh-signed-trust still
+      # needs DPAPI-aware signer-key unwrap (tracked as a follow-up); for
+      # now skip with an explicit log line — the daemon bounce in
+      # refresh_runtime_state_worker already picked up the latest signed
+      # trust evidence the orchestrator distributed.
+      printf '[trust-refresh] %s skipped on windows (DPAPI signer-key unwrap pending)\n' "$label"
       ;;
     *)
       printf 'refresh_trust_evidence_worker: unsupported platform %q for label %q\n' \
