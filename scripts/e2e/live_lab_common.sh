@@ -2264,8 +2264,12 @@ actual_next_hop="unresolved"
 # address. After whitespace stripping that becomes 'index:<N><device>'.
 # Treat this case as a direct-link route to the device so the next-hop
 # canonical form matches the orchestrator's expected 'direct:<dev>'.
-if [[ "\$actual_via" =~ ^index:[0-9]+([A-Za-z][A-Za-z0-9]*)\$ ]]; then
-  actual_route_device="\${BASH_REMATCH[1]}"
+# sed is used because the body runs under zsh on macOS (default login
+# shell), where bash's BASH_REMATCH captures from \`[[ =~ ]]\` are not
+# populated. BSD sed -E and GNU sed -E both support this pattern.
+index_form_device="\$(printf '%s' "\$actual_via" | sed -nE 's/^index:[0-9]+([A-Za-z][A-Za-z0-9]*)\$/\1/p')"
+if [[ -n "\$index_form_device" ]]; then
+  actual_route_device="\$index_form_device"
   actual_via=""
 fi
 if [[ -n "\$actual_via" ]]; then

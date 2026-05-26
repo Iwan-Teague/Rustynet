@@ -833,9 +833,13 @@ mod tests {
         // that becomes 'index:<N><device>'. The body must rewrite this to
         // direct:<device> so the orchestrator's expected_next_hop assertion
         // (direct:utunN) matches the actual route.
+        //
+        // The extraction uses sed -nE (not `[[ =~ ]]` with BASH_REMATCH) because
+        // the body executes under zsh on macOS, where bash's capture array
+        // is absent and accessing it under set -u aborts the snapshot body.
         assert!(
-            LIVE_LAB_COMMON.contains(r#"^index:[0-9]+([A-Za-z][A-Za-z0-9]*)\$"#),
-            "route policy body must rewrite index:<N><device> gateways to direct:<device>"
+            LIVE_LAB_COMMON.contains(r"sed -nE 's/^index:[0-9]+([A-Za-z][A-Za-z0-9]*)\$/\1/p'"),
+            "route policy body must extract device via sed (portable across bash and zsh)"
         );
     }
 
