@@ -1655,6 +1655,36 @@ rustynet_assignment_pub_path() {
   esac
 }
 
+# Returns the trust evidence path for the given platform.
+rustynet_trust_evidence_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.trust' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.trust' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.trust' ;;
+  esac
+}
+
+# Returns the trust verifier key path for the given platform.
+rustynet_trust_verifier_key_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\trust-evidence.pub' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/trust-evidence.pub' ;;
+    *)       printf '%s' '/etc/rustynet/trust-evidence.pub' ;;
+  esac
+}
+
+# Returns the trust watermark path for the given platform.
+rustynet_trust_watermark_path() {
+  local platform="${1:-linux}"
+  case "$platform" in
+    windows) printf '%s' 'C:\ProgramData\RustyNet\trust\rustynetd.trust.watermark' ;;
+    macos)   printf '%s' '/usr/local/var/rustynet/trust/rustynetd.trust.watermark' ;;
+    *)       printf '%s' '/var/lib/rustynet/rustynetd.trust.watermark' ;;
+  esac
+}
+
 # Returns true (exit 0) if the platform uses a Unix/SSH shell; false (exit 1) for Windows.
 rustynet_platform_uses_unix_shell() {
   local platform="${1:-linux}"
@@ -2080,11 +2110,27 @@ live_lab_signed_state_body() {
   local zone_name="${2:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
   local max_age_secs="${3:-${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}}"
   local max_clock_skew_secs="${4:-${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}}"
+  local platform="${5:-linux}"
   local quoted_node_id quoted_zone_name quoted_max_age quoted_max_clock_skew
   quoted_node_id="$(live_lab_shell_quote "$node_id")"
   quoted_zone_name="$(live_lab_shell_quote "$zone_name")"
   quoted_max_age="$(live_lab_shell_quote "$max_age_secs")"
   quoted_max_clock_skew="$(live_lab_shell_quote "$max_clock_skew_secs")"
+  local daemon_socket assignment_bundle assignment_pub assignment_watermark
+  local traversal_bundle traversal_pub traversal_watermark
+  local dns_zone_bundle dns_zone_pub trust_evidence trust_verifier_key trust_watermark
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  assignment_bundle="$(rustynet_assignment_bundle_path "$platform")"
+  assignment_pub="$(rustynet_assignment_pub_path "$platform")"
+  assignment_watermark="$(rustynet_assignment_watermark_path "$platform")"
+  traversal_bundle="$(rustynet_traversal_bundle_path "$platform")"
+  traversal_pub="$(rustynet_traversal_pub_path "$platform")"
+  traversal_watermark="$(rustynet_traversal_watermark_path "$platform")"
+  dns_zone_bundle="$(rustynet_dns_zone_bundle_path "$platform")"
+  dns_zone_pub="$(rustynet_dns_zone_pub_path "$platform")"
+  trust_evidence="$(rustynet_trust_evidence_path "$platform")"
+  trust_verifier_key="$(rustynet_trust_verifier_key_path "$platform")"
+  trust_watermark="$(rustynet_trust_watermark_path "$platform")"
   cat <<EOF
 node_id=${quoted_node_id}
 zone_name=${quoted_zone_name}
@@ -2096,11 +2142,11 @@ assignment_verify_rc=0
 traversal_verify_rc=0
 trust_verify_rc=0
 dns_zone_verify_rc=0
-netcheck_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet netcheck 2>&1)" || netcheck_rc=\$?
-assignment_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet assignment verify --bundle /var/lib/rustynet/rustynetd.assignment --verifier-key /etc/rustynet/assignment.pub --watermark /var/lib/rustynet/rustynetd.assignment.watermark --expected-node-id "\$node_id" --max-age-secs "\$max_age_secs" --max-clock-skew-secs "\$max_clock_skew_secs" 2>&1)" || assignment_verify_rc=\$?
-traversal_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet traversal verify --bundle /var/lib/rustynet/rustynetd.traversal --verifier-key /etc/rustynet/traversal.pub --watermark /var/lib/rustynet/rustynetd.traversal.watermark --expected-source-node-id "\$node_id" --max-age-secs "\$max_age_secs" --max-clock-skew-secs "\$max_clock_skew_secs" 2>&1)" || traversal_verify_rc=\$?
-trust_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet trust verify --evidence /var/lib/rustynet/rustynetd.trust --verifier-key /etc/rustynet/trust-evidence.pub --watermark /var/lib/rustynet/rustynetd.trust.watermark --max-age-secs "\$max_age_secs" --max-clock-skew-secs "\$max_clock_skew_secs" 2>&1)" || trust_verify_rc=\$?
-dns_zone_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns zone verify --bundle /var/lib/rustynet/rustynetd.dns-zone --verifier-key /etc/rustynet/dns-zone.pub --expected-zone-name "\$zone_name" 2>&1)" || dns_zone_verify_rc=\$?
+netcheck_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet netcheck 2>&1)" || netcheck_rc=\$?
+assignment_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet assignment verify --bundle '${assignment_bundle}' --verifier-key '${assignment_pub}' --watermark '${assignment_watermark}' --expected-node-id "\$node_id" --max-age-secs "\$max_age_secs" --max-clock-skew-secs "\$max_clock_skew_secs" 2>&1)" || assignment_verify_rc=\$?
+traversal_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet traversal verify --bundle '${traversal_bundle}' --verifier-key '${traversal_pub}' --watermark '${traversal_watermark}' --expected-source-node-id "\$node_id" --max-age-secs "\$max_age_secs" --max-clock-skew-secs "\$max_clock_skew_secs" 2>&1)" || traversal_verify_rc=\$?
+trust_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet trust verify --evidence '${trust_evidence}' --verifier-key '${trust_verifier_key}' --watermark '${trust_watermark}' --max-age-secs "\$max_age_secs" --max-clock-skew-secs "\$max_clock_skew_secs" 2>&1)" || trust_verify_rc=\$?
+dns_zone_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet dns zone verify --bundle '${dns_zone_bundle}' --verifier-key '${dns_zone_pub}' --expected-zone-name "\$zone_name" 2>&1)" || dns_zone_verify_rc=\$?
 if [[ "\$assignment_verify_rc" -eq 0 && "\$traversal_verify_rc" -eq 0 && "\$trust_verify_rc" -eq 0 && "\$dns_zone_verify_rc" -eq 0 ]]; then
   artifact_chain_result=pass
 fi
@@ -2143,9 +2189,10 @@ live_lab_signed_state_snapshot_body() {
   local zone_name="${2:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
   local max_age_secs="${3:-${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}}"
   local max_clock_skew_secs="${4:-${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}}"
+  local platform="${5:-linux}"
   cat <<EOF
 printf '__RNLAB_SIGNED_STATE_BEGIN__\n'
-$(live_lab_signed_state_body "$node_id" "$zone_name" "$max_age_secs" "$max_clock_skew_secs")
+$(live_lab_signed_state_body "$node_id" "$zone_name" "$max_age_secs" "$max_clock_skew_secs" "$platform")
 printf '__RNLAB_SIGNED_STATE_END__\n'
 EOF
 }
@@ -2357,28 +2404,34 @@ EOF
 live_lab_dns_zone_body() {
   local node_id="$1"
   local zone_name="${2:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
+  local platform="${3:-linux}"
   local quoted_node_id quoted_zone_name
   quoted_node_id="$(live_lab_shell_quote "$node_id")"
   quoted_zone_name="$(live_lab_shell_quote "$zone_name")"
+  local daemon_socket dns_zone_bundle dns_zone_pub dns_zone_watermark
+  daemon_socket="$(rustynet_daemon_socket "$platform")"
+  dns_zone_bundle="$(rustynet_dns_zone_bundle_path "$platform")"
+  dns_zone_pub="$(rustynet_dns_zone_pub_path "$platform")"
+  dns_zone_watermark="$(rustynet_dns_zone_watermark_path "$platform")"
   cat <<EOF
 node_id=${quoted_node_id}
 zone_name=${quoted_zone_name}
 status_rc=0
 dns_inspect_rc=0
 dns_zone_verify_rc=0
-status_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status 2>&1)" || status_rc=\$?
-dns_inspect_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns inspect 2>&1)" || dns_inspect_rc=\$?
-dns_zone_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet dns zone verify --bundle /var/lib/rustynet/rustynetd.dns-zone --verifier-key /etc/rustynet/dns-zone.pub --expected-zone-name "\$zone_name" 2>&1)" || dns_zone_verify_rc=\$?
+status_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet status 2>&1)" || status_rc=\$?
+dns_inspect_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet dns inspect 2>&1)" || dns_inspect_rc=\$?
+dns_zone_verify_output="\$(root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet dns zone verify --bundle '${dns_zone_bundle}' --verifier-key '${dns_zone_pub}' --expected-zone-name "\$zone_name" 2>&1)" || dns_zone_verify_rc=\$?
 dns_zone_bundle_present=0
 dns_zone_verifier_present=0
 dns_zone_watermark_present=0
-if root test -f /var/lib/rustynet/rustynetd.dns-zone; then
+if root test -f '${dns_zone_bundle}'; then
   dns_zone_bundle_present=1
 fi
-if root test -f /etc/rustynet/dns-zone.pub; then
+if root test -f '${dns_zone_pub}'; then
   dns_zone_verifier_present=1
 fi
-if root test -e /var/lib/rustynet/rustynetd.dns-zone.watermark; then
+if root test -e '${dns_zone_watermark}'; then
   dns_zone_watermark_present=1
 fi
 printf 'dns_zone_snapshot_version=1\n'
@@ -2405,9 +2458,10 @@ EOF
 live_lab_dns_zone_snapshot_body() {
   local node_id="$1"
   local zone_name="${2:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
+  local platform="${3:-linux}"
   cat <<EOF
 printf '__RNLAB_DNS_ZONE_BEGIN__\n'
-$(live_lab_dns_zone_body "$node_id" "$zone_name")
+$(live_lab_dns_zone_body "$node_id" "$zone_name" "$platform")
 printf '__RNLAB_DNS_ZONE_END__\n'
 EOF
 }
@@ -2553,8 +2607,9 @@ live_lab_collect_signed_state_snapshot() {
   local zone_name="${4:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
   local max_age_secs="${5:-${CROSS_NETWORK_SIGNED_ARTIFACT_MAX_AGE_SECS:-900}}"
   local max_clock_skew_secs="${6:-${CROSS_NETWORK_MAX_TIME_SKEW_SECS:-2}}"
+  local platform="${7:-linux}"
   local snapshot
-  snapshot="$(live_lab_capture_root "$target" "$(live_lab_signed_state_snapshot_body "$node_id" "$zone_name" "$max_age_secs" "$max_clock_skew_secs")")" || return 1
+  snapshot="$(live_lab_capture_root "$target" "$(live_lab_signed_state_snapshot_body "$node_id" "$zone_name" "$max_age_secs" "$max_clock_skew_secs" "$platform")")" || return 1
   {
     printf 'signed_state_target=%s\n' "$target"
     printf 'signed_state_node_id=%s\n' "$node_id"
@@ -2571,8 +2626,9 @@ live_lab_collect_dns_zone_snapshot() {
   local target="$1"
   local node_id="$2"
   local zone_name="${3:-${RUSTYNET_DNS_ZONE_NAME:-rustynet}}"
+  local platform="${4:-linux}"
   local snapshot
-  snapshot="$(live_lab_capture_root "$target" "$(live_lab_dns_zone_snapshot_body "$node_id" "$zone_name")")" || return 1
+  snapshot="$(live_lab_capture_root "$target" "$(live_lab_dns_zone_snapshot_body "$node_id" "$zone_name" "$platform")")" || return 1
   {
     printf 'dns_zone_target=%s\n' "$target"
     printf 'dns_zone_node_id=%s\n' "$node_id"
