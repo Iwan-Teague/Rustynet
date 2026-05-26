@@ -77,6 +77,41 @@ impl MacosUserspaceSharedBackend {
         )
     }
 
+    /// Build a macOS backend that routes every ifconfig / route invocation
+    /// through the privileged helper while still opening utun via SCM_RIGHTS
+    /// from the helper. The macOS daemon runs as `User=rustynetd` (uid 500);
+    /// dataplane apply requires SIOCAIFADDR / SIOCDIFADDR ioctls (via ifconfig)
+    /// and `route add` / `route delete`, both of which need root. The helper
+    /// already accepts `PrivilegedCommandProgram::Ifconfig` and `Route`, so the
+    /// runner threaded in here is `PrivilegedHelperWireguardRunner` from
+    /// `rustynetd::privileged_helper`.
+    ///
+    /// Mirrors the Linux flow in `LinuxUserspaceSharedBackend::new_with_helper_runner`.
+    #[cfg(target_os = "macos")]
+    pub fn new_with_helper_runner<R>(
+        interface_name: impl Into<String>,
+        private_key_path: impl Into<String>,
+        listen_port: u16,
+        runner: R,
+        utun_opener: crate::MacosUtunOpenerFn,
+    ) -> Result<Self, BackendError>
+    where
+        R: crate::linux_command::WireguardCommandRunner + Send + Sync + 'static,
+    {
+        Self::new_with_tun_lifecycle(
+            interface_name,
+            private_key_path,
+            listen_port,
+            Box::new(
+                tun::DirectMacosTunLifecycle::with_helper_runner_and_utun_opener(
+                    runner,
+                    utun_opener,
+                ),
+            ),
+            false,
+        )
+    }
+
     #[cfg(any(test, feature = "test-harness"))]
     #[doc(hidden)]
     pub fn new_for_test(

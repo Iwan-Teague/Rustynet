@@ -217,7 +217,7 @@ pub(crate) trait MacosTunLifecycle: fmt::Debug + Send + Sync {
 }
 
 pub(crate) struct DirectMacosTunLifecycle {
-    runner: LinuxCommandRunner,
+    runner: Box<dyn WireguardCommandRunner + Send + Sync>,
     default_route: Option<MacosDefaultRoute>,
     endpoint_bypass_hosts: BTreeSet<IpAddr>,
     #[cfg(target_os = "macos")]
@@ -235,7 +235,7 @@ impl fmt::Debug for DirectMacosTunLifecycle {
 impl Default for DirectMacosTunLifecycle {
     fn default() -> Self {
         Self {
-            runner: LinuxCommandRunner,
+            runner: Box::new(LinuxCommandRunner),
             default_route: None,
             endpoint_bypass_hosts: BTreeSet::new(),
             #[cfg(target_os = "macos")]
@@ -250,6 +250,29 @@ impl DirectMacosTunLifecycle {
         Self {
             utun_opener: Some(opener),
             ..Self::default()
+        }
+    }
+
+    /// Build a lifecycle that routes ifconfig / route invocations through the
+    /// privileged helper while still opening utun via SCM_RIGHTS from the
+    /// helper. The macOS daemon runs as `User=rustynetd` (uid 500); ifconfig
+    /// ioctls (SIOCAIFADDR / SIOCDIFADDR) and `route add/delete` need root.
+    /// The helper accepts `PrivilegedCommandProgram::Ifconfig` and `Route`,
+    /// so the runner threaded in here is `PrivilegedHelperWireguardRunner`
+    /// from `rustynetd::privileged_helper`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_helper_runner_and_utun_opener<R>(
+        runner: R,
+        opener: crate::MacosUtunOpenerFn,
+    ) -> Self
+    where
+        R: WireguardCommandRunner + Send + Sync + 'static,
+    {
+        Self {
+            runner: Box::new(runner),
+            default_route: None,
+            endpoint_bypass_hosts: BTreeSet::new(),
+            utun_opener: Some(opener),
         }
     }
 }
@@ -277,7 +300,7 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
         })?;
 
         let result = (|| -> Result<(), BackendError> {
-            configure_macos_utun_address(&mut self.runner, interface_name, local.address)?;
+            configure_macos_utun_address(&mut *self.runner, interface_name, local.address)?;
             self.runner
                 .run("ifconfig", &[interface_name.to_owned(), "up".to_owned()])?;
             Ok(())
@@ -297,7 +320,7 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
 
     fn cleanup(&mut self, interface_name: &str) -> Result<(), BackendError> {
         cleanup_macos_runtime_state(
-            &mut self.runner,
+            &mut *self.runner,
             &mut self.default_route,
             &mut self.endpoint_bypass_hosts,
             interface_name,
@@ -311,7 +334,7 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
         next_routes: &[Route],
     ) -> Result<(), BackendError> {
         reconcile_macos_backend_routes(
-            &mut self.runner,
+            &mut *self.runner,
             interface_name,
             previous_routes,
             next_routes,
@@ -326,7 +349,7 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
         peers: &[PeerConfig],
     ) -> Result<(), BackendError> {
         reconcile_macos_exit_mode(
-            &mut self.runner,
+            &mut *self.runner,
             interface_name,
             previous_mode,
             next_mode,
