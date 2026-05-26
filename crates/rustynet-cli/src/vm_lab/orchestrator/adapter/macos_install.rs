@@ -702,6 +702,21 @@ mod tests {
     }
 
     #[test]
+    fn live_lab_macos_enforce_uses_writable_staging() {
+        assert!(
+            LIVE_LINUX_LAB_ORCHESTRATOR.contains(
+                "local remote_install_script=\"/private/var/tmp/Install-RustyNetMacosService.sh\""
+            ),
+            "macOS enforce must stage Install-RustyNetMacosService.sh under /private/var/tmp"
+        );
+        assert!(
+            !LIVE_LINUX_LAB_ORCHESTRATOR
+                .contains("local remote_install_script=\"/tmp/Install-RustyNetMacosService.sh\""),
+            "macOS enforce must not regress to locked-down /tmp"
+        );
+    }
+
+    #[test]
     fn bootstrap_maps_orchestrator_exit_role_to_daemon_blind_exit() {
         assert!(
             !BOOTSTRAP_SCRIPT.contains("daemon_node_role_from_orchestrator_role"),
