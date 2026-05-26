@@ -2683,11 +2683,11 @@ cleanup_host_worker() {
 # and exits 0 even when the resource was already absent.
 cleanup_host_worker_macos() {
   local target="$1"
+  local cleanup_cmd
   live_lab_push_sudo_password "$target"
-  # Heredoc payload is constant; no orchestrator-controlled value is
-  # interpolated, so there is no shell-injection surface.
-  live_lab_ssh "$target" 'sudo -n bash -s' <<'MACOS_CLEANUP'
-set -euo pipefail
+  # Payload is constant; no orchestrator-controlled value is interpolated.
+  # Do not use ssh stdin here: live_lab_ssh_via_ssh intentionally passes -n.
+  cleanup_cmd="$(cat <<'MACOS_CLEANUP'
 chown root:wheel /private/tmp
 chmod 1777 /private/tmp
 launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
@@ -2705,6 +2705,8 @@ for utun in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun[0-9]'); do
 done
 exit 0
 MACOS_CLEANUP
+)"
+  live_lab_run_root "$target" "$cleanup_cmd"
 }
 
 # Windows cleanup — best-effort SCM service teardown + state-root removal.
