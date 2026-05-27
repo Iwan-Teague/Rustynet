@@ -1519,10 +1519,20 @@ fn validate_membership_file_security(path: &Path, label: &str) -> Result<(), Mem
             )));
         }
         let owner_uid = metadata.uid();
-        let expected_uid = Uid::effective().as_raw();
-        if owner_uid != expected_uid {
+        let effective_uid = Uid::effective().as_raw();
+        // The membership snapshot is written by the daemon (whose
+        // effective UID owns the file) and read by both the daemon
+        // and root-running tooling such as `rustynet anchor list`
+        // executed under sudo. When the reader is root (effective
+        // UID 0), it is allowed to read any owner's file — mode bits
+        // (checked above) already restrict access to the file owner,
+        // and root can chown/chmod regardless. Without this carve-out
+        // every root-only verb that reads the snapshot fails with
+        // `owner uid mismatch: expected 0, got <daemon_uid>` and
+        // breaks downstream lab stages like `live_anchor`.
+        if owner_uid != effective_uid && effective_uid != 0 {
             return Err(MembershipError::InvalidFormat(format!(
-                "{label} owner uid mismatch: expected {expected_uid}, got {owner_uid}"
+                "{label} owner uid mismatch: expected {effective_uid}, got {owner_uid}"
             )));
         }
     }
@@ -2629,5 +2639,30 @@ mod epoch_tagged_bundle_tests {
             err,
             EpochTaggedBundleError::Membership(MembershipError::SignatureInvalid)
         ));
+    }
+
+    #[test]
+    fn validate_membership_file_security_source_allows_root_to_read_daemon_owned_file() {
+        // Pin against the regression where the membership-file validator
+        // required the file owner UID to equal the running process's
+        // effective UID. The daemon writes the snapshot as its own
+        // service UID (uid 987 on Debian); when `rustynet anchor list`
+        // runs under sudo (effective UID 0) and tries to read the
+        // snapshot, the validator returned "owner uid mismatch:
+        // expected 0, got 987" and the live_anchor stage failed rc=70.
+        //
+        // The carve-out: when effective_uid is 0 (root), root is
+        // allowed to read files owned by any UID — mode bits already
+        // restrict access to the owner, and root can chown/chmod
+        // anyway. This is a source-text pin so a future refactor that
+        // accidentally drops the carve-out trips a named failure.
+        let source = include_str!("membership.rs");
+        let marker = "owner_uid != effective_uid && effective_uid != 0";
+        assert!(
+            source.contains(marker),
+            "validate_membership_file_security must keep the `effective_uid != 0` carve-out so \
+             root-running tooling (e.g. `rustynet anchor list` under sudo) can read snapshots \
+             owned by the daemon's service UID"
+        );
     }
 }
