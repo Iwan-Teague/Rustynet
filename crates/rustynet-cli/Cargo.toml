@@ -21,6 +21,7 @@ rustynet-sysinfo = { path = "../rustynet-sysinfo" }
 rustynet-crypto = { path = "../rustynet-crypto" }
 rustynet-dns-zone = { path = "../rustynet-dns-zone" }
 rustynet-local-security = { path = "../rustynet-local-security" }
+rustynet-operator = { path = "../rustynet-operator" }
 rustynet-policy = { path = "../rustynet-policy" }
 rustynetd = { path = "../rustynetd" }
 ed25519-dalek = "2"

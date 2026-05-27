@@ -71,6 +71,13 @@ use rustynet_dns_zone::{
 use rustynet_local_security::{
     validate_owner_only_socket, validate_root_managed_shared_runtime_socket,
 };
+use rustynet_operator::args::{ArgsOutcome, RequestedLaunch, parse_start_args};
+use rustynet_operator::config::parse::parse_wizard_env;
+use rustynet_operator::config::persist::{assert_config_file_secure, save_config_atomic};
+use rustynet_operator::config::validate::{OperatorConfig, build_and_enforce, to_wizard_env};
+use rustynet_operator::host::HostProfile;
+use rustynet_operator::launch::{LanMode, LaunchProfile};
+use rustynet_operator::menu::{MenuAction, menu_tree};
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_ANCHOR_BUNDLE_PULL_ADDR, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
@@ -122,7 +129,9 @@ enum CliCommand {
     Login,
     Netcheck,
     StateRefresh,
-    OperatorMenu,
+    OperatorMenu {
+        args: Vec<String>,
+    },
     ExitNodeSelect(String),
     ExitNodeOff,
     LanAccessOn,
@@ -1637,7 +1646,11 @@ fn parse_command(args: &[String]) -> CliCommand {
             })
         }
         [cmd, subcmd] if cmd == "state" && subcmd == "refresh" => CliCommand::StateRefresh,
-        [cmd, subcmd] if cmd == "operator" && subcmd == "menu" => CliCommand::OperatorMenu,
+        [cmd, subcmd, rest @ ..] if cmd == "operator" && subcmd == "menu" => {
+            CliCommand::OperatorMenu {
+                args: rest.to_vec(),
+            }
+        }
         [cmd, subcmd, node] if cmd == "exit-node" && subcmd == "select" => {
             CliCommand::ExitNodeSelect(node.clone())
         }
@@ -5192,7 +5205,7 @@ fn execute(command: CliCommand) -> Result<String, String> {
         CliCommand::CompareToBaseline => execute_compare_baseline(),
         CliCommand::PerformanceRegressionDetection => execute_perf_regression(),
         CliCommand::Login => Ok("login: open auth URL and complete device enrollment".to_owned()),
-        CliCommand::OperatorMenu => execute_operator_menu(),
+        CliCommand::OperatorMenu { args } => execute_operator_menu(args),
         CliCommand::StateRefresh => execute_state_refresh(),
         CliCommand::DnsZoneIssue(command) => execute_dns_zone_issue(*command),
         CliCommand::DnsZoneVerify {
@@ -5662,18 +5675,71 @@ fn execute_dns_zone_verify(
     ))
 }
 
-fn execute_operator_menu() -> Result<String, String> {
+fn execute_operator_menu(args: Vec<String>) -> Result<String, String> {
+    let outcome = parse_start_args(args).map_err(|err| err.0)?;
+    let ArgsOutcome::Run(start_args) = outcome else {
+        return Ok(rustynet_operator::args::help_text().to_owned());
+    };
+
+    let config_path = operator_config_path()?;
+    let mut config = load_operator_config(&config_path)?;
+    if !config.setup_complete {
+        println!(
+            "Rustynet operator config is not marked setup-complete; runtime actions may fail until the service and trust material are provisioned."
+        );
+    }
+
+    if start_args.auto_only && !config.setup_complete {
+        return Err(
+            "cannot run non-interactive launch profile before operator config is setup-complete"
+                .to_owned(),
+        );
+    }
+
+    let launch_request = match start_args.requested_profile {
+        Some(RequestedLaunch::SavedDefault) => Some(config.default_launch_profile),
+        Some(RequestedLaunch::Profile(profile)) => Some(profile),
+        None if config.auto_launch_on_start => Some(config.default_launch_profile),
+        None => None,
+    };
+    if let Some(profile) = launch_request
+        && profile != LaunchProfile::Menu
+    {
+        apply_operator_launch_profile(
+            profile,
+            start_args
+                .requested_exit_node_id
+                .as_deref()
+                .or(config.auto_launch_exit_node_id.as_deref()),
+            start_args
+                .requested_lan_mode
+                .or(Some(config.auto_launch_lan_mode)),
+        )?;
+        if start_args.auto_only {
+            return Ok(format!(
+                "operator launch profile '{}' applied",
+                profile.as_str()
+            ));
+        }
+    }
+
     let stdin = io::stdin();
     loop {
+        let tree = menu_tree(config.node_role);
         println!();
-        println!("Rustynet Operator Menu");
-        println!("  1) Status");
-        println!("  2) Netcheck");
-        println!("  3) Exit node off");
-        println!("  4) Advertise default exit route (0.0.0.0/0)");
-        println!("  5) LAN access on");
-        println!("  6) LAN access off");
-        println!("  0) Exit");
+        println!("{}", tree.title);
+        println!(
+            "  role={} preset={} config={}",
+            config.node_role.as_str(),
+            config
+                .setup_role_preset
+                .map(|preset| preset.as_str())
+                .unwrap_or("unset"),
+            config_path.display()
+        );
+        for item in &tree.items {
+            println!("  {}) {}", item.key, item.label);
+        }
         print!("Choose an option: ");
         io::stdout()
             .flush()
@@ -5687,18 +5753,137 @@ fn execute_operator_menu() -> Result<String, String> {
             return Ok("operator menu exited (stdin closed)".to_owned());
         }
 
-        match choice.trim() {
-            "1" => render_operator_action("status", send_command(IpcCommand::Status)),
-            "2" => render_operator_action("netcheck", send_command(IpcCommand::Netcheck)),
-            "3" => render_operator_action("exit-node off", send_command(IpcCommand::ExitNodeOff)),
-            "4" => render_operator_action(
+        let choice = choice.trim();
+        let Some(action) = tree.action_for_key(choice) else {
+            println!("unknown option");
+            continue;
+        };
+        if action == MenuAction::Quit {
+            return Ok("operator menu exited".to_owned());
+        }
+        run_operator_action(action, &mut config, &config_path)?;
+    }
+}
+
+fn operator_config_path() -> Result<PathBuf, String> {
+    let config_dir = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(path) if !path.is_empty() => PathBuf::from(path).join("rustynet"),
+        _ => {
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| "HOME is required to locate operator config".to_owned())?;
+            PathBuf::from(home).join(".config").join("rustynet")
+        }
+    };
+    fs::create_dir_all(&config_dir).map_err(|err| {
+        format!(
+            "create operator config directory {} failed: {err}",
+            config_dir.display()
+        )
+    })?;
+    Ok(config_dir.join("wizard.env"))
+}
+
+fn load_operator_config(path: &Path) -> Result<OperatorConfig, String> {
+    let current_uid = Uid::current().as_raw();
+    assert_config_file_secure(path, current_uid).map_err(|err| err.to_string())?;
+    let contents = match fs::metadata(path) {
+        Ok(metadata) => {
+            if metadata.len() > 128 * 1024 {
+                return Err(format!(
+                    "operator config too large: {} bytes (max 131072)",
+                    metadata.len()
+                ));
+            }
+            fs::read_to_string(path)
+                .map_err(|err| format!("read operator config {} failed: {err}", path.display()))?
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(format!(
+                "inspect operator config {} failed: {err}",
+                path.display()
+            ));
+        }
+    };
+    let parsed = parse_wizard_env(&contents);
+    for warning in &parsed.warnings {
+        println!("config warning: {warning}");
+    }
+    let trust_signer_path = parsed
+        .values
+        .get("TRUST_SIGNER_KEY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/rustynet/trust-evidence.key"));
+    let device_node_id = parsed
+        .values
+        .get("DEVICE_NODE_ID")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "rustynet-node".to_owned());
+    let (config, warnings) = build_and_enforce(
+        &parsed,
+        HostProfile::detect(),
+        device_node_id,
+        trust_signer_path.is_file(),
+    )
+    .map_err(|err| err.to_string())?;
+    for warning in warnings {
+        println!("config warning: {warning}");
+    }
+    Ok(config)
+}
+
+fn save_operator_config(config: &OperatorConfig, path: &Path) -> Result<(), String> {
+    save_config_atomic(path, &to_wizard_env(config)).map_err(|err| err.to_string())
+}
+
+fn apply_operator_launch_profile(
+    profile: LaunchProfile,
+    exit_node_id: Option<&str>,
+    lan_mode: Option<LanMode>,
+) -> Result<(), String> {
+    if let Some(node_id) = exit_node_id
+        && !node_id.is_empty()
+    {
+        render_operator_action(
+            "exit-node select",
+            send_command(IpcCommand::ExitNodeSelect(node_id.to_owned())),
+        );
+    }
+    match lan_mode {
+        Some(LanMode::On) => {
+            render_operator_action("lan-access on", send_command(IpcCommand::LanAccessOn))
+        }
+        Some(LanMode::Off) => {
+            render_operator_action("lan-access off", send_command(IpcCommand::LanAccessOff));
+        }
+        Some(LanMode::Skip) | None => {}
+    }
+
+    match profile {
+        LaunchProfile::Menu => Ok(()),
+        LaunchProfile::QuickConnect => execute_ops_restart_runtime_service().map(|msg| {
+            println!("{msg}");
+        }),
+        LaunchProfile::QuickExitNode => {
+            render_operator_action(
                 "route advertise 0.0.0.0/0",
                 send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned())),
-            ),
-            "5" => render_operator_action("lan-access on", send_command(IpcCommand::LanAccessOn)),
-            "6" => render_operator_action("lan-access off", send_command(IpcCommand::LanAccessOff)),
-            "0" => return Ok("operator menu exited".to_owned()),
-            _ => println!("unknown option"),
+            );
+            execute_ops_restart_runtime_service().map(|msg| {
+                println!("{msg}");
+            })
+        }
+        LaunchProfile::QuickHybrid => {
+            render_operator_action(
+                "route advertise 0.0.0.0/0",
+                send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned())),
+            );
+            render_operator_action("lan-access on", send_command(IpcCommand::LanAccessOn));
+            execute_ops_restart_runtime_service().map(|msg| {
+                println!("{msg}");
+            })
         }
     }
 }
@@ -5709,6 +5894,79 @@ fn render_operator_action(action: &str, result: Result<IpcResponse, String>) {
         Ok(response) => println!("{action}: failed: {}", response.message),
         Err(err) => println!("{action}: daemon unreachable: {err}"),
     }
+}
+
+fn run_operator_action(
+    action: MenuAction,
+    config: &mut OperatorConfig,
+    config_path: &Path,
+) -> Result<(), String> {
+    match action {
+        MenuAction::ToggleConnection | MenuAction::RestartRuntime => {
+            println!("{}", execute_ops_restart_runtime_service()?);
+        }
+        MenuAction::SelectExitNode => {
+            let node_id = prompt_operator_value("Exit node id")?;
+            if !rustynet_operator::launch::is_valid_node_id(&node_id) {
+                println!("invalid node id");
+            } else {
+                render_operator_action(
+                    "exit-node select",
+                    send_command(IpcCommand::ExitNodeSelect(node_id)),
+                );
+            }
+        }
+        MenuAction::DisableExit => {
+            render_operator_action("exit-node off", send_command(IpcCommand::ExitNodeOff));
+        }
+        MenuAction::AdvertiseDefaultRoute => render_operator_action(
+            "route advertise 0.0.0.0/0",
+            send_command(IpcCommand::RouteAdvertise("0.0.0.0/0".to_owned())),
+        ),
+        MenuAction::LanAccessOn => {
+            render_operator_action("lan-access on", send_command(IpcCommand::LanAccessOn));
+        }
+        MenuAction::LanAccessOff => {
+            render_operator_action("lan-access off", send_command(IpcCommand::LanAccessOff));
+        }
+        MenuAction::Status => render_operator_action("status", send_command(IpcCommand::Status)),
+        MenuAction::Netcheck => {
+            render_operator_action("netcheck", send_command(IpcCommand::Netcheck));
+        }
+        MenuAction::ShowPeers => println!("{}", execute_peer_list()?),
+        MenuAction::ShowExitNodes => println!("{}", execute_exit_node_list()?),
+        MenuAction::ShowConfig => print!("{}", to_wizard_env(config)),
+        MenuAction::SaveConfig => {
+            save_operator_config(config, config_path)?;
+            println!("configuration saved to {}", config_path.display());
+        }
+        MenuAction::Doctor => println!("{}", execute_doctor()?),
+        MenuAction::ServiceStatus => println!("{}", execute_ops_show_runtime_service_status()?),
+        MenuAction::RefreshTrust => println!("{}", execute_ops_refresh_signed_trust()?),
+        MenuAction::RotateKey => {
+            render_operator_action("key rotate", send_command(IpcCommand::KeyRotate))
+        }
+        MenuAction::RevokeKey => {
+            render_operator_action("key revoke", send_command(IpcCommand::KeyRevoke))
+        }
+        MenuAction::DisconnectCleanup => println!("{}", execute_ops_disconnect_cleanup()?),
+        MenuAction::ShowRoleStatus => println!("{}", execute_role(RoleCommand::Status)?),
+        MenuAction::ListRoles => println!("{}", execute_role(RoleCommand::List)?),
+        MenuAction::Quit => {}
+    }
+    Ok(())
+}
+
+fn prompt_operator_value(label: &str) -> Result<String, String> {
+    print!("{label}: ");
+    io::stdout()
+        .flush()
+        .map_err(|err| format!("flush stdout failed: {err}"))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|err| format!("read operator input failed: {err}"))?;
+    Ok(value.trim().to_owned())
 }
 
 fn execute_anchor(command: AnchorCommand) -> Result<String, String> {
@@ -7882,39 +8140,41 @@ fn phase6_probe_host() -> String {
 
 const PHASE6_MACOS_REQUIRED_START_PATTERNS: &[(&str, &str)] = &[
     (
-        "validate_macos_passphrase_source_contract",
-        "missing macOS passphrase source contract enforcement in start.sh",
+        "exec cargo run --quiet -p rustynet-cli -- operator menu \"$@\"",
+        "start.sh no longer dispatches to the checked-out Rust operator menu",
     ),
     (
-        "configure_macos_binary_path_env",
-        "missing macOS privileged binary custody enforcement in start.sh",
+        "exec \"${ROOT_DIR}/target/release/rustynet-cli\" operator menu \"$@\"",
+        "start.sh no longer supports release rustynet-cli operator dispatch",
     ),
     (
-        "rustynet ops bootstrap-wireguard-custody",
-        "missing Rust-backed macOS WireGuard custody bootstrap in start.sh",
+        "exec rustynet operator menu \"$@\"",
+        "start.sh no longer supports installed rustynet operator dispatch",
     ),
     (
-        "rustynet ops restart-runtime-service",
-        "missing Rust-backed macOS launchd restart path in start.sh",
-    ),
-    (
-        "RUSTYNET_WG_KEY_PASSPHRASE=\"${WG_KEY_PASSPHRASE_PATH}\"",
-        "missing macOS passphrase placeholder path wiring in start.sh",
-    ),
-    (
-        "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=\"${WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT}\"",
-        "missing macOS keychain account wiring in start.sh",
-    ),
-    (
-        "RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE=\"${MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}\"",
-        "missing macOS keychain service wiring in start.sh",
+        "exec rustynet-cli operator menu \"$@\"",
+        "start.sh no longer supports installed rustynet-cli operator dispatch",
     ),
 ];
 
-const PHASE6_MACOS_FORBIDDEN_START_PATTERNS: &[(&str, &str)] = &[(
-    "install_macos_unprivileged_wireguard_tools",
-    "insecure macOS unprivileged WireGuard fallback is still present in start.sh",
-)];
+const PHASE6_MACOS_FORBIDDEN_START_PATTERNS: &[(&str, &str)] = &[
+    (
+        "install_macos_unprivileged_wireguard_tools",
+        "insecure macOS unprivileged WireGuard fallback is still present in start.sh",
+    ),
+    (
+        "WG_KEY_PASSPHRASE",
+        "macOS passphrase material wiring is still present in start.sh instead of Rust custody paths",
+    ),
+    (
+        "security ",
+        "macOS keychain command construction is still present in start.sh instead of Rust custody paths",
+    ),
+    (
+        "pfctl",
+        "macOS packet-filter mutation is still present in start.sh instead of Rust ops paths",
+    ),
+];
 
 fn phase6_workspace_root() -> Result<PathBuf, String> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14423,7 +14683,7 @@ fn to_ipc_command(command: CliCommand) -> IpcCommand {
         | CliCommand::SystemStateSnapshot
         | CliCommand::CompareToBaseline
         | CliCommand::PerformanceRegressionDetection
-        | CliCommand::OperatorMenu
+        | CliCommand::OperatorMenu { .. }
         | CliCommand::DnsZoneIssue(_)
         | CliCommand::DnsZoneVerify { .. }
         | CliCommand::Traversal(_)
@@ -19644,7 +19904,19 @@ mod tests {
     #[test]
     fn parse_supports_operator_menu_command() {
         let menu = parse_command(&["operator".to_owned(), "menu".to_owned()]);
-        assert!(format!("{menu:?}").contains("OperatorMenu"));
+        assert!(matches!(menu, CliCommand::OperatorMenu { args } if args.is_empty()));
+
+        let with_args = parse_command(&[
+            "operator".to_owned(),
+            "menu".to_owned(),
+            "--profile".to_owned(),
+            "quick-connect".to_owned(),
+        ]);
+        assert!(matches!(
+            with_args,
+            CliCommand::OperatorMenu { args }
+                if args == vec!["--profile".to_owned(), "quick-connect".to_owned()]
+        ));
     }
 
     #[test]

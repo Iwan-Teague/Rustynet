@@ -40,66 +40,23 @@ inline. Cross-reference with:
 
 ## Section 1 — Debian / Linux (rustynet-on-Linux dataplane host)
 
-### L1. `start.sh` modularization (GAP-10)
+### L1. `start.sh` Rust operator migration (GAP-10)
 
-* `[~]` Scaffolding slice landed (commit pending). New
-  `scripts/start/` directory holds:
-  - `common.sh` — platform-agnostic helpers: `print_info`,
-    `print_warn`, `print_err`, `is_linux_host`, `is_macos_host`,
-    `path_in_linux_runtime_roots` (loop-based against a pinned
-    reviewed-roots list — replaces the inline four-prefix test),
-    `sanitize_macos_keychain_account`, plus crate-internal
-    `__rustynet_is_bool_token` / `__rustynet_canonical_bool` for
-    future env-rewriter calls.
-  - `linux.sh` — Linux-runtime scaffolds: reviewed systemd unit
-    constants pinned and `rustynet_linux_killswitch_programmed`
-    helper that wraps the new `linux-killswitch-boot-check`
-    subcommand from L8. Sourcing requires `common.sh` first; fails
-    fast if missing.
-  - `macos.sh` — macOS scaffolds: reviewed Keychain service
-    constants and `rustynet_macos_keychain_entry_exists` argv-only
-    helper for the `security` binary. Sourcing requires `common.sh`
-    first; fails fast if missing.
-  - `start.sh` sources all three modules with hard-fail on missing
-    `common.sh` (no inline-fallback that would defeat the audit
-    boundary). The duplicated inline helpers (`print_info` /
-    `print_warn` / `print_err` / `is_linux_host` / `is_macos_host` /
-    `path_in_linux_runtime_roots` / `sanitize_macos_keychain_account`)
-    are removed from start.sh and now live only in `common.sh`.
-  Operator-visible behaviour is unchanged: `./start.sh --help`
-  produces the same output, and the smoke gate
-  `scripts/ci/start_modularization_smoke.sh` runs `bash -n` on each
-  module, sources all three under both `HOST_OS=Linux` and
-  `HOST_OS=Darwin`, and pins the behaviour of
-  `path_in_linux_runtime_roots` (8 input shapes including
-  `/etc/rustynet-other/foo` boundary case and empty input) and
-  `sanitize_macos_keychain_account` (6 shapes including degenerate
-  all-bad-chars input). All checks pass today.
-* `[~]` `apply_host_profile_defaults` split landed (commit 201dc2f).
-  `__rustynet_linux_apply_profile_defaults` lives in
-  `scripts/start/linux.sh`,
-  `__rustynet_macos_apply_profile_defaults` lives in
-  `scripts/start/macos.sh`, and `start.sh` retains a thin
-  dispatcher. The smoke gate has 6 new dispatch checks pinning
-  Linux→HOST_PROFILE=linux + LINUX_* credential paths,
-  Darwin→HOST_PROFILE=macos + WG_INTERFACE=utun9,
-  FreeBSD→HOST_PROFILE=unsupported. Operator-visible behaviour of
-  `./start.sh --help` unchanged.
-* `[~]` macOS Keychain helpers extracted (commit b2fdc11).
-  `ensure_macos_keychain_passphrase_account` and
-  `macos_keychain_passphrase_exists` now live in
-  `scripts/start/macos.sh` with `is_macos_host` early-return guards;
-  smoke gate extended with 2 new module-sourcing declare-F asserts.
-  Call sites inside start.sh (lines 210, 1687, 1848, 2263, 2285,
-  3416) all sit downstream of the macos.sh source point — no
-  call-site edits needed. Operator-visible behaviour unchanged.
-* `[~]` `enforce_host_storage_policy` extracted per-platform
-  (commit ecfd597). `__rustynet_linux_enforce_host_storage_policy`
-  in `linux.sh`, `__rustynet_macos_enforce_host_storage_policy` in
-  `macos.sh`; `require_macos_path_var_exact` moved alongside its
-  sole caller. start.sh retains a 3-branch dispatcher (linux /
-  macos / unsupported). Smoke gate now has 32 checks (+7 dispatch
-  assertions). Operator-visible behaviour unchanged.
+* `[x]` Superseded the intermediate bash modularization path on
+  2026-05-27. The active entrypoint is now a thin `start.sh` shim
+  that locates `rustynet-cli` and dispatches to
+  `rustynet operator menu`; it contains no platform policy, config
+  mutation, service lifecycle, trust, or secret-handling logic.
+* `[x]` The prior `scripts/start/{common,linux,macos}.sh` modules and
+  `scripts/ci/start_modularization_smoke.sh` gate were removed from
+  active paths. Their covered behavior now lives in
+  `crates/rustynet-operator` pure Rust modules plus the existing
+  Rust CLI/ops subcommands.
+* `[x]` Verification moved from shell-module smoke tests to Rust gates:
+  `cargo test -p rustynet-operator`, `cargo clippy -p
+  rustynet-operator --all-targets --all-features -- -D warnings`,
+  `cargo check -p rustynet-cli --all-targets --all-features`, and
+  `bash -n start.sh`.
 * `[x]` pfctl extraction audit: NO-OP confirmed. start.sh contains
   only `doctor_require_cmd pfctl` (line 1593) and the `pfctl_bin`
   path-resolver (lines 2227-2269); both already sit inside
