@@ -1606,6 +1606,18 @@ fn validate_route_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        // Endpoint bypass route without `-ifscope`. The macOS WireGuard
+        // backend installs the per-peer endpoint bypass route in the
+        // default (non-scoped) flavor so the daemon's unbound
+        // authoritative UDP socket actually consults it; an ifscope'd
+        // route is invisible to unbound sockets and lets the encrypted
+        // handshake frames loop back into the utun after full-tunnel
+        // exit mode flips the default route.
+        ["-n", "add", "-inet" | "-inet6", "-host", endpoint, gateway]
+            if is_ipv4_or_ipv6(endpoint) && is_ipv4_or_ipv6(gateway) =>
+        {
+            Ok(())
+        }
         ["-n", "delete", "-inet" | "-inet6", "-host", endpoint] if is_ipv4_or_ipv6(endpoint) => {
             Ok(())
         }
@@ -2723,5 +2735,43 @@ mod tests {
         let err =
             decode_helper_request(&payload).expect_err("oversized program field must be rejected");
         assert!(err.contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn validate_route_args_accepts_endpoint_bypass_with_and_without_ifscope() {
+        // The macOS WireGuard backend installs endpoint bypass routes
+        // in two reviewed shapes. Both must pass the helper's argv
+        // whitelist; both must not require any other argument.
+        super::validate_route_args(&[
+            "-n",
+            "add",
+            "-inet",
+            "-host",
+            "192.168.65.3",
+            "192.168.64.1",
+        ])
+        .expect("non-ifscope bypass form must be whitelisted");
+        super::validate_route_args(&["-n", "add", "-inet6", "-host", "fd00::3", "fd00::1"])
+            .expect("non-ifscope bypass form must support inet6");
+        super::validate_route_args(&[
+            "-n",
+            "add",
+            "-inet",
+            "-host",
+            "192.168.65.3",
+            "192.168.64.1",
+            "-ifscope",
+            "en0",
+        ])
+        .expect("ifscope bypass form must remain whitelisted for legacy callers");
+    }
+
+    #[test]
+    fn validate_route_args_rejects_endpoint_bypass_with_invalid_payload() {
+        // Endpoint and gateway must both be IPs.
+        super::validate_route_args(&["-n", "add", "-inet", "-host", "not-an-ip", "192.168.64.1"])
+            .expect_err("non-IP endpoint must be rejected");
+        super::validate_route_args(&["-n", "add", "-inet", "-host", "192.168.65.3", "not-an-ip"])
+            .expect_err("non-IP gateway must be rejected");
     }
 }
