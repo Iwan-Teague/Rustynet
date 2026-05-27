@@ -3,6 +3,7 @@
 mod anchor_init;
 mod env_file;
 mod live_lab_results;
+mod live_lab_run_matrix;
 mod ops_cross_network_preflight;
 mod ops_cross_network_reports;
 mod ops_e2e;
@@ -3399,6 +3400,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 repo_ref: parser.value("--repo-ref"),
                 report_dir: parser.optional_path("--report-dir"),
                 timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
+                orchestrated: false,
             },
         }),
         "vm-lab-check-known-hosts" => {

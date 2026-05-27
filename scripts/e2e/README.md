@@ -26,12 +26,14 @@ diagnose if something fails.
 
 ## Run Ledger
 
-Append every live-lab run or focused `live_*` stage used as evidence to
+The standard Rust wrappers append every live-lab run used as evidence to
 [`documents/operations/live_lab_run_matrix.csv`](../../documents/operations/live_lab_run_matrix.csv).
 The schema and status rules are in
 [`documents/operations/LiveLabRunMatrix.md`](../../documents/operations/LiveLabRunMatrix.md).
+They also write `<report_dir>/state/live_lab_run_matrix_row.csv`. Direct
+`live_*` script invocations that bypass the wrappers still need a manual row.
 Do not claim OS/role/stage parity without a matching row that records the
-commit, dirty state, report directory, and pass/fail/skip status.
+commit, dirty state, report directory, node identity, and pass/fail/skip status.
 
 Automation security posture for this workflow:
 
