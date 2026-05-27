@@ -2903,13 +2903,9 @@ impl TunnelBackend for DaemonBackend {
                 backend.initiate_peer_handshake(node_id, force_resend)
             }
             #[cfg(target_os = "linux")]
-            DaemonBackend::Linux(backend) => {
-                backend.initiate_peer_handshake(node_id, force_resend)
-            }
+            DaemonBackend::Linux(backend) => backend.initiate_peer_handshake(node_id, force_resend),
             #[cfg(target_os = "macos")]
-            DaemonBackend::Macos(backend) => {
-                backend.initiate_peer_handshake(node_id, force_resend)
-            }
+            DaemonBackend::Macos(backend) => backend.initiate_peer_handshake(node_id, force_resend),
             #[cfg(target_os = "macos")]
             DaemonBackend::MacosUserspaceShared(backend) => {
                 backend.initiate_peer_handshake(node_id, force_resend)
@@ -17315,13 +17311,17 @@ mod tests {
             .expect("initiate_peer_handshake fn body must close within the impl block");
         let body = &body[..close];
 
+        // Match each variant in either the brace-block form
+        // `<variant> => {` or the collapsed single-expression form
+        // `<variant> => backend.initiate_peer_handshake(...)` —
+        // rustfmt may collapse short arms.
         for variant in [
-            "DaemonBackend::InMemory(backend) => {",
-            "DaemonBackend::LinuxUserspaceShared(backend) => {",
-            "DaemonBackend::Linux(backend) => {",
-            "DaemonBackend::Macos(backend) => {",
-            "DaemonBackend::MacosUserspaceShared(backend) => {",
-            "DaemonBackend::Windows(backend) => {",
+            "DaemonBackend::InMemory(backend) =>",
+            "DaemonBackend::LinuxUserspaceShared(backend) =>",
+            "DaemonBackend::Linux(backend) =>",
+            "DaemonBackend::Macos(backend) =>",
+            "DaemonBackend::MacosUserspaceShared(backend) =>",
+            "DaemonBackend::Windows(backend) =>",
         ] {
             assert!(
                 body.contains(variant),
