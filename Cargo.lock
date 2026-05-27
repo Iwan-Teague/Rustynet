@@ -884,6 +884,7 @@ dependencies = [
  "rustynet-crypto",
  "rustynet-dns-zone",
  "rustynet-local-security",
+ "rustynet-operator",
  "rustynet-policy",
  "rustynet-sysinfo",
  "rustynetd",
@@ -942,6 +943,10 @@ dependencies = [
 
 [[package]]
 name = "rustynet-local-security"
+version = "0.1.0"
+
+[[package]]
+name = "rustynet-operator"
 version = "0.1.0"
 
 [[package]]

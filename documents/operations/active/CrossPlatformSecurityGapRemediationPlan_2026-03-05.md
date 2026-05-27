@@ -294,13 +294,15 @@ Relevant baseline docs:
 - Why this is a gap:
   - High chance of accidental Linux regression while editing macOS paths.
 - Fix:
-  1. Split into common + OS-specific modules:
-     - `scripts/start/common.sh`
-     - `scripts/start/linux.sh`
-     - `scripts/start/macos.sh`
-  2. Keep shared policy validation in common layer.
+  1. Move operator UX, config parsing, validation, launch policy, and
+     role-aware menu decisions into `crates/rustynet-operator`.
+  2. Keep `start.sh` as a thin shim that only dispatches to
+     `rustynet operator menu`.
+  3. Keep privileged, trust, and service operations behind Rust CLI/ops
+     subcommands.
 - What fixed looks like:
-  - OS-specific changes are isolated and testable with smaller diff blast radius.
+  - OS-specific policy is isolated in Rust modules with unit tests, and
+    `start.sh` no longer carries mixed host branches.
 
 ## 5) Debian-Safe Rollout Strategy (Do-Not-Break Plan)
 
@@ -591,17 +593,18 @@ Status note:
 
 ### 11.10 GAP-10 implementation plan
 - Files to add/change:
-  - `scripts/start/common.sh` (new)
-  - `scripts/start/linux.sh` (new)
-  - `scripts/start/macos.sh` (new)
-  - [start.sh](../../../start.sh) (thin dispatcher)
+  - `crates/rustynet-operator/` (new Rust operator logic crate)
+  - [start.sh](../../../start.sh) (thin CLI shim)
 - Changes:
-  1. Extract OS-specific branches into separate modules.
-  2. Keep shared validation and policy defaults in common module.
-  3. Add shell linting/tests per module.
+  1. Move OS/profile defaults, config parsing, semantic validation,
+     launch policy, egress parsing, and role-aware menu models into
+     Rust.
+  2. Dispatch operator actions through existing Rust CLI/ops commands.
+  3. Remove superseded bash modules from active paths.
 - Verification:
-  - behavior parity tests pass before/after split.
-  - reduced diff scope for OS-specific PRs.
+  - Rust operator unit tests pass.
+  - CLI compiles with the operator menu dispatch path.
+  - `start.sh` passes shell syntax validation as a shim only.
 
 ## 12) Debian Regression Shield (Mandatory for Every macOS Security PR)
 
@@ -687,4 +690,3 @@ Use these rules every time you modify this document during implementation work.
 7. If tests fail, record the failure honestly and fix the root cause.
 - Do not weaken gates, remove checks, or relabel failures as acceptable.
 - If a fix is incomplete, mark the item partial instead of complete.
-

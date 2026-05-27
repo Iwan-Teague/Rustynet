@@ -144,7 +144,7 @@ Modules with typed views landed:
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
 | `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 615 pinned tests)   |
-| `scripts/ci/start_modularization_smoke.sh`         | bash module / dispatcher contract (32 checks)                                |
+| `cargo test -p rustynet-operator`                  | Rust operator-UX migration logic: parser, config, role policy, menu model    |
 | `scripts/ci/secrets_hygiene_gates.sh`              | structured secret-leak audit + required tests                                |
 | Per-phase gate scripts (`phase1_gates.sh`, `phase3_gates.sh` … `phase10_gates.sh`; no phase2 script) | per-phase release-readiness pins                                |
 

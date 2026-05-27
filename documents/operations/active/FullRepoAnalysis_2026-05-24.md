@@ -1588,7 +1588,7 @@ All 16 `IpcCommand` variants documented:
 
 **Crates:** All `src/` trees — `rustynet-crypto`, `rustynet-control`, `rustynet-policy`, `rustynetd`, `rustynet-cli`, `rustynet-relay`, `rustynet-backend-api`, `rustynet-backend-wireguard`, `rustynet-backend-userspace`, `rustynet-backend-stub`, `rustynet-local-security`, `rustynet-dns-zone`, `rustynet-sysinfo`, `rustynet-windows-native`, `fuzz/`
 
-**Scripts:** `scripts/e2e/` (44 files), `scripts/ci/` (45 files), `scripts/bootstrap/` (3 files), `scripts/start/` (3 files), `scripts/systemd/` (1 file), `scripts/windows/` (1 file), `scripts/operations/`, `scripts/perf/`, `scripts/release/`, `scripts/fuzz/`, `start.sh`
+**Scripts:** `scripts/e2e/` (44 files), `scripts/ci/`, `scripts/bootstrap/` (3 files), `scripts/systemd/` (1 file), `scripts/windows/` (1 file), `scripts/operations/`, `scripts/perf/`, `scripts/release/`, `scripts/fuzz/`, `start.sh`
 
 **Documents:** All files in `documents/` and `documents/operations/active/` (40+ files), `README.md`, `CLAUDE.md`, `AGENTS.md`, `deny.toml`, workspace `Cargo.toml` and per-crate `Cargo.toml`
 
