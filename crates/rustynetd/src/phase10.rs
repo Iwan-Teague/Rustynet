@@ -2185,6 +2185,7 @@ pub struct MacosCommandSystem {
     ipv6_blocked: bool,
     dns_protected: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
+    managed_peer_egress_endpoints: Vec<SocketAddr>,
     blind_exit_pf_config: Option<MacosBlindExitPfConfig>,
 }
 
@@ -2219,6 +2220,7 @@ impl MacosCommandSystem {
             ipv6_blocked: false,
             dns_protected: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
+            managed_peer_egress_endpoints: Vec::new(),
             blind_exit_pf_config: None,
         })
     }
@@ -2355,6 +2357,29 @@ impl MacosCommandSystem {
             // Address family (`inet`/`inet6`) must come after `on <iface>`
             // per the macOS pf grammar — see strict_fail_closed=false block
             // above for the same constraint.
+            rules.push_str(&format!(
+                "pass out quick on {} {} proto udp to {} port {} keep state\n",
+                self.egress_interface,
+                pf_family_for_ip(endpoint.ip()),
+                endpoint.ip(),
+                endpoint.port()
+            ));
+        }
+        // Per-peer endpoint egress allow rules. The macOS WireGuard
+        // userspace-shared backend sends every WireGuard handshake
+        // initiation through the daemon's authoritative UDP socket
+        // (bound 0.0.0.0:51820). After full-tunnel exit mode flips the
+        // default route to the utun, the per-peer endpoint bypass
+        // route routes those datagrams back out via the egress
+        // interface — but the killswitch's terminal
+        // `block drop out quick all` rule would still drop them
+        // because no `pass out quick on <egress>` rule covers the
+        // peer endpoint. Without this allow rule the WireGuard
+        // handshake silently fails: `traversal_probe_attempts`
+        // increments (the probe runtime says it sent the packet)
+        // but tcpdump on the egress interface shows zero outbound
+        // WireGuard datagrams.
+        for endpoint in &self.managed_peer_egress_endpoints {
             rules.push_str(&format!(
                 "pass out quick on {} {} proto udp to {} port {} keep state\n",
                 self.egress_interface,
@@ -2559,6 +2584,40 @@ impl DataplaneSystem for MacosCommandSystem {
     }
 
     fn rollback_routes(&mut self) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn apply_peer_endpoint_bypass_routes(
+        &mut self,
+        peers: &[PeerConfig],
+    ) -> Result<(), SystemError> {
+        // The actual per-peer `route add -host` invocations are owned by
+        // the backend lifecycle (DirectMacosTunLifecycle::reconcile_exit_mode
+        // installs them as the default route is flipped to utun). Here
+        // we only cache the peer endpoints so that the next
+        // `apply_pf_rules` re-render includes an egress allow rule per
+        // endpoint — without it the killswitch's terminal
+        // `block drop out quick all` discards the WireGuard handshake
+        // packets before they reach the LAN gateway.
+        let endpoints: BTreeSet<SocketAddr> = peers
+            .iter()
+            .map(|peer| SocketAddr::new(peer.endpoint.addr, peer.endpoint.port))
+            .collect();
+        let mut next: Vec<SocketAddr> = endpoints.into_iter().collect();
+        next.sort();
+        if next != self.managed_peer_egress_endpoints {
+            self.managed_peer_egress_endpoints = next;
+            // The anchor may not be loaded yet on the first call
+            // (apply_peer_endpoint_bypass_routes can run before the
+            // killswitch is applied during initial reconcile). When
+            // no anchor is owned, skip the re-render — the next
+            // apply_firewall_killswitch / apply_dns_protection /
+            // hard_disable_ipv6_egress call will pick up the new
+            // endpoint set.
+            if self.anchor_name.is_some() {
+                self.apply_pf_rules(false)?;
+            }
+        }
         Ok(())
     }
 
@@ -10243,6 +10302,73 @@ mod tests {
              pass out quick on utun9 inet all keep state\n\
              pass out quick on en0 inet all keep state\n\
              block drop out quick all\n"
+        );
+    }
+
+    #[test]
+    fn macos_render_pf_rules_emits_per_peer_endpoint_egress_allow() {
+        // Without an explicit egress allow for each managed peer's
+        // WireGuard endpoint, the terminal `block drop out quick all`
+        // rule swallows the encrypted handshake datagrams the daemon's
+        // authoritative UDP socket sends out over the LAN interface —
+        // which is exactly what made `path_live_proven=false` and
+        // `tcpdump -i en0 udp port 51820` show zero packets even
+        // though `traversal_probe_attempts` incremented.
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.managed_peer_egress_endpoints = vec![
+            "192.168.65.3:51820"
+                .parse()
+                .expect("peer endpoint should parse"),
+            "[2001:db8::3]:51820"
+                .parse()
+                .expect("ipv6 peer endpoint should parse"),
+        ];
+
+        let rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+
+        assert!(
+            rules.contains(
+                "pass out quick on en0 inet proto udp to 192.168.65.3 port 51820 keep state"
+            ),
+            "rendered rules must include IPv4 peer endpoint egress allow; got: {rules}"
+        );
+        assert!(
+            rules.contains(
+                "pass out quick on en0 inet6 proto udp to 2001:db8::3 port 51820 keep state"
+            ),
+            "rendered rules must include IPv6 peer endpoint egress allow; got: {rules}"
+        );
+    }
+
+    #[test]
+    fn macos_apply_peer_endpoint_bypass_routes_captures_peer_endpoints() {
+        use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+        use std::net::IpAddr;
+
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        let peer = PeerConfig {
+            node_id: NodeId::new("exit-1").expect("node id should parse"),
+            public_key: [0u8; 32],
+            endpoint: SocketEndpoint {
+                addr: "192.168.65.3".parse::<IpAddr>().expect("peer ip"),
+                port: 51820,
+            },
+            allowed_ips: Vec::new(),
+        };
+        system
+            .apply_peer_endpoint_bypass_routes(&[peer])
+            .expect("apply peer endpoint bypass should succeed without an anchor");
+        assert_eq!(
+            system.managed_peer_egress_endpoints,
+            vec![
+                "192.168.65.3:51820"
+                    .parse()
+                    .expect("peer endpoint should parse")
+            ]
         );
     }
 
