@@ -158,6 +158,13 @@ impl BootSshCidr {
 ///   during normal daemon operation)
 /// - outbound accept for the WireGuard interface (passthrough for
 ///   tunnel traffic when the daemon later brings the interface up)
+/// - outbound UDP accept on `wg_listen_port` when `Some(port)` is
+///   supplied — without this the daemon's traversal-probe initial
+///   handshake datagrams are dropped by this boot chain even though
+///   the daemon's own generation-rotated table would accept them.
+///   Both chains hook `output` at priority 0 and a `policy drop`
+///   verdict in this boot chain still drops the packet regardless of
+///   what the daemon chain decides.
 /// - TCP port 22 accept for each CIDR in `ssh_cidrs` when
 ///   `ssh_allow` is true
 /// - implicit `policy drop` for everything else
@@ -167,8 +174,9 @@ pub fn install_linux_boot_killswitch(
     iface: &str,
     ssh_allow: bool,
     ssh_cidrs: &[BootSshCidr],
+    wg_listen_port: Option<u16>,
 ) -> Result<(), String> {
-    install_linux_boot_killswitch_inner(iface, ssh_allow, ssh_cidrs)
+    install_linux_boot_killswitch_inner(iface, ssh_allow, ssh_cidrs, wg_listen_port)
 }
 
 #[cfg(target_os = "linux")]
@@ -176,6 +184,7 @@ fn install_linux_boot_killswitch_inner(
     iface: &str,
     ssh_allow: bool,
     ssh_cidrs: &[BootSshCidr],
+    wg_listen_port: Option<u16>,
 ) -> Result<(), String> {
     // Argv-only helper: no shell construction, args are separate tokens.
     fn nft(args: &[&str]) -> Result<(), String> {
@@ -253,6 +262,27 @@ fn install_linux_boot_killswitch_inner(
         iface,
         "accept",
     ])?;
+    // Allow outbound UDP to the WireGuard listen port so the daemon's
+    // traversal-probe handshake datagrams can leave the host during the
+    // window where this boot chain hooks `output` alongside the daemon's
+    // generation-rotated chain.  Without this rule, every WG outbound
+    // datagram returns EPERM regardless of the daemon's own ruleset,
+    // because both chains share the `output` hook and `policy drop` in
+    // either chain drops the packet.
+    if let Some(port) = wg_listen_port {
+        let port_str = port.to_string();
+        nft(&[
+            "add",
+            "rule",
+            "inet",
+            BOOT_KILLSWITCH_TABLE,
+            "killswitch",
+            "udp",
+            "dport",
+            port_str.as_str(),
+            "accept",
+        ])?;
+    }
     if ssh_allow {
         for cidr in ssh_cidrs {
             nft(&[
@@ -279,6 +309,7 @@ fn install_linux_boot_killswitch_inner(
     _iface: &str,
     _ssh_allow: bool,
     _ssh_cidrs: &[BootSshCidr],
+    _wg_listen_port: Option<u16>,
 ) -> Result<(), String> {
     // Off-Linux: no-op. The boot-time killswitch is Linux-specific.
     Ok(())
@@ -1080,10 +1111,40 @@ table inet rustynetfoo {
             BootSshCidr::parse("192.168.0.0/16").unwrap(),
             BootSshCidr::parse("fd00::/64").unwrap(),
         ];
-        let result = install_linux_boot_killswitch("rustynet0", true, &cidrs);
+        let result = install_linux_boot_killswitch("rustynet0", true, &cidrs, Some(51820));
         assert!(
             result.is_ok(),
             "off-Linux install must be a no-op: {result:?}"
+        );
+    }
+
+    #[test]
+    fn boot_killswitch_source_contains_wg_listen_port_rule() {
+        // Pin against the regression where the boot chain (which hooks
+        // `output` priority 0 alongside the daemon's generation-rotated
+        // chain) had no outbound-UDP accept for the WireGuard listen
+        // port. Without that rule, every WG handshake the daemon emits
+        // during the pre-`path_live_proven` window returns EPERM from
+        // `sendto(2)` because this boot chain's `policy drop` still
+        // applies even when the daemon's chain would have accepted.
+        let source = include_str!("linux_killswitch_boot.rs");
+        assert!(
+            source.contains("if let Some(port) = wg_listen_port {"),
+            "install_linux_boot_killswitch_inner must gate the WG-port allow rule on the \
+             wg_listen_port argument so a None caller skips it cleanly"
+        );
+        assert!(
+            source.contains("\"udp\","),
+            "install_linux_boot_killswitch_inner must emit an `udp` token in the boot ruleset"
+        );
+        assert!(
+            source.contains("\"dport\","),
+            "install_linux_boot_killswitch_inner must emit a `dport` token in the boot ruleset"
+        );
+        assert!(
+            source.contains("wg_listen_port: Option<u16>"),
+            "install_linux_boot_killswitch* signatures must accept Option<u16> for the \
+             WireGuard listen port so the systemd unit can forward RUSTYNET_WG_LISTEN_PORT"
         );
     }
 }

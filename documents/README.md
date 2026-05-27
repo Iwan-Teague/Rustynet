@@ -149,6 +149,9 @@ These are the current runbooks, support matrices, gate references, and policies.
 Start there when you need:
 - deployment or service guidance
 - live-lab execution help
+- live-lab OS/role/stage evidence tracking:
+  [operations/LiveLabRunMatrix.md](./operations/LiveLabRunMatrix.md) and
+  [operations/live_lab_run_matrix.csv](./operations/live_lab_run_matrix.csv)
 - release-gate expectations
 - platform support policy
 - evidence generation or incident response context

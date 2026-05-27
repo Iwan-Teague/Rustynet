@@ -24,6 +24,15 @@ end.
 This is the recommended operator path: discover, set up, link and test, then
 diagnose if something fails.
 
+## Run Ledger
+
+Append every live-lab run or focused `live_*` stage used as evidence to
+[`documents/operations/live_lab_run_matrix.csv`](../../documents/operations/live_lab_run_matrix.csv).
+The schema and status rules are in
+[`documents/operations/LiveLabRunMatrix.md`](../../documents/operations/LiveLabRunMatrix.md).
+Do not claim OS/role/stage parity without a matching row that records the
+commit, dirty state, report directory, and pass/fail/skip status.
+
 Automation security posture for this workflow:
 
 - SSH host trust is pinned from the operator-supplied `known_hosts` file

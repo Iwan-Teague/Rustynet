@@ -112,6 +112,13 @@ Use this four-step path when you want to exercise the local UTM lab end to end:
 This is the recommended operator path for live-lab work:
 discover, set up, link and test, then diagnose if something fails.
 
+Record every live-lab run or focused live-lab stage used as evidence in
+[`documents/operations/live_lab_run_matrix.csv`](./documents/operations/live_lab_run_matrix.csv).
+Use [`documents/operations/LiveLabRunMatrix.md`](./documents/operations/LiveLabRunMatrix.md)
+for the required columns and status vocabulary. Each row records the tested
+commit, dirty-tree state, OS/role/stage coverage, report directory, and last
+known good commit when tracking a regression.
+
 This four-step live-lab wrapper path is currently Linux-runtime only. Profiles
 with missing target platform metadata, or with any target that is not
 `platform=linux`, `remote_shell=posix`, `guest_exec_mode=linux_bash`, and

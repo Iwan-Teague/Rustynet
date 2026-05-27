@@ -38,6 +38,15 @@ These expectations are part of the active live-lab contract:
 - unattended runtime secret custody remains credential-only; plaintext passphrase files are not an acceptable substitute for the release path
 - same-underlay local UTM evidence is useful for reduced helper/debug loops, but it is not cross-network release evidence
 
+## Run Matrix Requirement
+
+Append every live-lab run or focused `live_*` stage used as evidence to
+[`live_lab_run_matrix.csv`](./live_lab_run_matrix.csv). The required columns and
+status vocabulary are defined in
+[`LiveLabRunMatrix.md`](./LiveLabRunMatrix.md). Record the exact tested commit,
+dirty-tree state, report directory, OS/role/stage statuses, and last known good
+commit when investigating a regression.
+
 ## Quick Discovery
 
 If you are on a local machine with UTM-backed lab VMs, start by discovering the
