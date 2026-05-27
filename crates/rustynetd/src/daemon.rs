@@ -95,7 +95,7 @@ use crate::windows_paths::{
     validate_windows_runtime_file_path,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::ifaddrs;
 #[cfg(not(windows))]
 use nix::sys::socket::getsockopt;
@@ -290,10 +290,10 @@ pub const DEFAULT_TRAVERSAL_STUN_GATHER_TIMEOUT_MS: u64 = TRAVERSAL_DEFAULT_STUN
 pub const DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_TRAVERSAL_PROBE_HANDSHAKE_FRESHNESS_SECS: u64 = 30;
 pub const DEFAULT_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS: u64 = 30;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 #[cfg_attr(test, allow(dead_code))]
 const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_ATTEMPTS: usize = 10;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 const TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS: u64 = 100;
 pub const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 pub const DEFAULT_WG_LISTEN_PORT: u16 = 51820;
@@ -4442,7 +4442,7 @@ impl DaemonRuntime {
     /// detection in `maybe_trigger_endpoint_change_refresh`.
     #[cfg(target_os = "linux")]
     fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
-        let current = collect_linux_interface_addrs();
+        let current = collect_interface_addrs();
         if snapshot_has_usable_traversal_host_candidates(&current) {
             self.local_host_candidates = current.clone();
         }
@@ -4451,11 +4451,26 @@ impl DaemonRuntime {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// macOS does not yet wire up the Linux EndpointMonitor (netlink-backed
+    /// NIC-change watcher), but the local-host-candidate snapshot is still
+    /// required to feed the traversal probe path. Refresh the snapshot from
+    /// `getifaddrs(3)` on each reconcile so the probe race sees a non-empty
+    /// local-candidate list. Endpoint-change detection on macOS falls back
+    /// to the fingerprint check in `maybe_trigger_endpoint_change_refresh`.
+    #[cfg(target_os = "macos")]
     fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
-        // EndpointMonitor NIC polling is Linux-only; the fingerprint-based
-        // change detection in maybe_trigger_endpoint_change_refresh() handles
-        // other platforms.
+        let current = collect_interface_addrs();
+        if snapshot_has_usable_traversal_host_candidates(&current) {
+            self.local_host_candidates = current;
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn poll_endpoint_monitor_and_maybe_refresh(&mut self) {
+        // EndpointMonitor NIC polling is Linux-only; macOS uses the
+        // getifaddrs path above. Other platforms fall back to the
+        // fingerprint-based change detection in
+        // maybe_trigger_endpoint_change_refresh().
     }
 
     fn traversal_alarm_state(&self, now_unix: u64) -> (&'static str, String) {
@@ -5053,14 +5068,20 @@ impl DaemonRuntime {
     }
 
     fn refresh_local_host_candidates_for_traversal(&mut self) {
+        // Tests seed `test_local_host_candidates_snapshot` to make the
+        // traversal probe path deterministic; when present it is the
+        // sole authoritative source. The live `getifaddrs` path is
+        // suppressed under `cfg(test)` so it cannot overwrite the
+        // seeded snapshot with whatever NICs the host running the
+        // test happens to have.
         #[cfg(test)]
         if let Some(snapshot) = self.test_local_host_candidates_snapshot.clone() {
             self.local_host_candidates = snapshot;
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), not(test)))]
         {
-            let current = collect_linux_interface_addrs_for_traversal();
+            let current = collect_interface_addrs_for_traversal();
             if snapshot_has_usable_traversal_host_candidates(&current) {
                 self.local_host_candidates = current;
             }
@@ -8301,7 +8322,30 @@ fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr
 /// Loopback and link-local addresses are included as-is; `EndpointMonitor`
 /// applies its own filtering via the `ignored_prefixes` list.
 fn interface_name_is_usable_for_traversal_host_candidate(interface: &str) -> bool {
-    interface != "lo" && !interface.starts_with(DEFAULT_WG_INTERFACE)
+    // Loopback: Linux exposes it as "lo", macOS as "lo0".
+    if interface == "lo" || interface == "lo0" {
+        return false;
+    }
+    // Our own WireGuard interface (Linux default "rustynet0").
+    if interface.starts_with(DEFAULT_WG_INTERFACE) {
+        return false;
+    }
+    // macOS virtual / privacy / direct-link interfaces. utun is the
+    // shared tunnel-device namespace on macOS — every WireGuard
+    // userspace-shared interface ("utunN") lives here, plus the
+    // system VPN framework's tunnels and on-demand peer-to-peer
+    // adapters. The local IP of a utun is the mesh IP, which is
+    // useless as a peer-dial-back host candidate.
+    if interface.starts_with("utun")
+        || interface.starts_with("awdl")
+        || interface.starts_with("llw")
+        || interface.starts_with("anpi")
+        || interface.starts_with("gif")
+        || interface.starts_with("stf")
+    {
+        return false;
+    }
+    true
 }
 
 fn ip_is_usable_for_traversal_host_candidate(ip: IpAddr) -> bool {
@@ -8314,7 +8358,7 @@ fn ip_is_usable_for_traversal_host_candidate(ip: IpAddr) -> bool {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn snapshot_has_usable_traversal_host_candidates(
     snapshot: &BTreeMap<String, Vec<std::net::IpAddr>>,
 ) -> bool {
@@ -8327,7 +8371,7 @@ fn snapshot_has_usable_traversal_host_candidates(
     })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn collect_traversal_host_candidate_snapshot_with_retry<Collect, Wait>(
     mut collect: Collect,
     mut wait: Wait,
@@ -8355,17 +8399,23 @@ where
     last_snapshot
 }
 
-#[cfg(target_os = "linux")]
-fn collect_linux_interface_addrs_for_traversal() -> BTreeMap<String, Vec<std::net::IpAddr>> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(test, allow(dead_code))]
+fn collect_interface_addrs_for_traversal() -> BTreeMap<String, Vec<std::net::IpAddr>> {
     collect_traversal_host_candidate_snapshot_with_retry(
-        collect_linux_interface_addrs,
+        collect_interface_addrs,
         sleep,
         TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_ATTEMPTS,
     )
 }
 
-#[cfg(target_os = "linux")]
-fn collect_linux_interface_addrs() -> BTreeMap<String, Vec<std::net::IpAddr>> {
+/// Cross-platform NIC enumeration via the POSIX `getifaddrs(3)` shim
+/// nix exposes. Used as the host-candidate source on Linux and macOS;
+/// both platforms emit the same `BTreeMap<iface_name, Vec<IpAddr>>`
+/// shape, so the higher-level traversal filters and pin tests run
+/// identically across them.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect_interface_addrs() -> BTreeMap<String, Vec<std::net::IpAddr>> {
     use std::net::IpAddr;
     let mut result: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
     let Ok(iter) = ifaddrs::getifaddrs() else {
@@ -16719,6 +16769,73 @@ mod tests {
         assert!(!snapshot_has_usable_traversal_host_candidates(&collected));
         assert_eq!(waited.len(), 1);
         assert_eq!(collected, transient_loopback_only_candidate_snapshot());
+    }
+
+    #[test]
+    fn traversal_host_candidate_filter_rejects_loopback_and_tunnel_interfaces() {
+        // Linux loopback.
+        assert!(!super::interface_name_is_usable_for_traversal_host_candidate("lo"));
+        // macOS loopback.
+        assert!(!super::interface_name_is_usable_for_traversal_host_candidate("lo0"));
+        // Our own WG interface on Linux.
+        assert!(!super::interface_name_is_usable_for_traversal_host_candidate("rustynet0"));
+        // macOS utun namespace — WG userspace-shared interfaces all
+        // sit here, and so do the system VPN framework's adapters.
+        // We never want any of these as a host candidate.
+        for name in ["utun0", "utun9", "utun386"] {
+            assert!(
+                !super::interface_name_is_usable_for_traversal_host_candidate(name),
+                "interface {} should be rejected",
+                name
+            );
+        }
+        // macOS proprietary virtual interfaces.
+        for name in ["awdl0", "llw0", "anpi0", "gif0", "stf0"] {
+            assert!(
+                !super::interface_name_is_usable_for_traversal_host_candidate(name),
+                "interface {} should be rejected",
+                name
+            );
+        }
+        // Standard LAN interfaces — Linux + macOS — must remain usable.
+        for name in ["eth0", "enp0s1", "wlan0", "en0", "en1", "bridge0"] {
+            assert!(
+                super::interface_name_is_usable_for_traversal_host_candidate(name),
+                "interface {} should be accepted",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn traversal_host_candidate_snapshot_filter_excludes_macos_utun_addresses() {
+        // Mirrors the on-host topology of a macOS aux client: en0
+        // is the LAN interface; lo0 + utun386 must not pass.
+        let snapshot: BTreeMap<String, Vec<IpAddr>> = BTreeMap::from([
+            (
+                "en0".to_owned(),
+                vec!["192.168.64.18".parse().expect("ipv4 should parse")],
+            ),
+            (
+                "lo0".to_owned(),
+                vec!["127.0.0.1".parse().expect("ipv4 should parse")],
+            ),
+            (
+                "utun386".to_owned(),
+                vec!["100.91.193.62".parse().expect("ipv4 should parse")],
+            ),
+        ]);
+        assert!(snapshot_has_usable_traversal_host_candidates(&snapshot));
+
+        // Drop en0 and only the unusable interfaces remain.
+        let snapshot_without_en0: BTreeMap<String, Vec<IpAddr>> = snapshot
+            .iter()
+            .filter(|(iface, _)| iface.as_str() != "en0")
+            .map(|(iface, addrs)| (iface.clone(), addrs.clone()))
+            .collect();
+        assert!(!snapshot_has_usable_traversal_host_candidates(
+            &snapshot_without_en0
+        ));
     }
 
     fn write_traversal_file_set(
