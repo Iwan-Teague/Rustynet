@@ -142,6 +142,7 @@ pub enum TraversalError {
     },
     NoDirectCandidates,
     InvalidConfig(&'static str),
+    ProbeSend(String),
     Stun(String),
     Coordination(String),
     CoordinationSignatureInvalid,
@@ -177,6 +178,9 @@ impl fmt::Display for TraversalError {
             }
             TraversalError::InvalidConfig(message) => {
                 write!(f, "invalid traversal config: {message}")
+            }
+            TraversalError::ProbeSend(message) => {
+                write!(f, "probe send failed: {message}")
             }
             TraversalError::Stun(message) => write!(f, "stun error: {message}"),
             TraversalError::Coordination(message) => write!(f, "coordination error: {message}"),

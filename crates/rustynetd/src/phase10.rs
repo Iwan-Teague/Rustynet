@@ -47,18 +47,18 @@ impl<'a, B: TunnelBackend, S: DataplaneSystem> SimultaneousOpenRuntime
         // passed to execute_simultaneous_open.
         self.controller
             .reconfigure_managed_peer(&self.node_id, endpoint, PathMode::Direct)
-            .map_err(|_| TraversalError::InvalidConfig("phase10 direct probe send failed"))?;
+            .map_err(|err| TraversalError::ProbeSend(format!("reconfigure_managed_peer: {err}")))?;
         self.controller
             .backend
             .initiate_peer_handshake(&self.node_id, round > 0)
-            .map_err(|_| TraversalError::InvalidConfig("phase10 direct probe send failed"))
+            .map_err(|err| TraversalError::ProbeSend(format!("initiate_peer_handshake: {err}")))
     }
 
     fn latest_handshake_unix(&mut self) -> Result<Option<u64>, TraversalError> {
         self.controller
             .backend
             .peer_latest_handshake_unix(&self.node_id)
-            .map_err(|_| TraversalError::InvalidConfig("phase10 handshake read failed"))
+            .map_err(|err| TraversalError::ProbeSend(format!("peer_latest_handshake_unix: {err}")))
     }
 }
 
