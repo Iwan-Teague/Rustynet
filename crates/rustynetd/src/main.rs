@@ -837,12 +837,7 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
     // the reviewed daemon tables (rustynet / rustynet_g<N>) so the verifier
     // below is unaffected.
     if install_boot {
-        install_linux_boot_killswitch(
-            iface_name.as_str(),
-            ssh_allow,
-            &ssh_cidrs,
-            wg_listen_port,
-        )?;
+        install_linux_boot_killswitch(iface_name.as_str(), ssh_allow, &ssh_cidrs, wg_listen_port)?;
     }
 
     let report = collect_linux_killswitch_boot_report(iface_name.as_str());
