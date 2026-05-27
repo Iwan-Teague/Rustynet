@@ -64,7 +64,7 @@ Scope-specific validation for this document:
 - ./scripts/ci/phase6_gates.sh
 - ./scripts/ci/phase10_gates.sh
 - ./scripts/ci/membership_gates.sh
-- ./scripts/ci/macos_dataplane_smoke.sh
+- `cargo test --workspace --all-targets --all-features --locked` (covers the macOS dataplane unit tests previously fronted by `scripts/ci/macos_dataplane_smoke.sh`, which was retired once `cargo test --workspace` was wired into the macOS CI job)
 - Debian two-node or equivalent Linux smoke validation if the lab is available.
 
 Definition of done for this document:
@@ -148,14 +148,14 @@ Relevant baseline docs:
   - [phase10.md:14](../../../documents/phase10.md:14)
   - [phase10_gates.sh:121](../../../scripts/ci/phase10_gates.sh:121)
   - [real_wireguard_exitnode_e2e.sh:15](../../../scripts/e2e/real_wireguard_exitnode_e2e.sh:15)
-- Linux service path is hardened systemd; macOS lifecycle is now launchd-managed:
+- Linux service path is hardened systemd; macOS lifecycle is now launchd-managed (post `start.sh` → Rust migration, commit b050f4e on 2026-05-27):
   - [rustynetd.service:47](../../../scripts/systemd/rustynetd.service:47)
-  - [start.sh:2126](../../../start.sh:2126)
-  - [start.sh:2134](../../../start.sh:2134)
-- Several admin dataplane actions are still Linux-only in menu layer:
-  - [start.sh:2558](../../../start.sh:2558)
-  - [start.sh:2590](../../../start.sh:2590)
-  - [start.sh:2626](../../../start.sh:2626)
+  - [macos_service_hardening.rs:234](../../../crates/rustynetd/src/macos_service_hardening.rs:234) — `evaluate_macos_launchd_environment`
+  - [main.rs:9850](../../../crates/rustynet-cli/src/main.rs:9850) — `render_launchd_plist`
+  - [ops_install_macos_relay.rs:166](../../../crates/rustynet-cli/src/ops_install_macos_relay.rs:166) — relay launchd install/uninstall
+- Manual peer admin mutation surface is **removed wholesale on both platforms** (no longer a Linux-only menu gap — break-glass mutation was deleted, not ported); only read-only peer-store display remains via the platform-agnostic Rust `ops peer-store-list` / `ops peer-store-validate` verbs:
+  - [validate.rs:297](../../../crates/rustynet-operator/src/config/validate.rs:297) — fail-closed rejection of `MANUAL_PEER_OVERRIDE != 0`
+  - [main.rs:7056](../../../crates/rustynet-cli/src/main.rs:7056) — peer-store ops dispatch (validate/list only)
 
 ## 4) Gap Register
 
@@ -195,9 +195,10 @@ Relevant baseline docs:
   - Kill-switch assertions verify DNS allow/block rules when DNS protection is active:
     - [phase10.rs:1468](../../../crates/rustynetd/src/phase10.rs:1468)
     - [phase10.rs:1489](../../../crates/rustynetd/src/phase10.rs:1489)
-  - CI executes targeted macOS DNS fail-closed tests:
-    - [macos_dataplane_smoke.sh:44](../../../scripts/ci/macos_dataplane_smoke.sh:44)
-    - [macos_dataplane_smoke.sh:45](../../../scripts/ci/macos_dataplane_smoke.sh:45)
+  - CI executes targeted macOS DNS fail-closed tests via `cargo test --workspace` on the macOS runner:
+    - [cross-platform-ci.yml:25](../../../.github/workflows/cross-platform-ci.yml:25)
+    - [phase10.rs:10223](../../../crates/rustynetd/src/phase10.rs:10223)
+    - [phase10.rs:10480](../../../crates/rustynetd/src/phase10.rs:10480)
 - Security risk truth:
   - If this regresses, DNS can leak off-tunnel and bypass policy/privacy guarantees.
 - Residual action:
@@ -220,41 +221,45 @@ Relevant baseline docs:
 - Where:
   - Linux hardened systemd profile:
     - [rustynetd.service:11](../../../scripts/systemd/rustynetd.service:11)
-  - macOS helper/daemon launchd lifecycle wiring:
-    - [start.sh:2126](../../../start.sh:2126)
-    - [start.sh:2134](../../../start.sh:2134)
+  - macOS helper/daemon launchd lifecycle wiring (post `start.sh` → Rust migration; the previous `start.sh:2126/2134` citations were superseded by commit b050f4e on 2026-05-27):
+    - [macos_service_hardening.rs:234](../../../crates/rustynetd/src/macos_service_hardening.rs:234) — `evaluate_macos_launchd_environment` (hardened launchd env validator)
+    - [main.rs:9850](../../../crates/rustynet-cli/src/main.rs:9850) — `render_launchd_plist` (typed plist renderer)
+    - [main.rs:9924](../../../crates/rustynet-cli/src/main.rs:9924) — `launchd_xml_escape` (XML escape for plist values)
+    - [main.rs:4028](../../../crates/rustynet-cli/src/main.rs:4028) — `ops restart-runtime-service` argv guard
+    - [ops_install_macos_exit.rs:242](../../../crates/rustynet-cli/src/ops_install_macos_exit.rs:242) — `run_launchctl` argv-only helper (exit-NAT launchd unit installer)
+    - [ops_install_macos_relay.rs:166](../../../crates/rustynet-cli/src/ops_install_macos_relay.rs:166) — `install` / [`uninstall`](../../../crates/rustynet-cli/src/ops_install_macos_relay.rs:172) for the relay launchd unit
     - [MacosLaunchdServiceManagement.md:1](../../../documents/operations/MacosLaunchdServiceManagement.md:1)
 - Security risk truth:
   - If launchd wiring or plist hardening drifts, privileged process lifecycle can become non-deterministic and weaken fail-closed posture.
 - Residual action:
   - Keep launchd smoke checks and ownership/mode checks as release gates.
 
-## GAP-06 (Medium): break-glass/manual peer admin flows are Linux-only
-- Where:
-  - Linux-only guards on manual peer operations:
-    - [start.sh:2558](../../../start.sh:2558)
-    - [start.sh:2590](../../../start.sh:2590)
-    - [start.sh:2626](../../../start.sh:2626)
-- Why this is a gap:
-  - Operational inconsistency and increased chance of unsafe ad-hoc commands on macOS.
-- Fix:
-  1. Implement macOS equivalents using daemon IPC + helper path (not direct shell peer mutations).
-  2. Keep break-glass confirmations and audit logging identical across OS.
-- What fixed looks like:
-  - Menu capability parity for supported admin operations across Linux/macOS.
-
-## GAP-07 (High, Partially Remediated 2026-03-05): macOS dataplane security evidence in CI
-- Current enforcement:
-  - macOS CI now includes dataplane smoke gates:
-    - [cross-platform-ci.yml:21](../../../.github/workflows/cross-platform-ci.yml:21)
-    - [cross-platform-ci.yml:24](../../../.github/workflows/cross-platform-ci.yml:24)
-  - Smoke script validates launch/path contracts and runs targeted dataplane tests:
-    - [macos_dataplane_smoke.sh:7](../../../scripts/ci/macos_dataplane_smoke.sh:7)
-    - [macos_dataplane_smoke.sh:44](../../../scripts/ci/macos_dataplane_smoke.sh:44)
+## GAP-06 (Remediated 2026-05-27): break-glass/manual peer admin flows are Linux-only
+- Resolution:
+  - The break-glass mutation path was removed wholesale (not ported to macOS). `MANUAL_PEER_OVERRIDE` now fail-closes during config validation on every host platform:
+    - [validate.rs:297](../../../crates/rustynet-operator/src/config/validate.rs:297) — rejects any persisted `MANUAL_PEER_OVERRIDE` other than `0` with explicit "Manual peer break-glass is removed" error.
+  - The remaining peer-store surface is read-only and routed through the platform-agnostic Rust `ops peer-store-list` / `ops peer-store-validate` verbs (no shell peer mutation on any platform):
+    - [main.rs:7060](../../../crates/rustynet-cli/src/main.rs:7060) — `OpsCommand::PeerStoreList` dispatch
+    - [main.rs:7056](../../../crates/rustynet-cli/src/main.rs:7056) — `OpsCommand::PeerStoreValidate` dispatch
+  - Original Linux-only shell guards (previously cited as `start.sh:2558/2590/2626`, which had already drifted from those line numbers before the `start.sh` → Rust migration in commit b050f4e on 2026-05-27) are no longer present in any active path.
 - Security risk truth:
-  - Residual risk remains because Linux-only real WireGuard netns E2E has no macOS equivalent yet; deep runtime regressions could still escape smoke coverage.
+  - If a future change reintroduces a mutation surface for peer state outside the signed-membership flow, the fail-closed validator must continue to reject it on all platforms.
 - Residual action:
-  - Expand from smoke coverage to richer macOS integration/leak tests as infrastructure allows.
+  - Treat any attempt to re-introduce `MANUAL_PEER_OVERRIDE` (or any platform-conditional manual peer mutation) as a regression and reopen this gap.
+
+## GAP-07 (High, Partially Remediated 2026-03-05; smoke gate retired 2026-05-27 in favour of workspace tests): macOS dataplane security evidence in CI
+- Current enforcement:
+  - macOS CI runs the full workspace test suite, which exercises the start.sh hardened-contract validator, bash syntax check, and the macOS dataplane unit tests directly:
+    - [cross-platform-ci.yml:25](../../../.github/workflows/cross-platform-ci.yml:25)
+    - [main.rs:19897](../../../crates/rustynet-cli/src/main.rs:19897) — start.sh hardened-contract test (`phase6_macos_start_contract_matches_current_hardened_path`)
+    - [main.rs:19904](../../../crates/rustynet-cli/src/main.rs:19904) — `start_sh_passes_bash_syntax_check`
+    - [phase10.rs:10223](../../../crates/rustynetd/src/phase10.rs:10223) — `macos_render_pf_rules_enforces_dns_fail_closed_when_enabled`
+    - [phase10.rs:10480](../../../crates/rustynetd/src/phase10.rs:10480) — `macos_dns_rule_parser_accepts_port_alias_output`
+  - The standalone `scripts/ci/macos_dataplane_smoke.sh` + `macos_dataplane_smoke` bin were retired on 2026-05-27 because `cargo test --workspace` (already required on the macOS runner) covers the same pattern/test surface with a tighter forbidden-pattern set, and the smoke gate had drifted: its required-test list referenced a renamed test (`macos_backend_reports_ipv6_supported`) and its start.sh pattern list referenced strings deleted by the `start.sh` operator-UX Rust migration (commit b050f4e).
+- Security risk truth:
+  - Residual risk remains because Linux-only real WireGuard netns E2E has no macOS equivalent yet; deep runtime regressions could still escape the unit-test surface.
+- Residual action:
+  - Expand from unit-test coverage to richer macOS integration/leak tests as infrastructure allows.
 
 ## GAP-08 (Medium): phase-scope/docs and runtime reality are mismatched
 - Where:

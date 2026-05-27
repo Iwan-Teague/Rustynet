@@ -19901,6 +19901,38 @@ mod tests {
             .expect("current start.sh must satisfy macOS hardened contract");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn start_sh_passes_bash_syntax_check() {
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+
+        let start_sh = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root must exist")
+            .join("start.sh");
+        assert!(
+            start_sh.exists(),
+            "start.sh missing at {}",
+            start_sh.display()
+        );
+
+        let status = Command::new("bash")
+            .arg("-n")
+            .arg(&start_sh)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("bash must be available on unix CI runners to syntax-check start.sh");
+        assert!(
+            status.success(),
+            "start.sh failed bash -n syntax check at {}",
+            start_sh.display()
+        );
+    }
+
     #[test]
     fn parse_supports_operator_menu_command() {
         let menu = parse_command(&["operator".to_owned(), "menu".to_owned()]);
