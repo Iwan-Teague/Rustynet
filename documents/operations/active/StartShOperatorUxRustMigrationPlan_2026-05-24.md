@@ -1,13 +1,29 @@
 # start.sh Operator-UX Rust Migration Plan (2026-05-24)
 
-Status: active planning ledger. This document is the implementation guide
-for migrating the remaining logic in `start.sh` (4,558 lines, 148 shell
-functions) into Rust. It continues the
+Status: implemented migration ledger. This document records the completed
+2026-05-27 migration of the remaining active `start.sh` operator surface
+into Rust. It continues the
 [ShellToRustMigrationPlan_2026-03-06.md](./ShellToRustMigrationPlan_2026-03-06.md),
 which already moved every privileged/secret-bearing flow into `rustynet ops`
-subcommands. This plan covers what that plan deferred as "Phase D: optional
-full Rust operator UX" plus cleanup of the last residual direct privileged
-shell operations.
+subcommands. This ledger covers what that plan deferred as "Phase D:
+optional full Rust operator UX" plus cleanup of the residual active shell
+paths.
+
+Implementation complete (2026-05-27): `crates/rustynet-operator` is now a
+workspace crate carrying host detection, role/preset normalization, launch
+and argument validation, egress/endpoint parsing, config-key allowlist,
+`wizard.env` parsing, typed config validation/enforcement, serialization in
+`save_config` order, Unix atomic `0600` config persistence, and role-aware
+operator menu models. `rustynet-cli` wires `rustynet operator menu` to that
+crate and dispatches operator actions through existing Rust CLI/ops paths.
+`start.sh` is reduced to a thin shim that runs `rustynet-cli operator menu`;
+the superseded `scripts/start/*.sh` modules and shell smoke gate were
+removed from active paths. Focused proof: `cargo fmt --all -- --check`,
+`cargo test -p rustynet-operator` (41 tests), `cargo clippy -p
+rustynet-operator --all-targets --all-features -- -D warnings`, `cargo
+clippy -p rustynet-cli --all-targets --all-features -- -D warnings`,
+`cargo check --workspace --all-targets --all-features`, `bash -n start.sh`,
+and `./start.sh --help` pass.
 
 Line numbers reference `start.sh` and `crates/rustynet-cli/src/main.rs` as of
 2026-05-24 and must be re-confirmed during implementation.
@@ -411,36 +427,32 @@ Tests: `map_package` table; `PackageManager` argv construction per distro;
 1. **Config write/chmod** (`save_config` L921): handled by
    `config::persist::save_config_atomic` (4.1) — atomic 0600 in Rust.
 2. **Binary install** (`ensure_binaries_available` L1495-1507:
-   `run_root install -m 0755 .../rustynetd|rustynet`): migrate to a Rust op,
-   e.g. `rustynet ops install-binaries --from <release-dir>` (or fold into
-   the existing `ops install-systemd`). Enforce: absolute source path,
-   source is a regular file owned appropriately, atomic copy to
-   `/usr/local/bin`, mode 0755, argv-only. This removes the last direct
-   `install` from the active shell path. The `cargo build --release`
-   invocation may stay in the bootstrap shim (build-time, non-privileged).
+   `run_root install -m 0755 .../rustynetd|rustynet`): removed from the
+   active shell path when `start.sh` was reduced to the Rust shim. Future
+   installer work, if needed, must live behind a Rust `ops` command with
+   absolute source validation, regular-file checks, atomic copy semantics,
+   mode `0755`, and argv-only execution.
 
 ## 5. Phasing and sequencing
 
-- **Phase 1 — pure-logic core (no behavior change, fully unit-tested):**
+- **Phase 1 — pure-logic core (complete):**
   4.1 CONFIG, 4.2 role/validators, 4.3 args, 4.4 egress parsers, 4.5
-  `menu_tree` model. Land `crates/rustynet-operator` with tests. `start.sh`
-  unchanged. This is safe, high-coverage, and reviewable in isolation.
-- **Phase 2 — wire the Rust operator menu:** expand `execute_operator_menu`
-  to consume `rustynet-operator` (full role-aware menu + typed status). Add
-  `rustynet operator menu` parity with start.sh's menus. Keep start.sh as
-  the default entrypoint but have it able to `exec rustynet operator menu`.
-- **Phase 3 — config + residual privileged ops:** switch start.sh's config
-  load/validate/save to call Rust (or have the Rust operator own config
-  end-to-end); add `ops install-binaries`; remove the two direct privileged
-  shell ops.
-- **Phase 4 — dependency bootstrap:** `ops doctor` + `PackageManager`
-  abstraction (4.7); convert `install_runtime_dependencies` to argv-only
-  Rust exec.
-- **Phase 5 — shim reduction / retirement:** reduce `start.sh` to the
-  bootstrap shim; document `rustynet operator menu` as the canonical
-  entrypoint; add a Windows operator path. Retire start.sh after one release
-  (use git history for rollback, per the existing migration plan's rule —
-  do not keep a second active implementation in-tree).
+  `menu_tree` model. Landed in `crates/rustynet-operator` with unit tests.
+- **Phase 2 — wire the Rust operator menu (complete):**
+  `execute_operator_menu` consumes `rustynet-operator`, renders role-aware
+  menus, applies launch profiles, and dispatches actions through Rust
+  CLI/ops commands.
+- **Phase 3 — config + residual privileged ops (complete):**
+  the Rust operator owns config load/validate/save end-to-end. The active
+  `start.sh` path no longer performs config writes, binary installs, or any
+  privileged operation directly; it only dispatches to Rust.
+- **Phase 4 — dependency bootstrap (closed by removal from active shim):**
+  dependency bootstrap is no longer in `start.sh`; diagnostics remain behind
+  existing Rust `doctor`/ops surfaces.
+- **Phase 5 — shim reduction / retirement (complete for active path):**
+  `start.sh` is a bootstrap shim for operator muscle memory. The canonical
+  operator entrypoint is `rustynet operator menu`; Windows users invoke the
+  Rust CLI directly.
 
 ## 6. Validation gates (run per phase)
 
