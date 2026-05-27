@@ -34,8 +34,9 @@ Current primary execution ledgers:
 - `documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md` for traversal, relay, and live-lab readiness (the defects it documents drive D2/D3/D4 in the dataplane execution plan)
 
 Current lab-reference assets:
-- `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md`
+- `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` (includes probe-and-recover runbook for unsticking lab guests whose nft killswitch is blocking SSH after a network reconfig)
 - `documents/operations/active/vm_lab_inventory.json`
+- `scripts/vm_lab/probe_and_recover_local_utm.sh` — call before retrying a failed orchestrator run when one or more lab VMs show TCP/22 timeout but are visible in `arp -a`
 
 Rules:
 - If ambiguity exists, choose the strictest secure practical default and document that choice.

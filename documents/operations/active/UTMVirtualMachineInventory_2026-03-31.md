@@ -68,6 +68,70 @@ Security note:
 - The per-VM IPv4s below are live-confirmed from the running guests, not inferred from hostname history.
 - One extra UTM-style historical IP, `192.168.64.18`, still exists in older host-key history but could not be tied to the current five bundles during this pass.
 
+## Probe-and-Recover Runbook
+
+When an orchestrator retry fails at `prime_remote_access`, `cleanup_hosts`,
+or `verify_ssh_reachability` because one or more lab VMs are stuck (TCP/22
+times out from the host even though `arp -a` shows the VM is alive on the
+LAN), use the probe-and-recover script:
+
+```
+scripts/vm_lab/probe_and_recover_local_utm.sh
+```
+
+What it does (each step idempotent):
+
+1. Calls `cargo run --quiet --bin rustynet-cli -- ops vm-lab-discover-local-utm`
+   to enumerate every registered UTM VM, its DHCP-assigned IP, and the
+   current SSH-port status.
+2. Prints a per-VM table with platform, live IP, and SSH:22 reachability.
+3. For each Linux VM whose SSH port is NOT open, invokes
+   `utmctl exec <vm> --cmd /usr/bin/sudo nft flush ruleset` followed by
+   `systemctl stop rustynetd` and `rustynetd-privileged-helper`. This path
+   does not depend on SSH — it travels the qemu-guest-agent socket UTM
+   exposes for QEMU guests. Recovery is automatic only for Linux guests
+   because UTM's Apple Virtualization backend does not surface
+   `utmctl exec` for macOS guests.
+4. Re-probes TCP/22 on every VM after recovery and prints a final summary.
+
+Common stuck cause: a previous lab run's `restrict_permanent` killswitch
+table is still installed inside the guest. nftables on the OUTPUT chain
+has policy `drop` plus narrow allowlists tied to the prior management
+CIDR (e.g., `192.168.65.0/24`); after a re-IP (DHCP renewal, network mode
+change, fresh bridge), inbound SSH still reaches the guest's listener but
+the SYN-ACK can't leave because the new source IP is not in the allowed
+set. `nft flush ruleset` removes the killswitch and reopens the path.
+
+Manual recovery for macOS / Windows guests (UTM Apple Virtualization
+backend does not expose `utmctl exec`) — open the guest via UTM serial
+console / VNC / RDP and run:
+
+- macOS:
+  ```
+  sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+  sudo launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
+  sudo pfctl -F all -d
+  ```
+- Windows:
+  ```
+  sc.exe stop RustyNet
+  sc.exe stop RustyNetPrivilegedHelper
+  ```
+
+After recovery, regenerate `known_hosts` if the lab profile's pinned
+known_hosts file references the old IPs:
+
+```
+KH=profiles/live_lab/<your_known_hosts_file>
+> "$KH"
+for ip in <new IPs>; do
+  ssh-keyscan -T 5 -t rsa,ed25519 "$ip" 2>/dev/null >> "$KH"
+done
+```
+
+Then update the matching lab profile (`.env` file in `profiles/live_lab/`)
+with the new `*_TARGET=` values and re-run the orchestrator.
+
 ## Machine-Readable Inventory Model
 
 The companion inventory file at

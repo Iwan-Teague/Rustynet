@@ -63,7 +63,7 @@ phase checklists that finished (Phase 1, 2, 3, 5) have moved to
 
 ## Active Lab Assets
 
-- [UTMVirtualMachineInventory_2026-03-31.md](./UTMVirtualMachineInventory_2026-03-31.md)
+- [UTMVirtualMachineInventory_2026-03-31.md](./UTMVirtualMachineInventory_2026-03-31.md) — VM list, SSH key fingerprints, **probe-and-recover runbook** (`scripts/vm_lab/probe_and_recover_local_utm.sh`) for unsticking stale-killswitch lab guests
 - [rustynet_blind_exit_pcb_report_2026-05-10.docx](./rustynet_blind_exit_pcb_report_2026-05-10.docx)
 - `vm_lab_inventory.json` — VM topology + role assignments
 - `vm_lab_readiness_check_2026-04-28.json` — dated VM lab readiness summary (schema_version=1)
