@@ -19,6 +19,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::env_file::{format_env_assignment, parse_env_value};
 use crate::live_lab_results::{LiveLabWorkerResult, read_parallel_stage_results};
+use crate::live_lab_run_matrix::{
+    LiveLabRunMatrixAppendConfig, LiveLabRunMatrixStageOutcome, append_live_lab_run_matrix_row,
+};
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -211,6 +214,7 @@ pub struct VmLabRunLiveLabConfig {
     pub repo_ref: Option<String>,
     pub report_dir: Option<PathBuf>,
     pub timeout_secs: u64,
+    pub orchestrated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4659,9 +4663,14 @@ fn finalize_vm_lab_orchestration_result(
     report_dir: &Path,
     orchestration_dir: &Path,
     outcomes: Vec<VmLabStageOutcome>,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
     next_actions: Vec<String>,
 ) -> Result<String, String> {
+    if let Err(err) =
+        append_live_lab_run_matrix_for_command(command, report_dir, None, None, outcomes.as_slice())
+    {
+        warnings.push(format!("live-lab run matrix update failed: {err}"));
+    }
     let overall_status = orchestrated_command_status(outcomes.as_slice(), warnings.as_slice());
     let rendered = serialize_vm_lab_command_result(&VmLabCommandResult {
         command: command.to_owned(),
@@ -5027,15 +5036,29 @@ pub fn execute_ops_vm_lab_setup_live_lab(
     } else {
         None
     };
-    let next_actions = if status.success() && state_update_error.is_none() {
+    let mut completion_error = state_update_error;
+    if !config.orchestrated {
+        let outcomes = stage_outcomes_from_records(&records);
+        if let Err(err) = append_live_lab_run_matrix_for_command(
+            "vm-lab-setup-live-lab",
+            report_dir.as_path(),
+            Some(selection.profile_path.as_path()),
+            Some(config.inventory_path.as_path()),
+            outcomes.as_slice(),
+        ) {
+            warnings.push(format!("live-lab run matrix update failed: {err}"));
+            completion_error.get_or_insert(err);
+        }
+    }
+    let next_actions = if status.success() && completion_error.is_none() {
         vec![format!(
             "Run vm-lab-run-live-lab with --profile {} --report-dir {}",
             selection.profile_path.display(),
             report_dir.display()
         )]
-    } else if state_update_error.is_some() {
+    } else if completion_error.is_some() {
         vec![format!(
-            "Re-run vm-lab-setup-live-lab for report dir {} after fixing report-state persistence",
+            "Re-run vm-lab-setup-live-lab for report dir {} after fixing completion artifact persistence",
             report_dir.display()
         )]
     } else {
@@ -5052,11 +5075,11 @@ pub fn execute_ops_vm_lab_setup_live_lab(
         &records,
         warnings,
         next_actions,
-        state_update_error
+        completion_error
             .as_ref()
             .map(|_| VmLabCommandOverallStatus::Fail),
     )?;
-    if status.success() && state_update_error.is_none() {
+    if status.success() && completion_error.is_none() {
         Ok(rendered)
     } else {
         Err(rendered)
@@ -6348,6 +6371,20 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
             Some(err)
         }
     };
+    let mut completion_error = state_update_error;
+    if !config.orchestrated {
+        let outcomes = stage_outcomes_from_records(&records);
+        if let Err(err) = append_live_lab_run_matrix_for_command(
+            "vm-lab-run-live-lab",
+            report_dir.as_path(),
+            Some(config.profile_path.as_path()),
+            None,
+            outcomes.as_slice(),
+        ) {
+            warnings.push(format!("live-lab run matrix update failed: {err}"));
+            completion_error.get_or_insert(err);
+        }
+    }
     let next_actions = if run_report.success && completeness_error.is_none() {
         Vec::new()
     } else if let Some(message) = completeness_error.as_ref() {
@@ -6374,7 +6411,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
         &records,
         warnings,
         next_actions,
-        state_update_error
+        completion_error
             .as_ref()
             .map(|_| VmLabCommandOverallStatus::Fail)
             .or_else(|| {
@@ -6384,7 +6421,7 @@ pub fn execute_ops_vm_lab_run_live_lab(config: VmLabRunLiveLabConfig) -> Result<
                     .map(|_| VmLabCommandOverallStatus::Fail)
             }),
     )?;
-    if run_report.success && completeness_error.is_none() && state_update_error.is_none() {
+    if run_report.success && completeness_error.is_none() && completion_error.is_none() {
         Ok(rendered)
     } else {
         Err(rendered)
@@ -6596,6 +6633,39 @@ fn execute_rust_native_orchestration(
     }
     let _ = writeln!(out, "passed={passed} failed={failed} skipped={skipped}");
     let _ = writeln!(out, "parity_input: {}", parity_path.display());
+
+    let matrix_outcomes = results
+        .iter()
+        .map(|(id, outcome)| LiveLabRunMatrixStageOutcome {
+            stage: id.as_str().to_owned(),
+            status: match outcome {
+                StageOutcome::Passed => "pass",
+                StageOutcome::Failed(_) => "fail",
+                StageOutcome::Skipped => "skip",
+            }
+            .to_owned(),
+            artifacts: vec![parity_path.display().to_string()],
+        })
+        .collect::<Vec<_>>();
+    match append_live_lab_run_matrix_row(LiveLabRunMatrixAppendConfig {
+        command_name: "vm-lab-orchestrate-live-lab",
+        report_dir: report_dir.as_path(),
+        profile_path: None,
+        inventory_path: Some(inventory_path.as_path()),
+        extra_stage_outcomes: matrix_outcomes.as_slice(),
+    }) {
+        Ok(result) => {
+            let _ = writeln!(
+                out,
+                "live_lab_run_matrix_row: {}",
+                result.report_row_path.display()
+            );
+        }
+        Err(err) => {
+            let _ = writeln!(out, "live_lab_run_matrix_error: {err}");
+            return Err(out);
+        }
+    }
 
     if failed > 0 { Err(out) } else { Ok(out) }
 }
@@ -7178,6 +7248,7 @@ pub fn execute_ops_vm_lab_orchestrate_live_lab(
         repo_ref: config.repo_ref.clone(),
         report_dir: Some(report_dir.clone()),
         timeout_secs: config.timeout_secs,
+        orchestrated: true,
     };
     let run_result_path = orchestration_dir.join("run_result.json");
     match execute_ops_vm_lab_run_live_lab(run_config) {
@@ -15397,6 +15468,7 @@ pub fn execute_ops_vm_lab_iterate_live_lab(
         repo_ref: resolved_repo_ref,
         report_dir: Some(report_dir.clone()),
         timeout_secs,
+        orchestrated: false,
     });
 
     let summary = summarize_live_lab_report(
@@ -18129,6 +18201,42 @@ fn stage_outcomes_from_records(records: &[LiveLabStageRecord]) -> Vec<VmLabStage
             artifacts: vec![record.log_path.display().to_string()],
         })
         .collect()
+}
+
+fn live_lab_matrix_stage_outcomes_from_vm_lab(
+    outcomes: &[VmLabStageOutcome],
+) -> Vec<LiveLabRunMatrixStageOutcome> {
+    outcomes
+        .iter()
+        .map(|outcome| LiveLabRunMatrixStageOutcome {
+            stage: outcome.stage.clone(),
+            status: match outcome.status {
+                VmLabStageStatus::Pass => "pass",
+                VmLabStageStatus::Fail => "fail",
+                VmLabStageStatus::Skipped => "skip",
+            }
+            .to_owned(),
+            artifacts: outcome.artifacts.clone(),
+        })
+        .collect()
+}
+
+fn append_live_lab_run_matrix_for_command(
+    command_name: &str,
+    report_dir: &Path,
+    profile_path: Option<&Path>,
+    inventory_path: Option<&Path>,
+    outcomes: &[VmLabStageOutcome],
+) -> Result<PathBuf, String> {
+    let matrix_outcomes = live_lab_matrix_stage_outcomes_from_vm_lab(outcomes);
+    append_live_lab_run_matrix_row(LiveLabRunMatrixAppendConfig {
+        command_name,
+        report_dir,
+        profile_path,
+        inventory_path,
+        extra_stage_outcomes: matrix_outcomes.as_slice(),
+    })
+    .map(|result| result.report_row_path)
 }
 
 fn serialize_vm_lab_command_result(result: &VmLabCommandResult) -> Result<String, String> {
@@ -29804,6 +29912,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             repo_ref: None,
             report_dir: Some(report_dir.clone()),
             timeout_secs: 30,
+            orchestrated: false,
         });
 
         let err = result.expect_err("windows profile must be blocked before shell invocation");

@@ -40,12 +40,14 @@ These expectations are part of the active live-lab contract:
 
 ## Run Matrix Requirement
 
-Append every live-lab run or focused `live_*` stage used as evidence to
-[`live_lab_run_matrix.csv`](./live_lab_run_matrix.csv). The required columns and
+The standard Rust wrappers append every live-lab run used as evidence to
+[`live_lab_run_matrix.csv`](./live_lab_run_matrix.csv) and write the exact row
+to `<report_dir>/state/live_lab_run_matrix_row.csv`. The required columns and
 status vocabulary are defined in
 [`LiveLabRunMatrix.md`](./LiveLabRunMatrix.md). Record the exact tested commit,
 dirty-tree state, report directory, OS/role/stage statuses, and last known good
-commit when investigating a regression.
+commit when investigating a regression. Direct `live_*` script invocations that
+bypass the wrappers still require a manual row.
 
 ## Quick Discovery
 

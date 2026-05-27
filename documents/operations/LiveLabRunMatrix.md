@@ -12,17 +12,18 @@ to commits and so OS, role, and stage gaps stay visible.
 
 ## When To Append A Row
 
-Append one row after every:
+The standard wrappers append one row automatically at completion:
 
 - `ops vm-lab-setup-live-lab`
 - `ops vm-lab-run-live-lab`
 - `ops vm-lab-orchestrate-live-lab`
 - `ops vm-lab-iterate-live-lab`
-- direct `scripts/e2e/live_*` stage run
-- focused macOS, Windows, or Linux role validation used as evidence
 
-Do this before claiming a run is green, regressed, unsupported, or at platform
-parity.
+The writer also emits the exact row for the current run at
+`<report_dir>/state/live_lab_run_matrix_row.csv`. Direct `scripts/e2e/live_*`
+stage runs and focused macOS, Windows, or Linux role validations that bypass
+the wrappers still require a manual row before claiming a run is green,
+regressed, unsupported, or at platform parity.
 
 ## Required Row Rules
 
@@ -38,6 +39,9 @@ parity.
   skipped.
 - If something worked in the past and fails now, set
   `regression_reference_commit` to the last known good commit.
+- The Rust writer reads the current CSV header and writes values by column name.
+  When built-in identity columns are missing, it extends the header and leaves
+  older rows intact.
 
 ## Status Vocabulary
 
@@ -64,6 +68,8 @@ The CSV tracks:
 - Cross-OS proof: membership convergence, peer visibility, direct path, relay
   path, exit path, DNS, LAN toggle, role switch, anchor bundle pull/enrollment,
   Windows named-pipe and DPAPI custody, macOS Keychain and PF killswitch.
+- Node identity per OS role: alias, node ID, and target for client, admin,
+  exit, blind_exit, relay, and anchor roles.
 
 ## Current Truth
 
@@ -78,7 +84,7 @@ Mark those cells honestly.
   root.
 - Use the exact command line in `run_command`, CSV-escaped when it contains
   commas.
-- Keep the row append-only. If a row needs correction, append a later
+- Keep the ledger append-only. If a row needs correction, append a later
   superseding row and explain it in `notes`.
 - The CSV is intentionally diffable instead of `.xlsx` so agents can update it
   safely during code review and merge work.
