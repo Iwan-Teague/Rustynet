@@ -988,6 +988,113 @@ mod tests {
         assert_eq!(parsed.records[0].aliases, vec!["storage".to_owned()]);
     }
 
+    fn valid_wire_bundle() -> String {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &signing_key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: vec![],
+            }],
+        )
+        .expect("bundle should build");
+        render_signed_dns_zone_bundle_wire(&bundle)
+    }
+
+    #[test]
+    fn dns_relative_name_rejects_malformed_names() {
+        let long_label = "a".repeat(64);
+        let total_too_long = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62),
+        ]
+        .join(".");
+        let cases = [".nas", "na*s", long_label.as_str(), total_too_long.as_str()];
+
+        for case in cases {
+            assert!(
+                super::canonicalize_dns_relative_name(case).is_err(),
+                "malformed dns name must be rejected: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_wire_rejects_oversized_bundle_line_and_line_count() {
+        let oversized_bundle = "a".repeat(super::MAX_BUNDLE_BYTES + 1);
+        assert!(parse_signed_dns_zone_bundle_wire(&oversized_bundle).is_err());
+
+        let oversized_line = format!("{}=1", "a".repeat(super::MAX_LINE_BYTES + 1));
+        assert!(parse_signed_dns_zone_bundle_wire(&oversized_line).is_err());
+
+        let too_many_lines = "\n".repeat(super::MAX_BUNDLE_LINES + 1);
+        assert!(parse_signed_dns_zone_bundle_wire(&too_many_lines).is_err());
+    }
+
+    #[test]
+    fn parse_wire_rejects_unsupported_version_duplicate_and_field_mismatch() {
+        let wire = valid_wire_bundle();
+
+        let bad_version = wire.replacen("version=1", "version=2", 1);
+        assert!(parse_signed_dns_zone_bundle_wire(&bad_version).is_err());
+
+        let duplicate_version = format!("version=1\n{wire}");
+        assert!(parse_signed_dns_zone_bundle_wire(&duplicate_version).is_err());
+
+        let missing_field = wire
+            .lines()
+            .filter(|line| !line.starts_with("record.0.aliases="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_signed_dns_zone_bundle_wire(&missing_field).is_err());
+    }
+
+    #[test]
+    fn verify_bundle_rejects_tampered_signature() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut bundle = build_signed_dns_zone_bundle(
+            &signing_key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &[DnsZoneRecordInput {
+                label: "nas".to_owned(),
+                target_node_id: "node-nas-1".to_owned(),
+                rr_type: DnsRecordType::A,
+                target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.68.1.10".to_owned(),
+                ttl_secs: 60,
+                aliases: vec![],
+            }],
+        )
+        .expect("bundle should build");
+
+        let replacement = if bundle.signature_hex.starts_with("00") {
+            "ff"
+        } else {
+            "00"
+        };
+        bundle.signature_hex.replace_range(0..2, replacement);
+        assert_eq!(
+            verify_signed_dns_zone_bundle(&bundle, &signing_key.verifying_key()).err(),
+            Some(super::DnsZoneError::SignatureInvalid)
+        );
+    }
+
     #[test]
     fn bundle_builder_rejects_alias_collision() {
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
