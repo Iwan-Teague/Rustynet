@@ -2878,6 +2878,49 @@ impl TunnelBackend for DaemonBackend {
         }
     }
 
+    /// Dispatch handshake initiation to the active backend variant.
+    ///
+    /// Without this arm the trait's default `Ok(())` no-op runs instead,
+    /// silently dropping every traversal-probe handshake initiation:
+    /// `traversal_probe_attempts` still increments (the no-op returns
+    /// Ok, so `runtime.send_probe` succeeds), but zero WireGuard
+    /// handshake datagrams ever reach the wire. The macOS userspace-
+    /// shared backend's override (which routes through the in-process
+    /// boringtun engine + authoritative UDP socket) and the Linux
+    /// userspace-shared backend's override (kernel-WG netlink) are
+    /// both bypassed in that mode. `path_live_proven` cannot become
+    /// true for any peer until this dispatch is present.
+    fn initiate_peer_handshake(
+        &mut self,
+        node_id: &NodeId,
+        force_resend: bool,
+    ) -> Result<(), BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => {
+                backend.initiate_peer_handshake(node_id, force_resend)
+            }
+            DaemonBackend::LinuxUserspaceShared(backend) => {
+                backend.initiate_peer_handshake(node_id, force_resend)
+            }
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => {
+                backend.initiate_peer_handshake(node_id, force_resend)
+            }
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => {
+                backend.initiate_peer_handshake(node_id, force_resend)
+            }
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => {
+                backend.initiate_peer_handshake(node_id, force_resend)
+            }
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => {
+                backend.initiate_peer_handshake(node_id, force_resend)
+            }
+        }
+    }
+
     fn stats(&self) -> Result<TunnelStats, BackendError> {
         match self {
             DaemonBackend::InMemory(backend) => backend.stats(),
@@ -17230,6 +17273,65 @@ mod tests {
         let err = validate_daemon_config(&config)
             .expect_err("fail-closed ssh allow must require management cidrs");
         assert!(err.to_string().contains("at least one management cidr"));
+    }
+
+    #[test]
+    fn daemon_backend_impl_dispatches_initiate_peer_handshake_to_variants() {
+        // Pin against the regression observed in retry22-31 where the
+        // TunnelBackend impl for DaemonBackend was missing the
+        // initiate_peer_handshake dispatch arm. Without it the trait's
+        // default `Ok(())` no-op silently swallowed every traversal-probe
+        // handshake initiation across all backend variants:
+        // `traversal_probe_attempts` still incremented (because the no-op
+        // returns Ok and `runtime.send_probe` accordingly returns Ok),
+        // but zero WireGuard handshake datagrams reached the wire on
+        // any platform. `path_live_proven` could never become true for
+        // any peer until the dispatch arm was added.
+        //
+        // This test is a source-text pin: it asserts the dispatch is in
+        // place for every variant. If a new variant is added to
+        // DaemonBackend, the per-arm assertions below force the author
+        // to also wire the new variant into the dispatch — which is the
+        // exact failure mode this test exists to prevent.
+        let source = include_str!("daemon.rs");
+        // Find the `fn initiate_peer_handshake` body inside the
+        // `impl TunnelBackend for DaemonBackend` block.
+        let trait_impl_marker = "impl TunnelBackend for DaemonBackend {";
+        let trait_start = source
+            .find(trait_impl_marker)
+            .expect("daemon.rs must contain `impl TunnelBackend for DaemonBackend`");
+        let trait_block = &source[trait_start..];
+        let fn_marker = "fn initiate_peer_handshake(";
+        let fn_pos = trait_block
+            .find(fn_marker)
+            .expect("the TunnelBackend impl must define initiate_peer_handshake");
+        // Window the next ~2000 chars after the fn signature; the body is
+        // small (one match expression). Anchor the closing `}` of the
+        // function so the window doesn't accidentally pick up content
+        // from a later method.
+        let body = &trait_block[fn_pos..];
+        let close = body
+            .find("\n    }\n")
+            .expect("initiate_peer_handshake fn body must close within the impl block");
+        let body = &body[..close];
+
+        for variant in [
+            "DaemonBackend::InMemory(backend) => {",
+            "DaemonBackend::LinuxUserspaceShared(backend) => {",
+            "DaemonBackend::Linux(backend) => {",
+            "DaemonBackend::Macos(backend) => {",
+            "DaemonBackend::MacosUserspaceShared(backend) => {",
+            "DaemonBackend::Windows(backend) => {",
+        ] {
+            assert!(
+                body.contains(variant),
+                "TunnelBackend::initiate_peer_handshake for DaemonBackend must dispatch the `{variant}` variant; without it the trait default no-op silently drops every traversal-probe handshake initiation for that backend"
+            );
+        }
+        assert!(
+            body.contains("backend.initiate_peer_handshake(node_id, force_resend)"),
+            "every dispatch arm must forward `node_id` and `force_resend` to the variant's backend.initiate_peer_handshake"
+        );
     }
 
     #[test]
