@@ -577,6 +577,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn membership_aware_policy_denies_node_selectors_when_directory_empty() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:node-a".to_owned(),
+                dst: "node:node-b".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let request = AccessRequest {
+            src: "node:node-a".to_owned(),
+            dst: "node:node-b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        let membership = MembershipDirectory::default();
+
+        assert!(!membership.is_populated());
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn wildcard_rule_does_not_bypass_revoked_node_request_membership() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "*".to_owned(),
+                dst: "*".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+            }],
+        };
+        let request = AccessRequest {
+            src: "node:revoked-node".to_owned(),
+            dst: "node:active-node".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("revoked-node", MembershipStatus::Revoked);
+        membership.set_node_status("active-node", MembershipStatus::Active);
+
+        assert_eq!(
+            set.evaluate_with_membership(&request, &membership),
+            Decision::Deny
+        );
+    }
+
     /// M5: A revoked node's traffic must be denied even when a permissive ACL
     /// rule would otherwise allow it (revocation check runs before rule eval).
     #[test]

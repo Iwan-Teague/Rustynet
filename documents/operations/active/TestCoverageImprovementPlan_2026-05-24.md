@@ -76,6 +76,15 @@ These shape how gaps should be closed, not just where.
 
 #### P0.1 — `rustynet-control/src/roles.rs`: zero tests on role-capability parsing/enforcement
 147 lines, 0 tests; controls the capability set used in trust decisions.
+
+Status 2026-05-27: landed the seed unit-test batch in
+`crates/rustynet-control/src/roles.rs` covering canonical/alias parsing,
+empty/whitespace/unknown rejection, CSV trimming/trailing-comma behavior,
+mixed-invalid rejection, canonicalization idempotence, anchor preset
+completeness, and stable CSV rendering. Evidence:
+`CARGO_TARGET_DIR=/private/tmp/rustynet-target-roles cargo test -p rustynet-control --lib roles::tests`
+passed 9/9 tests.
+
 - `RoleCapability::parse()` (~L37-63): reject unknown/empty/whitespace; accept each known variant.
 - `parse_role_capability_csv()` (~L127): empty CSV, trailing commas, whitespace-only items, mixed valid/invalid.
 - `canonicalize_role_capabilities()` (~L118): dedup + sort idempotence (`[Client,Client]` -> `[Client]`).
@@ -91,11 +100,24 @@ Accept paths are covered; the security-relevant reject paths are not.
 - `validate()` rejects empty network_id, zero quorum, duplicate node_ids, quorum > active_approvers (~L158).
 
 #### P0.3 — `rustynet-crypto`: negative tests on verification + fail-closed CSPRNG
+Status 2026-05-27: added negative coverage for expired algorithm exceptions
+and 63/65-byte attestation signatures. Existing CSPRNG regression coverage
+already pins fallible key-custody material generation. Evidence:
+`CARGO_TARGET_DIR=/private/tmp/rustynet-target-crypto-quick cargo test -p rustynet-crypto --lib`
+passed 32/32 tests.
+
 - Signature length validation: reject 63/65-byte sigs in `verify_attestation()` (~L796).
 - Algorithm policy: reject an algorithm that is neither allowlisted nor denylisted (default-deny) and reject expired exceptions — `AlgorithmPolicy::validate()` (~L195).
 - CSPRNG fail-closed: `try_generate_key_custody_material()` returns Err when OsRng is unavailable (inject failure) (~L918) — the failure branch is currently unexercised.
 
 #### P0.4 — `rustynet-dns-zone`: untrusted wire-format parser under-tested
+Status 2026-05-27: added malformed DNS-name and wire-parser negative tests
+covering forbidden labels, label/name length, oversized bundle, oversized
+line, excessive line count, unsupported version, duplicate field, and
+field-count mismatch, plus tampered-signature rejection. Evidence:
+`CARGO_TARGET_DIR=/private/tmp/rustynet-target-dns-quick cargo test -p rustynet-dns-zone --lib`
+passed 17/17 tests.
+
 - Bounds: oversized bundle / oversized line / too many lines rejected — `parse_signed_dns_zone_bundle_wire()` (~L291).
 - Tampered signature rejected — `verify_signed_dns_zone_bundle()` (~L273).
 - Unsupported version rejected (~L357); duplicate field rejected (~L344); field-count mismatch rejected (~L399).
@@ -139,6 +161,12 @@ The fix is architectural:
 - Drain timeout exact-boundary and backward-clock (`saturating_duration_since` masks jumps, ~L461).
 
 #### P1.4 — `rustynet-cli/main.rs`: user-facing control-plane logic (not lab tooling)
+Status 2026-05-27: verified the existing CLI error-classification test batch
+covering BadArgs, PolicyReject, ConfigError, TransientFailure, fallback, and
+precedence. Evidence:
+`CARGO_TARGET_DIR=/private/tmp/rustynet-target-cli-classify cargo test -p rustynet-cli --bin rustynet-cli classify_cli_error`
+passed 7/7 tests.
+
 - `classify_cli_error()` (~L1341): parametrized test for each exit-code bucket (BadArgs / PolicyReject / ConfigError / TransientFailure) — operators depend on these codes.
 - Argument parsing for major subcommands rejects missing required flags (`--signing-secret`, `--target-node-id`) with BadArgs.
 - DNS-zone records-manifest limit enforcement (`MAX_DNS_ZONE_RECORDS_MANIFEST_*`) and alias-cycle rejection.
@@ -151,6 +179,12 @@ relative-path rejection, root-managed wrong-gid — the complex OR-logic in
 untested branches.
 
 #### P1.6 — `rustynet-policy`: edge cases around membership-aware deny
+Status 2026-05-27: added membership-aware policy negative tests covering
+empty-directory node-selector denial and wildcard-rule denial for a revoked
+request node. Evidence:
+`CARGO_TARGET_DIR=/private/tmp/rustynet-target-policy-quick cargo test -p rustynet-policy --lib`
+passed 12/12 tests.
+
 Unpopulated membership directory behavior (`is_populated()` ~L83 — is
 enforcement skipped? pin it), context mismatch (rule=SharedExit,
 request=Mesh), wildcard vs literal selector semantics.

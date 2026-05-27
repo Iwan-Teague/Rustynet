@@ -1477,6 +1477,19 @@ mod tests {
     }
 
     #[test]
+    fn denylisted_algorithm_with_expired_exception_is_rejected() {
+        let policy = AlgorithmPolicy {
+            exceptions: vec![CompatibilityException {
+                algorithm: CryptoAlgorithm::Sha1,
+                expires_unix_seconds: 200,
+            }],
+        };
+
+        let result = policy.validate(CryptoAlgorithm::Sha1, 201);
+        assert_eq!(result.err(), Some(CryptoError::ExceptionExpired));
+    }
+
+    #[test]
     fn invalid_exception_for_allowlisted_algorithm_is_rejected() {
         let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
             algorithm: CryptoAlgorithm::Tls13,
@@ -1847,6 +1860,31 @@ mod tests {
             provider.verify_attestation(payload, &mauled).err(),
             Some(CryptoError::AttestationVerificationFailed),
             "verify_strict must reject the non-canonical (mauled) signature"
+        );
+    }
+
+    #[test]
+    fn verify_attestation_rejects_wrong_signature_lengths() {
+        let provider = Ed25519SigningProvider::from_seed(
+            SigningProviderKind::Kms,
+            "kms://rustynet/signature-length",
+            [11; 32],
+        );
+        let payload = b"signature-length-canary";
+        let signature = provider.sign_attestation(payload).expect("sign");
+        assert_eq!(signature.len(), 64);
+
+        let short_signature = &signature[..63];
+        assert_eq!(
+            provider.verify_attestation(payload, short_signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
+        );
+
+        let mut long_signature = signature.clone();
+        long_signature.push(0);
+        assert_eq!(
+            provider.verify_attestation(payload, &long_signature).err(),
+            Some(CryptoError::AttestationVerificationFailed)
         );
     }
 
