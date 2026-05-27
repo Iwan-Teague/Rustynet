@@ -859,12 +859,19 @@ fn apply_endpoint_bypass_plan(
 fn add_endpoint_bypass_route(
     runner: &mut dyn WireguardCommandRunner,
     gateway: Ipv4Addr,
-    egress_interface: &str,
+    _egress_interface: &str,
     endpoint: &str,
 ) -> Result<(), BackendError> {
     let endpoint_ip = endpoint
         .parse::<IpAddr>()
         .map_err(|_| BackendError::invalid_input("endpoint bypass host is not an IP address"))?;
+    // No `-ifscope`: an ifscope'd route on macOS is only consulted for
+    // sockets bound to the named interface, and the WireGuard
+    // authoritative UDP socket is bound to 0.0.0.0. With `-ifscope` the
+    // route lookup falls through to the default route, which after
+    // full-tunnel exit mode points at utun — so encrypted handshake
+    // frames to the peer endpoint loop back into the tunnel they are
+    // supposed to bring up.
     runner.run(
         "route",
         &[
@@ -874,8 +881,6 @@ fn add_endpoint_bypass_route(
             "-host".to_owned(),
             endpoint.to_owned(),
             gateway.to_string(),
-            "-ifscope".to_owned(),
-            egress_interface.to_owned(),
         ],
     )
 }

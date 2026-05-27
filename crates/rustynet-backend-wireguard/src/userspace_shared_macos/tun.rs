@@ -1378,6 +1378,17 @@ fn add_macos_endpoint_bypass_route(
     default_route: &MacosDefaultRoute,
     endpoint: IpAddr,
 ) -> Result<(), BackendError> {
+    // Plain `route add -host <ep> <gw>` (no `-ifscope`). An ifscope'd
+    // route on macOS is only consulted for sockets that have explicitly
+    // bound to the named interface; the daemon's WireGuard authoritative
+    // UDP socket is bound to 0.0.0.0:51820, so under `-ifscope en0` the
+    // route lookup falls through to the default route — and after the
+    // daemon retargets the default route to the utun for full-tunnel
+    // exit mode, the encrypted WireGuard handshake packets to the peer
+    // endpoint loop back into the tunnel they are meant to bring up.
+    // Without `-ifscope` the host route is installed at the default
+    // (non-scoped) flavor, so unbound sockets see it and the
+    // handshake leaves via en0 toward the LAN gateway as intended.
     runner.run(
         "route",
         &[
@@ -1387,8 +1398,6 @@ fn add_macos_endpoint_bypass_route(
             "-host".to_owned(),
             endpoint.to_string(),
             default_route.gateway.to_string(),
-            "-ifscope".to_owned(),
-            default_route.interface_name.clone(),
         ],
     )
 }
@@ -1809,8 +1818,6 @@ mod tests {
                     "-host".to_owned(),
                     "203.0.113.10".to_owned(),
                     "192.0.2.1".to_owned(),
-                    "-ifscope".to_owned(),
-                    "en0".to_owned(),
                 ],
                 vec![
                     "route".to_owned(),
@@ -2079,8 +2086,6 @@ mod tests {
                     "-host".to_owned(),
                     "203.0.113.10".to_owned(),
                     "192.0.2.1".to_owned(),
-                    "-ifscope".to_owned(),
-                    "en0".to_owned(),
                 ]),
             "rollback should re-add removed previous bypass host; calls: {:?}",
             runner.calls
