@@ -11,7 +11,7 @@ Start with these, depending on what you are doing:
 
 - active implementation status: [active/README.md](./active/README.md)
 - service and runtime operation: [ProductionRunbook.md](./ProductionRunbook.md)
-- live-lab execution and evidence: [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md), [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md), and the script-local function map at [scripts/e2e/README.md](../../scripts/e2e/README.md)
+- live-lab execution and evidence: [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md), [LiveLabRunMatrix.md](./LiveLabRunMatrix.md), [live_lab_run_matrix.csv](./live_lab_run_matrix.csv), [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md), and the script-local function map at [scripts/e2e/README.md](../../scripts/e2e/README.md)
 - release-readiness and support posture: [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md) and [PlatformSupportMatrix.md](./PlatformSupportMatrix.md)
 - final release sign-off gate: [ReleaseReadinessGuardrails.md](./ReleaseReadinessGuardrails.md)
 - phase10 exit-node and dataplane behavior: [Phase10ExitNodeDataplaneRunbook.md](./Phase10ExitNodeDataplaneRunbook.md)
@@ -92,6 +92,7 @@ Cross-platform code-quality ledger:
 - [HeterogeneousLiveLabRunbook.md](./HeterogeneousLiveLabRunbook.md)
 - [LinuxDaemonValidatorRunbook.md](./LinuxDaemonValidatorRunbook.md)
 - [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md)
+- [LiveLabRunMatrix.md](./LiveLabRunMatrix.md) — append-only CSV-backed evidence ledger for LiveLab OS/role/stage coverage and regression commits
 - [MacosInstallRunbook.md](./MacosInstallRunbook.md) — manual install procedure, known gotchas (pf SSH block, EROFS socket path, disk space, boringtun submodule)
 - [MacosLaunchdServiceManagement.md](./MacosLaunchdServiceManagement.md) — launchd service lifecycle reference (see MacosInstallRunbook.md for current paths and labels)
 - [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md)

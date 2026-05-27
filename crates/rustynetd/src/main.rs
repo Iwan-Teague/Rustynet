@@ -752,6 +752,7 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
     let mut install_boot = false;
     let mut ssh_allow = false;
     let mut ssh_cidrs: Vec<BootSshCidr> = Vec::new();
+    let mut wg_listen_port: Option<u16> = None;
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -806,6 +807,22 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
                     index += 2;
                 }
             }
+            Some("--wg-listen-port") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--wg-listen-port requires a value (e.g. --wg-listen-port 51820)".to_owned()
+                })?;
+                let parsed: u16 = value
+                    .parse()
+                    .map_err(|err| format!("invalid --wg-listen-port value '{value}': {err}"))?;
+                if parsed == 0 {
+                    return Err(
+                        "--wg-listen-port must be non-zero; the boot killswitch needs a real port"
+                            .to_owned(),
+                    );
+                }
+                wg_listen_port = Some(parsed);
+                index += 2;
+            }
             Some(flag) => {
                 return Err(format!(
                     "unknown linux-killswitch-boot-check argument: {flag}"
@@ -820,7 +837,12 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
     // the reviewed daemon tables (rustynet / rustynet_g<N>) so the verifier
     // below is unaffected.
     if install_boot {
-        install_linux_boot_killswitch(iface_name.as_str(), ssh_allow, &ssh_cidrs)?;
+        install_linux_boot_killswitch(
+            iface_name.as_str(),
+            ssh_allow,
+            &ssh_cidrs,
+            wg_listen_port,
+        )?;
     }
 
     let report = collect_linux_killswitch_boot_report(iface_name.as_str());

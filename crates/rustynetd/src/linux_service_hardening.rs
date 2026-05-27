@@ -700,6 +700,19 @@ mod tests {
                     line.contains("--fail-closed-ssh-allow"),
                     "killswitch-boot-check ExecStartPre must pass --fail-closed-ssh-allow: {line}"
                 );
+                // The WireGuard listen port must be forwarded so the
+                // boot table emits an outbound-UDP allow rule for the
+                // daemon's traversal-probe handshake datagrams.
+                // Without this, the boot chain (policy drop on hook
+                // output) silently drops every WG handshake the
+                // daemon emits during the pre-`path_live_proven`
+                // window, returning EPERM from `sendto(2)`.
+                assert!(
+                    line.contains("--wg-listen-port"),
+                    "killswitch-boot-check ExecStartPre must pass --wg-listen-port so the boot \
+                     chain allows outbound WireGuard handshakes alongside the daemon's chain: \
+                     {line}"
+                );
             }
         }
     }

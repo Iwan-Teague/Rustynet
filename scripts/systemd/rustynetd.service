@@ -113,7 +113,7 @@ ExecStartPre=/usr/bin/test -S ${RUSTYNET_PRIVILEGED_HELPER_SOCKET}
 # programmed (cold-boot pre-up window and steady-state both pass).
 # When the L8 gate fails, bring the iface down manually before retrying:
 #   ip link delete ${RUSTYNET_WG_INTERFACE}
-ExecStartPre=/usr/local/bin/rustynetd linux-killswitch-boot-check --iface ${RUSTYNET_WG_INTERFACE} --install-boot-killswitch --fail-closed-ssh-allow ${RUSTYNET_FAIL_CLOSED_SSH_ALLOW} --fail-closed-ssh-allow-cidrs ${RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS}
+ExecStartPre=/usr/local/bin/rustynetd linux-killswitch-boot-check --iface ${RUSTYNET_WG_INTERFACE} --install-boot-killswitch --fail-closed-ssh-allow ${RUSTYNET_FAIL_CLOSED_SSH_ALLOW} --fail-closed-ssh-allow-cidrs ${RUSTYNET_FAIL_CLOSED_SSH_ALLOW_CIDRS} --wg-listen-port ${RUSTYNET_WG_LISTEN_PORT}
 User=rustynetd
 Group=rustynetd
 NoNewPrivileges=true

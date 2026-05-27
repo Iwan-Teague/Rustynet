@@ -37,6 +37,7 @@ Current lab-reference assets:
 - `documents/operations/active/UTMVirtualMachineInventory_2026-03-31.md` (includes probe-and-recover runbook for unsticking lab guests whose nft killswitch is blocking SSH after a network reconfig)
 - `documents/operations/active/vm_lab_inventory.json`
 - `scripts/vm_lab/probe_and_recover_local_utm.sh` — call before retrying a failed orchestrator run when one or more lab VMs show TCP/22 timeout but are visible in `arp -a`
+- `documents/operations/LiveLabRunMatrix.md` and `documents/operations/live_lab_run_matrix.csv` — append a row after every live-lab run or focused live-lab stage used as evidence, including commit, dirty state, report directory, OS/role/stage statuses, and regression reference when applicable
 
 Rules:
 - If ambiguity exists, choose the strictest secure practical default and document that choice.
