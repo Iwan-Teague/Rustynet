@@ -35,8 +35,10 @@ RUN_LOCAL_GATES=1
 RUN_SOAK=1
 ENABLE_CHAOS_SUITE=0
 DRY_RUN=0
+VALIDATE_ONLY=0
 SETUP_ONLY=0
 SKIP_SETUP=0
+STAGE_TIMEOUT_SECS=0
 PRESERVE_REPORT_STATE=0
 RESUME_FROM_STAGE=""
 RERUN_STAGE=""
@@ -177,6 +179,8 @@ options:
                                  Override probe underlay endpoint/topology IP for cross-network validators
   --reboot-hard-fail             Deprecated: extended soak is hard-fail by default
   --dry-run                      Validate config and planned stages without touching hosts
+  --validate-only                Run preflight + SSH reachability check only; no remote changes
+  --stage-timeout-secs N         Kill any stage that exceeds N seconds (0 = disabled, default 0)
   -h, --help                     Show this help
 USAGE
 }
@@ -1244,6 +1248,11 @@ run_setup_stage() {
   run_stage "$severity" "$stage_name" "$description" "$@"
 }
 
+_WAIT_N_SUPPORTED=0
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+  _WAIT_N_SUPPORTED=1
+fi
+
 wait_for_parallel_slot() {
   local max_jobs="$1"
   local running
@@ -1252,7 +1261,11 @@ wait_for_parallel_slot() {
     if [[ "$running" -lt "$max_jobs" ]]; then
       return 0
     fi
-    sleep 0.2
+    if [[ "$_WAIT_N_SUPPORTED" -eq 1 ]]; then
+      wait -n 2>/dev/null || true
+    else
+      sleep 0.1
+    fi
   done
 }
 
@@ -1483,11 +1496,15 @@ live_lab_collect_forensics_bundle() {
   } > "$stage_dir/cluster_snapshot.txt"
 
   manifest_path="$stage_dir/manifest.json"
+  local _manifest_rc=0
   cargo run --quiet -p rustynet-cli -- ops write-cross-network-forensics-manifest \
     --stage "$stage_name" \
     --collected-at-utc "$collected_at" \
     --stage-dir "$stage_dir" \
-    --output "$manifest_path" >/dev/null
+    --output "$manifest_path" >/dev/null || _manifest_rc=$?
+  if [[ "$_manifest_rc" -ne 0 ]]; then
+    printf '[forensics:%s] warning: manifest write failed (rc=%s)\n' "$stage_name" "$_manifest_rc" >&2
+  fi
 
   local artifact_index_path bundle_validation_path helper_output helper_rc
   bundle_validation_path="$stage_dir/bundle_validation.json"
@@ -1659,14 +1676,47 @@ run_stage() {
   local status="pass"
   local forensics_dir=""
   printf '[stage:%s] START %s\n' "$stage_name" "$description" | tee "$log_path"
-  if (
-    set -euo pipefail
-    "$@"
-  ) 2>&1 | tee -a "$log_path"; then
-    rc=0
+
+  if [[ "${STAGE_TIMEOUT_SECS:-0}" -gt 0 ]]; then
+    local _tmp_log="${log_path}.running.$$"
+    (
+      set -euo pipefail
+      "$@"
+    ) >"$_tmp_log" 2>&1 &
+    local _bg_pid=$!
+    (
+      sleep "${STAGE_TIMEOUT_SECS}"
+      if kill -0 "$_bg_pid" 2>/dev/null; then
+        printf '\n[stage:%s] TIMEOUT: exceeded %ss — sending SIGTERM\n' \
+          "$stage_name" "${STAGE_TIMEOUT_SECS}" >> "$_tmp_log"
+        kill -TERM "$_bg_pid" 2>/dev/null || true
+        sleep 5
+        kill -KILL "$_bg_pid" 2>/dev/null || true
+      fi
+    ) &
+    local _watchdog_pid=$!
+    tail -f "$_tmp_log" &
+    local _tail_pid=$!
+    if wait "$_bg_pid" 2>/dev/null; then
+      rc=0
+    else
+      rc=$?
+    fi
+    kill "$_watchdog_pid" "$_tail_pid" 2>/dev/null || true
+    wait "$_watchdog_pid" "$_tail_pid" 2>/dev/null || true
+    cat "$_tmp_log" >> "$log_path" 2>/dev/null || true
+    rm -f "$_tmp_log"
   else
-    rc=$?
+    if (
+      set -euo pipefail
+      "$@"
+    ) 2>&1 | tee -a "$log_path"; then
+      rc=0
+    else
+      rc=$?
+    fi
   fi
+
   finished_at="$(date -u +%FT%TZ)"
   if [[ "$rc" -ne 0 ]]; then
     status="fail"
@@ -7134,6 +7184,7 @@ write_run_summary() {
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   elapsed_secs=$((finished_at_unix - RUN_STARTED_AT_UNIX))
   elapsed_human="$(format_elapsed_duration "$elapsed_secs")"
+  local _rc=0
   cargo run --quiet -p rustynet-cli -- ops write-live-linux-lab-run-summary \
     --nodes-tsv "$NODES_TSV" \
     --stages-tsv "$STAGE_TSV" \
@@ -7150,7 +7201,12 @@ write_run_summary() {
     --finished-at-utc "$finished_at_utc" \
     --finished-at-unix "$finished_at_unix" \
     --elapsed-secs "$elapsed_secs" \
-    --elapsed-human "$elapsed_human" >/dev/null
+    --elapsed-human "$elapsed_human" >/dev/null || _rc=$?
+  if [[ "$_rc" -ne 0 ]]; then
+    printf 'warning: run summary write failed (rc=%s); %s may be incomplete\n' \
+      "$_rc" "$SUMMARY_JSON" >&2
+  fi
+  return 0
 }
 
 refresh_failure_digest() {
@@ -7174,7 +7230,21 @@ cleanup_local_password_files() {
   return 0
 }
 
+kill_background_workers() {
+  local _pids
+  _pids="$(jobs -rp 2>/dev/null || true)"
+  if [[ -n "$_pids" ]]; then
+    printf '%s\n' "$_pids" | xargs kill -TERM 2>/dev/null || true
+    sleep 2
+    _pids="$(jobs -rp 2>/dev/null || true)"
+    if [[ -n "$_pids" ]]; then
+      printf '%s\n' "$_pids" | xargs kill -KILL 2>/dev/null || true
+    fi
+  fi
+}
+
 orchestrator_cleanup() {
+  kill_background_workers
   cleanup_local_password_files
   live_lab_cleanup
 }
@@ -7237,6 +7307,13 @@ parse_args() {
       --cross-network-probe-underlay-ip) CROSS_NETWORK_PROBE_UNDERLAY_IP="$2"; shift 2 ;;
       --reboot-hard-fail) SOAK_HARD_FAIL=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
+      --validate-only) VALIDATE_ONLY=1; shift ;;
+      --stage-timeout-secs)
+        if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+          printf 'error: --stage-timeout-secs requires a non-negative integer (got: %s)\n' "$2" >&2
+          exit 2
+        fi
+        STAGE_TIMEOUT_SECS="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -7473,6 +7550,8 @@ main() {
   live_lab_init "rustynet-live-lab" "$SSH_IDENTITY_FILE"
   register_cleanup_targets
   trap orchestrator_cleanup EXIT
+  trap 'printf "\n[orchestrator] SIGINT received — stopping\n" >&2; kill_background_workers; exit 130' INT
+  trap 'printf "\n[orchestrator] SIGTERM received — stopping\n" >&2; kill_background_workers; exit 143' TERM
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     record_stage_skip "preflight" "hard" "dry-run: not executed"
@@ -7585,6 +7664,18 @@ main() {
     printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
     printf 'dry-run summary: %s\n' "$SUMMARY_MD"
     printf 'failure digest: %s\n' "$FAILURE_DIGEST_MD"
+    return 0
+  fi
+
+  if [[ "$VALIDATE_ONLY" -eq 1 ]]; then
+    run_setup_stage hard preflight 'verify local prerequisites' stage_preflight || true
+    run_setup_stage hard verify_ssh_reachability 'verify all selected nodes are reachable via ssh' stage_verify_ssh_reachability || true
+    write_run_summary
+    printf 'elapsed: %s\n' "$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
+    printf 'validate-only summary: %s\n' "$SUMMARY_MD"
+    if [[ "$OVERALL_STATUS" == "fail" ]]; then
+      return 1
+    fi
     return 0
   fi
 
@@ -7822,6 +7913,12 @@ main() {
   printf 'run summary: %s\n' "$SUMMARY_MD"
   printf 'run summary json: %s\n' "$SUMMARY_JSON"
   printf 'failure digest: %s\n' "$FAILURE_DIGEST_MD"
+  local _dir_size_mb
+  _dir_size_mb="$(du -sm "$REPORT_DIR" 2>/dev/null | cut -f1 || echo 0)"
+  if [[ "${_dir_size_mb:-0}" -gt 500 ]]; then
+    printf 'warning: report directory is %s MB (threshold: 500 MB) — consider archiving old runs under %s\n' \
+      "$_dir_size_mb" "$(dirname "$REPORT_DIR")" >&2
+  fi
   if [[ "$OVERALL_STATUS" == "fail" ]]; then
     return 1
   fi
