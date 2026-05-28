@@ -4732,7 +4732,7 @@ stage_run_live_anchor() {
     --leaf-client-node-id "$(node_id_for_label aux)" \
     --enrollee-host "$(node_target_for_label extra)" \
     --enrollee-node-id "$(node_id_for_label extra)" \
-    --owner-approver-id "$(node_id_for_label exit)" \
+    --owner-approver-id "$(node_id_for_label exit)-owner" \
     --anchor-bundle-pull-addr "127.0.0.1:51822" \
     --report-path "$report_path" \
     --log-path "$log_path"

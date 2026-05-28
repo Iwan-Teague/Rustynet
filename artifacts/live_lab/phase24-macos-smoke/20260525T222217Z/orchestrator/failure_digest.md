@@ -1,4 +1,4 @@
-# Live Linux Lab Failure Digest (20260528T204801Z)
+# Live Linux Lab Failure Digest (20260528T205811Z)
 
 - overall_status: `fail`
 - report_dir: `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator`
