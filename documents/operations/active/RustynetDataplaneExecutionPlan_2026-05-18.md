@@ -307,6 +307,7 @@ starting script, and archive the resulting artifacts under
   - D11.c: commit `d7c2c65` plus follow-up — anchor-priority gossip rebroadcast in `gossip_runtime.rs`; `port_mapping_bring_up_skip_reason` is fail-closed unless signed membership elects this node as `anchor.port_mapping_authoritative`. Tests: `port_mapping_skipped_when_non_authority`, `port_mapping_proceeds_when_self_is_authority`, `port_mapping_skipped_when_authority_unavailable`.
   - D11.d: `anchor_init.rs` + `rustynetd-anchor.service` + `start.sh` 6-role wizard anchor preset.
   - Live pass criterion (clean install end-to-end, second machine join, macOS flow, 3-peer rebroadcast) requires lab hardware; deferred to live-evidence cycle.
+  - **Live evidence attempts (2026-05-27 to 2026-05-28).** Retries 38–43 (run matrix) attempted D11 lab validation. Defects found and fixed: `a1c064f` (anchor sub-caps missing from genesis membership), `56b1776` (anchor bundle-pull token scope for admin nodes), `27b0e39` (macOS default route lost on lab restart), `1c254ff` (env_logger not initialized → anchor events silent in journald), `e1652c1` (orchestrator `--skip-to`, auto matrix-row finalization, journalctl flush retry). Live pass criterion remains open — a clean run against the current HEAD is the next step.
 
 ### D12 — Node role taxonomy + 6-role user-selectable surface (Track Alpha)
 
@@ -322,7 +323,7 @@ starting script, and archive the resulting artifacts under
 - **Estimated cost.** 8–11 cycles total (2 + 3 + 2 + 3 + 1).
 - **Depends on.** D11 (anchor capability schema + bundle-pull endpoint). D12 generalises the role surface that D11 establishes for `anchor`.
 - **Cross-platform note.** Linux + macOS roles land in D12, including macOS `blind_exit` through the reviewed PF hard-lock path. Windows non-client roles deferred behind D7/D9 (same dataplane parity prerequisite). Mobile is `client (mobile)` only — no role-set surface ever.
-- **Status (2026-05-22).** **D12.a + D12.b + D12.c + D12.d (Linux + macOS relay service path) + D12.e complete.**
+- **Status (2026-05-28).** **D12.a + D12.b + D12.c + D12.d (Linux + macOS relay service path) + D12.e complete. Live pass criterion pending (same lab-evidence cycle as D11).**
 
   D12.d lands the Linux service deploy/undeploy infrastructure for the relay-bearing presets:
 

@@ -76,8 +76,14 @@ Rule: these JSON evidence files are dated artifacts from specific lab runs.
 Add a new dated file when a new run produces fresh evidence; do not edit
 existing ones in place.
 
+## Prompt-Style Execution Documents
+
+These are execution prompts handed to an agent as a starting brief. They are tracked here for discoverability but are not source-of-truth ledgers — the active ledgers above own the authoritative status.
+
+- [CrossOsLiveLabParityExecutionPrompt_2026-05-25.md](./CrossOsLiveLabParityExecutionPrompt_2026-05-25.md) — agent execution brief for driving the cross-OS live-lab parity work (phases 19-31); predates the "no standalone prompt documents" rule; kept for reference only; the authoritative status lives in `AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md` and `RustynetDataplaneExecutionPlan_2026-05-18.md`
+
 ## Rules
 
 - Keep status and evidence in the owning ledger or plan.
-- Do not add standalone prompt documents here.
+- Do not add standalone prompt documents here. (Existing prompt documents are listed in the section above for discoverability only.)
 - If an active file becomes historical, move it or reclassify it honestly and update the indexes in the same change.
