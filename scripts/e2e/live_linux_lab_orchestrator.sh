@@ -2778,7 +2778,7 @@ done
 root ipconfig set en0 DHCP 2>/dev/null || true
 sleep 3
 if ! netstat -rn -f inet 2>/dev/null | grep -q '^default'; then
-  gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')"
+  gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')" || true
   if [ -n "$gw" ]; then
     root route add default "$gw" 2>/dev/null \
       || root route change default "$gw" 2>/dev/null \
