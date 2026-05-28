@@ -4730,6 +4730,7 @@ stage_run_live_anchor() {
     --second-anchor-node-id "$(node_id_for_label entry)" \
     --leaf-client-host "$(node_target_for_label aux)" \
     --leaf-client-node-id "$(node_id_for_label aux)" \
+    --leaf-client-platform "$(node_platform_for_label aux)" \
     --enrollee-host "$(node_target_for_label extra)" \
     --enrollee-node-id "$(node_id_for_label extra)" \
     --owner-approver-id "$(node_id_for_label exit)-owner" \

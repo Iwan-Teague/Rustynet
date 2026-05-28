@@ -370,8 +370,15 @@ fn capture_anchor_list_from_host(
     platform: AnchorPlatform,
 ) -> Result<String, String> {
     match platform {
-        AnchorPlatform::Linux | AnchorPlatform::Macos => {
+        AnchorPlatform::Linux => {
             let command = "command -v rustynet >/dev/null; rustynet anchor list";
+            capture_root(identity, known_hosts, host, command)
+                .map_err(|err| format!("anchor list failed on {host}: {err}"))
+        }
+        AnchorPlatform::Macos => {
+            // macOS installs membership state under membership/ subdir, not /var/lib/rustynet.
+            // Pass --snapshot explicitly so the CLI default (Linux path) does not mis-route.
+            let command = "command -v rustynet >/dev/null; rustynet anchor list --snapshot /usr/local/var/rustynet/membership/membership.snapshot";
             capture_root(identity, known_hosts, host, command)
                 .map_err(|err| format!("anchor list failed on {host}: {err}"))
         }
@@ -447,7 +454,7 @@ fn validate_anchor_gossip_priority(
             identity,
             known_hosts,
             leaf_client_host,
-            config.platform,
+            config.leaf_client_platform,
         )?;
         validate_anchor_capabilities(&anchor_list, config.anchor_node_id.as_str())?;
         validate_anchor_capabilities(&anchor_list, second_anchor_node_id)?;
@@ -2209,6 +2216,7 @@ struct Config {
     second_anchor_node_id: Option<String>,
     leaf_client_host: Option<String>,
     leaf_client_node_id: Option<String>,
+    leaf_client_platform: AnchorPlatform,
     enrollee_host: Option<String>,
     enrollee_node_id: Option<String>,
     owner_approver_id: Option<String>,
@@ -2246,6 +2254,7 @@ impl Config {
             second_anchor_node_id: None,
             leaf_client_host: None,
             leaf_client_node_id: None,
+            leaf_client_platform: AnchorPlatform::Linux,
             enrollee_host: None,
             enrollee_node_id: None,
             owner_approver_id: None,
@@ -2286,6 +2295,10 @@ impl Config {
                 }
                 "--leaf-client-node-id" => {
                     config.leaf_client_node_id = Some(next_value(&mut iter, &arg)?)
+                }
+                "--leaf-client-platform" => {
+                    config.leaf_client_platform =
+                        AnchorPlatform::parse(&next_value(&mut iter, &arg)?)?
                 }
                 "--enrollee-host" => config.enrollee_host = Some(next_value(&mut iter, &arg)?),
                 "--enrollee-node-id" => {
