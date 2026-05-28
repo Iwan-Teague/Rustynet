@@ -2722,9 +2722,19 @@ done
 # the default route during fail-closed rollback (privileged helper
 # disconnect mid-cleanup), leaving the host unable to detect the egress
 # interface on the next daemon start. Re-binding DHCP on en0 reinstalls
-# the default route published by the configd DHCP lease.
+# the default route published by the configd DHCP lease. If DHCP does
+# not restore the route within 3 s (lease renewal races or missing router
+# option), derive the gateway from the existing lease and add it explicitly.
 root ipconfig set en0 DHCP 2>/dev/null || true
-sleep 2
+sleep 3
+if ! netstat -rn -f inet 2>/dev/null | grep -q '^default'; then
+  gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')"
+  if [ -n "$gw" ]; then
+    root route add default "$gw" 2>/dev/null \
+      || root route change default "$gw" 2>/dev/null \
+      || true
+  fi
+fi
 exit 0
 MACOS_CLEANUP
 )"
