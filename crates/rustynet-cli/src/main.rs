@@ -1108,6 +1108,12 @@ enum OpsCommand {
     E2eIssueDnsZoneBundlesFromEnv {
         config: ops_e2e::E2eIssueDnsZoneBundlesFromEnvConfig,
     },
+    AppendLiveLabMatrixRow {
+        stage: String,
+        status: String,
+        report_path: String,
+        report_dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4332,6 +4338,12 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .unwrap_or_else(|| PathBuf::from("/run/rustynet/dns-zone-issue")),
             },
         }),
+        "append-live-lab-matrix-row" => Ok(OpsCommand::AppendLiveLabMatrixRow {
+            stage: parser.required("--stage")?,
+            status: parser.required("--status")?,
+            report_path: parser.required("--report-path")?,
+            report_dir: parser.required_path("--report-dir")?,
+        }),
         _ => Err(format!("unknown ops subcommand: {subcommand}")),
     }
 }
@@ -7157,6 +7169,22 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::E2eIssueDnsZoneBundlesFromEnv { config } => {
             ops_e2e::execute_ops_e2e_issue_dns_zone_bundles_from_env(config)
+        }
+        OpsCommand::AppendLiveLabMatrixRow { stage, status, report_path, report_dir } => {
+            let outcome = live_lab_run_matrix::LiveLabRunMatrixStageOutcome {
+                stage,
+                status,
+                artifacts: vec![report_path],
+            };
+            let config = live_lab_run_matrix::LiveLabRunMatrixAppendConfig {
+                command_name: "append-live-lab-matrix-row",
+                report_dir: report_dir.as_path(),
+                profile_path: None,
+                inventory_path: None,
+                extra_stage_outcomes: &[outcome],
+            };
+            live_lab_run_matrix::append_live_lab_run_matrix_row(config)
+                .map(|r| format!("appended row run_id={}", r.run_id))
         }
     }
 }
