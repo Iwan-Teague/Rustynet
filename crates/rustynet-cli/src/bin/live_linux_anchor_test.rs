@@ -471,11 +471,13 @@ fn validate_anchor_gossip_priority(
                 )?;
                 validate_anchor_capabilities(&anchor_list, config.anchor_node_id.as_str())?;
                 validate_anchor_capabilities(&anchor_list, second_anchor_node_id)?;
-                validate_lex_min_anchor_authority(
-                    &anchor_list,
-                    config.anchor_node_id.as_str(),
-                    second_anchor_node_id,
-                )?;
+                let (lex_min_id, lex_other_id) =
+                    if config.anchor_node_id.as_str() <= second_anchor_node_id {
+                        (config.anchor_node_id.as_str(), second_anchor_node_id)
+                    } else {
+                        (second_anchor_node_id, config.anchor_node_id.as_str())
+                    };
+                validate_lex_min_anchor_authority(&anchor_list, lex_min_id, lex_other_id)?;
                 Ok(format!(
                     "primary={} secondary={} anchor_host={} leaf={} secondary_host={} attempts={}",
                     config.anchor_node_id,
