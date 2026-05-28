@@ -836,51 +836,62 @@ fn validate_bundle_pull_log_redaction(
     let thumbprint = anchor_token_thumbprint(&token);
     let token_str = std::str::from_utf8(&token)
         .map_err(|err| format!("anchor token bytes not utf-8: {err}"))?;
-    // The trait's `run_argv` drives `journalctl` in argv-only form
-    // (no shell composition), then the Rust side filters lines for
-    // the `anchor_bundle_pull:` tag and asserts the leak/thumbprint
-    // contract locally. This replaces the previous `grep -F` +
-    // shell-case composition with deterministic string ops.
-    let logs = shell
-        .run_argv(
-            &[
-                "journalctl",
-                "-u",
-                "rustynetd",
-                "--since",
-                "10 minutes ago",
-                "--no-pager",
-            ],
-            &[],
-            &[],
-        )
-        .map_err(|err| format!("journalctl run failed: {err}"))?;
-    if !logs.is_success() {
-        return Err(format!(
-            "journalctl exited {}: {}",
-            logs.code,
-            String::from_utf8_lossy(&logs.stderr).trim()
-        ));
-    }
-    let body = String::from_utf8_lossy(&logs.stdout);
-    let filtered: Vec<&str> = body
-        .lines()
-        .filter(|line| line.contains("anchor_bundle_pull:"))
-        .collect();
-    if filtered.iter().any(|line| line.contains(token_str)) {
-        return Err("anchor bundle-pull journal leaked raw token material".to_owned());
-    }
     let thumbprint_marker = format!("token_thumbprint={thumbprint}");
-    if !filtered
-        .iter()
-        .any(|line| line.contains(&thumbprint_marker))
-    {
-        return Err(format!(
-            "anchor bundle-pull journal missing token thumbprint {thumbprint}"
-        ));
+    // journald indexes entries asynchronously after the daemon writes them.
+    // On a loaded system the entry may not appear immediately after the TCP
+    // roundtrip. Retry up to 3 times with a 1 s sleep between attempts so
+    // the check is robust without adding fixed latency on fast systems.
+    // Token-leak detection is checked on every attempt (no retry for leaks).
+    let max_attempts: u8 = 3;
+    for attempt in 1..=max_attempts {
+        // The trait's `run_argv` drives `journalctl` in argv-only form
+        // (no shell composition), then the Rust side filters lines for
+        // the `anchor_bundle_pull:` tag and asserts the leak/thumbprint
+        // contract locally.
+        let logs = shell
+            .run_argv(
+                &[
+                    "journalctl",
+                    "-u",
+                    "rustynetd",
+                    "--since",
+                    "10 minutes ago",
+                    "--no-pager",
+                ],
+                &[],
+                &[],
+            )
+            .map_err(|err| format!("journalctl run failed: {err}"))?;
+        if !logs.is_success() {
+            return Err(format!(
+                "journalctl exited {}: {}",
+                logs.code,
+                String::from_utf8_lossy(&logs.stderr).trim()
+            ));
+        }
+        let body = String::from_utf8_lossy(&logs.stdout);
+        let filtered: Vec<&str> = body
+            .lines()
+            .filter(|line| line.contains("anchor_bundle_pull:"))
+            .collect();
+        if filtered.iter().any(|line| line.contains(token_str)) {
+            return Err("anchor bundle-pull journal leaked raw token material".to_owned());
+        }
+        if filtered
+            .iter()
+            .any(|line| line.contains(&thumbprint_marker))
+        {
+            return Ok(format!(
+                "token_thumbprint={thumbprint} raw_token_leaked=false"
+            ));
+        }
+        if attempt < max_attempts {
+            // Entry not yet indexed; wait 1 s and retry.
+            let _ = shell.run_argv(&["sleep", "1"], &[], &[]);
+        }
     }
-    Ok(format!(
-        "token_thumbprint={thumbprint} raw_token_leaked=false"
+    Err(format!(
+        "anchor bundle-pull journal missing token thumbprint {thumbprint}"
     ))
 }
 
@@ -3368,6 +3379,77 @@ mod tests {
         let err = super::validate_bundle_pull_log_redaction(&shell, &cfg)
             .expect_err("must fail closed on leaked token");
         assert!(err.contains("leaked raw token material"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_bundle_pull_log_redaction_retries_when_thumbprint_missing_first_attempt() {
+        let shell = MockShellHost::new();
+        let cfg = mock_config_for_test(super::AnchorPlatform::Linux);
+        let token: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+        shell
+            .write_file(cfg.anchor_token_path.as_str(), token, 0o600)
+            .unwrap();
+        let thumbprint = super::anchor_token_thumbprint(token);
+        let empty_log = "";
+        let good_log = format!(
+            "Jul 01 anchor_bundle_pull: peer=relay-1 token_thumbprint={thumbprint} bytes=512"
+        );
+        let jctl_argv = &[
+            "journalctl",
+            "-u",
+            "rustynetd",
+            "--since",
+            "10 minutes ago",
+            "--no-pager",
+        ];
+        // First attempt: no matching entries (journald not yet flushed)
+        shell.program_run_response(jctl_argv, ok_response(empty_log.as_bytes()));
+        // sleep 1 between attempts
+        shell.program_run_response(&["sleep", "1"], ok_response(b""));
+        // Second attempt: entry now indexed
+        shell.program_run_response(jctl_argv, ok_response(good_log.as_bytes()));
+        let summary =
+            super::validate_bundle_pull_log_redaction(&shell, &cfg).expect("should succeed");
+        assert!(summary.contains(&format!("token_thumbprint={thumbprint}")));
+        assert!(summary.contains("raw_token_leaked=false"));
+        let log = shell.run_log();
+        assert_eq!(log.len(), 3, "journalctl + sleep + journalctl");
+        assert_eq!(log[0].argv[0], "journalctl");
+        assert_eq!(log[1].argv[0], "sleep");
+        assert_eq!(log[2].argv[0], "journalctl");
+    }
+
+    #[test]
+    fn validate_bundle_pull_log_redaction_fails_after_all_retries_exhausted() {
+        let shell = MockShellHost::new();
+        let cfg = mock_config_for_test(super::AnchorPlatform::Linux);
+        let token: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+        shell
+            .write_file(cfg.anchor_token_path.as_str(), token, 0o600)
+            .unwrap();
+        let thumbprint = super::anchor_token_thumbprint(token);
+        let empty_log = "";
+        let jctl_argv = &[
+            "journalctl",
+            "-u",
+            "rustynetd",
+            "--since",
+            "10 minutes ago",
+            "--no-pager",
+        ];
+        for _ in 0..3 {
+            shell.program_run_response(jctl_argv, ok_response(empty_log.as_bytes()));
+        }
+        shell.program_run_response(&["sleep", "1"], ok_response(b""));
+        shell.program_run_response(&["sleep", "1"], ok_response(b""));
+        let err = super::validate_bundle_pull_log_redaction(&shell, &cfg)
+            .expect_err("should fail after all retries");
+        assert!(
+            err.contains(&format!("missing token thumbprint {thumbprint}")),
+            "got: {err}"
+        );
+        let log = shell.run_log();
+        assert_eq!(log.len(), 5, "3× journalctl + 2× sleep");
     }
 
     #[test]

@@ -102,6 +102,7 @@ pub struct WriteLiveLinuxLabRunSummaryConfig {
     pub finished_at_unix: u64,
     pub elapsed_secs: u64,
     pub elapsed_human: String,
+    pub run_note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1071,6 +1072,8 @@ struct LiveLabRunSummaryView {
     finished_at_unix: u64,
     elapsed_secs: u64,
     elapsed_human: String,
+    #[serde(default)]
+    run_note: String,
     nodes: Vec<RunSummaryNodeView>,
     stages: Vec<RunSummaryStageView>,
     #[serde(flatten, default)]
@@ -1124,6 +1127,7 @@ impl LiveLabRunSummaryView {
             "elapsed_human".to_owned(),
             Value::String(self.elapsed_human),
         );
+        m.insert("run_note".to_owned(), Value::String(self.run_note));
         m.insert(
             "nodes".to_owned(),
             Value::Array(
@@ -2056,6 +2060,7 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
         finished_at_unix: config.finished_at_unix,
         elapsed_secs: config.elapsed_secs,
         elapsed_human: config.elapsed_human.clone(),
+        run_note: config.run_note.clone(),
         nodes,
         stages,
         extra: Map::new(),
@@ -2087,6 +2092,9 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
     ));
     lines.push(format!("- finished_at_utc: `{}`", summary.finished_at_utc));
     lines.push(format!("- elapsed: `{}`", summary.elapsed_human));
+    if !summary.run_note.is_empty() {
+        lines.push(format!("- run_note: {}", summary.run_note));
+    }
     lines.push(String::new());
     lines.push("## Nodes".to_owned());
     lines.push(String::new());
@@ -4386,6 +4394,7 @@ mod tests {
             finished_at_unix: 11,
             elapsed_secs: 10,
             elapsed_human: "00m 10s".to_owned(),
+            run_note: String::new(),
         })
         .expect("summary should write");
 

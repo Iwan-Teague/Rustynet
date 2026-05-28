@@ -6653,6 +6653,7 @@ fn execute_rust_native_orchestration(
         profile_path: None,
         inventory_path: Some(inventory_path.as_path()),
         extra_stage_outcomes: matrix_outcomes.as_slice(),
+        notes: None,
     }) {
         Ok(result) => {
             let _ = writeln!(
@@ -18235,6 +18236,7 @@ fn append_live_lab_run_matrix_for_command(
         profile_path,
         inventory_path,
         extra_stage_outcomes: matrix_outcomes.as_slice(),
+        notes: None,
     })
     .map(|result| result.report_row_path)
 }

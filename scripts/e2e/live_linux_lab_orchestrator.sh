@@ -45,6 +45,9 @@ RERUN_STAGE=""
 RERUN_FAILED=0
 PREV_RUN_DIR=""
 PASSED_STAGES=()
+RUN_NOTE=""
+SKIP_TO_STAGE=""
+SKIP_STAGES_ARRAY=()
 MAX_PARALLEL_NODE_WORKERS="${MAX_PARALLEL_NODE_WORKERS:-2}"
 CROSS_NETWORK_MODE="auto"
 CROSS_NETWORK_SKIP_REASON=""
@@ -149,6 +152,8 @@ options:
   --report-dir <path>            Override report output directory
   --setup-only                   Run only the preflight + baseline setup stages
   --skip-setup                   Skip preflight + baseline setup stages and run follow-on tests only
+  --skip-to <stage>              Resume any stage by name, skipping all preceding stages; setup
+                                 is skipped automatically when targeting a post-setup stage
   --preserve-report-state        Reuse an existing report dir instead of truncating stage state
   --resume-from <stage>          Resume the setup stage sequence from a specific setup stage
   --rerun-stage <stage>          Rerun one setup stage in an existing report dir
@@ -1159,7 +1164,7 @@ record_stage_skip() {
 
 is_setup_stage_name() {
   case "$1" in
-    preflight|prepare_source_archive|verify_ssh_reachability|prime_remote_access|cleanup_hosts|bootstrap_hosts|collect_pubkeys|membership_setup|distribute_membership_state|issue_and_distribute_assignments|issue_and_distribute_traversal|issue_and_distribute_dns_zone|enforce_baseline_runtime|validate_baseline_runtime)
+    preflight|prepare_source_archive|verify_ssh_reachability|prime_remote_access|macos_preflight_check|cleanup_hosts|bootstrap_hosts|collect_pubkeys|membership_setup|distribute_membership_state|issue_and_distribute_assignments|issue_and_distribute_traversal|issue_and_distribute_dns_zone|enforce_baseline_runtime|validate_baseline_runtime)
       return 0
       ;;
     *)
@@ -1176,6 +1181,7 @@ setup_stage_index() {
     prepare_source_archive
     verify_ssh_reachability
     prime_remote_access
+    macos_preflight_check
     cleanup_hosts
     bootstrap_hosts
     collect_pubkeys
@@ -1687,7 +1693,27 @@ run_stage() {
     fi
   fi
 
+  if [[ "${#SKIP_STAGES_ARRAY[@]}" -gt 0 ]]; then
+    local _skipme=0
+    for _ss in "${SKIP_STAGES_ARRAY[@]}"; do
+      if [[ "$_ss" == "$stage_name" ]]; then _skipme=1; break; fi
+    done
+    if [[ "$_skipme" -eq 1 ]]; then
+      record_stage_skip "$stage_name" "$severity" "skip-stages: explicitly skipped"
+      return 0
+    fi
+  fi
+
+  if [[ -n "$SKIP_TO_STAGE" ]]; then
+    if [[ "$stage_name" != "$SKIP_TO_STAGE" ]]; then
+      record_stage_skip "$stage_name" "$severity" "skip-to: resuming from ${SKIP_TO_STAGE}"
+      return 0
+    fi
+    SKIP_TO_STAGE=""
+  fi
+
   local log_path="$LOG_DIR/${stage_name}.log"
+  local _stage_started_unix; _stage_started_unix="$(date +%s)"
   local started_at="$(date -u +%FT%TZ)"
   local finished_at
   local rc
@@ -1736,9 +1762,10 @@ run_stage() {
   fi
 
   finished_at="$(date -u +%FT%TZ)"
+  local _stage_elapsed; _stage_elapsed="$(format_elapsed_duration "$(( $(date +%s) - _stage_started_unix ))")"
   if [[ "$rc" -ne 0 ]]; then
     status="fail"
-    printf '[stage:%s] FAIL rc=%s\n' "$stage_name" "$rc" | tee -a "$log_path"
+    printf '[stage:%s] FAIL rc=%s (%s)\n' "$stage_name" "$rc" "$_stage_elapsed" | tee -a "$log_path"
     if stage_requires_forensics_bundle "$stage_name"; then
       if forensics_dir="$(collect_cross_network_failure_forensics "$stage_name")"; then
         printf '[stage:%s] forensics bundle: %s\n' "$stage_name" "$forensics_dir" | tee -a "$log_path"
@@ -1748,7 +1775,7 @@ run_stage() {
     fi
     printf '[stage:%s] failure digest: %s\n' "$stage_name" "$FAILURE_DIGEST_MD" | tee -a "$log_path"
   else
-    printf '[stage:%s] PASS\n' "$stage_name" | tee -a "$log_path"
+    printf '[stage:%s] PASS (%s)\n' "$stage_name" "$_stage_elapsed" | tee -a "$log_path"
   fi
   record_stage "$stage_name" "$severity" "$status" "$rc" "$log_path" "$description" "$started_at" "$finished_at"
   update_overall_status "$severity" "$status"
@@ -2682,6 +2709,19 @@ stage_prepare_source_archive() {
   local -a tar_flags=()
   write_remote_scripts
   printf 'source mode: %s\n' "$(describe_source_mode)"
+  # For non-working-tree modes, skip re-creating the archive if it already
+  # exists and the recorded commit matches the ref we would archive now.
+  # Working-tree mode is excluded: the tree may be dirty even if HEAD hasn't
+  # moved, so we always re-archive to capture latest edits.
+  if [[ "$SOURCE_MODE" != "working-tree" && -f "$SOURCE_ARCHIVE" && -f "$STATE_DIR/git_head.txt" ]]; then
+    local _existing_commit _current_commit
+    _existing_commit="$(tr -d '[:space:]' < "$STATE_DIR/git_head.txt" 2>/dev/null || true)"
+    _current_commit="$(git -C "$ROOT_DIR" rev-parse "$(resolve_source_ref)" 2>/dev/null || true)"
+    if [[ -n "$_existing_commit" && -n "$_current_commit" && "$_existing_commit" == "$_current_commit" ]]; then
+      printf 'source archive already current (commit: %s) — skipping re-creation\n' "$_existing_commit"
+      return 0
+    fi
+  fi
   if [[ "$SOURCE_MODE" == "working-tree" ]]; then
     tar_version="$(tar --version 2>/dev/null || true)"
     tar_version="${tar_version%%$'\n'*}"
@@ -2714,6 +2754,7 @@ stage_run_fresh_bootstrap_and_network_setup() {
   run_setup_stage hard prepare_source_archive 'package local source tree for remote install' stage_prepare_source_archive || return 1
   run_setup_stage hard verify_ssh_reachability 'verify all selected nodes are reachable via ssh' stage_verify_ssh_reachability || return 1
   run_setup_stage hard prime_remote_access 'push sudo credentials to all targets' prime_remote_access || return 1
+  run_setup_stage soft macos_preflight_check 'pre-cleanup macOS node diagnostic snapshot' stage_macos_preflight_check || true
   run_setup_stage hard cleanup_hosts 'remove prior RustyNet state from targets' stage_cleanup_hosts || return 1
   run_setup_stage hard bootstrap_hosts 'fresh install and bootstrap RustyNet on all targets' stage_bootstrap_hosts || return 1
   run_setup_stage hard collect_pubkeys 'collect WireGuard public keys from all targets' stage_collect_pubkeys || return 1
@@ -2728,6 +2769,65 @@ stage_run_fresh_bootstrap_and_network_setup() {
 
 stage_cleanup_hosts() {
   run_serial_node_stage cleanup_hosts cleanup_host_worker
+}
+
+# Soft diagnostic stage: SSHes to each macOS node and logs WG interfaces,
+# launchctl rustynet services, and default route state. If the default route
+# is absent (e.g. a prior run died mid-cleanup), attempts auto-restoration
+# using the DHCP-lease gateway before cleanup_hosts runs. Logs the outcome
+# clearly per node; never hard-fails (cleanup_hosts will fail fast if the
+# network is truly broken, with the route state now captured upfront).
+stage_macos_preflight_check() {
+  local _found_macos=0
+  local _label _target _platform
+  while IFS=$'\t' read -r _label _target _ _; do
+    _platform="$(node_platform_for_label "$_label" 2>/dev/null || echo unknown)"
+    if [[ "$_platform" == "macos" ]]; then
+      _found_macos=1
+      printf '[macos-preflight] checking %s (%s)\n' "$_label" "$_target"
+      local _diag
+      _diag="$(live_lab_ssh "$_target" '
+        printf "=== WG interfaces ===\n"; ifconfig | grep -E "^utun|inet" | head -30 || true
+        printf "=== launchctl rustynet services ===\n"
+        launchctl list 2>/dev/null | grep -i rustynet || printf "(none found)\n"
+        printf "=== default route ===\n"; netstat -rn 2>/dev/null | grep "default" | head -5 || true
+      ' 2>&1 || true)"
+      printf '%s\n' "$_diag"
+      # Auto-restore default route if absent — a prior run that died mid-cleanup
+      # can leave the host without a default route, causing every subsequent
+      # stage to fail opaquely. Restore it now so cleanup_hosts has a
+      # working network, and log what we did.
+      local _route_present
+      _route_present="$(live_lab_ssh "$_target" \
+        'netstat -rn -f inet 2>/dev/null | grep -c "^default" || printf 0' 2>/dev/null || printf 0)"
+      if [[ "${_route_present:-0}" -eq 0 ]]; then
+        printf '[macos-preflight] WARNING: %s (%s) has no default route — attempting restore\n' \
+          "$_label" "$_target"
+        local _restore_result
+        _restore_result="$(live_lab_ssh "$_target" '
+          gw="$(ipconfig getpacket en0 2>/dev/null | awk '"'"'/^router /{gsub(/[{}]/, "", $3); print $3; exit}'"'"')" || true
+          if [ -n "$gw" ]; then
+            route add default "$gw" 2>/dev/null \
+              || route change default "$gw" 2>/dev/null \
+              || true
+            if netstat -rn -f inet 2>/dev/null | grep -q "^default"; then
+              printf "route_restored=true gateway=%s\n" "$gw"
+            else
+              printf "route_restored=false gateway=%s\n" "$gw"
+            fi
+          else
+            printf "route_restored=false gateway=unknown (no DHCP lease found)\n"
+          fi
+        ' 2>&1 || true)"
+        printf '[macos-preflight] route restore result: %s\n' "${_restore_result:-no output}"
+      else
+        printf '[macos-preflight] %s (%s) default route present\n' "$_label" "$_target"
+      fi
+    fi
+  done < "$NODES_TSV"
+  if [[ "$_found_macos" -eq 0 ]]; then
+    printf '[macos-preflight] no macOS nodes in topology — skipping\n'
+  fi
 }
 
 cleanup_host_worker() {
@@ -7219,7 +7319,8 @@ write_run_summary() {
     --finished-at-utc "$finished_at_utc" \
     --finished-at-unix "$finished_at_unix" \
     --elapsed-secs "$elapsed_secs" \
-    --elapsed-human "$elapsed_human" >/dev/null || _rc=$?
+    --elapsed-human "$elapsed_human" \
+    --run-note "$RUN_NOTE" >/dev/null || _rc=$?
   if [[ "$_rc" -ne 0 ]]; then
     printf 'warning: run summary write failed (rc=%s); %s may be incomplete\n' \
       "$_rc" "$SUMMARY_JSON" >&2
@@ -7264,6 +7365,12 @@ kill_background_workers() {
 orchestrator_cleanup() {
   kill_background_workers
   cleanup_local_password_files
+  if [[ -f "$SUMMARY_JSON" ]]; then
+    local _matrix_args=(--report-dir "$REPORT_DIR")
+    [[ -n "${PROFILE_PATH:-}" ]] && _matrix_args+=(--profile "$PROFILE_PATH")
+    cargo run --quiet -p rustynet-cli -- ops append-orchestrator-run-to-matrix \
+      "${_matrix_args[@]}" 2>/dev/null || true
+  fi
   live_lab_cleanup
 }
 
@@ -7304,6 +7411,7 @@ parse_args() {
       --report-dir) REPORT_DIR="$2"; LOG_DIR="$REPORT_DIR/logs"; VERIFICATION_DIR="$REPORT_DIR/verification"; STATE_DIR="$REPORT_DIR/state"; SUMMARY_JSON="$REPORT_DIR/run_summary.json"; SUMMARY_MD="$REPORT_DIR/run_summary.md"; FAILURE_DIGEST_JSON="$REPORT_DIR/failure_digest.json"; FAILURE_DIGEST_MD="$REPORT_DIR/failure_digest.md"; STAGE_TSV="$STATE_DIR/stages.tsv"; NODES_TSV="$STATE_DIR/nodes.tsv"; SOURCE_ARCHIVE="$STATE_DIR/rustynet-source.tar.gz"; PUBKEYS_TSV="$STATE_DIR/pubkeys.tsv"; ONEHOP_STATE_ENV="$STATE_DIR/onehop_state.env"; shift 2 ;;
       --setup-only) SETUP_ONLY=1; shift ;;
       --skip-setup) SKIP_SETUP=1; shift ;;
+      --skip-to) SKIP_TO_STAGE="$2"; shift 2 ;;
       --preserve-report-state) PRESERVE_REPORT_STATE=1; shift ;;
       --resume-from) RESUME_FROM_STAGE="$2"; shift 2 ;;
       --rerun-stage) RERUN_STAGE="$2"; shift 2 ;;
@@ -7328,6 +7436,10 @@ parse_args() {
       --validate-only) VALIDATE_ONLY=1; shift ;;
       --rerun-failed) RERUN_FAILED=1; shift ;;
       --prev-run-dir) PREV_RUN_DIR="$2"; shift 2 ;;
+      --note) RUN_NOTE="$2"; shift 2 ;;
+      --skip-stages)
+        IFS=',' read -ra SKIP_STAGES_ARRAY <<< "$2"
+        shift 2 ;;
       --stage-timeout-secs)
         if [[ ! "$2" =~ ^[0-9]+$ ]]; then
           printf 'error: --stage-timeout-secs requires a non-negative integer (got: %s)\n' "$2" >&2
@@ -7498,6 +7610,12 @@ main() {
     }
     PRESERVE_REPORT_STATE=1
   fi
+  if [[ -n "$SKIP_TO_STAGE" ]]; then
+    PRESERVE_REPORT_STATE=1
+    if ! is_setup_stage_name "$SKIP_TO_STAGE"; then
+      SKIP_SETUP=1
+    fi
+  fi
   maybe_prompt_for_default_profile
   if [[ -n "$PROFILE_PATH" ]]; then
     load_profile_file "$PROFILE_PATH"
@@ -7593,7 +7711,7 @@ main() {
       --run-summary "$_prev_summary" --status pass 2>/dev/null || true)
     local _setup_stages=(
       preflight prepare_source_archive verify_ssh_reachability prime_remote_access
-      cleanup_hosts bootstrap_hosts collect_pubkeys membership_setup
+      macos_preflight_check cleanup_hosts bootstrap_hosts collect_pubkeys membership_setup
       distribute_membership_state issue_and_distribute_assignments
       issue_and_distribute_traversal issue_and_distribute_dns_zone
       enforce_baseline_runtime validate_baseline_runtime
@@ -7618,6 +7736,7 @@ main() {
     record_stage_skip "prepare_source_archive" "hard" "dry-run: not executed"
     record_stage_skip "verify_ssh_reachability" "hard" "dry-run: not executed"
     record_stage_skip "prime_remote_access" "hard" "dry-run: not executed"
+    record_stage_skip "macos_preflight_check" "soft" "dry-run: not executed"
     record_stage_skip "cleanup_hosts" "hard" "dry-run: not executed"
     record_stage_skip "bootstrap_hosts" "hard" "dry-run: not executed"
     record_stage_skip "collect_pubkeys" "hard" "dry-run: not executed"

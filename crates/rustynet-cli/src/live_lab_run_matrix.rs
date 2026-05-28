@@ -192,13 +192,21 @@ pub struct LiveLabRunMatrixStageOutcome {
     pub artifacts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LiveLabRunMatrixAppendConfig<'a> {
     pub command_name: &'a str,
     pub report_dir: &'a Path,
     pub profile_path: Option<&'a Path>,
     pub inventory_path: Option<&'a Path>,
     pub extra_stage_outcomes: &'a [LiveLabRunMatrixStageOutcome],
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendOrchestratorRunToMatrixConfig {
+    pub report_dir: PathBuf,
+    pub profile_path: Option<PathBuf>,
+    pub inventory_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +249,73 @@ struct StageEvidence {
 
 pub fn default_live_lab_run_matrix_path() -> PathBuf {
     workspace_root_path().join("documents/operations/live_lab_run_matrix.csv")
+}
+
+pub fn execute_ops_append_orchestrator_run_to_matrix(
+    config: AppendOrchestratorRunToMatrixConfig,
+) -> Result<LiveLabRunMatrixAppendResult, String> {
+    let report_dir = config.report_dir.as_path();
+
+    // Read run_note from run_summary.json if present
+    let run_summary_path = report_dir.join("run_summary.json");
+    let run_note = if run_summary_path.is_file() {
+        let body = std::fs::read_to_string(&run_summary_path)
+            .map_err(|e| format!("read run_summary.json: {e}"))?;
+        let val: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("parse run_summary.json: {e}"))?;
+        val.get("run_note")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+
+    // Read first failure context from failure_digest.json if present
+    let first_failure_note = {
+        let digest_path = report_dir.join("failure_digest.json");
+        if digest_path.is_file() {
+            let body = std::fs::read_to_string(&digest_path)
+                .map_err(|e| format!("read failure_digest.json: {e}"))?;
+            let val: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("parse failure_digest.json: {e}"))?;
+            if let Some(first) = val.get("first_failure").filter(|v| !v.is_null()) {
+                let stage = first
+                    .get("stage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let reason = first
+                    .get("primary_failure_reason")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| first.get("message").and_then(|v| v.as_str()))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("see log");
+                Some(format!("first_failed: {stage}; {reason}"))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Combine notes: run_note, then failure detail if any
+    let notes = match (run_note, first_failure_note) {
+        (Some(n), Some(f)) => Some(format!("{n}; {f}")),
+        (Some(n), None) => Some(n),
+        (None, Some(f)) => Some(f),
+        (None, None) => None,
+    };
+
+    append_live_lab_run_matrix_row(LiveLabRunMatrixAppendConfig {
+        command_name: "live-linux-lab-orchestrator",
+        report_dir,
+        profile_path: config.profile_path.as_deref(),
+        inventory_path: config.inventory_path.as_deref(),
+        extra_stage_outcomes: &[],
+        notes,
+    })
 }
 
 pub fn append_live_lab_run_matrix_row(
@@ -486,6 +561,9 @@ fn build_live_lab_run_matrix_values(
         "evidence_bundle_path",
         path_display(config.report_dir),
     );
+    if let Some(ref notes) = config.notes {
+        set_if_present(&mut values, &schema_set, "notes", notes.clone());
+    }
 
     populate_target_identity_values(&mut values, &schema_set, &target_evidence);
     populate_stage_values(
@@ -1537,6 +1615,7 @@ mod tests {
                 profile_path: Some(profile.as_path()),
                 inventory_path: None,
                 extra_stage_outcomes: extra.as_slice(),
+                notes: None,
             },
         )
         .expect("values");
