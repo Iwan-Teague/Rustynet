@@ -560,10 +560,17 @@ repair_bootstrap_dns_state_macos() {
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   dscacheutil -flushcache 2>/dev/null || true
   killall -HUP mDNSResponder 2>/dev/null || true
+  # Give mDNSResponder time to apply the new nameserver settings before any
+  # caller checks connectivity.
+  sleep 3
 }
 
 wait_for_cargo_registry_endpoint() {
   local endpoint="https://index.crates.io/"
+  # Always repair DNS before the first check to ensure 1.1.1.1 is the active
+  # resolver. Without this, curl may pass on a stale cache entry but cargo's
+  # fresh resolution fails because mDNSResponder still has broken DHCP DNS.
+  repair_bootstrap_dns_state_macos
   local attempt
   for attempt in $(seq 1 8); do
     if curl --ipv4 --fail --silent --head --connect-timeout 10 --max-time 15 \
