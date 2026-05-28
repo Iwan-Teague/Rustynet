@@ -557,14 +557,18 @@ provision_enrollment_secret() {
 ensure_ipv4_default_route_macos() {
   netstat -rn -f inet 2>/dev/null | grep -q '^default' && return 0
   local gw=""
-  # 1. DHCP lease router option
-  gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')" || true
-  # 2. Any existing host route that already carries an IPv4 gateway
+  # 1. networksetup Router field — works for Manual (static) and DHCP configs
+  gw="$(networksetup -getinfo "Ethernet" 2>/dev/null | awk '/^Router:/{print $2; exit}')" || true
+  # 2. DHCP lease router option (DHCP-only fallback)
+  if [[ -z "$gw" ]]; then
+    gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')" || true
+  fi
+  # 3. Any existing host route that already carries an IPv4 gateway
   if [[ -z "$gw" ]]; then
     gw="$(netstat -rn -f inet 2>/dev/null \
           | awk '$2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /G/ {print $2; exit}')" || true
   fi
-  # 3. Assume .1 of the host's primary IPv4 address on en0
+  # 4. Assume .1 of the host's primary IPv4 address on en0
   if [[ -z "$gw" ]]; then
     local host_ip
     host_ip="$(ipconfig getifaddr en0 2>/dev/null)" || true
