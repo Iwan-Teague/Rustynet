@@ -450,25 +450,51 @@ fn validate_anchor_gossip_priority(
     )
     .map_err(|err| format!("promote second anchor {second_anchor_node_id} failed: {err}"))?;
 
-    let validation = (|| -> Result<String, String> {
-        let anchor_list = capture_anchor_list_from_host(
-            identity,
-            known_hosts,
-            leaf_client_host,
-            config.leaf_client_platform,
-        )?;
-        validate_anchor_capabilities(&anchor_list, config.anchor_node_id.as_str())?;
-        validate_anchor_capabilities(&anchor_list, second_anchor_node_id)?;
-        validate_lex_min_anchor_authority(
-            &anchor_list,
-            config.anchor_node_id.as_str(),
-            second_anchor_node_id,
-        )?;
-        Ok(format!(
-            "primary={} secondary={} leaf={} secondary_host={}",
-            config.anchor_node_id, second_anchor_node_id, leaf_client_host, second_anchor_host
-        ))
-    })();
+    // Poll until both anchors are visible in the leaf's membership view.
+    // The exit-node daemon must gossip the promotion before the leaf's
+    // on-disk log reflects it; on slower (e.g. macOS userspace-WG) nodes
+    // this can take several reconcile cycles.
+    let validation = {
+        let max_attempts = 10u32;
+        let sleep_secs = 5u64;
+        let mut last_err = String::new();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match (|| -> Result<String, String> {
+                let anchor_list = capture_anchor_list_from_host(
+                    identity,
+                    known_hosts,
+                    leaf_client_host,
+                    config.leaf_client_platform,
+                )?;
+                validate_anchor_capabilities(&anchor_list, config.anchor_node_id.as_str())?;
+                validate_anchor_capabilities(&anchor_list, second_anchor_node_id)?;
+                validate_lex_min_anchor_authority(
+                    &anchor_list,
+                    config.anchor_node_id.as_str(),
+                    second_anchor_node_id,
+                )?;
+                Ok(format!(
+                    "primary={} secondary={} leaf={} secondary_host={} attempts={}",
+                    config.anchor_node_id,
+                    second_anchor_node_id,
+                    leaf_client_host,
+                    second_anchor_host,
+                    attempt,
+                ))
+            })() {
+                Ok(summary) => break Ok(summary),
+                Err(err) => {
+                    last_err = err;
+                    if attempt >= max_attempts {
+                        break Err(last_err);
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+                }
+            }
+        }
+    };
 
     let restore = set_membership_capabilities(
         identity,
