@@ -2877,6 +2877,11 @@ root launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
 root launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
 root pkill -9 rustynetd 2>/dev/null || true
 sleep 1
+# Flush any pf rules the privileged-helper loaded. SIGKILL does not allow
+# the helper to run its cleanup path, so pf rules accumulate across retries
+# and block HTTPS/cargo on the next bootstrap attempt. Disable pf entirely
+# to restore plain connectivity; the bootstrap/daemon will re-enable it.
+root pfctl -F all -d 2>/dev/null || true
 root rm -f /Library/LaunchDaemons/com.rustynet.daemon.plist \
       /Library/LaunchDaemons/com.rustynet.privileged-helper.plist
 root rm -rf /usr/local/var/rustynet /usr/local/etc/rustynet \
@@ -3052,15 +3057,33 @@ bootstrap_host_worker_macos() {
   invoke_cmd+=" --build-dir '${remote_build_dir}'"
   invoke_cmd+=" --env-file '${remote_env}'"
   for attempt in $(seq 1 "$max_attempts"); do
+    local _ssh_rc=0
+    # Run SCP and SSH separately so we can inspect the SSH exit code.
+    # The macOS daemon's privileged-helper flushes pfctl state when it first
+    # loads its rules, which tears down the existing SSH session mid-script.
+    # SSH exit 255 means the connection broke (not that the remote script
+    # failed), so a successful compile+install can still report 255. Treat
+    # 255 as "possibly succeeded" and fall through to the artifact check.
     if live_lab_scp_to "$wrapper_local" "$target" "$remote_wrapper" &&
-      live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "$remote_archive" &&
-      live_lab_ssh "$target" "$invoke_cmd" &&
-      live_lab_wait_for_daemon_socket "$target" "/private/var/run/rustynet/rustynetd.sock" &&
-      live_lab_run_root "$target" "root test -x /usr/local/bin/rustynet && root test -x /usr/local/bin/rustynetd && root test -f /usr/local/var/rustynet/keys/wireguard.pub && root test -f /usr/local/var/rustynet/keys/enrollment.secret"
-    then
-      return 0
+       live_lab_scp_to "$SOURCE_ARCHIVE" "$target" "$remote_archive"; then
+      live_lab_ssh "$target" "$invoke_cmd" || _ssh_rc=$?
+    else
+      _ssh_rc=1
+    fi
+    if [[ "$_ssh_rc" -eq 0 || "$_ssh_rc" -eq 255 ]]; then
+      # Give the daemon a moment to stabilise (socket creation, pf rules) before
+      # checking artifacts — especially important after an SSH-255 drop.
+      [[ "$_ssh_rc" -eq 255 ]] && sleep 5
+      if live_lab_wait_for_daemon_socket "$target" "/private/var/run/rustynet/rustynetd.sock" &&
+         live_lab_run_root "$target" "root test -x /usr/local/bin/rustynet && root test -x /usr/local/bin/rustynetd && root test -f /usr/local/var/rustynet/keys/wireguard.pub && root test -f /usr/local/var/rustynet/keys/enrollment.secret"
+      then
+        return 0
+      fi
     fi
     if [[ "$attempt" -lt "$max_attempts" ]]; then
+      # The daemon may have started and loaded pfctl rules that block
+      # HTTPS/cargo on the next attempt. Clean up before retrying.
+      cleanup_host_worker_macos "$target" || true
       sleep "$sleep_secs"
     fi
   done

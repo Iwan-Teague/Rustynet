@@ -1,7 +1,7 @@
-preflight	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/preflight.log	verify local prerequisites	2026-05-28T19:02:06Z	2026-05-28T19:02:06Z
-prepare_source_archive	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/prepare_source_archive.log	package local source tree for remote install	2026-05-28T19:02:06Z	2026-05-28T19:02:07Z
-verify_ssh_reachability	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/verify_ssh_reachability.log	verify all selected nodes are reachable via ssh	2026-05-28T19:02:08Z	2026-05-28T19:02:39Z
-prime_remote_access	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/prime_remote_access.log	push sudo credentials to all targets	2026-05-28T19:02:40Z	2026-05-28T19:04:14Z
-macos_preflight_check	soft	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/macos_preflight_check.log	pre-cleanup macOS node diagnostic snapshot	2026-05-28T19:04:15Z	2026-05-28T19:05:16Z
-cleanup_hosts	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/cleanup_hosts.log	remove prior RustyNet state from targets	2026-05-28T19:05:17Z	2026-05-28T19:08:30Z
-bootstrap_hosts	hard	fail	1	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/bootstrap_hosts.log	fresh install and bootstrap RustyNet on all targets	2026-05-28T19:08:31Z	2026-05-28T19:17:23Z
+preflight	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/preflight.log	verify local prerequisites	2026-05-28T20:25:57Z	2026-05-28T20:25:57Z
+prepare_source_archive	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/prepare_source_archive.log	package local source tree for remote install	2026-05-28T20:25:58Z	2026-05-28T20:25:59Z
+verify_ssh_reachability	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/verify_ssh_reachability.log	verify all selected nodes are reachable via ssh	2026-05-28T20:26:00Z	2026-05-28T20:26:01Z
+prime_remote_access	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/prime_remote_access.log	push sudo credentials to all targets	2026-05-28T20:26:02Z	2026-05-28T20:26:05Z
+macos_preflight_check	soft	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/macos_preflight_check.log	pre-cleanup macOS node diagnostic snapshot	2026-05-28T20:26:06Z	2026-05-28T20:26:07Z
+cleanup_hosts	hard	pass	0	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/cleanup_hosts.log	remove prior RustyNet state from targets	2026-05-28T20:26:07Z	2026-05-28T20:26:17Z
+bootstrap_hosts	hard	fail	1	artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/bootstrap_hosts.log	fresh install and bootstrap RustyNet on all targets	2026-05-28T20:26:18Z	2026-05-28T20:38:54Z
