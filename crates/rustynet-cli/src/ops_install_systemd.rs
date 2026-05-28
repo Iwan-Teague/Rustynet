@@ -30,6 +30,7 @@ const SERVICE_SIGNING_CREDENTIAL_BLOB_PATH: &str =
     "/etc/rustynet/credentials/signing_key_passphrase.cred";
 const RUNTIME_WIREGUARD_PASSPHRASE_CREDENTIAL_NAME: &str = concat!("w", "g", "_key_passphrase");
 const ASSIGNMENT_REFRESH_ENV_DST: &str = "/etc/rustynet/assignment-refresh.env";
+const ANCHOR_BUNDLE_PULL_TOKEN_PATH: &str = "/var/lib/rustynet/anchor-bundle-pull.token";
 const DEFAULT_EXIT_ROUTE_CIDR: &str = "0.0.0.0/0";
 const MAX_ASSIGNMENT_ROUTE_SCAN: usize = 4096;
 const MAX_ASSIGNMENT_PEER_SCAN: usize = 4096;
@@ -728,7 +729,63 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         "false"
     };
 
-    let env_entries = vec![
+    // Seed the anchor bundle-pull token for admin nodes. Written once
+    // at install time so the daemon can start its loopback bundle-pull
+    // listener without separate operator provisioning. The token is
+    // preserved across re-installs (mode/owner are corrected but
+    // content is kept so existing peers remain authorised). Non-admin
+    // nodes leave the service-default empty path so the listener stays
+    // disabled — a security boundary not an optimisation.
+    let anchor_bundle_pull_token_env = if node_role == "admin" {
+        let token_path = Path::new(ANCHOR_BUNDLE_PULL_TOKEN_PATH);
+        let token_exists = match fs::symlink_metadata(token_path) {
+            Ok(_) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(format!(
+                    "inspect anchor bundle-pull token at {} failed: {err}",
+                    token_path.display()
+                ));
+            }
+        };
+        if !token_exists {
+            let mut random_bytes = [0u8; 32];
+            fill_os_random_bytes(&mut random_bytes, "anchor bundle-pull token")?;
+            let token = bytes_to_hex(&random_bytes);
+            let parent = token_path.parent().expect("token path has parent");
+            let tmp = create_secure_temp_file(parent, "rustynetd.abpt.tmp.")?;
+            {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(tmp.as_path())
+                    .map_err(|err| {
+                        format!(
+                            "open anchor bundle-pull token tmp {} failed: {err}",
+                            tmp.display()
+                        )
+                    })?;
+                file.write_all(token.as_bytes()).map_err(|err| {
+                    format!("write anchor bundle-pull token content failed: {err}")
+                })?;
+            }
+            publish_file_with_owner_mode(
+                tmp.as_path(),
+                token_path,
+                daemon_uid,
+                daemon_gid,
+                0o600,
+                "anchor bundle-pull token",
+            )?;
+        } else {
+            set_owner_mode_if_exists(token_path, daemon_uid, daemon_gid, 0o600)?;
+        }
+        display_path(token_path)
+    } else {
+        String::new()
+    };
+
+    let mut env_entries = vec![
         ("RUSTYNET_NODE_ID".to_owned(), node_id),
         ("RUSTYNET_NODE_ROLE".to_owned(), node_role.clone()),
         (
@@ -923,6 +980,12 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
             fail_closed_ssh_allow_cidrs,
         ),
     ];
+    if !anchor_bundle_pull_token_env.is_empty() {
+        env_entries.push((
+            "RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH".to_owned(),
+            anchor_bundle_pull_token_env,
+        ));
+    }
 
     let mut rendered_env = String::new();
     for (key, value) in env_entries {
