@@ -1126,6 +1126,12 @@ enum OpsCommand {
         report_path: String,
         report_dir: PathBuf,
     },
+    ListRunStages {
+        config: ops_live_lab_orchestrator::ListRunStagesConfig,
+    },
+    DiffRunSummaries {
+        config: ops_live_lab_orchestrator::DiffRunSummariesConfig,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4430,6 +4436,18 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             report_path: parser.required("--report-path")?,
             report_dir: parser.required_path("--report-dir")?,
         }),
+        "list-run-stages" => Ok(OpsCommand::ListRunStages {
+            config: ops_live_lab_orchestrator::ListRunStagesConfig {
+                run_summary: parser.required_path("--run-summary")?,
+                status_filter: parser.value("--status").as_deref().map(str::to_owned),
+            },
+        }),
+        "diff-run-summaries" => Ok(OpsCommand::DiffRunSummaries {
+            config: ops_live_lab_orchestrator::DiffRunSummariesConfig {
+                run_a: parser.required_path("--run-a")?,
+                run_b: parser.required_path("--run-b")?,
+            },
+        }),
         _ => Err(format!("unknown ops subcommand: {subcommand}")),
     }
 }
@@ -7287,6 +7305,18 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             };
             live_lab_run_matrix::append_live_lab_run_matrix_row(config)
                 .map(|r| format!("appended row run_id={}", r.run_id))
+        }
+        OpsCommand::ListRunStages { config } => {
+            ops_live_lab_orchestrator::execute_ops_list_run_stages(config).map(|s| {
+                print!("{s}");
+                String::new()
+            })
+        }
+        OpsCommand::DiffRunSummaries { config } => {
+            ops_live_lab_orchestrator::execute_ops_diff_run_summaries(config).map(|s| {
+                print!("{s}");
+                String::new()
+            })
         }
     }
 }
