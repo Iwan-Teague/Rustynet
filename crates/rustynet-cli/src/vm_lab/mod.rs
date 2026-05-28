@@ -26417,6 +26417,22 @@ mod tests {
         path
     }
 
+    // On macOS, first execve() of a new binary from a temp path triggers a ~26-50s
+    // security check by trustd, which exceeds the 30s per-operation timeout used
+    // inside transition_local_utm_vm_with_process_probe. Call this after writing any
+    // executable test script and before passing the path to timing-sensitive code.
+    fn prime_executable_if_macos(_path: &Path) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new(_path)
+                .arg("--_noop_prime_cache")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
     fn write_temp_report_dir() -> PathBuf {
         let unique = super::unique_suffix();
         let dir = std::env::temp_dir().join(format!("rustynet-live-lab-report-{unique}.dir"));
@@ -29582,6 +29598,10 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         utmctl_permissions.set_mode(0o755);
         fs::set_permissions(&utmctl, utmctl_permissions)
             .expect("utmctl script should be executable");
+        prime_executable_if_macos(&utmctl);
+        // priming may have logged to utmctl_log as a side effect; clear it so the
+        // later assertion sees only log entries from the actual test run
+        let _ = fs::write(&utmctl_log, "");
 
         let ps = dir.join("ps");
         fs::write(
@@ -29594,6 +29614,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .permissions();
         ps_permissions.set_mode(0o755);
         fs::set_permissions(&ps, ps_permissions).expect("ps script should be executable");
+        prime_executable_if_macos(&ps);
 
         transition_local_utm_vm_with_process_probe(
             utmctl.as_path(),
@@ -29642,6 +29663,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .permissions();
         ps_permissions.set_mode(0o755);
         fs::set_permissions(&ps, ps_permissions).expect("ps script should be executable");
+        prime_executable_if_macos(&ps);
 
         transition_local_utm_vm_with_process_probe(
             utmctl.as_path(),
@@ -29693,6 +29715,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
         utmctl_permissions.set_mode(0o755);
         fs::set_permissions(&utmctl, utmctl_permissions)
             .expect("utmctl script should be executable");
+        prime_executable_if_macos(&utmctl);
 
         let ps = dir.join("ps");
         fs::write(
@@ -29705,6 +29728,7 @@ FDC31AD5-CF13-404E-9D9A-0035999D607A started  debian-headless-2
             .permissions();
         ps_permissions.set_mode(0o755);
         fs::set_permissions(&ps, ps_permissions).expect("ps script should be executable");
+        prime_executable_if_macos(&ps);
 
         transition_local_utm_vm_with_process_probe(
             utmctl.as_path(),
