@@ -193,6 +193,53 @@ pub struct WriteLiveLinuxEndpointHijackReportConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxKeyCustodyReportConfig {
+    pub report_path: PathBuf,
+    pub initial_key_file_mode: String,
+    pub initial_key_dir_mode: String,
+    pub initial_mode_ok: String,
+    pub daemon_rejected_bad_mode: String,
+    pub daemon_recovered: String,
+    pub final_mode_ok: String,
+    pub overall_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxSecretsNotInLogsReportConfig {
+    pub report_path: PathBuf,
+    pub log_lines_checked: u64,
+    pub suspicious_matches: u64,
+    pub hex64_matches: u64,
+    pub hex32_matches: u64,
+    pub b64_key_matches: u64,
+    pub verdict: String,
+    pub overall_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxEnrollmentRestartReportConfig {
+    pub report_path: PathBuf,
+    pub admin_recovered: String,
+    pub enrollment_outcome: String,
+    pub membership_integrity: String,
+    pub kill_timing_ms: u64,
+    pub overall_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteLiveLinuxNetworkFlapReportConfig {
+    pub report_path: PathBuf,
+    pub baseline_handshake_age_s: u64,
+    pub flap_duration_s: u64,
+    pub disruption_confirmed: String,
+    pub recovery_handshake_arrived: String,
+    pub recovery_time_s: u64,
+    pub gossip_recovered: String,
+    pub membership_intact: String,
+    pub overall_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteRealWireguardExitnodeE2eReportConfig {
     pub report_path: PathBuf,
     pub exit_status: String,
@@ -2930,6 +2977,152 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
         .map_err(|err| format!("serialize endpoint-hijack report failed: {err}"))?;
     write_json_pretty(report_path.as_path(), &payload)?;
     Ok(report.status)
+}
+
+pub fn execute_ops_write_live_linux_key_custody_report(
+    config: WriteLiveLinuxKeyCustodyReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let initial_mode_ok = parse_pass_fail(config.initial_mode_ok.as_str(), "--initial-mode-ok")?;
+    let daemon_rejected =
+        parse_pass_fail(config.daemon_rejected_bad_mode.as_str(), "--daemon-rejected-bad-mode")?;
+    let daemon_recovered =
+        parse_pass_fail(config.daemon_recovered.as_str(), "--daemon-recovered")?;
+    let final_mode_ok = parse_pass_fail(config.final_mode_ok.as_str(), "--final-mode-ok")?;
+    let overall_status = parse_pass_fail(config.overall_status.as_str(), "--overall-status")?;
+
+    let checks = json!({
+        "initial_key_file_mode_600": initial_mode_ok,
+        "daemon_rejected_insecure_key_mode": daemon_rejected,
+        "daemon_recovered_after_permission_restore": daemon_recovered,
+        "final_key_file_mode_600": final_mode_ok,
+    });
+
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "live_linux_key_custody",
+        "status": overall_status,
+        "checks": checks,
+        "evidence": {
+            "initial_key_file_mode": config.initial_key_file_mode,
+            "initial_key_dir_mode": config.initial_key_dir_mode,
+        },
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    if overall_status != CHECK_PASS {
+        return Err("live_linux_key_custody report status is fail".to_owned());
+    }
+    Ok(overall_status)
+}
+
+pub fn execute_ops_write_live_linux_secrets_not_in_logs_report(
+    config: WriteLiveLinuxSecretsNotInLogsReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let verdict = if config.verdict.trim() == "clean" || config.verdict.trim() == "contaminated" {
+        config.verdict.trim().to_owned()
+    } else {
+        return Err(format!(
+            "--verdict must be clean or contaminated (got: {:?})",
+            config.verdict
+        ));
+    };
+    let overall_status = parse_pass_fail(config.overall_status.as_str(), "--overall-status")?;
+
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "live_linux_secrets_not_in_logs",
+        "status": overall_status,
+        "verdict": verdict,
+        "log_lines_checked": config.log_lines_checked,
+        "suspicious_match_counts": {
+            "total": config.suspicious_matches,
+            "hex64_pattern": config.hex64_matches,
+            "hex32_pattern": config.hex32_matches,
+            "b64_key_header": config.b64_key_matches,
+        },
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    if overall_status != CHECK_PASS {
+        return Err("live_linux_secrets_not_in_logs report status is fail".to_owned());
+    }
+    Ok(overall_status)
+}
+
+pub fn execute_ops_write_live_linux_enrollment_restart_report(
+    config: WriteLiveLinuxEnrollmentRestartReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let admin_recovered =
+        parse_pass_fail_skip(config.admin_recovered.as_str(), "--admin-recovered")?;
+    let membership_integrity =
+        parse_pass_fail_skip(config.membership_integrity.as_str(), "--membership-integrity")?;
+    let overall_status = parse_pass_fail_skip(config.overall_status.as_str(), "--overall-status")?;
+
+    let outcome = match config.enrollment_outcome.trim() {
+        "consumed" | "rolled_back" | "skipped" => config.enrollment_outcome.trim().to_owned(),
+        other => {
+            return Err(format!(
+                "--enrollment-outcome must be consumed, rolled_back, or skipped (got: {other:?})"
+            ));
+        }
+    };
+
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "live_linux_enrollment_restart",
+        "status": overall_status,
+        "checks": {
+            "admin_daemon_recovered": admin_recovered,
+            "membership_integrity_intact": membership_integrity,
+        },
+        "enrollment_outcome": outcome,
+        "kill_timing_ms": config.kill_timing_ms,
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    if overall_status == CHECK_FAIL {
+        return Err("live_linux_enrollment_restart report status is fail".to_owned());
+    }
+    Ok(overall_status)
+}
+
+pub fn execute_ops_write_live_linux_network_flap_report(
+    config: WriteLiveLinuxNetworkFlapReportConfig,
+) -> Result<String, String> {
+    let report_path = resolve_path(config.report_path.as_path())?;
+    let disruption_confirmed =
+        parse_pass_fail(config.disruption_confirmed.as_str(), "--disruption-confirmed")?;
+    let recovery_arrived = parse_pass_fail(
+        config.recovery_handshake_arrived.as_str(),
+        "--recovery-handshake-arrived",
+    )?;
+    let gossip_recovered =
+        parse_pass_fail(config.gossip_recovered.as_str(), "--gossip-recovered")?;
+    let membership_intact =
+        parse_pass_fail(config.membership_intact.as_str(), "--membership-intact")?;
+    let overall_status = parse_pass_fail(config.overall_status.as_str(), "--overall-status")?;
+
+    let payload = json!({
+        "schema_version": 1,
+        "mode": "live_linux_network_flap",
+        "status": overall_status,
+        "checks": {
+            "wg_disruption_confirmed": disruption_confirmed,
+            "wg_handshake_recovered": recovery_arrived,
+            "gossip_epoch_nonzero": gossip_recovered,
+            "membership_integrity_intact": membership_intact,
+        },
+        "timings": {
+            "baseline_handshake_age_s": config.baseline_handshake_age_s,
+            "flap_duration_s": config.flap_duration_s,
+            "recovery_time_s": config.recovery_time_s,
+        },
+    });
+    write_json_pretty(report_path.as_path(), &payload)?;
+    if overall_status != CHECK_PASS {
+        return Err("live_linux_network_flap report status is fail".to_owned());
+    }
+    Ok(overall_status)
 }
 
 /// Typed view for the per-check verdicts inside the real-WireGuard
