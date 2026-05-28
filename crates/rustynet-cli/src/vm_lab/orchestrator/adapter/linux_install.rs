@@ -78,11 +78,17 @@ pub fn install_daemon(
     let _ = std::fs::remove_file(&script_tmp);
     let _ = std::fs::remove_file(&env_tmp);
 
-    // Run bootstrap.
-    ssh::run_remote(
+    // Run bootstrap, streaming stdout+stderr to a per-node log so cargo
+    // build progress is visible in real time rather than only on completion.
+    let bootstrap_log = ctx
+        .report_dir
+        .join("logs")
+        .join(format!("bootstrap_node_{alias}.log"));
+    ssh::run_remote_with_log(
         conn,
         "chmod 700 /tmp/rn_bootstrap.sh && bash /tmp/rn_bootstrap.sh /tmp/rn_bootstrap.env",
         build_timeout,
+        &bootstrap_log,
     )?;
     let _ = socket_timeout; // daemon socket is checked in enforce_baseline_runtime / validate_baseline_runtime, not install.
 

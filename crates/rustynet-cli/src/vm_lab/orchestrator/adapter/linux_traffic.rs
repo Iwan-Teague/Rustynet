@@ -140,11 +140,34 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop daemon first (best-effort). Privileged: systemctl manage daemon
-    // service.
+    // Stop daemon first (best-effort).
     let _ = ssh::run_remote(
         conn,
         "sudo -n systemctl stop rustynetd 2>/dev/null || true",
+        Duration::from_secs(30),
+    );
+    // Flush the rustynet_boot nftables table installed by the daemon's
+    // ExecStartPre. Its default OUTPUT policy is drop, which blocks outbound
+    // traffic (including cargo registry downloads) during the next bootstrap
+    // run if it is not removed here. The table is re-created on daemon start
+    // so removing it at cleanup is safe and idempotent.
+    let _ = ssh::run_remote(
+        conn,
+        "if command -v nft >/dev/null 2>&1; then \
+             sudo -n nft delete table inet rustynet_boot 2>/dev/null || true; \
+         fi",
+        Duration::from_secs(30),
+    );
+    // Restart systemd-resolved so the next bootstrap inherits a clean DNS
+    // stub. The daemon's network plumbing can leave the stub at 127.0.0.53
+    // in a degraded state after teardown, causing DNS timeouts during cargo
+    // registry downloads in the subsequent bootstrap stage.
+    let _ = ssh::run_remote(
+        conn,
+        "if command -v systemctl >/dev/null 2>&1 && \
+              systemctl is-active systemd-resolved >/dev/null 2>&1; then \
+             sudo -n systemctl restart systemd-resolved 2>/dev/null || true; \
+         fi",
         Duration::from_secs(30),
     );
     // Privileged: state files are root:rustynetd, mode 600/640.

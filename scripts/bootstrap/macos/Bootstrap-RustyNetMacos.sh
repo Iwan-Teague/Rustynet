@@ -548,6 +548,36 @@ provision_enrollment_secret() {
   echo "[bootstrap] enrollment.secret generated at ${secret_path}"
 }
 
+# ── DNS repair and cargo registry connectivity ────────────────────────────────
+repair_bootstrap_dns_state_macos() {
+  # Override DNS on every network service with a known-good public resolver.
+  # The lab router's DNS (from DHCP) may be broken or unreachable; if cargo
+  # cannot resolve index.crates.io the build hangs silently for minutes.
+  local service
+  while IFS= read -r service; do
+    [[ -n "${service}" ]] || continue
+    networksetup -setdnsservers "${service}" 1.1.1.1 8.8.8.8 2>/dev/null || true
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  dscacheutil -flushcache 2>/dev/null || true
+  killall -HUP mDNSResponder 2>/dev/null || true
+}
+
+wait_for_cargo_registry_endpoint() {
+  local endpoint="https://index.crates.io/"
+  local attempt
+  for attempt in $(seq 1 8); do
+    if curl --ipv4 --fail --silent --head --connect-timeout 10 --max-time 15 \
+         "${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "[bootstrap] cargo registry unreachable (attempt ${attempt}/8); repairing DNS" >&2
+    repair_bootstrap_dns_state_macos
+    sleep 2
+  done
+  echo "[bootstrap] failed to reach cargo registry: ${endpoint}" >&2
+  return 1
+}
+
 # ── Clear residual state ──────────────────────────────────────────────────────
 clear_residual_state() {
   if networksetup -listallhardwareports 2>/dev/null | grep -q rustynet; then
@@ -607,6 +637,7 @@ build_rustynet() {
   # the current workspace.  `-p rustynet-cli` builds the rustynet-cli
   # binary at target/release/rustynet-cli, which install_binaries below
   # renames to /usr/local/bin/rustynet on the way out.
+  wait_for_cargo_registry_endpoint || exit 1
   as_user "${brew_rustup}" run stable cargo build --release -p rustynetd -p rustynet-cli
 
   popd >/dev/null
