@@ -147,6 +147,10 @@ fn run() -> Result<(), String> {
                 Ok(())
             }
             [cmd, rest @ ..] if cmd == "daemon" => {
+                env_logger::Builder::new()
+                    .filter_level(log::LevelFilter::Info)
+                    .parse_default_env()
+                    .init();
                 let config = parse_daemon_config(rest)?;
                 run_daemon(config).map_err(|err| err.to_string())
             }
