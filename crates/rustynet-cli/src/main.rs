@@ -1132,6 +1132,9 @@ enum OpsCommand {
     DiffRunSummaries {
         config: ops_live_lab_orchestrator::DiffRunSummariesConfig,
     },
+    AppendOrchestratorRunToMatrix {
+        config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2540,6 +2543,11 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     finished_at_unix: parse_u64("--finished-at-unix")?,
                     elapsed_secs: parse_u64("--elapsed-secs")?,
                     elapsed_human: parser.required("--elapsed-human")?,
+                    run_note: parser
+                        .value("--run-note")
+                        .as_deref()
+                        .map(str::to_owned)
+                        .unwrap_or_default(),
                 },
             })
         }
@@ -4446,6 +4454,13 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             config: ops_live_lab_orchestrator::DiffRunSummariesConfig {
                 run_a: parser.required_path("--run-a")?,
                 run_b: parser.required_path("--run-b")?,
+            },
+        }),
+        "append-orchestrator-run-to-matrix" => Ok(OpsCommand::AppendOrchestratorRunToMatrix {
+            config: live_lab_run_matrix::AppendOrchestratorRunToMatrixConfig {
+                report_dir: parser.required_path("--report-dir")?,
+                profile_path: parser.value("--profile").as_deref().map(PathBuf::from),
+                inventory_path: parser.value("--inventory").as_deref().map(PathBuf::from),
             },
         }),
         _ => Err(format!("unknown ops subcommand: {subcommand}")),
@@ -7302,6 +7317,7 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
                 profile_path: None,
                 inventory_path: None,
                 extra_stage_outcomes: &[outcome],
+                notes: None,
             };
             live_lab_run_matrix::append_live_lab_run_matrix_row(config)
                 .map(|r| format!("appended row run_id={}", r.run_id))
@@ -7317,6 +7333,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
                 print!("{s}");
                 String::new()
             })
+        }
+        OpsCommand::AppendOrchestratorRunToMatrix { config } => {
+            live_lab_run_matrix::execute_ops_append_orchestrator_run_to_matrix(config)
+                .map(|r| format!("appended orchestrator run row run_id={}", r.run_id))
         }
     }
 }
