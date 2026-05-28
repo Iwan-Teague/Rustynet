@@ -1,4 +1,4 @@
-# Live Linux Lab Failure Digest (20260528T202409Z)
+# Live Linux Lab Failure Digest (20260528T204801Z)
 
 - overall_status: `fail`
 - report_dir: `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator`
@@ -12,16 +12,21 @@
 - `PASS` `prime_remote_access`: all targeted nodes accepted remote SSH and sudo priming
 - `PASS` `macos_preflight_check`: stage passed
 - `PASS` `cleanup_hosts`: all targeted nodes cleaned prior RustyNet state successfully
-- `FAIL` `bootstrap_hosts`: bootstrap or compile failed on one or more targeted nodes (1/6 targeted nodes failed)
+- `PASS` `bootstrap_hosts`: all targeted nodes bootstrapped and compiled RustyNet successfully
+- `PASS` `collect_pubkeys`: all targeted nodes exported WireGuard public keys successfully
+- `PASS` `membership_setup`: primary exit applied signed membership updates successfully
+- `PASS` `distribute_membership_state`: membership state distributed to all targeted peer nodes successfully
+- `PASS` `issue_and_distribute_assignments`: signed assignments were issued and distributed to all targeted nodes successfully
+- `PASS` `issue_and_distribute_traversal`: stage passed
+- `PASS` `issue_and_distribute_dns_zone`: stage passed
+- `PASS` `enforce_baseline_runtime`: all targeted nodes enforced baseline runtime successfully
+- `PASS` `validate_baseline_runtime`: all targeted nodes connected to the network correctly under baseline validation
+- `FAIL` `live_anchor`: stage failed
 
 ## Failure Focus
 
-- first_failed_stage: `bootstrap_hosts`
+- first_failed_stage: `live_anchor`
 - severity: `hard`
-- rc: `1`
-- likely_reason: [bootstrap] failed to reach cargo registry: https://index.crates.io/ 
-- full_log: `artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/bootstrap_hosts.log`
-
-### Failed Nodes
-
-- `aux` `mac@192.168.0.210` (`client-3`): rc=1 reason=[bootstrap] failed to reach cargo registry: https://index.crates.io/  log=`artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/state/parallel-bootstrap_hosts/aux.log` snapshot=`n/a`
+- rc: `70`
+- likely_reason: [stage:live_anchor] failure digest: artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/failure_digest.md
+- full_log: `artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/live_anchor.log`
