@@ -773,6 +773,18 @@ enum OpsCommand {
     WriteLiveLinuxEndpointHijackReport {
         config: ops_live_lab_orchestrator::WriteLiveLinuxEndpointHijackReportConfig,
     },
+    WriteLiveLinuxKeyCustodyReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxKeyCustodyReportConfig,
+    },
+    WriteLiveLinuxSecretsNotInLogsReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxSecretsNotInLogsReportConfig,
+    },
+    WriteLiveLinuxEnrollmentRestartReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxEnrollmentRestartReportConfig,
+    },
+    WriteLiveLinuxNetworkFlapReport {
+        config: ops_live_lab_orchestrator::WriteLiveLinuxNetworkFlapReportConfig,
+    },
     WriteRealWireguardExitnodeE2eReport {
         config: ops_live_lab_orchestrator::WriteRealWireguardExitnodeE2eReportConfig,
     },
@@ -2691,6 +2703,79 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     endpoints_after_recovery: parser.required("--endpoints-after-recovery")?,
                     captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
                     captured_at_unix,
+                },
+            })
+        }
+        "write-live-linux-key-custody-report" => {
+            Ok(OpsCommand::WriteLiveLinuxKeyCustodyReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxKeyCustodyReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    initial_key_file_mode: parser.required("--initial-key-file-mode")?,
+                    initial_key_dir_mode: parser.required("--initial-key-dir-mode")?,
+                    initial_mode_ok: parser.required("--initial-mode-ok")?,
+                    daemon_rejected_bad_mode: parser.required("--daemon-rejected-bad-mode")?,
+                    daemon_recovered: parser.required("--daemon-recovered")?,
+                    final_mode_ok: parser.required("--final-mode-ok")?,
+                    overall_status: parser.required("--overall-status")?,
+                },
+            })
+        }
+        "write-live-linux-secrets-not-in-logs-report" => {
+            let parse_u64 = |key: &str| -> Result<u64, String> {
+                parser
+                    .required(key)?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid value for {key}: {err}"))
+            };
+            Ok(OpsCommand::WriteLiveLinuxSecretsNotInLogsReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxSecretsNotInLogsReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    log_lines_checked: parse_u64("--log-lines-checked")?,
+                    suspicious_matches: parse_u64("--suspicious-matches")?,
+                    hex64_matches: parse_u64("--hex64-matches")?,
+                    hex32_matches: parse_u64("--hex32-matches")?,
+                    b64_key_matches: parse_u64("--b64-key-matches")?,
+                    verdict: parser.required("--verdict")?,
+                    overall_status: parser.required("--overall-status")?,
+                },
+            })
+        }
+        "write-live-linux-enrollment-restart-report" => {
+            let kill_timing_ms = parser
+                .value("--kill-timing-ms")
+                .map(|v| v.parse::<u64>().map_err(|e| format!("invalid --kill-timing-ms: {e}")))
+                .transpose()?
+                .unwrap_or(0);
+            Ok(OpsCommand::WriteLiveLinuxEnrollmentRestartReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxEnrollmentRestartReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    admin_recovered: parser.required("--admin-recovered")?,
+                    enrollment_outcome: parser.required("--enrollment-outcome")?,
+                    membership_integrity: parser.required("--membership-integrity")?,
+                    kill_timing_ms,
+                    overall_status: parser.required("--overall-status")?,
+                },
+            })
+        }
+        "write-live-linux-network-flap-report" => {
+            let parse_u64 = |key: &str| -> Result<u64, String> {
+                parser
+                    .value(key)
+                    .map(|v| v.parse::<u64>().map_err(|e| format!("invalid {key}: {e}")))
+                    .transpose()
+                    .map(|opt| opt.unwrap_or(0))
+            };
+            Ok(OpsCommand::WriteLiveLinuxNetworkFlapReport {
+                config: ops_live_lab_orchestrator::WriteLiveLinuxNetworkFlapReportConfig {
+                    report_path: parser.required_path("--report-path")?,
+                    baseline_handshake_age_s: parse_u64("--baseline-handshake-age-s")?,
+                    flap_duration_s: parse_u64("--flap-duration-s")?,
+                    disruption_confirmed: parser.required("--disruption-confirmed")?,
+                    recovery_handshake_arrived: parser.required("--recovery-handshake-arrived")?,
+                    recovery_time_s: parse_u64("--recovery-time-s")?,
+                    gossip_recovered: parser.required("--gossip-recovered")?,
+                    membership_intact: parser.required("--membership-intact")?,
+                    overall_status: parser.required("--overall-status")?,
                 },
             })
         }
@@ -6815,6 +6900,22 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         }
         OpsCommand::WriteLiveLinuxEndpointHijackReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_live_linux_endpoint_hijack_report(config)
+        }
+        OpsCommand::WriteLiveLinuxKeyCustodyReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_key_custody_report(config)
+        }
+        OpsCommand::WriteLiveLinuxSecretsNotInLogsReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_secrets_not_in_logs_report(
+                config,
+            )
+        }
+        OpsCommand::WriteLiveLinuxEnrollmentRestartReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_enrollment_restart_report(
+                config,
+            )
+        }
+        OpsCommand::WriteLiveLinuxNetworkFlapReport { config } => {
+            ops_live_lab_orchestrator::execute_ops_write_live_linux_network_flap_report(config)
         }
         OpsCommand::WriteRealWireguardExitnodeE2eReport { config } => {
             ops_live_lab_orchestrator::execute_ops_write_real_wireguard_exitnode_e2e_report(config)
