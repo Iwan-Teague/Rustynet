@@ -3046,17 +3046,17 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Bootstrap-time single-node membership grants BOTH Anchor and
-        // Client capabilities to the local node so the daemon can start
-        // with any role mapping (Admin → Anchor, Client → Client) before
-        // the orchestrator distributes the real multi-node membership.
-        // Without Client capability here, every non-exit node fails its
-        // `validate_node_role_membership_alignment` preflight at first
-        // boot (exit 65) — the daemon never opens its socket and the
-        // orchestrator's bootstrap_hosts stage times out.  The real
-        // membership snapshot overwrites this single-node bootstrap
-        // record during DistributeMembership, so giving it broader
-        // capabilities here has no effect on production posture.
+        // Bootstrap-time single-node membership grants the full Anchor
+        // capability set (including sub-caps) plus Client/ExitServer/RelayHost
+        // so the daemon can start with any role mapping before the orchestrator
+        // distributes the real multi-node membership. Without Client capability
+        // here, every non-exit node fails its
+        // `validate_node_role_membership_alignment` preflight at first boot
+        // (exit 65). The real membership snapshot overwrites this record on
+        // non-exit nodes during DistributeMembership. For the exit/anchor
+        // genesis node the sub-caps here become the persistent capabilities
+        // visible to live_anchor and other post-validate_baseline_runtime
+        // tests — missing them causes policy_reject (rc 78) in live_anchor.
         let state = MembershipState {
             schema_version: MEMBERSHIP_SCHEMA_VERSION,
             network_id: network_id.clone(),
@@ -3069,6 +3069,11 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
                 roles: vec![],
                 capabilities: vec![
                     RoleCapability::Anchor,
+                    RoleCapability::AnchorGossipSeed,
+                    RoleCapability::AnchorBundlePull,
+                    RoleCapability::AnchorEnrollmentEndpoint,
+                    RoleCapability::AnchorRelayColocation,
+                    RoleCapability::AnchorPortMappingAuthoritative,
                     RoleCapability::Client,
                     RoleCapability::ExitServer,
                     RoleCapability::RelayHost,
@@ -4561,6 +4566,28 @@ mod tests {
             err.contains("--node-id"),
             "should show first missing arg: {err}"
         );
+    }
+
+    #[test]
+    fn membership_init_genesis_includes_anchor_sub_caps() {
+        // Regression: live_anchor (rc 78) — genesis membership for the exit/
+        // anchor node was missing anchor.* sub-capabilities, causing
+        // policy_reject at the live_anchor stage.
+        // Artifact: artifacts/live_lab/phase24-macos-smoke/
+        //   20260527T224355Z_origin_main_live_macos_ssh_full_retry39
+        let src = include_str!("main.rs");
+        for sub_cap in [
+            "RoleCapability::AnchorGossipSeed",
+            "RoleCapability::AnchorBundlePull",
+            "RoleCapability::AnchorEnrollmentEndpoint",
+            "RoleCapability::AnchorRelayColocation",
+            "RoleCapability::AnchorPortMappingAuthoritative",
+        ] {
+            assert!(
+                src.contains(sub_cap),
+                "genesis capabilities must include {sub_cap}; re-check run_membership_init"
+            );
+        }
     }
 
     #[test]
