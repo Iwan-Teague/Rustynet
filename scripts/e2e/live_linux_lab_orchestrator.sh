@@ -4838,6 +4838,89 @@ stage_run_live_mixed_topology() {
     --log-path "$log_path"
 }
 
+stage_run_live_reboot_recovery() {
+  local wrapper report_path log_path
+  wrapper="$ROOT_DIR/scripts/e2e/live_linux_reboot_recovery_test.sh"
+  report_path="$REPORT_DIR/live_linux_reboot_recovery_report.json"
+  log_path="$REPORT_DIR/live_linux_reboot_recovery.log"
+  RUSTYNET_ORCHESTRATOR_ACTIVE=1 \
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --exit-host "$(node_target_for_label exit)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --client-host "$(node_target_for_label client)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
+stage_run_live_secrets_not_in_logs() {
+  local wrapper report_path log_path
+  wrapper="$ROOT_DIR/scripts/e2e/live_linux_secrets_not_in_logs_test.sh"
+  report_path="$REPORT_DIR/live_linux_secrets_not_in_logs_report.json"
+  log_path="$REPORT_DIR/live_linux_secrets_not_in_logs.log"
+  RUSTYNET_ORCHESTRATOR_ACTIVE=1 \
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --target-host "$(node_target_for_label client)" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
+stage_run_live_key_custody() {
+  local wrapper report_path log_path
+  wrapper="$ROOT_DIR/scripts/e2e/live_linux_key_custody_test.sh"
+  report_path="$REPORT_DIR/live_linux_key_custody_report.json"
+  log_path="$REPORT_DIR/live_linux_key_custody.log"
+  RUSTYNET_ORCHESTRATOR_ACTIVE=1 \
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --target-host "$(node_target_for_label client)" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
+stage_run_live_enrollment_restart() {
+  if ! has_label aux; then
+    printf 'enrollment_restart requires aux target (enrollee)\n' >&2
+    return 1
+  fi
+  local wrapper report_path log_path
+  wrapper="$ROOT_DIR/scripts/e2e/live_linux_enrollment_restart_test.sh"
+  report_path="$REPORT_DIR/live_linux_enrollment_restart_report.json"
+  log_path="$REPORT_DIR/live_linux_enrollment_restart.log"
+  RUSTYNET_ORCHESTRATOR_ACTIVE=1 \
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --admin-host "$(node_target_for_label exit)" \
+    --admin-node-id "$(node_id_for_label exit)" \
+    --enrollee-host "$(node_target_for_label aux)" \
+    --enrollee-node-id "$(node_id_for_label aux)" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
+stage_run_live_network_flap() {
+  local wrapper report_path log_path
+  wrapper="$ROOT_DIR/scripts/e2e/live_linux_network_flap_test.sh"
+  report_path="$REPORT_DIR/live_linux_network_flap_report.json"
+  log_path="$REPORT_DIR/live_linux_network_flap.log"
+  RUSTYNET_ORCHESTRATOR_ACTIVE=1 \
+  RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
+  bash "$wrapper" \
+    --ssh-identity-file "$SSH_IDENTITY_FILE" \
+    --exit-host "$(node_target_for_label exit)" \
+    --exit-node-id "$(node_id_for_label exit)" \
+    --client-host "$(node_target_for_label client)" \
+    --client-node-id "$(node_id_for_label client)" \
+    --report-path "$report_path" \
+    --log-path "$log_path"
+}
+
 assert_json_report_status_pass() {
   local report_path="$1"
   local label="$2"
@@ -7572,6 +7655,16 @@ main() {
   fi
   run_stage hard live_managed_dns 'run live managed DNS validation' stage_run_live_managed_dns
   run_or_skip_chaos_suite
+
+  run_stage hard live_reboot_recovery 'standalone reboot recovery validation' stage_run_live_reboot_recovery
+  run_stage hard live_secrets_not_in_logs 'no key material in daemon logs' stage_run_live_secrets_not_in_logs
+  run_stage hard live_key_custody 'key file permission enforcement' stage_run_live_key_custody
+  if has_label aux; then
+    run_stage hard live_enrollment_restart 'enrollment consistency under kill' stage_run_live_enrollment_restart
+  else
+    record_stage_skip live_enrollment_restart hard 'requires aux target (enrollee node)'
+  fi
+  run_stage hard live_network_flap 'WG tunnel recovery after network flap' stage_run_live_network_flap
 
   if has_five_node_release_gate_topology; then
     run_stage hard fresh_install_os_matrix_report 'generate commit-bound fresh install OS matrix report' stage_generate_fresh_install_os_matrix_report
