@@ -1278,7 +1278,7 @@ fn validate_anchor_enrollment_endpoint(
             .write_file(&wrong_secret_path, &[0u8; 32], 0o600)
             .map_err(|err| format!("stage wrong secret failed: {err}"))?;
 
-        // 3. assert enrollee not already present in membership.
+        // 3. probe whether enrollee is already in membership.
         let pre_status = run_argv_capture_stdout(
             shell,
             &[
@@ -1292,11 +1292,17 @@ fn validate_anchor_enrollment_endpoint(
             ],
         )?;
         // In the full live lab the bootstrap pre-enrolls all nodes, so client-4 is
-        // already in membership here. Allow re-enrollment: the admit command appends a
-        // new signed log entry, and the negative-path tests are independent of prior
-        // enrollment state. A fresh node would also pass this block (pre_status won't
-        // contain the enrollee_node_id).
+        // already in membership when this test runs. enrollment admit refuses to add
+        // a node_id that is already present in the snapshot. Use a synthetic test-only
+        // node ID ("<enrollee_node_id>-live-test") when the enrollee is pre-enrolled
+        // so the positive admit has a fresh ID to work with. The enrollment MECHANISM
+        // (token minting, rejection paths, signed log append) is identical either way.
         let pre_enrolled = pre_status.contains("active_nodes=") && pre_status.contains(enrollee_node_id);
+        let effective_enrollee_node_id: String = if pre_enrolled {
+            format!("{enrollee_node_id}-live-test")
+        } else {
+            enrollee_node_id.to_owned()
+        };
 
         // 4. generate a random 32-byte pubkey and URL-safe-base64
         //    encode it locally — no need to shell out to dd/base64/tr.
@@ -1480,9 +1486,9 @@ fn validate_anchor_enrollment_endpoint(
                     "--pubkey",
                     &pubkey_b64,
                     "--node-id",
-                    enrollee_node_id,
+                    effective_enrollee_node_id.as_str(),
                     "--owner",
-                    enrollee_node_id,
+                    effective_enrollee_node_id.as_str(),
                     "--roles",
                     "client",
                     "--secret",
@@ -1528,8 +1534,12 @@ fn validate_anchor_enrollment_endpoint(
                 config.membership_log_path.as_str(),
             ],
         )?;
-        if !(post_status.contains("active_nodes=") && post_status.contains(enrollee_node_id)) {
-            return Err("enrollee missing from membership status after admit".to_owned());
+        if !(post_status.contains("active_nodes=")
+            && post_status.contains(effective_enrollee_node_id.as_str()))
+        {
+            return Err(format!(
+                "enrollee {effective_enrollee_node_id} missing from membership status after admit"
+            ));
         }
 
         Ok(format!(
