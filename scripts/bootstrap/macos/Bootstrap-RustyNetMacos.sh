@@ -549,6 +549,37 @@ provision_enrollment_secret() {
 }
 
 # ── DNS repair and cargo registry connectivity ────────────────────────────────
+
+# Ensure an IPv4 default route exists. Cleanup can leave the route missing when
+# ipconfig getpacket fails (no DHCP lease data). Derive the gateway using three
+# fallbacks: DHCP lease router option → any UGH host route with an IPv4 gateway
+# → .1 of the host's primary address on en0.
+ensure_ipv4_default_route_macos() {
+  netstat -rn -f inet 2>/dev/null | grep -q '^default' && return 0
+  local gw=""
+  # 1. DHCP lease router option
+  gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')" || true
+  # 2. Any existing host route that already carries an IPv4 gateway
+  if [[ -z "$gw" ]]; then
+    gw="$(netstat -rn -f inet 2>/dev/null \
+          | awk '$2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $3 ~ /G/ {print $2; exit}')" || true
+  fi
+  # 3. Assume .1 of the host's primary IPv4 address on en0
+  if [[ -z "$gw" ]]; then
+    local host_ip
+    host_ip="$(ipconfig getifaddr en0 2>/dev/null)" || true
+    [[ -n "$host_ip" ]] && gw="${host_ip%.*}.1"
+  fi
+  if [[ -n "$gw" ]]; then
+    route add default "$gw" 2>/dev/null \
+      || route change default "$gw" 2>/dev/null \
+      || true
+    echo "[bootstrap] IPv4 default route added via ${gw}" >&2
+  else
+    echo "[bootstrap] warning: IPv4 default route missing; could not determine gateway" >&2
+  fi
+}
+
 repair_bootstrap_dns_state_macos() {
   # Override DNS on every network service with a known-good public resolver.
   # The lab router's DNS (from DHCP) may be broken or unreachable; if cargo
@@ -567,6 +598,9 @@ repair_bootstrap_dns_state_macos() {
 
 wait_for_cargo_registry_endpoint() {
   local endpoint="https://index.crates.io/"
+  # Ensure IPv4 default route exists before any connectivity check. Cleanup can
+  # silently drop the route when ipconfig getpacket has no lease data.
+  ensure_ipv4_default_route_macos
   # Always repair DNS before the first check to ensure 1.1.1.1 is the active
   # resolver. Without this, curl may pass on a stale cache entry but cargo's
   # fresh resolution fails because mDNSResponder still has broken DHCP DNS.
