@@ -739,19 +739,17 @@ fn posix_write_file(
     validate_remote_path(remote_path)?;
     validate_mode_octal(mode_octal)?;
     let b64 = encode_base64_standard(bytes);
-    // Three steps in one `sh -lc` body to keep them atomic from the
-    // operator's perspective: install via `umask 077` so the
-    // temporary path never carries the system umask; decode; then
-    // `install -m` to the final path with the requested mode.
-    // `install` does an atomic rename so a partial file is never
-    // visible to other readers.
+    // Decode to a temp file in /tmp (world-writable, no sudo needed for
+    // mktemp), then `sudo -n install` atomically copies+modes it to the
+    // final destination (which may be in a root-owned directory created
+    // by ensure_remote_dir via run_argv/sudo). Using a destination-local
+    // template for mktemp would fail when the parent dir is root-owned 700.
     let body = format!(
         "umask 077; \
-         tmp=$(mktemp -- {tmp_template}); \
+         tmp=$(mktemp); \
          trap 'rm -f -- \"$tmp\"' EXIT; \
          printf %s {b64_quoted} | base64 -d > \"$tmp\"; \
          sudo -n install -m {mode:o} -- \"$tmp\" {dst}",
-        tmp_template = super::shell_quote(&format!("{remote_path}.partial-XXXXXX")),
         b64_quoted = super::shell_quote(&b64),
         mode = mode_octal,
         dst = super::shell_quote(remote_path),
