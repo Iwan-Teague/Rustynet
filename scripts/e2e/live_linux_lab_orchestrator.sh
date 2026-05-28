@@ -42,6 +42,9 @@ STAGE_TIMEOUT_SECS=0
 PRESERVE_REPORT_STATE=0
 RESUME_FROM_STAGE=""
 RERUN_STAGE=""
+RERUN_FAILED=0
+PREV_RUN_DIR=""
+PASSED_STAGES=()
 MAX_PARALLEL_NODE_WORKERS="${MAX_PARALLEL_NODE_WORKERS:-2}"
 CROSS_NETWORK_MODE="auto"
 CROSS_NETWORK_SKIP_REASON=""
@@ -181,6 +184,9 @@ options:
   --dry-run                      Validate config and planned stages without touching hosts
   --validate-only                Run preflight + SSH reachability check only; no remote changes
   --stage-timeout-secs N         Kill any stage that exceeds N seconds (0 = disabled, default 0)
+  --rerun-failed                 Re-run only stages that failed in the previous run; skips stages
+                                 that passed. Auto-skips setup if all setup stages passed.
+  --prev-run-dir PATH            Previous run to compare against (default: latest in artifacts/live_lab)
   -h, --help                     Show this help
 USAGE
 }
@@ -1669,6 +1675,18 @@ run_stage() {
   local stage_name="$2"
   local description="$3"
   shift 3
+
+  if [[ "${#PASSED_STAGES[@]}" -gt 0 ]]; then
+    local _skip=0
+    for _ps in "${PASSED_STAGES[@]}"; do
+      if [[ "$_ps" == "$stage_name" ]]; then _skip=1; break; fi
+    done
+    if [[ "$_skip" -eq 1 ]]; then
+      record_stage_skip "$stage_name" "$severity" "rerun-failed: passed in previous run"
+      return 0
+    fi
+  fi
+
   local log_path="$LOG_DIR/${stage_name}.log"
   local started_at="$(date -u +%FT%TZ)"
   local finished_at
@@ -7308,6 +7326,8 @@ parse_args() {
       --reboot-hard-fail) SOAK_HARD_FAIL=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       --validate-only) VALIDATE_ONLY=1; shift ;;
+      --rerun-failed) RERUN_FAILED=1; shift ;;
+      --prev-run-dir) PREV_RUN_DIR="$2"; shift 2 ;;
       --stage-timeout-secs)
         if [[ ! "$2" =~ ^[0-9]+$ ]]; then
           printf 'error: --stage-timeout-secs requires a non-negative integer (got: %s)\n' "$2" >&2
@@ -7552,6 +7572,46 @@ main() {
   trap orchestrator_cleanup EXIT
   trap 'printf "\n[orchestrator] SIGINT received — stopping\n" >&2; kill_background_workers; exit 130' INT
   trap 'printf "\n[orchestrator] SIGTERM received — stopping\n" >&2; kill_background_workers; exit 143' TERM
+
+  if [[ "$RERUN_FAILED" -eq 1 ]]; then
+    local _prev_summary
+    if [[ -n "$PREV_RUN_DIR" ]]; then
+      _prev_summary="${PREV_RUN_DIR}/run_summary.json"
+    else
+      _prev_summary="$(find "${ROOT_DIR}/artifacts/live_lab" -name "run_summary.json" \
+        -not -path "${REPORT_DIR}/*" 2>/dev/null | sort -r | head -1 || true)"
+    fi
+    if [[ -z "$_prev_summary" || ! -f "$_prev_summary" ]]; then
+      printf 'error: --rerun-failed: no previous run summary found (pass --prev-run-dir)\n' >&2
+      exit 2
+    fi
+    printf '[rerun-failed] reference run: %s\n' "$(dirname "$_prev_summary")"
+    while IFS= read -r _sn; do
+      [[ -n "$_sn" ]] || continue
+      PASSED_STAGES+=("$_sn")
+    done < <(cargo run --quiet -p rustynet-cli -- ops list-run-stages \
+      --run-summary "$_prev_summary" --status pass 2>/dev/null || true)
+    local _setup_stages=(
+      preflight prepare_source_archive verify_ssh_reachability prime_remote_access
+      cleanup_hosts bootstrap_hosts collect_pubkeys membership_setup
+      distribute_membership_state issue_and_distribute_assignments
+      issue_and_distribute_traversal issue_and_distribute_dns_zone
+      enforce_baseline_runtime validate_baseline_runtime
+    )
+    local _all_setup_passed=1
+    for _ss in "${_setup_stages[@]}"; do
+      local _found=0
+      for _ps in "${PASSED_STAGES[@]}"; do
+        if [[ "$_ps" == "$_ss" ]]; then _found=1; break; fi
+      done
+      if [[ "$_found" -eq 0 ]]; then _all_setup_passed=0; break; fi
+    done
+    if [[ "$_all_setup_passed" -eq 1 && "$SKIP_SETUP" -eq 0 ]]; then
+      SKIP_SETUP=1
+      printf '[rerun-failed] all setup stages passed in previous run — skipping setup\n'
+    fi
+    printf '[rerun-failed] will skip %d previously-passed stage(s)\n' "${#PASSED_STAGES[@]}"
+  fi
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     record_stage_skip "preflight" "hard" "dry-run: not executed"
@@ -7918,6 +7978,19 @@ main() {
   if [[ "${_dir_size_mb:-0}" -gt 500 ]]; then
     printf 'warning: report directory is %s MB (threshold: 500 MB) — consider archiving old runs under %s\n' \
       "$_dir_size_mb" "$(dirname "$REPORT_DIR")" >&2
+  fi
+  if command -v osascript >/dev/null 2>&1; then
+    local _elapsed _notif_title _notif_msg _first_fail
+    _elapsed="$(format_elapsed_duration "$(( $(date +%s) - RUN_STARTED_AT_UNIX ))")"
+    if [[ "$OVERALL_STATUS" == "pass" ]]; then
+      _notif_title="Lab Run Passed"
+      _notif_msg="All stages passed in ${_elapsed}"
+    else
+      _first_fail="$(awk -F'\t' '$3 == "fail" {print $1; exit}' "$STAGE_TSV" 2>/dev/null || true)"
+      _notif_title="Lab Run Failed"
+      _notif_msg="${_first_fail:-unknown stage} failed (${_elapsed})"
+    fi
+    osascript -e "display notification \"${_notif_msg}\" with title \"${_notif_title}\"" 2>/dev/null || true
   fi
   if [[ "$OVERALL_STATUS" == "fail" ]]; then
     return 1

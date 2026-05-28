@@ -240,6 +240,18 @@ pub struct WriteLiveLinuxNetworkFlapReportConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRunStagesConfig {
+    pub run_summary: PathBuf,
+    pub status_filter: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRunSummariesConfig {
+    pub run_a: PathBuf,
+    pub run_b: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteRealWireguardExitnodeE2eReportConfig {
     pub report_path: PathBuf,
     pub exit_status: String,
@@ -3127,6 +3139,150 @@ pub fn execute_ops_write_live_linux_network_flap_report(
         return Err("live_linux_network_flap report status is fail".to_owned());
     }
     Ok(overall_status)
+}
+
+pub fn execute_ops_list_run_stages(config: ListRunStagesConfig) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Summary {
+        stages: Vec<StageEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct StageEntry {
+        stage: String,
+        status: String,
+    }
+
+    let path = resolve_path(config.run_summary.as_path())?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let summary: Summary =
+        serde_json::from_str(&content).map_err(|e| format!("failed to parse run summary: {e}"))?;
+
+    let mut out = String::new();
+    for s in &summary.stages {
+        let matches = match config.status_filter.as_deref() {
+            None => true,
+            Some(f) => s.status == f,
+        };
+        if matches {
+            out.push_str(&s.stage);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+pub fn execute_ops_diff_run_summaries(config: DiffRunSummariesConfig) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Summary {
+        run_id: String,
+        overall_status: String,
+        elapsed_human: String,
+        stages: Vec<StageEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct StageEntry {
+        stage: String,
+        status: String,
+    }
+
+    let read_summary = |p: &std::path::Path| -> Result<Summary, String> {
+        let rp = resolve_path(p)?;
+        let content = std::fs::read_to_string(&rp)
+            .map_err(|e| format!("failed to read {}: {e}", rp.display()))?;
+        serde_json::from_str(&content).map_err(|e| format!("failed to parse {}: {e}", rp.display()))
+    };
+
+    let a = read_summary(config.run_a.as_path())?;
+    let b = read_summary(config.run_b.as_path())?;
+
+    let mut stage_order: Vec<String> = a.stages.iter().map(|s| s.stage.clone()).collect();
+    for s in &b.stages {
+        if !stage_order.contains(&s.stage) {
+            stage_order.push(s.stage.clone());
+        }
+    }
+
+    let a_map: std::collections::HashMap<&str, &str> = a
+        .stages
+        .iter()
+        .map(|s| (s.stage.as_str(), s.status.as_str()))
+        .collect();
+    let b_map: std::collections::HashMap<&str, &str> = b
+        .stages
+        .iter()
+        .map(|s| (s.stage.as_str(), s.status.as_str()))
+        .collect();
+
+    let stage_col = stage_order
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(10)
+        .max(24);
+    let status_col = 10usize;
+    let mut out = String::new();
+
+    let header = format!(
+        "{:<sw$}  {:<sc$}  {:<sc$}  change",
+        "stage",
+        "run-A",
+        "run-B",
+        sw = stage_col,
+        sc = status_col
+    );
+    let divider = "─".repeat(header.len());
+    out.push_str(&format!(
+        "A  {} ({}, {})\nB  {} ({}, {})\n\n",
+        a.run_id, a.overall_status, a.elapsed_human, b.run_id, b.overall_status, b.elapsed_human,
+    ));
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&divider);
+    out.push('\n');
+
+    let mut improved = 0u32;
+    let mut regressed = 0u32;
+    let mut unchanged = 0u32;
+
+    for stage in &stage_order {
+        let sa = a_map.get(stage.as_str()).copied().unwrap_or("─");
+        let sb = b_map.get(stage.as_str()).copied().unwrap_or("─");
+        let change = match (sa, sb) {
+            ("─", _) => "(new in B)".to_owned(),
+            (_, "─") => "(absent in B)".to_owned(),
+            ("pass", "fail") => {
+                regressed += 1;
+                "↓ REGRESSED".to_owned()
+            }
+            ("fail", "pass") => {
+                improved += 1;
+                "↑ IMPROVED".to_owned()
+            }
+            (x, y) if x == y => {
+                unchanged += 1;
+                "─".to_owned()
+            }
+            (x, y) => {
+                unchanged += 1;
+                format!("({x}→{y})")
+            }
+        };
+        out.push_str(&format!(
+            "{:<sw$}  {:<sc$}  {:<sc$}  {change}\n",
+            stage,
+            sa,
+            sb,
+            sw = stage_col,
+            sc = status_col
+        ));
+    }
+
+    out.push_str(&format!(
+        "\n{} improved, {} regressed, {} unchanged\n",
+        improved, regressed, unchanged
+    ));
+    Ok(out)
 }
 
 /// Typed view for the per-check verdicts inside the real-WireGuard
