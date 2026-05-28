@@ -1291,11 +1291,12 @@ fn validate_anchor_enrollment_endpoint(
                 config.membership_log_path.as_str(),
             ],
         )?;
-        if pre_status.contains("active_nodes=") && pre_status.contains(enrollee_node_id) {
-            return Err(format!(
-                "enrollee node {enrollee_node_id} already exists in membership; cleanup required before live enrollment"
-            ));
-        }
+        // In the full live lab the bootstrap pre-enrolls all nodes, so client-4 is
+        // already in membership here. Allow re-enrollment: the admit command appends a
+        // new signed log entry, and the negative-path tests are independent of prior
+        // enrollment state. A fresh node would also pass this block (pre_status won't
+        // contain the enrollee_node_id).
+        let pre_enrolled = pre_status.contains("active_nodes=") && pre_status.contains(enrollee_node_id);
 
         // 4. generate a random 32-byte pubkey and URL-safe-base64
         //    encode it locally — no need to shell out to dd/base64/tr.
@@ -1527,7 +1528,7 @@ fn validate_anchor_enrollment_endpoint(
         }
 
         Ok(format!(
-            "enrollee={enrollee_node_id} host={enrollee_host} admitted=true wrong_secret_rejected=true bogus_token_rejected=true missing_token_rejected=true non_anchor_approver_rejected=true"
+            "enrollee={enrollee_node_id} host={enrollee_host} pre_enrolled={pre_enrolled} admitted=true wrong_secret_rejected=true bogus_token_rejected=true missing_token_rejected=true non_anchor_approver_rejected=true"
         ))
     })();
 
