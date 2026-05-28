@@ -12,18 +12,20 @@ to commits and so OS, role, and stage gaps stay visible.
 
 ## When To Append A Row
 
-The standard wrappers append one row automatically at completion:
+The following paths append one row automatically at completion:
 
 - `ops vm-lab-setup-live-lab`
 - `ops vm-lab-run-live-lab`
 - `ops vm-lab-orchestrate-live-lab`
 - `ops vm-lab-iterate-live-lab`
+- `scripts/e2e/live_linux_lab_orchestrator.sh` (appends on exit via the EXIT
+  trap whenever `run_summary.json` was written; covers both pass and hard-fail
+  exits)
 
 The writer also emits the exact row for the current run at
-`<report_dir>/state/live_lab_run_matrix_row.csv`. Direct `scripts/e2e/live_*`
-stage runs and focused macOS, Windows, or Linux role validations that bypass
-the wrappers still require a manual row before claiming a run is green,
-regressed, unsupported, or at platform parity.
+`<report_dir>/state/live_lab_run_matrix_row.csv`. Focused macOS, Windows, or
+Linux role validation scripts that bypass these paths still require a manual row
+before claiming a run is green, regressed, unsupported, or at platform parity.
 
 ## Required Row Rules
 

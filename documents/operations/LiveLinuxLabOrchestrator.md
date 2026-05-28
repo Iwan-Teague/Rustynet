@@ -594,6 +594,14 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   - shorthand for `--source-mode origin-main`
 - `--use-local-head`
   - shorthand for `--source-mode local-head`
+- `--skip-to <stage>`
+  - resumes from a named stage, skipping all preceding stages and recording each as skipped
+  - for post-setup stages (`live_anchor`, `live_role_switch_matrix`, etc.) setup is skipped automatically, reusing the bootstrap state in the existing report directory
+  - implies `--preserve-report-state`; combine with `--report-dir` to point at an earlier run
+  - example: `--report-dir artifacts/live_lab/run_42 --skip-to live_anchor` retries the anchor stage without a 7-8 min recompile
+  - complements `--rerun-failed`: use `--rerun-failed` when you want all previously-failed stages; use `--skip-to` when you want exactly one named stage
+- `--skip-setup`
+  - skips the entire preflight + baseline setup sequence; the existing bootstrap state in the report dir must already be valid
 - `--skip-gates`
   - skips the local full gate suite stage
 - `--skip-soak`
@@ -602,6 +610,7 @@ bash scripts/e2e/live_linux_lab_orchestrator.sh \
   - promotes reboot/soak failures to hard failures
 - `--repo-ref <ref>`
   - archives a git ref instead of the current working tree
+  - for `local-head` and `origin-main` source modes, the orchestrator skips re-creating the archive when the recorded commit hash already matches the resolved ref, saving ~1-2 min on repeated retries
 - `--report-dir <path>`
   - writes reports to an explicit location
 - `--traversal-ttl-secs <seconds>`
@@ -653,3 +662,36 @@ For release-style lab validation:
 1. run the full orchestrator with all stages enabled
 2. inspect `run_summary.md`
 3. inspect the individual failing stage log if any stage is not `pass`
+
+For retrying a specific failed stage without rebuilding from scratch:
+
+```bash
+# All setup stages passed but live_anchor failed? Skip straight to it.
+./scripts/e2e/live_linux_lab_orchestrator.sh \
+  --report-dir artifacts/live_lab/<prior_run_id> \
+  --skip-to live_anchor \
+  [other flags...]
+```
+
+The `--skip-to` flag sets `PRESERVE_REPORT_STATE=1` and `SKIP_SETUP=1`
+automatically when the target is a post-setup stage. Saves ~10 min per
+retry compared to a full rebuild.
+
+To compare two runs after a fix:
+
+```bash
+./scripts/e2e/diff_lab_runs.sh artifacts/live_lab/<run_a> artifacts/live_lab/<run_b>
+```
+
+## Run matrix
+
+The orchestrator now appends a row to `documents/operations/live_lab_run_matrix.csv`
+automatically on exit, including `run_finished_utc`, `overall_result`, and
+`first_failed_stage`. No manual CSV editing is required for direct orchestrator
+invocations. The row is written in the EXIT trap so it fires for both pass and
+fail exits.
+
+For macOS nodes, the `macos_preflight_check` stage (which runs before
+`cleanup_hosts`) now detects a missing default route — a common symptom after a
+run dies mid-cleanup — and attempts restoration via the DHCP-lease gateway. The
+outcome is logged per node so cleanup failures are no longer opaque.

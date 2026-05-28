@@ -26,14 +26,28 @@ diagnose if something fails.
 
 ## Run Ledger
 
-The standard Rust wrappers append every live-lab run used as evidence to
+The standard Rust wrappers and `live_linux_lab_orchestrator.sh` append every
+live-lab run used as evidence to
 [`documents/operations/live_lab_run_matrix.csv`](../../documents/operations/live_lab_run_matrix.csv).
 The schema and status rules are in
 [`documents/operations/LiveLabRunMatrix.md`](../../documents/operations/LiveLabRunMatrix.md).
-They also write `<report_dir>/state/live_lab_run_matrix_row.csv`. Direct
-`live_*` script invocations that bypass the wrappers still need a manual row.
+They also write `<report_dir>/state/live_lab_run_matrix_row.csv`.
+
+`live_linux_lab_orchestrator.sh` appends automatically on exit (EXIT trap) for
+both pass and fail runs, so no manual row is needed for direct orchestrator
+invocations. Focused `live_*` stage scripts that bypass the orchestrator
+entirely still need a manual row.
+
 Do not claim OS/role/stage parity without a matching row that records the
 commit, dirty state, report directory, node identity, and pass/fail/skip status.
+
+To compare the stage outcomes of two runs:
+
+```bash
+./diff_lab_runs.sh artifacts/live_lab/<run_a> artifacts/live_lab/<run_b>
+# or via the Rust wrapper:
+# cargo run -p rustynet-cli -- ops vm-lab-diff-live-lab-runs --run-a <dir_a> --run-b <dir_b>
+```
 
 Automation security posture for this workflow:
 
