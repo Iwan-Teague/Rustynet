@@ -300,6 +300,25 @@ repair_bootstrap_dns_state() {
   elif [[ -n "${default_gateway}" ]]; then
     run_root sh -c 'printf "nameserver %s\noptions timeout:2 attempts:2\n" "$1" > /etc/resolv.conf' sh "${default_gateway}"
   fi
+
+  # Validate that DNS is actually responding after the repair. The stub at
+  # 127.0.0.53 can enter a broken state (socket bound but no responses) that
+  # persists across systemd-resolved restarts. Give it a brief moment to
+  # initialize, then verify. If broken, fall back to a working nameserver so
+  # cargo build can reach the registry.
+  sleep 2
+  if ! timeout 6 getent ahosts index.crates.io >/dev/null 2>&1; then
+    echo "[bootstrap] DNS unresponsive after repair; switching to direct nameservers" >&2
+    # First try the upstream resolv.conf from systemd-resolved (bypasses the stub).
+    if [[ -e /run/systemd/resolve/resolv.conf ]] && \
+       grep -q '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null; then
+      run_root cp /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || true
+    fi
+    # If still broken, hardcode public resolvers as last resort.
+    if ! timeout 6 getent ahosts index.crates.io >/dev/null 2>&1; then
+      run_root sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" > /etc/resolv.conf'
+    fi
+  fi
 }
 
 emit_bootstrap_network_diagnostics() {
@@ -319,6 +338,22 @@ emit_bootstrap_network_diagnostics() {
   fi
   echo "--- getent ahosts ${host} ---" >&2
   getent ahosts "${host}" >&2 || true
+}
+
+wait_for_cargo_registry_endpoint() {
+  local endpoint="https://index.crates.io/"
+  local attempt
+  for attempt in $(seq 1 8); do
+    if run_local_timed 15 curl --ipv4 --fail --silent --head "${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+    echo "[bootstrap] cargo registry unreachable (attempt ${attempt}/8); repairing DNS" >&2
+    repair_bootstrap_dns_state
+    sleep 2
+  done
+  echo "[bootstrap] failed to reach cargo registry: ${endpoint}" >&2
+  emit_bootstrap_network_diagnostics "index.crates.io"
+  return 1
 }
 
 wait_for_bootstrap_rustup_endpoint() {
@@ -389,6 +424,7 @@ if ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version >/dev/null 2>&1 || !
 fi
 rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 
+wait_for_cargo_registry_endpoint || exit 1
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet

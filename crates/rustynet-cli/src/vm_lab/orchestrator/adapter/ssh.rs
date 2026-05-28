@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -119,13 +121,39 @@ pub fn run_remote(
     script: &str,
     timeout: Duration,
 ) -> Result<String, AdapterError> {
+    run_remote_inner(conn, script, timeout, None)
+}
+
+/// Like `run_remote` but also streams stdout+stderr to `log_path` in real time.
+/// Creates parent directories if they do not exist. Appends to the file.
+pub fn run_remote_with_log(
+    conn: &NodeConnection,
+    script: &str,
+    timeout: Duration,
+    log_path: &Path,
+) -> Result<String, AdapterError> {
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    run_remote_inner(conn, script, timeout, Some(log_path))
+}
+
+fn run_remote_inner(
+    conn: &NodeConnection,
+    script: &str,
+    timeout: Duration,
+    log_sink: Option<&Path>,
+) -> Result<String, AdapterError> {
     let (host, port, user, identity_file, known_hosts) = ssh_params(conn)?;
     let mut cmd = base_ssh_command(host, port, user, identity_file, known_hosts);
     cmd.arg(script);
-    let output =
-        run_output_with_timeout(&mut cmd, timeout).map_err(|message| AdapterError::Ssh {
+    let output = run_output_with_timeout(&mut cmd, timeout, log_sink).map_err(|message| {
+        AdapterError::Ssh {
             message: format!("SSH spawn failed for {host}: {message}"),
-        })?;
+        }
+    })?;
     if !output.status.success() {
         let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         // Windows PowerShell over OpenSSH frequently writes diagnostic
@@ -135,10 +163,6 @@ pub fn run_remote(
         let stdout_lossy = String::from_utf8_lossy(&output.stdout);
         let stdout_trimmed = stdout_lossy.trim();
         let stderr = if stderr_raw.is_empty() {
-            // Windows PowerShell over OpenSSH frequently writes diagnostic
-            // detail to stdout (CLIXML stream / Write-Host). When stderr is
-            // empty, fall back to a tail of stdout so the operator sees
-            // *something* rather than a bare "(exit Some(1)): ".
             if stdout_trimmed.is_empty() {
                 String::new()
             } else {
@@ -283,9 +307,15 @@ pub fn wait_for_remote_socket(
 
 // ── Private runtime helpers ───────────────────────────────────────────────────
 
+/// Run `command` with `timeout`. Drains stdout and stderr concurrently in
+/// background threads so that pipe buffers never fill and block the child.
+/// When `log_sink` is `Some(path)`, each byte is also appended to that file
+/// as it arrives, giving live visibility into long-running commands such as
+/// `cargo build` during bootstrap.
 fn run_output_with_timeout(
     command: &mut Command,
     timeout: Duration,
+    log_sink: Option<&Path>,
 ) -> Result<std::process::Output, String> {
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -294,23 +324,98 @@ fn run_output_with_timeout(
         .spawn()
         .map_err(|err| format!("spawn failed: {err}"))?;
     let started_at = Instant::now();
-    loop {
-        if child
+
+    // Take ownership of the pipes before entering the poll loop.
+    let stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let stderr_pipe = child.stderr.take().expect("stderr was piped");
+
+    // Open the log file for append when a sink path was provided.
+    let log_writer: Option<Arc<Mutex<fs::File>>> = match log_sink {
+        Some(path) => {
+            let f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("open log sink {}: {e}", path.display()))?;
+            Some(Arc::new(Mutex::new(f)))
+        }
+        None => None,
+    };
+
+    // Spawn a thread to drain stdout, optionally tee-ing to the log.
+    let out_log = log_writer.clone();
+    let stdout_thread = thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut pipe = stdout_pipe;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(ref w) = out_log {
+                        if let Ok(mut f) = w.lock() {
+                            let _ = f.write_all(&chunk[..n]);
+                        }
+                    }
+                }
+            }
+        }
+        buf
+    });
+
+    // Spawn a thread to drain stderr, optionally tee-ing to the log.
+    let err_log = log_writer;
+    let stderr_thread = thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut pipe = stderr_pipe;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(ref w) = err_log {
+                        if let Ok(mut f) = w.lock() {
+                            let _ = f.write_all(&chunk[..n]);
+                        }
+                    }
+                }
+            }
+        }
+        buf
+    });
+
+    // Poll for child exit or timeout.
+    let exit_status = loop {
+        match child
             .try_wait()
             .map_err(|err| format!("wait failed: {err}"))?
-            .is_some()
         {
-            return child
-                .wait_with_output()
-                .map_err(|err| format!("collect output failed: {err}"));
+            Some(status) => break status,
+            None => {
+                if started_at.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Flush remaining log data before returning.
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return Err(format!("timed out after {} seconds", timeout.as_secs()));
+                }
+                thread::sleep(Duration::from_millis(POLL_INTERVAL_MILLIS));
+            }
         }
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("timed out after {} seconds", timeout.as_secs()));
-        }
-        thread::sleep(Duration::from_millis(POLL_INTERVAL_MILLIS));
-    }
+    };
+
+    // Join reader threads to collect all output (pipes closed when child exited).
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    Ok(std::process::Output {
+        status: exit_status,
+        stdout,
+        stderr,
+    })
 }
 
 fn run_status_with_timeout(
