@@ -2706,20 +2706,18 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 },
             })
         }
-        "write-live-linux-key-custody-report" => {
-            Ok(OpsCommand::WriteLiveLinuxKeyCustodyReport {
-                config: ops_live_lab_orchestrator::WriteLiveLinuxKeyCustodyReportConfig {
-                    report_path: parser.required_path("--report-path")?,
-                    initial_key_file_mode: parser.required("--initial-key-file-mode")?,
-                    initial_key_dir_mode: parser.required("--initial-key-dir-mode")?,
-                    initial_mode_ok: parser.required("--initial-mode-ok")?,
-                    daemon_rejected_bad_mode: parser.required("--daemon-rejected-bad-mode")?,
-                    daemon_recovered: parser.required("--daemon-recovered")?,
-                    final_mode_ok: parser.required("--final-mode-ok")?,
-                    overall_status: parser.required("--overall-status")?,
-                },
-            })
-        }
+        "write-live-linux-key-custody-report" => Ok(OpsCommand::WriteLiveLinuxKeyCustodyReport {
+            config: ops_live_lab_orchestrator::WriteLiveLinuxKeyCustodyReportConfig {
+                report_path: parser.required_path("--report-path")?,
+                initial_key_file_mode: parser.required("--initial-key-file-mode")?,
+                initial_key_dir_mode: parser.required("--initial-key-dir-mode")?,
+                initial_mode_ok: parser.required("--initial-mode-ok")?,
+                daemon_rejected_bad_mode: parser.required("--daemon-rejected-bad-mode")?,
+                daemon_recovered: parser.required("--daemon-recovered")?,
+                final_mode_ok: parser.required("--final-mode-ok")?,
+                overall_status: parser.required("--overall-status")?,
+            },
+        }),
         "write-live-linux-secrets-not-in-logs-report" => {
             let parse_u64 = |key: &str| -> Result<u64, String> {
                 parser
@@ -2743,7 +2741,10 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         "write-live-linux-enrollment-restart-report" => {
             let kill_timing_ms = parser
                 .value("--kill-timing-ms")
-                .map(|v| v.parse::<u64>().map_err(|e| format!("invalid --kill-timing-ms: {e}")))
+                .map(|v| {
+                    v.parse::<u64>()
+                        .map_err(|e| format!("invalid --kill-timing-ms: {e}"))
+                })
                 .transpose()?
                 .unwrap_or(0);
             Ok(OpsCommand::WriteLiveLinuxEnrollmentRestartReport {
