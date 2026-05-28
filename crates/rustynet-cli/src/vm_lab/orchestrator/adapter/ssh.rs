@@ -132,10 +132,10 @@ pub fn run_remote_with_log(
     timeout: Duration,
     log_path: &Path,
 ) -> Result<String, AdapterError> {
-    if let Some(parent) = log_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = fs::create_dir_all(parent);
-        }
+    if let Some(parent) = log_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = fs::create_dir_all(parent);
     }
     run_remote_inner(conn, script, timeout, Some(log_path))
 }
@@ -353,10 +353,10 @@ fn run_output_with_timeout(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if let Some(ref w) = out_log {
-                        if let Ok(mut f) = w.lock() {
-                            let _ = f.write_all(&chunk[..n]);
-                        }
+                    if let Some(ref w) = out_log
+                        && let Ok(mut f) = w.lock()
+                    {
+                        let _ = f.write_all(&chunk[..n]);
                     }
                 }
             }
@@ -375,10 +375,10 @@ fn run_output_with_timeout(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if let Some(ref w) = err_log {
-                        if let Ok(mut f) = w.lock() {
-                            let _ = f.write_all(&chunk[..n]);
-                        }
+                    if let Some(ref w) = err_log
+                        && let Ok(mut f) = w.lock()
+                    {
+                        let _ = f.write_all(&chunk[..n]);
                     }
                 }
             }

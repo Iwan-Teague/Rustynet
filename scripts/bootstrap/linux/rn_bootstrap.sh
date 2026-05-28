@@ -310,13 +310,16 @@ repair_bootstrap_dns_state() {
   if ! timeout 6 getent ahosts index.crates.io >/dev/null 2>&1; then
     echo "[bootstrap] DNS unresponsive after repair; switching to direct nameservers" >&2
     # First try the upstream resolv.conf from systemd-resolved (bypasses the stub).
+    # Break the symlink before writing so systemd-resolved can't regenerate it.
     if [[ -e /run/systemd/resolve/resolv.conf ]] && \
        grep -q '^nameserver' /run/systemd/resolve/resolv.conf 2>/dev/null; then
-      run_root cp /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || true
+      run_root bash -c 'rm -f /etc/resolv.conf; cp /run/systemd/resolve/resolv.conf /etc/resolv.conf' 2>/dev/null || true
     fi
     # If still broken, hardcode public resolvers as last resort.
+    # Break the symlink first so systemd-resolved cannot regenerate
+    # stub-resolv.conf and revert our change.
     if ! timeout 6 getent ahosts index.crates.io >/dev/null 2>&1; then
-      run_root sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" > /etc/resolv.conf'
+      run_root bash -c 'rm -f /etc/resolv.conf; printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" > /etc/resolv.conf'
     fi
   fi
 }
@@ -424,6 +427,11 @@ if ! rustup run "${RUST_TOOLCHAIN_CHANNEL}" rustc --version >/dev/null 2>&1 || !
 fi
 rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 
+# Break the /etc/resolv.conf symlink unconditionally before cargo so that
+# systemd-resolved regenerating stub-resolv.conf mid-build cannot race us
+# and revert nameservers to the broken 127.0.0.53 stub.
+echo "[bootstrap] pinning nameservers for cargo build" >&2
+run_root bash -c 'rm -f /etc/resolv.conf; printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n" > /etc/resolv.conf' 2>/dev/null || true
 wait_for_cargo_registry_endpoint || exit 1
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
