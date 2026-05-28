@@ -433,6 +433,41 @@ pub fn execute_ops_e2e_bootstrap_host(
             "rustynetd key init failed during e2e bootstrap",
         )?;
 
+        // Provision the 32-byte HMAC enrollment secret. The daemon reads this at
+        // enrollment request time (not at startup), so it doesn't fail the service
+        // start if absent — but the live anchor enrollment test requires it.
+        // Mode 0600, owned by rustynetd so the daemon (User=rustynetd) can read it.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let enrollment_secret_path = Path::new("/var/lib/rustynet/keys/enrollment.secret");
+            let mut enrollment_secret_bytes = [0u8; 32];
+            fill_os_random_bytes(&mut enrollment_secret_bytes, "enrollment secret")?;
+            let write_result = (|| -> Result<(), String> {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true).mode(0o600);
+                let mut file =
+                    options
+                        .open(enrollment_secret_path)
+                        .map_err(|err| format!("create enrollment secret failed: {err}"))?;
+                file.write_all(&enrollment_secret_bytes)
+                    .map_err(|err| format!("write enrollment secret failed: {err}"))?;
+                file.sync_all()
+                    .map_err(|err| format!("sync enrollment secret failed: {err}"))?;
+                Ok(())
+            })();
+            enrollment_secret_bytes.zeroize();
+            write_result?;
+        }
+        run_status(
+            "chown",
+            &[
+                "rustynetd:rustynetd",
+                "/var/lib/rustynet/keys/enrollment.secret",
+            ],
+            &[],
+            "chown enrollment secret failed during e2e bootstrap",
+        )?;
+
         run_status(
             "systemd-creds",
             &[
