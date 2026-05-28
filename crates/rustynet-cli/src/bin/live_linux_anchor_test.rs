@@ -1362,13 +1362,18 @@ fn validate_anchor_enrollment_endpoint(
             return Err("bogus enrollment token unexpectedly verified".to_owned());
         }
 
-        // 8. negative admit: missing --token MUST fail.
-        let missing_token_admit = shell
+        // 8. negative admit: wrong-secret token MUST be rejected by admit.
+        // Using an explicitly bad token string rather than a missing --token,
+        // because the CLI falls through to Help (exit 0) when required args are
+        // absent (Err(_) => CliCommand::Help in parse_command).
+        let wrong_token_admit = shell
             .run_argv(
                 &[
                     "rustynet",
                     "enrollment",
                     "admit",
+                    "--token",
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                     "--pubkey",
                     &pubkey_b64,
                     "--node-id",
@@ -1398,9 +1403,9 @@ fn validate_anchor_enrollment_endpoint(
                 &[],
                 &[],
             )
-            .map_err(|err| format!("missing-token admit run failed: {err}"))?;
-        if missing_token_admit.is_success() {
-            return Err("missing-token enrollment admit unexpectedly succeeded".to_owned());
+            .map_err(|err| format!("wrong-token admit run failed: {err}"))?;
+        if wrong_token_admit.is_success() {
+            return Err("wrong-token enrollment admit unexpectedly succeeded".to_owned());
         }
 
         // 9. mint a fresh token for the negative-approver test (the
@@ -1528,7 +1533,7 @@ fn validate_anchor_enrollment_endpoint(
         }
 
         Ok(format!(
-            "enrollee={enrollee_node_id} host={enrollee_host} pre_enrolled={pre_enrolled} admitted=true wrong_secret_rejected=true bogus_token_rejected=true missing_token_rejected=true non_anchor_approver_rejected=true"
+            "enrollee={enrollee_node_id} host={enrollee_host} pre_enrolled={pre_enrolled} admitted=true wrong_secret_rejected=true bogus_token_rejected=true wrong_token_rejected=true non_anchor_approver_rejected=true"
         ))
     })();
 
