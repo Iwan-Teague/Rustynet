@@ -377,8 +377,9 @@ fn capture_anchor_list_from_host(
         }
         AnchorPlatform::Macos => {
             // macOS installs membership state under membership/ subdir, not /var/lib/rustynet.
-            // Pass --snapshot explicitly so the CLI default (Linux path) does not mis-route.
-            let command = "command -v rustynet >/dev/null; rustynet anchor list --snapshot /usr/local/var/rustynet/membership/membership.snapshot";
+            // Pass both --snapshot and --log explicitly; the CLI defaults to the Linux paths
+            // which do not exist on macOS.
+            let command = "command -v rustynet >/dev/null; rustynet anchor list --snapshot /usr/local/var/rustynet/membership/membership.snapshot --log /usr/local/var/rustynet/membership/membership.log";
             capture_root(identity, known_hosts, host, command)
                 .map_err(|err| format!("anchor list failed on {host}: {err}"))
         }
