@@ -2984,10 +2984,11 @@ pub fn execute_ops_write_live_linux_key_custody_report(
 ) -> Result<String, String> {
     let report_path = resolve_path(config.report_path.as_path())?;
     let initial_mode_ok = parse_pass_fail(config.initial_mode_ok.as_str(), "--initial-mode-ok")?;
-    let daemon_rejected =
-        parse_pass_fail(config.daemon_rejected_bad_mode.as_str(), "--daemon-rejected-bad-mode")?;
-    let daemon_recovered =
-        parse_pass_fail(config.daemon_recovered.as_str(), "--daemon-recovered")?;
+    let daemon_rejected = parse_pass_fail(
+        config.daemon_rejected_bad_mode.as_str(),
+        "--daemon-rejected-bad-mode",
+    )?;
+    let daemon_recovered = parse_pass_fail(config.daemon_recovered.as_str(), "--daemon-recovered")?;
     let final_mode_ok = parse_pass_fail(config.final_mode_ok.as_str(), "--final-mode-ok")?;
     let overall_status = parse_pass_fail(config.overall_status.as_str(), "--overall-status")?;
 
@@ -3055,8 +3056,10 @@ pub fn execute_ops_write_live_linux_enrollment_restart_report(
     let report_path = resolve_path(config.report_path.as_path())?;
     let admin_recovered =
         parse_pass_fail_skip(config.admin_recovered.as_str(), "--admin-recovered")?;
-    let membership_integrity =
-        parse_pass_fail_skip(config.membership_integrity.as_str(), "--membership-integrity")?;
+    let membership_integrity = parse_pass_fail_skip(
+        config.membership_integrity.as_str(),
+        "--membership-integrity",
+    )?;
     let overall_status = parse_pass_fail_skip(config.overall_status.as_str(), "--overall-status")?;
 
     let outcome = match config.enrollment_outcome.trim() {
@@ -3090,14 +3093,15 @@ pub fn execute_ops_write_live_linux_network_flap_report(
     config: WriteLiveLinuxNetworkFlapReportConfig,
 ) -> Result<String, String> {
     let report_path = resolve_path(config.report_path.as_path())?;
-    let disruption_confirmed =
-        parse_pass_fail(config.disruption_confirmed.as_str(), "--disruption-confirmed")?;
+    let disruption_confirmed = parse_pass_fail(
+        config.disruption_confirmed.as_str(),
+        "--disruption-confirmed",
+    )?;
     let recovery_arrived = parse_pass_fail(
         config.recovery_handshake_arrived.as_str(),
         "--recovery-handshake-arrived",
     )?;
-    let gossip_recovered =
-        parse_pass_fail(config.gossip_recovered.as_str(), "--gossip-recovered")?;
+    let gossip_recovered = parse_pass_fail(config.gossip_recovered.as_str(), "--gossip-recovered")?;
     let membership_intact =
         parse_pass_fail(config.membership_intact.as_str(), "--membership-intact")?;
     let overall_status = parse_pass_fail(config.overall_status.as_str(), "--overall-status")?;
