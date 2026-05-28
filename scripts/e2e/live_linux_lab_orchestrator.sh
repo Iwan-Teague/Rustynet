@@ -2886,18 +2886,18 @@ root rm -rf /usr/local/var/rustynet /usr/local/etc/rustynet \
 for utun in $(ifconfig -l 2>/dev/null | tr ' ' '\n' | grep '^utun[0-9]'); do
   root ifconfig "${utun}" down 2>/dev/null || true
 done
-# Restore the default route. A prior dataplane apply may have torn down
-# the default route during fail-closed rollback (privileged helper
-# disconnect mid-cleanup), leaving the host unable to detect the egress
-# interface on the next daemon start. Re-binding DHCP on en0 reinstalls
-# the default route published by the configd DHCP lease. If DHCP does
-# not restore the route within 3 s (lease renewal races or missing router
-# option), derive the gateway from the existing lease and add it explicitly.
-# If the lease is unavailable, fall back to .1 of the host primary address.
-root ipconfig set en0 DHCP 2>/dev/null || true
-sleep 3
+# Restore the default route if a prior fail-closed rollback removed it.
+# Do NOT rebind DHCP on en0 — on static-IP hosts (e.g. macOS VMs using
+# networksetup -setmanual) that would overwrite the static assignment and
+# leave the host with an APIPA address if DHCP fails, breaking subsequent
+# cargo builds. Instead derive the gateway from networksetup (works for
+# both Manual and DHCP service configs), fall back to the DHCP lease
+# packet, then fall back to .1 of the host primary address.
 if ! netstat -rn -f inet 2>/dev/null | grep -q '^default'; then
-  gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')" || true
+  gw="$(networksetup -getinfo "Ethernet" 2>/dev/null | awk '/^Router:/{print $2; exit}')" || true
+  if [ -z "$gw" ]; then
+    gw="$(ipconfig getpacket en0 2>/dev/null | awk '/^router /{gsub(/[{}]/, "", $3); print $3; exit}')" || true
+  fi
   if [ -z "$gw" ]; then
     host_ip="$(ipconfig getifaddr en0 2>/dev/null)" || true
     if [ -n "$host_ip" ]; then gw="${host_ip%.*}.1"; fi
