@@ -26402,6 +26402,18 @@ mod tests {
             .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("temp executable should be chmodded");
+        // On macOS, first execve() of a new binary from a temp path triggers a ~26s
+        // Gatekeeper/trustd check. Run it once now so the cache is warm before the
+        // script is used inside timing-sensitive code that has a 30s subprocess timeout.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new(&path)
+                .arg("--_noop_prime_cache")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
         path
     }
 
