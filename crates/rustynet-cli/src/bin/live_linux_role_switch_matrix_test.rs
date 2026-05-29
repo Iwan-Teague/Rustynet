@@ -70,6 +70,12 @@ struct SignedStateRefreshContext {
     // since macOS has no local assignment-refresh service. Optional so
     // the harness still runs when the orchestrator does not supply it.
     assignment_env_file: Option<PathBuf>,
+    // Serving-blind_exit assignment-issue env for the aux/macOS node. Used
+    // instead of `assignment_env_file` when the role-switch enforces
+    // blind_exit on the mac: it grants blind_exit in the assignment intent
+    // and drops the exit-consumer assignment (a blind_exit node cannot
+    // consume exit traffic).
+    aux_blind_exit_assignment_env_file: Option<PathBuf>,
     exit_host: String,
     targets: Vec<SignedStateRefreshTarget>,
 }
@@ -346,6 +352,7 @@ struct Config {
     traversal_env_file: Option<PathBuf>,
     dns_zone_env_file: Option<PathBuf>,
     assignment_env_file: Option<PathBuf>,
+    aux_blind_exit_assignment_env_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -373,6 +380,7 @@ impl Config {
             traversal_env_file: None,
             dns_zone_env_file: None,
             assignment_env_file: None,
+            aux_blind_exit_assignment_env_file: None,
         };
 
         let mut iter = args.into_iter();
@@ -414,6 +422,10 @@ impl Config {
                 }
                 "--assignment-env-file" => {
                     config.assignment_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?));
+                }
+                "--aux-blind-exit-assignment-env-file" => {
+                    config.aux_blind_exit_assignment_env_file =
+                        Some(PathBuf::from(next_value(&mut iter, &arg)?));
                 }
                 "-h" | "--help" => {
                     print_usage();
@@ -459,6 +471,14 @@ impl Config {
         {
             return Err(format!("missing assignment env file: {}", path.display()));
         }
+        if let Some(path) = &config.aux_blind_exit_assignment_env_file
+            && !path.is_file()
+        {
+            return Err(format!(
+                "missing aux blind-exit assignment env file: {}",
+                path.display()
+            ));
+        }
         Ok(config)
     }
 }
@@ -482,6 +502,9 @@ fn build_signed_state_refresh_context(
                 traversal_env_file: traversal_env_file.clone(),
                 dns_zone_env_file: dns_zone_env_file.clone(),
                 assignment_env_file: config.assignment_env_file.clone(),
+                aux_blind_exit_assignment_env_file: config
+                    .aux_blind_exit_assignment_env_file
+                    .clone(),
                 exit_host: config.exit_host.clone(),
                 targets: vec![
                     SignedStateRefreshTarget {
@@ -562,6 +585,7 @@ fn process_host(
             context.workspace_dir,
             refresh,
             spec.host,
+            spec.temp_role,
             format!(
                 "before waiting for {} to settle as {}",
                 spec.node_id, spec.temp_role
@@ -804,6 +828,7 @@ fn ensure_client_role_with_expected_exit(
             context.workspace_dir,
             refresh,
             context.host,
+            "client",
             format!("before restoring {} to client", context.node_id).as_str(),
         )?;
     }
@@ -833,6 +858,7 @@ fn ensure_client_role_with_expected_exit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_signed_state_for_transition(
     logger: &mut Logger,
     identity: &Path,
@@ -840,6 +866,7 @@ fn refresh_signed_state_for_transition(
     workspace_dir: &Path,
     refresh: &SignedStateRefreshContext,
     target_host: &str,
+    target_role: &str,
     reason: &str,
 ) -> Result<(), String> {
     refresh_traversal_bundles_for_transition(
@@ -857,6 +884,8 @@ fn refresh_signed_state_for_transition(
         known_hosts,
         workspace_dir,
         refresh,
+        target_host,
+        target_role,
         reason,
     )?;
     for target in &refresh.targets {
@@ -1012,17 +1041,17 @@ fn refresh_traversal_bundles_for_transition(
 /// freshness bound and `state refresh` fails closed with "auto-tunnel
 /// bundle is stale". Keeping the signer on the exit preserves
 /// least-privilege: the macOS blind_exit node gains no signing power.
+#[allow(clippy::too_many_arguments)]
 fn refresh_assignment_bundles_for_macos_targets(
     logger: &mut Logger,
     identity: &Path,
     known_hosts: &Path,
     workspace_dir: &Path,
     refresh: &SignedStateRefreshContext,
+    target_host: &str,
+    target_role: &str,
     reason: &str,
 ) -> Result<(), String> {
-    let Some(assignment_env_file) = refresh.assignment_env_file.as_ref() else {
-        return Ok(());
-    };
     if !refresh
         .targets
         .iter()
@@ -1030,6 +1059,32 @@ fn refresh_assignment_bundles_for_macos_targets(
     {
         return Ok(());
     }
+    // When the transition enforces blind_exit on the macOS target itself, the
+    // bundle must grant blind_exit in its intent and must NOT assign it an exit
+    // to consume (a blind_exit node cannot consume exit traffic). Use the
+    // serving-blind_exit env in that case; otherwise re-issue the baseline
+    // (client) assignment to keep the mac fresh.
+    let macos_switching_to_blind_exit = target_role == "blind_exit"
+        && refresh
+            .targets
+            .iter()
+            .any(|target| target.platform == "macos" && target.host == target_host);
+    let assignment_env_file = if macos_switching_to_blind_exit {
+        match refresh.aux_blind_exit_assignment_env_file.as_ref() {
+            Some(path) => path,
+            None => {
+                return Err(
+                    "role-switch: macOS target is switching to blind_exit but no aux blind-exit assignment env was provided"
+                        .to_owned(),
+                );
+            }
+        }
+    } else {
+        match refresh.assignment_env_file.as_ref() {
+            Some(path) => path,
+            None => return Ok(()),
+        }
+    };
     let issue_dir = workspace_dir.join(format!(
         "role-switch-assignment-{}-{}",
         sanitize_path_component(reason),
@@ -1583,7 +1638,7 @@ fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<Strin
 
 fn print_usage() {
     eprintln!(
-        "usage: live_linux_role_switch_matrix_test --ssh-identity-file <path> [options]\n\noptions:\n  --exit-host <user@host>\n  --exit-node-id <id>\n  --debian-host <user@host>\n  --debian-node-id <id>\n  --ubuntu-host <user@host>\n  --ubuntu-node-id <id>\n  --fedora-host <user@host>\n  --fedora-node-id <id>\n  --mint-host <user@host>\n  --mint-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --source-path <path>\n  --log-path <path>\n  --known-hosts <path>\n  --git-commit <sha>\n  --traversal-env-file <path>\n  --dns-zone-env-file <path>\n  --assignment-env-file <path>"
+        "usage: live_linux_role_switch_matrix_test --ssh-identity-file <path> [options]\n\noptions:\n  --exit-host <user@host>\n  --exit-node-id <id>\n  --debian-host <user@host>\n  --debian-node-id <id>\n  --ubuntu-host <user@host>\n  --ubuntu-node-id <id>\n  --fedora-host <user@host>\n  --fedora-node-id <id>\n  --mint-host <user@host>\n  --mint-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --source-path <path>\n  --log-path <path>\n  --known-hosts <path>\n  --git-commit <sha>\n  --traversal-env-file <path>\n  --dns-zone-env-file <path>\n  --assignment-env-file <path>\n  --aux-blind-exit-assignment-env-file <path>"
     );
 }
 
@@ -1706,6 +1761,7 @@ mod tests {
             traversal_env_file: Some(traversal_env.clone()),
             dns_zone_env_file: None,
             assignment_env_file: None,
+            aux_blind_exit_assignment_env_file: None,
         };
 
         let err = build_signed_state_refresh_context(&config)

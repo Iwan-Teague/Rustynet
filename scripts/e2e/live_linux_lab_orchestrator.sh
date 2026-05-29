@@ -3420,6 +3420,28 @@ stage_issue_and_distribute_assignments() {
   append_env_assignment "$env_path" "BUNDLE_TTL_SECS" "3600"
   live_lab_issue_assignment_bundles_from_env "$exit_target" "$env_path" "/tmp/rn_issue_assignments.env" || return 1
 
+  # Build the serving-blind_exit assignment variant for the aux node, used by
+  # the role-switch matrix when it enforces blind_exit on the mac. A blind_exit
+  # node serves exit traffic and cannot consume an exit, so: add
+  # exit_server,blind_exit to its assignment intent (the daemon requires
+  # blind_exit in the intent when enforced as blind_exit) and drop its exit
+  # assignment (client-3|exit-1 -> client-3|-). The role-switch test issues a
+  # fresh bundle from this env for the blind_exit phase and the baseline env on
+  # restore to client.
+  local aux_node_id be_nodes be_assignments be_env be_exit_node_id
+  aux_node_id="$(node_id_for_label aux)"
+  be_exit_node_id="$EXIT_NODE_ID"
+  if [[ -n "$aux_node_id" ]]; then
+    be_nodes="$(printf '%s' "$NODES_SPEC" | sed "s~\(${aux_node_id}|[^|]*|[^|]*|\)client,relay_host||||client,relay_host~\1client,relay_host,exit_server,blind_exit||||client,relay_host,exit_server,blind_exit~")"
+    be_assignments="$(printf '%s' "$ASSIGNMENTS_SPEC" | sed "s~${aux_node_id}|${be_exit_node_id}~${aux_node_id}|-~")"
+    be_env="$STATE_DIR/issue_assignments_aux_blind_exit.env"
+    : > "$be_env"
+    append_env_assignment "$be_env" "NODES_SPEC" "$be_nodes"
+    append_env_assignment "$be_env" "ALLOW_SPEC" "$ALLOW_SPEC"
+    append_env_assignment "$be_env" "ASSIGNMENTS_SPEC" "$be_assignments"
+    append_env_assignment "$be_env" "BUNDLE_TTL_SECS" "3600"
+  fi
+
   verifier_local="$STATE_DIR/assignment.pub"
   live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment.pub" "$verifier_local" || return 1
   run_parallel_node_stage issue_and_distribute_assignments distribute_assignment_worker
@@ -4677,6 +4699,7 @@ stage_run_live_role_switch_matrix() {
     --traversal-env-file "$STATE_DIR/issue_traversal.env" \
     --dns-zone-env-file "$STATE_DIR/issue_dns_zone.env" \
     --assignment-env-file "$STATE_DIR/issue_assignments.env" \
+    --aux-blind-exit-assignment-env-file "$STATE_DIR/issue_assignments_aux_blind_exit.env" \
     --exit-host "$(node_target_for_label exit)" \
     --exit-node-id "$(node_id_for_label exit)" \
     --debian-host "$(node_target_for_label client)" \
