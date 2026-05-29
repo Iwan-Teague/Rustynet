@@ -4676,6 +4676,7 @@ stage_run_live_role_switch_matrix() {
     --known-hosts "$SSH_KNOWN_HOSTS_FILE" \
     --traversal-env-file "$STATE_DIR/issue_traversal.env" \
     --dns-zone-env-file "$STATE_DIR/issue_dns_zone.env" \
+    --assignment-env-file "$STATE_DIR/issue_assignments.env" \
     --exit-host "$(node_target_for_label exit)" \
     --exit-node-id "$(node_id_for_label exit)" \
     --debian-host "$(node_target_for_label client)" \
