@@ -22,7 +22,6 @@ Environment=RUSTYNET_MEMBERSHIP_SNAPSHOT=/var/lib/rustynet/membership.snapshot
 Environment=RUSTYNET_MEMBERSHIP_LOG=/var/lib/rustynet/membership.log
 Environment=RUSTYNET_MEMBERSHIP_WATERMARK=/var/lib/rustynet/membership.watermark
 Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_ADDR=127.0.0.1:51822
-Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_TOKEN_PATH=
 Environment=RUSTYNET_ANCHOR_BUNDLE_PULL_ALLOW_LAN=false
 Environment=RUSTYNET_GOSSIP_WATERMARK=/var/lib/rustynet/rustynetd.gossip.watermark
 Environment=RUSTYNET_ENROLLMENT_SECRET=/var/lib/rustynet/keys/enrollment.secret
