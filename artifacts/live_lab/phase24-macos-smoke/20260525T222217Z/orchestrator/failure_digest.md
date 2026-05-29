@@ -1,4 +1,4 @@
-# Live Linux Lab Failure Digest (20260528T205811Z)
+# Live Linux Lab Failure Digest (20260529T064340Z)
 
 - overall_status: `fail`
 - report_dir: `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator`
@@ -27,6 +27,6 @@
 
 - first_failed_stage: `live_anchor`
 - severity: `hard`
-- rc: `70`
+- rc: `1`
 - likely_reason: [stage:live_anchor] failure digest: artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/failure_digest.md
 - full_log: `artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator/logs/live_anchor.log`

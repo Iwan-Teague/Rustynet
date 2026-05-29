@@ -3244,17 +3244,18 @@ stage_membership_setup() {
   live_lab_run_root "$exit_target" "root test -f /var/lib/rustynet/membership.snapshot && root test -f /var/lib/rustynet/membership.log && root test -f /var/lib/rustynet/membership.watermark && root chown rustynetd:rustynetd /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark && root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark" || return 1
   while IFS=$'\t' read -r _label target node_id pub_hex; do
     [[ "$node_id" == "$exit_node_id" ]] && continue
-    # Capability assignment differentiates the blind_exit test target (aux)
-    # from the admin test targets (all other non-exit nodes).
-    # anchor and blind_exit cannot coexist in one membership entry:
-    # - admin role requires anchor (NodeRole::Admin rejects blind_exit)
-    # - blind_exit role requires blind_exit (NodeRole::BlindExit rejects anchor)
-    # The role-switch matrix tests aux as blind_exit and all others as admin.
+    # aux gets blind_exit; other clients get baseline client caps without
+    # anchor.  anchor and blind_exit cannot coexist in one membership entry.
+    # anchor is added to the admin-role test nodes (client, entry, extra) by
+    # stage_upgrade_admin_node_membership after live_anchor completes, so that
+    # live_anchor can verify the correct lex-min authority without interference
+    # from client-1 (which sorts before client-2/exit-1 and would otherwise
+    # become the lex-min, breaking the validate_lex_min_anchor_authority check).
     local node_caps
     if [[ "$_label" == "aux" ]]; then
       node_caps="client,relay_host,exit_server,blind_exit"
     else
-      node_caps="client,relay_host,anchor,exit_server"
+      node_caps="client,relay_host,exit_server"
     fi
     local add_out add_rc
     add_out="$(live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" 2>&1)"
@@ -3324,6 +3325,33 @@ root rm -f '${watermark_path}' '${remote_snapshot}' '${remote_log}'
       live_lab_run_root "$target" "root mkdir -p /var/lib/rustynet && root install -m 0600 -o rustynetd -g rustynetd '${remote_snapshot}' /var/lib/rustynet/membership.snapshot && root install -m 0600 -o rustynetd -g rustynetd '${remote_log}' /var/lib/rustynet/membership.log && root rm -f /var/lib/rustynet/membership.watermark '${remote_snapshot}' '${remote_log}'"
       ;;
   esac
+}
+
+stage_upgrade_admin_node_membership() {
+  # After live_anchor completes, promote the admin-role test nodes (client,
+  # entry, extra) to anchor capability so live_role_switch_matrix can switch
+  # them to NodeRole::Admin.  live_anchor requires that no node with an ID
+  # that sorts before the second_anchor_node_id (client-2) carries anchor
+  # capability during its run — client-1 < client-2 alphabetically, so giving
+  # client-1 anchor in membership_setup would break the lex-min authority check.
+  # Running this stage after live_anchor avoids that conflict while still
+  # satisfying live_role_switch_matrix's need for anchor on admin-role nodes.
+  local exit_target exit_node_id owner_approver_id label node_id
+  exit_target="$(node_target_for_label exit)"
+  exit_node_id="$(node_id_for_label exit)"
+  owner_approver_id="${exit_node_id}-owner"
+  for label in client entry extra; do
+    has_label "$label" || continue
+    node_id="$(node_id_for_label "$label")"
+    live_lab_run_root "$exit_target" \
+      "root rustynet ops e2e-membership-set-capabilities --node-id '${node_id}' --capabilities 'client,relay_host,exit_server,anchor' --owner-approver-id '${owner_approver_id}'" || return 1
+  done
+  local snapshot_local log_local
+  snapshot_local="$STATE_DIR/membership.snapshot"
+  log_local="$STATE_DIR/membership.log"
+  live_lab_capture_root "$exit_target" "root cat /var/lib/rustynet/membership.snapshot" > "$snapshot_local" || return 1
+  live_lab_capture_root "$exit_target" "root cat /var/lib/rustynet/membership.log" > "$log_local" || return 1
+  run_parallel_node_stage upgrade_admin_node_membership distribute_membership_worker non_exit
 }
 
 stage_issue_and_distribute_assignments() {
@@ -7792,9 +7820,11 @@ main() {
     record_stage_skip "validate_baseline_runtime" "hard" "dry-run: not executed"
     if has_five_node_release_gate_topology; then
       record_stage_skip "live_anchor" "hard" "dry-run: not executed"
+      record_stage_skip "upgrade_admin_node_membership" "hard" "dry-run: not executed"
       record_stage_skip "live_role_switch_matrix" "hard" "dry-run: not executed"
     else
       record_stage_skip "live_anchor" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
+      record_stage_skip "upgrade_admin_node_membership" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
       record_stage_skip "live_role_switch_matrix" "hard" "dry-run: skipped because the five-node release-gate topology is not configured"
     fi
     if has_label entry; then
@@ -7925,9 +7955,11 @@ main() {
     else
       record_stage_skip live_anchor hard "live anchor traffic validation currently supports linux anchors; ${anchor_platform} anchors are covered by non-mutating plan gates"
     fi
+    run_stage hard upgrade_admin_node_membership 'promote admin nodes to anchor capability for role-switch matrix' stage_upgrade_admin_node_membership
     run_stage hard live_role_switch_matrix 'run controlled role switch validation' stage_run_live_role_switch_matrix
   else
     record_stage_skip live_anchor hard 'requires the full five-node topology (entry, aux, and extra targets)'
+    record_stage_skip upgrade_admin_node_membership hard 'requires the full five-node topology (entry, aux, and extra targets)'
     record_stage_skip live_role_switch_matrix hard 'requires the full five-node topology (entry, aux, and extra targets)'
   fi
 
