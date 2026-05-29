@@ -10904,6 +10904,7 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
                         config.passphrase_path.as_path(),
                         Some(account.as_str()),
                         None,
+                        false,
                     )?;
                     secure_remove_if_present(config.passphrase_path.as_path())?;
                     return Ok(format!(
@@ -11005,6 +11006,7 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
                     passphrase_tmp.as_path(),
                     Some(account.as_str()),
                     None,
+                    false,
                 )?;
                 let removed_runtime_plaintext =
                     secure_remove_if_present(config.passphrase_path.as_path())?;
