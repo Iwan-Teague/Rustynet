@@ -3244,17 +3244,19 @@ stage_membership_setup() {
   live_lab_run_root "$exit_target" "root test -f /var/lib/rustynet/membership.snapshot && root test -f /var/lib/rustynet/membership.log && root test -f /var/lib/rustynet/membership.watermark && root chown rustynetd:rustynetd /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark && root chmod 0600 /var/lib/rustynet/membership.snapshot /var/lib/rustynet/membership.log /var/lib/rustynet/membership.watermark" || return 1
   while IFS=$'\t' read -r _label target node_id pub_hex; do
     [[ "$node_id" == "$exit_node_id" ]] && continue
-    # Caps assigned to every non-exit node so the orchestrator can flip
-    # them between Client / Relay / Exit / BlindExit roles at runtime
-    # without re-issuing membership:
-    #   - client       : default daemon NodeRole::Client requirement
-    #   - relay_host   : lets peer carry signed traffic for others
-    #   - exit_server  : lets the node be promoted to exit during handoff
-    #   - blind_exit   : satisfies NodeRole::BlindExit (used by lan_toggle)
-    # Anchor is intentionally OMITTED — NodeRole::BlindExit rejects any
-    # membership entry carrying Anchor. Only the exit-1 genesis node owns
-    # the anchor role in this lab.
-    live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}' --capabilities 'client,relay_host,exit_server,blind_exit'" || return 1
+    # Capability assignment differentiates the blind_exit test target (aux)
+    # from the admin test targets (all other non-exit nodes).
+    # anchor and blind_exit cannot coexist in one membership entry:
+    # - admin role requires anchor (NodeRole::Admin rejects blind_exit)
+    # - blind_exit role requires blind_exit (NodeRole::BlindExit rejects anchor)
+    # The role-switch matrix tests aux as blind_exit and all others as admin.
+    local node_caps
+    if [[ "$_label" == "aux" ]]; then
+      node_caps="client,relay_host,exit_server,blind_exit"
+    else
+      node_caps="client,relay_host,anchor,exit_server"
+    fi
+    live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" || return 1
   done < "$PUBKEYS_TSV"
 }
 
