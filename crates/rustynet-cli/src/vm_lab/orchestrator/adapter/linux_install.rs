@@ -145,6 +145,10 @@ pub fn enforce_daemon(
     // SSH_ALLOW_CIDRS may contain commas; quote the whole arg.
     // Backslash-escape any single quotes in the cidr string (none expected in practice).
     let ssh_allow_cidrs = ctx.ssh_allow_cidrs.replace('\'', "'\\''");
+    // node_id flows from inventory/daemon status into a single-quoted arg below;
+    // escape embedded single quotes for parity with ssh_allow_cidrs so a stray
+    // quote cannot break out of the quoting (defence-in-depth).
+    let node_id = node_id.replace('\'', "'\\''");
 
     // Detect the SSH user's home directory for the source root that the
     // bootstrap script extracts to (`${HOME}/Rustynet`).

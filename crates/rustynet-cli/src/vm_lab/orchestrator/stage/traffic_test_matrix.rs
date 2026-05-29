@@ -96,6 +96,14 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         const PING_RETRY_INTERVAL_SECS: u64 = 5;
 
         for src_alias in &aliases {
+            // Tracks whether this src demonstrated baseline mesh reachability
+            // (reached at least one peer). The default-deny negative test below
+            // is only meaningful once we know the data path works: otherwise a
+            // ping that "fails" to the denied IP could simply mean the interface
+            // is down, and crediting that as "blocked" would fake-pass the
+            // security control. No baseline → the negative result is inconclusive
+            // and must fail closed, not silently pass.
+            let mut src_reached_peer = false;
             // Positive tests: ping each peer (with retry to allow handshake settle)
             for peer_alias in &aliases {
                 if peer_alias == src_alias {
@@ -128,7 +136,9 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                     }
                 };
                 match final_result {
-                    Some(Ok(TrafficTestResult::Reachable)) => {}
+                    Some(Ok(TrafficTestResult::Reachable)) => {
+                        src_reached_peer = true;
+                    }
                     Some(Ok(TrafficTestResult::Blocked)) => {
                         errors.push(format!(
                             "{src_alias} → {peer_alias} ({peer_ip}): blocked (expected reachable)"
@@ -142,22 +152,45 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                 }
             }
 
-            // Negative test: confirm default-deny
-            // TEST-NET-2 (RFC 5737) — never routable in real meshes
+            // Negative test: confirm default-deny.
+            // TEST-NET-2 (RFC 5737) — never routable in real meshes.
+            //
+            // Security posture: this verifies a default-deny ACL, so it must
+            // fail CLOSED. A "blocked" result only counts as a pass when the
+            // node has proven baseline mesh reachability above — otherwise an
+            // unreachable denied IP is indistinguishable from a dead data path
+            // and crediting it would fake-pass the control. A probe Error is
+            // likewise inconclusive, not a pass.
             let denied_ip = "198.51.100.1";
             match ctx
                 .adapters
                 .get(src_alias.as_str())
                 .map(|a| a.probe_denied_peer(denied_ip))
             {
-                Some(Ok(TrafficTestResult::Blocked)) | Some(Ok(TrafficTestResult::Error(_))) => {}
+                Some(Ok(TrafficTestResult::Blocked)) => {
+                    if !src_reached_peer {
+                        errors.push(format!(
+                            "{src_alias}: default-deny INCONCLUSIVE — {denied_ip} was unreachable \
+                             but the node reached no mesh peer, so the block cannot be attributed \
+                             to policy (failing closed)"
+                        ));
+                    }
+                }
                 Some(Ok(TrafficTestResult::Reachable)) => {
                     errors.push(format!(
                         "{src_alias}: default-deny VIOLATED — {denied_ip} was reachable"
                     ));
                 }
+                Some(Ok(TrafficTestResult::Error(e))) => {
+                    errors.push(format!(
+                        "{src_alias}: default-deny INCONCLUSIVE — probe to {denied_ip} errored \
+                         ({e}); cannot confirm the target is blocked by policy (failing closed)"
+                    ));
+                }
                 Some(Err(e)) => errors.push(format!("{src_alias}: probe_denied_peer error: {e}")),
-                None => {} // no adapter: skip denied probe
+                None => errors.push(format!(
+                    "{src_alias}: no adapter; cannot run default-deny negative test (failing closed)"
+                )),
             }
         }
 
