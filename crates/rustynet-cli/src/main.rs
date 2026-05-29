@@ -7454,8 +7454,15 @@ fn refresh_trust_record_with_inputs(
                 trust_signing_key_passphrase_path,
                 "trust signer key passphrase file",
             )?;
+            // The trust evidence must stay readable by the daemon (uid
+            // rustynetd) — it reloads it on every reconcile. Write it
+            // root:<daemon_group> 0640, matching the bootstrap seed and the
+            // Linux path. Writing it root:wheel 0600 (effective uid/gid) would
+            // fail closed in the daemon with "trust evidence open failed:
+            // Permission denied".
+            let trust_group_gid = group_gid_required(daemon_group)?;
             ensure_directory_with_mode_owner(target_dir, 0o700, None, None)?;
-            (Uid::effective(), Gid::effective(), 0o600)
+            (Uid::from_raw(0), trust_group_gid, 0o640)
         }
     };
 
