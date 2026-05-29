@@ -1094,12 +1094,14 @@ fn force_runtime_state_refresh(
     host: &str,
     platform: &str,
 ) -> Result<(), String> {
-    run_root(
-        identity,
-        known_hosts,
-        host,
-        "rustynet ops force-local-assignment-refresh-now",
-    )?;
+    if platform != "macos" {
+        run_root(
+            identity,
+            known_hosts,
+            host,
+            "rustynet ops force-local-assignment-refresh-now",
+        )?;
+    }
     wait_for_daemon_socket(
         identity,
         known_hosts,
