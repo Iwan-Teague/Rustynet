@@ -81,7 +81,12 @@ FIFTH_CLIENT_TARGET_DECLARED=0
 PROFILE_PATH=""
 DEFAULT_PROFILE_PATH="${ROOT_DIR}/profiles/live_lab/default_four_node.env"
 SOURCE_MODE_EXPLICIT=0
-TRAVERSAL_TTL_SECS=120
+# Lab traversal bundle TTL. Long (1h) to match the lab's other long-freshness
+# windows (assignment 3600s, trust/max-age 86400s): the lab issues signed state
+# once and does not rotate it, and macOS has no local traversal auto-refresh, so
+# a short 120s bundle ages out mid-settle (e.g. the blind_exit role-switch),
+# tripping "traversal bundle is stale". The daemon traversal max-age is 86400s.
+TRAVERSAL_TTL_SECS=3600
 MANAGED_DNS_FATAL_PATTERN_1='rustynetd-managed-dns\.service failed to reach active state'
 MANAGED_DNS_FATAL_PATTERN_2='command failed \(systemctl restart rustynetd-managed-dns\.service\)'
 MANAGED_DNS_FATAL_PATTERN_3='Job for rustynetd-managed-dns\.service canceled'
@@ -159,7 +164,7 @@ options:
   --rerun-stage <stage>          Rerun one setup stage in an existing report dir
   --max-parallel-node-workers <n>
                                 Cap concurrent parallel worker fan-out (default: ${MAX_PARALLEL_NODE_WORKERS})
-  --traversal-ttl-secs <secs>    Signed traversal bundle TTL for issued lab bundles (1-120, default: ${TRAVERSAL_TTL_SECS})
+  --traversal-ttl-secs <secs>    Signed traversal bundle TTL for issued lab bundles (1-86400, default: ${TRAVERSAL_TTL_SECS})
   --skip-gates                   Skip local full gate suite
   --skip-soak                    Skip extended soak/reboot stages
   --enable-chaos-suite           Run opt-in chaos/fault-injection stages after managed DNS
@@ -575,7 +580,7 @@ load_profile_file() {
       SSH_KNOWN_HOSTS_FILE) [[ -z "$SSH_KNOWN_HOSTS_FILE" ]] && SSH_KNOWN_HOSTS_FILE="$value" ;;
       NETWORK_ID) [[ "$NETWORK_ID" == rn-live-lab-* ]] && NETWORK_ID="$value" ;;
       SSH_ALLOW_CIDRS) [[ "$SSH_ALLOW_CIDRS" == "192.168.18.0/24" ]] && SSH_ALLOW_CIDRS="$value" ;;
-      TRAVERSAL_TTL_SECS) [[ "$TRAVERSAL_TTL_SECS" == "120" ]] && TRAVERSAL_TTL_SECS="$value" ;;
+      TRAVERSAL_TTL_SECS) [[ "$TRAVERSAL_TTL_SECS" == "3600" ]] && TRAVERSAL_TTL_SECS="$value" ;;
       CROSS_NETWORK_NAT_PROFILES) [[ "$CROSS_NETWORK_NAT_PROFILES" == "${RUSTYNET_CROSS_NETWORK_NAT_PROFILES:-baseline_lan}" ]] && CROSS_NETWORK_NAT_PROFILES="$value" ;;
       CROSS_NETWORK_REQUIRED_NAT_PROFILES) [[ -z "$CROSS_NETWORK_REQUIRED_NAT_PROFILES" ]] && CROSS_NETWORK_REQUIRED_NAT_PROFILES="$value" ;;
       CROSS_NETWORK_IMPAIRMENT_PROFILE) [[ "$CROSS_NETWORK_IMPAIRMENT_PROFILE" == "${RUSTYNET_CROSS_NETWORK_IMPAIRMENT_PROFILE:-none}" ]] && CROSS_NETWORK_IMPAIRMENT_PROFILE="$value" ;;
@@ -7822,8 +7827,8 @@ main() {
     cargo run --quiet -p rustynet-cli -- ops validate-ipv4-address --ip "$CROSS_NETWORK_PROBE_UNDERLAY_IP" >/dev/null
   fi
   prepare_cross_network_profile_config
-  if (( TRAVERSAL_TTL_SECS > 120 )); then
-    printf 'traversal TTL seconds must be <= 120 (got: %s)\n' "$TRAVERSAL_TTL_SECS" >&2
+  if (( TRAVERSAL_TTL_SECS > 86400 )); then
+    printf 'traversal TTL seconds must be <= 86400 (got: %s)\n' "$TRAVERSAL_TTL_SECS" >&2
     exit 2
   fi
 
