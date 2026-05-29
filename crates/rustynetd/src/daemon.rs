@@ -1074,7 +1074,10 @@ fn handle_anchor_bundle_pull_stream(
     mut stream: TcpStream,
     token_path: &Path,
     bundle_path: &Path,
+    local_node_id: &str,
 ) -> Result<AnchorBundlePullOutcome, AnchorBundlePullStreamError> {
+    use rustynet_control::membership::snapshot_bytes_have_bundle_pull_capability;
+    use std::io::Write as _;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|err| {
@@ -1098,6 +1101,13 @@ fn handle_anchor_bundle_pull_stream(
     let bundle = load_anchor_bundle_pull_bundle(bundle_path).map_err(|source| {
         AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
     })?;
+    if !snapshot_bytes_have_bundle_pull_capability(&bundle, local_node_id) {
+        let _ = stream.write_all(b"ERR forbidden after revocation\n");
+        return Err(AnchorBundlePullStreamError::with_token(
+            DaemonError::State("anchor.bundle_pull capability revoked".to_owned()),
+            token_thumbprint,
+        ));
+    }
     write_anchor_bundle_pull_response(stream, &presented_token, &expected_token, &bundle).map_err(
         |source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()),
     )?;
@@ -9240,6 +9250,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                             stream,
                             token_path.as_path(),
                             config.membership_snapshot_path.as_path(),
+                            &config.node_id,
                         ) {
                             Ok(outcome) => {
                                 log::info!(
