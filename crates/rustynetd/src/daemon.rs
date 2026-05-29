@@ -10371,21 +10371,18 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         } else {
             Vec::new()
         };
-        let membership_state = replay_membership_snapshot_and_log(
+        // Validate structural integrity of snapshot + log only.  Role/capability
+        // alignment is intentionally NOT checked here: during a live role switch
+        // the membership snapshot may not yet reflect the new role, and the daemon
+        // must still be able to start (it enters restricted-safe mode until the
+        // next reconcile cycle re-validates alignment).
+        replay_membership_snapshot_and_log(
             &membership_snapshot,
             &membership_entries,
             unix_now(),
         )
         .map_err(|err| {
             DaemonError::InvalidConfig(format!("membership replay preflight failed: {err}"))
-        })?;
-        validate_node_role_membership_alignment(
-            &membership_state,
-            &config.node_id,
-            config.node_role,
-        )
-        .map_err(|err| {
-            DaemonError::InvalidConfig(format!("membership role preflight failed: {err}"))
         })?;
     }
 
