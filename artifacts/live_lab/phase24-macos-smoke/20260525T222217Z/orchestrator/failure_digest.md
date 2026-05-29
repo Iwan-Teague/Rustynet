@@ -1,4 +1,4 @@
-# Live Linux Lab Failure Digest (20260529T064340Z)
+# Live Linux Lab Failure Digest (20260529T074441Z)
 
 - overall_status: `fail`
 - report_dir: `/Users/iwan/Desktop/Rustynet/artifacts/live_lab/phase24-macos-smoke/20260525T222217Z/orchestrator`
@@ -14,6 +14,41 @@
 - `PASS` `cleanup_hosts`: all targeted nodes cleaned prior RustyNet state successfully
 - `PASS` `bootstrap_hosts`: all targeted nodes bootstrapped and compiled RustyNet successfully
 - `PASS` `collect_pubkeys`: all targeted nodes exported WireGuard public keys successfully
+- `PASS` `membership_setup`: primary exit applied signed membership updates successfully
+- `PASS` `distribute_membership_state`: membership state distributed to all targeted peer nodes successfully
+- `PASS` `issue_and_distribute_assignments`: signed assignments were issued and distributed to all targeted nodes successfully
+- `PASS` `issue_and_distribute_traversal`: stage passed
+- `PASS` `issue_and_distribute_dns_zone`: stage passed
+- `PASS` `enforce_baseline_runtime`: all targeted nodes enforced baseline runtime successfully
+- `PASS` `validate_baseline_runtime`: all targeted nodes connected to the network correctly under baseline validation
+- `FAIL` `live_anchor`: stage failed
+- `FAIL` `live_anchor`: stage failed
+- `SKIPPED` `preflight`: stage skipped
+- `SKIPPED` `prepare_source_archive`: stage skipped
+- `SKIPPED` `verify_ssh_reachability`: stage skipped
+- `SKIPPED` `prime_remote_access`: stage skipped
+- `SKIPPED` `macos_preflight_check`: stage skipped
+- `SKIPPED` `cleanup_hosts`: stage skipped
+- `SKIPPED` `bootstrap_hosts`: stage skipped
+- `SKIPPED` `collect_pubkeys`: stage skipped
+- `PASS` `membership_setup`: primary exit applied signed membership updates successfully
+- `PASS` `distribute_membership_state`: membership state distributed to all targeted peer nodes successfully
+- `PASS` `issue_and_distribute_assignments`: signed assignments were issued and distributed to all targeted nodes successfully
+- `PASS` `issue_and_distribute_traversal`: stage passed
+- `PASS` `issue_and_distribute_dns_zone`: stage passed
+- `PASS` `enforce_baseline_runtime`: all targeted nodes enforced baseline runtime successfully
+- `PASS` `validate_baseline_runtime`: all targeted nodes connected to the network correctly under baseline validation
+- `PASS` `live_anchor`: stage passed
+- `PASS` `upgrade_admin_node_membership`: stage passed
+- `FAIL` `live_role_switch_matrix`: controlled role-switch validation failed
+- `SKIPPED` `preflight`: stage skipped
+- `SKIPPED` `prepare_source_archive`: stage skipped
+- `SKIPPED` `verify_ssh_reachability`: stage skipped
+- `SKIPPED` `prime_remote_access`: stage skipped
+- `SKIPPED` `macos_preflight_check`: stage skipped
+- `SKIPPED` `cleanup_hosts`: stage skipped
+- `SKIPPED` `bootstrap_hosts`: stage skipped
+- `SKIPPED` `collect_pubkeys`: stage skipped
 - `PASS` `membership_setup`: primary exit applied signed membership updates successfully
 - `PASS` `distribute_membership_state`: membership state distributed to all targeted peer nodes successfully
 - `PASS` `issue_and_distribute_assignments`: signed assignments were issued and distributed to all targeted nodes successfully
