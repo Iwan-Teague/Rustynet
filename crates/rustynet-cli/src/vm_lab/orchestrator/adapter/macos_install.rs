@@ -378,6 +378,16 @@ pub fn enforce_daemon(
     let wg_interface = utun_name_for_node_id(&node_id);
     validate_utun_name(&wg_interface)?;
 
+    // Escape single quotes in values interpolated into single-quoted shell args
+    // (parity with the Linux enforce path, which escapes ssh_allow_cidrs). The
+    // un-escaped `node_id` above is still used for the utun derivation; only the
+    // shell interpolation below uses the escaped copies. daemon_node_role comes
+    // from a fixed enum mapping and wg_interface is digit-validated, so neither
+    // needs escaping.
+    let node_id_arg = node_id.replace('\'', "'\\''");
+    let network_id_arg = ctx.network_id.replace('\'', "'\\''");
+    let ssh_allow_cidrs_arg = ssh_allow_cidrs.replace('\'', "'\\''");
+
     // Write the install-service script to a temp file on the remote host and
     // re-invoke it with enforce-mode settings.  The script is compiled into the
     // binary so the same version is always used; the local working copy stays in
@@ -406,9 +416,9 @@ pub fn enforce_daemon(
          sudo /tmp/Install-RustyNetMacosService.sh \
            --rustynetd-bin {MACOS_RUSTYNETD_PATH} \
            --state-root {MACOS_STATE_ROOT} \
-           --node-id '{node_id}' \
+           --node-id '{node_id_arg}' \
            --node-role '{daemon_node_role}' \
-           --network-id '{network_id}' \
+           --network-id '{network_id_arg}' \
            --wg-interface '{wg_interface}' \
            --auto-tunnel-enforce true \
            --trust-max-age-secs 86400 \
@@ -416,8 +426,7 @@ pub fn enforce_daemon(
            --traversal-max-age-secs 86400 \
            --dns-zone-max-age-secs 86400 \
            --fail-closed-ssh-allow '{ssh_allow_flag}' \
-           --fail-closed-ssh-allow-cidrs '{ssh_allow_cidrs}'",
-        network_id = ctx.network_id,
+           --fail-closed-ssh-allow-cidrs '{ssh_allow_cidrs_arg}'",
     );
     ssh::run_remote(conn, &script, Duration::from_secs(60))?;
     // The install script reloads the launchd plist, which bounces the daemon.

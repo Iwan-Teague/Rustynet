@@ -63,7 +63,8 @@ pub fn init_membership_snapshot(
     peers: &[NodeMembershipPeer],
 ) -> Result<MembershipSnapshot, AdapterError> {
     use crate::vm_lab::orchestrator::adapter::windows_install::{
-        WINDOWS_MEMBERSHIP_OWNER_KEY_PATH, WINDOWS_RUSTYNETD_PATH, WINDOWS_WG_PASSPHRASE_PATH,
+        WINDOWS_MEMBERSHIP_OWNER_KEY_PATH, WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH,
+        WINDOWS_RUSTYNETD_PATH,
     };
 
     // Derive the owner approver ID from the exit node's node_id.
@@ -76,8 +77,12 @@ pub fn init_membership_snapshot(
 
     // Add each non-exit peer via `rustynetd membership add-peer`.
     // The owner signing key lives at WINDOWS_MEMBERSHIP_OWNER_KEY_PATH and is
-    // encrypted with the passphrase stored in the DPAPI blob at
-    // WINDOWS_WG_PASSPHRASE_PATH; `read_passphrase_file_explicit` on Windows
+    // encrypted with the SIGNING passphrase stored in the DPAPI blob at
+    // WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH. Bootstrap deliberately uses a
+    // passphrase distinct from the WireGuard key passphrase (see windows_install
+    // bootstrap, which fails closed if the two collide), so we must hand the
+    // signing passphrase here — not the WG one — or decryption of the owner key
+    // fails and add-peer aborts. `read_passphrase_file_explicit` on Windows
     // auto-decrypts DPAPI blobs.
     for peer in peers {
         if peer.role == NodeRole::Exit {
@@ -108,7 +113,7 @@ pub fn init_membership_snapshot(
             owner_q = ps_quote(exit_node_id)?,
             approver_q = ps_quote(&approver_id)?,
             signing_key_q = ps_quote(WINDOWS_MEMBERSHIP_OWNER_KEY_PATH)?,
-            passphrase_q = ps_quote(WINDOWS_WG_PASSPHRASE_PATH)?,
+            passphrase_q = ps_quote(WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH)?,
             peer_id = &peer.node_id,
         );
         // Invoke-RustyNetBootstrapNative is defined in the bootstrap script which
@@ -413,7 +418,8 @@ mod tests {
     #[test]
     fn init_membership_snapshot_uses_rustynetd_not_trust_cli() {
         use crate::vm_lab::orchestrator::adapter::windows_install::{
-            WINDOWS_MEMBERSHIP_OWNER_KEY_PATH, WINDOWS_RUSTYNETD_PATH, WINDOWS_WG_PASSPHRASE_PATH,
+            WINDOWS_MEMBERSHIP_OWNER_KEY_PATH, WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH,
+            WINDOWS_RUSTYNETD_PATH,
         };
         // These constants are referenced in the generated PS script. Verify the paths
         // are all under the reviewed state/install roots and contain the expected names.
@@ -425,9 +431,11 @@ mod tests {
             WINDOWS_MEMBERSHIP_OWNER_KEY_PATH.contains("membership.owner.key"),
             "signing key path must reference membership owner key: {WINDOWS_MEMBERSHIP_OWNER_KEY_PATH}"
         );
+        // add-peer must decrypt the owner signing key with the SIGNING passphrase,
+        // not the WireGuard key passphrase (bootstrap stores them separately).
         assert!(
-            WINDOWS_WG_PASSPHRASE_PATH.ends_with(".dpapi"),
-            "passphrase path must be a DPAPI blob: {WINDOWS_WG_PASSPHRASE_PATH}"
+            WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH.ends_with(".dpapi"),
+            "signing passphrase path must be a DPAPI blob: {WINDOWS_MEMBERSHIP_SIGNING_PASSPHRASE_PATH}"
         );
         // The trust CLI is NOT referenced in init_membership_snapshot.
         // If the WINDOWS_RUSTYNET_PATH constant is removed from module-level imports,
