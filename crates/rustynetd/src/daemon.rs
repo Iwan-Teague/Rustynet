@@ -4290,9 +4290,19 @@ impl DaemonRuntime {
         let _trust = self
             .load_verified_trust()
             .map_err(|err| format!("signed trust refresh failed: {err}"))?;
-        let membership_state = self
-            .load_verified_membership()
-            .map_err(|err| format!("signed membership refresh failed: {err}"))?;
+        let membership_state = match self.load_verified_membership() {
+            Ok(state) => state,
+            Err(MembershipBootstrapError::RoleMismatch(msg)) => {
+                // During a live role switch the membership snapshot may not yet
+                // reflect the new role.  Enter restricted-safe mode and return
+                // success so callers (e.g. install-systemd enforce) succeed; the
+                // reconcile loop re-evaluates alignment on the next cycle.
+                let reason = format!("membership role mismatch: {msg}");
+                self.restrict_recoverable(reason);
+                return Ok(());
+            }
+            Err(err) => return Err(format!("signed membership refresh failed: {err}")),
+        };
         let membership_directory = membership_directory_from_state(&membership_state);
         let auto_bundle = if self.auto_tunnel_enforce {
             Some(
