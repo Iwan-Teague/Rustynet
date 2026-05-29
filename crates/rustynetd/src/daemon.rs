@@ -4481,6 +4481,17 @@ impl DaemonRuntime {
                     self.traversal_endpoint_change_events.saturating_add(1);
                 self.traversal_last_endpoint_fingerprint = Some(fingerprint);
                 self.traversal_last_endpoint_change_unix = Some(now_unix);
+                // A local endpoint change can leave our STUN-observed public
+                // (srflx) address stale. Force the next poll_stun_results to
+                // re-gather immediately instead of waiting out the remaining
+                // gather interval, so the new srflx candidate drifts the
+                // CandidateSet and is broadcast within a reconcile tick rather
+                // than up to DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS later.
+                // Only when STUN is active (None means STUN disabled — leave it
+                // disabled rather than starting a poll cycle that early-returns).
+                if self.next_stun_refresh_at.is_some() {
+                    self.next_stun_refresh_at = Some(Instant::now());
+                }
                 if let Err(err) = self.refresh_signed_state_with_reason(
                     true,
                     SignedStateRefreshReason::EndpointChange,
@@ -20407,6 +20418,53 @@ mod tests {
             netcheck
                 .message
                 .contains("stun_candidate_local_addrs=0.0.0.0:51820")
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Gap-2 regression: a detected local endpoint change must force the next
+    /// STUN poll to re-gather immediately, collapsing the up-to-
+    /// `DEFAULT_TRAVERSAL_STUN_GATHER_INTERVAL_SECS` wait so a moved srflx
+    /// address drifts the CandidateSet and is broadcast within a reconcile
+    /// tick. Without this, a peer whose public address changes can stay
+    /// unreachable for up to a full gather interval after the NIC change is
+    /// observed.
+    #[test]
+    fn endpoint_change_forces_immediate_stun_regather() {
+        let relay_addr: SocketAddr = "203.0.113.33:40023".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-endpoint-change-forces-stun-regather",
+            relay_addr,
+            "relay-eu-1",
+        );
+        let authoritative_local_addr: SocketAddr =
+            "0.0.0.0:51820".parse().expect("local addr should parse");
+        configure_runtime_authoritative_transport(&mut runtime, authoritative_local_addr);
+
+        // STUN active, but next refresh is scheduled far in the future
+        // (simulating "gathered recently, not due for a while").
+        let far_future = Instant::now() + Duration::from_secs(3_600);
+        runtime.next_stun_refresh_at = Some(far_future);
+
+        // Prime a stale fingerprint that differs from the current runtime
+        // endpoint fingerprint so the change branch fires. No prior change
+        // timestamp => the stability-window short-circuit is skipped.
+        runtime.traversal_last_endpoint_fingerprint = Some("stale-endpoint-fingerprint".to_owned());
+        runtime.traversal_last_endpoint_change_unix = None;
+
+        runtime.maybe_trigger_endpoint_change_refresh();
+
+        let next = runtime
+            .next_stun_refresh_at
+            .expect("STUN refresh must remain scheduled after an endpoint change");
+        assert!(
+            next <= Instant::now(),
+            "endpoint change must force the next STUN re-gather to be due immediately"
+        );
+        assert!(
+            next < far_future,
+            "endpoint change must move the STUN refresh earlier than the prior schedule"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
