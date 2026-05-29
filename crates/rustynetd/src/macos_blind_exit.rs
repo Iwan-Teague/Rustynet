@@ -322,14 +322,22 @@ fn normalize_pf_rule(line: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase();
-    // `pfctl -sr` echoes the default stateful flags ("flags S/SA") on every
-    // keep-state rule, even when the loaded ruleset omitted them. The rule
-    // strings this module generates (and the verifier's expected strings) use
-    // plain "keep state", and the live verification path feeds `pfctl -sr`
-    // output back in. Strip the canonical flags token so the loaded rules
-    // match: without this every keep-state allow reads as "missing" and the
-    // final-hop egress allow reads as an "unreviewed non-tunnel" rule.
-    collapsed.replace(" flags s/sa keep state", " keep state")
+    // `pfctl -sr` re-renders a loaded ruleset into its own canonical form,
+    // which differs textually from the rule strings this module generates
+    // (and the verifier's expected strings). The live verification path feeds
+    // `pfctl -sr` output back in, so fold pfctl's canonicalizations back to the
+    // generated form. Each replacement is idempotent (a no-op when the token is
+    // absent), so it can only make a correct rule match, never mask a real
+    // difference:
+    //   - keep-state rules gain the default stateful flags "flags S/SA"
+    //     (otherwise every keep-state allow reads as "missing" and the
+    //     final-hop egress allow reads as an "unreviewed non-tunnel" rule);
+    //   - an unspecified source is expanded to "from any to any";
+    //   - a "port 53" equality match is rendered with the operator "port = 53".
+    collapsed
+        .replace(" flags s/sa keep state", " keep state")
+        .replace(" from any to any ", " to any ")
+        .replace(" port = ", " port ")
 }
 
 fn contains_forbidden_route_primitive(lines: &[String]) -> bool {
@@ -392,6 +400,28 @@ pass out quick on rustynet0 inet all flags S/SA keep state
 pass out quick on rustynet0 inet6 all flags S/SA keep state
 pass in quick on rustynet0 inet from 100.64.0.0/10 to any flags S/SA keep state
 pass out quick on en0 inet from 100.64.0.0/10 to any flags S/SA keep state
+block drop out quick all
+";
+        let reasons = evaluate_macos_blind_exit_pf_rules(rules, &cfg);
+        assert!(reasons.is_empty(), "{reasons:?}");
+    }
+
+    #[test]
+    fn evaluator_accepts_pfctl_rendered_dns_rules() {
+        // With dns_protected, pfctl additionally renders "port 53" as
+        // "port = 53" and expands the unspecified source to "from any to any".
+        // The live verification feeds that back in and it must still validate.
+        let mut cfg = config();
+        cfg.dns_protected = true;
+        let rules = "\
+pass out quick on rustynet0 inet all flags S/SA keep state
+pass out quick on rustynet0 inet6 all flags S/SA keep state
+pass in quick on rustynet0 inet from 100.64.0.0/10 to any flags S/SA keep state
+pass out quick on en0 inet from 100.64.0.0/10 to any flags S/SA keep state
+pass out quick on rustynet0 inet proto udp from any to any port = 53 keep state
+block drop out quick inet proto udp from any to any port = 53
+pass out quick on rustynet0 inet proto tcp from any to any port = 53 flags S/SA keep state
+block drop out quick inet proto tcp from any to any port = 53
 block drop out quick all
 ";
         let reasons = evaluate_macos_blind_exit_pf_rules(rules, &cfg);
