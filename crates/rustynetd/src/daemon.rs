@@ -1092,22 +1092,24 @@ fn handle_anchor_bundle_pull_stream(
                 "anchor bundle-pull write timeout failed: {err}"
             )))
         })?;
+    // Load the bundle and check capability before reading the token from
+    // the client.  Revocation updates the snapshot on disk; loading here
+    // (at accept-time) rather than after the network read ensures that a
+    // connection accepted before revocation sees the pre-revocation state.
+    let bundle = load_anchor_bundle_pull_bundle(bundle_path)
+        .map_err(AnchorBundlePullStreamError::without_token)?;
+    if !snapshot_bytes_have_bundle_pull_capability(&bundle, local_node_id) {
+        let _ = stream.write_all(b"ERR forbidden after revocation\n");
+        return Err(AnchorBundlePullStreamError::without_token(
+            DaemonError::State("anchor.bundle_pull capability revoked".to_owned()),
+        ));
+    }
     let presented_token = read_anchor_bundle_pull_request_token(&mut stream)
         .map_err(AnchorBundlePullStreamError::without_token)?;
     let token_thumbprint = anchor_bundle_pull_token_thumbprint(&presented_token);
     let expected_token = load_anchor_bundle_pull_token(token_path).map_err(|source| {
         AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
     })?;
-    let bundle = load_anchor_bundle_pull_bundle(bundle_path).map_err(|source| {
-        AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
-    })?;
-    if !snapshot_bytes_have_bundle_pull_capability(&bundle, local_node_id) {
-        let _ = stream.write_all(b"ERR forbidden after revocation\n");
-        return Err(AnchorBundlePullStreamError::with_token(
-            DaemonError::State("anchor.bundle_pull capability revoked".to_owned()),
-            token_thumbprint,
-        ));
-    }
     write_anchor_bundle_pull_response(stream, &presented_token, &expected_token, &bundle).map_err(
         |source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()),
     )?;
