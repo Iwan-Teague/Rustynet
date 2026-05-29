@@ -81,13 +81,26 @@ pub fn init_membership_snapshot(
         )?;
     }
 
-    // 3. Read snapshot back as base64.
+    // 3. Read snapshot back as base64. `test -s` first so a missing/empty
+    //    snapshot fails loudly here instead of being masked by the pipe
+    //    (cat's non-zero exit is swallowed by base64's success, yielding an
+    //    empty "valid" snapshot that would later be distributed and rejected).
     let snapshot_b64 = ssh::run_remote(
         conn,
-        &format!("cat '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}' | base64",),
+        &format!(
+            "test -s '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}' && \
+             cat '{MACOS_MEMBERSHIP_SNAPSHOT_PATH}' | base64"
+        ),
         SHORT_TIMEOUT,
     )?;
     let data = base64_decode(snapshot_b64.trim())?;
+    if data.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "membership snapshot decoded to zero bytes; init-membership/\
+                      e2e-membership-add did not produce a snapshot"
+                .to_owned(),
+        });
+    }
     Ok(MembershipSnapshot { data })
 }
 
@@ -148,11 +161,17 @@ pub fn distribute_verifier_key(
     )?;
     ssh::scp_to(conn, pub_key_path, &remote_tmp, MEDIUM_TIMEOUT)?;
     let dst_dir = dst.rsplit_once('/').map_or(MACOS_STATE_ROOT, |(d, _)| d);
+    // The verifier-key destination dir ({state}/trust) is shared with the
+    // signed-bundle install, which creates it as 0700 rustynetd:rustynetd.
+    // Use the SAME owner/mode here so the last writer doesn't flip the trust
+    // dir to 0755 root:wheel and trip the daemon's key-custody/hardening
+    // posture. The key file itself stays world-readable (0644) so the daemon
+    // can read it while the dir remains rustynetd-owned.
     ssh::run_remote(
         conn,
         &format!(
-            "sudo install -d -m 0755 -o root -g wheel '{dst_dir}' && \
-             sudo install -m 0644 -o root -g wheel '{remote_tmp}' '{dst}' && \
+            "sudo install -d -m 0700 -o rustynetd -g rustynetd '{dst_dir}' && \
+             sudo install -m 0644 -o root -g rustynetd '{remote_tmp}' '{dst}' && \
              sudo rm -f '{remote_tmp}'"
         ),
         SHORT_TIMEOUT,

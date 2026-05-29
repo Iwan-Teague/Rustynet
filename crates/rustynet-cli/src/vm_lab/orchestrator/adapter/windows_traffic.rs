@@ -437,12 +437,26 @@ fn verify_no_key_material_zip(path: &Path) -> Result<(), AdapterError> {
             message: format!("list zip contents failed: {err}"),
         })?;
     if !output.status.success() {
-        // An empty archive returns non-zero from unzip -Z — treat as ok if listing is empty.
+        // Fail closed (parity with the Linux/macOS tar path): a listing we
+        // cannot read must NOT silently pass the key-exclusion invariant.
+        // The one benign non-zero case is an empty archive (`unzip -Z` exits
+        // non-zero with "Empty zipfile"/no entries) — only that is treated as
+        // OK; any other failure is a hard error.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("error") && !stderr.contains("Error") {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let listing_empty = stdout.trim().is_empty();
+        let looks_empty_archive = stderr.to_lowercase().contains("empty");
+        if listing_empty && looks_empty_archive {
             return Ok(());
         }
-        return Ok(());
+        return Err(AdapterError::Io {
+            message: format!(
+                "could not list artifact zip contents (status {}); failing closed on \
+                 key-exclusion check: {}",
+                output.status,
+                stderr.trim()
+            ),
+        });
     }
     let listing = String::from_utf8_lossy(&output.stdout);
     for entry in listing.lines() {

@@ -29,17 +29,35 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     // /run/rustynet/ is mode 770 root:rustynetd; the daemon control socket
     // is unreadable to a non-root SSH user, so the status query needs sudo.
-    let status = ssh::run_remote(
-        conn,
-        "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
-        SHORT_TIMEOUT,
-    )?;
-    ssh::parse_status_node_id(&status).ok_or_else(|| AdapterError::Protocol {
-        message: format!(
-            "node_id field not found in rustynet status output: {}",
-            &status[..status.len().min(200)]
-        ),
-    })
+    //
+    // This runs in the CollectPubkeys stage, immediately after bootstrap.
+    // `install_daemon` does NOT wait for the socket (unlike the macOS path),
+    // and systemd reports the unit active before the daemon binds its socket,
+    // so a single status query can race the daemon's startup. Retry for up to
+    // ~40 s (matching the macOS socket wait) before giving up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        let attempt_err = match ssh::run_remote(
+            conn,
+            "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status",
+            SHORT_TIMEOUT,
+        ) {
+            Ok(status) => match ssh::parse_status_node_id(&status) {
+                Some(node_id) => return Ok(node_id),
+                None => AdapterError::Protocol {
+                    message: format!(
+                        "node_id field not found in rustynet status output: {}",
+                        &status[..status.len().min(200)]
+                    ),
+                },
+            },
+            Err(e) => e,
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(attempt_err);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
 }
 
 /// Positive connectivity: ping `peer_mesh_ip` 3 times via the tunnel.
