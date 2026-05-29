@@ -3270,6 +3270,13 @@ stage_membership_setup() {
       fi
     fi
   done < "$PUBKEYS_TSV"
+  # Exit-1 is bootstrapped with anchor sub-caps but no exit_server.  Set its
+  # full capability set explicitly so that validate_exit_provider_membership
+  # passes when role-switch nodes refresh their signed assignment after
+  # upgrade_admin_node_membership distributes the updated snapshot.
+  local exit_full_caps="anchor,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative,exit_server,relay_host"
+  live_lab_run_root "$exit_target" \
+    "root rustynet ops e2e-membership-set-capabilities --node-id '${exit_node_id}' --capabilities '${exit_full_caps}' --owner-approver-id '${owner_approver_id}'" || return 1
 }
 
 stage_distribute_membership_state() {
