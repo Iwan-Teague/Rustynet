@@ -1383,6 +1383,7 @@ fn pin_client_to_expected_exit(
         Some(expected_exit_node_id),
         false,
         ASSIGNMENT_REFRESH_ENV_PATH,
+        "linux",
     )?;
     run_root(
         identity,

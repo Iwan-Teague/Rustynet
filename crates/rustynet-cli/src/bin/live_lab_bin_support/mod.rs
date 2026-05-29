@@ -1333,6 +1333,42 @@ pub fn issue_traversal_bundles_from_env(
     )
 }
 
+/// Daemon IPC socket path for the given platform. The macOS daemon
+/// listens under `/private/var/run` (there is no `/run` on macOS),
+/// while Linux uses `/run/rustynet`.
+pub fn daemon_socket_path_for_platform(platform: &str) -> &'static str {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "macos" | "darwin" => "/private/var/run/rustynet/rustynetd.sock",
+        _ => "/run/rustynet/rustynetd.sock",
+    }
+}
+
+/// Auto-tunnel assignment bundle path for the given platform. macOS
+/// keeps trust state under `/usr/local/var/rustynet/trust`.
+pub fn assignment_bundle_path_for_platform(platform: &str) -> &'static str {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "macos" | "darwin" => "/usr/local/var/rustynet/trust/rustynetd.assignment",
+        _ => "/var/lib/rustynet/rustynetd.assignment",
+    }
+}
+
+/// Auto-tunnel assignment watermark path for the given platform.
+pub fn assignment_watermark_path_for_platform(platform: &str) -> &'static str {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "macos" | "darwin" => "/usr/local/var/rustynet/trust/rustynetd.assignment.watermark",
+        _ => "/var/lib/rustynet/rustynetd.assignment.watermark",
+    }
+}
+
+/// Assignment-refresh env file path for the given platform. macOS
+/// config lives under `/usr/local/etc/rustynet`.
+pub fn assignment_refresh_env_path_for_platform(platform: &str) -> &'static str {
+    match platform.trim().to_ascii_lowercase().as_str() {
+        "macos" | "darwin" => "/usr/local/etc/rustynet/assignment-refresh.env",
+        _ => "/etc/rustynet/assignment-refresh.env",
+    }
+}
+
 pub fn enforce_host(
     identity: &Path,
     known_hosts: &Path,
@@ -1360,6 +1396,7 @@ pub fn enforce_host(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_role_coupling(
     identity: &Path,
     known_hosts: &Path,
@@ -1368,9 +1405,13 @@ pub fn apply_role_coupling(
     preferred_exit_node_id: Option<&str>,
     enable_exit_advertise: bool,
     env_path: &str,
+    platform: &str,
 ) -> Result<(), String> {
     let mut command = format!(
-        "sudo -n env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-role-coupling --target-role {} --enable-exit-advertise {} --env-path {}",
+        "sudo -n env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} rustynet ops apply-role-coupling --target-role {} --enable-exit-advertise {} --env-path {}",
+        daemon_socket_path_for_platform(platform),
+        assignment_bundle_path_for_platform(platform),
+        assignment_watermark_path_for_platform(platform),
         shell_quote(target_role),
         shell_quote(if enable_exit_advertise {
             "true"
@@ -1401,9 +1442,13 @@ pub fn apply_lan_access_coupling(
     enable: bool,
     lan_routes: Option<&str>,
     env_path: &str,
+    platform: &str,
 ) -> Result<(), String> {
     let mut command = format!(
-        "sudo -n env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-lan-access-coupling --enable {} --env-path {}",
+        "sudo -n env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} rustynet ops apply-lan-access-coupling --enable {} --env-path {}",
+        daemon_socket_path_for_platform(platform),
+        assignment_bundle_path_for_platform(platform),
+        assignment_watermark_path_for_platform(platform),
         shell_quote(if enable { "true" } else { "false" }),
         shell_quote(env_path)
     );

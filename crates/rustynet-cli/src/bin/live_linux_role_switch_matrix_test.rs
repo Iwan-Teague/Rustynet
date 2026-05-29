@@ -16,19 +16,40 @@ use std::time::{Duration, Instant};
 use live_lab_bin_support as live_lab_support;
 
 use live_lab_support::{
-    Logger, apply_role_coupling, capture_root, create_workspace, enforce_host, field_value,
-    git_head_commit, read_last_matching_line, remote_src_dir, require_command, run_cargo_ops,
-    run_root, scp_to, shell_quote, ssh_status, status, unix_now, wait_for_daemon_socket,
-    write_file,
+    Logger, apply_role_coupling, assignment_bundle_path_for_platform,
+    assignment_refresh_env_path_for_platform, assignment_watermark_path_for_platform,
+    capture_daemon_status_for_platform, capture_root, create_workspace,
+    daemon_socket_path_for_platform, enforce_host, field_value, git_head_commit,
+    read_last_matching_line, remote_src_dir, require_command, run_cargo_ops, run_root, scp_to,
+    shell_quote, ssh_status, unix_now, wait_for_daemon_socket, write_file,
 };
 
 const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 
 fn daemon_socket_for_platform(platform: &str) -> &'static str {
+    daemon_socket_path_for_platform(platform)
+}
+
+/// Remote shell snippet that prints the active default route for the
+/// given platform. Linux has `ip`; macOS uses BSD `route -n get`.
+fn route_get_command(platform: &str) -> &'static str {
     if platform == "macos" {
-        "/private/var/run/rustynet/rustynetd.sock"
+        "route -n get 1.1.1.1 2>/dev/null || true"
     } else {
-        "/run/rustynet/rustynetd.sock"
+        "ip -4 route get 1.1.1.1 || true"
+    }
+}
+
+/// True when the captured route egresses the RustyNet tunnel device.
+/// Linux programs a named `rustynet0` interface; the macOS userspace
+/// WireGuard backend egresses a kernel `utun` device (the lab has
+/// exactly one RustyNet tunnel, so `interface: utun` from BSD
+/// `route get` identifies the tunnel path).
+fn route_uses_tunnel(route: &str, platform: &str) -> bool {
+    if platform == "macos" {
+        route.contains("interface: utun")
+    } else {
+        route.contains("dev rustynet0")
     }
 }
 
@@ -536,6 +557,7 @@ fn process_host(
         context.known_hosts,
         spec.host,
         spec.temp_role,
+        spec.platform,
     )?;
 
     let mut switch_execution = "fail";
@@ -544,7 +566,12 @@ fn process_host(
     let mut least_privilege_preserved = "fail";
 
     if spec.temp_role == "blind_exit" {
-        if route_advertise_denied(context.identity, context.known_hosts, spec.host)? {
+        if route_advertise_denied(
+            context.identity,
+            context.known_hosts,
+            spec.host,
+            spec.platform,
+        )? {
             policy_still_enforced = "pass";
         }
         if exit_select_denied(
@@ -552,11 +579,21 @@ fn process_host(
             context.known_hosts,
             spec.host,
             &baseline_exit,
-        )? && lan_toggle_denied(context.identity, context.known_hosts, spec.host)?
-        {
+            spec.platform,
+        )? && lan_toggle_denied(
+            context.identity,
+            context.known_hosts,
+            spec.host,
+            spec.platform,
+        )? {
             least_privilege_preserved = "pass";
         }
-    } else if route_advertise_denied(context.identity, context.known_hosts, spec.host)? {
+    } else if route_advertise_denied(
+        context.identity,
+        context.known_hosts,
+        spec.host,
+        spec.platform,
+    )? {
         policy_still_enforced = "pass";
         least_privilege_preserved = "pass";
     }
@@ -587,7 +624,7 @@ fn process_host(
             && field_value(&after_temp, "lan_access") == "off"
             && !baseline_exit.is_empty()
             && baseline_exit != "none"
-            && client_exit_route_converged(&after_restore, &baseline_exit)
+            && client_exit_route_converged(&after_restore, &baseline_exit, spec.platform)
         {
             post_switch_reconcile = "pass";
         }
@@ -595,7 +632,7 @@ fn process_host(
         && baseline_exit != "none"
         && field_value(&after_temp, "serving_exit_node") == "false"
         && field_value(&after_temp, "exit_node") == baseline_exit
-        && client_exit_route_converged(&after_restore, &baseline_exit)
+        && client_exit_route_converged(&after_restore, &baseline_exit, spec.platform)
     {
         post_switch_reconcile = "pass";
     }
@@ -683,8 +720,12 @@ fn ensure_client_role_with_expected_exit(
     context: &mut ClientRoleContext<'_>,
     expected_exit: Option<&str>,
 ) -> Result<String, String> {
-    let baseline =
-        capture_client_role_snapshot(context.identity, context.known_hosts, context.host)?;
+    let baseline = capture_client_role_snapshot(
+        context.identity,
+        context.known_hosts,
+        context.host,
+        context.platform,
+    )?;
     let baseline_exit = expected_exit
         .filter(|value| !value.is_empty() && *value != "none")
         .map_or_else(
@@ -695,7 +736,7 @@ fn ensure_client_role_with_expected_exit(
         if role_runtime_ready(&baseline, "client") {
             return Ok(baseline);
         }
-    } else if client_exit_route_converged(&baseline, &baseline_exit) {
+    } else if client_exit_route_converged(&baseline, &baseline_exit, context.platform) {
         return Ok(baseline);
     }
 
@@ -708,6 +749,7 @@ fn ensure_client_role_with_expected_exit(
         context.ssh_allow_cidrs,
         context.platform,
     )?;
+    let refresh_env_path = assignment_refresh_env_path_for_platform(context.platform);
     if baseline_exit.is_empty() || baseline_exit == "none" {
         apply_role_coupling(
             context.identity,
@@ -716,7 +758,8 @@ fn ensure_client_role_with_expected_exit(
             "client",
             None,
             false,
-            "/etc/rustynet/assignment-refresh.env",
+            refresh_env_path,
+            context.platform,
         )?;
     } else {
         apply_role_coupling(
@@ -726,7 +769,8 @@ fn ensure_client_role_with_expected_exit(
             "client",
             Some(baseline_exit.as_str()),
             false,
-            "/etc/rustynet/assignment-refresh.env",
+            refresh_env_path,
+            context.platform,
         )?;
     }
     force_runtime_state_refresh(
@@ -751,6 +795,7 @@ fn ensure_client_role_with_expected_exit(
         context.known_hosts,
         context.host,
         "client",
+        context.platform,
     )?;
     let restore_exit = expected_exit
         .filter(|value| !value.is_empty() && *value != "none")
@@ -766,6 +811,7 @@ fn ensure_client_role_with_expected_exit(
             context.known_hosts,
             context.host,
             &restore_exit,
+            context.platform,
         )
     }
 }
@@ -1190,18 +1236,14 @@ fn capture_client_role_snapshot(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
+    platform: &str,
 ) -> Result<String, String> {
-    let status_output = status(identity, known_hosts, host)?;
+    let status_output = capture_daemon_status_for_platform(identity, known_hosts, host, platform)?;
     let status_line = read_last_matching_line(&status_output, "node_id=");
     if status_line.is_empty() {
         return Ok(status_line);
     }
-    let route_output = capture_root(
-        identity,
-        known_hosts,
-        host,
-        "ip -4 route get 1.1.1.1 || true",
-    )?;
+    let route_output = capture_root(identity, known_hosts, host, route_get_command(platform))?;
     let route_line = sanitize_line(route_output.trim());
     if route_line.is_empty() {
         Ok(status_line)
@@ -1215,10 +1257,11 @@ fn wait_for_role(
     known_hosts: &Path,
     host: &str,
     role: &str,
+    platform: &str,
 ) -> Result<String, String> {
     let mut last = String::new();
     for _ in 0..40 {
-        last = status(identity, known_hosts, host)?;
+        last = capture_daemon_status_for_platform(identity, known_hosts, host, platform)?;
         let status_line = read_last_matching_line(&last, "node_id=");
         if role_runtime_ready(&status_line, role) {
             return Ok(status_line);
@@ -1239,14 +1282,10 @@ fn role_runtime_ready(status_line: &str, role: &str) -> bool {
         && field_value(status_line, "last_reconcile_error") == "none"
 }
 
-fn client_exit_route_converged(status_line: &str, expected_exit: &str) -> bool {
+fn client_exit_route_converged(status_line: &str, expected_exit: &str, platform: &str) -> bool {
     role_runtime_ready(status_line, "client")
         && field_value(status_line, "exit_node") == expected_exit
-        && route_uses_rustynet0(status_line)
-}
-
-fn route_uses_rustynet0(route: &str) -> bool {
-    route.contains("dev rustynet0")
+        && route_uses_tunnel(status_line, platform)
 }
 
 fn wait_for_client_exit_route_convergence(
@@ -1254,45 +1293,49 @@ fn wait_for_client_exit_route_convergence(
     known_hosts: &Path,
     host: &str,
     expected_exit: &str,
+    platform: &str,
 ) -> Result<String, String> {
     let start = Instant::now();
     let timeout = Duration::from_secs(ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS);
     let mut last_status = String::new();
     let mut last_route = String::new();
     while start.elapsed() <= timeout {
-        last_status = status(identity, known_hosts, host)?;
+        last_status = capture_daemon_status_for_platform(identity, known_hosts, host, platform)?;
         let status_line = read_last_matching_line(&last_status, "node_id=");
-        let route = capture_root(
-            identity,
-            known_hosts,
-            host,
-            "ip -4 route get 1.1.1.1 || true",
-        )?;
+        let route = capture_root(identity, known_hosts, host, route_get_command(platform))?;
         last_route = route.trim().to_owned();
         let combined = if last_route.is_empty() {
             status_line.clone()
         } else {
             format!("{status_line} route={}", sanitize_line(&last_route))
         };
-        if client_exit_route_converged(&combined, expected_exit) {
+        if client_exit_route_converged(&combined, expected_exit, platform) {
             return Ok(combined);
         }
         std::thread::sleep(Duration::from_secs(1));
     }
     Err(format!(
-        "timed out waiting for {host} to restore client route convergence via rustynet0 for exit {expected_exit}: status={} route={}",
+        "timed out waiting for {host} to restore client route convergence via the rustynet tunnel for exit {expected_exit}: status={} route={}",
         read_last_matching_line(&last_status, "node_id="),
         sanitize_line(&last_route)
     ))
 }
 
-fn route_advertise_denied(identity: &Path, known_hosts: &Path, host: &str) -> Result<bool, String> {
-    let command = "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet route advertise 10.250.0.0/16 >/dev/null 2>&1 && exit 1 || exit 0";
+fn route_advertise_denied(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    platform: &str,
+) -> Result<bool, String> {
+    let command = format!(
+        "env RUSTYNET_DAEMON_SOCKET={} rustynet route advertise 10.250.0.0/16 >/dev/null 2>&1 && exit 1 || exit 0",
+        daemon_socket_path_for_platform(platform)
+    );
     let status = ssh_status(
         identity,
         known_hosts,
         host,
-        &format!("sudo -n sh -lc {}", shell_quote(command)),
+        &format!("sudo -n sh -lc {}", shell_quote(command.as_str())),
     )?;
     Ok(status.success())
 }
@@ -1302,12 +1345,14 @@ fn exit_select_denied(
     known_hosts: &Path,
     host: &str,
     baseline_exit: &str,
+    platform: &str,
 ) -> Result<bool, String> {
     if baseline_exit.is_empty() || baseline_exit == "none" {
         return Ok(false);
     }
     let command = format!(
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet exit-node select {} >/dev/null 2>&1 && exit 1 || exit 0",
+        "env RUSTYNET_DAEMON_SOCKET={} rustynet exit-node select {} >/dev/null 2>&1 && exit 1 || exit 0",
+        daemon_socket_path_for_platform(platform),
         shell_quote(baseline_exit)
     );
     let status = ssh_status(
@@ -1319,13 +1364,24 @@ fn exit_select_denied(
     Ok(status.success())
 }
 
-fn lan_toggle_denied(identity: &Path, known_hosts: &Path, host: &str) -> Result<bool, String> {
-    let command = "env RUSTYNET_SOCKET=/run/rustynet/rustynetd.sock RUSTYNET_AUTO_TUNNEL_BUNDLE=/var/lib/rustynet/rustynetd.assignment RUSTYNET_AUTO_TUNNEL_WATERMARK=/var/lib/rustynet/rustynetd.assignment.watermark rustynet ops apply-lan-access-coupling --enable true --env-path /etc/rustynet/assignment-refresh.env --lan-routes 192.168.1.0/24 >/dev/null 2>&1 && exit 1 || exit 0";
+fn lan_toggle_denied(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    platform: &str,
+) -> Result<bool, String> {
+    let command = format!(
+        "env RUSTYNET_SOCKET={} RUSTYNET_AUTO_TUNNEL_BUNDLE={} RUSTYNET_AUTO_TUNNEL_WATERMARK={} rustynet ops apply-lan-access-coupling --enable true --env-path {} --lan-routes 192.168.1.0/24 >/dev/null 2>&1 && exit 1 || exit 0",
+        daemon_socket_path_for_platform(platform),
+        assignment_bundle_path_for_platform(platform),
+        assignment_watermark_path_for_platform(platform),
+        assignment_refresh_env_path_for_platform(platform)
+    );
     let status = ssh_status(
         identity,
         known_hosts,
         host,
-        &format!("sudo -n sh -lc {}", shell_quote(command)),
+        &format!("sudo -n sh -lc {}", shell_quote(command.as_str())),
     )?;
     Ok(status.success())
 }
@@ -1386,7 +1442,7 @@ fn utc_now_string() -> String {
 mod tests {
     use super::{
         Config, build_signed_state_refresh_context, client_exit_route_converged,
-        role_runtime_ready, route_uses_rustynet0,
+        role_runtime_ready, route_uses_tunnel,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1414,25 +1470,42 @@ mod tests {
     }
 
     #[test]
-    fn route_uses_rustynet0_requires_tunnel_device() {
-        assert!(route_uses_rustynet0(
-            "1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0"
+    fn route_uses_tunnel_requires_tunnel_device() {
+        assert!(route_uses_tunnel(
+            "1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0",
+            "linux"
         ));
-        assert!(!route_uses_rustynet0(
-            "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.12 uid 0"
+        assert!(!route_uses_tunnel(
+            "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.12 uid 0",
+            "linux"
+        ));
+        assert!(route_uses_tunnel(
+            "route to: 1.1.1.1 gateway: index: 7 utun386 interface: utun386",
+            "macos"
+        ));
+        assert!(!route_uses_tunnel(
+            "route to: 1.1.1.1 gateway: 192.168.0.1 interface: en0",
+            "macos"
         ));
     }
 
     #[test]
     fn client_exit_route_converged_requires_ready_client_exit_and_route() {
         let good = "node_id=client-1 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0";
-        assert!(client_exit_route_converged(good, "exit-1"));
+        assert!(client_exit_route_converged(good, "exit-1", "linux"));
 
         let wrong_exit = "node_id=client-1 node_role=client state=ExitActive exit_node=exit-2 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=1.1.1.1 dev rustynet0 src 100.64.0.2 uid 0";
-        assert!(!client_exit_route_converged(wrong_exit, "exit-1"));
+        assert!(!client_exit_route_converged(wrong_exit, "exit-1", "linux"));
 
         let underlay_route = "node_id=client-1 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.12 uid 0";
-        assert!(!client_exit_route_converged(underlay_route, "exit-1"));
+        assert!(!client_exit_route_converged(
+            underlay_route,
+            "exit-1",
+            "linux"
+        ));
+
+        let macos_good = "node_id=client-3 node_role=client state=ExitActive exit_node=exit-1 restricted_safe_mode=false bootstrap_error=none last_reconcile_error=none route=route to: 1.1.1.1 interface: utun386";
+        assert!(client_exit_route_converged(macos_good, "exit-1", "macos"));
     }
 
     #[test]
