@@ -11316,8 +11316,8 @@ fn execute_ops_apply_role_coupling(
     skip_client_exit_route_convergence_wait: bool,
 ) -> Result<String, String> {
     require_root_execution()?;
-    if !cfg!(target_os = "linux") {
-        return Err("apply-role-coupling is supported on Linux only".to_owned());
+    if !cfg!(target_os = "linux") && !cfg!(target_os = "macos") {
+        return Err("apply-role-coupling is supported on Linux and macOS only".to_owned());
     }
     if !assignment_refresh_env_path.is_absolute() {
         return Err(format!(
@@ -12302,6 +12302,13 @@ fn assignment_refresh_available_ops(env_path: &Path) -> Result<bool, String> {
         }
     }
 
+    if cfg!(target_os = "macos") {
+        // macOS has no systemd assignment-refresh service; the env file
+        // existing (verified above) is sufficient for availability. The
+        // assignment bundle is re-issued and installed externally by the lab.
+        return Ok(true);
+    }
+
     let status = Command::new("systemctl")
         .arg("cat")
         .arg("rustynetd-assignment-refresh.service")
@@ -12480,6 +12487,15 @@ fn refresh_local_traversal_bundle_from_assignment_env(
 }
 
 fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        // macOS has no systemd assignment-refresh service and does not
+        // regenerate the assignment bundle locally (the lab re-issues and
+        // installs it externally). Restart the launchd-managed daemon so it
+        // re-reads the freshly installed bundle; do NOT remove the bundle or
+        // watermark, since nothing on macOS would regenerate them.
+        execute_ops_restart_runtime_service_macos()?;
+        return Ok(());
+    }
     let assignment_refresh_env_path = env_path_or_default(
         "RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH",
         DEFAULT_ASSIGNMENT_REFRESH_ENV_PATH,
