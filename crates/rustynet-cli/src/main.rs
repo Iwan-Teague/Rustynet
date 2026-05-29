@@ -8813,15 +8813,14 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
         .exists()
     {
         let socket_path = PathBuf::from(DEFAULT_DAEMON_SOCKET_PATH);
-        if let Ok(status) = send_command_with_socket(IpcCommand::Status, socket_path) {
-            if status.ok
-                && status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
-                    == Some("true")
-            {
-                return Ok(format!(
-                    "managed DNS routing skipped: daemon restricted-safe mode (interface {interface} not yet up)"
-                ));
-            }
+        if let Ok(status) = send_command_with_socket(IpcCommand::Status, socket_path)
+            && status.ok
+            && status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
+                == Some("true")
+        {
+            return Ok(format!(
+                "managed DNS routing skipped: daemon restricted-safe mode (interface {interface} not yet up)"
+            ));
         }
     }
     wait_for_managed_dns_interface(
