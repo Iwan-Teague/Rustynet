@@ -64,6 +64,12 @@ struct SignedStateRefreshTarget {
 struct SignedStateRefreshContext {
     traversal_env_file: PathBuf,
     dns_zone_env_file: PathBuf,
+    // Assignment-issue env for re-minting auto-tunnel bundles from the
+    // exit (the sole authoritative signer). Used to keep macOS targets
+    // fresh within the auto-tunnel max-age window during a transition,
+    // since macOS has no local assignment-refresh service. Optional so
+    // the harness still runs when the orchestrator does not supply it.
+    assignment_env_file: Option<PathBuf>,
     exit_host: String,
     targets: Vec<SignedStateRefreshTarget>,
 }
@@ -339,6 +345,7 @@ struct Config {
     git_commit: Option<String>,
     traversal_env_file: Option<PathBuf>,
     dns_zone_env_file: Option<PathBuf>,
+    assignment_env_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -365,6 +372,7 @@ impl Config {
             git_commit: None,
             traversal_env_file: None,
             dns_zone_env_file: None,
+            assignment_env_file: None,
         };
 
         let mut iter = args.into_iter();
@@ -403,6 +411,9 @@ impl Config {
                 }
                 "--dns-zone-env-file" => {
                     config.dns_zone_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?));
+                }
+                "--assignment-env-file" => {
+                    config.assignment_env_file = Some(PathBuf::from(next_value(&mut iter, &arg)?));
                 }
                 "-h" | "--help" => {
                     print_usage();
@@ -443,6 +454,11 @@ impl Config {
         {
             return Err(format!("missing dns zone env file: {}", path.display()));
         }
+        if let Some(path) = &config.assignment_env_file
+            && !path.is_file()
+        {
+            return Err(format!("missing assignment env file: {}", path.display()));
+        }
         Ok(config)
     }
 }
@@ -465,6 +481,7 @@ fn build_signed_state_refresh_context(
             Ok(Some(SignedStateRefreshContext {
                 traversal_env_file: traversal_env_file.clone(),
                 dns_zone_env_file: dns_zone_env_file.clone(),
+                assignment_env_file: config.assignment_env_file.clone(),
                 exit_host: config.exit_host.clone(),
                 targets: vec![
                     SignedStateRefreshTarget {
@@ -834,6 +851,14 @@ fn refresh_signed_state_for_transition(
         reason,
     )?;
     refresh_dns_zone_bundles_for_transition(identity, known_hosts, workspace_dir, refresh)?;
+    refresh_assignment_bundles_for_macos_targets(
+        logger,
+        identity,
+        known_hosts,
+        workspace_dir,
+        refresh,
+        reason,
+    )?;
     for target in &refresh.targets {
         // Trust-evidence refresh requires a trust signer key, which
         // only admin and blind_exit nodes have.  Client nodes stay in
@@ -969,6 +994,134 @@ fn refresh_traversal_bundles_for_transition(
              && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
         };
         run_root(identity, known_hosts, target.host.as_str(), install_cmd)?;
+    }
+
+    Ok(())
+}
+
+/// Re-mint and reinstall the auto-tunnel assignment bundle for every
+/// macOS target from the exit node (the sole authoritative assignment
+/// signer) so the bundle's `generated_at` stays inside the daemon's
+/// auto-tunnel max-age window before the per-target `state refresh`.
+///
+/// Linux targets self-refresh via the `rustynetd-assignment-refresh`
+/// systemd timer, so their bundles never age out mid-transition. macOS
+/// has no such service and never holds the assignment signing secret,
+/// so without this external re-issue the macOS bundle ages past the
+/// freshness bound and `state refresh` fails closed with "auto-tunnel
+/// bundle is stale". Keeping the signer on the exit preserves
+/// least-privilege: the macOS blind_exit node gains no signing power.
+fn refresh_assignment_bundles_for_macos_targets(
+    logger: &mut Logger,
+    identity: &Path,
+    known_hosts: &Path,
+    workspace_dir: &Path,
+    refresh: &SignedStateRefreshContext,
+    reason: &str,
+) -> Result<(), String> {
+    let Some(assignment_env_file) = refresh.assignment_env_file.as_ref() else {
+        return Ok(());
+    };
+    if !refresh
+        .targets
+        .iter()
+        .any(|target| target.platform == "macos")
+    {
+        return Ok(());
+    }
+    let issue_dir = workspace_dir.join(format!(
+        "role-switch-assignment-{}-{}",
+        sanitize_path_component(reason),
+        unix_now()
+    ));
+    let remote_env_path = "/tmp/rn-role-switch-assignment.env";
+    let remote_issue_dir = "/run/rustynet/role-switch-assignment-issue";
+    logger.line(format!("[role-switch] refresh macos assignment {reason}").as_str())?;
+    fs::create_dir_all(&issue_dir).map_err(|err| {
+        format!(
+            "failed to create role-switch assignment workspace {}: {err}",
+            issue_dir.display()
+        )
+    })?;
+    scp_to(
+        identity,
+        known_hosts,
+        assignment_env_file.as_path(),
+        refresh.exit_host.as_str(),
+        remote_env_path,
+    )?;
+    if let Err(err) = run_root(
+        identity,
+        known_hosts,
+        refresh.exit_host.as_str(),
+        format!(
+            "rustynet ops e2e-issue-assignment-bundles-from-env --env-file '{remote_env_path}' --issue-dir '{remote_issue_dir}'"
+        )
+        .as_str(),
+    ) {
+        let _ = run_root(
+            identity,
+            known_hosts,
+            refresh.exit_host.as_str(),
+            format!("rm -f '{remote_env_path}'").as_str(),
+        );
+        return Err(err);
+    }
+    let _ = run_root(
+        identity,
+        known_hosts,
+        refresh.exit_host.as_str(),
+        format!("rm -f '{remote_env_path}'").as_str(),
+    );
+
+    let verifier_key = issue_dir.join("rn-assignment.pub");
+    capture_root_file_to_path(
+        identity,
+        known_hosts,
+        refresh.exit_host.as_str(),
+        &format!("{remote_issue_dir}/rn-assignment.pub"),
+        verifier_key.as_path(),
+    )?;
+
+    for target in refresh
+        .targets
+        .iter()
+        .filter(|target| target.platform == "macos")
+    {
+        let bundle = issue_dir.join(format!("rn-assignment-{}.assignment", target.node_id));
+        capture_root_file_to_path(
+            identity,
+            known_hosts,
+            refresh.exit_host.as_str(),
+            &format!(
+                "{remote_issue_dir}/rn-assignment-{}.assignment",
+                target.node_id
+            ),
+            bundle.as_path(),
+        )?;
+        scp_to(
+            identity,
+            known_hosts,
+            verifier_key.as_path(),
+            target.host.as_str(),
+            "/tmp/rn-assignment.pub",
+        )?;
+        scp_to(
+            identity,
+            known_hosts,
+            bundle.as_path(),
+            target.host.as_str(),
+            "/tmp/rn-assignment.bundle",
+        )?;
+        run_root(
+            identity,
+            known_hosts,
+            target.host.as_str(),
+            "mkdir -p /usr/local/var/rustynet/trust \
+             && install -m 0644 /tmp/rn-assignment.pub /usr/local/var/rustynet/trust/assignment.pub \
+             && install -m 0640 /tmp/rn-assignment.bundle /usr/local/var/rustynet/trust/rustynetd.assignment \
+             && rm -f /usr/local/var/rustynet/trust/rustynetd.assignment.watermark /tmp/rn-assignment.pub /tmp/rn-assignment.bundle",
+        )?;
     }
 
     Ok(())
@@ -1418,7 +1571,7 @@ fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<Strin
 
 fn print_usage() {
     eprintln!(
-        "usage: live_linux_role_switch_matrix_test --ssh-identity-file <path> [options]\n\noptions:\n  --exit-host <user@host>\n  --exit-node-id <id>\n  --debian-host <user@host>\n  --debian-node-id <id>\n  --ubuntu-host <user@host>\n  --ubuntu-node-id <id>\n  --fedora-host <user@host>\n  --fedora-node-id <id>\n  --mint-host <user@host>\n  --mint-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --source-path <path>\n  --log-path <path>\n  --known-hosts <path>\n  --git-commit <sha>\n  --traversal-env-file <path>\n  --dns-zone-env-file <path>"
+        "usage: live_linux_role_switch_matrix_test --ssh-identity-file <path> [options]\n\noptions:\n  --exit-host <user@host>\n  --exit-node-id <id>\n  --debian-host <user@host>\n  --debian-node-id <id>\n  --ubuntu-host <user@host>\n  --ubuntu-node-id <id>\n  --fedora-host <user@host>\n  --fedora-node-id <id>\n  --mint-host <user@host>\n  --mint-node-id <id>\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --source-path <path>\n  --log-path <path>\n  --known-hosts <path>\n  --git-commit <sha>\n  --traversal-env-file <path>\n  --dns-zone-env-file <path>\n  --assignment-env-file <path>"
     );
 }
 
@@ -1540,6 +1693,7 @@ mod tests {
             git_commit: None,
             traversal_env_file: Some(traversal_env.clone()),
             dns_zone_env_file: None,
+            assignment_env_file: None,
         };
 
         let err = build_signed_state_refresh_context(&config)
@@ -1553,6 +1707,7 @@ mod tests {
         assert_eq!(refresh.targets.len(), 5);
         assert_eq!(refresh.traversal_env_file, traversal_env);
         assert_eq!(refresh.dns_zone_env_file, dns_zone_env);
+        assert_eq!(refresh.assignment_env_file, None);
 
         let _ = fs::remove_dir_all(&temp_root);
     }
