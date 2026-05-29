@@ -3200,6 +3200,13 @@ build_onehop_specs() {
     local node_capabilities
     if [[ "$node_id" == "$exit_node_id" ]]; then
       node_capabilities="anchor,exit_server"
+    elif [[ "$_label" == "aux" ]]; then
+      # The aux node is the blind_exit node in membership. Its auto-tunnel
+      # assignment intent must include blind_exit so the daemon accepts the
+      # bundle once the role-switch matrix enforces blind_exit; client stays
+      # present so the baseline (client-role) daemon validates too. Mirrors
+      # the aux membership capabilities.
+      node_capabilities="client,relay_host,exit_server,blind_exit"
     else
       node_capabilities="client,relay_host"
     fi
