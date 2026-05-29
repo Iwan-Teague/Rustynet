@@ -8804,6 +8804,23 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
 
     ensure_systemd_resolved_active()?;
     let interface = managed_dns_interface_name_from_env()?;
+    // If the interface isn't up yet and the daemon reports restricted-safe mode,
+    // skip DNS configuration.  The daemon is intentionally holding off the tunnel
+    // (e.g. during a live role switch before membership catches up).  The service
+    // will re-run when the daemon exits restriction and brings up the interface.
+    if !Path::new("/sys/class/net").join(interface.as_str()).exists() {
+        let socket_path = PathBuf::from(DEFAULT_DAEMON_SOCKET_PATH);
+        if let Ok(status) = send_command_with_socket(IpcCommand::Status, socket_path) {
+            if status.ok
+                && status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
+                    == Some("true")
+            {
+                return Ok(format!(
+                    "managed DNS routing skipped: daemon restricted-safe mode (interface {interface} not yet up)"
+                ));
+            }
+        }
+    }
     wait_for_managed_dns_interface(
         interface.as_str(),
         Duration::from_secs(MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS),
