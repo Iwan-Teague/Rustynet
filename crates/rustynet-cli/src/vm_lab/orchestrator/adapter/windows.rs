@@ -148,12 +148,7 @@ impl NodeAdapter for WindowsNodeAdapter {
         let op_label = argv.get(1).cloned().unwrap_or_default();
         let script = build_validator_script(&argv);
         let output = run_remote_ps(&self.conn, &script, VALIDATOR_TIMEOUT)?;
-        // Fail closed: a validator must explicitly report `"passed": true`.
-        // Empty, truncated, or non-JSON output (e.g. a probe that exited 0
-        // without emitting its report) must NOT be treated as a pass.
-        let has_true = output.contains("\"passed\": true") || output.contains("\"passed\":true");
-        let has_false = output.contains("\"passed\": false") || output.contains("\"passed\":false");
-        let passed = has_true && !has_false;
+        let passed = crate::vm_lab::orchestrator::adapter::ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
             op_label,
             output,

@@ -30,7 +30,13 @@ impl OrchestrationStage for CleanupHostsStage {
             .filter_map(|alias| {
                 match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
-                    None => Ok(()), // no adapter = nothing to clean
+                    // An assigned node with no adapter is a construction bug, not
+                    // "nothing to clean": its prior runtime state (incl. a
+                    // default-deny killswitch) would be left in place and could
+                    // brick the next run. Fail closed.
+                    None => Err(
+                        "no adapter for assigned node; cannot clean prior runtime state".to_owned(),
+                    ),
                 }
                 .err()
                 .map(|e| format!("{alias}: {e}"))

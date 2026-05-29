@@ -30,7 +30,12 @@ impl OrchestrationStage for FinalCleanupStage {
             .map(|alias| {
                 let r = match ctx.adapters.get(alias.as_str()) {
                     Some(adapter) => adapter.cleanup_runtime_state().map_err(|e| e.to_string()),
-                    None => Ok(()), // no adapter = nothing to clean
+                    // An assigned node with no adapter is a construction bug, not
+                    // "nothing to clean"; fail closed rather than leave prior
+                    // runtime state (incl. a killswitch) in place.
+                    None => Err(
+                        "no adapter for assigned node; cannot clean prior runtime state".to_owned(),
+                    ),
                 };
                 (alias.clone(), r)
             })

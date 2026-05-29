@@ -44,6 +44,35 @@ pub fn ssh_params(
 
 // ── Command builders ──────────────────────────────────────────────────────────
 
+/// Attach SSH connection-multiplexing (ControlMaster) options to `cmd`.
+///
+/// The first connection to a host opens a master; subsequent ssh/scp
+/// invocations in the same run reuse it, skipping the TCP + auth handshake.
+/// This is a pure latency optimisation and does NOT weaken security:
+/// `StrictHostKeyChecking=yes` is still enforced when the master is
+/// established, the control socket lives in a per-process directory created
+/// mode 0700 (so other local users cannot hijack the multiplexed channel),
+/// and `ControlPersist` is short so masters do not outlive the run.
+///
+/// The `ControlPath` is kept under a short, fixed `/tmp` prefix (not `$TMPDIR`,
+/// which on macOS is long) so the resulting Unix-socket path stays well under
+/// the ~104-char `sun_path` limit. `%C` is a short hash of (host, port, user,
+/// local host), giving one master per distinct target.
+fn attach_control_master(cmd: &mut Command) {
+    let dir = format!("/tmp/rn_ssh_cm_{}", std::process::id());
+    if std::fs::create_dir_all(&dir).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        cmd.args(["-o", "ControlMaster=auto", "-o", "ControlPersist=30s"]);
+        cmd.arg("-o").arg(format!("ControlPath={dir}/cm-%C"));
+    }
+    // If the control dir cannot be created we simply omit multiplexing and
+    // fall back to a fresh connection per command — correct, just slower.
+}
+
 fn base_ssh_command(
     host: &str,
     port: u16,
@@ -74,6 +103,7 @@ fn base_ssh_command(
     cmd.arg("-i").arg(identity_file);
     cmd.arg("-o")
         .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    attach_control_master(&mut cmd);
     if let Some(u) = user {
         cmd.arg("-l").arg(u);
     }
@@ -106,6 +136,7 @@ fn base_scp_command(
     cmd.arg("-i").arg(identity_file);
     cmd.arg("-o")
         .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    attach_control_master(&mut cmd);
     if let Some(u) = user {
         cmd.arg("-o").arg(format!("User={u}"));
     }
@@ -455,6 +486,28 @@ pub fn parse_status_node_id(status_text: &str) -> Option<String> {
     })
 }
 
+/// Decide whether a daemon `*-check` JSON report indicates success.
+///
+/// The daemon prints a report whose top-level `overall_ok` boolean is the
+/// verdict — there is NO `passed` field. The orchestrator runs every check with
+/// `--no-fail-on-drift`, so the daemon exits 0 and prints the report even when
+/// it detected drift; the verdict must therefore be read from the report body,
+/// not the process exit code.
+///
+/// Fail closed: returns `true` only when `overall_ok: true` is present AND
+/// `overall_ok: false` is absent. Empty, truncated, non-JSON, field-missing, or
+/// `false` output all return `false`. Substring matching (rather than strict
+/// JSON parsing) is deliberate: a check whose stdout has stderr merged into it,
+/// is pretty-printed across multiple lines, or carries a leading log line is
+/// still evaluated correctly instead of fail-closing on output that is valid
+/// but not a single parseable JSON value.
+pub fn validator_report_ok(output: &str) -> bool {
+    let has_ok = output.contains("\"overall_ok\": true") || output.contains("\"overall_ok\":true");
+    let has_not_ok =
+        output.contains("\"overall_ok\": false") || output.contains("\"overall_ok\":false");
+    has_ok && !has_not_ok
+}
+
 /// Parse any `key=<value>` field from a `rustynet status` space-separated output.
 pub fn parse_status_field(status_text: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
@@ -479,5 +532,41 @@ pub fn remote_home_for_user(user: Option<&str>, heap_user: &str) -> PathBuf {
         Some("root") => PathBuf::from("/root"),
         Some(u) => PathBuf::from(format!("/home/{u}")),
         None => PathBuf::from(format!("/home/{heap_user}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validator_report_ok;
+
+    #[test]
+    fn validator_report_ok_true_only_on_explicit_overall_ok_true() {
+        // Pretty-printed (spaced) form the daemon emits via to_string_pretty.
+        assert!(validator_report_ok(
+            "{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}"
+        ));
+        // Compact form.
+        assert!(validator_report_ok("{\"overall_ok\":true}"));
+        // Tolerant of a merged stderr log line preceding the JSON.
+        assert!(validator_report_ok(
+            "WARN something\n{\n  \"overall_ok\": true\n}"
+        ));
+    }
+
+    #[test]
+    fn validator_report_ok_fails_closed() {
+        // Drift reported.
+        assert!(!validator_report_ok(
+            "{\n  \"overall_ok\": false,\n  \"drift_reasons\": [\"x\"]\n}"
+        ));
+        // Field absent (e.g. wrong schema / old `passed` schema) → fail closed.
+        assert!(!validator_report_ok("{\"passed\": true}"));
+        // Empty / non-JSON output → fail closed.
+        assert!(!validator_report_ok(""));
+        assert!(!validator_report_ok("command not found"));
+        // Both present (top-level false plus a nested true) → fail closed.
+        assert!(!validator_report_ok(
+            "{\"overall_ok\": false, \"sub\": {\"overall_ok\": true}}"
+        ));
     }
 }

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::report::{
-    LiveLabRunReport, NodeStatus, RunStatus, StageOutcomeRecord, StageReport,
+    LiveLabRunReport, NodeStatus, RunStatus, StageOutcomeRecord, StageReport, ValidatorResult,
 };
 use crate::vm_lab::orchestrator::stage::StageId;
 
@@ -74,6 +74,19 @@ pub fn build_live_lab_run_report(
         RunStatus::Passed
     };
 
+    // Per-node validator detail is recorded by ValidateBaselineRuntime to
+    // `{report_dir}/validator_results.json`. Read it back so node_statuses
+    // carries the actual per-op pass/fail instead of an empty list (which made
+    // parity's validator comparison a vacuous 0-vs-0 match). Absent/unparseable
+    // file → empty, matching prior behaviour.
+    let validator_results: HashMap<String, Vec<ValidatorResult>> = {
+        let path = ctx.report_dir.join("validator_results.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    };
+
     let mut node_statuses: HashMap<String, NodeStatus> = HashMap::new();
     for assignment in &ctx.assignments {
         let platform = ctx.adapters.get(&assignment.alias).map_or_else(
@@ -86,7 +99,10 @@ pub fn build_live_lab_run_report(
                 alias: assignment.alias.clone(),
                 platform,
                 role: assignment.role.as_str().to_owned(),
-                validator_results: Vec::new(),
+                validator_results: validator_results
+                    .get(&assignment.alias)
+                    .cloned()
+                    .unwrap_or_default(),
             },
         );
     }
