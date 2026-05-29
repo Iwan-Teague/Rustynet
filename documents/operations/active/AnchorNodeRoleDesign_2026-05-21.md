@@ -377,7 +377,26 @@ The anchor role is "done" when:
 
 ---
 
-## 13) Cross-references
+## 13) Operational hardening: anchor address stability
+
+An anchor's value is its stability, so the operator should make its address as stable as the design allows. Two cases, two different answers.
+
+**LAN IP (fully solvable — do this).** Give the anchor a **DHCP reservation** on the router (bind its MAC → a fixed LAN IP). A reboot then never changes the LAN address, which:
+- keeps any uPnP/NAT-PMP port-forward lease valid (the lease points at an internal IP; if that IP moves, inbound WAN traffic breaks until the `anchor.port_mapping_authoritative` re-lease lands — see §5/D11 and `crates/rustynetd/src/port_mapper.rs`),
+- keeps the gossiped LAN-host candidate stable so same-LAN peers and new-device enrollment never miss a beat,
+- makes the "stable LAN/router boundary" assumption in §2 literally true.
+
+This is operator-side configuration, not a code change. It removes the LAN variant of the "anchor endpoint changes while offline" trade-off in [`RustynetDataplaneExecutionPlan_2026-05-18.md`](./RustynetDataplaneExecutionPlan_2026-05-18.md) §4 entirely.
+
+**WAN/public IP (not fully solvable in code — by design).** A residential WAN IP can change on ISP lease renewal, and the zero-ingress architecture (§3 of the dataplane plan) forbids the things that would pin it (DDNS-as-dependency, a rendezvous host, contacting the ISP). The mesh already converges automatically when at least one peer is online to receive the re-gathered srflx (the daemon forces an immediate STUN re-gather on a detected local endpoint change — see `maybe_trigger_endpoint_change_refresh` in `crates/rustynetd/src/daemon.rs`). The residual, **inherent** gap is the *all-peers-offline* case: if the WAN IP changes while every peer is offline, a returning remote peer has only a stale endpoint and no live gossip source. Mitigations are architectural, not a patch:
+- **Run a second anchor at a different site.** Multiple anchors are first-class (§2 — "multiple anchors are supported, no SPOF"). A remote peer then always has at least one stable-enough gossip source, and the two anchors cross-gossip each other's current endpoints.
+- **Relay fallback** covers the transient window for peers that can reach *a* relay but not the moved anchor directly.
+
+Do **not** "fix" the WAN case by adding a fixed hostname / DDNS dependency or a public ingress — that re-opens the §3 non-goals and the §8 open question (public-ingress host), which stays answered "No" until the documented re-visit trigger fires.
+
+---
+
+## 14) Cross-references
 
 - [`NodeRoleTaxonomy_2026-05-21.md`](./NodeRoleTaxonomy_2026-05-21.md) — parent doc. Anchor is one of six user-selectable presets; this document is the deep dive.
 - [`RustynetDataplaneExecutionPlan_2026-05-18.md`](./RustynetDataplaneExecutionPlan_2026-05-18.md) — adds D11 in §5.1; anchor builds on D2-D5.5 primitives.
