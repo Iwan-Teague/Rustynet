@@ -133,7 +133,12 @@ impl NodeAdapter for LinuxNodeAdapter {
         let script = argv.join(" ");
         let op_label = argv.get(1).cloned().unwrap_or_default();
         let output = ssh::run_remote(&self.conn, &script, SHORT_TIMEOUT)?;
-        let passed = !output.contains("\"passed\": false") && !output.contains("\"passed\":false");
+        // Fail closed: a validator must explicitly report `"passed": true`.
+        // Empty, truncated, or non-JSON output (e.g. a probe that exited 0
+        // without emitting its report) must NOT be treated as a pass.
+        let has_true = output.contains("\"passed\": true") || output.contains("\"passed\":true");
+        let has_false = output.contains("\"passed\": false") || output.contains("\"passed\":false");
+        let passed = has_true && !has_false;
         Ok(ValidatorReport {
             op_label,
             output,

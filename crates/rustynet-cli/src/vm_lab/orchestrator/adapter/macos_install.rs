@@ -420,6 +420,13 @@ pub fn enforce_daemon(
         network_id = ctx.network_id,
     );
     ssh::run_remote(conn, &script, Duration::from_secs(60))?;
+    // The install script reloads the launchd plist, which bounces the daemon.
+    // launchctl returns before the daemon re-binds its control socket, but the
+    // next stage (ValidateBaselineRuntime) probes that socket with no retry of
+    // its own. Wait for the socket to reappear so a mid-restart daemon does not
+    // produce a spurious validation failure. Mirrors install_daemon and the
+    // Windows enforce path's post-restart readiness wait.
+    wait_for_macos_daemon_socket(conn)?;
     Ok(())
 }
 

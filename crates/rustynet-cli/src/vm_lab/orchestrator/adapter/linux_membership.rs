@@ -90,12 +90,24 @@ pub fn init_membership_snapshot(
     }
 
     // 3. Read back the snapshot bytes. /var/lib/rustynet/ is mode 700 root-owned.
+    // `test -s` first so a missing/empty snapshot fails loudly here instead of
+    // being masked by the pipe (cat's non-zero exit is swallowed by base64's
+    // success, yielding an empty "valid" snapshot that would later be
+    // distributed to peers and rejected by the daemon).
     let snapshot_b64 = ssh::run_remote(
         conn,
-        "sudo -n cat /var/lib/rustynet/membership.snapshot | base64 -w 0",
+        "sudo -n test -s /var/lib/rustynet/membership.snapshot && \
+         sudo -n cat /var/lib/rustynet/membership.snapshot | base64 -w 0",
         SHORT_TIMEOUT,
     )?;
     let data = base64_decode(&snapshot_b64)?;
+    if data.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "membership snapshot decoded to zero bytes; init-membership/\
+                      e2e-membership-add did not produce a snapshot"
+                .to_owned(),
+        });
+    }
     Ok(MembershipSnapshot { data })
 }
 

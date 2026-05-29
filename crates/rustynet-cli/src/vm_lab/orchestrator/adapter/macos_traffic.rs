@@ -198,6 +198,24 @@ pub fn check_ssh_reachable(conn: &NodeConnection) -> Result<(), AdapterError> {
 
 /// Collect the `WireGuard` mesh IP from the running daemon interface or status.
 pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
+    // Prefer the daemon's own status: it reports the mesh IP for the specific
+    // node-assigned utun device. A bare `ifconfig | grep utun` can pick the
+    // first inet among ANY utun interface (iCloud Private Relay, a corporate
+    // VPN, etc.), which on a real Mac may not be the rustynet interface.
+    // Query status (sudo + socket env, matching collect_node_id) first and
+    // only fall back to the interface scan if status is unavailable.
+    let status = ssh::run_remote(
+        conn,
+        "sudo -n env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
+         /usr/local/bin/rustynet status 2>/dev/null || echo ''",
+        SHORT_TIMEOUT,
+    )?;
+    if let Some(ip) = ssh::parse_status_field(&status, "mesh_ip")
+        .or_else(|| ssh::parse_status_field(&status, "wg_ip"))
+    {
+        return Ok(ip);
+    }
+
     let ip = ssh::run_remote(
         conn,
         "ifconfig 2>/dev/null \
@@ -210,17 +228,9 @@ pub fn collect_mesh_ip(conn: &NodeConnection) -> Result<String, AdapterError> {
     if !ip.is_empty() {
         return Ok(ip);
     }
-    let status = ssh::run_remote(
-        conn,
-        "RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
-         /usr/local/bin/rustynet status 2>/dev/null || echo ''",
-        SHORT_TIMEOUT,
-    )?;
-    ssh::parse_status_field(&status, "mesh_ip")
-        .or_else(|| ssh::parse_status_field(&status, "wg_ip"))
-        .ok_or_else(|| AdapterError::Protocol {
-            message: "mesh IP not found via ifconfig or rustynet status".to_owned(),
-        })
+    Err(AdapterError::Protocol {
+        message: "mesh IP not found via rustynet status or ifconfig".to_owned(),
+    })
 }
 
 /// Issue signed bundles on this exit node and SCP the results to `local_out_dir`.
