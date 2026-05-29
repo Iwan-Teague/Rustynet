@@ -220,29 +220,31 @@ pub fn install_daemon_from_workdir(
     let workdir_present =
         ssh::run_remote(conn, &format!("test -d '{workdir}'"), SHORT_TIMEOUT).is_ok();
 
-    let build_cmd = if workdir_present {
-        // Workdir already has the fresh source (a prior caller — e.g.
-        // an earlier orchestrator stage or a manual sync — populated
-        // it).  Pack it into the bootstrap archive path and proceed.
+    let build_cmd = if let Some(source) = source {
+        // A freshly-carried source archive ALWAYS wins, even when a remote
+        // workdir exists. The workdir may be a stale checkout from a prior
+        // deploy, and building stale code would make this node's security
+        // evidence describe the wrong binary — and diverge from the Linux
+        // nodes, which always build the orchestrator's archived source. The
+        // archive is `git archive HEAD`, so every node builds the same known,
+        // reproducible commit. (Previously the workdir-present branch tar'd the
+        // remote workdir and ignored this archive — silently keeping stale
+        // binaries, the original root cause of "membership role preflight
+        // failed" reappearing after a fix had merged.)
+        ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+             echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
+             sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
+            .to_owned()
+    } else if workdir_present {
+        // No fresh archive carried, but a workdir exists (e.g. an operator
+        // manually synced it). Build from it.
         format!(
             "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
              cd '{workdir}' && tar -czf /tmp/rn_source.tar.gz . && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
              sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
         )
-    } else if let Some(source) = source {
-        // Workdir absent but the orchestrator carried a fresh source
-        // archive.  Ship it directly, then run the bootstrap with
-        // SOURCE_ARCHIVE pointing at the SCP'd tarball.  Skipping
-        // build here (the old behaviour) silently kept stale
-        // binaries across deploys and was the actual root cause of
-        // "membership role preflight failed" reappearing after the
-        // capability fix was merged.
-        ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
-        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
-             echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
-             sudo bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
-            .to_owned()
     } else {
         // No workdir AND no source — last-resort legacy path: rely on
         // SKIP_BUILD=1 so the bootstrap re-runs the service-install
