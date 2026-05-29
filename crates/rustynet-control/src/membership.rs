@@ -757,7 +757,11 @@ pub fn load_membership_snapshot(
         "membership snapshot",
         MAX_MEMBERSHIP_SNAPSHOT_BYTES,
     )?;
-    let fields = parse_key_values(&content)?;
+    parse_snapshot_content(&content)
+}
+
+fn parse_snapshot_content(content: &str) -> Result<MembershipState, MembershipError> {
+    let fields = parse_key_values(content)?;
     let version = parse_u8_field(&fields, "version")?;
     if version != MEMBERSHIP_SCHEMA_VERSION {
         return Err(MembershipError::UnsupportedVersion(version));
@@ -775,6 +779,28 @@ pub fn load_membership_snapshot(
     let state = parse_membership_state_payload(&payload)?;
     state.validate()?;
     Ok(state)
+}
+
+/// Return `true` iff `node_id` holds `anchor.bundle_pull` in the given
+/// snapshot bytes.  Fails closed (returns `false`) on any parse error.
+/// Does not perform file-security checks — caller owns the source trust.
+pub fn snapshot_bytes_have_bundle_pull_capability(bytes: &[u8], node_id: &str) -> bool {
+    let Ok(content) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if content.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return false;
+    }
+    parse_snapshot_content(content)
+        .ok()
+        .and_then(|state| {
+            state
+                .nodes
+                .into_iter()
+                .find(|n| n.node_id == node_id)
+                .map(|n| n.capabilities.contains(&RoleCapability::AnchorBundlePull))
+        })
+        .unwrap_or(false)
 }
 
 pub fn append_membership_log_entry(
