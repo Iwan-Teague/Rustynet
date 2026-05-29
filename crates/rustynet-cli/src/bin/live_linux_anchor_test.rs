@@ -1014,10 +1014,18 @@ fn start_inflight_bundle_pull(
     let token_str = std::str::from_utf8(&token)
         .map_err(|err| format!("anchor token bytes not utf-8: {err}"))?;
     let work_dir = remote_scratch_dir(config.platform, "rustynet-anchor-inflight");
-    // Stage the work dir + token so the in-flight worker is
-    // self-contained (the token file uses the same 0o600 mode the
-    // POSIX script applied via `chmod 700` on the parent dir +
-    // umask).
+    // Create the scratch dir before writing the token into it.
+    // write_file uses `install -m <mode> -- src dst` which requires
+    // the parent directory to already exist.
+    let mk = shell.run_argv(&["mkdir", "-p", &work_dir], &[], &[]).map_err(|err| {
+        format!("create in-flight work dir {work_dir} failed: {err}")
+    })?;
+    if !mk.is_success() {
+        return Err(format!(
+            "create in-flight work dir {work_dir} failed: {}",
+            String::from_utf8_lossy(&mk.stderr).trim()
+        ));
+    }
     let token_remote_path = remote_join(config.platform, &work_dir, "token");
     shell
         .write_file(&token_remote_path, &token, 0o600)
