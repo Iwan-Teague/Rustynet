@@ -65,6 +65,26 @@ set -m
 ( "$@" ) >"$LOG" 2>&1 &
 CMD_PID=$!
 
+# Total cumulative CPU-seconds of $1 and all its descendants. This is the
+# signal that distinguishes "a test is running quietly" (CPU climbs) from
+# "the process is wedged on a lock or full disk" (CPU flat). Without it, a
+# long silent test with no log output and no rustc looks identical to a stall.
+tree_cpu_secs() {
+  local root=$1
+  ps -Ao pid=,ppid=,time= 2>/dev/null | awk -v root="$root" '
+    function tosec(t,   n,a){ gsub(/ /,"",t); n=split(t,a,":");
+      if (n==3) return a[1]*3600 + a[2]*60 + a[3];
+      if (n==2) return a[1]*60 + a[2];
+      return a[1]+0 }
+    { PPID[$1]=$2; TIME[$1]=tosec($3) }
+    END {
+      desc[root]=1; change=1
+      while (change) { change=0
+        for (p in PPID) if (!(p in desc) && (PPID[p] in desc)) { desc[p]=1; change=1 } }
+      tot=0; for (p in desc) if (p in TIME) tot+=TIME[p]
+      printf "%d", tot }'
+}
+
 # 0 if any live rustc process descends from $1.
 has_rustc_descendant() {
   local root=$1 map rustcs pid cur guard
@@ -91,6 +111,7 @@ kill_tree() {
 start=$(date +%s)
 last_progress=$start
 last_size=0
+last_cpu=$(tree_cpu_secs "$CMD_PID")
 
 while :; do
   if ! kill -0 "$CMD_PID" 2>/dev/null; then
@@ -116,6 +137,10 @@ while :; do
   progressed=0
   if [ "${size:-0}" -gt "$last_size" ]; then progressed=1; last_size=${size:-0}; fi
   if has_rustc_descendant "$CMD_PID"; then progressed=1; fi
+  # CPU climbing => real work (compiling OR a quietly-running test).
+  cpu=$(tree_cpu_secs "$CMD_PID")
+  if [ "${cpu:-0}" -gt "$last_cpu" ]; then progressed=1; fi
+  last_cpu=${cpu:-$last_cpu}
   if [ "$progressed" -eq 1 ]; then last_progress=$now; fi
 
   if [ $((now - last_progress)) -ge "$STALL_SECS" ]; then
