@@ -10903,6 +10903,7 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
                     store_passphrase_in_os_secure_store(
                         config.passphrase_path.as_path(),
                         Some(account.as_str()),
+                        None,
                     )?;
                     secure_remove_if_present(config.passphrase_path.as_path())?;
                     return Ok(format!(
@@ -11003,6 +11004,7 @@ fn execute_ops_bootstrap_wireguard_custody() -> Result<String, String> {
                 store_passphrase_in_os_secure_store(
                     passphrase_tmp.as_path(),
                     Some(account.as_str()),
+                    None,
                 )?;
                 let removed_runtime_plaintext =
                     secure_remove_if_present(config.passphrase_path.as_path())?;

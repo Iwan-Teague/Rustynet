@@ -726,7 +726,7 @@ fn switch_role(
     // switch contract. Mirrors the explicit pre-mutation refresh
     // pattern from live_linux_two_hop_test (commit cca0418) and
     // live_linux_lan_toggle_test (commit fc648df).
-    refresh_trust_evidence(identity, known_hosts, host, platform)
+    refresh_trust_evidence(identity, known_hosts, host, node_id, platform)
 }
 
 fn ensure_client_role(context: &mut ClientRoleContext<'_>) -> Result<String, String> {
@@ -872,6 +872,7 @@ fn refresh_signed_state_for_transition(
                 identity,
                 known_hosts,
                 target.host.as_str(),
+                target.node_id.as_str(),
                 target.platform.as_str(),
             )?;
         }
@@ -1275,6 +1276,7 @@ fn refresh_trust_evidence(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
+    node_id: &str,
     platform: &str,
 ) -> Result<(), String> {
     wait_for_daemon_socket(
@@ -1285,10 +1287,20 @@ fn refresh_trust_evidence(
         20,
         2,
     )?;
+    // macOS resolves the trust signing-key passphrase from the System.keychain
+    // (bootstrap stores it under the signing-passphrase service, account
+    // trust-passphrase-<node_id>); the account must be supplied or
+    // refresh-signed-trust fails closed. Linux uses its default file/systemd
+    // credential custody and needs no extra env.
+    let macos_cmd;
     let cmd = if platform == "macos" {
-        "env RUSTYNET_TRUST_SIGNER_KEY='/usr/local/etc/rustynet/trust-evidence.key' \
-         RUSTYNET_TRUST_EVIDENCE='/usr/local/var/rustynet/trust/rustynetd.trust' \
-         rustynet ops refresh-signed-trust"
+        macos_cmd = format!(
+            "env RUSTYNET_TRUST_SIGNER_KEY='/usr/local/etc/rustynet/trust-evidence.key' \
+             RUSTYNET_TRUST_EVIDENCE='/usr/local/var/rustynet/trust/rustynetd.trust' \
+             RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-{node_id}' \
+             rustynet ops refresh-signed-trust"
+        );
+        macos_cmd.as_str()
     } else {
         "rustynet ops refresh-signed-trust"
     };

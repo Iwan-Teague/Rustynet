@@ -96,6 +96,7 @@ pub fn read_passphrase_file_explicit(path: &Path) -> Result<Zeroizing<String>, S
 pub fn store_passphrase_in_os_secure_store(
     passphrase_path: &Path,
     keychain_account: Option<&str>,
+    keychain_service: Option<&str>,
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -107,20 +108,23 @@ pub fn store_passphrase_in_os_secure_store(
                 )
             })?,
         };
+        // Default to the WireGuard passphrase service for back-compat; callers
+        // that custody a different secret (e.g. the trust signing-key
+        // passphrase) pass their own service explicitly.
+        let service = match keychain_service {
+            Some(value) => normalize_macos_keychain_service(value)?,
+            None => MACOS_PASSPHRASE_KEYCHAIN_SERVICE.to_owned(),
+        };
         let passphrase = read_passphrase_file_explicit(passphrase_path)?;
-        store_macos_generic_password(
-            MACOS_PASSPHRASE_KEYCHAIN_SERVICE,
-            account.as_str(),
-            passphrase.as_bytes(),
-        )
-        .map_err(|err| format!("store macOS keychain passphrase failed: {err}"))?;
+        store_macos_generic_password(service.as_str(), account.as_str(), passphrase.as_bytes())
+            .map_err(|err| format!("store macOS keychain passphrase failed: {err}"))?;
         Ok(())
     }
     #[cfg(windows)]
     {
-        if keychain_account.is_some() {
+        if keychain_account.is_some() || keychain_service.is_some() {
             return Err(
-                "Windows passphrase secure-store provisioning does not accept --keychain-account"
+                "Windows passphrase secure-store provisioning does not accept --keychain-account or --keychain-service"
                     .to_string(),
             );
         }
@@ -130,7 +134,7 @@ pub fn store_passphrase_in_os_secure_store(
     #[cfg(not(target_os = "macos"))]
     #[cfg(not(windows))]
     {
-        let _ = (passphrase_path, keychain_account);
+        let _ = (passphrase_path, keychain_account, keychain_service);
         Err("passphrase secure-store provisioning is only supported on macOS".to_string())
     }
 }
@@ -418,6 +422,32 @@ fn resolve_macos_keychain_account_from_env() -> Result<Option<String>, String> {
         }
     };
     Ok(Some(normalize_macos_keychain_account(&account)?))
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_keychain_service(raw: &str) -> Result<String, String> {
+    let service = raw.trim();
+    if service.is_empty() {
+        return Err("macOS keychain service must not be empty".to_owned());
+    }
+    if service != raw {
+        return Err(
+            "macOS keychain service must not contain leading or trailing whitespace".to_owned(),
+        );
+    }
+    if service.len() > 128 {
+        return Err("macOS keychain service exceeds max length (128)".to_owned());
+    }
+    if !service
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return Err(
+            "macOS keychain service contains invalid characters; allowed: [A-Za-z0-9._:-]"
+                .to_owned(),
+        );
+    }
+    Ok(service.to_owned())
 }
 
 #[cfg(target_os = "macos")]

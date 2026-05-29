@@ -62,7 +62,7 @@ pub fn run_windows_runtime_boundary_check(
 
     let run_result = (|| -> Result<(), String> {
         write_plaintext_seed_passphrase(secret_blob_path.as_path())?;
-        store_passphrase_in_os_secure_store(secret_blob_path.as_path(), None)?;
+        store_passphrase_in_os_secure_store(secret_blob_path.as_path(), None, None)?;
         let passphrase = read_passphrase_file(secret_blob_path.as_path())?;
         if passphrase.trim() != SELF_CHECK_PASSPHRASE.trim() {
             return Err("Windows DPAPI passphrase round-trip returned unexpected data".to_owned());
