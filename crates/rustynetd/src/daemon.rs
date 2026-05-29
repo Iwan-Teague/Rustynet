@@ -10388,12 +10388,8 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
         // the membership snapshot may not yet reflect the new role, and the daemon
         // must still be able to start (it enters restricted-safe mode until the
         // next reconcile cycle re-validates alignment).
-        replay_membership_snapshot_and_log(
-            &membership_snapshot,
-            &membership_entries,
-            unix_now(),
-        )
-        .map_err(|err| {
+        replay_membership_snapshot_and_log(&membership_snapshot, &membership_entries, unix_now())
+            .map_err(|err| {
             DaemonError::InvalidConfig(format!("membership replay preflight failed: {err}"))
         })?;
     }

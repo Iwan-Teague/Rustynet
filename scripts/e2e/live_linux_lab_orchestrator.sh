@@ -3347,6 +3347,12 @@ stage_upgrade_admin_node_membership() {
   exit_target="$(node_target_for_label exit)"
   exit_node_id="$(node_id_for_label exit)"
   owner_approver_id="${exit_node_id}-owner"
+  # Re-assert exit-1 exit_server after live_anchor's validate_anchor_downgrade_revocation
+  # temporarily strips it when testing anchor.bundle_pull revocation.
+  local exit_full_caps="anchor,exit_server,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative"
+  live_lab_run_root "$exit_target" \
+    "root rustynet ops e2e-membership-set-capabilities --node-id '${exit_node_id}' --capabilities '${exit_full_caps}' --owner-approver-id '${owner_approver_id}'" || return 1
+
   for label in client entry extra; do
     has_label "$label" || continue
     node_id="$(node_id_for_label "$label")"
