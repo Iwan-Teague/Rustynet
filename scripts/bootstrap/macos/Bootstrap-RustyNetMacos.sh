@@ -882,6 +882,23 @@ seed_trust_evidence() {
     --signing-key-passphrase-file "${passphrase_file}" \
     --output "${trust_evidence}"
 
+  # Persist the trust signing-key passphrase into the System.keychain so the
+  # daemon can re-sign trust evidence after a role switch to admin/blind_exit.
+  # macOS has no Linux-style systemd-credential custody for the signing key;
+  # without this the passphrase would be discarded with the temp file below and
+  # `rustynet ops refresh-signed-trust` would fail closed ("macOS keychain
+  # account is required"). Stored under the signing-passphrase service that
+  # refresh-signed-trust resolves (matches DEFAULT_MACOS_PASSPHRASE_KEYCHAIN_SERVICE
+  # in rustynet-cli), keyed per node so co-tenant nodes cannot cross-read. Runs
+  # as root because the service account may not create System.keychain items.
+  if ! sudo "${RUSTYNETD_BIN}" key store-passphrase \
+      --passphrase-file "${passphrase_file}" \
+      --keychain-service "rustynet.signing_passphrase" \
+      --keychain-account "trust-passphrase-${NODE_ID}"; then
+    echo "[bootstrap] rustynetd key store-passphrase (trust signing) failed; node cannot re-sign trust evidence after a role switch" >&2
+    exit 1
+  fi
+
   rm -f "${passphrase_file}"
 
   # Secure the signing key (root-owned, group-read for rustynetd).

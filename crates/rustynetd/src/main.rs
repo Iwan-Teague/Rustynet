@@ -1856,6 +1856,7 @@ fn run_key_migrate(args: &[String]) -> Result<(), String> {
 fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
     let mut passphrase_path = String::new();
     let mut keychain_account: Option<String> = None;
+    let mut keychain_service: Option<String> = None;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -1874,6 +1875,13 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
                 keychain_account = Some(value.clone());
                 index += 2;
             }
+            Some("--keychain-service") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--keychain-service requires a value".to_owned())?;
+                keychain_service = Some(value.clone());
+                index += 2;
+            }
             Some(flag) => return Err(format!("unknown key store-passphrase argument: {flag}")),
             None => break,
         }
@@ -1887,12 +1895,14 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
     store_passphrase_in_os_secure_store(
         std::path::Path::new(&passphrase_path),
         keychain_account.as_deref(),
+        keychain_service.as_deref(),
     )?;
 
     println!(
-        "key passphrase store complete: passphrase_file={} keychain_account={}",
+        "key passphrase store complete: passphrase_file={} keychain_account={} keychain_service={}",
         passphrase_path,
-        keychain_account.as_deref().unwrap_or("<env>")
+        keychain_account.as_deref().unwrap_or("<env>"),
+        keychain_service.as_deref().unwrap_or("<default>")
     );
     Ok(())
 }
@@ -3235,7 +3245,7 @@ fn help_text() -> String {
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
-        "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>]",
+        "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>] [--keychain-service <name>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
