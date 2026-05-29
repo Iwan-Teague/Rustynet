@@ -3256,7 +3256,18 @@ stage_membership_setup() {
     else
       node_caps="client,relay_host,anchor,exit_server"
     fi
-    live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" || return 1
+    local add_out add_rc
+    add_out="$(live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-add --client-node-id '${node_id}' --client-pubkey-hex '${pub_hex}' --owner-approver-id '${owner_approver_id}' --capabilities '${node_caps}'" 2>&1)"
+    add_rc=$?
+    if [[ $add_rc -ne 0 ]]; then
+      if printf '%s' "$add_out" | grep -qF "already exists"; then
+        # Idempotent re-run (e.g. --skip-to membership_setup): update caps.
+        live_lab_run_root "$exit_target" "root rustynet ops e2e-membership-set-capabilities --node-id '${node_id}' --capabilities '${node_caps}' --owner-approver-id '${owner_approver_id}'" || return 1
+      else
+        printf '%s\n' "$add_out" >&2
+        return 1
+      fi
+    fi
   done < "$PUBKEYS_TSV"
 }
 
