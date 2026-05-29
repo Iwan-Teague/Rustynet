@@ -907,9 +907,14 @@ seed_trust_evidence() {
 
   rm -f "${passphrase_file}"
 
-  # Secure the signing key (root-owned, group-read for rustynetd).
+  # Secure the signing key owner-only (0600). `rustynet ops refresh-signed-trust`
+  # (run as root to re-sign trust evidence after a role switch) requires the
+  # signer key to be owner-only and fails closed on a group-readable key. The
+  # macOS daemon never reads the signer key directly (its launchd plist carries
+  # only the trust evidence + verifier key, not the signer), so dropping group
+  # read does not affect daemon startup.
   chown root:rustynetd "${signing_key}"
-  chmod 0640 "${signing_key}"
+  chmod 0600 "${signing_key}"
   # Trust evidence: root:rustynetd 0640.
   chown root:rustynetd "${trust_evidence}"
   chmod 0640 "${trust_evidence}"
