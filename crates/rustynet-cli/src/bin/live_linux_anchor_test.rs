@@ -798,31 +798,48 @@ fn validate_bundle_pull_loopback(
         })?;
     let mut request = token.clone();
     request.push(b'\n');
-    let response = shell
-        .tcp_send_recv(
-            &config.anchor_bundle_pull_addr,
-            &request,
-            Duration::from_secs(5),
-        )
-        .map_err(|err| format!("anchor bundle-pull loopback: tcp probe failed: {err}"))?;
-    let (header, body) = split_bundle_pull_response(&response)?;
-    if !header.starts_with(b"OK ") {
+    // Retry the TCP probe up to 3 times with a 2s sleep between attempts.
+    // An empty response means the listener wasn't ready (port not yet bound
+    // or daemon briefly between restart cycles) — not a hard failure.
+    let max_attempts = 3u32;
+    let sleep_secs = 2u64;
+    let mut attempt = 0u32;
+    let (header_vec, body_vec) = loop {
+        attempt += 1;
+        let response = shell
+            .tcp_send_recv(
+                &config.anchor_bundle_pull_addr,
+                &request,
+                Duration::from_secs(5),
+            )
+            .map_err(|err| format!("anchor bundle-pull loopback: tcp probe failed: {err}"))?;
+        match split_bundle_pull_response(&response) {
+            Ok((header, body)) => break (header.to_vec(), body.to_vec()),
+            Err(err) => {
+                if attempt >= max_attempts {
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+            }
+        }
+    };
+    if !header_vec.starts_with(b"OK ") {
         return Err(format!(
             "anchor bundle-pull loopback: unexpected header {:?}",
-            String::from_utf8_lossy(header)
+            String::from_utf8_lossy(&header_vec)
         ));
     }
-    if body != snapshot.as_slice() {
+    if body_vec != snapshot.as_slice() {
         return Err(format!(
             "anchor bundle-pull loopback: response body ({} bytes) does not match snapshot ({} bytes) byte-for-byte",
-            body.len(),
+            body_vec.len(),
             snapshot.len()
         ));
     }
     let digest = sha256_hex(&snapshot);
     Ok(format!(
         "bundle_digest={digest} bundle_bytes={}",
-        body.len()
+        body_vec.len()
     ))
 }
 
@@ -1297,7 +1314,8 @@ fn validate_anchor_enrollment_endpoint(
         // node ID ("<enrollee_node_id>-live-test") when the enrollee is pre-enrolled
         // so the positive admit has a fresh ID to work with. The enrollment MECHANISM
         // (token minting, rejection paths, signed log append) is identical either way.
-        let pre_enrolled = pre_status.contains("active_nodes=") && pre_status.contains(enrollee_node_id);
+        let pre_enrolled =
+            pre_status.contains("active_nodes=") && pre_status.contains(enrollee_node_id);
         let effective_enrollee_node_id: String = if pre_enrolled {
             format!("{enrollee_node_id}-live-test")
         } else {
