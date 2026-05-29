@@ -499,19 +499,37 @@ fn validate_anchor_gossip_priority(
         }
     };
 
-    let restore = set_membership_capabilities(
-        identity,
-        known_hosts,
-        config,
-        &config.anchor_host,
-        second_anchor_node_id,
-        "client,relay_host",
-        owner_approver_id,
-    );
+    let restore = {
+        let mut last_err = String::new();
+        let mut ok = false;
+        for attempt in 1u32..=3 {
+            match set_membership_capabilities(
+                identity,
+                known_hosts,
+                config,
+                &config.anchor_host,
+                second_anchor_node_id,
+                "client,relay_host",
+                owner_approver_id,
+            ) {
+                Ok(_) => {
+                    ok = true;
+                    break;
+                }
+                Err(err) => {
+                    last_err = err;
+                    if attempt < 3 {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                    }
+                }
+            }
+        }
+        if ok { Ok(()) } else { Err(last_err) }
+    };
 
     match (validation, restore) {
-        (Ok(summary), Ok(_)) => Ok(format!("{summary} restore=ok")),
-        (Err(err), Ok(_)) => Err(err),
+        (Ok(summary), Ok(())) => Ok(format!("{summary} restore=ok")),
+        (Err(err), Ok(())) => Err(err),
         (Ok(_), Err(restore_err)) => Err(format!(
             "second anchor validation passed but restore failed for {second_anchor_node_id}: {restore_err}"
         )),
