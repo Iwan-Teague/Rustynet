@@ -49,6 +49,16 @@ no current active implementation work.
 - [MembershipImplementationPlan.md](./MembershipImplementationPlan.md)
 - [CliCommandsDesign.md](./CliCommandsDesign.md)
 
+## Application Integration Planning Documents
+
+These hold forward-looking design for applications built on top of the Rustynet
+overlay. They are scoping/design material, not active dataplane ledgers.
+
+- [RustyChatIntegrationRequirements_2026-05-29.md](./RustyChatIntegrationRequirements_2026-05-29.md) —
+  capability gap analysis for building RustyChat (encrypted messaging for nodes
+  on a Rustynet) on top of Rustynet. Two-repo pair: a companion copy belongs in
+  the `Iwan-Teague/rustychat` repo.
+
 ## Mobile Planning Documents
 
 These hold future mobile-client architecture and roadmap material.
