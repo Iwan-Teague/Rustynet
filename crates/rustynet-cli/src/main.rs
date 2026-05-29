@@ -11049,10 +11049,10 @@ fn execute_ops_set_assignment_refresh_exit_node(
             env_path.display()
         ));
     }
-    if cfg!(target_os = "linux") {
-        // Expected runtime for assignment-refresh coupling mutation.
-    } else {
-        return Err("set-assignment-refresh-exit-node is supported on Linux only".to_owned());
+    if !cfg!(target_os = "linux") && !cfg!(target_os = "macos") {
+        return Err(
+            "set-assignment-refresh-exit-node is supported on Linux and macOS only".to_owned(),
+        );
     }
     if let Some(exit_node_id_value) = exit_node_id.as_deref()
         && !is_valid_assignment_refresh_exit_node_id(exit_node_id_value)
