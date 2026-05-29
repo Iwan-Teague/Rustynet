@@ -1394,6 +1394,7 @@ mod tests {
             ubuntu_node_id: "client-2".to_owned(),
             fedora_host: "debian@192.168.64.10".to_owned(),
             fedora_node_id: "client-3".to_owned(),
+            fedora_platform: "linux".to_owned(),
             mint_host: "debian@192.168.64.11".to_owned(),
             mint_node_id: "client-4".to_owned(),
             ssh_allow_cidrs: "192.168.64.0/24".to_owned(),
