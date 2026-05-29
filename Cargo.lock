@@ -1077,6 +1077,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustynet-xtask"
+version = "0.1.0"
+dependencies = [
+ "nix 0.29.0",
+ "serde_json",
+]
+
+[[package]]
 name = "rustynetd"
 version = "0.1.0"
 dependencies = [
