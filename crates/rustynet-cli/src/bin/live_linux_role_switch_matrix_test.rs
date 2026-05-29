@@ -28,6 +28,7 @@ const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 struct SignedStateRefreshTarget {
     host: String,
     node_id: String,
+    platform: String,
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +293,7 @@ struct Config {
     ubuntu_node_id: String,
     fedora_host: String,
     fedora_node_id: String,
+    fedora_platform: String,
     mint_host: String,
     mint_node_id: String,
     ssh_allow_cidrs: String,
@@ -317,6 +319,7 @@ impl Config {
             ubuntu_node_id: "client-52".to_owned(),
             fedora_host: "fedora@192.168.18.51".to_owned(),
             fedora_node_id: "client-51".to_owned(),
+            fedora_platform: "linux".to_owned(),
             mint_host: "mint@192.168.18.53".to_owned(),
             mint_node_id: "client-53".to_owned(),
             ssh_allow_cidrs: "192.168.18.0/24".to_owned(),
@@ -348,6 +351,7 @@ impl Config {
                 "--ubuntu-node-id" => config.ubuntu_node_id = next_value(&mut iter, &arg)?,
                 "--fedora-host" => config.fedora_host = next_value(&mut iter, &arg)?,
                 "--fedora-node-id" => config.fedora_node_id = next_value(&mut iter, &arg)?,
+                "--fedora-platform" => config.fedora_platform = next_value(&mut iter, &arg)?,
                 "--mint-host" => config.mint_host = next_value(&mut iter, &arg)?,
                 "--mint-node-id" => config.mint_node_id = next_value(&mut iter, &arg)?,
                 "--ssh-allow-cidrs" => config.ssh_allow_cidrs = next_value(&mut iter, &arg)?,
@@ -431,22 +435,27 @@ fn build_signed_state_refresh_context(
                     SignedStateRefreshTarget {
                         host: config.exit_host.clone(),
                         node_id: config.exit_node_id.clone(),
+                        platform: "linux".to_owned(),
                     },
                     SignedStateRefreshTarget {
                         host: config.debian_host.clone(),
                         node_id: config.debian_node_id.clone(),
+                        platform: "linux".to_owned(),
                     },
                     SignedStateRefreshTarget {
                         host: config.ubuntu_host.clone(),
                         node_id: config.ubuntu_node_id.clone(),
+                        platform: "linux".to_owned(),
                     },
                     SignedStateRefreshTarget {
                         host: config.fedora_host.clone(),
                         node_id: config.fedora_node_id.clone(),
+                        platform: config.fedora_platform.clone(),
                     },
                     SignedStateRefreshTarget {
                         host: config.mint_host.clone(),
                         node_id: config.mint_node_id.clone(),
+                        platform: "linux".to_owned(),
                     },
                 ],
             }))
@@ -857,11 +866,24 @@ fn refresh_traversal_bundles_for_transition(
             target.host.as_str(),
             "/tmp/rn-traversal.bundle",
         )?;
+        let install_cmd = if target.platform == "macos" {
+            "mkdir -p /usr/local/var/rustynet/trust \
+             && install -m 0644 /tmp/rn-traversal.pub /usr/local/var/rustynet/trust/traversal.pub \
+             && install -m 0640 /tmp/rn-traversal.bundle /usr/local/var/rustynet/trust/rustynetd.traversal \
+             && rm -f /usr/local/var/rustynet/trust/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+        } else {
+            "if ! getent group rustynetd >/dev/null 2>&1; then groupadd --system rustynetd; fi \
+             && install -d -m 0750 -o root -g rustynetd /etc/rustynet \
+             && install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet \
+             && install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub \
+             && install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal \
+             && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
+        };
         run_root(
             identity,
             known_hosts,
             target.host.as_str(),
-            "if ! getent group rustynetd >/dev/null 2>&1; then groupadd --system rustynetd; fi && install -d -m 0750 -o root -g rustynetd /etc/rustynet && install -d -m 0700 -o rustynetd -g rustynetd /var/lib/rustynet && install -m 0644 -o root -g root /tmp/rn-traversal.pub /etc/rustynet/traversal.pub && install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle",
+            install_cmd,
         )?;
     }
 
@@ -938,6 +960,7 @@ fn refresh_dns_zone_bundles_for_transition(
             target.host.as_str(),
             verifier_key.as_path(),
             bundle.as_path(),
+            target.platform.as_str(),
         )?;
     }
     Ok(())
@@ -1057,6 +1080,7 @@ fn install_dns_zone_bundle(
     target: &str,
     verifier_local: &Path,
     bundle_local: &Path,
+    platform: &str,
 ) -> Result<(), String> {
     scp_to(
         identity,
@@ -1072,18 +1096,32 @@ fn install_dns_zone_bundle(
         target,
         "/tmp/rn-dns-zone.bundle",
     )?;
-    run_root(
-        identity,
-        known_hosts,
-        target,
-        "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
-    )?;
-    run_root(
-        identity,
-        known_hosts,
-        target,
-        "install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub && install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone && rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle",
-    )
+    if platform == "macos" {
+        run_root(
+            identity,
+            known_hosts,
+            target,
+            "mkdir -p /usr/local/var/rustynet/trust \
+             && install -m 0644 /tmp/rn-dns-zone.pub /usr/local/var/rustynet/trust/dns-zone.pub \
+             && install -m 0640 /tmp/rn-dns-zone.bundle /usr/local/var/rustynet/trust/rustynetd.dns-zone \
+             && rm -f /usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle",
+        )
+    } else {
+        run_root(
+            identity,
+            known_hosts,
+            target,
+            "install -d -m 0750 -o root -g rustynetd /etc/rustynet",
+        )?;
+        run_root(
+            identity,
+            known_hosts,
+            target,
+            "install -m 0644 -o root -g root /tmp/rn-dns-zone.pub /etc/rustynet/dns-zone.pub \
+             && install -m 0640 -o root -g rustynetd /tmp/rn-dns-zone.bundle /var/lib/rustynet/rustynetd.dns-zone \
+             && rm -f /var/lib/rustynet/rustynetd.dns-zone.watermark /tmp/rn-dns-zone.pub /tmp/rn-dns-zone.bundle",
+        )
+    }
 }
 
 fn capture_client_role_snapshot(

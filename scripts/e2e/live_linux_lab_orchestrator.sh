@@ -4591,6 +4591,7 @@ stage_run_live_role_switch_matrix() {
     --ubuntu-node-id "$(node_id_for_label entry)" \
     --fedora-host "$(node_target_for_label aux)" \
     --fedora-node-id "$(node_id_for_label aux)" \
+    --fedora-platform "$(node_platform_for_label aux)" \
     --mint-host "$(node_target_for_label extra)" \
     --mint-node-id "$(node_id_for_label extra)" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
