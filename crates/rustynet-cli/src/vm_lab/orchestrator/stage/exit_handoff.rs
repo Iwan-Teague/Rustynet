@@ -28,12 +28,28 @@ impl OrchestrationStage for ExitHandoffStage {
             Some(a) => a.alias.clone(),
             None => return StageOutcome::Failed("no Exit node in assignments".to_owned()),
         };
-        match ctx.adapters.get(exit_alias.as_str()) {
-            Some(adapter) => match adapter.issue_membership_owner_key() {
-                Ok(_) => StageOutcome::Passed,
-                Err(e) => StageOutcome::Failed(format!("exit handoff probe failed: {e}")),
+        use crate::vm_lab::orchestrator::stage::role_switch_matrix::verify_tunnels_active;
+        let adapter = match ctx.adapters.get(exit_alias.as_str()) {
+            Some(a) => a,
+            None => return StageOutcome::Failed(format!("no adapter for exit '{exit_alias}'")),
+        };
+        // 1. The exit must hold its membership owner key (it is the signer).
+        if let Err(e) = adapter.issue_membership_owner_key() {
+            return StageOutcome::Failed(format!(
+                "exit handoff: membership owner key unavailable on '{exit_alias}': {e}"
+            ));
+        }
+        // 2. Prove the exit is actually serving the mesh, not merely that the
+        //    owner-key file exists: it must have at least one active tunnel.
+        //    Fails closed if tunnels are absent or unverifiable.
+        match adapter.collect_active_tunnels() {
+            Ok(list) => match verify_tunnels_active(&list) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("exit handoff: exit '{exit_alias}' {e}")),
             },
-            None => StageOutcome::Failed(format!("no adapter for exit '{exit_alias}'")),
+            Err(e) => StageOutcome::Failed(format!(
+                "exit handoff: tunnel query failed on '{exit_alias}': {e}"
+            )),
         }
     }
 }

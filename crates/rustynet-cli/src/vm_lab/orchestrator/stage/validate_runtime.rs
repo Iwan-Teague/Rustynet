@@ -55,15 +55,42 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
             })
             .collect();
 
+        use crate::vm_lab::orchestrator::report::ValidatorResult;
+        use std::collections::HashMap;
+
         let mut errors = Vec::new();
+        // Record per-node, per-op results as machine-readable evidence so the
+        // run report carries the actual validator detail rather than an empty
+        // list. Written to report_dir and read back by build_live_lab_run_report.
+        let mut records: HashMap<String, Vec<ValidatorResult>> = HashMap::new();
         for (alias, op_results) in all_results {
+            let mut node_records: Vec<ValidatorResult> = Vec::new();
             for (op, r) in OPS.iter().zip(op_results) {
+                let (passed, summary) = match &r {
+                    Ok(true) => (true, "passed".to_owned()),
+                    Ok(false) => (false, "validator reported not passed".to_owned()),
+                    Err(e) => (false, e.clone()),
+                };
+                node_records.push(ValidatorResult {
+                    op: format!("{op:?}"),
+                    passed,
+                    summary,
+                });
                 match r {
                     Ok(false) => errors.push(format!("{alias}/{op:?}: validation not passed")),
                     Err(e) => errors.push(format!("{alias}/{op:?}: {e}")),
                     Ok(true) => {}
                 }
             }
+            records.insert(alias, node_records);
+        }
+
+        // Best-effort: a write failure must not change the verdict (the actual
+        // validation already happened above); it only means the report ships
+        // without per-op detail, which is the prior behaviour.
+        if let Ok(json) = serde_json::to_string_pretty(&records) {
+            let path = ctx.report_dir.join("validator_results.json");
+            let _ = std::fs::write(path, json);
         }
 
         if errors.is_empty() {
