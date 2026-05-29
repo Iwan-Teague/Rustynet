@@ -1415,6 +1415,15 @@ fn atomic_write(path: &Path, body: &[u8], _mode: u32) -> Result<(), MembershipEr
                 .map_err(|err| MembershipError::Io(err.to_string()))?;
         }
     }
+    // Capture the existing file's owner before replacing it so we can
+    // restore ownership after the atomic rename.  When root-run tooling
+    // (e.g. `enrollment admit --apply`) rewrites a snapshot that the
+    // daemon owns (uid=rustynetd), the new file inherits uid=root and the
+    // daemon then rejects it on the ownership check in
+    // validate_membership_file_security.
+    #[cfg(unix)]
+    let prev_owner: Option<(u32, u32)> = fs::metadata(path).ok().map(|m| (m.uid(), m.gid()));
+
     if path.exists() {
         let metadata =
             fs::symlink_metadata(path).map_err(|err| MembershipError::Io(err.to_string()))?;
@@ -1454,6 +1463,15 @@ fn atomic_write(path: &Path, body: &[u8], _mode: u32) -> Result<(), MembershipEr
     if let Err(err) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(MembershipError::Io(err.to_string()));
+    }
+    // Restore original ownership when running as root over a non-root-owned
+    // file.  root can always chown, so an error here is unexpected and we
+    // surface it rather than silently leaving a root-owned snapshot.
+    #[cfg(unix)]
+    if matches!(prev_owner, Some((uid, _)) if uid != 0) && Uid::effective().is_root() {
+        let (uid, gid) = prev_owner.unwrap();
+        std::os::unix::fs::chown(path, Some(uid), Some(gid))
+            .map_err(|err| MembershipError::Io(format!("chown {}: {err}", path.display())))?;
     }
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
