@@ -95,6 +95,15 @@ Run these as mandatory quality gates for substantial work:
 - `cargo audit --deny warnings`
 - `cargo deny check bans licenses sources advisories`
 
+Fast-fail convenience runner (recommended for local iteration):
+- `cargo run -p rustynet-xtask -- gates` runs fmt → check → clippy → test in
+  dependency order, stops at the first failure, streams output live, and wraps
+  each stage in a timeout watchdog (kills the whole process group and prints the
+  tail on a hang). Add `--skip-test` to gate without the slow test stage, or
+  pass a cargo scope such as `-p rustynet-cli`. Per-stage timeouts are
+  overridable via `XTASK_{FMT,CHECK,CLIPPY,TEST}_TIMEOUT` (seconds). The
+  individual commands above remain the authoritative gate definitions.
+
 Run scope-specific scripts when present:
 - `./scripts/ci/phase9_gates.sh`
 - `./scripts/ci/phase10_gates.sh`
