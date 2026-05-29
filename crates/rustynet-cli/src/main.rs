@@ -13972,9 +13972,15 @@ fn write_bytes_file(path: &Path, body: &[u8]) -> Result<(), String> {
 
 fn encrypted_secret_permission_policy(path: &Path) -> KeyCustodyPermissionPolicy {
     let mut policy = KeyCustodyPermissionPolicy::default();
-    if matches!(path.parent(), Some(parent) if parent == Path::new("/etc/rustynet")) {
-        // Encrypted signing artifacts currently coexist with daemon-readable verifier
-        // material under /etc/rustynet on Linux.
+    if matches!(
+        path.parent(),
+        Some(parent)
+            if parent == Path::new("/etc/rustynet")
+                || parent == Path::new("/usr/local/etc/rustynet")
+    ) {
+        // Encrypted signing artifacts coexist with daemon-readable verifier
+        // material under the config root (/etc/rustynet on Linux,
+        // /usr/local/etc/rustynet on macOS), which is 0750 root:rustynetd.
         policy.required_directory_mode = 0o750;
     }
     policy
