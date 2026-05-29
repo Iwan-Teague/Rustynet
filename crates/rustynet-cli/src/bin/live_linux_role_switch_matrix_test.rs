@@ -729,7 +729,12 @@ fn ensure_client_role_with_expected_exit(
             "/etc/rustynet/assignment-refresh.env",
         )?;
     }
-    force_runtime_state_refresh(context.identity, context.known_hosts, context.host, context.platform)?;
+    force_runtime_state_refresh(
+        context.identity,
+        context.known_hosts,
+        context.host,
+        context.platform,
+    )?;
     if let Some(refresh) = context.signed_state_refresh {
         refresh_signed_state_for_transition(
             context.logger,
@@ -790,12 +795,21 @@ fn refresh_signed_state_for_transition(
         // the exit node (always admin) and the target_host (just
         // switched to admin or blind_exit) are the only two that must
         // refresh their trust records.
-        if target.host.as_str() == refresh.exit_host.as_str()
-            || target.host.as_str() == target_host
+        if target.host.as_str() == refresh.exit_host.as_str() || target.host.as_str() == target_host
         {
-            refresh_trust_evidence(identity, known_hosts, target.host.as_str(), target.platform.as_str())?;
+            refresh_trust_evidence(
+                identity,
+                known_hosts,
+                target.host.as_str(),
+                target.platform.as_str(),
+            )?;
         }
-        refresh_signed_state(identity, known_hosts, target.host.as_str(), target.platform.as_str())?;
+        refresh_signed_state(
+            identity,
+            known_hosts,
+            target.host.as_str(),
+            target.platform.as_str(),
+        )?;
     }
     force_runtime_state_refresh_targets_ordered(
         identity,
@@ -908,12 +922,7 @@ fn refresh_traversal_bundles_for_transition(
              && install -m 0640 -o root -g rustynetd /tmp/rn-traversal.bundle /var/lib/rustynet/rustynetd.traversal \
              && rm -f /var/lib/rustynet/rustynetd.traversal.watermark /tmp/rn-traversal.pub /tmp/rn-traversal.bundle"
         };
-        run_root(
-            identity,
-            known_hosts,
-            target.host.as_str(),
-            install_cmd,
-        )?;
+        run_root(identity, known_hosts, target.host.as_str(), install_cmd)?;
     }
 
     Ok(())
@@ -1031,20 +1040,35 @@ fn force_runtime_state_refresh_targets_ordered(
         .iter()
         .filter(|target| target.host.as_str() != exit_host && target.host.as_str() != target_host)
     {
-        force_runtime_state_refresh(identity, known_hosts, target.host.as_str(), target.platform.as_str())?;
+        force_runtime_state_refresh(
+            identity,
+            known_hosts,
+            target.host.as_str(),
+            target.platform.as_str(),
+        )?;
     }
     if exit_host != target_host {
         let exit_target = targets
             .iter()
             .find(|target| target.host.as_str() == exit_host)
             .ok_or_else(|| format!("missing exit traversal refresh target: {exit_host}"))?;
-        force_runtime_state_refresh(identity, known_hosts, exit_target.host.as_str(), exit_target.platform.as_str())?;
+        force_runtime_state_refresh(
+            identity,
+            known_hosts,
+            exit_target.host.as_str(),
+            exit_target.platform.as_str(),
+        )?;
     }
     let restore_target = targets
         .iter()
         .find(|target| target.host.as_str() == target_host)
         .ok_or_else(|| format!("missing restore traversal refresh target: {target_host}"))?;
-    force_runtime_state_refresh(identity, known_hosts, restore_target.host.as_str(), restore_target.platform.as_str())?;
+    force_runtime_state_refresh(
+        identity,
+        known_hosts,
+        restore_target.host.as_str(),
+        restore_target.platform.as_str(),
+    )?;
     Ok(())
 }
 

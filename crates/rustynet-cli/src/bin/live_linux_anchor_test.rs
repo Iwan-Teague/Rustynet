@@ -1017,9 +1017,9 @@ fn start_inflight_bundle_pull(
     // Create the scratch dir before writing the token into it.
     // write_file uses `install -m <mode> -- src dst` which requires
     // the parent directory to already exist.
-    let mk = shell.run_argv(&["mkdir", "-p", &work_dir], &[], &[]).map_err(|err| {
-        format!("create in-flight work dir {work_dir} failed: {err}")
-    })?;
+    let mk = shell
+        .run_argv(&["mkdir", "-p", &work_dir], &[], &[])
+        .map_err(|err| format!("create in-flight work dir {work_dir} failed: {err}"))?;
     if !mk.is_success() {
         return Err(format!(
             "create in-flight work dir {work_dir} failed: {}",
@@ -1600,7 +1600,7 @@ fn validate_anchor_downgrade_revocation(
         config,
         &config.anchor_host,
         config.anchor_node_id.as_str(),
-        "anchor,relay_host,anchor.gossip_seed,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
+        "anchor,exit_server,relay_host,anchor.gossip_seed,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
         owner_approver_id,
     ) {
         let _ = finish_inflight_bundle_pull(shell, config, &inflight_work_dir);
@@ -1631,7 +1631,7 @@ fn validate_anchor_downgrade_revocation(
         config,
         &config.anchor_host,
         config.anchor_node_id.as_str(),
-        "anchor,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
+        "anchor,exit_server,relay_host,anchor.gossip_seed,anchor.bundle_pull,anchor.enrollment_endpoint,anchor.relay_colocation,anchor.port_mapping_authoritative",
         owner_approver_id,
     );
 

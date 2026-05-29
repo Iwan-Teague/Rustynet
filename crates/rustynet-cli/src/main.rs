@@ -8808,7 +8808,10 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
     // skip DNS configuration.  The daemon is intentionally holding off the tunnel
     // (e.g. during a live role switch before membership catches up).  The service
     // will re-run when the daemon exits restriction and brings up the interface.
-    if !Path::new("/sys/class/net").join(interface.as_str()).exists() {
+    if !Path::new("/sys/class/net")
+        .join(interface.as_str())
+        .exists()
+    {
         let socket_path = PathBuf::from(DEFAULT_DAEMON_SOCKET_PATH);
         if let Ok(status) = send_command_with_socket(IpcCommand::Status, socket_path) {
             if status.ok
