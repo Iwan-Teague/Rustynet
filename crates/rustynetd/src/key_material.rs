@@ -97,6 +97,7 @@ pub fn store_passphrase_in_os_secure_store(
     passphrase_path: &Path,
     keychain_account: Option<&str>,
     keychain_service: Option<&str>,
+    allow_any_app: bool,
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -116,12 +117,26 @@ pub fn store_passphrase_in_os_secure_store(
             None => MACOS_PASSPHRASE_KEYCHAIN_SERVICE.to_owned(),
         };
         let passphrase = read_passphrase_file_explicit(passphrase_path)?;
-        store_macos_generic_password(service.as_str(), account.as_str(), passphrase.as_bytes())
-            .map_err(|err| format!("store macOS keychain passphrase failed: {err}"))?;
+        // `allow_any_app` forces the allow-any-application ACL, required when a
+        // *different* binary reads the secret back (the trust signing-key
+        // passphrase is stored by rustynetd but read by `rustynet ops
+        // refresh-signed-trust`). The default framework path binds read access
+        // to the storing binary's identity.
+        if allow_any_app {
+            rustynet_crypto::store_macos_generic_password_allow_any_app(
+                service.as_str(),
+                account.as_str(),
+                passphrase.as_bytes(),
+            )
+        } else {
+            store_macos_generic_password(service.as_str(), account.as_str(), passphrase.as_bytes())
+        }
+        .map_err(|err| format!("store macOS keychain passphrase failed: {err}"))?;
         Ok(())
     }
     #[cfg(windows)]
     {
+        let _ = allow_any_app;
         if keychain_account.is_some() || keychain_service.is_some() {
             return Err(
                 "Windows passphrase secure-store provisioning does not accept --keychain-account or --keychain-service"
@@ -134,7 +149,12 @@ pub fn store_passphrase_in_os_secure_store(
     #[cfg(not(target_os = "macos"))]
     #[cfg(not(windows))]
     {
-        let _ = (passphrase_path, keychain_account, keychain_service);
+        let _ = (
+            passphrase_path,
+            keychain_account,
+            keychain_service,
+            allow_any_app,
+        );
         Err("passphrase secure-store provisioning is only supported on macOS".to_string())
     }
 }

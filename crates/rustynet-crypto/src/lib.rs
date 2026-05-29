@@ -557,6 +557,29 @@ pub fn store_macos_generic_password(
     store_macos_generic_password_system_keychain(service, account, secret)
 }
 
+/// Store a System-keychain generic password with an allow-any-application
+/// ACL (`security add-generic-password -A`).
+///
+/// Use this for secrets that must be read back by a *different* binary than
+/// the one that stored them — e.g. the trust signing-key passphrase, stored by
+/// `rustynetd` at bootstrap and read by `rustynet ops refresh-signed-trust` via
+/// `/usr/bin/security -w`. The default [`store_macos_generic_password`] path
+/// prefers the `SecKeychain` framework, which binds read access to the storing
+/// binary's code-signing identity and would deny the cross-binary reader. This
+/// entry point goes straight to the `-A` CLI path so any local application can
+/// read the item (single-tenant service-account install layout; see the
+/// rationale on `store_macos_generic_password_system_keychain_via_security_cli`).
+#[cfg(target_os = "macos")]
+pub fn store_macos_generic_password_allow_any_app(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Result<(), CryptoError> {
+    validate_macos_keychain_label("service", service)?;
+    validate_macos_keychain_label("account", account)?;
+    store_macos_generic_password_system_keychain_via_security_cli(service, account, secret)
+}
+
 /// Targets the macOS System keychain. First attempts the legacy `SecKeychain`
 /// framework API; falls back to `/usr/bin/security add-generic-password`
 /// when the framework path fails. macOS 26 has progressively deprecated

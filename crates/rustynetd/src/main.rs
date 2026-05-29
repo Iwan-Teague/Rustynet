@@ -1857,6 +1857,7 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
     let mut passphrase_path = String::new();
     let mut keychain_account: Option<String> = None;
     let mut keychain_service: Option<String> = None;
+    let mut allow_any_app = false;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -1882,6 +1883,10 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
                 keychain_service = Some(value.clone());
                 index += 2;
             }
+            Some("--keychain-allow-any-app") => {
+                allow_any_app = true;
+                index += 1;
+            }
             Some(flag) => return Err(format!("unknown key store-passphrase argument: {flag}")),
             None => break,
         }
@@ -1896,13 +1901,15 @@ fn run_key_store_passphrase(args: &[String]) -> Result<(), String> {
         std::path::Path::new(&passphrase_path),
         keychain_account.as_deref(),
         keychain_service.as_deref(),
+        allow_any_app,
     )?;
 
     println!(
-        "key passphrase store complete: passphrase_file={} keychain_account={} keychain_service={}",
+        "key passphrase store complete: passphrase_file={} keychain_account={} keychain_service={} allow_any_app={}",
         passphrase_path,
         keychain_account.as_deref().unwrap_or("<env>"),
-        keychain_service.as_deref().unwrap_or("<default>")
+        keychain_service.as_deref().unwrap_or("<default>"),
+        allow_any_app
     );
     Ok(())
 }
@@ -3245,7 +3252,7 @@ fn help_text() -> String {
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key migrate --existing-private-key <path> [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
-        "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>] [--keychain-service <name>]",
+        "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>] [--keychain-service <name>] [--keychain-allow-any-app]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
         "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",

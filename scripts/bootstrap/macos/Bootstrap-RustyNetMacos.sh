@@ -891,10 +891,16 @@ seed_trust_evidence() {
   # refresh-signed-trust resolves (matches DEFAULT_MACOS_PASSPHRASE_KEYCHAIN_SERVICE
   # in rustynet-cli), keyed per node so co-tenant nodes cannot cross-read. Runs
   # as root because the service account may not create System.keychain items.
+  # --keychain-allow-any-app: the trust passphrase is stored by rustynetd but
+  # read back by a different binary (`rustynet ops refresh-signed-trust` via
+  # `/usr/bin/security -w`); the allow-any-application ACL lets the cross-binary
+  # reader access it (the default framework ACL binds to the storing binary's
+  # identity). Single-tenant service-account install layout.
   if ! sudo "${RUSTYNETD_BIN}" key store-passphrase \
       --passphrase-file "${passphrase_file}" \
       --keychain-service "rustynet.signing_passphrase" \
-      --keychain-account "trust-passphrase-${NODE_ID}"; then
+      --keychain-account "trust-passphrase-${NODE_ID}" \
+      --keychain-allow-any-app; then
     echo "[bootstrap] rustynetd key store-passphrase (trust signing) failed; node cannot re-sign trust evidence after a role switch" >&2
     exit 1
   fi
