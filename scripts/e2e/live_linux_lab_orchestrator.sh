@@ -3359,6 +3359,45 @@ stage_upgrade_admin_node_membership() {
     live_lab_run_root "$exit_target" \
       "root rustynet ops e2e-membership-set-capabilities --node-id '${node_id}' --capabilities 'client,relay_host,exit_server,anchor' --owner-approver-id '${owner_approver_id}'" || return 1
   done
+
+  # Re-issue assignment bundles for promoted nodes so bundle.node_capabilities
+  # includes anchor.  validate_auto_tunnel_role_membership_alignment Check 1
+  # requires anchor in the bundle when the daemon starts in Admin role.
+  # The original bundles (issued before live_anchor) carry only client,relay_host.
+  build_onehop_specs
+  # shellcheck disable=SC1090
+  source "$ONEHOP_STATE_ENV"
+  local admin_node_caps="client,relay_host,exit_server,anchor"
+  local updated_nodes_spec="$NODES_SPEC"
+  for label in client entry extra; do
+    has_label "$label" || continue
+    node_id="$(node_id_for_label "$label")"
+    updated_nodes_spec="$(printf '%s' "$updated_nodes_spec" | \
+      sed "s~\(${node_id}|[^|]*|[^|]*|\)client,relay_host||||client,relay_host~\1${admin_node_caps}||||${admin_node_caps}~")"
+  done
+  local admin_assign_env="$STATE_DIR/upgrade_admin_assignments.env"
+  : > "$admin_assign_env"
+  append_env_assignment "$admin_assign_env" "NODES_SPEC" "$updated_nodes_spec"
+  append_env_assignment "$admin_assign_env" "ALLOW_SPEC" "$ALLOW_SPEC"
+  append_env_assignment "$admin_assign_env" "ASSIGNMENTS_SPEC" "$ASSIGNMENTS_SPEC"
+  append_env_assignment "$admin_assign_env" "BUNDLE_TTL_SECS" "3600"
+  live_lab_issue_assignment_bundles_from_env "$exit_target" "$admin_assign_env" "/tmp/rn_upgrade_admin_assignments.env" || return 1
+  local admin_verifier_local="$STATE_DIR/upgrade_admin_assignment.pub"
+  live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment.pub" "$admin_verifier_local" || return 1
+  local target platform bundle_local refresh_env
+  for label in client entry extra; do
+    has_label "$label" || continue
+    target="$(node_target_for_label "$label")"
+    node_id="$(node_id_for_label "$label")"
+    bundle_local="$STATE_DIR/upgrade-admin-assignment-${node_id}.bundle"
+    refresh_env="$STATE_DIR/upgrade-admin-assignment-refresh-${node_id}.env"
+    platform="$(node_platform_for_label "$label")" || return 1
+    live_lab_fetch_root_file_to_local "$exit_target" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
+    live_lab_install_assignment_bundle "$target" "$admin_verifier_local" "$bundle_local" "$platform" || return 1
+    live_lab_write_assignment_refresh_env "$refresh_env" "$node_id" "$updated_nodes_spec" "$ALLOW_SPEC" "$exit_node_id"
+    live_lab_install_assignment_refresh_env "$target" "$refresh_env" "$platform" || return 1
+  done
+
   local snapshot_local log_local
   snapshot_local="$STATE_DIR/membership.snapshot"
   log_local="$STATE_DIR/membership.log"
