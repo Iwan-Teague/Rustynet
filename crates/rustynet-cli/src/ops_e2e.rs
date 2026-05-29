@@ -445,10 +445,9 @@ pub fn execute_ops_e2e_bootstrap_host(
             let write_result = (|| -> Result<(), String> {
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true).mode(0o600);
-                let mut file =
-                    options
-                        .open(enrollment_secret_path)
-                        .map_err(|err| format!("create enrollment secret failed: {err}"))?;
+                let mut file = options
+                    .open(enrollment_secret_path)
+                    .map_err(|err| format!("create enrollment secret failed: {err}"))?;
                 file.write_all(&enrollment_secret_bytes)
                     .map_err(|err| format!("write enrollment secret failed: {err}"))?;
                 file.sync_all()
