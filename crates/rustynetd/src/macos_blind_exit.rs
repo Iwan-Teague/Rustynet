@@ -314,13 +314,22 @@ fn pf_family_for_cidr(value: &str) -> Result<&'static str, String> {
 }
 
 fn normalize_pf_rule(line: &str) -> String {
-    line.split('#')
+    let collapsed = line
+        .split('#')
         .next()
         .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    // `pfctl -sr` echoes the default stateful flags ("flags S/SA") on every
+    // keep-state rule, even when the loaded ruleset omitted them. The rule
+    // strings this module generates (and the verifier's expected strings) use
+    // plain "keep state", and the live verification path feeds `pfctl -sr`
+    // output back in. Strip the canonical flags token so the loaded rules
+    // match: without this every keep-state allow reads as "missing" and the
+    // final-hop egress allow reads as an "unreviewed non-tunnel" rule.
+    collapsed.replace(" flags s/sa keep state", " keep state")
 }
 
 fn contains_forbidden_route_primitive(lines: &[String]) -> bool {
@@ -368,6 +377,25 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("unreviewed non-tunnel outbound"))
         );
+    }
+
+    #[test]
+    fn evaluator_accepts_pfctl_rendered_flags_s_sa() {
+        // `pfctl -sr` echoes the default "flags S/SA" on every keep-state rule.
+        // The live blind_exit verification feeds that output back in, so it must
+        // validate identically to the generated ("keep state") form. Regression
+        // for the FailClosed where every allow read as "missing" and the
+        // final-hop egress as "unreviewed".
+        let cfg = config();
+        let rules = "\
+pass out quick on rustynet0 inet all flags S/SA keep state
+pass out quick on rustynet0 inet6 all flags S/SA keep state
+pass in quick on rustynet0 inet from 100.64.0.0/10 to any flags S/SA keep state
+pass out quick on en0 inet from 100.64.0.0/10 to any flags S/SA keep state
+block drop out quick all
+";
+        let reasons = evaluate_macos_blind_exit_pf_rules(rules, &cfg);
+        assert!(reasons.is_empty(), "{reasons:?}");
     }
 
     #[test]
