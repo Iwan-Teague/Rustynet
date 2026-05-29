@@ -12490,10 +12490,25 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
     if cfg!(target_os = "macos") {
         // macOS has no systemd assignment-refresh service and does not
         // regenerate the assignment bundle locally (the lab re-issues and
-        // installs it externally). Restart the launchd-managed daemon so it
-        // re-reads the freshly installed bundle; do NOT remove the bundle or
-        // watermark, since nothing on macOS would regenerate them.
-        execute_ops_restart_runtime_service_macos()?;
+        // installs it externally). Kickstart the launchd-managed daemon in
+        // place so it re-reads the freshly installed bundle; do NOT remove the
+        // bundle or watermark (nothing on macOS would regenerate them). Use a
+        // lightweight `launchctl kickstart -k` rather than
+        // restart-runtime-service-macos, which regenerates the plist and
+        // requires full launchd-config env not present in this context.
+        let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_DAEMON_SOCKET_PATH)?;
+        let output = run_command_capture(
+            "launchctl",
+            &["kickstart", "-k", "system/com.rustynet.daemon"],
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "launchctl kickstart com.rustynet.daemon failed: {}",
+                command_failure_detail(&output)
+            ));
+        }
+        wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))?;
+        wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))?;
         return Ok(());
     }
     let assignment_refresh_env_path = env_path_or_default(
