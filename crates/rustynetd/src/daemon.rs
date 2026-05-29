@@ -319,6 +319,17 @@ pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_MAX_RECONCILE_FAILURES: u32 = 5;
 pub const DEFAULT_AUTO_PORT_FORWARD_EXIT: bool = false;
 pub const DEFAULT_AUTO_PORT_FORWARD_LEASE_SECS: u32 = 1_200;
+/// Floor for the port-mapping refresh cadence. A gateway that hands out a
+/// very short TTL must not be able to spin the reconcile loop into
+/// re-requesting the mapping many times per second; we never refresh more
+/// often than this even if half the lease lifetime is smaller.
+const PORT_MAPPING_MIN_REFRESH_INTERVAL_SECS: u64 = 30;
+/// Re-check / retry cadence when no lease is currently held — either the
+/// gateway declined (keepalive fallback) or this node is not the elected
+/// port-mapping authority. We re-evaluate on this interval so authority that
+/// swings back to us, or a gateway that comes back, is picked up without a
+/// restart.
+const PORT_MAPPING_RECHECK_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_NODE_ID: &str = "daemon-local";
 pub const DEFAULT_REMOTE_OPS_EXPECTED_SUBJECT: &str = "user:local";
 pub const DEFAULT_FAIL_CLOSED_SSH_ALLOW: bool = false;
@@ -3389,6 +3400,18 @@ struct DaemonRuntime {
     /// to complete before transitioning to the atomic-swap phase.
     /// Defaults to `DEFAULT_ROTATION_DRAIN_TIMEOUT_SECS` seconds.
     rotation_drain_timeout: Duration,
+    /// D2.3 follow-up / D11 port-mapping authority: lease lifecycle state.
+    /// The reconcile loop re-runs the supervisor bring-up when
+    /// `next_port_mapping_refresh_at` elapses (scheduled at ~half the lease
+    /// lifetime) or immediately after a local endpoint change, so the router
+    /// port-forward survives both lease expiry and an internal-IP change
+    /// (e.g. a DHCP reassignment after a reboot). `None` deadline =
+    /// inactive (disabled, keepalive mode, or not the elected authority).
+    port_mapping_mode: crate::port_mapper::PortMappingMode,
+    port_mapping_internal_port: u16,
+    port_mapping_lease_secs: u32,
+    port_mapping_lease: Option<crate::port_mapper::MappingLease>,
+    next_port_mapping_refresh_at: Option<Instant>,
 }
 
 #[cfg(target_os = "linux")]
@@ -3741,6 +3764,21 @@ impl DaemonRuntime {
             rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref()),
             rotation_handshake_tracker: InFlightHandshakeTracker::new(),
             rotation_drain_timeout: Duration::from_secs(DEFAULT_ROTATION_DRAIN_TIMEOUT_SECS),
+            port_mapping_mode: config.port_mapping_mode,
+            port_mapping_internal_port: config.wg_listen_port,
+            port_mapping_lease_secs: config.auto_port_forward_lease_secs.get(),
+            port_mapping_lease: None,
+            // Auto mode arms an immediate first bring-up on the first
+            // reconcile tick; disabled / keepalive never schedule one.
+            next_port_mapping_refresh_at: if matches!(
+                config.port_mapping_mode,
+                crate::port_mapper::PortMappingMode::Disabled
+                    | crate::port_mapper::PortMappingMode::Keepalive
+            ) {
+                None
+            } else {
+                Some(Instant::now())
+            },
         })
     }
 
@@ -4492,6 +4530,15 @@ impl DaemonRuntime {
                 if self.next_stun_refresh_at.is_some() {
                     self.next_stun_refresh_at = Some(Instant::now());
                 }
+                // Same rationale for the router port-forward: a changed
+                // internal IP (e.g. a DHCP reassignment after a reboot)
+                // leaves the current mapping pointing at the old address.
+                // Force an immediate re-bring_up so the mapping is
+                // re-issued for the new internal IP within a reconcile
+                // tick rather than only when the lease's TTL lapses.
+                if self.next_port_mapping_refresh_at.is_some() {
+                    self.next_port_mapping_refresh_at = Some(Instant::now());
+                }
                 if let Err(err) = self.refresh_signed_state_with_reason(
                     true,
                     SignedStateRefreshReason::EndpointChange,
@@ -4736,6 +4783,107 @@ impl DaemonRuntime {
         self.seen_gossip_sequences = node.seen_gossip_sequences.clone();
         self.last_minted_bundle = node.last_minted_bundle.clone();
         self.next_gossip_mint_at = node.next_gossip_mint_at;
+    }
+
+    /// D2.3 follow-up / D11 port-mapping authority: own the router
+    /// port-forward lease lifecycle. Re-runs the supervisor bring-up when
+    /// `next_port_mapping_refresh_at` elapses (scheduled at ~half the lease
+    /// lifetime, so a failed first attempt still has a retry budget before
+    /// the mapping lapses) or when an endpoint change forced an immediate
+    /// re-lease. Re-evaluates the elected port-mapping authority every
+    /// cycle so a node that loses authority stops refreshing and a node
+    /// that gains it starts.
+    ///
+    /// Best-effort and additive, exactly like the original one-shot
+    /// bring-up: every failure path falls back to WireGuard keepalive
+    /// (decision 2.3) and never restricts the daemon. Re-running
+    /// `bring_up` rather than `refresh_existing_lease` is deliberate — it
+    /// re-resolves the gateway and the internal client address, so a DHCP
+    /// reassignment of the internal IP is picked up automatically without
+    /// the daemon having to track the internal address itself (the
+    /// `MappingLease` does not carry it). The previous lease is dropped,
+    /// not explicitly released: re-requesting the same internal port
+    /// replaces the mapping at the gateway, and any stale mapping for an
+    /// old internal IP lapses on its own TTL.
+    fn maybe_refresh_port_mapping(&mut self) {
+        use crate::port_mapper::{PortMappingMode, PortMappingSupervisor, SupervisorBringUp};
+
+        let Some(due_at) = self.next_port_mapping_refresh_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < due_at {
+            return;
+        }
+
+        // Defensive: disabled / keepalive never arm a deadline, but if one
+        // is somehow set, disarm it rather than probing.
+        if matches!(
+            self.port_mapping_mode,
+            PortMappingMode::Disabled | PortMappingMode::Keepalive
+        ) {
+            self.next_port_mapping_refresh_at = None;
+            return;
+        }
+
+        // Re-evaluate the elected lex-min authority every cycle. If we are
+        // not (or no longer) the authority, drop any lease we hold and
+        // re-check later in case authority swings back to us.
+        if let Some(reason) = port_mapping_bring_up_skip_reason(
+            self.local_node_id.as_str(),
+            self.membership_state.as_ref(),
+        ) {
+            if self.port_mapping_lease.take().is_some() {
+                log::info!("port_mapping: releasing local lease — {reason}");
+            }
+            self.next_port_mapping_refresh_at =
+                Some(now + Duration::from_secs(PORT_MAPPING_RECHECK_INTERVAL_SECS));
+            return;
+        }
+
+        let supervisor = PortMappingSupervisor::new(self.port_mapping_mode);
+        match supervisor.bring_up(
+            self.port_mapping_internal_port,
+            self.port_mapping_lease_secs,
+        ) {
+            Ok(SupervisorBringUp::Mapped { lease }) => {
+                let remaining = lease
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
+                log::info!(
+                    "port_mapping: granted protocol={} external_addr={} external_port={} internal_port={} ttl_secs={}",
+                    lease.protocol.label(),
+                    lease.external_addr,
+                    lease.external_port,
+                    lease.internal_port,
+                    remaining
+                );
+                let refresh_in = remaining
+                    .saturating_div(2)
+                    .max(PORT_MAPPING_MIN_REFRESH_INTERVAL_SECS);
+                self.next_port_mapping_refresh_at =
+                    Some(Instant::now() + Duration::from_secs(refresh_in));
+                self.port_mapping_lease = Some(lease);
+            }
+            Ok(SupervisorBringUp::KeepaliveFallback { reason }) => {
+                log::info!("port_mapping: keepalive_fallback reason={reason}");
+                self.port_mapping_lease = None;
+                self.next_port_mapping_refresh_at =
+                    Some(now + Duration::from_secs(PORT_MAPPING_RECHECK_INTERVAL_SECS));
+            }
+            Ok(SupervisorBringUp::Skipped { reason }) => {
+                log::info!("port_mapping: skipped reason={reason}");
+                self.port_mapping_lease = None;
+                self.next_port_mapping_refresh_at = None;
+            }
+            Err(err) => {
+                log::warn!("port_mapping: bring-up failed (continuing with keepalive): {err}");
+                self.port_mapping_lease = None;
+                self.next_port_mapping_refresh_at =
+                    Some(now + Duration::from_secs(PORT_MAPPING_RECHECK_INTERVAL_SECS));
+            }
+        }
     }
 
     fn poll_stun_results(&mut self) {
@@ -8756,67 +8904,6 @@ fn port_mapping_bring_up_skip_reason(
     }
 }
 
-/// Best-effort port-mapping bring-up. Logs the outcome; never propagates
-/// an error to the caller because port mapping is purely additive (the
-/// daemon's outbound-keepalive fallback covers every case where the
-/// gateway probe fails). Called once on daemon startup. Refresh-on-
-/// cadence is a follow-up cycle (see D2.3 status in the dataplane
-/// execution plan).
-fn bootstrap_port_mapping(config: &DaemonConfig, membership_state: Option<&MembershipState>) {
-    use crate::port_mapper::{PortMappingMode, PortMappingSupervisor, SupervisorBringUp};
-
-    log::info!(
-        "port_mapping: mode={} wg_listen_port={} lease_secs={}",
-        config.port_mapping_mode.label(),
-        config.wg_listen_port,
-        config.auto_port_forward_lease_secs.get()
-    );
-    if matches!(config.port_mapping_mode, PortMappingMode::Disabled) {
-        log::info!("port_mapping: disabled by configuration; skipping probe and keepalive logging");
-        return;
-    }
-    if matches!(config.port_mapping_mode, PortMappingMode::Keepalive) {
-        log::info!(
-            "port_mapping: keepalive mode — relying on WireGuard PersistentKeepalive to maintain NAT bindings"
-        );
-        return;
-    }
-    if let Some(reason) =
-        port_mapping_bring_up_skip_reason(config.node_id.as_str(), membership_state)
-    {
-        log::info!("port_mapping: {reason}");
-        return;
-    }
-    let supervisor = PortMappingSupervisor::new(config.port_mapping_mode);
-    match supervisor.bring_up(
-        config.wg_listen_port,
-        config.auto_port_forward_lease_secs.get(),
-    ) {
-        Ok(SupervisorBringUp::Mapped { lease }) => {
-            log::info!(
-                "port_mapping: granted protocol={} external_addr={} external_port={} internal_port={} ttl_secs={}",
-                lease.protocol.label(),
-                lease.external_addr,
-                lease.external_port,
-                lease.internal_port,
-                lease
-                    .expires_at
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_secs()
-            );
-        }
-        Ok(SupervisorBringUp::KeepaliveFallback { reason }) => {
-            log::info!("port_mapping: keepalive_fallback reason={reason}");
-        }
-        Ok(SupervisorBringUp::Skipped { reason }) => {
-            log::info!("port_mapping: skipped reason={reason}");
-        }
-        Err(err) => {
-            log::warn!("port_mapping: bring-up failed (continuing with keepalive): {err}");
-        }
-    }
-}
-
 pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     let mut config = config;
     if matches!(config.backend_mode, DaemonBackendMode::InMemory) {
@@ -8851,7 +8938,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     };
     runtime.bootstrap();
     scrub_runtime_wireguard_key_after_bootstrap(&config)?;
-    bootstrap_port_mapping(&config, runtime.membership_state.as_ref());
+    // Port-mapping bring-up is owned by the reconcile loop's
+    // `maybe_refresh_port_mapping()` — it performs the initial bring-up on
+    // the first tick and then refreshes on a cadence / re-leases on an
+    // endpoint change. (Superseded the previous one-shot startup call.)
 
     #[cfg(windows)]
     {
@@ -9033,6 +9123,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             }
             let now_unix = unix_now();
             runtime.poll_stun_results();
+            runtime.maybe_refresh_port_mapping();
             runtime.maybe_preexpiry_refresh_traversal(now_unix);
             runtime.poll_endpoint_monitor_and_maybe_refresh();
             runtime.maybe_trigger_endpoint_change_refresh();
@@ -9312,6 +9403,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             }
             let now_unix = unix_now();
             runtime.poll_stun_results();
+            runtime.maybe_refresh_port_mapping();
             runtime.maybe_preexpiry_refresh_traversal(now_unix);
             runtime.poll_endpoint_monitor_and_maybe_refresh();
             runtime.maybe_trigger_endpoint_change_refresh();
@@ -20465,6 +20557,81 @@ mod tests {
         assert!(
             next < far_future,
             "endpoint change must move the STUN refresh earlier than the prior schedule"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Port-mapping lifecycle: a detected local endpoint change must force an
+    /// immediate port-mapping re-bring_up (collapsing the wait to a reconcile
+    /// tick) so a DHCP-reassigned internal IP gets a fresh router mapping
+    /// instead of leaving the old mapping pointing at the stale address until
+    /// its TTL lapses.
+    #[test]
+    fn endpoint_change_forces_immediate_port_mapping_release() {
+        let relay_addr: SocketAddr = "203.0.113.34:40024".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-endpoint-change-forces-port-mapping",
+            relay_addr,
+            "relay-eu-1",
+        );
+
+        runtime.port_mapping_mode = crate::port_mapper::PortMappingMode::Auto;
+        let far_future = Instant::now() + Duration::from_secs(3_600);
+        runtime.next_port_mapping_refresh_at = Some(far_future);
+
+        runtime.traversal_last_endpoint_fingerprint = Some("stale-endpoint-fingerprint".to_owned());
+        runtime.traversal_last_endpoint_change_unix = None;
+
+        runtime.maybe_trigger_endpoint_change_refresh();
+
+        let next = runtime
+            .next_port_mapping_refresh_at
+            .expect("port-mapping refresh must remain scheduled after an endpoint change");
+        assert!(
+            next <= Instant::now(),
+            "endpoint change must force the next port-mapping re-bring_up to be due immediately"
+        );
+        assert!(
+            next < far_future,
+            "endpoint change must move the port-mapping refresh earlier than the prior schedule"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// Port-mapping lifecycle: when this node is not the elected
+    /// port-mapping authority (here: no membership state at all), a due
+    /// refresh must NOT hold a lease and must reschedule a re-check rather
+    /// than disarming — so authority swinging back to us is picked up
+    /// without a restart. Exercises the authority-gating path with no
+    /// network dependency.
+    #[test]
+    fn port_mapping_refresh_defers_when_not_authority() {
+        let relay_addr: SocketAddr = "203.0.113.35:40025".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-runtime-port-mapping-not-authority",
+            relay_addr,
+            "relay-eu-1",
+        );
+
+        runtime.port_mapping_mode = crate::port_mapper::PortMappingMode::Auto;
+        runtime.membership_state = None; // => skip_reason: authority unavailable
+        runtime.port_mapping_lease = None;
+        runtime.next_port_mapping_refresh_at = Some(Instant::now());
+
+        runtime.maybe_refresh_port_mapping();
+
+        assert!(
+            runtime.port_mapping_lease.is_none(),
+            "a non-authority node must not hold a port-mapping lease"
+        );
+        let next = runtime
+            .next_port_mapping_refresh_at
+            .expect("non-authority node must reschedule a re-check, not disarm refresh");
+        assert!(
+            next > Instant::now(),
+            "the re-check must be scheduled in the future, not left immediately due"
         );
 
         let _ = std::fs::remove_dir_all(test_dir);
