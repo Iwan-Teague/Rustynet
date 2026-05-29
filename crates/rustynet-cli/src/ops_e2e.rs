@@ -697,6 +697,12 @@ pub fn execute_ops_e2e_enforce_host(
     }
     let src_dir_text = src_dir.display().to_string();
     ensure_safe_token("src-dir", src_dir_text.as_str())?;
+    // macOS has no systemd; enforce the role via the launchd install script
+    // (parity with the orchestrator's macos_install::enforce_daemon) instead
+    // of `ops install-systemd`, which is Linux-only and fails closed here.
+    if cfg!(target_os = "macos") {
+        return enforce_host_macos(role.as_str(), node_id.as_str(), ssh_allow_cidrs.as_str());
+    }
     let auto_refresh = Path::new("/etc/rustynet/trust-evidence.key").is_file();
     let assignment_auto_refresh = Path::new("/etc/rustynet/assignment.signing.secret").is_file()
         && Path::new("/etc/rustynet/assignment-refresh.env").is_file();
@@ -753,6 +759,222 @@ pub fn execute_ops_e2e_enforce_host(
     Ok(format!(
         "e2e enforce host complete: role={role} node_id={node_id}",
     ))
+}
+
+/// Embedded macOS launchd install/enforce script. Same file the orchestrator
+/// carries to the node for `macos_install::enforce_daemon`; here it is run
+/// locally so `e2e-enforce-host` can enforce a role on a macOS node.
+#[cfg(not(windows))]
+const MACOS_INSTALL_SERVICE_SCRIPT: &str =
+    include_str!("../../../scripts/bootstrap/macos/Install-RustyNetMacosService.sh");
+
+/// Enforce a role on the local macOS node via the launchd install script.
+///
+/// Mirrors `vm_lab::orchestrator::adapter::macos_install::enforce_daemon`:
+/// re-renders the daemon launchd plist with the requested role,
+/// `--auto-tunnel-enforce true`, and extended max-age windows, then reloads
+/// it. The node's existing `--wg-interface` and `RUSTYNET_NETWORK_ID` are
+/// read back from the installed plist and preserved, so enforcing a role
+/// never resets the tunnel device or blanks the network id. Fail-closed: a
+/// missing/unparseable plist, an invalid interface, or a failed reload all
+/// return `Err` rather than silently producing a weaker configuration.
+#[cfg(not(windows))]
+fn enforce_host_macos(role: &str, node_id: &str, ssh_allow_cidrs: &str) -> Result<String, String> {
+    const PLIST_PATH: &str = "/Library/LaunchDaemons/com.rustynet.daemon.plist";
+    const SOCKET_PATH: &str = "/private/var/run/rustynet/rustynetd.sock";
+    const RUSTYNETD_BIN: &str = "/usr/local/bin/rustynetd";
+    const STATE_ROOT: &str = "/usr/local/var/rustynet";
+
+    // The launchd install script only accepts these daemon roles; reject
+    // anything else up front rather than letting the script fail opaquely.
+    if !matches!(role, "admin" | "client" | "blind_exit") {
+        return Err(format!(
+            "e2e-enforce-host on macOS: unsupported --node-role {role:?} (expected admin, client, or blind_exit)"
+        ));
+    }
+
+    // Preserve the interface and network id the node was bootstrapped with.
+    let plist = std::fs::read_to_string(PLIST_PATH).map_err(|err| {
+        format!(
+            "e2e-enforce-host on macOS: read {PLIST_PATH} failed (daemon not bootstrapped?): {err}"
+        )
+    })?;
+    let wg_interface = plist_program_arg_value(&plist, "--wg-interface").ok_or_else(|| {
+        "e2e-enforce-host on macOS: --wg-interface not found in installed plist".to_owned()
+    })?;
+    if !is_valid_utun(&wg_interface) {
+        return Err(format!(
+            "e2e-enforce-host on macOS: existing --wg-interface {wg_interface:?} is not utun<digits>"
+        ));
+    }
+    let network_id = plist_env_value(&plist, "RUSTYNET_NETWORK_ID").unwrap_or_default();
+
+    // Extended freshness windows (lab passes 86400 via env; default to the
+    // same so an omitted env var does not fall back to the 300 s default).
+    let auto_tunnel_max_age =
+        env::var("RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS").unwrap_or_else(|_| "86400".to_owned());
+    let traversal_max_age =
+        env::var("RUSTYNET_TRAVERSAL_MAX_AGE_SECS").unwrap_or_else(|_| "86400".to_owned());
+    let ssh_allow_flag = if ssh_allow_cidrs.is_empty() {
+        "false"
+    } else {
+        "true"
+    };
+
+    let script_path = write_secure_macos_install_script()?;
+    let run = run_status(
+        "/bin/bash",
+        &[
+            script_path
+                .to_str()
+                .ok_or("e2e-enforce-host on macOS: temp script path is not UTF-8")?,
+            "--rustynetd-bin",
+            RUSTYNETD_BIN,
+            "--state-root",
+            STATE_ROOT,
+            "--node-id",
+            node_id,
+            "--node-role",
+            role,
+            "--network-id",
+            network_id.as_str(),
+            "--wg-interface",
+            wg_interface.as_str(),
+            "--auto-tunnel-enforce",
+            "true",
+            "--trust-max-age-secs",
+            "86400",
+            "--auto-tunnel-max-age-secs",
+            auto_tunnel_max_age.as_str(),
+            "--traversal-max-age-secs",
+            traversal_max_age.as_str(),
+            "--dns-zone-max-age-secs",
+            "86400",
+            "--fail-closed-ssh-allow",
+            ssh_allow_flag,
+            "--fail-closed-ssh-allow-cidrs",
+            ssh_allow_cidrs,
+        ],
+        &[],
+        "install-launchd enforce pass failed",
+    );
+    let _ = std::fs::remove_file(&script_path);
+    run?;
+
+    // The install script reloads the launchd plist, which bounces the daemon;
+    // launchctl returns before the control socket re-binds. Wait for it so a
+    // caller that immediately probes the socket does not see a transient gap.
+    wait_for_macos_daemon_socket(SOCKET_PATH)?;
+
+    Ok(format!(
+        "e2e enforce host complete: role={role} node_id={node_id}"
+    ))
+}
+
+/// Extract the value `<string>` that immediately follows the `<string>{flag}`
+/// entry in a launchd plist's `ProgramArguments` array.
+#[cfg(not(windows))]
+fn plist_program_arg_value(plist: &str, flag: &str) -> Option<String> {
+    let needle = format!("<string>{flag}</string>");
+    let mut lines = plist.lines();
+    for line in lines.by_ref() {
+        if line.contains(needle.as_str()) {
+            for next in lines.by_ref() {
+                if let Some(value) = extract_string_tag(next) {
+                    return Some(value);
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Extract the `<string>` value that follows a `<key>{key}</key>` entry in a
+/// launchd plist's `EnvironmentVariables` dict.
+#[cfg(not(windows))]
+fn plist_env_value(plist: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let mut lines = plist.lines();
+    for line in lines.by_ref() {
+        if line.contains(needle.as_str()) {
+            for next in lines.by_ref() {
+                if let Some(value) = extract_string_tag(next) {
+                    return Some(value);
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn extract_string_tag(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let start = trimmed.find("<string>")? + "<string>".len();
+    let end = trimmed[start..].find("</string>")? + start;
+    Some(trimmed[start..end].to_owned())
+}
+
+#[cfg(not(windows))]
+fn is_valid_utun(value: &str) -> bool {
+    value
+        .strip_prefix("utun")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Write the embedded launchd install script to a root-only temp file
+/// (`O_EXCL`, mode 0700) under the daemon runtime dir so it cannot be
+/// pre-created or swapped by a non-root user before we exec it.
+#[cfg(not(windows))]
+fn write_secure_macos_install_script() -> Result<PathBuf, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut rnd = [0u8; 8];
+    OsRng
+        .try_fill_bytes(&mut rnd)
+        .map_err(|err| format!("e2e-enforce-host on macOS: rng failed: {err}"))?;
+    let suffix: String = rnd.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = PathBuf::from(format!(
+        "/private/var/run/rustynet/.rn-enforce-install-{suffix}.sh"
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .map_err(|err| {
+            format!(
+                "e2e-enforce-host on macOS: create temp install script {} failed: {err}",
+                path.display()
+            )
+        })?;
+    file.write_all(MACOS_INSTALL_SERVICE_SCRIPT.as_bytes())
+        .map_err(|err| {
+            format!("e2e-enforce-host on macOS: write temp install script failed: {err}")
+        })?;
+    Ok(path)
+}
+
+/// Poll until the macOS daemon control socket re-binds after a launchd reload,
+/// or fail closed after 45 s.
+#[cfg(not(windows))]
+fn wait_for_macos_daemon_socket(socket: &str) -> Result<(), String> {
+    let path = Path::new(socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.file_type().is_socket()
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "e2e-enforce-host on macOS: daemon socket {socket} did not reappear within 45s after enforce"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Enforce baseline runtime configuration on the local Windows host.
@@ -7119,5 +7341,76 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             err.contains("only supported on Windows"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod macos_enforce_tests {
+    use super::{extract_string_tag, is_valid_utun, plist_env_value, plist_program_arg_value};
+
+    const SAMPLE_PLIST: &str = r#"<plist version="1.0">
+<dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/rustynetd</string>
+        <string>daemon</string>
+        <string>--node-id</string>
+        <string>client-3</string>
+        <string>--node-role</string>
+        <string>blind_exit</string>
+        <string>--wg-interface</string>
+        <string>utun386</string>
+        <string>--backend</string>
+        <string>macos-wireguard-userspace-shared</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUSTYNET_NODE_ROLE</key>
+        <string>blind_exit</string>
+        <key>RUSTYNET_NETWORK_ID</key>
+        <string>rustynet-lab-net</string>
+    </dict>
+</dict>
+</plist>"#;
+
+    #[test]
+    fn program_arg_value_reads_the_following_string() {
+        assert_eq!(
+            plist_program_arg_value(SAMPLE_PLIST, "--wg-interface").as_deref(),
+            Some("utun386")
+        );
+        assert_eq!(
+            plist_program_arg_value(SAMPLE_PLIST, "--node-role").as_deref(),
+            Some("blind_exit")
+        );
+        assert_eq!(plist_program_arg_value(SAMPLE_PLIST, "--absent"), None);
+    }
+
+    #[test]
+    fn env_value_reads_network_id() {
+        assert_eq!(
+            plist_env_value(SAMPLE_PLIST, "RUSTYNET_NETWORK_ID").as_deref(),
+            Some("rustynet-lab-net")
+        );
+        assert_eq!(plist_env_value(SAMPLE_PLIST, "RUSTYNET_MISSING"), None);
+    }
+
+    #[test]
+    fn extract_string_tag_handles_indentation() {
+        assert_eq!(
+            extract_string_tag("        <string>utun42</string>").as_deref(),
+            Some("utun42")
+        );
+        assert_eq!(extract_string_tag("        <array>"), None);
+    }
+
+    #[test]
+    fn is_valid_utun_requires_utun_prefix_and_digits() {
+        assert!(is_valid_utun("utun0"));
+        assert!(is_valid_utun("utun386"));
+        assert!(!is_valid_utun("utun"));
+        assert!(!is_valid_utun("en0"));
+        assert!(!is_valid_utun("utunX"));
+        assert!(!is_valid_utun("rustynet0"));
     }
 }
