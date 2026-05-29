@@ -3625,9 +3625,6 @@ mod tests {
         shell
             .write_file(cfg.anchor_token_path.as_str(), token, 0o600)
             .unwrap();
-        // Program ANY sh -c invocation with success — assert on the
-        // recorded argv below to confirm the helper drove the right
-        // commands.
         let body = "set -eu; \
                 work=\"$1\"; tok=\"$2\"; addr_host=\"$3\"; addr_port=\"$4\"; \
                 chmod 700 \"$work\"; \
@@ -3638,28 +3635,36 @@ mod tests {
                   \"$work/response\" \"$work/stderr\" \"$work/status\" \
                   </dev/null >/dev/null 2>&1 &
                 printf '%s\\n' \"$!\" > \"$work/pid\"";
-        // We don't know the scratch dir name in advance, so first
-        // capture the helper's argv by reading run_log AFTER the
-        // attempt. Since the mock requires a programmed response,
-        // we drive it via a wildcard: pre-stage the response for the
-        // EXACT argv the helper builds. To do that, predict the dir.
-        // Easier: run the helper without a programmed response,
-        // read the error to discover the argv, then re-program.
-        let err = super::start_inflight_bundle_pull(&shell, &cfg)
-            .expect_err("no programmed response on first attempt");
-        let log = shell.run_log();
-        assert_eq!(log.len(), 1, "one run_argv attempt expected: {err}");
-        // The argv is [sh, -c, <body>, --, <work>, <tok>, host, port]
-        let argv: Vec<&str> = log[0].argv.iter().map(String::as_str).collect();
-        assert_eq!(argv[0], "sh");
-        assert_eq!(argv[1], "-c");
-        assert_eq!(argv[2], body);
-        assert_eq!(argv[3], "--");
-        let work_dir = argv[4].to_owned();
+        // The scratch dir embeds a pid + nanosecond timestamp, so its
+        // argv cannot be predicted to pre-program the `mkdir -p` step.
+        // Drive every command to success via the default response so
+        // the helper runs end-to-end, then assert on the recorded argv
+        // sequence: `mkdir -p <work>` followed by the `sh -c` launcher.
+        shell.program_default_run_response(ok_response(b""));
+        let work_dir = super::start_inflight_bundle_pull(&shell, &cfg)
+            .expect("helper succeeds when all commands return success");
         assert!(
             work_dir.starts_with("/tmp/rustynet-anchor-inflight-"),
             "work dir under POSIX scratch root: {work_dir}"
         );
+        let log = shell.run_log();
+        assert_eq!(
+            log.len(),
+            2,
+            "expected mkdir then sh launcher: {:?}",
+            log.iter().map(|inv| inv.argv.clone()).collect::<Vec<_>>()
+        );
+        // First command stages the scratch dir.
+        let mkdir_argv: Vec<&str> = log[0].argv.iter().map(String::as_str).collect();
+        assert_eq!(mkdir_argv, ["mkdir", "-p", work_dir.as_str()]);
+        // Second command launches the background nc bundle-pull.
+        // argv is [sh, -c, <body>, --, <work>, <tok>, host, port].
+        let argv: Vec<&str> = log[1].argv.iter().map(String::as_str).collect();
+        assert_eq!(argv[0], "sh");
+        assert_eq!(argv[1], "-c");
+        assert_eq!(argv[2], body);
+        assert_eq!(argv[3], "--");
+        assert_eq!(argv[4], work_dir);
         assert_eq!(argv[5], format!("{work_dir}/token"));
         assert_eq!(argv[6], "127.0.0.1");
         assert_eq!(argv[7], "51822");
@@ -3667,16 +3672,6 @@ mod tests {
         let token_remote_path = format!("{work_dir}/token");
         let staged = shell.read_file(&token_remote_path).expect("token staged");
         assert_eq!(staged, token);
-
-        // Now re-program success for a second attempt with the same
-        // argv, exercise the happy path.
-        let argv_str: Vec<&str> = argv.to_vec();
-        shell.program_run_response(&argv_str, ok_response(b""));
-        // The second call generates a different work_dir because of
-        // the monotonic timestamp — so the helper writes a new token
-        // file and would build a new argv. Instead we just confirm
-        // the inputs/outputs above are correct; the second-run path
-        // is exercised by the integration test.
     }
 
     #[test]

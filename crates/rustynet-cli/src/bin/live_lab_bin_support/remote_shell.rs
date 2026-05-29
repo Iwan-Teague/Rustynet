@@ -1269,6 +1269,12 @@ struct MockShellState {
     files: BTreeMap<String, MockFile>,
     /// Programmed responses keyed by argv-joined-with-NUL, FIFO.
     run_responses: BTreeMap<String, Vec<RemoteExitStatus>>,
+    /// Fallback response for any argv without an exact programmed
+    /// match. Off by default so unprogrammed calls still error; set
+    /// via `program_default_run_response` when a test needs to drive a
+    /// helper past intermediate commands whose argv (e.g. a scratch
+    /// dir with an embedded timestamp) cannot be predicted in advance.
+    default_run_response: Option<RemoteExitStatus>,
     /// Recording of every run_argv call, for assertion in tests.
     run_log: Vec<MockRunInvocation>,
     /// Programmed TCP responses keyed by address, FIFO.
@@ -1309,6 +1315,11 @@ impl MockShellHost {
         let key = mock_argv_key(argv);
         let mut state = self.inner.lock().expect("mock shell mutex poisoned");
         state.run_responses.entry(key).or_default().push(response);
+    }
+
+    pub fn program_default_run_response(&self, response: RemoteExitStatus) {
+        let mut state = self.inner.lock().expect("mock shell mutex poisoned");
+        state.default_run_response = Some(response);
     }
 
     pub fn program_tcp_response(&self, addr: &str, response: Vec<u8>) {
@@ -1419,9 +1430,12 @@ impl RemoteShellHost for MockShellHost {
         let entry = state.run_responses.get_mut(&key);
         match entry {
             Some(queue) if !queue.is_empty() => Ok(queue.remove(0)),
-            _ => Err(RemoteShellError::Transport {
-                message: format!("mock backend has no programmed response for argv {argv:?}"),
-            }),
+            _ => match state.default_run_response.clone() {
+                Some(response) => Ok(response),
+                None => Err(RemoteShellError::Transport {
+                    message: format!("mock backend has no programmed response for argv {argv:?}"),
+                }),
+            },
         }
     }
 
