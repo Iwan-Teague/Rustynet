@@ -24,6 +24,14 @@ use live_lab_support::{
 
 const ROLE_SWITCH_ROUTE_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 
+fn daemon_socket_for_platform(platform: &str) -> &'static str {
+    if platform == "macos" {
+        "/private/var/run/rustynet/rustynetd.sock"
+    } else {
+        "/run/rustynet/rustynetd.sock"
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SignedStateRefreshTarget {
     host: String,
@@ -55,6 +63,7 @@ struct HostSwitchSpec<'a> {
     os_id: &'a str,
     temp_role: &'a str,
     node_id: &'a str,
+    platform: &'a str,
 }
 
 struct ClientRoleContext<'a> {
@@ -63,6 +72,7 @@ struct ClientRoleContext<'a> {
     known_hosts: &'a Path,
     host: &'a str,
     node_id: &'a str,
+    platform: &'a str,
     ssh_allow_cidrs: &'a str,
     workspace_dir: &'a Path,
     signed_state_refresh: Option<&'a SignedStateRefreshContext>,
@@ -222,24 +232,28 @@ fn run() -> Result<(), String> {
             os_id: "debian13",
             temp_role: "admin",
             node_id: &config.debian_node_id,
+            platform: "linux",
         },
         HostSwitchSpec {
             host: &config.fedora_host,
             os_id: "fedora",
             temp_role: "blind_exit",
             node_id: &config.fedora_node_id,
+            platform: &config.fedora_platform,
         },
         HostSwitchSpec {
             host: &config.ubuntu_host,
             os_id: "ubuntu",
             temp_role: "admin",
             node_id: &config.ubuntu_node_id,
+            platform: "linux",
         },
         HostSwitchSpec {
             host: &config.mint_host,
             os_id: "mint",
             temp_role: "admin",
             node_id: &config.mint_node_id,
+            platform: "linux",
         },
     ] {
         process_host(
@@ -483,6 +497,7 @@ fn process_host(
             known_hosts: context.known_hosts,
             host: spec.host,
             node_id: spec.node_id,
+            platform: spec.platform,
             ssh_allow_cidrs: context.ssh_allow_cidrs,
             workspace_dir: context.workspace_dir,
             signed_state_refresh: context.signed_state_refresh,
@@ -499,6 +514,7 @@ fn process_host(
         spec.temp_role,
         spec.node_id,
         context.ssh_allow_cidrs,
+        spec.platform,
     )?;
     if let Some(refresh) = context.signed_state_refresh {
         refresh_signed_state_for_transition(
@@ -551,6 +567,7 @@ fn process_host(
         known_hosts: context.known_hosts,
         host: spec.host,
         node_id: spec.node_id,
+        platform: spec.platform,
         ssh_allow_cidrs: context.ssh_allow_cidrs,
         workspace_dir: context.workspace_dir,
         signed_state_refresh: context.signed_state_refresh,
@@ -627,6 +644,7 @@ fn switch_role(
     role: &str,
     node_id: &str,
     ssh_allow_cidrs: &str,
+    platform: &str,
 ) -> Result<(), String> {
     enforce_host(
         identity,
@@ -641,7 +659,7 @@ fn switch_role(
         identity,
         known_hosts,
         host,
-        "/run/rustynet/rustynetd.sock",
+        daemon_socket_for_platform(platform),
         20,
         2,
     )?;
@@ -654,7 +672,7 @@ fn switch_role(
     // switch contract. Mirrors the explicit pre-mutation refresh
     // pattern from live_linux_two_hop_test (commit cca0418) and
     // live_linux_lan_toggle_test (commit fc648df).
-    refresh_trust_evidence(identity, known_hosts, host)
+    refresh_trust_evidence(identity, known_hosts, host, platform)
 }
 
 fn ensure_client_role(context: &mut ClientRoleContext<'_>) -> Result<String, String> {
@@ -688,6 +706,7 @@ fn ensure_client_role_with_expected_exit(
         "client",
         context.node_id,
         context.ssh_allow_cidrs,
+        context.platform,
     )?;
     if baseline_exit.is_empty() || baseline_exit == "none" {
         apply_role_coupling(
@@ -710,7 +729,7 @@ fn ensure_client_role_with_expected_exit(
             "/etc/rustynet/assignment-refresh.env",
         )?;
     }
-    force_runtime_state_refresh(context.identity, context.known_hosts, context.host)?;
+    force_runtime_state_refresh(context.identity, context.known_hosts, context.host, context.platform)?;
     if let Some(refresh) = context.signed_state_refresh {
         refresh_signed_state_for_transition(
             context.logger,
@@ -765,8 +784,18 @@ fn refresh_signed_state_for_transition(
     )?;
     refresh_dns_zone_bundles_for_transition(identity, known_hosts, workspace_dir, refresh)?;
     for target in &refresh.targets {
-        refresh_trust_evidence(identity, known_hosts, target.host.as_str())?;
-        refresh_signed_state(identity, known_hosts, target.host.as_str())?;
+        // Trust-evidence refresh requires a trust signer key, which
+        // only admin and blind_exit nodes have.  Client nodes stay in
+        // client role during any given transition so skip them here;
+        // the exit node (always admin) and the target_host (just
+        // switched to admin or blind_exit) are the only two that must
+        // refresh their trust records.
+        if target.host.as_str() == refresh.exit_host.as_str()
+            || target.host.as_str() == target_host
+        {
+            refresh_trust_evidence(identity, known_hosts, target.host.as_str(), target.platform.as_str())?;
+        }
+        refresh_signed_state(identity, known_hosts, target.host.as_str(), target.platform.as_str())?;
     }
     force_runtime_state_refresh_targets_ordered(
         identity,
@@ -1002,54 +1031,60 @@ fn force_runtime_state_refresh_targets_ordered(
         .iter()
         .filter(|target| target.host.as_str() != exit_host && target.host.as_str() != target_host)
     {
-        force_runtime_state_refresh(identity, known_hosts, target.host.as_str())?;
+        force_runtime_state_refresh(identity, known_hosts, target.host.as_str(), target.platform.as_str())?;
     }
     if exit_host != target_host {
         let exit_target = targets
             .iter()
             .find(|target| target.host.as_str() == exit_host)
             .ok_or_else(|| format!("missing exit traversal refresh target: {exit_host}"))?;
-        force_runtime_state_refresh(identity, known_hosts, exit_target.host.as_str())?;
+        force_runtime_state_refresh(identity, known_hosts, exit_target.host.as_str(), exit_target.platform.as_str())?;
     }
     let restore_target = targets
         .iter()
         .find(|target| target.host.as_str() == target_host)
         .ok_or_else(|| format!("missing restore traversal refresh target: {target_host}"))?;
-    force_runtime_state_refresh(identity, known_hosts, restore_target.host.as_str())?;
+    force_runtime_state_refresh(identity, known_hosts, restore_target.host.as_str(), restore_target.platform.as_str())?;
     Ok(())
 }
 
-fn refresh_trust_evidence(identity: &Path, known_hosts: &Path, host: &str) -> Result<(), String> {
+fn refresh_trust_evidence(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    platform: &str,
+) -> Result<(), String> {
     wait_for_daemon_socket(
         identity,
         known_hosts,
         host,
-        "/run/rustynet/rustynetd.sock",
+        daemon_socket_for_platform(platform),
         20,
         2,
     )?;
-    run_root(
-        identity,
-        known_hosts,
-        host,
-        "rustynet ops refresh-signed-trust",
-    )
+    let cmd = if platform == "macos" {
+        "env RUSTYNET_TRUST_SIGNER_KEY='/usr/local/etc/rustynet/trust-evidence.key' \
+         RUSTYNET_TRUST_EVIDENCE='/usr/local/var/rustynet/trust/rustynetd.trust' \
+         rustynet ops refresh-signed-trust"
+    } else {
+        "rustynet ops refresh-signed-trust"
+    };
+    run_root(identity, known_hosts, host, cmd)
 }
 
-fn refresh_signed_state(identity: &Path, known_hosts: &Path, host: &str) -> Result<(), String> {
-    wait_for_daemon_socket(
-        identity,
-        known_hosts,
-        host,
-        "/run/rustynet/rustynetd.sock",
-        20,
-        2,
-    )?;
+fn refresh_signed_state(
+    identity: &Path,
+    known_hosts: &Path,
+    host: &str,
+    platform: &str,
+) -> Result<(), String> {
+    let socket = daemon_socket_for_platform(platform);
+    wait_for_daemon_socket(identity, known_hosts, host, socket, 20, 2)?;
     run_root(
         identity,
         known_hosts,
         host,
-        "env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet state refresh",
+        &format!("env RUSTYNET_DAEMON_SOCKET={socket} rustynet state refresh"),
     )
 }
 
@@ -1057,6 +1092,7 @@ fn force_runtime_state_refresh(
     identity: &Path,
     known_hosts: &Path,
     host: &str,
+    platform: &str,
 ) -> Result<(), String> {
     run_root(
         identity,
@@ -1068,7 +1104,7 @@ fn force_runtime_state_refresh(
         identity,
         known_hosts,
         host,
-        "/run/rustynet/rustynetd.sock",
+        daemon_socket_for_platform(platform),
         20,
         2,
     )
