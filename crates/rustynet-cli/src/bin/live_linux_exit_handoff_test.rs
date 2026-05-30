@@ -194,8 +194,14 @@ fn run() -> Result<(), String> {
     // regenerated bundle ("route peer ... lacks signed relay_host or exit_server")
     // and fail-closed on the enforce restart. Mirror build_onehop_specs:
     // `caps||||caps`.
+    // exit_a and exit_b are both enforced as `admin` (the handoff keeps a
+    // standby exit), so both need `anchor` in their assignment intent —
+    // otherwise the daemon rejects the bundle with "assignment target intent
+    // lacks required local capability anchor". They are the two anchor/exit
+    // servers; the client stays client,relay_host. (upgrade_admin already
+    // granted these nodes anchor in signed membership.)
     let nodes_spec = format!(
-        "{}|{}:51820|{}|anchor,exit_server||||anchor,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host;{}|{}:51820|{}|client,relay_host||||client,relay_host",
+        "{}|{}:51820|{}|anchor,exit_server||||anchor,exit_server;{}|{}:51820|{}|anchor,exit_server||||anchor,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host",
         config.exit_a_node_id,
         exit_a_addr,
         exit_a_pub_hex,
