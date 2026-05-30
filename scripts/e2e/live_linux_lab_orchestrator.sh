@@ -5216,6 +5216,26 @@ stage_run_live_relay() {
 # `macos_*`, and the first Windows host to `windows_*`. If any of
 # the three OSes is absent from the inventory, the stage fails
 # closed rather than fabricating a default.
+# True only when the entry/aux/extra labels cover exactly the platform mix
+# live_mixed_topology needs: at least one Linux, one macOS, and one Windows
+# host. Used to gate the stage so a profile without a Windows node (e.g. the
+# macOS-smoke profile, where Windows bring-up is deferred) records a skip
+# instead of hard-failing the stage's fail-closed mix check.
+live_mixed_topology_has_required_mix() {
+  local label platform
+  local have_linux=0 have_macos=0 have_windows=0
+  for label in entry aux extra; do
+    has_label "$label" || continue
+    platform="$(node_platform_for_label "$label")"
+    case "$platform" in
+      linux) have_linux=1 ;;
+      macos) have_macos=1 ;;
+      windows) have_windows=1 ;;
+    esac
+  done
+  [[ "$have_linux" == 1 && "$have_macos" == 1 && "$have_windows" == 1 ]]
+}
+
 stage_run_live_mixed_topology() {
   local linux_host="" linux_node_id=""
   local macos_host="" macos_node_id=""
@@ -8184,7 +8204,7 @@ main() {
   # the entry / aux / extra labels. The stage itself fails closed
   # when that mix is not present, so the orchestrator only needs to
   # check the label presence here.
-  if has_label entry && has_label aux && has_label extra; then
+  if has_label entry && has_label aux && has_label extra && live_mixed_topology_has_required_mix; then
     run_stage hard live_mixed_topology 'run mixed-OS topology visibility validation' stage_run_live_mixed_topology
   else
     record_stage_skip live_mixed_topology hard 'requires entry + aux + extra labels with one Linux + one macOS + one Windows host'
