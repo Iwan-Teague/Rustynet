@@ -1230,17 +1230,36 @@ fn finish_inflight_bundle_pull(
         format!("read in-flight response failed: {err}")
     })?;
     let (header, body) = split_bundle_pull_response(&response)?;
-    if !header.starts_with(b"OK ") {
-        cleanup_remote_dir(shell, config, work_dir);
-        return Err(format!(
-            "in-flight bundle-pull header was not OK: {:?}",
-            String::from_utf8_lossy(header)
-        ));
-    }
     let header_text = String::from_utf8_lossy(header).into_owned();
     let bytes = body.len();
     cleanup_remote_dir(shell, config, work_dir);
-    Ok(format!("header={header_text} bytes={bytes}"))
+    // The in-flight pull races the revocation's membership-snapshot rewrite.
+    // The anchor serves bundle-pulls synchronously on its event loop and reads
+    // the snapshot at handler-start (before the client token), then serves
+    // atomically — so a handler, once started, is never yanked mid-serve.
+    // Exactly one of two CORRECT outcomes therefore occurs:
+    //   * the handler read the snapshot before the revoke write landed -> a
+    //     valid `OK <len>` signed bundle, or
+    //   * it read the snapshot after -> a clean fail-closed
+    //     `ERR forbidden after revocation`.
+    // Both demonstrate correct behaviour under concurrent revocation (no yank,
+    // no corruption, no hang). Asserting the pull must always win the race is
+    // wrong and was the source of this stage's flakiness. Anything OTHER than
+    // these two headers (a truncated line, a different error, garbage) is a
+    // real defect and still fails. The strict guarantee that pulls are forbidden
+    // AFTER revocation settles is asserted separately by
+    // `wait_for_bundle_pull_fail_closed`.
+    if header.starts_with(b"OK ") {
+        Ok(format!("served header={header_text} bytes={bytes}"))
+    } else if header == b"ERR forbidden after revocation" {
+        Ok(format!(
+            "forbidden_clean header={header_text} (in-flight pull lost the race to the revocation snapshot write; daemon fail-closed correctly)"
+        ))
+    } else {
+        Err(format!(
+            "in-flight bundle-pull returned an unexpected header (neither a valid OK bundle nor the clean revocation fail-closed): {header_text:?}"
+        ))
+    }
 }
 
 /// Track B Phase 29 — probe the bundle-pull listener until it
@@ -3905,7 +3924,62 @@ mod tests {
         shell.program_run_response(&["rm", "-rf", "--", work_dir], ok_response(b""));
         let summary = super::finish_inflight_bundle_pull(&shell, &cfg, work_dir)
             .expect("inflight finished cleanly");
-        assert_eq!(summary, "header=OK 8 bytes=8");
+        assert_eq!(summary, "served header=OK 8 bytes=8");
+    }
+
+    #[test]
+    fn finish_inflight_bundle_pull_accepts_clean_revocation_fail_closed() {
+        // An in-flight pull whose handler read the membership snapshot AFTER the
+        // revocation write is correctly fail-closed by the daemon. That is a
+        // valid race outcome (the daemon serves bundle-pulls synchronously and
+        // never yanks an already-started serve), so the finisher must accept it
+        // rather than demand the pull always win the race. The post-revocation
+        // fail-closed guarantee is asserted separately by
+        // wait_for_bundle_pull_fail_closed.
+        let shell = MockShellHost::new();
+        let cfg = mock_config_for_test(super::AnchorPlatform::Linux);
+        let work_dir = "/tmp/rustynet-anchor-inflight-forbidden";
+        shell
+            .write_file(&format!("{work_dir}/status"), b"0\n", 0o600)
+            .unwrap();
+        shell
+            .write_file(
+                &format!("{work_dir}/response"),
+                b"ERR forbidden after revocation\n",
+                0o600,
+            )
+            .unwrap();
+        shell.program_run_response(&["rm", "-rf", "--", work_dir], ok_response(b""));
+        let summary = super::finish_inflight_bundle_pull(&shell, &cfg, work_dir)
+            .expect("clean revocation fail-closed is a valid in-flight outcome");
+        assert!(
+            summary.starts_with("forbidden_clean header=ERR forbidden after revocation"),
+            "got: {summary}"
+        );
+    }
+
+    #[test]
+    fn finish_inflight_bundle_pull_rejects_unexpected_header() {
+        // Any header that is neither a valid OK bundle nor the exact clean
+        // revocation fail-closed indicates a real defect (truncation, wrong
+        // error, garbage) and must still fail.
+        let shell = MockShellHost::new();
+        let cfg = mock_config_for_test(super::AnchorPlatform::Linux);
+        let work_dir = "/tmp/rustynet-anchor-inflight-garbage";
+        shell
+            .write_file(&format!("{work_dir}/status"), b"0\n", 0o600)
+            .unwrap();
+        shell
+            .write_file(
+                &format!("{work_dir}/response"),
+                b"ERR something else entirely\n",
+                0o600,
+            )
+            .unwrap();
+        shell.program_run_response(&["rm", "-rf", "--", work_dir], ok_response(b""));
+        let err = super::finish_inflight_bundle_pull(&shell, &cfg, work_dir)
+            .expect_err("unexpected header must fail");
+        assert!(err.contains("unexpected header"), "got: {err}");
     }
 
     #[test]
