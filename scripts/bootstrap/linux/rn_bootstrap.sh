@@ -436,10 +436,6 @@ wait_for_cargo_registry_endpoint || exit 1
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
-# Co-deploy the sibling relay daemon binary (relay serving is behind the
-# `daemon` feature) so relay/anchor nodes can start rustynet-relay.service.
-run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
-run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
 backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
