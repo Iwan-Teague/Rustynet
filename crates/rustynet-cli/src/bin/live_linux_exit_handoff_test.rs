@@ -34,6 +34,14 @@ const DNS_ZONE_VERIFIER_REMOTE: &str = "/run/rustynet/dns-zone-issue-handoff/rn-
 const ASSIGNMENT_REFRESH_ENV_PATH: &str = "/etc/rustynet/assignment-refresh.env";
 const MAX_TRAVERSAL_COORDINATION_TTL_SECS: u64 = 30;
 const HANDOFF_PRE_MONITOR_TIMEOUT_SECS: u64 = 60;
+/// Upper bound on acceptable exit-failover reconvergence time (client observes
+/// exit_b as its exit after exit_a is downed). Exit failover is bounded by the
+/// traversal reprobe cycle: handshake-freshness (default 30s) + reprobe
+/// interval (default 30s) + a reconcile, so the dataplane plan's
+/// interval-bounded convergence model makes this ~one reprobe cycle, not
+/// instantaneous. Set to 3x the 30s default reprobe interval; never-reconverged
+/// (reconvergence_secs = -1) and gross slowness still fail.
+const MAX_HANDOFF_RECONVERGENCE_SECS: i64 = 90;
 const HANDOFF_REFRESH_CONVERGENCE_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -847,11 +855,21 @@ fn run() -> Result<(), String> {
         .and_then(|value| value.checked_sub(switch_ts))
         .map_or(-1, |value| value as i64);
 
-    let check_handoff_reconvergence = if (0..=30).contains(&reconvergence_secs) {
-        "pass"
-    } else {
-        "fail"
-    };
+    // Exit failover is bounded by the traversal reprobe cycle, not a hard 30s:
+    // the client must observe exit_a's handshake go stale (handshake-freshness,
+    // default 30s) AND complete a reprobe (reprobe interval, default 30s) before
+    // switching to exit_b, then reconcile to reprogram routes. The dataplane
+    // execution plan models such convergence as interval-bounded (e.g. STUN
+    // gather ~60s), so a sub-reprobe-interval bound was unachievable and flaky.
+    // Budget = MAX_HANDOFF_RECONVERGENCE_SECS (3x the 30s default reprobe
+    // interval). A failover that never reconverges yields reconvergence_secs=-1
+    // and still fails; gross slowness beyond the budget still fails.
+    let check_handoff_reconvergence =
+        if (0..=MAX_HANDOFF_RECONVERGENCE_SECS).contains(&reconvergence_secs) {
+            "pass"
+        } else {
+            "fail"
+        };
     let check_no_route_leak = if route_leak_count == 0 {
         "pass"
     } else {
