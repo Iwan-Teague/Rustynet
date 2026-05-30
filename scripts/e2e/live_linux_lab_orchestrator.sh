@@ -3781,7 +3781,7 @@ refresh_runtime_state_worker() {
       # re-mint on Linux only; on macOS the orchestrator supplies the fresh
       # bundle externally. Privileged-helper bounces best-effort
       # (KeepAlive=true re-launches it).
-      macos_admin_repush_assignment "$target" "$node_id" || return 1
+      macos_admin_repush_signed_bundles "$label" "$target" "$node_id" || return 1
       live_lab_run_root "$target" "root launchctl kickstart -k system/com.rustynet.privileged-helper 2>/dev/null || true; root launchctl kickstart -k system/com.rustynet.daemon" || return 1
       ;;
     windows)
@@ -4060,38 +4060,48 @@ refresh_validation_state_for_label() {
   refresh_runtime_state_for_validation "$target_label" || return 1
 }
 
-# Admin re-push of a freshly minted assignment bundle to a macOS node.
+# Admin re-push of freshly minted signed bundles to a macOS node.
 #
-# Linux nodes keep their signed auto-tunnel (assignment) bundle inside the
-# freshness window by re-minting it locally via
-# rustynetd-assignment-refresh.service, which decrypts the signing-key
-# passphrase from a TPM/host-bound systemd credential. macOS has no systemd
-# credential store and -- by design (least privilege) -- does not self-mint
-# its assignment bundle. Without a refresh path the bundle's signed_data_age
-# climbs past the daemon's freshness bound during a multi-stage run, so the
-# next `rustynet state refresh` fails with "auto-tunnel bundle is stale".
+# The daemon enforces a signed_data_age freshness bound on three control
+# bundles: the auto-tunnel (assignment) bundle (max 300s), the traversal
+# bundle (max 120s), and the DNS-zone bundle (max 300s). Linux nodes keep
+# these inside the window by re-minting locally -- e.g.
+# rustynetd-assignment-refresh.service decrypts the signing-key passphrase
+# from a TPM/host-bound systemd credential and re-issues. macOS has no
+# systemd credential store and -- by design (least privilege) -- does not
+# self-mint these bundles. During a multi-stage run their signed_data_age
+# climbs past the bound, so the next `rustynet state refresh` fails (e.g.
+# "auto-tunnel bundle is stale", or traversal hints drop to None which trips
+# "traversal state missing while peers are managed").
 #
 # The macOS-appropriate equivalent of the Linux local re-mint is an admin
-# re-push: the exit (the assignment issuer/admin) re-issues a fresh bundle
-# (signed_data_age ~0) and the orchestrator reinstalls it under the macOS
+# re-push: the exit (the bundle issuer/admin) re-issues fresh bundles
+# (signed_data_age ~0) and the orchestrator reinstalls them under the macOS
 # layout before the node validates signed state. This keeps the network
-# assignment-signing authority on the admin and the macOS client a pure
-# consumer of admin-signed assignments.
-macos_admin_repush_assignment() {
-  local target="$1"
-  local node_id="$2"
-  local exit_target bundle_local
+# signing authority on the admin and the macOS client a pure consumer of
+# admin-signed control state. Reuses the same issue + distribute paths the
+# baseline stages use, so layout/perms stay identical.
+macos_admin_repush_signed_bundles() {
+  local label="$1"
+  local target="$2"
+  local node_id="$3"
   # shellcheck disable=SC1090
   source "$ONEHOP_STATE_ENV"
-  exit_target="$EXIT_TARGET"
-  bundle_local="$STATE_DIR/assignment-${node_id}.refresh.bundle"
-  printf '[assignment-admin-repush] %s %s (macos): re-mint on exit + reinstall fresh bundle\n' \
+  printf '[signed-bundle-admin-repush] %s %s (macos): re-mint on exit + reinstall assignment/traversal/dns-zone\n' \
     "$node_id" "$target"
+  # Re-mint fresh bundles on the exit (signed_data_age ~0) from the same
+  # issue env files the baseline issue stages produced.
   live_lab_issue_assignment_bundles_from_env \
-    "$exit_target" "$STATE_DIR/issue_assignments.env" "/tmp/rn_issue_assignments_refresh.env" || return 1
-  live_lab_fetch_root_file_to_local \
-    "$exit_target" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
-  live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local" macos || return 1
+    "$EXIT_TARGET" "$STATE_DIR/issue_assignments.env" "/tmp/rn_issue_assignments_refresh.env" || return 1
+  live_lab_issue_traversal_bundles_from_env \
+    "$EXIT_TARGET" "$STATE_DIR/issue_traversal.env" "/tmp/rn_issue_traversal_refresh.env" || return 1
+  live_lab_issue_dns_zone_bundles_from_env \
+    "$EXIT_TARGET" "$STATE_DIR/issue_dns_zone.env" "/tmp/rn_issue_dns_zone_refresh.env" || return 1
+  # Reinstall the fresh bundles to the macOS node via the baseline distribute
+  # workers (each handles the macOS install layout/permissions).
+  distribute_assignment_worker "$label" "$target" "$node_id" || return 1
+  distribute_traversal_worker "$label" "$target" "$node_id" || return 1
+  distribute_dns_zone_worker "$label" "$target" "$node_id" || return 1
 }
 
 refresh_signed_state_worker() {
@@ -4104,7 +4114,7 @@ refresh_signed_state_worker() {
   daemon_socket="$(rustynet_daemon_socket "$platform")"
   printf '[signed-state-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
   if [[ "$platform" == "macos" ]]; then
-    macos_admin_repush_assignment "$target" "$node_id" || return 1
+    macos_admin_repush_signed_bundles "$label" "$target" "$node_id" || return 1
   fi
   live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
   live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet state refresh" 5 2
