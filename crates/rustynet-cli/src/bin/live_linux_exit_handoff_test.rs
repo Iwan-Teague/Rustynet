@@ -184,8 +184,18 @@ fn run() -> Result<(), String> {
     let exit_b_addr = resolved_target_address(&config.exit_b_host)?;
     let client_addr = resolved_target_address(&config.client_host)?;
 
+    // Capabilities must appear in BOTH the 4th field (read by parse_generic_nodes
+    // during issuance) and the 8th field (read by parse_assignment_nodes when the
+    // local rustynetd-assignment-refresh service regenerates the bundle from
+    // RUSTYNET_ASSIGNMENT_NODES). The node-spec layout is
+    // node_id|endpoint|pubkey|owner|hostname|os|tags|capabilities. Emitting caps
+    // only in the 4th field made the refresh service default every node to bare
+    // `client`, dropping relay_host/exit_server, so the daemon rejected the
+    // regenerated bundle ("route peer ... lacks signed relay_host or exit_server")
+    // and fail-closed on the enforce restart. Mirror build_onehop_specs:
+    // `caps||||caps`.
     let nodes_spec = format!(
-        "{}|{}:51820|{}|anchor,exit_server;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host",
+        "{}|{}:51820|{}|anchor,exit_server||||anchor,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host;{}|{}:51820|{}|client,relay_host||||client,relay_host",
         config.exit_a_node_id,
         exit_a_addr,
         exit_a_pub_hex,
