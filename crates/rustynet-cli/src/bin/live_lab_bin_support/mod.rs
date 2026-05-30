@@ -1424,6 +1424,15 @@ pub fn apply_role_coupling(
         command.push_str(" --preferred-exit-node-id ");
         command.push_str(shell_quote(preferred_exit_node_id).as_str());
     }
+    // The lab does not verify macOS client full-tunnel exit-route convergence:
+    // baseline validation skips apply-role-coupling entirely for macOS and
+    // relies on the pre-written assignment-refresh env + daemon pickup. Mirror
+    // that here so the role-switch restore performs the coupling mutation +
+    // launchd refresh without waiting on a route convergence the lab does not
+    // assert on macOS.
+    if platform == "macos" {
+        command.push_str(" --skip-client-exit-route-convergence-wait");
+    }
     let status = ssh_status(identity, known_hosts, target, &command)?;
     if status.success() {
         Ok(())
