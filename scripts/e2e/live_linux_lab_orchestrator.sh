@@ -3773,11 +3773,15 @@ refresh_runtime_state_worker() {
       live_lab_run_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet ops force-local-assignment-refresh-now"
       ;;
     macos)
-      # macOS has no systemd; `rustynet ops force-local-assignment-refresh-now`
-      # is Linux-only today. For Phase 24 client nodes the meaningful work is
-      # bouncing the daemon so it re-reads the signed bundles the orchestrator
-      # just distributed. Privileged-helper bounces best-effort (KeepAlive=true
-      # re-launches it).
+      # macOS does not self-mint its assignment bundle (least privilege: the
+      # signing authority stays on the admin/exit). Admin-re-push a freshly
+      # minted bundle so the daemon re-reads a bundle inside the freshness
+      # window, then bounce the launchd-managed daemon so it picks it up.
+      # `rustynet ops force-local-assignment-refresh-now` does the local
+      # re-mint on Linux only; on macOS the orchestrator supplies the fresh
+      # bundle externally. Privileged-helper bounces best-effort
+      # (KeepAlive=true re-launches it).
+      macos_admin_repush_assignment "$target" "$node_id" || return 1
       live_lab_run_root "$target" "root launchctl kickstart -k system/com.rustynet.privileged-helper 2>/dev/null || true; root launchctl kickstart -k system/com.rustynet.daemon" || return 1
       ;;
     windows)
@@ -4056,6 +4060,40 @@ refresh_validation_state_for_label() {
   refresh_runtime_state_for_validation "$target_label" || return 1
 }
 
+# Admin re-push of a freshly minted assignment bundle to a macOS node.
+#
+# Linux nodes keep their signed auto-tunnel (assignment) bundle inside the
+# freshness window by re-minting it locally via
+# rustynetd-assignment-refresh.service, which decrypts the signing-key
+# passphrase from a TPM/host-bound systemd credential. macOS has no systemd
+# credential store and -- by design (least privilege) -- does not self-mint
+# its assignment bundle. Without a refresh path the bundle's signed_data_age
+# climbs past the daemon's freshness bound during a multi-stage run, so the
+# next `rustynet state refresh` fails with "auto-tunnel bundle is stale".
+#
+# The macOS-appropriate equivalent of the Linux local re-mint is an admin
+# re-push: the exit (the assignment issuer/admin) re-issues a fresh bundle
+# (signed_data_age ~0) and the orchestrator reinstalls it under the macOS
+# layout before the node validates signed state. This keeps the network
+# assignment-signing authority on the admin and the macOS client a pure
+# consumer of admin-signed assignments.
+macos_admin_repush_assignment() {
+  local target="$1"
+  local node_id="$2"
+  local exit_target bundle_local
+  # shellcheck disable=SC1090
+  source "$ONEHOP_STATE_ENV"
+  exit_target="$EXIT_TARGET"
+  bundle_local="$STATE_DIR/assignment-${node_id}.refresh.bundle"
+  printf '[assignment-admin-repush] %s %s (macos): re-mint on exit + reinstall fresh bundle\n' \
+    "$node_id" "$target"
+  live_lab_issue_assignment_bundles_from_env \
+    "$exit_target" "$STATE_DIR/issue_assignments.env" "/tmp/rn_issue_assignments_refresh.env" || return 1
+  live_lab_fetch_root_file_to_local \
+    "$exit_target" "/run/rustynet/assignment-issue/rn-assignment-${node_id}.assignment" "$bundle_local" || return 1
+  live_lab_install_assignment_bundle "$target" "$STATE_DIR/assignment.pub" "$bundle_local" macos || return 1
+}
+
 refresh_signed_state_worker() {
   local label="$1"
   local target="$2"
@@ -4065,6 +4103,9 @@ refresh_signed_state_worker() {
   platform="$(node_platform_for_label "${label}")" || return 1
   daemon_socket="$(rustynet_daemon_socket "$platform")"
   printf '[signed-state-refresh] %s %s (%s) platform=%s\n' "$label" "$target" "$node_id" "$platform"
+  if [[ "$platform" == "macos" ]]; then
+    macos_admin_repush_assignment "$target" "$node_id" || return 1
+  fi
   live_lab_wait_for_daemon_socket "$target" "$daemon_socket"
   live_lab_retry_root "$target" "root env RUSTYNET_DAEMON_SOCKET='${daemon_socket}' rustynet state refresh" 5 2
 }
