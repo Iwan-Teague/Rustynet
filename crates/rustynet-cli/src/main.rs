@@ -13263,6 +13263,19 @@ fn route_uses_rustynet0(route_line: &str) -> bool {
     route_line.contains("dev rustynet0")
 }
 
+/// macOS `route -n get <dst>` prints a block that includes an
+/// "  interface: utunN" line. The client exit route has converged when the
+/// probe destination egresses via a WireGuard tunnel device (utun*) rather
+/// than the physical uplink (en0).
+fn macos_route_uses_tunnel(route_output: &str) -> bool {
+    route_output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("interface:")
+            .map(|iface| iface.trim().starts_with("utun"))
+            .unwrap_or(false)
+    })
+}
+
 fn wait_for_client_exit_route_convergence(
     socket_path: &Path,
     assignment_refresh_env_path: &Path,
@@ -13287,15 +13300,23 @@ fn wait_for_client_exit_route_convergence(
         let status = send_command_with_socket(IpcCommand::Status, socket_path.to_path_buf())?;
         if status.ok {
             last_status = status.message.clone();
-            let route_output = run_command_capture("ip", &["-4", "route", "get", "1.1.1.1"])?;
-            last_route = String::from_utf8_lossy(&route_output.stdout)
-                .trim()
-                .to_owned();
+            // Verify the probe destination egresses via the WireGuard tunnel.
+            // Linux: `ip -4 route get` reports "dev rustynet0"; macOS has no
+            // `ip` and names the tunnel utunN, so use `route -n get` and check
+            // the resolved interface is a utun device.
+            let route_via_tunnel = if cfg!(target_os = "macos") {
+                let out = run_command_capture("route", &["-n", "get", "1.1.1.1"])?;
+                last_route = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                out.status.success() && macos_route_uses_tunnel(last_route.as_str())
+            } else {
+                let out = run_command_capture("ip", &["-4", "route", "get", "1.1.1.1"])?;
+                last_route = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                out.status.success() && route_uses_rustynet0(last_route.as_str())
+            };
             if status_field(status.message.as_str(), "exit_node")
                 == Some(expected_exit_node.to_owned())
                 && daemon_runtime_ready_from_status_text(status.message.as_str())
-                && route_output.status.success()
-                && route_uses_rustynet0(last_route.as_str())
+                && route_via_tunnel
             {
                 return Ok(());
             }
@@ -23103,6 +23124,22 @@ mod tests {
         ));
         assert!(!super::route_uses_rustynet0(
             "1.1.1.1 via 192.168.64.1 dev enp0s1 src 192.168.64.24 uid 0"
+        ));
+    }
+
+    #[test]
+    fn macos_route_uses_tunnel_requires_utun_interface() {
+        // `route -n get 1.1.1.1` egressing via the tunnel.
+        assert!(super::macos_route_uses_tunnel(
+            "   route to: 1.1.1.1\ndestination: default\n  interface: utun386\n   flags: <UP,GATEWAY,DONE>"
+        ));
+        // Not converged: egress is the physical uplink.
+        assert!(!super::macos_route_uses_tunnel(
+            "   route to: 1.1.1.1\ndestination: default\n  interface: en0\n   flags: <UP,GATEWAY,DONE>"
+        ));
+        // Substring "utun" appearing elsewhere must not count.
+        assert!(!super::macos_route_uses_tunnel(
+            "   route to: 1.1.1.1\n  interface: en0\n   comment: utun candidate rejected"
         ));
     }
 
