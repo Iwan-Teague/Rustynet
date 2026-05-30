@@ -13289,7 +13289,14 @@ fn wait_for_client_exit_route_convergence(
     let mut last_route = String::new();
     while start.elapsed() <= timeout {
         if Instant::now() >= next_refresh_at {
-            refresh_local_traversal_bundle_from_assignment_env(assignment_refresh_env_path)?;
+            // The local traversal re-sign is a Linux client self-refresh that
+            // needs a provisioned credential workspace. macOS never signs
+            // traversal locally (the authority re-issues and the lab installs
+            // it externally), and has no such workspace, so skip it there and
+            // rely on the StateRefresh poke to re-read the installed bundle.
+            if !cfg!(target_os = "macos") {
+                refresh_local_traversal_bundle_from_assignment_env(assignment_refresh_env_path)?;
+            }
             if socket_exists_and_is_socket(socket_path, "daemon socket")? {
                 let _ =
                     send_command_with_socket(IpcCommand::StateRefresh, socket_path.to_path_buf());
