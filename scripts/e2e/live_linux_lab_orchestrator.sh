@@ -2630,12 +2630,6 @@ rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
-# rustynet-relay is the sibling relay daemon co-deployed on relay/anchor
-# nodes (rustynet-relay.service). Its serving mode is behind the `daemon`
-# feature, so build it explicitly with that feature and install the binary so
-# the relay role-deploy (ops install-systemd-relay) can start it.
-run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
-run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
 backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
@@ -5095,6 +5089,15 @@ stage_run_live_relay() {
     local relay_src relay_verifier_local
     relay_src="$(live_lab_remote_src_dir "$relay_target")"
     relay_verifier_local="$STATE_DIR/relay-verifier.pub"
+    # Build + install the sibling relay binary on the relay node ONLY. Its
+    # serving mode is behind the `daemon` feature, which pulls the tokio async
+    # stack rustynetd does not use, so it is a heavy compile; building it on
+    # every node in parallel at bootstrap thrashed the shared lab host. Build it
+    # here on the single relay node as the build user (so it reuses the
+    # bootstrap's user-owned cargo cache, not a fresh root-owned target), then
+    # install as root. cargo selects the pinned toolchain from rust-toolchain.toml.
+    live_lab_ssh "$relay_target" "export PATH=\"\$HOME/.cargo/bin:\$PATH\"; cd '${relay_src}' && cargo build --release -p rustynet-relay --features daemon" 7200 || return 1
+    live_lab_run_root "$relay_target" "root install -m 0755 '${relay_src}/target/release/rustynet-relay' /usr/local/bin/rustynet-relay" || return 1
     # rustynet-relay loads a RAW 32-byte ed25519 control-plane verifier key.
     # The lab's assignment verifier (assignment.pub) is the control-plane
     # authority but is stored hex-encoded (64 hex chars); decode the first 64
