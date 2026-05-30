@@ -444,8 +444,40 @@ live_lab_target_utm_name() {
   return 1
 }
 
+live_lab_target_platform() {
+  local target="$1"
+  if [[ -n "${EXIT_TARGET:-}" && "$target" == "$EXIT_TARGET" ]]; then
+    printf '%s' "${EXIT_PLATFORM:-}"; return 0
+  fi
+  if [[ -n "${CLIENT_TARGET:-}" && "$target" == "$CLIENT_TARGET" ]]; then
+    printf '%s' "${CLIENT_PLATFORM:-}"; return 0
+  fi
+  if [[ -n "${ENTRY_TARGET:-}" && "$target" == "$ENTRY_TARGET" ]]; then
+    printf '%s' "${ENTRY_PLATFORM:-}"; return 0
+  fi
+  if [[ -n "${AUX_TARGET:-}" && "$target" == "$AUX_TARGET" ]]; then
+    printf '%s' "${AUX_PLATFORM:-}"; return 0
+  fi
+  if [[ -n "${EXTRA_TARGET:-}" && "$target" == "$EXTRA_TARGET" ]]; then
+    printf '%s' "${EXTRA_PLATFORM:-}"; return 0
+  fi
+  if [[ -n "${FIFTH_CLIENT_TARGET:-}" && "$target" == "$FIFTH_CLIENT_TARGET" ]]; then
+    printf '%s' "${FIFTH_CLIENT_PLATFORM:-}"; return 0
+  fi
+  return 1
+}
+
 live_lab_target_uses_utm_transport() {
   if [[ "${LIVE_LAB_FORCE_SSH_TRANSPORT:-0}" == "1" ]]; then
+    return 1
+  fi
+  # macOS UTM guests run on the Apple Virtualization backend, whose guest
+  # agent does not implement `utmctl exec` / file ops -- every such call
+  # fails with "Operation not supported by the backend." (OSStatus -2700)
+  # after the per-attempt timeout, so the only working control transport for
+  # a macOS node is SSH. Route macOS targets to SSH regardless of UTM name
+  # (the UTM name is still used for VM lifecycle ops elsewhere).
+  if [[ "$(live_lab_target_platform "$1" 2>/dev/null || true)" == "macos" ]]; then
     return 1
   fi
   local utm_name
