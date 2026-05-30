@@ -154,8 +154,15 @@ fn run() -> Result<(), String> {
     let entry_addr = resolved_target_address(&config.entry_host)?;
     let second_client_addr = resolved_target_address(&config.second_client_host)?;
 
+    // The two-hop chain is client -> entry -> final_exit, where the entry node
+    // is the intermediate exit: it terminates the client's tunnel and
+    // re-exits toward the final exit (ASSIGNMENTS_SPEC below sets client|entry
+    // and entry|final_exit). Serving as an exit requires the exit_server
+    // capability in signed membership, so the entry node's intent must include
+    // exit_server in addition to client,relay_host; otherwise assignment
+    // issuance fails closed with "exit node <id> lacks exit_server capability".
     let nodes_spec = format!(
-        "{}|{}:51820|{}|anchor,exit_server;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host",
+        "{}|{}:51820|{}|anchor,exit_server;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host,exit_server;{}|{}:51820|{}|client,relay_host",
         config.final_exit_node_id,
         final_exit_addr,
         final_exit_pub_hex,
