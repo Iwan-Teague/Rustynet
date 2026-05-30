@@ -2630,6 +2630,16 @@ rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
+# Co-deploy the sibling relay daemon binary ONLY on the relay node (BUILD_RELAY=1
+# from the per-node env). Build it here during bootstrap — network + pinned
+# nameservers are available, so its tokio/windows-service deps download fine —
+# rather than at the relay deploy stage, where the node's killswitch + managed
+# DNS have locked the network down. Building on the single relay node avoids the
+# multi-node parallel-compile contention.
+if [[ "${BUILD_RELAY:-0}" == "1" ]]; then
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
+  run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
+fi
 backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
@@ -2992,6 +3002,19 @@ bootstrap_host_worker_linux() {
   local attempt max_attempts=12 sleep_secs=10
   ssh_wait_for_host "$target" || return 1
   live_lab_push_sudo_password "$target"
+  # Build the sibling relay binary during this node's bootstrap (network up)
+  # only if it is the relay_host used by live_relay (entry, else aux). Mirrors
+  # stage_run_live_relay's relay-node selection. Building only on the relay node
+  # avoids multi-node parallel relay compiles.
+  local relay_build_label="" build_relay=0
+  if has_label entry; then
+    relay_build_label="entry"
+  elif has_label aux; then
+    relay_build_label="aux"
+  fi
+  if [[ -n "$relay_build_label" && "$label" == "$relay_build_label" ]]; then
+    build_relay=1
+  fi
   env_path="$STATE_DIR/bootstrap-${label}.env"
   cat > "$env_path" <<EOF_ENV
 ROLE=${role}
@@ -2999,6 +3022,7 @@ NODE_ID=${node_id}
 NETWORK_ID=${NETWORK_ID}
 SSH_ALLOW_CIDRS=${SSH_ALLOW_CIDRS}
 SOURCE_ARCHIVE=/tmp/rn_source.tar.gz
+BUILD_RELAY=${build_relay}
 EOF_ENV
   if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
     printf 'RUSTYNET_BACKEND=%s\n' "${RUSTYNET_BACKEND}" >> "$env_path"
@@ -5089,15 +5113,14 @@ stage_run_live_relay() {
     local relay_src relay_verifier_local
     relay_src="$(live_lab_remote_src_dir "$relay_target")"
     relay_verifier_local="$STATE_DIR/relay-verifier.pub"
-    # Build + install the sibling relay binary on the relay node ONLY. Its
-    # serving mode is behind the `daemon` feature, which pulls the tokio async
-    # stack rustynetd does not use, so it is a heavy compile; building it on
-    # every node in parallel at bootstrap thrashed the shared lab host. Build it
-    # here on the single relay node as the build user (so it reuses the
-    # bootstrap's user-owned cargo cache, not a fresh root-owned target), then
-    # install as root. cargo selects the pinned toolchain from rust-toolchain.toml.
-    live_lab_ssh "$relay_target" "export PATH=\"\$HOME/.cargo/bin:\$PATH\"; cd '${relay_src}' && cargo build --release -p rustynet-relay --features daemon" 7200 || return 1
-    live_lab_run_root "$relay_target" "root install -m 0755 '${relay_src}/target/release/rustynet-relay' /usr/local/bin/rustynet-relay" || return 1
+    # The rustynet-relay binary is built + installed during this node's
+    # bootstrap (BUILD_RELAY=1), when the network is still up — building it here,
+    # after the killswitch + managed DNS have locked the node down, fails to
+    # download its deps. Fail closed if the binary is missing.
+    live_lab_run_root "$relay_target" "root test -x /usr/local/bin/rustynet-relay" || {
+      printf 'live_relay: /usr/local/bin/rustynet-relay missing on %s (bootstrap relay build did not run?)\n' "$relay_target" >&2
+      return 1
+    }
     # rustynet-relay loads a RAW 32-byte ed25519 control-plane verifier key.
     # The lab's assignment verifier (assignment.pub) is the control-plane
     # authority but is stored hex-encoded (64 hex chars); decode the first 64
