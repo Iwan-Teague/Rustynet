@@ -2630,6 +2630,12 @@ rustup default "${RUST_TOOLCHAIN_CHANNEL}"
 run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd -p rustynet-cli
 run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
 run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
+# rustynet-relay is the sibling relay daemon co-deployed on relay/anchor
+# nodes (rustynet-relay.service). Its serving mode is behind the `daemon`
+# feature, so build it explicitly with that feature and install the binary so
+# the relay role-deploy (ops install-systemd-relay) can start it.
+run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
+run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
 backend_env=()
 if [[ -n "${RUSTYNET_BACKEND:-}" ]]; then
   backend_env+=(RUSTYNET_BACKEND="${RUSTYNET_BACKEND}")
@@ -5078,6 +5084,37 @@ stage_run_live_relay() {
       return 1
       ;;
   esac
+
+  # Co-deploy the relay service on the relay_host before the lifecycle test.
+  # The lab enforces roles via install-systemd / e2e-enforce-host (never
+  # `rustynet role`), so the role-coupling relay auto-deploy never fires, and
+  # nothing else stands up rustynet-relay.service. Deploy it explicitly here so
+  # live_relay validates a real, running relay (Linux path; macOS/Windows relay
+  # deploy would use install-macos-relay / the Windows relay installer).
+  if [[ "$relay_platform" == "linux" ]]; then
+    local relay_src relay_verifier_local
+    relay_src="$(live_lab_remote_src_dir "$relay_target")"
+    relay_verifier_local="$STATE_DIR/relay-verifier.pub"
+    # rustynet-relay loads a RAW 32-byte ed25519 control-plane verifier key.
+    # The lab's assignment verifier (assignment.pub) is the control-plane
+    # authority but is stored hex-encoded (64 hex chars); decode the first 64
+    # hex chars to the raw 32 bytes the relay expects.
+    if [[ ! -f "$STATE_DIR/assignment.pub" ]]; then
+      printf 'live_relay: missing %s/assignment.pub for relay verifier key\n' "$STATE_DIR" >&2
+      return 1
+    fi
+    head -c 64 "$STATE_DIR/assignment.pub" | xxd -r -p > "$relay_verifier_local" || return 1
+    if [[ "$(wc -c < "$relay_verifier_local" | tr -d ' ')" -ne 32 ]]; then
+      printf 'live_relay: decoded relay verifier key is not 32 bytes\n' >&2
+      return 1
+    fi
+    live_lab_scp_to "$relay_verifier_local" "$relay_target" "/tmp/rn-relay-verifier.pub" || return 1
+    live_lab_run_root "$relay_target" "root install -d -m 0750 -o root -g rustynetd /etc/rustynet && root install -m 0644 -o root -g root /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub && root rm -f /tmp/rn-relay-verifier.pub" || return 1
+    # install-systemd-relay reads the unit from the relative path
+    # scripts/systemd/rustynet-relay.service, so run it with CWD at the
+    # deployed source root. It installs the unit + enable --now.
+    live_lab_run_root "$relay_target" "root sh -c 'cd \"${relay_src}\" && rustynet ops install-systemd-relay'" || return 1
+  fi
 
   RUSTYNET_EXPECTED_GIT_COMMIT="$(current_run_git_commit)" \
   bash "$wrapper" \
