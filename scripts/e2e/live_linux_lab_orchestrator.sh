@@ -2637,7 +2637,11 @@ run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
 # DNS have locked the network down. Building on the single relay node avoids the
 # multi-node parallel-compile contention.
 if [[ "${BUILD_RELAY:-0}" == "1" ]]; then
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
+  # The daemon feature pulls windows-service (a cfg(windows) crate cargo still
+  # resolves/downloads on Linux); its registry fetch intermittently exceeds
+  # cargo's default 30s HTTP timeout. Raise the timeout + retry budget so a slow
+  # or flaky download does not fail the relay build.
+  run_local_timed 7200 env CARGO_NET_RETRY=10 CARGO_HTTP_TIMEOUT=180 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
   run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
 fi
 backend_env=()
