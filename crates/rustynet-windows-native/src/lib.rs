@@ -210,6 +210,16 @@ pub fn get_adapters_addresses() -> Result<Vec<WindowsNetworkAdapterSnapshot>, St
     Err("GetAdaptersAddresses is only available on Windows hosts".to_owned())
 }
 
+#[cfg(not(windows))]
+pub fn apply_wfp_tunnel_permit(_interface_alias: &str) -> Result<(), String> {
+    Err("WFP killswitch filters are only available on Windows hosts".to_owned())
+}
+
+#[cfg(not(windows))]
+pub fn remove_wfp_tunnel_permit() -> Result<(), String> {
+    Err("WFP killswitch filters are only available on Windows hosts".to_owned())
+}
+
 pub fn detect_default_gateway() -> Result<IpAddr, String> {
     let adapters = get_adapters_addresses()?;
     select_default_gateway_from_adapters(&adapters)
@@ -1524,13 +1534,198 @@ mod imp {
             })
         }
     }
+
+    // ---- Native WFP killswitch tunnel-permit (readiness plan E2) ----
+    //
+    // Replaces the last CIM cmdlet on the dataplane-apply path
+    // (`New-NetFirewallRule -InterfaceAlias`) with a native Windows Filtering
+    // Platform filter keyed on the tunnel interface LUID. No PowerShell/WMI, so
+    // it cannot hang on a wedged WMI provider.
+    //
+    // Design: a dedicated, persistent RustyNet sublayer at max weight (0xFFFF)
+    // wins WFP arbitration over the netsh advfirewall default-block-outbound
+    // policy; inside it, a hard-permit (CLEAR_ACTION_RIGHT) filter at each of
+    // the ALE_AUTH_CONNECT_V4/V6 layers permits outbound connect when the local
+    // interface LUID equals the tunnel's. Filters + sublayer are persistent so
+    // the permit survives a daemon crash alongside the persistent block (else a
+    // crash would leave block-without-permit = total lockout). Re-apply is
+    // idempotent: the sublayer (and its filters) is deleted by key first.
+    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
+        FWP_ACTION_PERMIT, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_UINT64,
+        FWPM_CONDITION_IP_LOCAL_INTERFACE, FWPM_FILTER_CONDITION0,
+        FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0,
+        FwpmFilterAdd0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0,
+        FwpmTransactionBegin0, FwpmTransactionCommit0,
+    };
+    use windows_sys::core::GUID;
+
+    // Stable GUIDs minted once for RustyNet's WFP objects (never reused).
+    const RUSTYNET_WFP_SUBLAYER_KEY: GUID = GUID::from_u128(0x5b8f2a31_9c4d_4e7a_b1f0_3d6e8a2c9f44);
+    const RUSTYNET_WFP_FILTER_V4_KEY: GUID =
+        GUID::from_u128(0x5b8f2a32_9c4d_4e7a_b1f0_3d6e8a2c9f44);
+    const RUSTYNET_WFP_FILTER_V6_KEY: GUID =
+        GUID::from_u128(0x5b8f2a33_9c4d_4e7a_b1f0_3d6e8a2c9f44);
+
+    const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
+    const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x8032_0007;
+    // RPC_C_AUTHN_DEFAULT — use the calling process credentials for the engine.
+    const RPC_C_AUTHN_DEFAULT: u32 = 0xFFFF_FFFF;
+
+    fn interface_alias_to_luid(interface_alias: &str) -> Result<u64, String> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
+        use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+        let wide = to_wide(interface_alias);
+        let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+        let err = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) };
+        if err != 0 {
+            return Err(format!(
+                "ConvertInterfaceAliasToLuid({interface_alias}) failed with {err}"
+            ));
+        }
+        Ok(unsafe { luid.Value })
+    }
+
+    fn wfp_engine_open() -> Result<HANDLE, String> {
+        let mut engine: HANDLE = null_mut();
+        let status =
+            unsafe { FwpmEngineOpen0(null(), RPC_C_AUTHN_DEFAULT, null(), null(), &mut engine) };
+        if status != 0 {
+            return Err(format!("FwpmEngineOpen0 failed with {status}"));
+        }
+        Ok(engine)
+    }
+
+    fn wfp_delete_sublayer(engine: HANDLE) -> Result<(), String> {
+        let status = unsafe { FwpmSubLayerDeleteByKey0(engine, &RUSTYNET_WFP_SUBLAYER_KEY) };
+        if status != 0 && status != FWP_E_SUBLAYER_NOT_FOUND {
+            return Err(format!("FwpmSubLayerDeleteByKey0 failed with {status}"));
+        }
+        Ok(())
+    }
+
+    fn wfp_add_sublayer(engine: HANDLE) -> Result<(), String> {
+        let mut name = to_wide("RustyNet killswitch tunnel-permit sublayer");
+        let mut sublayer: FWPM_SUBLAYER0 = unsafe { std::mem::zeroed() };
+        sublayer.subLayerKey = RUSTYNET_WFP_SUBLAYER_KEY;
+        sublayer.displayData.name = name.as_mut_ptr();
+        sublayer.flags = FWPM_SUBLAYER_FLAG_PERSISTENT;
+        sublayer.weight = u16::MAX;
+        let status = unsafe { FwpmSubLayerAdd0(engine, &sublayer, null_mut()) };
+        if status != 0 && status != FWP_E_ALREADY_EXISTS {
+            return Err(format!("FwpmSubLayerAdd0 failed with {status}"));
+        }
+        Ok(())
+    }
+
+    fn wfp_add_permit_filter(
+        engine: HANDLE,
+        layer_key: GUID,
+        filter_key: GUID,
+        luid: u64,
+        display_name: &str,
+    ) -> Result<(), String> {
+        // `luid_value`, `cond`, and `name` must outlive the FwpmFilterAdd0 call:
+        // the condition stores a *pointer* to the u64 LUID (windows-sys models
+        // FWP_VALUE0.uint64 as `*mut u64`), and the filter points at the
+        // condition + display name.
+        let mut luid_value: u64 = luid;
+        let mut name = to_wide(display_name);
+        let mut cond: FWPM_FILTER_CONDITION0 = unsafe { std::mem::zeroed() };
+        cond.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
+        cond.matchType = FWP_MATCH_EQUAL;
+        cond.conditionValue.r#type = FWP_UINT64;
+        cond.conditionValue.Anonymous.uint64 = &mut luid_value as *mut u64;
+
+        let mut filter: FWPM_FILTER0 = unsafe { std::mem::zeroed() };
+        filter.filterKey = filter_key;
+        filter.displayData.name = name.as_mut_ptr();
+        filter.flags = FWPM_FILTER_FLAG_PERSISTENT | FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT;
+        filter.layerKey = layer_key;
+        filter.subLayerKey = RUSTYNET_WFP_SUBLAYER_KEY;
+        filter.weight.r#type = FWP_EMPTY; // auto-weight within our sublayer
+        filter.numFilterConditions = 1;
+        filter.filterCondition = &mut cond;
+        filter.action.r#type = FWP_ACTION_PERMIT;
+
+        let mut filter_id: u64 = 0;
+        let status = unsafe { FwpmFilterAdd0(engine, &filter, null_mut(), &mut filter_id) };
+        if status != 0 {
+            return Err(format!(
+                "FwpmFilterAdd0({display_name}) failed with {status}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn apply_wfp_tunnel_permit(interface_alias: &str) -> Result<(), String> {
+        let luid = interface_alias_to_luid(interface_alias)?;
+        let engine = wfp_engine_open()?;
+        let result = (|| -> Result<(), String> {
+            let status = unsafe { FwpmTransactionBegin0(engine, 0) };
+            if status != 0 {
+                return Err(format!("FwpmTransactionBegin0 failed with {status}"));
+            }
+            // Purge any prior RustyNet sublayer (and its filters) so re-apply is
+            // idempotent and never strands a stale-LUID permit.
+            wfp_delete_sublayer(engine)?;
+            wfp_add_sublayer(engine)?;
+            wfp_add_permit_filter(
+                engine,
+                FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+                RUSTYNET_WFP_FILTER_V4_KEY,
+                luid,
+                "RustyNet tunnel permit (IPv4)",
+            )?;
+            wfp_add_permit_filter(
+                engine,
+                FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                RUSTYNET_WFP_FILTER_V6_KEY,
+                luid,
+                "RustyNet tunnel permit (IPv6)",
+            )?;
+            let status = unsafe { FwpmTransactionCommit0(engine) };
+            if status != 0 {
+                return Err(format!("FwpmTransactionCommit0 failed with {status}"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            unsafe { FwpmTransactionAbort0(engine) };
+        }
+        unsafe { FwpmEngineClose0(engine) };
+        result
+    }
+
+    pub fn remove_wfp_tunnel_permit() -> Result<(), String> {
+        let engine = wfp_engine_open()?;
+        let result = (|| -> Result<(), String> {
+            let status = unsafe { FwpmTransactionBegin0(engine, 0) };
+            if status != 0 {
+                return Err(format!("FwpmTransactionBegin0 failed with {status}"));
+            }
+            wfp_delete_sublayer(engine)?;
+            let status = unsafe { FwpmTransactionCommit0(engine) };
+            if status != 0 {
+                return Err(format!("FwpmTransactionCommit0 failed with {status}"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            unsafe { FwpmTransactionAbort0(engine) };
+        }
+        unsafe { FwpmEngineClose0(engine) };
+        result
+    }
 }
 
 #[cfg(windows)]
 pub use imp::{
-    call_named_pipe, dpapi_protect, dpapi_unprotect, extract_signer_thumbprint_sha256,
-    get_adapters_addresses, inspect_file_sddl, inspect_named_pipe_sddl, inspect_registry_key_sddl,
-    lookup_account_sid_string, serve_named_pipe_one_message,
+    apply_wfp_tunnel_permit, call_named_pipe, dpapi_protect, dpapi_unprotect,
+    extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
+    inspect_named_pipe_sddl, inspect_registry_key_sddl, lookup_account_sid_string,
+    remove_wfp_tunnel_permit, serve_named_pipe_one_message,
     serve_named_pipe_one_message_authorized, verify_authenticode_chain,
 };
 
