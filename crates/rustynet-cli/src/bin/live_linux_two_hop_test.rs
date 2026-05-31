@@ -154,15 +154,26 @@ fn run() -> Result<(), String> {
     let entry_addr = resolved_target_address(&config.entry_host)?;
     let second_client_addr = resolved_target_address(&config.second_client_host)?;
 
+    // Node entry layout is node_id|endpoint|public_key|owner|hostname|os|
+    // tags_csv|capabilities_csv. The assignment issuer reads capabilities from
+    // field 7 (parse_assignment_nodes), while the traversal/DNS issuer reads
+    // them from field 3 (parse_generic_traversal_node_specs). To satisfy both
+    // parsers the canonical lab form repeats the capability CSV in field 3 and
+    // field 7 with the intervening owner/hostname/os/tags fields left empty
+    // (mirrors build_onehop_specs in live_linux_lab_orchestrator.sh). Using a
+    // bare node_id|endpoint|key|caps form puts the caps in the owner slot and
+    // leaves field 7 empty, so the assignment bundle defaults every peer to
+    // client and the daemon rejects it ("route peer <id> lacks signed
+    // relay_host or exit_server capability").
+    //
     // The two-hop chain is client -> entry -> final_exit, where the entry node
-    // is the intermediate exit: it terminates the client's tunnel and
-    // re-exits toward the final exit (ASSIGNMENTS_SPEC below sets client|entry
-    // and entry|final_exit). Serving as an exit requires the exit_server
-    // capability in signed membership, so the entry node's intent must include
-    // exit_server in addition to client,relay_host; otherwise assignment
-    // issuance fails closed with "exit node <id> lacks exit_server capability".
+    // is the intermediate exit: it terminates the client's tunnel and re-exits
+    // toward the final exit (ASSIGNMENTS_SPEC below sets client|entry and
+    // entry|final_exit). Serving as an exit requires the exit_server capability
+    // in signed membership, so the entry node's capabilities include
+    // exit_server in addition to client,relay_host.
     let nodes_spec = format!(
-        "{}|{}:51820|{}|anchor,exit_server;{}|{}:51820|{}|client,relay_host;{}|{}:51820|{}|client,relay_host,exit_server;{}|{}:51820|{}|client,relay_host",
+        "{}|{}:51820|{}|anchor,exit_server||||anchor,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host;{}|{}:51820|{}|client,relay_host,exit_server||||client,relay_host,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host",
         config.final_exit_node_id,
         final_exit_addr,
         final_exit_pub_hex,
