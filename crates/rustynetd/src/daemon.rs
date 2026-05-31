@@ -2352,7 +2352,7 @@ struct PrivilegedHelperWireguardRunner {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Default)]
-struct WindowsHostWireguardRunner;
+pub(crate) struct WindowsHostWireguardRunner;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PrivilegedHelperWireguardRunner {
