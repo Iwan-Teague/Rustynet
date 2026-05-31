@@ -3206,6 +3206,13 @@ const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActi
 /// interpolated into the script body.  Throws on the first drift detected.
 const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($LoopbackName, $EgressName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Allow') { throw \"rule $displayName action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
+/// Verify the reviewed DNS-block rules (the baseline plaintext-DNS protection,
+/// parity with the Linux `udp dport 53 oifname != tunnel drop`) are still
+/// present, Outbound, Block, and Enabled.  Rule names are passed as `PowerShell`
+/// parameters so no value is interpolated into the script body.  Throws on the
+/// first drift detected.
+const WINDOWS_PS_ASSERT_DNS: &str = "& { param($UdpName, $TcpName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($UdpName, $TcpName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Block') { throw \"rule $displayName action is not Block\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } } }";
+
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
@@ -3215,6 +3222,18 @@ impl DataplaneSystem for WindowsCommandSystem {
         let _ = Self::resolve_netsh_binary()?;
         let _ = Self::resolve_powershell_binary()?;
         Ok(())
+    }
+
+    fn set_relay_forwarding(&mut self, _enabled: bool) {
+        // Intentional no-op on Windows (made explicit so it is not mistaken for a
+        // missing impl). The controller only calls this with `true` when
+        // `relay_with_upstream` = FullTunnel && serve_exit_node, and that same
+        // serve_exit_node also drives `apply_nat_forwarding` →
+        // `apply_windows_exit_nat_forwarding`, which enables IP forwarding on both
+        // the tunnel and egress interfaces. So forwarding is already enabled for
+        // every case this is reached with `true`; there is no relay-without-exit
+        // path on Windows yet. A future relay-only role would enable forwarding
+        // here.
     }
 
     fn preflight_exit_serving(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
@@ -3437,6 +3456,30 @@ impl DataplaneSystem for WindowsCommandSystem {
         Ok(())
     }
 
+    fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
+        if !self.dns_protected {
+            return Err(SystemError::DnsApplyFailed(
+                "Windows DNS protection is not applied; call apply_dns_protection first".to_owned(),
+            ));
+        }
+        // Re-verify the OS still has both DNS-block rules (Outbound/Block/Enabled).
+        // Without this, an external `netsh advfirewall reset` between apply and
+        // assert would leave dns_protected=true while plaintext DNS is wide open —
+        // Windows would lie about posture exactly where the guarantee matters.
+        // Linux/macOS already query OS state in assert_dns_protection; this brings
+        // Windows to parity (previously Windows inherited the no-op trait default).
+        self.run_powershell_success(
+            WINDOWS_PS_ASSERT_DNS,
+            &[
+                WINDOWS_DNS_RULE_BLOCK_LAN_UDP.to_owned(),
+                WINDOWS_DNS_RULE_BLOCK_LAN_TCP.to_owned(),
+            ],
+        )
+        .map_err(|err| {
+            SystemError::DnsApplyFailed(format!("Windows DNS-block verification failed: {err}"))
+        })
+    }
+
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
         if !self.dns_protected {
             return Ok(());
@@ -3505,11 +3548,11 @@ impl DataplaneSystem for WindowsCommandSystem {
         // open — `assert_killswitch` would lie about posture in exactly
         // the window where its guarantee matters most.  Linux and macOS
         // already query the OS state here; this brings Windows to parity.
-        // The tunnel outbound allow is now a native WFP filter (E2), not a netsh
-        // rule, so it is not asserted via Get-NetFirewallRule here — and its
-        // absence would only block more (fail-safe), never open a hole. We still
-        // verify the security-critical bits: the default-block-outbound policy
-        // plus the loopback + egress netsh allow rules.
+        // Verify the security-critical netsh bits: the default-block-outbound
+        // policy plus the loopback + egress allow rules. The tunnel outbound
+        // allow is now a native WFP filter (E2), not a netsh rule, so it is
+        // verified separately below (via wfp_tunnel_permit_present) rather than
+        // Get-NetFirewallRule.
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_KILLSWITCH,
             &[
@@ -3521,7 +3564,21 @@ impl DataplaneSystem for WindowsCommandSystem {
             SystemError::KillSwitchAssertionFailed(format!(
                 "Windows advfirewall killswitch verification failed: {err}"
             ))
-        })
+        })?;
+        // Confirm the native WFP tunnel-permit filters (E2) are present so the
+        // tunnel can still egress through the killswitch. A missing permit fails
+        // safe (tunnel blocked), but a correct "killswitch active" assertion must
+        // catch it rather than silently report green.
+        if !rustynet_windows_native::wfp_tunnel_permit_present().map_err(|err| {
+            SystemError::KillSwitchAssertionFailed(format!(
+                "Windows WFP tunnel-permit verification failed: {err}"
+            ))
+        })? {
+            return Err(SystemError::KillSwitchAssertionFailed(
+                "Windows WFP tunnel-permit filters are missing".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn assert_exit_policy(&mut self, _exit_mode: ExitMode) -> Result<(), SystemError> {
@@ -8000,6 +8057,42 @@ mod tests {
             WINDOWS_PS_ASSERT_KILLSWITCH.contains("'Block'"),
             "assert_killswitch script must check the default action is 'Block'"
         );
+    }
+
+    #[test]
+    fn windows_assert_dns_script_checks_block_outbound_enabled() {
+        // The DNS-block verifier must bind rule names as parameters, fail closed,
+        // and reject a rule whose attributes drifted from Outbound/Block/Enabled
+        // or whose count != 1 (missing/duplicate).
+        assert!(
+            WINDOWS_PS_ASSERT_DNS.contains("param($UdpName, $TcpName)"),
+            "DNS assert must bind rule names as parameters"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_DNS.contains("$ErrorActionPreference = 'Stop'"),
+            "DNS assert must fail closed"
+        );
+        assert!(
+            WINDOWS_PS_ASSERT_DNS
+                .contains("Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop"),
+            "DNS assert must look up by display name with -ErrorAction Stop"
+        );
+        for required in ["'Block'", "'Outbound'", "'True'", "$rules.Count -ne 1"] {
+            assert!(
+                WINDOWS_PS_ASSERT_DNS.contains(required),
+                "DNS assert must check {required:?}"
+            );
+        }
+        // Rule-name constants must be parameters, never interpolated into the body.
+        for forbidden in [
+            WINDOWS_DNS_RULE_BLOCK_LAN_UDP,
+            WINDOWS_DNS_RULE_BLOCK_LAN_TCP,
+        ] {
+            assert!(
+                !WINDOWS_PS_ASSERT_DNS.contains(forbidden),
+                "DNS assert must not hard-code rule name {forbidden:?}"
+            );
+        }
     }
 
     #[test]

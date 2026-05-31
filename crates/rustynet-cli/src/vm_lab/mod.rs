@@ -9760,6 +9760,12 @@ fn run_windows_orchestration_stages_with_options(
                     "RustyNet service is not Running on {windows_alias}: status={service_status:?}"
                 ));
             }
+            // Informational only: at install-validate time a wg tunnel adapter
+            // may legitimately not exist yet (it materialises at tunnel bring-up /
+            // mesh-join, not at service install). The authoritative tunnel/adapter
+            // proof is validate_windows_mesh_join (path_live_proven), so the adapter
+            // state is recorded here but deliberately not asserted — asserting it at
+            // this stage would false-fail a correctly-installed pre-tunnel node.
             let adapter_script = build_ssh_powershell_encoded_invocation(
                 "Get-NetAdapter | Where-Object { $_.Name -match 'wg' } | Select-Object Name,Status | ConvertTo-Json -Compress",
             )?;
