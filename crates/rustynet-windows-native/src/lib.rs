@@ -220,6 +220,11 @@ pub fn remove_wfp_tunnel_permit() -> Result<(), String> {
     Err("WFP killswitch filters are only available on Windows hosts".to_owned())
 }
 
+#[cfg(not(windows))]
+pub fn wfp_tunnel_permit_present() -> Result<bool, String> {
+    Err("WFP killswitch filters are only available on Windows hosts".to_owned())
+}
+
 pub fn detect_default_gateway() -> Result<IpAddr, String> {
     let adapters = get_adapters_addresses()?;
     select_default_gateway_from_adapters(&adapters)
@@ -1556,8 +1561,9 @@ mod imp {
         FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
         FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0,
-        FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
-        FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
+        FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmFilterGetByKey0, FwpmFreeMemory0,
+        FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
+        FwpmTransactionCommit0,
     };
     use windows_sys::core::GUID;
 
@@ -1731,6 +1737,34 @@ mod imp {
         unsafe { FwpmEngineClose0(engine) };
         result
     }
+
+    /// True if BOTH RustyNet WFP tunnel-permit filters (IPv4 + IPv6) are present.
+    /// Used by the killswitch assertion to confirm the tunnel can still egress
+    /// through the killswitch. A missing filter fails safe (the tunnel is
+    /// blocked), but a correct "killswitch active" check should catch it.
+    pub fn wfp_tunnel_permit_present() -> Result<bool, String> {
+        let engine = wfp_engine_open()?;
+        let result = (|| -> Result<bool, String> {
+            for filter_key in [RUSTYNET_WFP_FILTER_V4_KEY, RUSTYNET_WFP_FILTER_V6_KEY] {
+                let mut filter: *mut FWPM_FILTER0 = null_mut();
+                let status = unsafe { FwpmFilterGetByKey0(engine, &filter_key, &mut filter) };
+                if status == FWP_E_FILTER_NOT_FOUND {
+                    return Ok(false);
+                }
+                if status != 0 {
+                    return Err(format!("FwpmFilterGetByKey0 failed with {status}"));
+                }
+                // FwpmFilterGetByKey0 allocates the returned filter; free it.
+                if !filter.is_null() {
+                    let mut freeable = filter as *mut c_void;
+                    unsafe { FwpmFreeMemory0(&mut freeable) };
+                }
+            }
+            Ok(true)
+        })();
+        unsafe { FwpmEngineClose0(engine) };
+        result
+    }
 }
 
 #[cfg(windows)]
@@ -1739,7 +1773,7 @@ pub use imp::{
     extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
     inspect_named_pipe_sddl, inspect_registry_key_sddl, lookup_account_sid_string,
     remove_wfp_tunnel_permit, serve_named_pipe_one_message,
-    serve_named_pipe_one_message_authorized, verify_authenticode_chain,
+    serve_named_pipe_one_message_authorized, verify_authenticode_chain, wfp_tunnel_permit_present,
 };
 
 #[cfg(test)]
