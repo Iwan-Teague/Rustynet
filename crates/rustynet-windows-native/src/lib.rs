@@ -1556,8 +1556,8 @@ mod imp {
         FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
         FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0,
-        FwpmFilterAdd0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0,
-        FwpmTransactionBegin0, FwpmTransactionCommit0,
+        FwpmFilterAdd0, FwpmFilterDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0,
+        FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
     };
     use windows_sys::core::GUID;
 
@@ -1570,6 +1570,7 @@ mod imp {
 
     const FWP_E_ALREADY_EXISTS: u32 = 0x8032_0009;
     const FWP_E_SUBLAYER_NOT_FOUND: u32 = 0x8032_0007;
+    const FWP_E_FILTER_NOT_FOUND: u32 = 0x8032_0003;
     // RPC_C_AUTHN_DEFAULT — use the calling process credentials for the engine.
     const RPC_C_AUTHN_DEFAULT: u32 = 0xFFFF_FFFF;
 
@@ -1597,7 +1598,19 @@ mod imp {
         Ok(engine)
     }
 
-    fn wfp_delete_sublayer(engine: HANDLE) -> Result<(), String> {
+    /// Remove RustyNet's WFP objects: the per-family filters FIRST, then the
+    /// sublayer. WFP refuses to delete a sublayer that still has filters
+    /// referencing it (FWP_E_IN_USE), and our filters are persistent — so a
+    /// sublayer-only delete would fail on every re-apply after the first and
+    /// would leave the permit in place during rollback / block_all_egress
+    /// (fail-open). NOT_FOUND on any object is benign (already gone).
+    fn wfp_delete_objects(engine: HANDLE) -> Result<(), String> {
+        for filter_key in [RUSTYNET_WFP_FILTER_V4_KEY, RUSTYNET_WFP_FILTER_V6_KEY] {
+            let status = unsafe { FwpmFilterDeleteByKey0(engine, &filter_key) };
+            if status != 0 && status != FWP_E_FILTER_NOT_FOUND {
+                return Err(format!("FwpmFilterDeleteByKey0 failed with {status}"));
+            }
+        }
         let status = unsafe { FwpmSubLayerDeleteByKey0(engine, &RUSTYNET_WFP_SUBLAYER_KEY) };
         if status != 0 && status != FWP_E_SUBLAYER_NOT_FOUND {
             return Err(format!("FwpmSubLayerDeleteByKey0 failed with {status}"));
@@ -1669,7 +1682,7 @@ mod imp {
             }
             // Purge any prior RustyNet sublayer (and its filters) so re-apply is
             // idempotent and never strands a stale-LUID permit.
-            wfp_delete_sublayer(engine)?;
+            wfp_delete_objects(engine)?;
             wfp_add_sublayer(engine)?;
             wfp_add_permit_filter(
                 engine,
@@ -1705,7 +1718,7 @@ mod imp {
             if status != 0 {
                 return Err(format!("FwpmTransactionBegin0 failed with {status}"));
             }
-            wfp_delete_sublayer(engine)?;
+            wfp_delete_objects(engine)?;
             let status = unsafe { FwpmTransactionCommit0(engine) };
             if status != 0 {
                 return Err(format!("FwpmTransactionCommit0 failed with {status}"));

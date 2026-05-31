@@ -3204,7 +3204,7 @@ const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActi
 /// global default outbound policy is still `Block`.  Each rule name and the
 /// expected attributes are passed as `PowerShell` parameters so no value is
 /// interpolated into the script body.  Throws on the first drift detected.
-const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $TunnelName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($LoopbackName, $TunnelName, $EgressName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Allow') { throw \"rule $displayName action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
+const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($LoopbackName, $EgressName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Allow') { throw \"rule $displayName action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
@@ -3505,11 +3505,15 @@ impl DataplaneSystem for WindowsCommandSystem {
         // open — `assert_killswitch` would lie about posture in exactly
         // the window where its guarantee matters most.  Linux and macOS
         // already query the OS state here; this brings Windows to parity.
+        // The tunnel outbound allow is now a native WFP filter (E2), not a netsh
+        // rule, so it is not asserted via Get-NetFirewallRule here — and its
+        // absence would only block more (fail-safe), never open a hole. We still
+        // verify the security-critical bits: the default-block-outbound policy
+        // plus the loopback + egress netsh allow rules.
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_KILLSWITCH,
             &[
                 WINDOWS_KS_RULE_LOOPBACK.to_owned(),
-                WINDOWS_KS_RULE_TUNNEL.to_owned(),
                 WINDOWS_KS_RULE_EGRESS.to_owned(),
             ],
         )
@@ -7953,7 +7957,7 @@ mod tests {
         //    every cmdlet so a missing rule or query failure is surfaced
         //    as a thrown exception, not a silently-empty result.
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH.contains("param($LoopbackName, $TunnelName, $EgressName)"),
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("param($LoopbackName, $EgressName)"),
             "assert_killswitch script must bind rule names as parameters"
         );
         assert!(
@@ -8047,7 +8051,6 @@ mod tests {
             WINDOWS_PS_ASSERT_KILLSWITCH,
             &[
                 WINDOWS_KS_RULE_LOOPBACK.to_owned(),
-                WINDOWS_KS_RULE_TUNNEL.to_owned(),
                 WINDOWS_KS_RULE_EGRESS.to_owned(),
             ],
         );
@@ -8056,8 +8059,7 @@ mod tests {
         assert_eq!(args[2], "-Command");
         assert_eq!(args[3], WINDOWS_PS_ASSERT_KILLSWITCH);
         assert_eq!(args[4], WINDOWS_KS_RULE_LOOPBACK);
-        assert_eq!(args[5], WINDOWS_KS_RULE_TUNNEL);
-        assert_eq!(args[6], WINDOWS_KS_RULE_EGRESS);
+        assert_eq!(args[5], WINDOWS_KS_RULE_EGRESS);
     }
 
     #[test]
