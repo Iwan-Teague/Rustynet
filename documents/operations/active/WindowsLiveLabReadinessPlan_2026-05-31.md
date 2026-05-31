@@ -249,16 +249,31 @@ role-switch matrix include a Windows node.
 
 ## 5. Engineering enablers (⚙️, parallelizable)
 
-- **E1 — Windows compile/lint/test gate (G7).** Stand up a Windows runner (or
-  cross toolchain) so `cfg(windows)` code is `clippy -D warnings` + `test`
-  gated, not just guest-built. Highest-leverage enabler — today Windows code
-  correctness rests on the guest build alone.
-- **E2 — Native firewall killswitch (G2).** Replace the last `New-NetFirewallRule`
-  (CIM) allow rule with a native Windows Filtering Platform (WFP) filter keyed
-  on the tunnel interface LUID — no CIM, cannot hang, continues the "no CIM
-  cmdlets on the daemon path" campaign (same lesson as native egress). Gate on
-  N2's timing data: do now if CIM proves unreliable on a healthy guest, defer
-  if the leak-fix + watchdog suffice. Security-sensitive — needs E1 to test.
+- **E1 — Windows compile gate (G7) — ✅ landed (cross-`check`).**
+  `scripts/ci/windows_compile_check.sh` cross-`cargo check`s `cfg(windows)` code
+  against `x86_64-pc-windows-msvc` (the guest ABI) via the pinned rustup 1.88.0
+  toolchain, giving local compile feedback without a guest build. Setup gotcha
+  (documented in the script): plain `cargo`/`rustc` on this host are **Homebrew
+  Rust** with no Windows target std, so the gate invokes the rustup toolchain's
+  cargo + `RUSTC` explicitly. **Limitation:** pure-Rust Windows crates
+  (`rustynet-windows-native`) cross-`check` cleanly, but crates pulling **C deps**
+  (`rustynetd` → `libsqlite3-sys`) cannot cross-compile on macOS (no Windows C
+  headers for `cc`); those still rely on the guest build for the full compile.
+  So the gate covers the FFI crates directly and the rest via the host build
+  (against the non-windows stubs) + the guest build.
+- **E2 — Native WFP killswitch (G2) — 🟡 implemented + locally compile-validated,
+  pending guest end-to-end.** `apply_wfp_tunnel_permit` / `remove_wfp_tunnel_permit`
+  in `rustynet-windows-native` replace the last `New-NetFirewallRule` (CIM) allow
+  rule with a native WFP filter keyed on the tunnel interface LUID — no CIM,
+  cannot hang. A persistent max-weight RustyNet sublayer wins arbitration over the
+  netsh default-block-outbound policy; hard-permit filters at ALE_AUTH_CONNECT_V4/V6
+  permit outbound on the tunnel LUID. `phase10.rs` `apply_firewall_killswitch`
+  now calls it (rollback removes it). Validated: `windows-native` **cross-compiles
+  for msvc** (E1); phase10 wiring host-compiles against the stub (identical
+  signature). Remaining: the overnight guest `build-release` for the full
+  rustynetd Windows compile, then N2 exercises it live (fail-closed + the WFP
+  permit actually overriding the block). Decouples E2 from N2's timing question:
+  the cmdlet is simply gone.
 - **E3 — Gate stage-timing CSV.** Record per-stage wall-clock from the xtask
   gates runner to `documents/operations/gate_timings.csv` (separate, queued).
 
