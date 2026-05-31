@@ -165,6 +165,33 @@ then tear down. Likely needs a small smoke verb (reuses the existing backend).
 - **Done when:** `rustynet0` appears up with the expected address and `wg show`
   reports the interface on `windows-utm-1`, then tears down cleanly. No leaks.
 
+Progress (2026-05-31):
+- **Smoke verb** `rustynetd windows-tunnel-smoke` landed on `main` (commit
+  59d5497, `crates/rustynetd/src/windows_tunnel_smoke.rs`). Its `cfg(windows)`
+  body is statically symbol-verified against the host but **not yet
+  guest-compiled** (cross-platform surface only).
+- **Orchestrator harness landed (host-gated):** a `tunnel-smoke` bootstrap
+  phase + `scripts/bootstrap/windows/Invoke-RustyNetWindowsTunnelSmoke.ps1`
+  (admin-gated, timeout+kill bounded, fail-closed JSON envelope surfacing
+  `overall_ok`) + a `parse_windows_tunnel_smoke_output` parser + unit tests,
+  modeled on the `smoke-service-host` harness. The phase requires proven
+  host-side access, is **excluded from `All`** (privileged, checkpoint-gated),
+  and fails closed as "Windows-only" on Linux/macOS. `cargo fmt`/`clippy
+  -D warnings`/unit tests are green on the macOS host.
+- **Run path (once the guest is reachable):** `sync-source` → `build-release`
+  (this is also the N1.1 guest-compile gate for the `cfg(windows)` smoke body)
+  → `ops vm-lab-bootstrap-phase --phase tunnel-smoke --vm windows-utm-1`. The
+  smoke runs the freshly built `target\release\rustynetd.exe` directly; it does
+  **not** require `install-release`/`restart-runtime`.
+- **BLOCKED:** `windows-utm-1` is currently unreachable (UTM reports the VM
+  `started`, but no ping/ARP/TCP-22 at `192.168.0.45`; it is an Apple-Virt guest
+  on `bridge100`, which has no host IPv4 right now — the QEMU debian guests on
+  the en0 bridge remain reachable). `probe_and_recover` cannot recover Apple-Virt
+  Windows guests; recovery is **manual via the UTM console** (confirm booted +
+  networked, capture the live IP, and `sc.exe stop RustyNet` if a stale
+  killswitch is blocking inbound SSH — the G9 lockout scenario). N1.1 (guest
+  compile) and the live N1.3 bring-up are gated on that recovery.
+
 ### N2 — Killswitch + protected-mode exercise on the single node 🔴 (covers G2)
 With a tunnel up, apply the killswitch and verify default-deny + the tunnel /
 egress allowances behave. Confirm **fail-closed**: if killswitch apply fails,

@@ -23,6 +23,7 @@ fn phase_requires_proven_access(phase: BootstrapPhase) -> bool {
             | BootstrapPhase::InstallRelease
             | BootstrapPhase::RestartRuntime
             | BootstrapPhase::VerifyRuntime
+            | BootstrapPhase::TunnelSmoke
     )
 }
 
@@ -233,6 +234,7 @@ fn build_bootstrap_script_invocation(
         BootstrapPhase::InstallRelease
         | BootstrapPhase::RestartRuntime
         | BootstrapPhase::VerifyRuntime
+        | BootstrapPhase::TunnelSmoke
         | BootstrapPhase::All => {
             return Err(format!(
                 "bootstrap script invocation is not used for Windows phase {} on {}",
@@ -281,6 +283,21 @@ fn build_windows_service_host_smoke_invocation(
             WINDOWS_STATE_ROOT.to_owned(),
             "-ServiceName".to_owned(),
             "RustyNetSmoke".to_owned(),
+        ],
+    }
+}
+
+fn build_windows_tunnel_smoke_invocation(
+    context: &BootstrapPhaseContext<'_>,
+) -> WindowsHelperScriptSpec {
+    WindowsHelperScriptSpec {
+        helper_file_name: WINDOWS_TUNNEL_SMOKE_HELPER_FILE,
+        remote_file_name: WINDOWS_TUNNEL_SMOKE_HELPER_FILE,
+        args: vec![
+            "-RustyNetRoot".to_owned(),
+            context.workdir.to_owned(),
+            "-StateRoot".to_owned(),
+            WINDOWS_STATE_ROOT.to_owned(),
         ],
     }
 }
@@ -646,6 +663,73 @@ fn parse_windows_service_host_smoke_output(output: &str, target_label: &str) -> 
 
     Err(format!(
         "Windows service-host smoke helper reported status={status} reason={reason} backend_label={backend_label} failure_step={failure_step} runtime_probe_mode={runtime_probe_mode} runtime_probe_excerpt={runtime_probe_excerpt} for {target_label}"
+    ))
+}
+
+/// Parse the JSON envelope emitted by `Invoke-RustyNetWindowsTunnelSmoke.ps1`.
+///
+/// The helper runs `rustynetd windows-tunnel-smoke` on the guest, captures the
+/// daemon's own tunnel-smoke report, and wraps it in a fixed envelope that
+/// surfaces `status` (`pass`/`fail`) and the daemon's `overall_ok` verdict at
+/// the top level. A smoke passes only when the wrapper reports `status=pass`
+/// **and** the daemon reported `overall_ok=true`; any other shape is a
+/// fail-closed error that preserves the daemon's per-stage flags for triage.
+fn parse_windows_tunnel_smoke_output(output: &str, target_label: &str) -> Result<(), String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Windows tunnel smoke helper produced no output for {target_label}"
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        format!("Windows tunnel smoke helper did not emit valid JSON for {target_label}: {err}")
+    })?;
+    let status = parsed
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("fail");
+    let reason = parsed
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let failure_step = parsed
+        .get("failure_step")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let overall_ok = parsed
+        .get("overall_ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let daemon_exit_code = parsed
+        .get("daemon_exit_code")
+        .and_then(serde_json::Value::as_i64);
+    // Surface the daemon's per-stage flags (when present) so a failed smoke
+    // names exactly which step regressed instead of a bare overall_ok=false.
+    let report = parsed.get("tunnel_report");
+    let report_flag = |key: &str| -> &'static str {
+        match report
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        }
+    };
+    let started = report_flag("started");
+    let interface_present = report_flag("interface_present");
+    let wg_show_ok = report_flag("wg_show_ok");
+    let torn_down = report_flag("torn_down");
+
+    if status == "pass" && overall_ok {
+        return Ok(());
+    }
+
+    let exit_code = daemon_exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    Err(format!(
+        "Windows tunnel smoke helper reported status={status} overall_ok={overall_ok} reason={reason} failure_step={failure_step} daemon_exit_code={exit_code} started={started} interface_present={interface_present} wg_show_ok={wg_show_ok} torn_down={torn_down} for {target_label}"
     ))
 }
 
@@ -2048,6 +2132,20 @@ impl WindowsBootstrapProvider {
                     )
                 }
             }
+            BootstrapPhase::TunnelSmoke => {
+                // Privileged single-node tunnel bring-up. Access is already
+                // proven (phase_requires_proven_access), so this runs over the
+                // pinned-SSH capture path — the local-UTM result-file path is
+                // not available for the Apple-Virtualization Windows guest.
+                let invocation = build_windows_tunnel_smoke_invocation(context);
+                let output = self.capture_helper_output(
+                    target,
+                    context,
+                    invocation,
+                    "Windows tunnel smoke helper",
+                )?;
+                parse_windows_tunnel_smoke_output(output.as_str(), target.label.as_str())
+            }
             BootstrapPhase::All => {
                 for subphase in [
                     BootstrapPhase::SyncSource,
@@ -2177,6 +2275,129 @@ mod tests {
                 "RustyNetSmoke",
             ]
         );
+    }
+
+    #[test]
+    fn windows_tunnel_smoke_invocation_uses_canonical_helper_and_runtime_roots() {
+        let invocation = build_windows_tunnel_smoke_invocation(&sample_context(None));
+        assert_eq!(
+            invocation.helper_file_name,
+            WINDOWS_TUNNEL_SMOKE_HELPER_FILE
+        );
+        assert_eq!(
+            invocation.remote_file_name,
+            WINDOWS_TUNNEL_SMOKE_HELPER_FILE
+        );
+        assert_eq!(
+            invocation.args,
+            vec![
+                "-RustyNetRoot",
+                r"C:\Rustynet",
+                "-StateRoot",
+                WINDOWS_STATE_ROOT,
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_tunnel_smoke_parser_accepts_pass() {
+        parse_windows_tunnel_smoke_output(
+            r#"{
+                "status": "pass",
+                "overall_ok": true,
+                "daemon_exit_code": 0,
+                "tunnel_report": {
+                    "tunnel_name": "rustynet0",
+                    "started": true,
+                    "interface_present": true,
+                    "wg_show_ok": true,
+                    "torn_down": true,
+                    "overall_ok": true
+                }
+            }"#,
+            "windows-utm-1",
+        )
+        .expect("a clean pass envelope must parse as success");
+    }
+
+    #[test]
+    fn windows_tunnel_smoke_parser_rejects_overall_ok_false() {
+        let err = parse_windows_tunnel_smoke_output(
+            r#"{
+                "status": "fail",
+                "overall_ok": false,
+                "reason": "tunnel did not come up cleanly (overall_ok=False, exit=1)",
+                "daemon_exit_code": 1,
+                "failure_step": "run-daemon",
+                "tunnel_report": {
+                    "started": true,
+                    "interface_present": false,
+                    "wg_show_ok": true,
+                    "torn_down": true,
+                    "overall_ok": false
+                }
+            }"#,
+            "windows-utm-1",
+        )
+        .expect_err("overall_ok=false must fail closed");
+        assert!(err.contains("status=fail"));
+        assert!(err.contains("overall_ok=false"));
+        assert!(err.contains("interface_present=false"));
+        assert!(err.contains("daemon_exit_code=1"));
+    }
+
+    #[test]
+    fn windows_tunnel_smoke_parser_rejects_status_pass_without_overall_ok() {
+        // A pass status with overall_ok=false (or absent) is internally
+        // inconsistent and must still fail closed — both signals must agree.
+        let err = parse_windows_tunnel_smoke_output(
+            r#"{ "status": "pass", "overall_ok": false, "daemon_exit_code": 0 }"#,
+            "windows-utm-1",
+        )
+        .expect_err("status=pass without overall_ok must fail closed");
+        assert!(err.contains("overall_ok=false"));
+    }
+
+    #[test]
+    fn windows_tunnel_smoke_parser_rejects_missing_daemon_report() {
+        let err = parse_windows_tunnel_smoke_output(
+            r#"{
+                "status": "fail",
+                "overall_ok": false,
+                "reason": "daemon emitted no tunnel-smoke report; exit=1; stderr: tunnel bring-up failed",
+                "daemon_exit_code": 1,
+                "failure_step": "run-daemon",
+                "tunnel_report": null
+            }"#,
+            "windows-utm-1",
+        )
+        .expect_err("a missing daemon report must fail closed");
+        assert!(err.contains("started=unknown"));
+        assert!(err.contains("interface_present=unknown"));
+        assert!(err.contains("wg_show_ok=unknown"));
+    }
+
+    #[test]
+    fn windows_tunnel_smoke_parser_rejects_empty_output() {
+        let err = parse_windows_tunnel_smoke_output("   ", "windows-utm-1")
+            .expect_err("empty output must fail closed");
+        assert!(err.contains("produced no output"));
+    }
+
+    #[test]
+    fn windows_tunnel_smoke_helper_is_admin_gated_and_runs_the_subcommand() {
+        let helper = include_str!(
+            "../../../../../scripts/bootstrap/windows/Invoke-RustyNetWindowsTunnelSmoke.ps1"
+        );
+        // Privileged bring-up must be admin-gated and fail closed off the happy path.
+        assert!(helper.contains("WindowsBuiltInRole]::Administrator"));
+        assert!(helper.contains("trap {"));
+        // It must invoke the daemon tunnel-smoke subcommand and gate on overall_ok.
+        assert!(helper.contains("windows-tunnel-smoke"));
+        assert!(helper.contains("overall_ok"));
+        assert!(helper.contains("rustynetd.exe"));
+        // Defense-in-depth: the canonical state root is enforced.
+        assert!(helper.contains(r"state root must be C:\ProgramData\RustyNet"));
     }
 
     #[test]
