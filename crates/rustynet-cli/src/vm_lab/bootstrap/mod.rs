@@ -12,6 +12,11 @@ pub(super) enum BootstrapPhase {
     InstallRelease,
     RestartRuntime,
     VerifyRuntime,
+    /// Single-node WireGuard tunnel bring-up smoke (readiness plan N1). A
+    /// standalone, manually-triggered phase — never part of `All` — because it
+    /// performs a privileged live tunnel bring-up that requires an operator
+    /// checkpoint. Windows-only; other platforms fail closed.
+    TunnelSmoke,
     All,
 }
 
@@ -24,9 +29,10 @@ impl BootstrapPhase {
             "install-release" => Ok(Self::InstallRelease),
             "restart-runtime" => Ok(Self::RestartRuntime),
             "verify-runtime" => Ok(Self::VerifyRuntime),
+            "tunnel-smoke" => Ok(Self::TunnelSmoke),
             "all" => Ok(Self::All),
             other => Err(format!(
-                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|all)"
+                "unsupported vm-lab bootstrap phase: {other} (expected sync-source|build-release|smoke-service-host|install-release|restart-runtime|verify-runtime|tunnel-smoke|all)"
             )),
         }
     }
@@ -39,6 +45,7 @@ impl BootstrapPhase {
             Self::InstallRelease => "install-release",
             Self::RestartRuntime => "restart-runtime",
             Self::VerifyRuntime => "verify-runtime",
+            Self::TunnelSmoke => "tunnel-smoke",
             Self::All => "all",
         }
     }
