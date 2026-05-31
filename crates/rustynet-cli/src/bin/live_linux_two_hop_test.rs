@@ -169,11 +169,13 @@ fn run() -> Result<(), String> {
     // The two-hop chain is client -> entry -> final_exit, where the entry node
     // is the intermediate exit: it terminates the client's tunnel and re-exits
     // toward the final exit (ASSIGNMENTS_SPEC below sets client|entry and
-    // entry|final_exit). Serving as an exit requires the exit_server capability
-    // in signed membership, so the entry node's capabilities include
-    // exit_server in addition to client,relay_host.
+    // entry|final_exit). The entry node is enforced as the admin role (it
+    // advertises an exit route), so its assignment intent must include the
+    // anchor capability (NodeRole::Admin requires Anchor); it also needs
+    // exit_server to serve client traffic as an exit and client to consume the
+    // final exit. The final exit is likewise admin (anchor) + exit_server.
     let nodes_spec = format!(
-        "{}|{}:51820|{}|anchor,exit_server||||anchor,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host;{}|{}:51820|{}|client,relay_host,exit_server||||client,relay_host,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host",
+        "{}|{}:51820|{}|anchor,exit_server||||anchor,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host;{}|{}:51820|{}|anchor,client,relay_host,exit_server||||anchor,client,relay_host,exit_server;{}|{}:51820|{}|client,relay_host||||client,relay_host",
         config.final_exit_node_id,
         final_exit_addr,
         final_exit_pub_hex,
