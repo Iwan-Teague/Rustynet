@@ -5066,13 +5066,28 @@ stage_run_live_two_hop() {
 
 stage_run_live_lan_toggle() {
   local exit_platform wrapper report_path log_path
-  if ! has_label aux; then
-    printf 'LAN toggle requires aux target\n' >&2
+  local blind_exit_label="" cand
+
+  # The Linux lan_toggle validator makes Linux-specific (systemd / nftables /
+  # iproute2) assertions on the blind_exit node, so the blind_exit must be a
+  # Linux host. Historically this was the aux label, but in mixed-OS profiles
+  # aux can be macOS. macOS blind-exit serving is validated separately by
+  # live_role_switch_matrix, which drives the mac node into a serving
+  # blind_exit role. Pick the first available Linux node (distinct from the
+  # exit/client roles) for the blind_exit here.
+  for cand in extra fifth_client entry aux; do
+    if has_label "$cand" && [[ "$(node_platform_for_label "$cand")" == "linux" ]]; then
+      blind_exit_label="$cand"
+      break
+    fi
+  done
+  if [[ -z "$blind_exit_label" ]]; then
+    printf 'LAN toggle requires a Linux blind_exit node (none available among extra/fifth_client/entry/aux)\n' >&2
     return 1
   fi
 
   # Track B Phase 2: dispatch per active-exit platform. The lan-
-  # toggle behaviour is enforced by the exit (and blind_exit aux) so
+  # toggle behaviour is enforced by the exit (and the Linux blind_exit) so
   # the exit platform drives the validator dispatch.
   exit_platform="$(node_platform_for_label exit)"
   case "$exit_platform" in
@@ -5104,8 +5119,8 @@ stage_run_live_lan_toggle() {
     --exit-node-id "$(node_id_for_label exit)" \
     --client-host "$(node_target_for_label client)" \
     --client-node-id "$(node_id_for_label client)" \
-    --blind-exit-host "$(node_target_for_label aux)" \
-    --blind-exit-node-id "$(node_id_for_label aux)" \
+    --blind-exit-host "$(node_target_for_label "$blind_exit_label")" \
+    --blind-exit-node-id "$(node_id_for_label "$blind_exit_label")" \
     --ssh-allow-cidrs "$SSH_ALLOW_CIDRS" \
     --report-path "$report_path" \
     --log-path "$log_path"

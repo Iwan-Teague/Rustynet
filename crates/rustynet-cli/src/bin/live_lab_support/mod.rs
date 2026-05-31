@@ -963,8 +963,27 @@ impl LiveLabContext {
 
     pub fn collect_pubkey_hex(&mut self, target: &str) -> Result<String, String> {
         self.push_sudo_password(target)?;
+        // The WireGuard public key lives under the platform state root:
+        // /var/lib/rustynet on Linux, /usr/local/var/rustynet on macOS. Try the
+        // Linux path first, then the macOS path, so this helper works for
+        // mixed-OS managed peers (e.g. a macOS node in a Linux-signer topology)
+        // without threading per-host platform through every caller. Each
+        // attempt is argv-only (no shell construction).
         let pub_b64 =
-            self.capture_root(target, &["cat", "/var/lib/rustynet/keys/wireguard.pub"])?;
+            match self.capture_root(target, &["cat", "/var/lib/rustynet/keys/wireguard.pub"]) {
+                Ok(value) => value,
+                Err(linux_err) => self
+                    .capture_root(
+                        target,
+                        &["cat", "/usr/local/var/rustynet/keys/wireguard.pub"],
+                    )
+                    .map_err(|macos_err| {
+                        format!(
+                            "wireguard.pub not found at Linux (/var/lib/rustynet) or macOS \
+                         (/usr/local/var/rustynet) state root: {linux_err}; {macos_err}"
+                        )
+                    })?,
+            };
         let decoded = base64_decode(pub_b64.trim())?;
         Ok(hex_encode_lower(&decoded))
     }

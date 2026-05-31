@@ -276,8 +276,18 @@ fn run() -> Result<(), String> {
 
     // blind_exit MUST NOT carry anchor capability (daemon rejects). Required
     // caps per NodeRole::BlindExit: blind_exit + exit_server.
+    //
+    // Node entry layout is node_id|endpoint|public_key|owner|hostname|os|
+    // tags_csv|capabilities_csv. The assignment issuer reads capabilities from
+    // field 7 (parse_assignment_nodes) while the traversal/DNS issuer reads
+    // them from field 3, so the canonical lab form repeats the capability CSV
+    // in field 3 and field 7 with the intervening fields empty (mirrors
+    // build_onehop_specs). A bare node_id|endpoint|key|caps form puts caps in
+    // the owner slot and leaves field 7 empty, so the assignment bundle
+    // defaults every peer to client and the daemon rejects it ("route peer
+    // <id> lacks signed relay_host or exit_server capability").
     let nodes_spec = format!(
-        "{exit_node_id}|{exit_addr}:51820|{exit_pub_hex}|anchor,exit_server;{client_node_id}|{client_addr}:51820|{client_pub_hex}|client,relay_host;{blind_exit_node_id}|{blind_exit_addr}:51820|{blind_exit_pub_hex}|blind_exit,exit_server"
+        "{exit_node_id}|{exit_addr}:51820|{exit_pub_hex}|anchor,exit_server||||anchor,exit_server;{client_node_id}|{client_addr}:51820|{client_pub_hex}|client,relay_host||||client,relay_host;{blind_exit_node_id}|{blind_exit_addr}:51820|{blind_exit_pub_hex}|blind_exit,exit_server||||blind_exit,exit_server"
     );
     let allow_spec = format!(
         "{client_node_id}|{exit_node_id};{exit_node_id}|{client_node_id};{blind_exit_node_id}|{exit_node_id};{exit_node_id}|{blind_exit_node_id}"
