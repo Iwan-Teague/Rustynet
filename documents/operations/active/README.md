@@ -43,6 +43,7 @@ phase checklists that finished (Phase 1, 2, 3, 5) have moved to
 - [VmLabCapabilitySources_2026-04-14.md](./VmLabCapabilitySources_2026-04-14.md)
 - [WindowsExitAndRelayDeltaPlan_2026-05-10.md](./WindowsExitAndRelayDeltaPlan_2026-05-10.md)
 - [WindowsLabVmStabilityAndSessionModel_2026-04-30.md](./WindowsLabVmStabilityAndSessionModel_2026-04-30.md)
+- [WindowsLiveLabReadinessPlan_2026-05-31.md](./WindowsLiveLabReadinessPlan_2026-05-31.md) — focused readiness ledger for running live-lab **on a Windows node**: `restart-runtime` is GREEN (daemon builds/installs/starts/serves hardened IPC), but no WireGuard tunnel has ever come up on Windows; ordered path N1-N6 (single-node tunnel smoke → killswitch/DNS fail-closed → two-node mesh → roles → full matrix) + enablers E1-E3 (Windows CI gate, native WFP killswitch, gate-timing CSV); cross-links the detailed Windows/connectivity/role ledgers
 - [WindowsUtmTransportArchitecture_2026-04-30.md](./WindowsUtmTransportArchitecture_2026-04-30.md)
 - [WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md](./WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md)
 - [WindowsWorkingNodePlan_2026-04-17.md](./WindowsWorkingNodePlan_2026-04-17.md)
