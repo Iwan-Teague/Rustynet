@@ -21,11 +21,13 @@
 #   3. For each Linux VM whose SSH port is NOT open, uses `utmctl exec` to
 #      invoke `sudo nft flush ruleset` and stop the rustynetd services
 #      inside the guest. This path does NOT depend on SSH — it goes through
-#      the qemu-guest-agent socket. Recovery is skipped for macOS and
-#      Windows guests because UTM's Apple Virtualization backend does not
-#      expose `utmctl exec`; for those, manually disable the daemon via
-#      UTM serial console (macOS: `launchctl bootout system/com.rustynet.daemon`
-#      + `pfctl -F all -d`; Windows: `sc.exe stop RustyNet`).
+#      the qemu-guest-agent socket. The Windows VM (windows-utm-1) is ALSO a
+#      QEMU guest with a working guest agent, so it is auto-recovered the same
+#      way: stop the RustyNet service + restore the outbound firewall policy
+#      (the killswitch lockout = firewall AllowInbound,BlockOutbound). Only
+#      macOS guests still require manual recovery, because UTM's Apple
+#      Virtualization backend exposes no `utmctl exec` (via serial console:
+#      `launchctl bootout system/com.rustynet.daemon` + `pfctl -F all -d`).
 #   4. Re-probes TCP/22 on every VM after recovery and prints a final
 #      summary table.
 #
@@ -148,22 +150,46 @@ if (( ${#STUCK_LINUX[@]} > 0 )); then
 fi
 
 if (( ${#STUCK_OTHER[@]} > 0 )); then
-  printf '\n== Non-Linux VMs stuck (manual recovery required) ==\n'
+  printf '\n== Non-Linux VMs stuck ==\n'
   for entry in "${STUCK_OTHER[@]}"; do
     IFS='|' read -r name ip platform <<< "$entry"
-    printf '  %s [%s] @ %s\n' "$name" "$platform" "$ip"
     case "$platform" in
+      windows)
+        # windows-utm-1 is a QEMU/VirtIO guest with a working guest agent, so
+        # `utmctl exec` drives recovery from the host without SSH (verified
+        # 2026-05-31; the "Apple-Virt / no utmctl exec" assumption was wrong for
+        # this VM). The usual lockout is the RustyNet killswitch leaving the
+        # Windows Firewall at AllowInbound,BlockOutbound — inbound SSH is
+        # accepted but the guest's outbound SYN-ACK/ICMP replies are dropped, so
+        # the host sees TCP/22 + ping timeouts. Recovery: stop the daemon, set it
+        # to demand-start (no auto-relock on reboot), let it settle, then restore
+        # the outbound firewall policy. Idempotent: re-running on an already-
+        # recovered guest is a no-op (sc stop on a stopped service is harmless;
+        # the firewall flip is the same value).
+        printf '\n--- %s [windows] @ %s — utmctl exec recovery ---\n' "$name" "$ip"
+        if "$UTMCTL" exec "$name" --cmd cmd.exe /c "sc stop RustyNet & sc stop RustyNetPrivilegedHelper & sc config RustyNet start= demand & ping -n 5 127.0.0.1 >nul & netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound"; then
+          printf '  ok (daemon stopped + demand-start, outbound firewall restored)\n'
+        else
+          # `utmctl exec` returns the guest command's exit code. The chain ends
+          # with `netsh ... set` so a non-zero result means the firewall flip
+          # itself failed (no elevated guest agent) — fall back to manual.
+          printf '  WARN: utmctl exec recovery failed (no guest agent / not elevated on this VM)\n' >&2
+          printf '    Recover via UTM serial console / RDP:\n'
+          printf '      sc.exe stop RustyNet\n'
+          printf '      netsh advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound\n'
+        fi
+        ;;
       macos)
+        # macOS guests run under UTM's Apple Virtualization backend, which does
+        # NOT expose `utmctl exec` — recovery stays manual via the console.
+        printf '\n--- %s [macos] @ %s — manual recovery (no utmctl exec) ---\n' "$name" "$ip"
         printf '    via UTM serial console / VNC:\n'
         printf '      sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true\n'
         printf '      sudo launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true\n'
         printf '      sudo pfctl -F all -d 2>/dev/null || true\n'
         ;;
-      windows)
-        printf '    via UTM serial console / RDP:\n'
-        printf '      sc.exe stop RustyNet\n'
-        printf '      sc.exe stop RustyNetPrivilegedHelper\n'
-        printf '      Stop-Service RustyNet -Force 2>$null\n'
+      *)
+        printf '\n--- %s [%s] @ %s — manual recovery required ---\n' "$name" "$platform" "$ip"
         ;;
     esac
   done
