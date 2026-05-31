@@ -3206,15 +3206,6 @@ const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActi
 /// interpolated into the script body.  Throws on the first drift detected.
 const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $TunnelName, $EgressName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($LoopbackName, $TunnelName, $EgressName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Allow') { throw \"rule $displayName action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
-/// Create an outbound allow rule scoped to a specific Windows network interface
-/// by alias using `New-NetFirewallRule -InterfaceAlias`.  Used for the `WireGuard`
-/// tunnel interface whose `MediaType` is `IP` / Virtual — wintun-based adapters do
-/// NOT match the `ras` or `lan` interface-type categories recognised by
-/// `netsh advfirewall`, so `interfacetype=` cannot scope the rule correctly.
-/// `PowerShell`'s `-InterfaceAlias` parameter binds by adapter name regardless of
-/// how Windows classifies the underlying adapter type.
-const WINDOWS_PS_ADD_KS_TUNNEL_RULE: &str = "& { param($RuleName, $InterfaceAlias) $ErrorActionPreference = 'Stop'; New-NetFirewallRule -DisplayName $RuleName -Direction Outbound -Action Allow -InterfaceAlias $InterfaceAlias -ErrorAction Stop | Out-Null }";
-
 impl DataplaneSystem for WindowsCommandSystem {
     fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
@@ -3299,22 +3290,16 @@ impl DataplaneSystem for WindowsCommandSystem {
         .map_err(|err| {
             SystemError::FirewallApplyFailed(format!("allow loopback rule failed: {err}"))
         })?;
-        // Allow outbound through the WireGuard tunnel interface (mesh + exit traffic).
-        // WireGuard adapters using wintun are classified as MediaType=IP/Virtual by Windows,
-        // which does NOT match `ras` or `lan` interface-type categories in netsh.  netsh also
-        // does not support `interface=<alias>` as a valid parameter — that form generates
-        // "The specified interface type is not valid."  Use PowerShell New-NetFirewallRule
-        // with -InterfaceAlias instead, which binds by adapter name independently of how
-        // Windows classifies the adapter internally.
-        self.run_powershell_success(
-            WINDOWS_PS_ADD_KS_TUNNEL_RULE,
-            &[
-                WINDOWS_KS_RULE_TUNNEL.to_owned(),
-                self.interface_name.clone(),
-            ],
-        )
-        .map_err(|err| {
-            SystemError::FirewallApplyFailed(format!("allow tunnel interface rule failed: {err}"))
+        // Allow outbound through the WireGuard tunnel interface (mesh + exit traffic)
+        // via a native WFP permit filter keyed on the tunnel interface LUID. This
+        // replaces the prior `New-NetFirewallRule -InterfaceAlias` cmdlet: wintun
+        // adapters (MediaType=IP/Virtual) are not scopable by netsh interfacetype,
+        // and a PowerShell/CIM cmdlet on the dataplane-apply path can hang on a
+        // wedged WMI provider. The native filter uses no CIM and cannot hang.
+        rustynet_windows_native::apply_wfp_tunnel_permit(&self.interface_name).map_err(|err| {
+            SystemError::FirewallApplyFailed(format!(
+                "allow tunnel interface WFP filter failed: {err}"
+            ))
         })?;
         // Allow outbound on the physical egress LAN interface for WireGuard UDP handshakes
         // and management traffic (SSH, STUN, relay bootstrap).
@@ -3344,6 +3329,9 @@ impl DataplaneSystem for WindowsCommandSystem {
                 format!("name={rule_name}"),
             ]);
         }
+        // Remove the native WFP tunnel-permit filter added at apply time
+        // (best-effort, mirrors the by-name rule deletes above).
+        let _ = rustynet_windows_native::remove_wfp_tunnel_permit();
         // Restore default allow-inbound/allow-outbound policy.
         self.run_netsh_success(&[
             "advfirewall".to_owned(),
@@ -5927,57 +5915,6 @@ mod tests {
     }
 
     #[test]
-    fn windows_ps_add_ks_tunnel_rule_uses_interface_alias_not_interfacetype() {
-        // The AllowTunnel killswitch rule must be created via PowerShell
-        // New-NetFirewallRule -InterfaceAlias, NOT via netsh interfacetype.
-        // wintun-based WireGuard adapters (MediaType=IP/Virtual) do NOT match
-        // `ras` or `lan` interfacetype categories in netsh, and netsh does not
-        // support `interface=<alias>` — that form produces "The specified
-        // interface type is not valid."  PowerShell -InterfaceAlias scopes the
-        // rule by adapter name regardless of adapter classification.
-        assert!(
-            WINDOWS_PS_ADD_KS_TUNNEL_RULE.contains("New-NetFirewallRule"),
-            "tunnel rule must use New-NetFirewallRule, not netsh interfacetype"
-        );
-        assert!(
-            WINDOWS_PS_ADD_KS_TUNNEL_RULE.contains("-InterfaceAlias"),
-            "tunnel rule must bind by adapter alias via -InterfaceAlias"
-        );
-        assert!(
-            WINDOWS_PS_ADD_KS_TUNNEL_RULE.contains("param($RuleName, $InterfaceAlias)"),
-            "tunnel rule script must bind values as PowerShell parameters"
-        );
-        assert!(
-            WINDOWS_PS_ADD_KS_TUNNEL_RULE.contains("$ErrorActionPreference = 'Stop'"),
-            "tunnel rule script must fail closed"
-        );
-        assert!(
-            WINDOWS_PS_ADD_KS_TUNNEL_RULE.contains("-ErrorAction Stop"),
-            "New-NetFirewallRule must use -ErrorAction Stop"
-        );
-        // Must NOT hard-code the rule name — it must be passed as a parameter.
-        assert!(
-            !WINDOWS_PS_ADD_KS_TUNNEL_RULE.contains(WINDOWS_KS_RULE_TUNNEL),
-            "tunnel rule script must not hard-code rule name {WINDOWS_KS_RULE_TUNNEL:?}"
-        );
-        // Must NOT use interfacetype — that path is broken for wintun adapters.
-        assert!(
-            !WINDOWS_PS_ADD_KS_TUNNEL_RULE.contains("interfacetype"),
-            "tunnel rule script must not fall back to interfacetype"
-        );
-        // Verify runtime argv passes rule name and alias as separate arguments.
-        let args = windows_powershell_command_args(
-            WINDOWS_PS_ADD_KS_TUNNEL_RULE,
-            &[WINDOWS_KS_RULE_TUNNEL.to_owned(), "rustynet0".to_owned()],
-        );
-        assert_eq!(args[0], "-NoProfile");
-        assert_eq!(args[2], "-Command");
-        assert_eq!(args[3], WINDOWS_PS_ADD_KS_TUNNEL_RULE);
-        assert_eq!(args[4], WINDOWS_KS_RULE_TUNNEL);
-        assert_eq!(args[5], "rustynet0");
-    }
-
-    #[test]
     fn windows_firewall_killswitch_rules_have_distinct_names() {
         // Each killswitch rule is purged-by-name at apply time.  If two rules
         // shared a name, applying the killswitch would silently remove one of
@@ -7903,10 +7840,6 @@ mod tests {
             (
                 "WINDOWS_PS_ASSERT_FORWARDING_ENABLED",
                 WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
-            ),
-            (
-                "WINDOWS_PS_ADD_KS_TUNNEL_RULE",
-                WINDOWS_PS_ADD_KS_TUNNEL_RULE,
             ),
         ] {
             assert!(
