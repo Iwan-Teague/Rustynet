@@ -14,11 +14,13 @@
 //! * `wg.exe` from the same installer at
 //!   `C:\Program Files\WireGuard\wg.exe`. Used for low-level peer
 //!   sync + transfer-stat queries.
+//!
 //! The current command adapter does not load a separate WireGuardNT
 //! provider DLL directly; it delegates tunnel lifecycle to the official
 //! `wireguard.exe` tunnel-service path and low-level inspection to `wg.exe`.
 //! Some supported WireGuard for Windows installs no longer expose
 //! `wireguard.dll` as a standalone file, so readiness must not require it.
+//!
 //! * `netsh.exe`, `sc.exe`, and `powershell.exe` from `System32`.
 //!   Used for route / DNS lifecycle, service-control visibility, and
 //!   fixed-shape host readiness probes. Always present on reviewed
