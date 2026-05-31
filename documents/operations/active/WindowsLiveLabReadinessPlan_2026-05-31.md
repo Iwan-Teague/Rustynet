@@ -183,9 +183,12 @@ then tear down. Likely needs a small smoke verb (reuses the existing backend).
 
 Progress (2026-05-31):
 - **Smoke verb** `rustynetd windows-tunnel-smoke` landed on `main` (commit
-  59d5497, `crates/rustynetd/src/windows_tunnel_smoke.rs`). Its `cfg(windows)`
-  body is statically symbol-verified against the host but **not yet
-  guest-compiled** (cross-platform surface only).
+  59d5497, `crates/rustynetd/src/windows_tunnel_smoke.rs`). **N1.1 done
+  (2026-05-31): its `cfg(windows)` body now compiles on Windows** — `build-release`
+  on `windows-utm-1` succeeded (exit 0) and the built
+  `C:\Rustynet\target\release\rustynetd.exe` (5,156,352 bytes, 2026-05-31 20:39)
+  lists the `windows-tunnel-smoke` subcommand in `--help`. First-ever Windows
+  compile of the smoke body; closes the G7 compile question for it.
 - **Orchestrator harness landed (host-gated):** a `tunnel-smoke` bootstrap
   phase + `scripts/bootstrap/windows/Invoke-RustyNetWindowsTunnelSmoke.ps1`
   (admin-gated, timeout+kill bounded, fail-closed JSON envelope surfacing
